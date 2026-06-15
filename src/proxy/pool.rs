@@ -1,0 +1,303 @@
+use crate::crypto::aead::create_crypto_pair;
+use crate::proxy::tunnel::Tunnel;
+use anyhow::Result;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex, Notify};
+use std::sync::RwLock;
+use tracing::{debug, error, info};
+use tokio::time::Instant;
+
+pub struct PoolConfig {
+    pub server_host: String,
+    pub server_port: u16,
+    pub password: String,
+    pub camouflage_host: String,
+    pub pool_size: usize,
+}
+
+#[derive(Debug)]
+pub struct PoolStats {
+    pub latency_samples: VecDeque<u64>,
+    pub consecutive_failures: u32,
+    pub last_sample_time: Option<Instant>,
+}
+
+impl PoolStats {
+    pub fn new() -> Self {
+        Self {
+            latency_samples: VecDeque::with_capacity(10),
+            consecutive_failures: 0,
+            last_sample_time: None,
+        }
+    }
+
+    pub fn record_latency(&mut self, ms: u64) {
+        if self.latency_samples.len() == 10 {
+            self.latency_samples.pop_front();
+        }
+        self.latency_samples.push_back(ms);
+        self.last_sample_time = Some(Instant::now());
+        self.consecutive_failures = 0;
+    }
+
+    pub fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+    }
+
+    pub fn latency_ms(&self) -> Option<u64> {
+        if self.latency_samples.is_empty() {
+            return None;
+        }
+        let mut sorted: Vec<u64> = self.latency_samples.iter().copied().collect();
+        sorted.sort_unstable();
+        Some(sorted[sorted.len() / 2])
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.consecutive_failures < 3
+    }
+}
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+use std::time::Duration;
+
+pub async fn read_server_handshake(stream: &mut tokio::net::tcp::OwnedReadHalf) -> Result<()> {
+    let mut saw_sh = false;
+    let mut saw_ccs = false;
+    let mut saw_enc = false;
+
+    loop {
+        let t = if saw_ccs { Duration::from_millis(1500) } else { Duration::from_secs(12) };
+        let mut header = [0u8; 5];
+        match timeout(t, stream.read_exact(&mut header)).await {
+            Ok(Ok(_)) => {
+                let ct = header[0];
+                let length = u16::from_be_bytes([header[3], header[4]]) as usize;
+                
+                let mut body = vec![0u8; length];
+                match timeout(t, stream.read_exact(&mut body)).await {
+                    Ok(Ok(_)) => {
+                        if ct == 0x15 {
+                            return Err(anyhow::anyhow!("Server sent TLS alert"));
+                        } else if ct == 0x16 {
+                            saw_sh = true;
+                        } else if ct == 0x14 {
+                            saw_ccs = true;
+                        } else if ct == 0x17 {
+                            saw_enc = true;
+                        }
+                    }
+                    Ok(Err(e)) => return Err(anyhow::anyhow!("Incomplete body: {}", e)),
+                    Err(_) => return Err(anyhow::anyhow!("Timeout reading body")),
+                }
+            }
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Incomplete header: {}", e)),
+            Err(_) => {
+                if !saw_ccs {
+                    return Err(anyhow::anyhow!("Timeout before CCS"));
+                }
+                break; // normal exit after timeout if we saw CCS
+            }
+        }
+    }
+
+    if !saw_sh || !saw_ccs || !saw_enc {
+        return Err(anyhow::anyhow!("Incomplete flight: sh={}, ccs={}, enc={}", saw_sh, saw_ccs, saw_enc));
+    }
+    Ok(())
+}
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// 高并发无锁化弹性协商连接池 (Elastic Auto-Scaling)
+/// 
+/// 设计哲学：
+/// 1. 弹性伸缩：后台监控每秒的消费速率 (RPS)，动态调整预建池的目标容量。闲时收缩节省内存，忙时激增扩容。
+/// 2. 严格控量：通过并发计数器保证 `in_flight + idle` 不超过绝对上限 `pool_size`。
+/// 3. Zero-RTT 提取：消费者通过 `get()` 方法极速获取底层通道，无需等待物理网络握手。
+pub struct WarmPool {
+    queue: Arc<Mutex<VecDeque<Tunnel>>>,
+    notify: Arc<Notify>,
+    pub stats: Arc<RwLock<PoolStats>>,
+    recent_gets: Arc<AtomicUsize>,
+}
+
+impl WarmPool {
+    pub fn new(cfg: Arc<PoolConfig>) -> Self {
+        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
+        let notify = Arc::new(Notify::new());
+        let stats = Arc::new(RwLock::new(PoolStats::new()));
+        let recent_gets = Arc::new(AtomicUsize::new(0));
+
+        let pool = Self {
+            queue: queue.clone(),
+            notify: notify.clone(),
+            stats: stats.clone(),
+            recent_gets: recent_gets.clone(),
+        };
+
+        let target_size = Arc::new(AtomicUsize::new(2)); // 默认闲时保持2个长连接
+        let in_flight = Arc::new(AtomicUsize::new(0));
+
+        // 弹性监控协程 (Manager Task)
+        let gets_clone = recent_gets.clone();
+        let target_clone = target_size.clone();
+        let q_clone = queue.clone();
+        let max_size = cfg.pool_size;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let rps = gets_clone.swap(0, Ordering::Relaxed) / 2; // 每两秒取样，计算每秒速率
+                
+                // 弹性扩缩容协商算法：
+                // 如果当前 RPS 为 0，保持最少 2 个连接。
+                // 如果 RPS > 0，目标大小 = RPS * 3 + 2，最高不超过 max_size。
+                let calculated_target = (rps * 3 + 2).min(max_size);
+                
+                let old_target = target_clone.load(Ordering::Relaxed);
+                if calculated_target != old_target {
+                    target_clone.store(calculated_target, Ordering::Relaxed);
+                    debug!("WarmPool Manager: Elastic resizing target {} -> {} (RPS: {})", old_target, calculated_target, rps);
+                }
+
+                // 闲置连接裁剪机制：如果池中闲置连接远大于目标，则主动销毁过剩连接释放资源
+                let mut q = q_clone.lock().await;
+                let mut to_drop = Vec::new();
+                while q.len() > calculated_target + 2 {
+                    if let Some(tunnel) = q.pop_back() {
+                        to_drop.push(tunnel);
+                    }
+                }
+                for mut tunnel in to_drop {
+                    tokio::spawn(async move {
+                        let _ = tunnel.writer.send_close_notify().await;
+                        debug!("WarmPool Manager: Pruned excess idle connection.");
+                    });
+                }
+            }
+        });
+
+        // 连接补充协程 (Builder Task)
+        let q_clone_builder = queue.clone();
+        let n_clone_builder = notify.clone();
+        let cfg_clone = cfg.clone();
+        let in_flight_clone = in_flight.clone();
+        let target_clone_builder = target_size.clone();
+        let stats_builder = stats.clone();
+        
+        tokio::spawn(async move {
+            info!("WarmPool (Elastic) initialized. Max capacity: {}", cfg_clone.pool_size);
+            let mut next_build_at = Instant::now();
+
+            loop {
+                let current_target = target_clone_builder.load(Ordering::Relaxed);
+                let current_idle = q_clone_builder.lock().await.len();
+                let current_in_flight = in_flight_clone.load(Ordering::Relaxed);
+
+                // 判断是否需要补充连接：闲置 + 正在建连的 < 目标，且没有触碰总上限
+                if current_idle + current_in_flight >= current_target || current_idle + current_in_flight >= cfg_clone.pool_size {
+                    // 等待消费者拿走连接，或者Manager提升目标值
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                in_flight_clone.fetch_add(1, Ordering::Relaxed);
+
+                // 引入 0.2s 阶梯延迟 (SYN Staggering)，防止网络拥塞和暴露特征
+                let now = Instant::now();
+                if next_build_at > now {
+                    tokio::time::sleep_until(next_build_at).await;
+                }
+                next_build_at = Instant::now() + Duration::from_millis(200);
+
+                let cfg_task = cfg_clone.clone();
+                let q_task = q_clone_builder.clone();
+                let n_task = n_clone_builder.clone();
+                let in_flight_task = in_flight_clone.clone();
+                let stats_task = stats_builder.clone();
+
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    match Self::connect_upstream(&cfg_task).await {
+                        Ok(tunnel) => {
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            stats_task.write().unwrap().record_latency(elapsed);
+                            
+                            q_task.lock().await.push_back(tunnel);
+                            n_task.notify_one();
+                            in_flight_task.fetch_sub(1, Ordering::Relaxed);
+                            debug!("WarmPool: 预热连接就绪 ({}ms)", elapsed);
+                        }
+                        Err(e) => {
+                            stats_task.write().unwrap().record_failure();
+                            in_flight_task.fetch_sub(1, Ordering::Relaxed);
+                            error!("WarmPool: 上游连接失败: {:?}", e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        pool
+    }
+
+    /// 核心握手逻辑：建立 TCP 并包装 AEAD Crypto 层
+    async fn connect_upstream(cfg: &PoolConfig) -> Result<Tunnel> {
+        let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
+        let stream = TcpStream::connect(&addr).await?;
+        
+        // 关键性能优化：关闭 Nagle 算法，降低首包延迟
+        stream.set_nodelay(true)?;
+
+        let (mut read_half, mut write_half) = stream.into_split();
+
+        // 1. 发送带 token 的 ClientHello
+        let token = crate::crypto::hello_auth::make_session_token(&cfg.password);
+        let (hello_bytes, client_random) = crate::crypto::tls_raw::build_client_hello(&cfg.camouflage_host, &token);
+        write_half.write_all(&hello_bytes).await?;
+        write_half.flush().await?;
+
+        // 2. 读取服务端的 ServerHello 及握手 flight
+        read_server_handshake(&mut read_half).await?;
+
+        // 3. 发送假 Finished tail 完成 TLS 1.3 握手模拟
+        let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail();
+        write_half.write_all(&tail_bytes).await?;
+        write_half.flush().await?;
+
+        // 4. 派生会话密钥 (使用 client_random 作为 salt)
+        let (crypto_reader, crypto_writer) = create_crypto_pair(
+            read_half,
+            write_half,
+            &cfg.password,
+            &client_random,
+            true, // is_initiator = true (Client -> Server)
+        );
+
+        Ok(Tunnel::new(crypto_reader, crypto_writer))
+    }
+
+    /// O(1) 复杂度提取连接
+    /// 
+    /// 如果队列有现成连接，0 延迟返回。
+    /// 如果队列为空，则无缝休眠等待 `notify` 唤醒。
+    pub async fn get(&self) -> Tunnel {
+        self.recent_gets.fetch_add(1, Ordering::Relaxed);
+
+        loop {
+            // 先获取通知句柄（关键：避免检查队列为空和发生通知之间的竞态条件 Race Condition）
+            let notified = self.notify.notified();
+
+            if let Some(tunnel) = self.queue.lock().await.pop_front() {
+                return tunnel;
+            }
+
+            // 队列真的空了，挂起当前协程等待补货
+            notified.await;
+        }
+    }
+}

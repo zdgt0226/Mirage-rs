@@ -1,0 +1,25 @@
+{
+    "log_level": "info",
+    "inbounds": [
+        {
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": 1080
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "block",
+            "tag": "block"
+        }
+    ],
+    "routing": {
+        "default_outbound": "direct",
+        "rules": []
+    }
+}

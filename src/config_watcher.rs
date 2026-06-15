@@ -1,0 +1,160 @@
+use crate::config::Config;
+use crate::proxy::outbound::OutboundManager;
+use crate::router::{RouterEngine, Rule};
+use anyhow::Result;
+use arc_swap::ArcSwap;
+use notify::{Event, RecursiveMode, Watcher};
+use std::path::Path;
+use std::sync::Arc;
+use ipnet::IpNet;
+use tracing::{error, info};
+
+pub struct CoreState {
+    pub router: Arc<RouterEngine>,
+    pub outbounds: Arc<OutboundManager>,
+    pub advanced_dns: Option<crate::config::AdvancedDnsConfig>,
+}
+
+pub struct ConfigWatcher {
+    pub state: Arc<ArcSwap<CoreState>>,
+}
+
+impl ConfigWatcher {
+    pub fn new(config_path: &str, geodata_dir: &str) -> Result<Self> {
+        let state = Self::build_state(config_path, geodata_dir, None)?;
+        let arc_state = Arc::new(ArcSwap::from_pointee(state));
+        
+        let watcher = Self {
+            state: arc_state.clone(),
+        };
+
+        Self::spawn_watcher(config_path.to_string(), geodata_dir.to_string(), arc_state);
+
+        Ok(watcher)
+    }
+
+    fn build_state(config_path: &str, geodata_dir: &str, old_outbounds: Option<Arc<OutboundManager>>) -> Result<CoreState> {
+        info!("Loading configuration from {}", config_path);
+        let config = Config::load_from_file(config_path)?;
+        
+        let outbounds = if let Some(old) = old_outbounds {
+            info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
+            old
+        } else {
+            Arc::new(OutboundManager::new(&config))
+        };
+        
+        let mut rules = Vec::new();
+        for (i, r) in config.routing.rules.into_iter().enumerate() {
+            let mut ip_cidr = Vec::new();
+            for cidr_str in r.ip_cidr {
+                if let Ok(net) = cidr_str.parse() {
+                    ip_cidr.push(net);
+                }
+            }
+            
+            let mut src_cidrs = Vec::new();
+            for src_ip_str in &r.source_ip_cidr {
+                if let Ok(net) = src_ip_str.parse::<IpNet>() {
+                    src_cidrs.push(net);
+                } else if let Ok(ip) = src_ip_str.parse::<std::net::IpAddr>() {
+                    src_cidrs.push(IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).unwrap());
+                }
+            }
+
+            rules.push(Rule {
+                id: i,
+                mode: r.mode.clone().unwrap_or_else(|| "or".to_string()),
+                outbound: r.outbound,
+                domain_suffix: r.domain_suffix,
+                domain_keyword: r.domain_keyword,
+                domain_regex: r.domain_regex,
+                geosite: r.geosite,
+                ip_cidr,
+                geoip: r.geoip,
+                source_ip_cidr: src_cidrs,
+                source_mac: r.source_mac,
+                protocol: r.protocol,
+                port: r.port,
+            });
+        }
+        
+        let router = RouterEngine::new(
+            rules, 
+            config.routing.default_outbound, 
+            geodata_dir,
+            &config.routing.geo_alias,
+        )?;
+        
+        let mut advanced_dns = config.advanced_dns;
+        if let Some(adv) = &mut advanced_dns {
+            let mut cn_dns = None;
+            let mut remote_host = None;
+            let mut remote_port = None;
+            for r in &adv.resolvers {
+                if adv.default.as_ref() == Some(&r.tag) || r.tag == "remote" || r.tag == "proxy" {
+                    if r.address.contains(':') {
+                        let parts: Vec<&str> = r.address.split(':').collect();
+                        remote_host = Some(parts[0].to_string());
+                        if let Ok(p) = parts[1].parse() { remote_port = Some(p); }
+                    } else {
+                        remote_host = Some(r.address.clone());
+                    }
+                } else if r.tag == "direct" || r.tag == "cn" {
+                    if let Ok(addr) = r.address.parse() { cn_dns = Some(addr); }
+                }
+            }
+            adv.cached_cn_dns = cn_dns;
+            adv.cached_remote_host = remote_host;
+            adv.cached_remote_port = remote_port;
+        }
+
+        Ok(CoreState { router: Arc::new(router), outbounds, advanced_dns })
+    }
+
+    fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>) {
+        tokio::spawn(async move {
+            let (tx, rx) = std::sync::mpsc::channel();
+            
+            let mut watcher = match notify::recommended_watcher(tx) {
+                Ok(w) => w,
+                Err(e) => {
+                    error!("Failed to initialize config file watcher: {}", e);
+                    return;
+                }
+            };
+
+            let path = Path::new(&config_path);
+            if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+                error!("Failed to watch config file {}: {}", config_path, e);
+                return;
+            }
+
+            info!("Started hot-reload watcher on {}", config_path);
+
+            for res in rx {
+                match res {
+                    Ok(Event { kind, .. }) => {
+                        if kind.is_modify() {
+                            info!("Config file {} modified. Attempting hot-reload...", config_path);
+                            // Give the writer a moment to finish flushing the file
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            
+                            let current_outbounds = state.load().outbounds.clone();
+                            match Self::build_state(&config_path, &geodata_dir, Some(current_outbounds)) {
+                                Ok(new_state) => {
+                                    state.store(Arc::new(new_state));
+                                    info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
+                                }
+                                Err(e) => {
+                                    error!("Hot-reload failed! Keeping previous state. Error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => error!("Watch error: {:?}", e),
+                }
+            }
+        });
+    }
+}

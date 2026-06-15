@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mirage-rs Dashboard</title>
+    <style>
+        :root {
+            --bg: #0d0f18;
+            --panel-bg: rgba(255, 255, 255, 0.03);
+            --panel-border: rgba(255, 255, 255, 0.05);
+            --text-main: #e2e8f0;
+            --text-muted: #94a3b8;
+            --accent-up: #38bdf8;
+            --accent-down: #a78bfa;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .blob {
+            position: fixed;
+            filter: blur(100px);
+            z-index: -1;
+            opacity: 0.5;
+        }
+        .blob-1 { top: -100px; left: -100px; width: 400px; height: 400px; background: rgba(56, 189, 248, 0.3); border-radius: 50%; }
+        .blob-2 { bottom: -100px; right: -100px; width: 400px; height: 400px; background: rgba(167, 139, 250, 0.3); border-radius: 50%; }
+
+        header {
+            width: 100%;
+            max-width: 1200px;
+            padding: 40px 20px 20px 20px;
+            box-sizing: border-box;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 2.5rem;
+            font-weight: 800;
+            background: linear-gradient(to right, var(--accent-up), var(--accent-down));
+            -webkit-background-clip: text;
+            color: transparent;
+            letter-spacing: -1px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            padding: 20px;
+            box-sizing: border-box;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            border: 1px solid var(--panel-border);
+            border-radius: 20px;
+            padding: 30px;
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .panel h2 {
+            margin-top: 0;
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
+
+        .stat-group {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            margin-top: 20px;
+        }
+
+        .stat-val {
+            font-size: 3rem;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .stat-val.up { color: var(--accent-up); text-shadow: 0 0 20px rgba(56, 189, 248, 0.4); }
+        .stat-val.down { color: var(--accent-down); text-shadow: 0 0 20px rgba(167, 139, 250, 0.4); }
+
+        .stat-unit {
+            font-size: 1rem;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+            margin-left: 8px;
+        }
+
+        .total-bytes {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 10px;
+        }
+
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        .terminal {
+            background: #000;
+            border-radius: 12px;
+            padding: 20px;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            font-size: 0.85rem;
+            color: #10b981;
+            height: 300px;
+            overflow-y: auto;
+            border: 1px solid #1f2937;
+        }
+
+        .terminal div {
+            margin-bottom: 4px;
+            word-break: break-all;
+        }
+        
+        .terminal .log-debug { color: #6b7280; }
+        .terminal .log-info { color: #38bdf8; }
+        .terminal .log-warn { color: #f59e0b; }
+        .terminal .log-error { color: #ef4444; }
+
+        .proxy-group {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 12px;
+            border: 1px solid var(--panel-border);
+        }
+
+        .proxy-group-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .badge {
+            font-size: 0.75rem;
+            background: var(--accent-down);
+            color: #fff;
+            padding: 2px 8px;
+            border-radius: 12px;
+        }
+
+        .node-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 10px;
+        }
+
+        .node-btn {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-main);
+            padding: 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            text-align: center;
+        }
+
+        .node-btn:hover {
+            background: rgba(255,255,255,0.1);
+        }
+
+        .node-btn.active {
+            background: rgba(56, 189, 248, 0.2);
+            border-color: var(--accent-up);
+            color: #fff;
+        }
+
+        .rule-card {
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--panel-border);
+            border-radius: 12px;
+            padding: 15px;
+            margin-bottom: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .rule-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .rule-fields {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .rule-field {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            font-size: 0.85rem;
+        }
+        .rule-field input, .rule-field select {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-main);
+            padding: 8px;
+            border-radius: 6px;
+            outline: none;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        .rule-field input:focus, .rule-field select:focus {
+            border-color: var(--accent-up);
+        }
+        .btn-add, .btn-remove {
+            background: rgba(255,255,255,0.1);
+            border: none;
+            color: var(--text-main);
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .btn-add:hover { background: rgba(56, 189, 248, 0.2); }
+        .btn-remove:hover { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+        .rule-tags-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 5px;
+        }
+        .rule-tag {
+            background: rgba(167, 139, 250, 0.2);
+            color: #d8b4fe;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .rule-tag span { cursor: pointer; color: #fca5a5; }
+
+        .btn-save {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, var(--accent-up), #2563eb);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.3);
+            transition: all 0.2s;
+        }
+
+        .btn-save:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(56, 189, 248, 0.4);
+        }
+
+        .btn-save:active {
+            transform: translateY(0);
+        }
+
+        @media (max-width: 768px) {
+            .container { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="blob blob-1"></div>
+    <div class="blob blob-2"></div>
+
+    <header>
+        <h1>Mirage Engine</h1>
+    </header>
+
+    <div class="container">
+        <div class="panel">
+            <h2>Upstream Speed</h2>
+            <div class="stat-group">
+                <div>
+                    <span class="stat-val up" id="upSpeed">0.0</span>
+                    <span class="stat-unit" id="upUnit">KB/s</span>
+                </div>
+            </div>
+            <div class="total-bytes" id="upTotal">Total: 0 B</div>
+        </div>
+
+        <div class="panel">
+            <h2>Downstream Speed</h2>
+            <div class="stat-group">
+                <div>
+                    <span class="stat-val down" id="downSpeed">0.0</span>
+                    <span class="stat-unit" id="downUnit">KB/s</span>
+                </div>
+            </div>
+            <div class="total-bytes" id="downTotal">Total: 0 B</div>
+        </div>
+
+        <div class="panel full-width">
+            <h2>Outbounds & Proxies</h2>
+            <div id="proxiesContainer">Loading proxies...</div>
+        </div>
+
+        <div class="panel full-width">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                <h2 style="margin: 0;">Routing Rules</h2>
+                <div>
+                    <button class="btn-add" onclick="addRule()">+ Add Rule</button>
+                    <button class="btn-save" onclick="saveRules()" style="position: relative; right: 0; bottom: 0; margin-left: 10px;">Save & Apply</button>
+                </div>
+            </div>
+            <div id="visualRulesContainer">Loading rules...</div>
+        </div>
+
+        <div class="panel full-width">
+            <h2>Live Routing Logs</h2>
+            <div class="terminal" id="terminal"></div>
+        </div>
+    </div>
+
+    <script>
+        let lastUp = 0; let lastDown = 0; let isFirstTick = true; let lastLogLines = 0;
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return { val: '0', unit: 'B' };
+            const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return { val: parseFloat((bytes / Math.pow(k, i)).toFixed(2)), unit: sizes[i] };
+        }
+
+        async function fetchOverview() {
+            try {
+                const res = await fetch('/api/overview'); const data = await res.json();
+                if (!isFirstTick) {
+                    const upSpeed = Math.max(0, data.up - lastUp);
+                    const downSpeed = Math.max(0, data.down - lastDown);
+                    const upFmt = formatBytes(upSpeed); const downFmt = formatBytes(downSpeed);
+                    document.getElementById('upSpeed').innerText = upFmt.val;
+                    document.getElementById('upUnit').innerText = upFmt.unit + '/s';
+                    document.getElementById('downSpeed').innerText = downFmt.val;
+                    document.getElementById('downUnit').innerText = downFmt.unit + '/s';
+                }
+                const upTot = formatBytes(data.up); const downTot = formatBytes(data.down);
+                document.getElementById('upTotal').innerText = `Total: ${upTot.val} ${upTot.unit}`;
+                document.getElementById('downTotal').innerText = `Total: ${downTot.val} ${downTot.unit}`;
+                lastUp = data.up; lastDown = data.down; isFirstTick = false;
+            } catch (err) {}
+        }
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/logs'); const data = await res.json();
+                const term = document.getElementById('terminal');
+                if (data.logs.length !== lastLogLines || data.logs.length > 0) {
+                    term.innerHTML = '';
+                    data.logs.forEach(log => {
+                        const div = document.createElement('div');
+                        div.innerText = log;
+                        if (log.includes('DEBUG')) div.className = 'log-debug';
+                        else if (log.includes('INFO')) div.className = 'log-info';
+                        else if (log.includes('WARN')) div.className = 'log-warn';
+                        else if (log.includes('ERROR')) div.className = 'log-error';
+                        term.appendChild(div);
+                    });
+                    term.scrollTop = term.scrollHeight; lastLogLines = data.logs.length;
+                }
+            } catch (err) {}
+        }
+
+        async function switchProxy(group, target) {
+            try {
+                await fetch('/api/proxies/select', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                    body: JSON.stringify({ group, target })
+                });
+                fetchProxies(); // Refresh UI
+            } catch(e) {}
+        }
+
+        async function fetchProxies() {
+            try {
+                const res = await fetch('/api/proxies'); const data = await res.json();
+                const container = document.getElementById('proxiesContainer');
+                if(data.proxies.length === 0) {
+                    container.innerHTML = 'No Selector or UrlTest groups found.'; return;
+                }
+                
+                let html = '';
+                data.proxies.forEach(p => {
+                    html += `<div class="proxy-group">
+                        <div class="proxy-group-title">${p.tag} <span class="badge">${p.type}</span></div>
+                        <div class="node-list">`;
+                    
+                    p.children.forEach(child => {
+                        const isActive = (child.tag === p.selected) ? 'active' : '';
+                        const onclick = p.type === 'Selector' ? `onclick="switchProxy('${p.tag}', '${child.tag}')"` : '';
+                        
+                        let pingHtml = '';
+                        if (child.latency !== null) {
+                            let color = child.latency < 100 ? '#10b981' : (child.latency < 300 ? '#f59e0b' : '#ef4444');
+                            pingHtml = `<div style="font-size: 0.75rem; color: ${color}; margin-top: 4px;">${child.latency} ms</div>`;
+                        } else {
+                            pingHtml = `<div style="font-size: 0.75rem; color: #6b7280; margin-top: 4px;">-</div>`;
+                        }
+
+                        html += `<div class="node-btn ${isActive}" ${onclick}>
+                            <div>${child.tag}</div>
+                            ${pingHtml}
+                        </div>`;
+                    });
+                    
+                    html += `</div></div>`;
+                });
+                container.innerHTML = html;
+            } catch (err) {}
+        }
+
+        let currentRules = [];
+
+        async function fetchRules() {
+            try {
+                const res = await fetch('/api/rules');
+                const data = await res.json();
+                if (data.status === 'success') {
+                    currentRules = data.rules || [];
+                    renderRules();
+                }
+            } catch(e) {}
+        }
+
+        function renderRules() {
+            const container = document.getElementById('visualRulesContainer');
+            if (currentRules.length === 0) {
+                container.innerHTML = 'No rules found. Add one above.';
+                return;
+            }
+            
+            let html = '';
+            currentRules.forEach((rule, idx) => {
+                const outbound = rule.outbound || '';
+                
+                const renderField = (key, label) => {
+                    const vals = rule[key] || [];
+                    let tagsHtml = vals.map((v, vIdx) => `
+                        <div class="rule-tag">${v} <span onclick="removeRuleItem(${idx}, '${key}', ${vIdx})">×</span></div>
+                    `).join('');
+                    
+                    return `
+                        <div class="rule-field">
+                            <label>${label}</label>
+                            <div style="display: flex; gap: 5px;">
+                                <input type="text" id="input_${idx}_${key}" placeholder="Add ${label}" onkeypress="if(event.key === 'Enter') addRuleItem(${idx}, '${key}')">
+                                <button class="btn-add" onclick="addRuleItem(${idx}, '${key}')">+</button>
+                            </div>
+                            <div class="rule-tags-container">${tagsHtml}</div>
+                        </div>
+                    `;
+                };
+
+                html += `
+                    <div class="rule-card">
+                        <div class="rule-header">
+                            <strong>Rule #${idx + 1}</strong>
+                            <button class="btn-remove" onclick="removeRule(${idx})">Delete Rule</button>
+                        </div>
+                        <div class="rule-fields">
+                            <div class="rule-field">
+                                <label>Outbound</label>
+                                <input type="text" value="${outbound}" onchange="updateRuleOutbound(${idx}, this.value)" placeholder="e.g. proxy, direct">
+                            </div>
+                            ${renderField('domain_suffix', 'Domain Suffix')}
+                            ${renderField('domain_keyword', 'Domain Keyword')}
+                            ${renderField('geosite', 'Geosite')}
+                            ${renderField('ip_cidr', 'IP CIDR')}
+                            ${renderField('geoip', 'GeoIP')}
+                            ${renderField('source_ip_cidr', 'Source IP')}
+                            ${renderField('protocol', 'Protocol')}
+                        </div>
+                    </div>
+                `;
+            });
+            container.innerHTML = html;
+        }
+
+        function addRule() {
+            currentRules.unshift({ outbound: "direct" });
+            renderRules();
+        }
+
+        function removeRule(idx) {
+            currentRules.splice(idx, 1);
+            renderRules();
+        }
+
+        function updateRuleOutbound(idx, val) {
+            currentRules[idx].outbound = val;
+        }
+
+        function addRuleItem(ruleIdx, key) {
+            const input = document.getElementById(`input_${ruleIdx}_${key}`);
+            const val = input.value.trim();
+            if (val) {
+                if (!currentRules[ruleIdx][key]) currentRules[ruleIdx][key] = [];
+                currentRules[ruleIdx][key].push(val);
+                renderRules();
+            }
+        }
+
+        function removeRuleItem(ruleIdx, key, itemIdx) {
+            currentRules[ruleIdx][key].splice(itemIdx, 1);
+            if (currentRules[ruleIdx][key].length === 0) {
+                delete currentRules[ruleIdx][key];
+            }
+            renderRules();
+        }
+
+        async function saveRules() {
+            try {
+                const res = await fetch('/api/rules', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: JSON.stringify({ rules: currentRules })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const btn = document.querySelector('.btn-save');
+                    const oldText = btn.innerText;
+                    btn.innerText = 'Saved & Applied!';
+                    btn.style.background = '#10b981';
+                    setTimeout(() => {
+                        btn.innerText = oldText;
+                        btn.style.background = '';
+                    }, 2000);
+                } else {
+                    alert('Error saving rules: ' + data.message);
+                }
+            } catch(e) {
+                alert('Failed to save rules!');
+            }
+        }
+
+        setInterval(fetchOverview, 1000);
+        setInterval(fetchLogs, 2000);
+        setInterval(fetchProxies, 5000);
+        
+        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules();
+    </script>
+</body>
+</html>
