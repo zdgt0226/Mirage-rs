@@ -113,7 +113,7 @@ impl ConfigWatcher {
     }
 
     fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>) {
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
             
             let mut watcher = match notify::recommended_watcher(tx) {

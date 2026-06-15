@@ -89,6 +89,10 @@ pub async fn read_server_handshake(stream: &mut tokio::net::tcp::OwnedReadHalf) 
                         } else if ct == 0x17 {
                             saw_enc = true;
                         }
+                        
+                        if saw_sh && saw_ccs && saw_enc {
+                            return Ok(());
+                        }
                     }
                     Ok(Err(e)) => return Err(anyhow::anyhow!("Incomplete body: {}", e)),
                     Err(_) => return Err(anyhow::anyhow!("Timeout reading body")),

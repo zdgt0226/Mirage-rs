@@ -114,8 +114,35 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     stream.write_all(&ch).await?;
 
     let mut buf = Vec::new();
+    let mut header = [0u8; 5];
+    
+    // Read ServerHello (0x16)
+    if tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut header)).await.is_err() {
+        return Ok(buf);
+    }
+    buf.extend_from_slice(&header);
+    let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let mut body = vec![0u8; len];
+    if tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut body)).await.is_err() {
+        return Ok(buf);
+    }
+    buf.extend_from_slice(&body);
 
-
+    // Read subsequent flights (ChangeCipherSpec, ApplicationData/EncryptedExtensions)
+    for _ in 0..2 {
+        if tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut header)).await.is_ok() {
+            buf.extend_from_slice(&header);
+            let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+            let mut body = vec![0u8; len];
+            if tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut body)).await.is_ok() {
+                buf.extend_from_slice(&body);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
     if buf.is_empty() {
         return Err(anyhow::anyhow!("Connection closed by server"));
     }
@@ -133,6 +160,8 @@ fn patch_server_hello(flight: &[u8], client_session_id: &[u8]) -> Vec<u8> {
         return flight.to_vec();
     }
     
+    let diff = client_session_id.len() as isize - sid_len as isize;
+    
     let mut result = Vec::with_capacity(flight.len() + client_session_id.len());
     result.extend_from_slice(&flight[..43]);
     result.push(client_session_id.len() as u8);
@@ -144,14 +173,18 @@ fn patch_server_hello(flight: &[u8], client_session_id: &[u8]) -> Vec<u8> {
     rand::fill(&mut new_random);
     result[11..43].copy_from_slice(&new_random);
     
-    let new_len = result.len() - 5;
-    result[3] = (new_len >> 8) as u8;
-    result[4] = (new_len & 0xFF) as u8;
+    let old_record_len = u16::from_be_bytes([flight[3], flight[4]]) as usize;
+    let old_hs_len = u32::from_be_bytes([0, flight[6], flight[7], flight[8]]) as usize;
     
-    let hs_len = new_len - 4;
-    result[6] = (hs_len >> 16) as u8;
-    result[7] = (hs_len >> 8) as u8;
-    result[8] = (hs_len & 0xFF) as u8;
+    let new_record_len = (old_record_len as isize + diff) as u16;
+    let new_hs_len = (old_hs_len as isize + diff) as u32;
+    
+    result[3] = (new_record_len >> 8) as u8;
+    result[4] = (new_record_len & 0xFF) as u8;
+    
+    result[6] = (new_hs_len >> 16) as u8;
+    result[7] = (new_hs_len >> 8) as u8;
+    result[8] = (new_hs_len & 0xFF) as u8;
     
     result
 }
