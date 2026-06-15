@@ -91,7 +91,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
         }
 
         let ip = peer_addr.ip();
-        {
+        let _slot_guard = {
             let mut map = UNAUTH_CONNS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
             let count = map.entry(ip).or_insert(0);
             if *count >= 100 {
@@ -99,8 +99,8 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
                 return;
             }
             *count += 1;
-        }
-        let _slot_guard = IpSlotGuard(ip);
+            IpSlotGuard(ip)
+        };
 
         let camouflage_fut = async {
             if let Ok(mut cam_stream) = tokio::time::timeout(
@@ -128,6 +128,29 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
 
 
 
+    // 2.5 Send ServerHello template back to satisfy Pyreality Client's TLS state machine
+    let template = crate::crypto::handshake_cache::get_server_hello(&camouflage_host, client_hello).await;
+    if let Err(e) = stream.write_all(&template).await {
+        tracing::error!("Mirage Server: write_all template failed: {}", e);
+        return;
+    }
+
+    // 2.7 Consume Fake Client Tail (63 bytes)
+    let mut tail = [0u8; 63];
+    match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut tail)).await {
+        Ok(Err(e)) => {
+            tracing::error!("Mirage Server: read_exact tail failed: {}", e);
+            return;
+        }
+        Err(_) => {
+            tracing::error!("Mirage Server: read_exact tail timed out!");
+            return;
+        }
+        Ok(Ok(_)) => {
+            tracing::info!("Mirage Server: Successfully consumed 63 bytes tail");
+        }
+    }
+
     // 3. Setup Crypto Stream
     let (read_half, write_half) = stream.into_split();
     let (mut reader, writer) = crate::crypto::aead::create_crypto_pair(
@@ -141,8 +164,17 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
     // 4. Read first data chunk to determine TCP or UDP
     let first_chunk = match tokio::time::timeout(std::time::Duration::from_secs(5), reader.recv_data()).await {
         Ok(Ok(data)) => data,
-        _ => return,
+        Ok(Err(e)) => {
+            tracing::error!("Mirage Server: recv_data failed: {:?}", e);
+            return;
+        }
+        Err(_) => {
+            tracing::error!("Mirage Server: recv_data timed out!");
+            return;
+        }
     };
+    
+    tracing::info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
     if first_chunk.len() == 1 && first_chunk[0] == 0x00 {
         // UDP Mode
@@ -150,11 +182,18 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         let target_len = u16::from_be_bytes([first_chunk[0], first_chunk[1]]) as usize;
+        tracing::info!("Mirage Server: Parsed target_len = {}", target_len);
+        
         if first_chunk.len() >= 2 + target_len {
             let target = match String::from_utf8(first_chunk[2..2+target_len].to_vec()) {
                 Ok(t) => t,
-                Err(_) => return,
+                Err(_) => {
+                    tracing::error!("Mirage Server: Target UTF-8 parsing failed!");
+                    return;
+                }
             };
+            
+            tracing::info!("Mirage Server: Target resolved to {}", target);
             
             // Check if there's any piggybacked payload after the target string
             let payload = if first_chunk.len() > 2 + target_len {
@@ -164,7 +203,11 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
             };
             
             handle_tcp_relay(target, payload, reader, writer).await;
+        } else {
+            tracing::error!("Mirage Server: first_chunk too short for target_len!");
         }
+    } else {
+        tracing::error!("Mirage Server: first_chunk too short to be valid!");
     }
 }
 
@@ -193,13 +236,13 @@ async fn handle_tcp_relay(
 
     let upload = async {
         loop {
-            match reader.recv_data().await {
-                Ok(data) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
+                Ok(Ok(data)) => {
                     if up_write.write_all(&data).await.is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                _ => break,
             }
         }
     };
@@ -207,14 +250,14 @@ async fn handle_tcp_relay(
     let download = async {
         let mut buf = [0u8; 16384];
         loop {
-            match up_read.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(1800), up_read.read(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
                     if writer.send_data(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
-                Err(_) => break,
+                _ => break,
             }
         }
         let _ = writer.send_close_notify().await;
@@ -225,7 +268,7 @@ async fn handle_tcp_relay(
 
 async fn handle_udp_relay(
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>, 
-    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>
+    writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>
 ) {
     debug!("Mirage Server: Started UDP relay session");
     
@@ -241,8 +284,11 @@ async fn handle_udp_relay(
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let udp_clone = udp_socket.clone();
     
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    let writer_clone = writer.clone();
+    
     let downlink = tokio::spawn(async move {
-        let mut buf = [0u8; 65536];
+        let mut buf = vec![0u8; 65536];
         loop {
             match udp_clone.recv_from(&mut buf).await {
                 Ok((size, addr)) => {
@@ -281,7 +327,7 @@ async fn handle_udp_relay(
 
     let tunnel_downlink = async move {
         while let Some(packet) = rx.recv().await {
-            if writer.send_data(&packet).await.is_err() {
+            if writer_clone.lock().await.send_data(&packet).await.is_err() {
                 break;
             }
         }
@@ -358,5 +404,7 @@ async fn handle_udp_relay(
         _ = tunnel_uplink => {}
         _ = tunnel_downlink => {}
     }
+    
+    let _ = writer.lock().await.send_close_notify().await;
     downlink.abort();
 }

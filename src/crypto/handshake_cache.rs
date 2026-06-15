@@ -112,31 +112,8 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     let (ch, _) = crate::crypto::tls_raw::build_client_hello(hostname, &session_id);
 
     stream.write_all(&ch).await?;
-    let _ = stream.shutdown().await;
 
     let mut buf = Vec::new();
-    let mut temp = [0u8; 4096];
-    loop {
-        let n = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            stream.read(&mut temp)
-        ).await {
-            Ok(Ok(n)) => n,
-            _ => break,
-        };
-        
-        if n == 0 {
-            break;
-        }
-        
-        buf.extend_from_slice(&temp[..n]);
-        if buf.windows(3).any(|w| w == b"\x17\x03\x03" || w == b"\x17\x03\x01" || w == b"\x17\x03\x02") {
-            break;
-        }
-        if buf.len() > 16384 {
-            break;
-        }
-    }
 
 
     if buf.is_empty() {

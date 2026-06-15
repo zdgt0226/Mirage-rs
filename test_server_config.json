@@ -1,0 +1,22 @@
+{
+  "inbounds": [
+    {
+      "camouflage_host": "www.apple.com",
+      "listen": "127.0.0.1",
+      "password": "test_password",
+      "port": 34803,
+      "tag": "server_in",
+      "type": "mirage_server"
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "routing": {
+    "default_outbound": "direct",
+    "rules": []
+  }
+}

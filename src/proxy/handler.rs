@@ -40,8 +40,12 @@ pub async fn handle_client(
                     OutboundNode::Direct { .. } => {
                         info!("UDP associate on Direct is currently dropping silently");
                     }
+                    OutboundNode::Block { .. } => {
+                        return;
+                    }
                     _ => {
-                        info!("UDP associate dropped by Block or unresolved group");
+                        tracing::warn!("Unexpected leaf type {:?}, dropping", leaf.tag());
+                        return;
                     }
                 }
             }
@@ -61,13 +65,16 @@ pub async fn proxy_tcp_target(
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
 ) {
     let current_state = state.load();
-    let mut final_target = target.clone();
+    let mut final_target = target;
     let mut final_host = String::new();
     let mut final_port = 0;
     
-    let parts: Vec<&str> = target.rsplitn(2, ':').collect();
+    let parts: Vec<&str> = final_target.rsplitn(2, ':').collect();
     if parts.len() == 2 {
-        let host = parts[1];
+        let mut host = parts[1];
+        if host.starts_with('[') && host.ends_with(']') {
+            host = &host[1..host.len()-1];
+        }
         if let Ok(port) = parts[0].parse() {
             final_port = port;
             final_host = host.to_string();
@@ -268,9 +275,12 @@ pub async fn proxy_tcp_target(
             let _ = tokio::try_join!(upload, download);
             debug!("Direct connection to {} gracefully closed", target);
         }
-        OutboundNode::Block { .. } | _ => {
+        OutboundNode::Block { .. } => {
             debug!("Connection to {} blocked by routing rule", target);
             // Drop connection
+        }
+        _ => {
+            tracing::warn!("Unexpected leaf type {:?} for {}, dropping", leaf.tag(), target);
         }
     }
 }

@@ -17,8 +17,8 @@ mod sys {
             
             let sockmap_fd = {
                 let map = bpf.map("mirage_sockmap").unwrap();
-                let sock_hash = SockHash::<_, u64>::try_from(map)?;
-                sock_hash.fd().try_clone()?.try_into()?
+                let mut sock_map = SockHash::<_, u64>::try_from(map)?;
+                sock_map.fd().try_clone()?.try_into()?
             };
             
             let program: &mut SkMsg = bpf.program_mut("mirage_sk_msg").unwrap().try_into()?;

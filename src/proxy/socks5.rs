@@ -69,7 +69,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<SocksCommand> {
             let mut port = [0u8; 2];
             stream.read_exact(&mut port).await?;
             let port = u16::from_be_bytes(port);
-            format!("{}:{}", Ipv6Addr::from(ip), port)
+            format!("[{}]:{}", Ipv6Addr::from(ip), port)
         }
         _ => return Err(anyhow!("Unsupported address type")),
     };
