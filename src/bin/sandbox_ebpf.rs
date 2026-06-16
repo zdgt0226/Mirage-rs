@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // 2. 启动我们的 Mirage-rs 代理内核
     tokio::spawn(async move {
         info!("[Sandbox] Starting Mirage-rs proxy core...");
-        if let Err(e) = mirage_rs::start_proxy("config.json").await {
+        if let Err(e) = mirage_rs::start_proxy("sandbox_config.json").await {
             tracing::error!("Proxy core failed: {}", e);
         }
     });

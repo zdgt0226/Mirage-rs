@@ -13,10 +13,11 @@ anyhow = "1.0.102"
 arc-swap = "1.9.1"
 axum = "0.8.9"
 aya = { version = "0.13.1", optional = true }
-chacha20poly1305 = "0.10.1"
+ring = "0.17"
 chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive"] }
 hex = "0.4.3"
+fastrand = "2.0.1"
 hkdf = "0.13.0"
 hmac = "0.13.0"
 ipnet = "2.12.0"

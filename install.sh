@@ -276,6 +276,17 @@ EOF
 # ──────────────────────────────────────────────────────────────────────────────
 # 主入口
 # ──────────────────────────────────────────────────────────────────────────────
+print_brutal_hint() {
+    echo "【极限性能优化建议】"
+    echo "如果要完全发挥 Brutal CC 的极速性能并让 4MB 发送缓冲区生效，"
+    echo "请手动执行以下步骤："
+    echo "  1. 安装 tcp-brutal 内核模块：https://github.com/apernet/tcp-brutal"
+    echo "  2. 运行：sudo sysctl -w net.core.wmem_max=8388608"
+    echo "  3. 在配置文件 outbounds[pyreality] 加 \"brutal_rate_bps\": 8000000"
+    echo "  4. 重启 mirage-rs：systemctl restart mirage-client"
+    echo "=========================================================="
+}
+
 main() {
     title "Mirage-rs 极速安装向导"
     if [[ $EUID -ne 0 ]]; then
@@ -292,10 +303,12 @@ main() {
             ;;
         2)
             config_client
+            print_brutal_hint
             ;;
         3)
             config_server
             config_client
+            print_brutal_hint
             ;;
     esac
     

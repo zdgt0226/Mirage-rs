@@ -39,6 +39,8 @@ impl ConfigWatcher {
         
         let outbounds = if let Some(old) = old_outbounds {
             info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
+            // NOTE: Stateful components like pool/fake_ip_mapper are preserved during reload.
+            // If inbounds, outbounds, or fakeip ranges need to be modified, a full restart is required.
             old
         } else {
             Arc::new(OutboundManager::new(&config))

@@ -20,8 +20,12 @@ impl FakeIpMapper {
         let ip: Ipv4Addr = parts[0].parse()?;
         let prefix: u32 = parts[1].parse()?;
         
-        let network = u32::from(ip) & (!0 << (32 - prefix));
-        let mask = !0 << (32 - prefix);
+        if prefix > 32 {
+            return Err(anyhow::anyhow!("Invalid CIDR prefix"));
+        }
+        
+        let mask = if prefix == 0 { 0u32 } else { !0u32 << (32 - prefix) };
+        let network = u32::from(ip) & mask;
         
         Ok(Self {
             network,
@@ -45,7 +49,7 @@ impl FakeIpMapper {
         
         // 2. Assign new IP
         let mut next_guard = self.next_ip.write().unwrap();
-        let ip_u32 = *next_guard;
+        let mut ip_u32 = *next_guard;
         *next_guard += 1;
         
         // Check overflow (wrap around)
@@ -53,7 +57,25 @@ impl FakeIpMapper {
             *next_guard = self.network + 2;
         }
         
-        let ip = Ipv4Addr::from(ip_u32);
+        let mut ip = Ipv4Addr::from(ip_u32);
+        
+        let max_attempts = !self.mask as usize;
+        let mut attempts = 0;
+        
+        // Conflict resolution: skip already mapped IPs if wrapped around
+        while self.ip_to_domain.read().unwrap().contains_key(&ip) {
+            attempts += 1;
+            if attempts >= max_attempts {
+                tracing::warn!("Fake-IP range {} exhausted", self.network);
+                break;
+            }
+            ip_u32 = *next_guard;
+            *next_guard += 1;
+            if (*next_guard & !self.mask) == (!self.mask) {
+                *next_guard = self.network + 2;
+            }
+            ip = Ipv4Addr::from(ip_u32);
+        }
         
         self.domain_to_ip.write().unwrap().insert(domain.clone(), ip);
         self.ip_to_domain.write().unwrap().insert(ip, domain);

@@ -1,8 +1,8 @@
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod sys {
     use anyhow::Result;
-    use aya::{Ebpf, programs::SkMsg};
-    use aya::maps::SockHash;
+    use aya::{Ebpf, programs::SkSkb};
+    use aya::maps::{SockHash, PerCpuArray};
     use std::os::unix::io::AsRawFd;
     use tokio::net::TcpStream;
     use tracing::info;
@@ -13,15 +13,16 @@ mod sys {
 
     impl EbpfEngine {
         pub fn init() -> Result<Self> {
-            let mut bpf = Ebpf::load_file("ebpf-src/sockmap.elf")?;
+            static SOCKMAP_ELF: &[u8] = include_bytes!("../../ebpf-src/sockmap.elf");
+            let mut bpf = Ebpf::load(SOCKMAP_ELF)?;
             
             let sockmap_fd = {
                 let map = bpf.map("mirage_sockmap").unwrap();
-                let mut sock_map = SockHash::<_, u64>::try_from(map)?;
+                let sock_map = SockHash::<_, u64>::try_from(map)?;
                 sock_map.fd().try_clone()?.try_into()?
             };
             
-            let program: &mut SkMsg = bpf.program_mut("mirage_sk_msg").unwrap().try_into()?;
+            let program: &mut SkSkb = bpf.program_mut("mirage_stream_verdict").unwrap().try_into()?;
             program.load()?;
             program.attach(&sockmap_fd)?;
             
@@ -44,6 +45,13 @@ mod sys {
             
             info!("eBPF SockMap: spliced local_cookie={} <-> remote_cookie={} (Zero-copy bypass activated)", local_cookie, remote_cookie);
             Ok(())
+        }
+        pub fn get_stats(&self) -> Result<(u64, u64)> {
+            let map = self.bpf.map("mirage_bpf_stats").unwrap();
+            let array = PerCpuArray::<_, u64>::try_from(map)?;
+            let success: u64 = array.get(&0u32, 0).map(|v| v.iter().copied().sum()).unwrap_or(0);
+            let fallback: u64 = array.get(&2u32, 0).map(|v| v.iter().copied().sum()).unwrap_or(0);
+            Ok((success, fallback))
         }
     }
 
@@ -83,6 +91,10 @@ mod sys {
         pub fn register_splice(&mut self, _local: &TcpStream, _remote: &TcpStream) -> Result<()> {
             // No-op. Tokio io::copy will take over.
             Ok(())
+        }
+        
+        pub fn get_stats(&self) -> Result<(u64, u64)> {
+            Ok((0, 0))
         }
     }
 }

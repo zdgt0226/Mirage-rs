@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::config_watcher::CoreState;
 use arc_swap::ArcSwap;
 
-pub async fn handle_mixed(
+pub async fn handle_client(
     mut stream: TcpStream,
     state: Arc<ArcSwap<CoreState>>,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
@@ -36,7 +36,6 @@ pub async fn handle_mixed(
         
         let mut header_buf = Vec::new();
         let mut temp = [0u8; 1024];
-        header_buf.push(buf[0]); // Don't forget the peeked byte
 
         loop {
             match stream.read(&mut temp).await {
@@ -101,6 +100,9 @@ pub async fn handle_mixed(
             } else {
                 let mut host = None;
                 for line in lines {
+                    if line.trim().is_empty() {
+                        break;
+                    }
                     if let Some((k, v)) = line.split_once(':') {
                         if k.eq_ignore_ascii_case("host") {
                             host = Some(v.trim().to_string());

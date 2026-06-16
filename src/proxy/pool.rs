@@ -15,6 +15,7 @@ pub struct PoolConfig {
     pub password: String,
     pub camouflage_host: String,
     pub pool_size: usize,
+    pub brutal_rate_bps: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -254,6 +255,83 @@ impl WarmPool {
         let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
         let stream = TcpStream::connect(&addr).await?;
         
+        // --- 性能优化：TCP 发送缓冲区与 Brutal 拥塞控制 ---
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        unsafe {
+            // 2. 发送缓冲区优化: 增加 Pool 中连接的发送 buffer size
+            let sndbuf: libc::c_int = 4 * 1024 * 1024; // 4MB
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &sndbuf as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            
+            let mut actual: libc::c_int = 0;
+            let mut sndbuf_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &mut actual as *mut _ as *mut libc::c_void, &mut sndbuf_len);
+            
+            if actual < sndbuf * 2 {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static SNDBUF_WARNED: AtomicBool = AtomicBool::new(false);
+                if !SNDBUF_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "SO_SNDBUF capped at {} bytes (requested {}). \
+                         Run `sysctl -w net.core.wmem_max=8388608` for Brutal CC and large buffer performance.",
+                        actual, sndbuf);
+                }
+            }
+            
+            // 3. Brutal 拥塞控制: 设置 TCP_CONGESTION 为 brutal (如果内核支持)
+            let brutal = b"brutal\0";
+            let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, brutal.as_ptr() as *const libc::c_void, 7);
+            
+            if ret < 0 {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static BRUTAL_WARNED: AtomicBool = AtomicBool::new(false);
+                let err = std::io::Error::last_os_error();
+                if !BRUTAL_WARNED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "TCP brutal congestion control not available ({}). \
+                         Install `hysteria-tcp-brutal-dkms` for full Brutal performance.", err);
+                }
+            } else if let Some(rate_bps) = cfg.brutal_rate_bps {
+                // 如果启用了 brutal 并且配置了目标速率，应用 params
+                let mut name = [0u8; 16];
+                let mut name_len = name.len() as libc::socklen_t;
+                libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, name.as_mut_ptr() as *mut libc::c_void, &mut name_len);
+                
+                let nul_pos = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+                if &name[..nul_pos] == b"brutal" {
+                    const TCP_BRUTAL_PARAMS: libc::c_int = 23;
+                    #[repr(C, packed)]
+                    struct BrutalParams { rate: u64, cwnd_gain: u32 }
+                    
+                    const CWND_GAIN_X10: u32 = 15; // 1.5x, in 1/10 units per tcp-brutal protocol
+                    let params = BrutalParams { rate: rate_bps, cwnd_gain: CWND_GAIN_X10 };
+                    
+                    let pret = libc::setsockopt(
+                        fd, 
+                        libc::IPPROTO_TCP, 
+                        TCP_BRUTAL_PARAMS,
+                        &params as *const _ as *const libc::c_void,
+                        std::mem::size_of::<BrutalParams>() as libc::socklen_t
+                    );
+                    
+                    if pret < 0 {
+                        use std::sync::atomic::{AtomicBool, Ordering};
+                        static BRUTAL_PARAMS_WARNED: AtomicBool = AtomicBool::new(false);
+                        let err = std::io::Error::last_os_error();
+                        if !BRUTAL_PARAMS_WARNED.swap(true, Ordering::Relaxed) {
+                            tracing::warn!(
+                                "Failed to set TCP_BRUTAL_PARAMS ({}). \
+                                 Possible causes: tcp-brutal module version mismatch, kernel TCP_FASTOPEN collision, \
+                                 or socket state incompatibility.", err);
+                        }
+                    }
+                } else {
+                    tracing::debug!("TCP_CONGESTION not set to brutal, skipping TCP_BRUTAL_PARAMS.");
+                }
+            }
+        }
+        // ------------------------------------------------
+        
         // 关键性能优化：关闭 Nagle 算法，降低首包延迟
         stream.set_nodelay(true)?;
 
@@ -297,6 +375,15 @@ impl WarmPool {
             let notified = self.notify.notified();
 
             if let Some(tunnel) = self.queue.lock().await.pop_front() {
+                if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
+                    tracing::debug!("Tunnel reached max age ({}s), gracefully closing", 
+                        tunnel.created_at.elapsed().as_secs());
+                    tokio::spawn(async move {
+                        let mut t = tunnel;
+                        let _ = t.writer.send_close_notify().await;
+                    });
+                    continue;
+                }
                 return tunnel;
             }
 

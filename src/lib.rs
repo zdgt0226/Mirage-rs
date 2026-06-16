@@ -61,7 +61,7 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
     }
 
     // 启动 Geo 数据库自动下载与热更新任务
-    crate::router::geo_updater::start_updater(geodata_dir.clone(), geosite_url, geoip_url).await;
+    crate::router::geo_updater::spawn_updater(geodata_dir.clone(), geosite_url, geoip_url).await;
     
     // 如果 config.json 不存在，我们先写一个基础模板，避免启动直接崩溃
     if !std::path::Path::new(config_path).exists() {
@@ -91,7 +91,10 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
         "rules": []
     }
 }"#;
-        std::fs::write(config_path, default_cfg).unwrap();
+        if let Err(e) = std::fs::write(config_path, default_cfg) {
+            tracing::error!("Failed to write default config to {}: {}", config_path, e);
+            return Err(e.into());
+        }
     }
     
     // ConfigWatcher::new() 会立刻解析配置并加载 Router 和 Outbounds，同时启动后台文件监控线程
@@ -143,6 +146,16 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
     }
 
 
+    if gui_enabled {
+        let gui_state = watcher.state.clone();
+        let ebp = ebpf_engine.clone();
+        let listen = gui_listen.clone();
+        let cfg_path = config_path.to_string();
+        tokio::spawn(async move {
+            crate::gui::start_server(&listen, gui_state, ebp, cfg_path).await;
+        });
+    }
+
     if inbounds.is_empty() {
         warn!("No inbounds configured!");
     }
@@ -152,32 +165,19 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
         let ebpf_clone = ebpf_engine.clone();
         let fake_mapper_clone = fake_ip_mapper.clone();
 
-        if gui_enabled {
-            let gui_state = watcher.state.clone();
-            let listen = gui_listen.clone();
-            let cfg_path = config_path.to_string();
-            tokio::spawn(async move {
-                crate::gui::start_server(&listen, gui_state, cfg_path).await;
-            });
-            gui_enabled = false; // Only spawn once
-        }
-
         match inbound {
             crate::config::InboundConfig::Socks { listen, port, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
                 tokio::spawn(async move {
                     if let Ok(listener) = tokio::net::TcpListener::bind(&listen_addr).await {
                         info!("SOCKS5 listening on {}", listen_addr);
-                        loop {
-                            if let Ok((socket, peer_addr)) = listener.accept().await {
-                                info!("Accepted SOCKS connection from {}", peer_addr);
-                                let st = state_clone.clone();
-                                let ebp = ebpf_clone.clone();
-                                let fm = fake_mapper_clone.clone();
-                                tokio::spawn(async move {
-                                    crate::proxy::handler::handle_client(socket, st, ebp, fm).await;
-                                });
-                            }
+                        while let Ok((stream, _)) = listener.accept().await {
+                            let st = state_clone.clone();
+                            let ebp = ebpf_clone.clone();
+                            let fm = fake_mapper_clone.clone();
+                            tokio::spawn(async move {
+                                crate::proxy::handler::handle_client(stream, st, ebp, fm).await;
+                            });
                         }
                     } else {
                         error!("Failed to bind SOCKS5 on {}", listen_addr);
@@ -195,17 +195,14 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 let listen_addr = format!("{}:{}", listen, port);
                 tokio::spawn(async move {
                     if let Ok(listener) = tokio::net::TcpListener::bind(&listen_addr).await {
-                        info!("Mixed (SOCKS5/HTTP) listening on {}", listen_addr);
-                        loop {
-                            if let Ok((socket, peer_addr)) = listener.accept().await {
-                                info!("Accepted Mixed connection from {}", peer_addr);
-                                let st = state_clone.clone();
-                                let ebp = ebpf_clone.clone();
-                                let fm = fake_mapper_clone.clone();
-                                tokio::spawn(async move {
-                                    crate::proxy::mixed::handle_mixed(socket, st, ebp, fm).await;
-                                });
-                            }
+                        info!("Mixed inbound listening on {}", listen_addr);
+                        while let Ok((stream, _)) = listener.accept().await {
+                            let st = state_clone.clone();
+                            let ebp = ebpf_clone.clone();
+                            let fm = fake_mapper_clone.clone();
+                            tokio::spawn(async move {
+                                crate::proxy::mixed::handle_client(stream, st, ebp, fm).await;
+                            });
                         }
                     } else {
                         error!("Failed to bind Mixed inbound on {}", listen_addr);
@@ -230,7 +227,17 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
     }
 
     // Keep main thread alive
-    let _ = tokio::signal::ctrl_c().await;
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(_) => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
     info!("Shutting down Mirage-rs...");
     std::process::exit(0);
 }

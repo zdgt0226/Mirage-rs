@@ -4,23 +4,33 @@
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKHASH);
     __uint(max_entries, 65536);
-    __type(key, __u64);   // socket cookie of the sending socket
-    __type(value, __u32); // file descriptor of the receiving socket (inserted from userspace)
+    __type(key, __u64);   
+    __type(value, __u32); 
 } mirage_sockmap SEC(".maps");
 
-SEC("sk_msg")
-int mirage_sk_msg(struct sk_msg_md *msg)
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 4);
+    __type(key, __u32);
+    __type(value, __u64);
+} mirage_bpf_stats SEC(".maps");
+
+SEC("sk_skb/stream_verdict")
+int mirage_stream_verdict(struct __sk_buff *skb)
 {
-    // Retrieve the socket cookie of the sender
-    __u64 cookie = bpf_get_socket_cookie(msg);
+    __u64 cookie = bpf_get_socket_cookie(skb);
     
-    // Attempt to redirect the message to the paired socket found in the hash map.
-    // BPF_F_INGRESS tells the kernel to put the packet onto the target socket's receive queue.
-    // This entirely bypasses the userspace process reading and writing the buffer.
-    bpf_msg_redirect_hash(msg, &mirage_sockmap, &cookie, BPF_F_INGRESS);
+    int ret = bpf_sk_redirect_hash(skb, &mirage_sockmap, &cookie, 0);
     
-    // If redirect fails (e.g., no entry in map), pass it down the normal TCP stack
-    return SK_PASS; 
+    // Track stats
+    // 0: success, 2: drop/fallback
+    __u32 key = (ret == SK_PASS) ? 0 : 2;
+    __u64 *val = bpf_map_lookup_elem(&mirage_bpf_stats, &key);
+    if (val) {
+        (*val)++;
+    }
+    
+    return ret;
 }
 
 char _license[] SEC("license") = "GPL";

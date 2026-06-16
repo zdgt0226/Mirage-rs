@@ -66,6 +66,8 @@ pub enum OutboundConfig {
         camouflage_host: String,
         #[serde(default = "default_pool_size")]
         pool_size: usize,
+        #[serde(default)]
+        brutal_rate_bps: Option<u64>,
     },
     Direct {
         tag: String,

@@ -95,9 +95,9 @@ async fn query_ntp_udp(host: &str) -> Option<u64> {
         return None;
     }
 
-    let mut buf = [0u8; 48];
+    let mut buf = [0u8; 64];
     if let Ok(Ok((size, _))) = timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await {
-        if size == 48 {
+        if size >= 48 {
             let secs = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]) as u64;
             if secs >= NTP_EPOCH_OFFSET {
                 return Some(secs - NTP_EPOCH_OFFSET);
@@ -135,10 +135,12 @@ async fn query_http_tcp(host: &str) -> Option<u64> {
     let header_str = String::from_utf8_lossy(&buf);
     for line in header_str.lines() {
         if line.to_lowercase().starts_with("date:") {
-            let date_str = line[5..].trim();
-            // Parse RFC2822 date
-            if let Ok(parsed_time) = chrono::DateTime::parse_from_rfc2822(date_str) {
-                return Some(parsed_time.timestamp() as u64);
+            if let Some((_, v)) = line.split_once(':') {
+                let date_str = v.trim();
+                // Parse RFC2822 date
+                if let Ok(parsed_time) = chrono::DateTime::parse_from_rfc2822(date_str) {
+                    return Some(parsed_time.timestamp() as u64);
+                }
             }
         }
     }

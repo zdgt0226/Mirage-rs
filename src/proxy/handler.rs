@@ -57,7 +57,7 @@ pub async fn handle_client(
 }
 
 pub async fn proxy_tcp_target(
-    mut local: TcpStream,
+    local: TcpStream,
     target: String,
     initial_payload: Vec<u8>,
     state: Arc<ArcSwap<CoreState>>,
@@ -225,28 +225,57 @@ pub async fn proxy_tcp_target(
             
             let mut ebpf_spliced = false;
             if let Some(engine) = ebpf_engine {
-                if let Ok(mut lock) = engine.try_lock() {
-                    match lock.register_splice(&local, &target_stream) {
-                        Ok(_) => {
-                            info!("eBPF TCP Splicing activated for {}. Tokio bypass enabled.", target);
-                            ebpf_spliced = true;
-                        }
-                        Err(e) => {
-                            debug!("eBPF splicing failed: {}. Falling back to userspace forwarding.", e);
-                        }
+                let mut lock = engine.lock().await;
+                match lock.register_splice(&local, &target_stream) {
+                    Ok(_) => {
+                        info!("eBPF TCP Splicing activated for {}. Tokio bypass enabled.", target);
+                        ebpf_spliced = true;
+                    }
+                    Err(e) => {
+                        debug!("eBPF splicing failed: {}. Falling back to userspace forwarding.", e);
                     }
                 }
             }
 
             if ebpf_spliced {
-                // Keep the connections alive in userspace to prevent dropping the FDs
-                // The actual traffic will bypass userspace via eBPF sk_msg sockmap.
-                let mut buf1 = [0u8; 1];
-                let mut buf2 = [0u8; 1];
-                let _ = tokio::select! {
-                    _ = local.read(&mut buf1) => {}
-                    _ = target_stream.read(&mut buf2) => {}
-                };
+                use std::os::unix::io::AsRawFd;
+                use tokio::io::unix::AsyncFd;
+                
+                struct EpollHandle(std::os::unix::io::RawFd);
+                impl AsRawFd for EpollHandle {
+                    fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0 }
+                }
+                impl Drop for EpollHandle {
+                    fn drop(&mut self) { unsafe { libc::close(self.0); } }
+                }
+
+                let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+                if epfd >= 0 {
+                    let mut ev1 = libc::epoll_event { events: libc::EPOLLRDHUP as u32, u64: 1 };
+                    let r1 = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, local.as_raw_fd(), &mut ev1) };
+                    if r1 < 0 { tracing::warn!("epoll_ctl ADD local failed: {}", std::io::Error::last_os_error()); }
+                    
+                    let mut ev2 = libc::epoll_event { events: libc::EPOLLRDHUP as u32, u64: 2 };
+                    let r2 = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, target_stream.as_raw_fd(), &mut ev2) };
+                    if r2 < 0 { tracing::warn!("epoll_ctl ADD target failed: {}", std::io::Error::last_os_error()); }
+
+                    if let Ok(async_epoll) = AsyncFd::new(EpollHandle(epfd)) {
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(1800), async {
+                            loop {
+                                let mut guard = match async_epoll.readable().await {
+                                    Ok(g) => g,
+                                    Err(_) => break,
+                                };
+                                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 2];
+                                let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 0) };
+                                if n > 0 {
+                                    break;
+                                }
+                                guard.clear_ready();
+                            }
+                        }).await;
+                    }
+                }
                 debug!("eBPF connection to {} gracefully closed", target);
                 return;
             }

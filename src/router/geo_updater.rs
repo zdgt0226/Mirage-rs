@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 
 /// 后台自动下载与更新 Geo 文件
-pub async fn start_updater(geodata_dir: String, geosite_url: String, geoip_url: String) {
+pub async fn spawn_updater(geodata_dir: String, geosite_url: String, geoip_url: String) {
     tokio::spawn(async move {
         // 初次启动先等 30 秒，避免影响主干流程的启动速度
         tokio::time::sleep(Duration::from_secs(30)).await;

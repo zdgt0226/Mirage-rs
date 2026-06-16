@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 pub static GLOBAL_UP: AtomicU64 = AtomicU64::new(0);
 pub static GLOBAL_DOWN: AtomicU64 = AtomicU64::new(0);
+pub static DROPPED_LOGS: AtomicU64 = AtomicU64::new(0);
 
 pub fn add_up(bytes: u64) {
     GLOBAL_UP.fetch_add(bytes, Ordering::Relaxed);
@@ -16,13 +17,29 @@ pub fn add_down(bytes: u64) {
 
 #[derive(Clone)]
 pub struct MemoryWriter {
+    tx: std::sync::mpsc::SyncSender<String>,
     buffer: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl MemoryWriter {
     pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1000);
+        let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(500)));
+        let bg_buf = buffer.clone();
+        
+        std::thread::spawn(move || {
+            while let Ok(s) = rx.recv() {
+                let mut q = bg_buf.lock().unwrap();
+                if q.len() >= 500 {
+                    q.pop_front();
+                }
+                q.push_back(s);
+            }
+        });
+        
         Self {
-            buffer: Arc::new(Mutex::new(VecDeque::with_capacity(500))),
+            tx,
+            buffer,
         }
     }
 
@@ -34,16 +51,15 @@ impl MemoryWriter {
 
 impl Write for MemoryWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let s = String::from_utf8_lossy(buf).to_string();
+        let s = String::from_utf8(buf.to_vec())
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
         if s.trim().is_empty() {
             return Ok(buf.len());
         }
         
-        let mut q = self.buffer.lock().unwrap();
-        if q.len() >= 500 {
-            q.pop_front();
+        if self.tx.try_send(s).is_err() {
+            DROPPED_LOGS.fetch_add(1, Ordering::Relaxed);
         }
-        q.push_back(s);
         Ok(buf.len())
     }
 

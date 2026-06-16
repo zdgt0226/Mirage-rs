@@ -1,6 +1,6 @@
 # Mirage-rs
 
-High-performance eBPF-accelerated proxy engine.
+High-performance proxy engine.
 
 ## Installation
 
@@ -42,10 +42,10 @@ If you want to compile Mirage-rs from source, follow these steps.
 
 ### Building
 
-To compile the release binary with eBPF features enabled:
+To compile the release binary:
 
 ```bash
-cargo build --release --features ebpf
+cargo build --release
 ```
 
 The compiled binary will be located at `target/release/mirage`.
@@ -60,11 +60,11 @@ We use `cross` and `musl` toolchains to cross-compile standalone static binaries
    ```
 2. Build for `x86_64`:
    ```bash
-   cross build --target x86_64-unknown-linux-musl --release --features ebpf
+   cross build --target x86_64-unknown-linux-musl --release
    ```
 3. Build for `aarch64` (ARM64):
    ```bash
-   cross build --target aarch64-unknown-linux-musl --release --features ebpf
+   cross build --target aarch64-unknown-linux-musl --release
    ```
 
 ## Configuration
@@ -78,3 +78,27 @@ Check `config.json` for all available fields.
 
 ### Telemetry (Traffic Monitoring)
 Note on mixed client-server nodes (where the node acts both as a pyreality inbound server and a pyreality outbound client): traffic metrics (`GLOBAL_UP` and `GLOBAL_DOWN`) are tracked independently at the connection boundary. A connection relayed through such a mixed node will be counted twice (once when received as a server, once when sent as a client). This is intentional and accurately reflects the local socket byte usage.
+
+## Brutal Congestion Control (Optional)
+
+To enable Hysteria2-style Brutal CC for max throughput:
+
+1. Install the kernel module:
+   ```bash
+   git clone https://github.com/apernet/tcp-brutal
+   cd tcp-brutal && make && sudo make install
+   sudo modprobe tcp_brutal
+   ```
+
+2. (Linux 6.4+) Verify no `TCP_FASTOPEN` conflict in your kernel — kernel ≤ 6.3 confirmed working.
+
+3. Set the target rate in config:
+   ```json
+   "outbounds": [{
+       "type": "pyreality",
+       // ...
+       "brutal_rate_bps": 8000000
+   }]
+   ```
+
+If the module is not installed, mirage-rs falls back to default CC (cubic/bbr) with a warning logged once.

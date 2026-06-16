@@ -36,9 +36,8 @@ pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>)
         error!("Failed to send UDP sentinel");
         return;
     }
-    
     let mut tunnel_reader = tunnel.reader;
-    let mut tunnel_writer = tunnel.writer;
+    let tunnel_writer = std::sync::Arc::new(tokio::sync::Mutex::new(tunnel.writer));
     
     // 4. Run Relay Loops
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -46,8 +45,9 @@ pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>)
     let udp_rx = udp_socket.clone();
     let udp_tx = udp_socket;
     
+    let tunnel_writer_clone = tunnel_writer.clone();
     let uplink = tokio::spawn(async move {
-        let mut buf = [0u8; 65536];
+        let mut buf = vec![0u8; 65536];
         let mut client_addr = None;
         
         loop {
@@ -78,7 +78,7 @@ pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>)
                     frame.extend_from_slice(&frame_len.to_be_bytes());
                     frame.extend_from_slice(packed_and_payload);
                     
-                    if tunnel_writer.send_data(&frame).await.is_err() {
+                    if tunnel_writer_clone.lock().await.send_data(&frame).await.is_err() {
                         break;
                     }
                 }
@@ -134,6 +134,8 @@ pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>)
         _ = downlink => {},
         _ = tcp_watcher => {},
     }
+    
+    let _ = tunnel_writer.lock().await.send_close_notify().await;
     
     debug!("UDP Relay gracefully closed for port {}", port);
 }

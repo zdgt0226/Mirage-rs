@@ -6,10 +6,17 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 pub struct Tunnel {
     pub reader: CryptoReader<OwnedReadHalf>,
     pub writer: CryptoWriter<OwnedWriteHalf>,
+    pub created_at: std::time::Instant,
+    pub max_age_sec: u64,
 }
 
 impl Tunnel {
     pub fn new(reader: CryptoReader<OwnedReadHalf>, writer: CryptoWriter<OwnedWriteHalf>) -> Self {
-        Self { reader, writer }
+        Self { 
+            reader, 
+            writer, 
+            created_at: std::time::Instant::now(),
+            max_age_sec: 120 + fastrand::u64(0..60)
+        }
     }
 }

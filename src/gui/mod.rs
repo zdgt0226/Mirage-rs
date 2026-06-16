@@ -18,11 +18,12 @@ use crate::proxy::outbound::OutboundNode;
 #[derive(Clone)]
 pub struct AppState {
     pub state: Arc<ArcSwap<CoreState>>,
+    pub ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     pub config_path: String,
 }
 
-pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, config_path: String) {
-    let app_state = AppState { state, config_path };
+pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>, config_path: String) {
+    let app_state = AppState { state, ebpf_engine, config_path };
     
     let app = Router::new()
         .route("/api/overview", get(get_overview))
@@ -40,14 +41,27 @@ pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, con
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn get_overview() -> Json<Value> {
+async fn get_overview(State(state): State<AppState>) -> Json<Value> {
     let up = GLOBAL_UP.load(Ordering::Relaxed);
     let down = GLOBAL_DOWN.load(Ordering::Relaxed);
+    
+    let mut bpf_success = 0;
+    let mut bpf_fallback = 0;
+    if let Some(engine) = state.ebpf_engine {
+        if let Ok(lock) = engine.try_lock() {
+            if let Ok((s, f)) = lock.get_stats() {
+                bpf_success = s;
+                bpf_fallback = f;
+            }
+        }
+    }
     
     Json(json!({
         "up": up,
         "down": down,
-        "connections": 0
+        "connections": 0,
+        "bpf_success": bpf_success,
+        "bpf_fallback": bpf_fallback
     }))
 }
 

@@ -2,7 +2,7 @@ use crate::proxy::pool::{WarmPool, PoolConfig};
 use std::sync::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 use crate::config::{Config, OutboundConfig};
 
 pub enum OutboundNode {
@@ -149,13 +149,14 @@ impl OutboundManager {
         // Pass 1: Leaf nodes
         for oc in &cfg.outbounds {
             match oc {
-                OutboundConfig::Pyreality { tag, server, server_port, password, camouflage_host, pool_size } => {
+                OutboundConfig::Pyreality { tag, server, server_port, password, camouflage_host, pool_size, brutal_rate_bps } => {
                     let pool_cfg = Arc::new(PoolConfig {
                         server_host: server.clone(),
                         server_port: *server_port,
                         password: password.clone(),
                         camouflage_host: camouflage_host.clone(),
                         pool_size: *pool_size,
+                        brutal_rate_bps: *brutal_rate_bps,
                     });
                     let pool = Arc::new(WarmPool::new(pool_cfg));
                     outbounds.insert(tag.clone(), Arc::new(OutboundNode::Pyreality {
@@ -256,8 +257,7 @@ impl OutboundManager {
             }
 
             if !progress {
-                error!("Unresolved or circular outbound groups: {:?}", next_round);
-                break;
+                panic!("Unresolved or circular outbound groups: {:?}", next_round);
             }
             pending = next_round;
         }

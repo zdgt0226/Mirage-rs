@@ -1,8 +1,5 @@
 use anyhow::{anyhow, Result};
-use chacha20poly1305::{
-    aead::{AeadInPlace, KeyInit},
-    ChaCha20Poly1305, Key, Nonce,
-};
+use ring::aead::{self, LessSafeKey, UnboundKey, Nonce as RingNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -19,20 +16,19 @@ fn derive_master(password: &str, salt: &[u8]) -> [u8; 32] {
     okm
 }
 
-/// 基于方向衍生对应的流密码 Key
-fn expand_key(master: &[u8; 32], info: &[u8]) -> Key {
+fn expand_key(master: &[u8; 32], info: &[u8]) -> LessSafeKey {
     let hk = Hkdf::<Sha256>::from_prk(master).unwrap();
     let mut okm = [0u8; 32];
     hk.expand(info, &mut okm).unwrap();
-    *Key::from_slice(&okm)
+    let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &okm).unwrap();
+    LessSafeKey::new(unbound)
 }
 
-/// 格式化 64 位计数器为 12 字节 Nonce (大端存储)
 #[inline]
-fn format_nonce(n: u64) -> Nonce {
+fn format_nonce(n: u64) -> RingNonce {
     let mut buf = [0u8; NONCE_SIZE];
     buf[4..12].copy_from_slice(&n.to_be_bytes());
-    *Nonce::from_slice(&buf)
+    RingNonce::assume_unique_for_key(buf)
 }
 
 // ============================================================================
@@ -41,17 +37,17 @@ fn format_nonce(n: u64) -> Nonce {
 
 pub struct CryptoWriter<W> {
     writer: W,
-    cipher: ChaCha20Poly1305,
+    cipher: LessSafeKey,
     nonce: u64,
     buffer: Vec<u8>,
     is_initiator: bool,
+    rng: fastrand::Rng,
 }
 
 impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
     pub fn new(writer: W, master_key: &[u8; 32], is_initiator: bool) -> Self {
         let info = if is_initiator { b"c2s" } else { b"s2c" };
-        let key = expand_key(master_key, info);
-        let cipher = ChaCha20Poly1305::new(&key);
+        let cipher = expand_key(master_key, info);
         Self {
             writer,
             cipher,
@@ -59,6 +55,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             // 预分配最大容量，杜绝运行时内存分配开销
             buffer: Vec::with_capacity(MAX_RECORD_SIZE + TAG_SIZE),
             is_initiator,
+            rng: fastrand::Rng::new(),
         }
     }
 
@@ -75,10 +72,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
 
         while offset < plaintext.len() {
             // 分桶随机化帧大小，模拟真实 HTTPS 碎片特征
-            let r: f64 = {
-                use rand::RngExt;
-                rand::rng().random()
-            };
+            let r: f64 = self.rng.f64();
             let limit = if r <= 0.50 {
                 16384
             } else if r <= 0.85 {
@@ -100,7 +94,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             self.nonce += 1;
 
             self.cipher
-                .encrypt_in_place(&nonce_bytes, b"", &mut self.buffer)
+                .seal_in_place_append_tag(nonce_bytes, aead::Aad::empty(), &mut self.buffer)
                 .map_err(|e| anyhow!("encryption failed: {:?}", e))?;
 
             // 构造 5 字节 TLS Header: [0x17, 0x03, 0x03, len_hi, len_lo]
@@ -126,7 +120,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         self.nonce += 1;
 
         self.cipher
-            .encrypt_in_place(&nonce_bytes, b"", &mut self.buffer)
+            .seal_in_place_append_tag(nonce_bytes, aead::Aad::empty(), &mut self.buffer)
             .map_err(|e| anyhow!("encryption failed: {:?}", e))?;
 
         let mut header = [0x17, 0x03, 0x03, 0x00, 0x00];
@@ -146,7 +140,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
 
 pub struct CryptoReader<R> {
     reader: R,
-    cipher: ChaCha20Poly1305,
+    cipher: LessSafeKey,
     nonce: u64,
     is_initiator: bool,
 }
@@ -154,8 +148,7 @@ pub struct CryptoReader<R> {
 impl<R: AsyncRead + Unpin> CryptoReader<R> {
     pub fn new(reader: R, master_key: &[u8; 32], is_initiator: bool) -> Self {
         let info = if is_initiator { b"s2c" } else { b"c2s" };
-        let key = expand_key(master_key, info);
-        let cipher = ChaCha20Poly1305::new(&key);
+        let cipher = expand_key(master_key, info);
         Self {
             reader,
             cipher,
@@ -187,9 +180,12 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         self.nonce += 1;
 
         // In-place 极速解密
-        self.cipher
-            .decrypt_in_place(&nonce_bytes, b"", &mut buffer)
+        let plaintext_slice = self.cipher
+            .open_in_place(nonce_bytes, aead::Aad::empty(), &mut buffer)
             .map_err(|e| anyhow!("decryption failed: {:?}", e))?;
+        
+        let plaintext_len = plaintext_slice.len();
+        buffer.truncate(plaintext_len);
 
         if buffer.is_empty() {
             return Err(anyhow!("empty plaintext received"));
