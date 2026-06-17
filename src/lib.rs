@@ -108,15 +108,118 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
 
     // 初始化 eBPF 引擎
     let ebpf_engine = match crate::ebpf::EbpfEngine::init() {
-        Ok(engine) => {
-            info!("eBPF Engine loaded successfully.");
-            Some(Arc::new(tokio::sync::Mutex::new(engine)))
-        }
+        Ok(engine) => Some(Arc::new(tokio::sync::Mutex::new(engine))),
         Err(e) => {
-            tracing::warn!("Failed to load eBPF Engine: {}. Running in userspace-only mode.", e);
+            tracing::warn!("Failed to initialize eBPF engine: {}. Features will fall back to userspace.", e);
             None
         }
     };
+    
+    // Start DNS resolution and RTT monitor loop if eBPF is enabled
+    if let Some(engine_arc) = &ebpf_engine {
+        let state = watcher.state.clone();
+        let lock = engine_arc.clone();
+        
+        // P1 #3: Decoupled background DNS resolver task (every 60s)
+        let dns_state = state.clone();
+        let dns_lock = lock.clone();
+        tokio::spawn(async move {
+            loop {
+                let st = dns_state.load();
+                let mut futures = Vec::new();
+                
+                for (_, node) in &st.outbounds.outbounds {
+                    if let crate::proxy::outbound::OutboundNode::Pyreality { server_host, server_port, server_ip, .. } = node.as_ref() {
+                        let host = server_host.clone();
+                        let port = *server_port;
+                        let ip_arc = server_ip.clone();
+                        let bpf_lock = dns_lock.clone();
+                        
+                        futures.push(tokio::spawn(async move {
+                            if let Ok(Ok(addrs)) = tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                tokio::net::lookup_host((host.as_str(), port))
+                            ).await {
+                                let mut v4 = None;
+                                let mut v6 = None;
+                                for addr in addrs {
+                                    match addr.ip() {
+                                        std::net::IpAddr::V4(_) if v4.is_none() => v4 = Some(addr.ip()),
+                                        std::net::IpAddr::V6(_) if v6.is_none() => v6 = Some(addr.ip()),
+                                        _ => {}
+                                    }
+                                }
+                                if let Some(ip) = v4.or(v6) {
+                                    *ip_arc.write().unwrap() = Some(ip);
+                                    if let Ok(mut engine) = bpf_lock.try_lock() {
+                                        let _ = engine.set_target_ip(ip);
+                                    }
+                                }
+                            }
+                        }));
+                    }
+                }
+                for f in futures {
+                    let _ = f.await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        // RTT monitor task (fast polling every 2s)
+        let core_state = state.clone();
+        let lock_clone = lock.clone();
+        tokio::spawn(async move {
+            loop {
+                let st = core_state.load();
+                if let Ok(lock) = lock_clone.try_lock() {
+                    for (_, node) in &st.outbounds.outbounds {
+                        if let crate::proxy::outbound::OutboundNode::Pyreality { server_ip, rtt_ms, snd_cwnd, total_retrans, pool, .. } = node.as_ref() {
+                            if let Some(ip) = *server_ip.read().unwrap() {
+                                if let Ok(state) = lock.get_tcp_state(ip) {
+                                    let rtt = state.srtt_us / 1000;
+                                    rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
+                                    snd_cwnd.store(state.snd_cwnd as u64, std::sync::atomic::Ordering::Relaxed);
+                                    let old_retrans = total_retrans.swap(state.total_retrans as u64, std::sync::atomic::Ordering::Relaxed);
+                                    let delta_retrans = state.total_retrans as i64 - old_retrans as i64;
+                                    
+                                    // P3.1: Dynamic Brutal CC adjustment based on BDP
+                                    if let (Some(base_rate), Some(base_rtt_ms)) = (pool.brutal_state.configured_rate, pool.brutal_state.base_rtt) {
+                                        if rtt > 0 {
+                                            let cwnd = state.snd_cwnd; // Packets
+                                            let current_rate = pool.brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
+                                            let mut dynamic_rate;
+
+                                            if rtt > (base_rtt_ms as f64 * 1.5) as u32 || delta_retrans > 0 {
+                                                // Congested! Back off to measured BDP bandwidth
+                                                // 1 MSS = 1440 bytes
+                                                let estimated_bdp_bytes_per_sec = (cwnd as f64 * 1440.0) / (rtt as f64 / 1000.0);
+                                                dynamic_rate = (estimated_bdp_bytes_per_sec as u64).max(base_rate / 10);
+                                            } else {
+                                                // Recover! Increase towards configured rate
+                                                dynamic_rate = (current_rate as f64 * 1.1) as u64;
+                                            }
+                                            
+                                            dynamic_rate = dynamic_rate.min(base_rate);
+                                            
+                                            // Only update if changes are significant (> 5%)
+                                            if (dynamic_rate as i64 - current_rate as i64).abs() > (current_rate / 20) as i64 {
+                                                let p = pool.clone();
+                                                tokio::spawn(async move {
+                                                    p.update_brutal_rate(dynamic_rate).await;
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
 
     let mut inbounds = Vec::new();
     let mut fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>> = None;

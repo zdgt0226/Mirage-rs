@@ -15,7 +15,26 @@ pub struct PoolConfig {
     pub password: String,
     pub camouflage_host: String,
     pub pool_size: usize,
-    pub brutal_rate_bps: Option<u64>,
+}
+
+pub struct BrutalState {
+    pub configured_rate: Option<u64>,
+    pub current_rate: Arc<std::sync::atomic::AtomicU64>,
+    pub base_rtt: Option<u64>,
+    pub active_fds: Arc<std::sync::Mutex<std::collections::HashSet<i32>>>,
+}
+
+pub struct ActiveFdGuard {
+    state: Arc<BrutalState>,
+    fd: i32,
+}
+
+impl Drop for ActiveFdGuard {
+    fn drop(&mut self) {
+        if let Ok(mut lock) = self.state.active_fds.lock() {
+            lock.remove(&self.fd);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -127,11 +146,12 @@ pub struct WarmPool {
     queue: Arc<Mutex<VecDeque<Tunnel>>>,
     notify: Arc<Notify>,
     pub stats: Arc<RwLock<PoolStats>>,
+    pub brutal_state: Arc<BrutalState>,
     recent_gets: Arc<AtomicUsize>,
 }
 
 impl WarmPool {
-    pub fn new(cfg: Arc<PoolConfig>) -> Self {
+    pub fn new(cfg: Arc<PoolConfig>, brutal_state: Arc<BrutalState>) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
         let notify = Arc::new(Notify::new());
         let stats = Arc::new(RwLock::new(PoolStats::new()));
@@ -141,6 +161,7 @@ impl WarmPool {
             queue: queue.clone(),
             notify: notify.clone(),
             stats: stats.clone(),
+            brutal_state: brutal_state.clone(),
             recent_gets: recent_gets.clone(),
         };
 
@@ -192,6 +213,7 @@ impl WarmPool {
         let in_flight_clone = in_flight.clone();
         let target_clone_builder = target_size.clone();
         let stats_builder = stats.clone();
+        let brutal_state_builder = brutal_state.clone();
         
         tokio::spawn(async move {
             info!("WarmPool (Elastic) initialized. Max capacity: {}", cfg_clone.pool_size);
@@ -223,10 +245,11 @@ impl WarmPool {
                 let n_task = n_clone_builder.clone();
                 let in_flight_task = in_flight_clone.clone();
                 let stats_task = stats_builder.clone();
+                let bs_task = brutal_state_builder.clone();
 
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    match Self::connect_upstream(&cfg_task).await {
+                    match Self::connect_upstream(&cfg_task, &bs_task).await {
                         Ok(tunnel) => {
                             let elapsed = start.elapsed().as_millis() as u64;
                             stats_task.write().unwrap().record_latency(elapsed);
@@ -251,7 +274,7 @@ impl WarmPool {
     }
 
     /// 核心握手逻辑：建立 TCP 并包装 AEAD Crypto 层
-    async fn connect_upstream(cfg: &PoolConfig) -> Result<Tunnel> {
+    async fn connect_upstream(cfg: &PoolConfig, brutal_state: &BrutalState) -> Result<Tunnel> {
         let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
         let stream = TcpStream::connect(&addr).await?;
         
@@ -291,8 +314,9 @@ impl WarmPool {
                         "TCP brutal congestion control not available ({}). \
                          Install `hysteria-tcp-brutal-dkms` for full Brutal performance.", err);
                 }
-            } else if let Some(rate_bps) = cfg.brutal_rate_bps {
-                // 如果启用了 brutal 并且配置了目标速率，应用 params
+            } else if brutal_state.configured_rate.is_some() {
+                let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
+                
                 let mut name = [0u8; 16];
                 let mut name_len = name.len() as libc::socklen_t;
                 libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, name.as_mut_ptr() as *mut libc::c_void, &mut name_len);
@@ -303,8 +327,8 @@ impl WarmPool {
                     #[repr(C, packed)]
                     struct BrutalParams { rate: u64, cwnd_gain: u32 }
                     
-                    const CWND_GAIN_X10: u32 = 15; // 1.5x, in 1/10 units per tcp-brutal protocol
-                    let params = BrutalParams { rate: rate_bps, cwnd_gain: CWND_GAIN_X10 };
+                    const CWND_GAIN_X10: u32 = 15;
+                    let params = BrutalParams { rate: current_rate, cwnd_gain: CWND_GAIN_X10 };
                     
                     let pret = libc::setsockopt(
                         fd, 
@@ -321,8 +345,7 @@ impl WarmPool {
                         if !BRUTAL_PARAMS_WARNED.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
                                 "Failed to set TCP_BRUTAL_PARAMS ({}). \
-                                 Possible causes: tcp-brutal module version mismatch, kernel TCP_FASTOPEN collision, \
-                                 or socket state incompatibility.", err);
+                                 Possible causes: tcp-brutal module version mismatch, kernel TCP_FASTOPEN collision.", err);
                         }
                     }
                 } else {
@@ -389,6 +412,53 @@ impl WarmPool {
 
             // 队列真的空了，挂起当前协程等待补货
             notified.await;
+        }
+    }
+
+    pub async fn update_brutal_rate(&self, new_rate: u64) {
+        self.brutal_state.current_rate.store(new_rate, std::sync::atomic::Ordering::Relaxed);
+        let mut fds: Vec<i32> = {
+            let q = self.queue.lock().await;
+            q.iter().map(|t| t.get_raw_fd()).collect()
+        }; // Queue lock released here
+        
+        if let Ok(actives) = self.brutal_state.active_fds.lock() {
+            fds.extend(actives.iter().copied());
+        }
+        
+        let total_updated = fds.len();
+        if fds.is_empty() {
+            return;
+        }
+        
+        tokio::task::spawn_blocking(move || {
+            for fd in fds {
+                const TCP_BRUTAL_PARAMS: libc::c_int = 23;
+                #[repr(C, packed)]
+                struct BrutalParams { rate: u64, cwnd_gain: u32 }
+                const CWND_GAIN_X10: u32 = 15;
+                let params = BrutalParams { rate: new_rate, cwnd_gain: CWND_GAIN_X10 };
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_TCP,
+                        TCP_BRUTAL_PARAMS,
+                        &params as *const _ as *const libc::c_void,
+                        std::mem::size_of::<BrutalParams>() as libc::socklen_t
+                    );
+                }
+            }
+        }).await.ok();
+        tracing::debug!("Updated Brutal rate to {} bps for {} tunnels (idle + active)", new_rate, total_updated);
+    }
+
+    pub fn active_fd_guard(&self, fd: i32) -> ActiveFdGuard {
+        if let Ok(mut lock) = self.brutal_state.active_fds.lock() {
+            lock.insert(fd);
+        }
+        ActiveFdGuard {
+            state: self.brutal_state.clone(),
+            fd,
         }
     }
 }

@@ -149,6 +149,9 @@ pub async fn proxy_tcp_target(
                 }
             }
 
+            let active_fd = tunnel.get_raw_fd();
+            let _guard = pool.active_fd_guard(active_fd);
+
             let (mut local_read, mut local_write) = local.into_split();
             let mut tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
@@ -182,6 +185,8 @@ pub async fn proxy_tcp_target(
                         if n == 0 { break; }
                     }
                 }).await;
+                
+                tunnel_writer
             };
 
             let download = async {
@@ -202,9 +207,14 @@ pub async fn proxy_tcp_target(
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
                     while let Ok(_) = tunnel_reader.recv_data().await {}
                 }).await;
+                
+                tunnel_reader
             };
 
-            tokio::join!(upload, download);
+            let (tw, tr) = tokio::join!(upload, download);
+            drop(_guard);   // ← 先从 set 移除，防止微秒级死 FD 暴露
+            drop(tw);
+            drop(tr);
             debug!("Pyreality connection to {} gracefully closed", target);
         }
         OutboundNode::Direct { .. } => {

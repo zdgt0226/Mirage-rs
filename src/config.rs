@@ -68,6 +68,8 @@ pub enum OutboundConfig {
         pool_size: usize,
         #[serde(default)]
         brutal_rate_bps: Option<u64>,
+        #[serde(default)]
+        brutal_base_rtt_ms: Option<u64>,
     },
     Direct {
         tag: String,
@@ -84,6 +86,8 @@ pub enum OutboundConfig {
         interval: u64,
         #[serde(default = "default_urltest_tolerance")]
         tolerance: u64,
+        #[serde(default = "default_test_type")]
+        test_type: String,
     },
     Fallback {
         tag: String,
@@ -213,6 +217,10 @@ fn default_urltest_tolerance() -> u64 {
 
 fn default_dns_cache_size() -> usize {
     10000
+}
+
+fn default_test_type() -> String {
+    "ping".to_string()
 }
 
 fn default_log_level() -> String {

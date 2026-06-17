@@ -83,7 +83,8 @@ async fn get_proxies(State(app_state): State<AppState>) -> Json<Value> {
                 for c in children {
                     child_info.push(json!({
                         "tag": c.tag(),
-                        "latency": c.latency_ms(),
+                        "latency_rtt_ms": c.latency_rtt_ms(),
+                        "latency_http_ms": c.latency_http_ms(),
                     }));
                 }
                 

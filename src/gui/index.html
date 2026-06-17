@@ -419,10 +419,15 @@
                         const onclick = p.type === 'Selector' ? `onclick="switchProxy('${p.tag}', '${child.tag}')"` : '';
                         
                         let pingHtml = '';
-                        if (child.latency !== null) {
-                            let color = child.latency < 100 ? '#10b981' : (child.latency < 300 ? '#f59e0b' : '#ef4444');
-                            pingHtml = `<div style="font-size: 0.75rem; color: ${color}; margin-top: 4px;">${child.latency} ms</div>`;
-                        } else {
+                        if (child.latency_rtt_ms !== null) {
+                            let color = child.latency_rtt_ms < 100 ? '#10b981' : (child.latency_rtt_ms < 300 ? '#f59e0b' : '#ef4444');
+                            pingHtml += `<div style="font-size: 0.75rem; color: ${color}; margin-top: 4px;">BPF: ${child.latency_rtt_ms} ms</div>`;
+                        }
+                        if (child.latency_http_ms !== null) {
+                            let color = child.latency_http_ms < 100 ? '#10b981' : (child.latency_http_ms < 300 ? '#f59e0b' : '#ef4444');
+                            pingHtml += `<div style="font-size: 0.75rem; color: ${color}; margin-top: 2px;">HTTP: ${child.latency_http_ms} ms</div>`;
+                        }
+                        if (pingHtml === '') {
                             pingHtml = `<div style="font-size: 0.75rem; color: #6b7280; margin-top: 4px;">-</div>`;
                         }
 

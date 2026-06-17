@@ -157,6 +157,10 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         }
     }
 
+    pub fn inner(&self) -> &R {
+        &self.reader
+    }
+
     /// 接收并解密 TLS 1.3 格式的加密数据块
     pub async fn recv_data(&mut self) -> Result<Vec<u8>> {
         let mut header = [0u8; 5];

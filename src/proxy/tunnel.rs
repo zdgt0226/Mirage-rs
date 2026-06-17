@@ -19,4 +19,9 @@ impl Tunnel {
             max_age_sec: 120 + fastrand::u64(0..60)
         }
     }
+
+    pub fn get_raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        self.reader.inner().as_ref().as_raw_fd()
+    }
 }
