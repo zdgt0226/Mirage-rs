@@ -15,6 +15,7 @@ pub enum OutboundNode {
         rtt_ms: Arc<std::sync::atomic::AtomicU64>,
         snd_cwnd: Arc<std::sync::atomic::AtomicU64>,
         total_retrans: Arc<std::sync::atomic::AtomicU64>,
+        total_segs_out: Arc<std::sync::atomic::AtomicU64>,
     },
     Direct {
         tag: String,
@@ -174,7 +175,7 @@ impl OutboundManager {
         // Pass 1: Leaf nodes
         for oc in &cfg.outbounds {
             match oc {
-                OutboundConfig::Pyreality { tag, server, server_port, password, camouflage_host, pool_size, brutal_rate_bps, brutal_base_rtt_ms } => {
+                OutboundConfig::Pyreality { tag, server, server_port, password, camouflage_host, pool_size, brutal_rate_bytes_per_sec, brutal_base_rtt_ms } => {
                     let pool_cfg = Arc::new(PoolConfig {
                         server_host: server.clone(),
                         server_port: *server_port,
@@ -183,8 +184,8 @@ impl OutboundManager {
                         pool_size: *pool_size,
                     });
                     let brutal_state = Arc::new(crate::proxy::pool::BrutalState {
-                        configured_rate: *brutal_rate_bps,
-                        current_rate: Arc::new(std::sync::atomic::AtomicU64::new(brutal_rate_bps.unwrap_or(8_000_000))),
+                        configured_rate: *brutal_rate_bytes_per_sec,
+                        current_rate: Arc::new(std::sync::atomic::AtomicU64::new(brutal_rate_bytes_per_sec.unwrap_or(8_000_000))),
                         base_rtt: *brutal_base_rtt_ms,
                         active_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                     });
@@ -197,7 +198,8 @@ impl OutboundManager {
                         server_ip: Arc::new(RwLock::new(None)),
                         rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
                         snd_cwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                        total_retrans: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        total_retrans: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+                        total_segs_out: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
                     }));
                 }
                 OutboundConfig::Direct { tag } => {

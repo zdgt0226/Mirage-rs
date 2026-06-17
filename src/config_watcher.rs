@@ -111,7 +111,11 @@ impl ConfigWatcher {
             adv.cached_remote_port = remote_port;
         }
 
-        Ok(CoreState { router: Arc::new(router), outbounds, advanced_dns })
+        Ok(CoreState {
+            router: Arc::new(router),
+            outbounds,
+            advanced_dns,
+        })
     }
 
     fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>) {

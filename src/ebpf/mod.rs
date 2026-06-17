@@ -4,7 +4,7 @@ pub struct TcpState {
     pub srtt_us: u32,
     pub snd_cwnd: u32,
     pub total_retrans: u32,
-    pub padding: u32,
+    pub data_segs_out: u32,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -13,7 +13,7 @@ unsafe impl aya::Pod for TcpState {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod sys {
     use anyhow::Result;
-    use aya::{Ebpf, programs::{SkSkb, SockOps, CgroupAttachMode}};
+    use aya::{Ebpf, programs::{SkSkb, SockOps, CgroupAttachMode, Xdp, XdpFlags}};
     use aya::maps::{SockHash, PerCpuArray, HashMap};
     use std::os::unix::io::AsRawFd;
     
@@ -37,6 +37,11 @@ mod sys {
 
     pub struct EbpfEngine {
         bpf: Ebpf,
+    }
+
+    pub struct XdpEngine {
+        bpf: std::sync::Mutex<Ebpf>,
+        pub attached: std::sync::atomic::AtomicU8,
     }
 
     impl EbpfEngine {
@@ -90,7 +95,6 @@ mod sys {
             }
             
             info!("eBPF Engine initialized! Waiting for registrations.");
-
             Ok(Self { bpf })
         }
 
@@ -117,14 +121,21 @@ mod sys {
             Ok((sum_up, sum_down))
         }
         
-        pub fn get_tcp_state(&self, ip: std::net::IpAddr) -> Result<crate::ebpf::TcpState> {
+        /**
+         * [读取底层 TCP 状态]
+         * 通过 Socket 的唯一 Cookie，从内核 LRU Cache 中提取 RTT 和丢包指标。
+         * 这比传统的 getsockopt(TCP_INFO) 快，并且完全规避了用户态锁竞争。
+         */
+        pub fn get_tcp_state_by_cookie(&self, cookie: u64) -> Result<crate::ebpf::TcpState> {
             let map = self.bpf.map("mirage_rtt_map").unwrap();
-            let hash = HashMap::<_, [u32; 5], crate::ebpf::TcpState>::try_from(map)?;
-            let key = ip_to_key(ip);
-            let state = hash.get(&key, 0)?;
-            Ok(state)
+            let hash = HashMap::<_, u64, crate::ebpf::TcpState>::try_from(map)?;
+            hash.get(&cookie, 0).map_err(|e| e.into())
         }
         
+        /**
+         * [添加监控白名单]
+         * 只有被登记到此 Map 的 IP，底层的 bpf_sockops 程序才会收集它的 TCP 信息。
+         */
         pub fn set_target_ip(&mut self, ip: std::net::IpAddr) -> Result<()> {
             let map = self.bpf.map_mut("mirage_target_ips").unwrap();
             let mut hash = HashMap::<_, [u32; 5], u8>::try_from(map)?;
@@ -134,7 +145,56 @@ mod sys {
         }
     }
 
-    fn get_socket_cookie(fd: std::os::unix::io::RawFd) -> Result<u64> {
+
+
+    impl XdpEngine {
+        pub fn init() -> Result<Self> {
+            static DNS_XDP_ELF: &[u8] = include_bytes!("../../ebpf-src/dns_xdp.elf");
+            let xdp_bpf = Ebpf::load(DNS_XDP_ELF)?;
+            Ok(Self { 
+                bpf: std::sync::Mutex::new(xdp_bpf),
+                attached: std::sync::atomic::AtomicU8::new(0),
+            })
+        }
+        
+        pub fn attach(&self, iface: &str) -> Result<()> {
+            let mut bpf = self.bpf.lock().unwrap();
+            let program: &mut Xdp = bpf.program_mut("mirage_xdp_dns").unwrap().try_into()?;
+            program.load()?;
+            if program.attach(iface, XdpFlags::DRV_MODE).is_err() {
+                program.attach(iface, XdpFlags::SKB_MODE)?;
+            }
+            info!("eBPF XDP DNS Accelerator attached to interface: {}", iface);
+            Ok(())
+        }
+        
+        /**
+         * [推送 Fake-IP 到 XDP 层]
+         * 当用户态解析到一个域名并分配了伪装 IP 后，将其同步给网卡层。
+         * 此后该域名的 DNS 查询包将由硬件直接拦截并伪装打回，实现纳秒级响应。
+         */
+        pub fn update_dns_cache(&self, domain: &str, fake_ip: std::net::Ipv4Addr) -> Result<()> {
+            let mut bpf = self.bpf.lock().unwrap();
+            let map = bpf.map_mut("mirage_dns_cache").unwrap();
+            let mut lru = aya::maps::HashMap::<_, u64, u32>::try_from(map)?;
+            
+            // DJB2 hash of the domain name
+            let mut hash: u64 = 5381;
+            for part in domain.split('.') {
+                for &c in part.as_bytes() {
+                    let mut b = c;
+                    if b >= b'A' && b <= b'Z' { b += 32; }
+                    hash = ((hash << 5) + hash).wrapping_add(b as u64);
+                }
+            }
+            
+            let ip_u32 = u32::from(fake_ip).to_be(); // Net endian
+            lru.insert(hash, ip_u32, 0)?;
+            Ok(())
+        }
+    }
+
+    pub fn get_socket_cookie(fd: std::os::unix::io::RawFd) -> Result<u64> {
         let mut cookie: u64 = 0;
         let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
         let res = unsafe {
@@ -176,7 +236,7 @@ mod sys {
             Ok((0, 0))
         }
         
-        pub fn get_tcp_state(&self, _ip: std::net::IpAddr) -> Result<crate::ebpf::TcpState> {
+        pub fn get_tcp_state_by_cookie(&self, _cookie: u64) -> Result<crate::ebpf::TcpState> {
             Err(anyhow::anyhow!("eBPF disabled"))
         }
         
@@ -184,6 +244,28 @@ mod sys {
             Ok(())
         }
     }
+        
+    pub struct XdpEngine {
+        pub attached: std::sync::atomic::AtomicU8,
+    }
+    
+    impl XdpEngine {
+        pub fn init() -> Result<Self> {
+            Err(anyhow::anyhow!("eBPF disabled"))
+        }
+        pub fn update_dns_cache(&self, _domain: &str, _fake_ip: std::net::Ipv4Addr) -> Result<()> {
+            Ok(())
+        }
+        pub fn attach(&self, _iface: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+    
+    pub fn get_socket_cookie(_fd: i32) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 pub use sys::EbpfEngine;
+pub use sys::XdpEngine;
+pub use sys::get_socket_cookie;

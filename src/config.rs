@@ -66,9 +66,9 @@ pub enum OutboundConfig {
         camouflage_host: String,
         #[serde(default = "default_pool_size")]
         pool_size: usize,
-        #[serde(default)]
-        brutal_rate_bps: Option<u64>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none", alias = "brutal_rate_bps")]
+        brutal_rate_bytes_per_sec: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_base_rtt_ms: Option<u64>,
     },
     Direct {
@@ -158,6 +158,7 @@ pub struct AdvancedDnsConfig {
     pub rules: Vec<DnsRule>,
     pub fakeip: Option<FakeIpConfig>,
     pub cache: Option<DnsCacheConfig>,
+    pub xdp_interface: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

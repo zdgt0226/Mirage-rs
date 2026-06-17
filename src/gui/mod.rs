@@ -19,11 +19,12 @@ use crate::proxy::outbound::OutboundNode;
 pub struct AppState {
     pub state: Arc<ArcSwap<CoreState>>,
     pub ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
+    pub xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     pub config_path: String,
 }
 
-pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>, config_path: String) {
-    let app_state = AppState { state, ebpf_engine, config_path };
+pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>, xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>, config_path: String) {
+    let app_state = AppState { state, ebpf_engine, xdp_engine, config_path };
     
     let app = Router::new()
         .route("/api/overview", get(get_overview))
@@ -56,12 +57,15 @@ async fn get_overview(State(state): State<AppState>) -> Json<Value> {
         }
     }
     
+    let xdp_attached = state.xdp_engine.as_ref().map(|e| e.attached.load(Ordering::Relaxed)).unwrap_or(0);
+    
     Json(json!({
         "up": up,
         "down": down,
         "connections": 0,
         "bpf_success": bpf_success,
-        "bpf_fallback": bpf_fallback
+        "bpf_fallback": bpf_fallback,
+        "xdp_attached": xdp_attached
     }))
 }
 

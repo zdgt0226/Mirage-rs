@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+          - target: x86_64-unknown-linux-musl
+            arch: amd64-musl
+          - target: aarch64-unknown-linux-musl
+            arch: arm64-musl
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm llvm-dev libclang-dev protobuf-compiler
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          elif [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            sudo apt-get install -y musl-tools
+          elif [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+            # We use an external toolchain or musl-cross for aarch64-musl
+            # But the easiest way for musl cross is using cross-rs
+            echo "We will use cross-rs for musl"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for musl cross-compilation)
+        if: contains(matrix.target, 'musl')
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build Binary (Standard)
+        if: "!contains(matrix.target, 'musl')"
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target ${{ matrix.target }} --features ebpf
+          cp target/${{ matrix.target }}/release/mirage-rs mirage-rs-${{ matrix.arch }}
+
+      - name: Build Binary (Musl via Cross)
+        if: contains(matrix.target, 'musl')
+        run: |
+          # cross-rs runs in a container, which may not have clang. We build BPF locally first.
+          cargo check --features ebpf # This will trigger build.rs locally and build BPF ELF
+          cross build --release --target ${{ matrix.target }} --features ebpf
+          cp target/${{ matrix.target }}/release/mirage-rs mirage-rs-${{ matrix.arch }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirage-rs-${{ matrix.arch }}
+          path: mirage-rs-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure of downloaded files
+        run: ls -R artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/mirage-rs-amd64/mirage-rs-amd64
+            artifacts/mirage-rs-arm64/mirage-rs-arm64
+            artifacts/mirage-rs-amd64-musl/mirage-rs-amd64-musl
+            artifacts/mirage-rs-arm64-musl/mirage-rs-arm64-musl
+          generate_release_notes: true

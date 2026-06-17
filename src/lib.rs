@@ -108,9 +108,20 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
 
     // 初始化 eBPF 引擎
     let ebpf_engine = match crate::ebpf::EbpfEngine::init() {
-        Ok(engine) => Some(Arc::new(tokio::sync::Mutex::new(engine))),
+        Ok(engine) => {
+            info!("eBPF acceleration ENABLED");
+            Some(Arc::new(tokio::sync::Mutex::new(engine)))
+        }
         Err(e) => {
-            tracing::warn!("Failed to initialize eBPF engine: {}. Features will fall back to userspace.", e);
+            warn!("eBPF acceleration DISABLED: {}", e);
+            None
+        }
+    };
+    
+    let xdp_engine = match crate::ebpf::XdpEngine::init() {
+        Ok(engine) => Some(Arc::new(engine)),
+        Err(e) => {
+            tracing::warn!("XDP DNS acceleration unavailable: {}", e);
             None
         }
     };
@@ -174,23 +185,52 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 let st = core_state.load();
                 if let Ok(lock) = lock_clone.try_lock() {
                     for (_, node) in &st.outbounds.outbounds {
-                        if let crate::proxy::outbound::OutboundNode::Pyreality { server_ip, rtt_ms, snd_cwnd, total_retrans, pool, .. } = node.as_ref() {
-                            if let Some(ip) = *server_ip.read().unwrap() {
-                                if let Ok(state) = lock.get_tcp_state(ip) {
-                                    let rtt = state.srtt_us / 1000;
-                                    rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
-                                    snd_cwnd.store(state.snd_cwnd as u64, std::sync::atomic::Ordering::Relaxed);
-                                    let old_retrans = total_retrans.swap(state.total_retrans as u64, std::sync::atomic::Ordering::Relaxed);
-                                    let delta_retrans = state.total_retrans as i64 - old_retrans as i64;
+                        if let crate::proxy::outbound::OutboundNode::Pyreality { server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, .. } = node.as_ref() {
+                            if let Some(_ip) = *server_ip.read().unwrap() {
+                                if let Ok(actives) = pool.brutal_state.active_fds.lock() {
+                                    let mut sum_retrans = 0;
+                                    let mut sum_segs = 0;
+                                    let mut sum_rtt = 0;
+                                    let mut max_cwnd = 0;
+                                    let mut count = 0;
                                     
-                                    // P3.1: Dynamic Brutal CC adjustment based on BDP
+                                    for &fd in actives.iter() {
+                                        if let Ok(cookie) = crate::ebpf::get_socket_cookie(fd) {
+                                            if let Ok(state) = lock.get_tcp_state_by_cookie(cookie) {
+                                                sum_retrans += state.total_retrans as u64;
+                                                sum_segs += state.data_segs_out as u64;
+                                                sum_rtt += state.srtt_us / 1000;
+                                                max_cwnd = max_cwnd.max(state.snd_cwnd as u64);
+                                                count += 1;
+                                            }
+                                        }
+                                    }
+                                    
+                                    if count > 0 {
+                                        let rtt = sum_rtt / count;
+                                        rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
+                                        snd_cwnd.store(max_cwnd as u64, std::sync::atomic::Ordering::Relaxed);
+                                        let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
+                                        let old_segs = total_segs_out.swap(sum_segs, std::sync::atomic::Ordering::Relaxed);
+                                        
+                                        let (delta_retrans, delta_segs) = if old_retrans == u64::MAX || old_segs == u64::MAX {
+                                            (0, 0)
+                                        } else {
+                                            (sum_retrans as i64 - old_retrans as i64, sum_segs as i64 - old_segs as i64)
+                                        };
+
+                                    // P3.1: Dynamic Brutal CC adjustment based on true loss rate and BDP
                                     if let (Some(base_rate), Some(base_rtt_ms)) = (pool.brutal_state.configured_rate, pool.brutal_state.base_rtt) {
                                         if rtt > 0 {
-                                            let cwnd = state.snd_cwnd; // Packets
+                                            let cwnd = max_cwnd; // Packets
                                             let current_rate = pool.brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
                                             let mut dynamic_rate;
 
-                                            if rtt > (base_rtt_ms as f64 * 1.5) as u32 || delta_retrans > 0 {
+                                            // Calculate loss rate (handle division by zero)
+                                            let loss_rate = if delta_segs > 0 { delta_retrans as f64 / delta_segs as f64 } else { 0.0 };
+
+                                            // Congested if RTT > 1.5x base, OR true packet loss rate exceeds 1%
+                                            if rtt > (base_rtt_ms as f64 * 1.5) as u32 || loss_rate > 0.01 {
                                                 // Congested! Back off to measured BDP bandwidth
                                                 // 1 MSS = 1440 bytes
                                                 let estimated_bdp_bytes_per_sec = (cwnd as f64 * 1440.0) / (rtt as f64 / 1000.0);
@@ -216,6 +256,7 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                         }
                     }
                 }
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
@@ -234,6 +275,15 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 gui_listen = gui.listen;
             }
             if let Some(adv) = config.advanced_dns {
+                if let Some(iface) = &adv.xdp_interface {
+                    if let Some(engine) = &xdp_engine {
+                        if let Err(e) = engine.attach(iface) {
+                            error!("Failed to attach XDP to interface {}: {}", iface, e);
+                        } else {
+                            engine.attached.store(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 if let Some(fakeip) = adv.fakeip {
                     if fakeip.enabled {
                         if let Ok(mapper) = crate::dns::fake_ip::FakeIpMapper::new(&fakeip.inet4_range) {
@@ -252,10 +302,11 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
     if gui_enabled {
         let gui_state = watcher.state.clone();
         let ebp = ebpf_engine.clone();
+        let xdp = xdp_engine.clone();
         let listen = gui_listen.clone();
         let cfg_path = config_path.to_string();
         tokio::spawn(async move {
-            crate::gui::start_server(&listen, gui_state, ebp, cfg_path).await;
+            crate::gui::start_server(&listen, gui_state, ebp, xdp, cfg_path).await;
         });
     }
 
@@ -316,12 +367,14 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 let listen_addr = format!("{}:{}", listen, port);
                 let st_for_dns = state_clone.clone();
                 let fm_for_dns = fake_mapper_clone.clone();
+                let xdp_for_dns = xdp_engine.clone();
                 tokio::spawn(async move {
                     if let Ok(addr) = listen_addr.parse() {
                         let _ = crate::dns::server::DnsForwarder::start(
                             addr,
                             st_for_dns,
-                            fm_for_dns
+                            fm_for_dns,
+                            xdp_for_dns,
                         ).await;
                     }
                 });

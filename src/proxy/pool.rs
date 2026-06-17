@@ -17,13 +17,24 @@ pub struct PoolConfig {
     pub pool_size: usize,
 }
 
+/**
+ * [Brutal 拥塞控制状态机]
+ * 维护每个节点出站连接的动态拥塞控制参数。
+ * 它根据 eBPF 提取的 TCP RTT 和丢包情况动态调节传输速率（BDP 算法）。
+ */
 pub struct BrutalState {
     pub configured_rate: Option<u64>,
-    pub current_rate: Arc<std::sync::atomic::AtomicU64>,
-    pub base_rtt: Option<u64>,
-    pub active_fds: Arc<std::sync::Mutex<std::collections::HashSet<i32>>>,
+    pub current_rate: Arc<std::sync::atomic::AtomicU64>, // 当前动态调整的发送速率
+    pub base_rtt: Option<u64>,                           // 连接池基准 RTT (测得的最快延迟)
+    pub active_fds: Arc<std::sync::Mutex<std::collections::HashSet<i32>>>, // 正在传输数据的套接字文件描述符集合
 }
 
+/**
+ * [活跃连接守卫 (RAII Guard)]
+ * 用于自动管理 active_fds 集合的生命周期。
+ * 创建时外部将其 FD 加入集合；当作用域结束（Guard 销毁）时，利用 Drop trait 自动将 FD 移出集合。
+ * 这是防止死 FD 泄漏并干扰拥塞控制算法的核心安全机制。
+ */
 pub struct ActiveFdGuard {
     state: Arc<BrutalState>,
     fd: i32,
@@ -136,17 +147,19 @@ pub async fn read_server_handshake(stream: &mut tokio::net::tcp::OwnedReadHalf) 
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// 高并发无锁化弹性协商连接池 (Elastic Auto-Scaling)
+/// [弹性预热连接池 (WarmPool)]
+/// Mirage 的核心性能组件，用于零延迟转发。
 /// 
-/// 设计哲学：
-/// 1. 弹性伸缩：后台监控每秒的消费速率 (RPS)，动态调整预建池的目标容量。闲时收缩节省内存，忙时激增扩容。
-/// 2. 严格控量：通过并发计数器保证 `in_flight + idle` 不超过绝对上限 `pool_size`。
-/// 3. Zero-RTT 提取：消费者通过 `get()` 方法极速获取底层通道，无需等待物理网络握手。
+/// 工作原理：
+/// 1. 后台异步维护一个处于 TLS 握手完毕状态的空闲隧道队列。
+/// 2. 客户端请求到达时，直接从池中取出一个已经建好握手的 Tunnel。
+/// 3. 并发不足时弹性扩容，支持高并发无缝爆发。
 pub struct WarmPool {
-    queue: Arc<Mutex<VecDeque<Tunnel>>>,
-    notify: Arc<Notify>,
-    pub stats: Arc<RwLock<PoolStats>>,
-    pub brutal_state: Arc<BrutalState>,
+    queue: Arc<Mutex<VecDeque<Tunnel>>>,      // 空闲可用的隧道队列
+    in_flight: Arc<std::sync::atomic::AtomicUsize>, // 正在执行握手/连接的隧道数
+    notifier: Arc<Notify>,                    // 阻塞唤醒器（当没有连接时挂起请求）
+    stats: Arc<RwLock<PoolStats>>,            // 连接池的延迟统计和健康检查
+    pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
     recent_gets: Arc<AtomicUsize>,
 }
 

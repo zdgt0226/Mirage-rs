@@ -281,9 +281,110 @@
         .btn-save:active {
             transform: translateY(0);
         }
+        
+        /* Neon Dashboard Styles */
+        .neon-dashboard {
+            position: relative;
+            overflow: hidden;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .neon-title-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 2;
+            position: relative;
+        }
+
+        .neon-title {
+            margin: 0;
+            font-size: 1.5rem;
+            background: linear-gradient(to right, #38bdf8, #a78bfa);
+            -webkit-background-clip: text;
+            color: transparent;
+            text-shadow: 0 0 20px rgba(56,189,248,0.5);
+            font-weight: 800;
+            letter-spacing: 2px;
+        }
+
+        .ebpf-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 700;
+            font-size: 0.85rem;
+            letter-spacing: 2px;
+            background: rgba(0,0,0,0.4);
+            padding: 6px 16px;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .ebpf-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #6b7280;
+            box-shadow: 0 0 10px #6b7280;
+            transition: all 0.3s;
+        }
+        
+        .ebpf-dot.online {
+            background: #10b981;
+            box-shadow: 0 0 15px #10b981, 0 0 30px #10b981;
+            animation: pulse-green 2s infinite;
+        }
+
+        @keyframes pulse-green {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 20px;
+            z-index: 2;
+            position: relative;
+        }
+
+        .stat-box {
+            background: rgba(0,0,0,0.3);
+            border: 1px solid rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            letter-spacing: 1.5px;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+
+        #neonCanvas {
+            width: 100%;
+            height: 300px;
+            display: block;
+            border-radius: 16px;
+            background: radial-gradient(circle at center, rgba(13,15,24,0.8) 0%, rgba(0,0,0,0.9) 100%);
+            border: 1px solid rgba(255,255,255,0.05);
+            box-shadow: inset 0 0 50px rgba(0,0,0,0.5);
+            z-index: 1;
+        }
 
         @media (max-width: 768px) {
             .container { grid-template-columns: 1fr; }
+            .stats-row { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -296,26 +397,44 @@
     </header>
 
     <div class="container">
-        <div class="panel">
-            <h2>Upstream Speed</h2>
-            <div class="stat-group">
-                <div>
-                    <span class="stat-val up" id="upSpeed">0.0</span>
-                    <span class="stat-unit" id="upUnit">KB/s</span>
+        <!-- NEON PULSE DASHBOARD -->
+        <div class="panel full-width neon-dashboard">
+            <div class="neon-title-bar">
+                <h2 class="neon-title">THE NEON PULSE</h2>
+                <div class="ebpf-status">
+                    <div class="ebpf-dot" id="ebpfDot"></div>
+                    <span id="ebpfText" style="color: #6b7280;">eBPF ENGINE: OFFLINE</span>
                 </div>
             </div>
-            <div class="total-bytes" id="upTotal">Total: 0 B</div>
-        </div>
+            
+            <div class="stats-row">
+                <div class="stat-box">
+                    <div class="stat-label">UPSTREAM VELOCITY</div>
+                    <div style="display: flex; align-items: baseline;">
+                        <span class="stat-val up" id="upSpeed">0.0</span>
+                        <span class="stat-unit" id="upUnit">KB/s</span>
+                    </div>
+                    <div class="total-bytes" id="upTotal">Total: 0 B</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">DOWNSTREAM VELOCITY</div>
+                    <div style="display: flex; align-items: baseline;">
+                        <span class="stat-val down" id="downSpeed">0.0</span>
+                        <span class="stat-unit" id="downUnit">KB/s</span>
+                    </div>
+                    <div class="total-bytes" id="downTotal">Total: 0 B</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">BPF FAST-PATH / XDP HIT</div>
+                    <div style="display: flex; align-items: baseline;">
+                        <span class="stat-val" id="bpfSuccess" style="color: #10b981; text-shadow: 0 0 20px rgba(16,185,129,0.4);">0</span>
+                        <span class="stat-unit">PKTS/s</span>
+                    </div>
+                    <div class="total-bytes" id="bpfTotal">Total: 0 PKTS Accelerated</div>
+                </div>
+            </div>
 
-        <div class="panel">
-            <h2>Downstream Speed</h2>
-            <div class="stat-group">
-                <div>
-                    <span class="stat-val down" id="downSpeed">0.0</span>
-                    <span class="stat-unit" id="downUnit">KB/s</span>
-                </div>
-            </div>
-            <div class="total-bytes" id="downTotal">Total: 0 B</div>
+            <canvas id="neonCanvas"></canvas>
         </div>
 
         <div class="panel full-width">
@@ -341,7 +460,14 @@
     </div>
 
     <script>
-        let lastUp = 0; let lastDown = 0; let isFirstTick = true; let lastLogLines = 0;
+        let lastUp = 0; let lastDown = 0; let lastBpfSuccess = 0; let isFirstTick = true; let lastLogLines = 0;
+        
+        // Canvas History
+        const HISTORY_LEN = 120;
+        let historyUp = new Array(HISTORY_LEN).fill(0);
+        let historyDown = new Array(HISTORY_LEN).fill(0);
+        let historyBpf = new Array(HISTORY_LEN).fill(0);
+        let lastFetchTime = performance.now();
 
         function formatBytes(bytes) {
             if (bytes === 0) return { val: '0', unit: 'B' };
@@ -353,21 +479,139 @@
         async function fetchOverview() {
             try {
                 const res = await fetch('/api/overview'); const data = await res.json();
+                const now = performance.now();
+                lastFetchTime = now;
+                
+                let upSpeed = 0; let downSpeed = 0; let bpfSpeed = 0;
+                
                 if (!isFirstTick) {
-                    const upSpeed = Math.max(0, data.up - lastUp);
-                    const downSpeed = Math.max(0, data.down - lastDown);
+                    upSpeed = Math.max(0, data.up - lastUp);
+                    downSpeed = Math.max(0, data.down - lastDown);
+                    bpfSpeed = Math.max(0, data.bpf_success - lastBpfSuccess);
+                    
                     const upFmt = formatBytes(upSpeed); const downFmt = formatBytes(downSpeed);
                     document.getElementById('upSpeed').innerText = upFmt.val;
                     document.getElementById('upUnit').innerText = upFmt.unit + '/s';
                     document.getElementById('downSpeed').innerText = downFmt.val;
                     document.getElementById('downUnit').innerText = downFmt.unit + '/s';
+                    document.getElementById('bpfSuccess').innerText = bpfSpeed;
                 }
+                
+                // eBPF Status Indicator
+                const dot = document.getElementById('ebpfDot');
+                const text = document.getElementById('ebpfText');
+                if (data.xdp_attached === 1) {
+                    if (!dot.classList.contains('online')) {
+                        dot.classList.add('online');
+                        text.innerText = 'eBPF ENGINE: ONLINE';
+                        text.style.color = '#10b981';
+                        text.style.textShadow = '0 0 10px rgba(16,185,129,0.5)';
+                    }
+                } else {
+                    dot.classList.remove('online');
+                    text.innerText = 'eBPF ENGINE: OFFLINE';
+                    text.style.color = '#6b7280';
+                    text.style.textShadow = 'none';
+                }
+
+                historyUp.push(upSpeed); historyUp.shift();
+                historyDown.push(downSpeed); historyDown.shift();
+                historyBpf.push(bpfSpeed); historyBpf.shift();
+
                 const upTot = formatBytes(data.up); const downTot = formatBytes(data.down);
                 document.getElementById('upTotal').innerText = `Total: ${upTot.val} ${upTot.unit}`;
                 document.getElementById('downTotal').innerText = `Total: ${downTot.val} ${downTot.unit}`;
-                lastUp = data.up; lastDown = data.down; isFirstTick = false;
+                document.getElementById('bpfTotal').innerText = `Total: ${data.bpf_success} PKTS Accelerated`;
+                
+                lastUp = data.up; lastDown = data.down; lastBpfSuccess = data.bpf_success; isFirstTick = false;
             } catch (err) {}
         }
+
+        // --- Neon Canvas Rendering ---
+        function drawLine(ctx, dataArr, colorStr, rgbaStr, maxVal, offsetY, height, width, slideX, step) {
+            ctx.beginPath();
+            for(let i=0; i<HISTORY_LEN; i++) {
+                let val = dataArr[i];
+                let x = i * step - slideX;
+                let y = offsetY + height - (val / Math.max(maxVal, 1)) * (height * 0.8) - (height * 0.1);
+                if(i===0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            
+            ctx.strokeStyle = colorStr;
+            ctx.lineWidth = 3;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.shadowBlur = 15;
+            ctx.shadowColor = colorStr;
+            ctx.stroke();
+            
+            ctx.lineTo(width, offsetY + height);
+            ctx.lineTo(0, offsetY + height);
+            ctx.closePath();
+            
+            let grad = ctx.createLinearGradient(0, offsetY, 0, offsetY + height);
+            grad.addColorStop(0, rgbaStr);
+            grad.addColorStop(1, 'transparent');
+            ctx.fillStyle = grad;
+            ctx.shadowBlur = 0; 
+            ctx.fill();
+        }
+
+        function drawGrid(ctx, w, h) {
+            ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for(let x=0; x<w; x+=100) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
+            for(let y=0; y<h; y+=50) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
+            ctx.stroke();
+        }
+
+        function renderCanvas() {
+            const canvas = document.getElementById('neonCanvas');
+            if(!canvas) return requestAnimationFrame(renderCanvas);
+            
+            const rect = canvas.getBoundingClientRect();
+            if(canvas.width !== rect.width * 2) {
+                canvas.width = rect.width * 2;
+                canvas.height = rect.height * 2;
+            }
+            
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width;
+            const h = canvas.height;
+            
+            ctx.clearRect(0, 0, w, h);
+            drawGrid(ctx, w, h);
+            
+            let now = performance.now();
+            let elapsed = Math.min(1000, now - lastFetchTime);
+            let step = w / (HISTORY_LEN - 1);
+            let slideX = (elapsed / 1000.0) * step;
+            
+            // Top Track: Up/Down Speed (60% height)
+            let maxSpeed = Math.max(...historyUp, ...historyDown, 1024 * 50); // min 50KB/s scale
+            drawLine(ctx, historyUp, '#38bdf8', 'rgba(56, 189, 248, 0.3)', maxSpeed, 0, h * 0.6, w, slideX, step);
+            drawLine(ctx, historyDown, '#a78bfa', 'rgba(167, 139, 250, 0.3)', maxSpeed, 0, h * 0.6, w, slideX, step);
+            
+            // Bottom Track: BPF Success Rate (40% height)
+            let maxBpf = Math.max(...historyBpf, 10);
+            drawLine(ctx, historyBpf, '#10b981', 'rgba(16, 185, 129, 0.3)', maxBpf, h * 0.6, h * 0.4, w, slideX, step);
+            
+            // Draw track divider
+            ctx.beginPath();
+            ctx.moveTo(0, h * 0.6);
+            ctx.lineTo(w, h * 0.6);
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+            ctx.setLineDash([10, 10]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            
+            requestAnimationFrame(renderCanvas);
+        }
+        
+        requestAnimationFrame(renderCanvas);
+        // --- End Neon Canvas Rendering ---
 
         async function fetchLogs() {
             try {

@@ -170,6 +170,7 @@ pub struct DnsForwarder {
     socket: Arc<UdpSocket>,
     state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
+    xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
 }
 
 impl DnsForwarder {
@@ -177,6 +178,7 @@ impl DnsForwarder {
         listen_addr: SocketAddr,
         state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
         fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
+        xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     ) -> anyhow::Result<Arc<Self>> {
         let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
         info!(
@@ -188,6 +190,7 @@ impl DnsForwarder {
             socket,
             state,
             fake_ip_mapper,
+            xdp_engine,
         });
 
         // Start worker task
@@ -262,6 +265,9 @@ impl DnsForwarder {
                         if qtype == 1 { // A
                             let fake_ip = mapper.lookup_or_assign(&domain);
                             debug!("DNS Fake-IP {} -> {}", domain, fake_ip);
+                            if let Some(engine) = &self.xdp_engine {
+                                let _ = engine.update_dns_cache(&domain, fake_ip);
+                            }
                             return make_fake_ip_response(req, fake_ip);
                         } else if qtype == 28 { // AAAA
                             debug!("DNS Fake-IP {} -> AAAA empty", domain);
@@ -269,7 +275,7 @@ impl DnsForwarder {
                         }
                     }
                     debug!("DNS proxy {} -> {}:{} via {}", domain, remote_dns_host, remote_dns_port, n.tag());
-                    self.tcp_over_tunnel(req, pool, &remote_dns_host, remote_dns_port).await.unwrap_or_else(|| make_nxdomain(req)).into()
+                    self.tcp_over_tunnel(req, &pool, &remote_dns_host, remote_dns_port).await.unwrap_or_else(|| make_nxdomain(req)).into()
                 }
                 _ => Some(make_nxdomain(req)),
             }

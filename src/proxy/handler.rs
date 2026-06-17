@@ -10,6 +10,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
 
+/**
+ * [SOCKS5 客户端接入点]
+ * 负责接收局域网设备或本机发来的代理请求，执行 SOCKS5 握手，
+ * 解析目标地址，并将其分流至 TCP 或 UDP 处理流程。
+ */
 pub async fn handle_client(
     mut local: TcpStream,
     state: Arc<ArcSwap<CoreState>>,
@@ -56,6 +61,14 @@ pub async fn handle_client(
     proxy_tcp_target(local, target, Vec::new(), state, ebpf_engine, fake_ip_mapper).await;
 }
 
+/**
+ * [TCP 流量核心路由与转发]
+ * 核心流程：
+ * 1. 域名还原：检查请求是否命中 Fake-IP（如命中，还原真实域名）。
+ * 2. 路由分发：基于 RuleEngine 进行正则匹配与 IP 匹配，决定该走哪个出站节点。
+ * 3. 动态拨号：如果出站是 Pyreality (Mirage 私有协议)，则直接从 WarmPool 中抽取一条极速隧道 (Zero-RTT)；如果是直连，则直接发起 TCP 连接。
+ * 4. 全双工转发：启动 tokio 协程将本地和远端的读写流打通。
+ */
 pub async fn proxy_tcp_target(
     local: TcpStream,
     target: String,
