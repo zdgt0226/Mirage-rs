@@ -156,9 +156,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// 3. 并发不足时弹性扩容，支持高并发无缝爆发。
 pub struct WarmPool {
     queue: Arc<Mutex<VecDeque<Tunnel>>>,      // 空闲可用的隧道队列
-    in_flight: Arc<std::sync::atomic::AtomicUsize>, // 正在执行握手/连接的隧道数
-    notifier: Arc<Notify>,                    // 阻塞唤醒器（当没有连接时挂起请求）
-    stats: Arc<RwLock<PoolStats>>,            // 连接池的延迟统计和健康检查
+    notify: Arc<Notify>,                      // 阻塞唤醒器（当没有连接时挂起请求）
+    pub stats: Arc<RwLock<PoolStats>>,        // 连接池的延迟统计和健康检查
     pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
     recent_gets: Arc<AtomicUsize>,
 }
