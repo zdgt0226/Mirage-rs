@@ -58,7 +58,7 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
           cargo build --release --target ${{ matrix.target }} --features ebpf
-          cp target/${{ matrix.target }}/release/mirage-rs mirage-rs-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       - name: Build Binary (Musl via Cross)
         if: contains(matrix.target, 'musl')
@@ -66,7 +66,7 @@ jobs:
           # cross-rs runs in a container, which may not have clang. We build BPF locally first.
           cargo check --features ebpf # This will trigger build.rs locally and build BPF ELF
           cross build --release --target ${{ matrix.target }} --features ebpf
-          cp target/${{ matrix.target }}/release/mirage-rs mirage-rs-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
