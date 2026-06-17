@@ -1,0 +1,163 @@
+{
+    "log_level": "info",
+
+    "gui": {
+        "enabled": true,
+        "listen": "127.0.0.1:9090" // 客户端建议只监听本地
+    },
+
+    "inbounds": [
+        // 1. 标准 SOCKS5 入站 (适合普通浏览器插件)
+        {
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": 1080
+        },
+        // 2. HTTP/SOCKS 混合入站
+        {
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "port": 1081
+        },
+        // 3. DNS 监听入站
+        {
+            "type": "dns",
+            "tag": "dns-in",
+            "listen": "127.0.0.1",
+            "port": 53
+        },
+        // 4. v0.3.0 eBPF 透明代理入站 (Linux 5.9+ 独占，基于 BPF_PROG_TYPE_SK_LOOKUP)
+        // 必须配合 advanced_dns 中的 fakeip 一起使用！
+        {
+            "type": "transparent",
+            "tag": "transparent-in",
+            "listen": "0.0.0.0",
+            "port": 7895             // eBPF 会自动将命中 FakeIP 的网卡流量塞给该端口
+        }
+    ],
+
+    "outbounds": [
+        // 1. 核心幻影协议出站 (连接远端 Mirage 服务器)
+        {
+            "type": "mirage",
+            "tag": "proxy-jp",
+            "server": "203.0.113.1",
+            "server_port": 443,
+            "password": "your-secure-password",
+            "camouflage_host": "www.apple.com", // 必须和服务端完全一致
+            
+            "pool_size": 16,                    // 多路复用连接池大小 (默认16)
+            
+            // 【硬核特性】TCP Brutal 参数 (需要服务端加载了 tcp-brutal.ko 内核模块)
+            // v0.3.0 起已移除 brutal_rate_bps 别名，强制使用 mbps 单位防溢出！
+            "brutal_rate_mbps": 100,            // 要求服务端固定发送速率为 100 Mbps
+            "brutal_base_rtt_ms": 45            // 强指定网络物理延迟(ms)，留空则自适应测算
+        },
+        {
+            "type": "mirage",
+            "tag": "proxy-us",
+            "server": "198.51.100.1",
+            "server_port": 443,
+            "password": "your-secure-password",
+            "camouflage_host": "www.apple.com",
+            "pool_size": 16
+        },
+        // 2. Urltest 出站 (高可用性/自动优选，v0.3 后续会接入 eBPF Socket RTT)
+        {
+            "type": "urltest",
+            "tag": "auto-proxy",
+            "outbounds": ["proxy-jp", "proxy-us"], // 被测速的子出站集合
+            "url": "http://www.gstatic.com/generate_204", // 拨测地址
+            "interval": 300,                       // 拨测间隔 (秒)
+            "tolerance": 50,                       // 容忍度 (ms)：只要 RTT 差值在此范围内就不随意切换
+            "test_type": "ping"                    // 探测类型：可选 "ping", "http"
+        },
+        // 3. Selector 出站 (手动选择出站/API 切换)
+        {
+            "type": "selector",
+            "tag": "manual-proxy",
+            "outbounds": ["auto-proxy", "proxy-jp", "proxy-us", "direct-out"]
+        },
+        // 4. 直连与拦截
+        {
+            "type": "direct",
+            "tag": "direct-out"
+        },
+        {
+            "type": "block",
+            "tag": "block-out"
+        }
+    ],
+
+    "routing": {
+        "default_outbound": "manual-proxy", // 所有未匹配规则的流量全部走代理
+        "rules": [
+            // GEO 路由体系
+            {
+                "geosite": ["cn"],          // 大陆域名
+                "outbound": "direct-out"    // 直连
+            },
+            {
+                "geoip": ["cn", "private"], // 大陆 IP 及 局域网 IP
+                "outbound": "direct-out"
+            },
+            // 后缀/正则/关键字路由
+            {
+                "domain_suffix": ["google.com", "github.com"],
+                "outbound": "manual-proxy"
+            },
+            {
+                "domain_keyword": ["ads", "tracker"],
+                "outbound": "block-out"
+            }
+        ]
+    },
+
+    "advanced_dns": {
+        // eBPF XDP 零拷贝 DNS 拦截网卡绑定 (v0.2.3+)
+        // 配置后系统 DNS 查询将无需穿越 Linux 内核协议栈，直接在网卡驱动层实现毫秒级 Fake-IP 响应
+        "xdp_interface": "eth0",
+        
+        "default": "remote-dns",
+
+        // Fake-IP 透明代理引擎 (极速 DNS 响应的核心)
+        "fakeip": {
+            "enabled": true,
+            "inet4_range": "198.18.0.0/16" // 映射分配的内网无害 IP 段
+        },
+
+        // eBPF DNS 结果 LRU 缓存
+        "cache": {
+            "enabled": true,
+            "max_entries": 10000
+        },
+
+        // DNS 解析器定义
+        "resolvers": [
+            {
+                "tag": "remote-dns",
+                "address": "tcp://8.8.8.8:53",
+                "via": "manual-proxy"      // 规定发往 8.8.8.8 的查询流必须从代理出站
+            },
+            {
+                "tag": "local-dns",
+                "address": "udp://223.5.5.5:53",
+                "via": "direct-out"        // 规定发往阿里的查询流直连
+            }
+        ],
+
+        // DNS 分流规则 (避免污染的核心)
+        "rules": [
+            {
+                "match": "geosite:cn",     // 国内域名
+                "use": "local-dns"         // 走国内 DNS 解析
+            },
+            {
+                "match": "geosite:geolocation-!cn", // 国外域名
+                "use": "remote-dns"        // 走代理查询
+            }
+        ]
+    }
+}

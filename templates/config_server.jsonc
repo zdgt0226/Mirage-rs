@@ -1,0 +1,60 @@
+{
+    // 全局日志级别：可选 "trace", "debug", "info", "warn", "error"
+    "log_level": "info",
+
+    // 图形化监控 / 仪表盘配置 (Neon Pulse Dashboard)
+    "gui": {
+        "enabled": true,                // 开启高逼格仪表盘
+        "listen": "0.0.0.0:9090"        // 仪表盘 Web 服务监听地址
+    },
+
+    // 入站配置：定义服务端如何接收客户端流量
+    "inbounds": [
+        {
+            "type": "mirage_server",    // 服务端专属的 Mirage 协议入站
+            "tag": "mirage-in",
+            "listen": "0.0.0.0",        // 绑定到所有网卡
+            "port": 443,                // 建议使用 443 伪装效果最好
+            "password": "your-secure-password", // 必须与客户端保持绝对一致
+            "camouflage_host": "www.apple.com"  // 必须与客户端一致，用于 TLS SNI 完美伪装，屏蔽主动探测
+        }
+    ],
+
+    // 出站配置：服务端接收请求后，发往真实互联网的通道
+    "outbounds": [
+        {
+            "type": "direct",           // 服务端通常直接出站
+            "tag": "direct-out"
+        },
+        {
+            "type": "block",            // 用于屏蔽恶意请求的出站
+            "tag": "block-out"
+        }
+    ],
+
+    // 路由配置：控制不同流量走向哪个出站
+    "routing": {
+        "default_outbound": "direct-out", // 默认放行所有流量
+        "rules": [
+            {
+                // 可选配置：屏蔽一些高风险端口或内网 IP 扫描（防止服务端被当做跳板机）
+                "port": [25, 465, 587],   // 屏蔽发件端口，防滥用
+                "outbound": "block-out"
+            },
+            {
+                // 使用 geosite 屏蔽特定类别的流量
+                "geosite": ["category-ads", "category-porn"],
+                "outbound": "block-out"
+            }
+        ]
+    },
+
+    // 系统内核与网络调优参数
+    "tuning": {
+        "tcp_keepalive": 300,           // TCP 保活时间(秒)
+        "decision_cache_max_entries": 65536, // 路由缓存大小
+        // 后台会自动下载/更新 geoip.dat 和 dlc.dat，可自定义下载源
+        "geosite_url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
+        "geoip_url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
+    }
+}
