@@ -82,6 +82,35 @@ ask_camouflage_host() {
     done
 }
 
+brutal_loaded() {
+    [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]] && \
+        grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control
+}
+
+handle_brutal_optional() {
+    info "Brutal 是给单条连接定速的内核模块（Hysteria2 思路），极大地优化高丢包线路"
+    if brutal_loaded; then
+        ok "已检测到 Brutal 内核模块"
+        return 0
+    fi
+    if ! ask_yn "未检测到 Brutal 内核模块。需要为本机一键安装吗？（VPS 推荐开启，能跑满带宽）" y; then
+        return 1
+    fi
+
+    info "下载并运行官方一键脚本：curl -fsSL https://tcp.hy2.sh/ | bash"
+    if curl -fsSL https://tcp.hy2.sh/ | bash >&2; then
+        if brutal_loaded; then
+            ok "Brutal 内核模块装好并已加载"
+            return 0
+        else
+            warn "安装完成但未检测到 brutal，可能是内核不兼容或需要重启。"
+        fi
+    else
+        warn "安装脚本执行失败，请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
+    fi
+    return 1
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FHS 路径与文件部署
 # ──────────────────────────────────────────────────────────────────────────────
@@ -157,6 +186,12 @@ config_server() {
     local pwd=$(ask "认证密码" "$rand_pwd")
     local sni=$(ask_camouflage_host "www.apple.com")
     
+    local brutal_rate_mbps=0
+    if handle_brutal_optional; then
+        brutal_rate_mbps=$(ask "每条连接的 Brutal 速率上限（Mbps，填入您的单线程预期带宽上限）" "100")
+        info "Brutal 速率已设为: ${brutal_rate_mbps} Mbps / connection"
+    fi
+
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
@@ -172,13 +207,14 @@ config_server() {
             "listen": "0.0.0.0",
             "port": ${port},
             "password": "${pwd}",
-            "camouflage_host": "${sni}"
+            "camouflage_host": "${sni}",
+            "brutal_rate_mbps": ${brutal_rate_mbps}
         }
     ],
     "outbounds": [],
     "gui": {
         "enabled": true,
-        "listen": "0.0.0.0:9090"
+        "listen": "127.0.0.1:9090"
     },
     "routing": {
         "default_outbound": "direct",
@@ -187,6 +223,7 @@ config_server() {
     "tuning": {
         "geodata_dir": "${ETC_DIR}/geosite"
     }
+}
 EOF
     
     ok "服务端配置文件已保存至: ${ETC_DIR}/config_server.json"

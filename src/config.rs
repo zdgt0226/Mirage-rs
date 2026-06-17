@@ -53,12 +53,18 @@ pub enum InboundConfig {
         listen: String,
         port: u16,
     },
+    Transparent {
+        tag: String,
+        listen: String,
+        port: u16,
+    },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboundConfig {
-    Pyreality {
+    #[serde(alias = "pyreality")]
+    Mirage {
         tag: String,
         server: String,
         server_port: u16,
@@ -66,8 +72,8 @@ pub enum OutboundConfig {
         camouflage_host: String,
         #[serde(default = "default_pool_size")]
         pool_size: usize,
-        #[serde(default, skip_serializing_if = "Option::is_none", alias = "brutal_rate_bps")]
-        brutal_rate_bytes_per_sec: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brutal_rate_mbps: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_base_rtt_ms: Option<u64>,
     },
@@ -259,7 +265,7 @@ mod tests {
             ],
             "outbounds": [
                 {
-                    "type": "pyreality",
+                    "type": "mirage",
                     "tag": "proxy",
                     "server": "1.2.3.4",
                     "server_port": 443,
@@ -293,7 +299,7 @@ mod tests {
 
         assert_eq!(config.outbounds.len(), 2);
         match &config.outbounds[0] {
-            OutboundConfig::Pyreality { tag, pool_size, .. } => {
+            OutboundConfig::Mirage { tag, pool_size, .. } => {
                 assert_eq!(tag, "proxy");
                 assert_eq!(*pool_size, 16); // default pool size applied!
             }

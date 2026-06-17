@@ -46,7 +46,7 @@ mod sys {
 
     impl EbpfEngine {
         pub fn init() -> Result<Self> {
-            static SOCKMAP_ELF: &[u8] = include_bytes!("../../ebpf-src/sockmap.elf");
+            static SOCKMAP_ELF: &[u8] = include_bytes!(env!("BPF_SOCKMAP_ELF"));
             let mut bpf = Ebpf::load(SOCKMAP_ELF)?;
             
             let sockmap_fd = {
@@ -149,7 +149,7 @@ mod sys {
 
     impl XdpEngine {
         pub fn init() -> Result<Self> {
-            static DNS_XDP_ELF: &[u8] = include_bytes!("../../ebpf-src/dns_xdp.elf");
+            static DNS_XDP_ELF: &[u8] = include_bytes!(env!("BPF_DNS_XDP_ELF"));
             let xdp_bpf = Ebpf::load(DNS_XDP_ELF)?;
             Ok(Self { 
                 bpf: std::sync::Mutex::new(xdp_bpf),
@@ -269,3 +269,6 @@ mod sys {
 pub use sys::EbpfEngine;
 pub use sys::XdpEngine;
 pub use sys::get_socket_cookie;
+
+pub mod transparent;
+pub use transparent::TransparentEngine;

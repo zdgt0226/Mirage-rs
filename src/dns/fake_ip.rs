@@ -5,6 +5,7 @@ use std::sync::RwLock;
 pub struct FakeIpMapper {
     network: u32,
     mask: u32,
+    prefix_len: u8,
     next_ip: RwLock<u32>,
     domain_to_ip: RwLock<HashMap<String, Ipv4Addr>>,
     ip_to_domain: RwLock<HashMap<Ipv4Addr, String>>,
@@ -30,10 +31,19 @@ impl FakeIpMapper {
         Ok(Self {
             network,
             mask,
+            prefix_len: prefix as u8,
             next_ip: RwLock::new(network + 2), // Start at .2
             domain_to_ip: RwLock::new(HashMap::new()),
             ip_to_domain: RwLock::new(HashMap::new()),
         })
+    }
+
+    pub fn network(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.network)
+    }
+
+    pub fn prefix_len(&self) -> u8 {
+        self.prefix_len
     }
 
     pub fn lookup_or_assign(&self, domain: &str) -> Ipv4Addr {

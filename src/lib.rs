@@ -30,7 +30,7 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
         if let Ok(cfg) = serde_json::from_str::<crate::config::Config>(&content) {
             let mut py_host = None;
             for out in &cfg.outbounds {
-                if let crate::config::OutboundConfig::Pyreality { server, .. } = out {
+                if let crate::config::OutboundConfig::Mirage { server, .. } = out {
                     py_host = Some(server.clone());
                     break;
                 }
@@ -125,6 +125,14 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
             None
         }
     };
+
+    let transparent_engine = match crate::ebpf::TransparentEngine::init() {
+        Ok(engine) => Some(Arc::new(tokio::sync::Mutex::new(engine))),
+        Err(e) => {
+            tracing::warn!("eBPF Transparent proxy unavailable: {}", e);
+            None
+        }
+    };
     
     // Start DNS resolution and RTT monitor loop if eBPF is enabled
     if let Some(engine_arc) = &ebpf_engine {
@@ -140,7 +148,7 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 let mut futures = Vec::new();
                 
                 for (_, node) in &st.outbounds.outbounds {
-                    if let crate::proxy::outbound::OutboundNode::Pyreality { server_host, server_port, server_ip, .. } = node.as_ref() {
+                    if let crate::proxy::outbound::OutboundNode::Mirage { server_host, server_port, server_ip, .. } = node.as_ref() {
                         let host = server_host.clone();
                         let port = *server_port;
                         let ip_arc = server_ip.clone();
@@ -185,7 +193,7 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 let st = core_state.load();
                 if let Ok(lock) = lock_clone.try_lock() {
                     for (_, node) in &st.outbounds.outbounds {
-                        if let crate::proxy::outbound::OutboundNode::Pyreality { server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, .. } = node.as_ref() {
+                        if let crate::proxy::outbound::OutboundNode::Mirage { server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, .. } = node.as_ref() {
                             if let Some(_ip) = *server_ip.read().unwrap() {
                                 if let Ok(actives) = pool.brutal_state.active_fds.lock() {
                                     let mut sum_retrans = 0;
@@ -349,7 +357,7 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 let listen_addr = format!("{}:{}", listen, port);
                 tokio::spawn(async move {
                     if let Ok(listener) = tokio::net::TcpListener::bind(&listen_addr).await {
-                        info!("Mixed inbound listening on {}", listen_addr);
+                        tracing::info!("Mixed inbound listening on {}", listen_addr);
                         while let Ok((stream, _)) = listener.accept().await {
                             let st = state_clone.clone();
                             let ebp = ebpf_clone.clone();
@@ -359,7 +367,24 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                             });
                         }
                     } else {
-                        error!("Failed to bind Mixed inbound on {}", listen_addr);
+                        tracing::error!("Failed to bind Mixed inbound on {}", listen_addr);
+                    }
+                });
+            }
+            crate::config::InboundConfig::Transparent { listen, port, .. } => {
+                let listen_addr = format!("{}:{}", listen, port);
+                let trans_eng = transparent_engine.clone();
+                tokio::spawn(async move {
+                    if let (Some(te), Some(fm)) = (trans_eng, fake_mapper_clone) {
+                        let net = fm.network();
+                        let prefix = fm.prefix_len();
+                        if let Err(e) = crate::proxy::transparent::start_transparent(
+                            &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix
+                        ).await {
+                            tracing::error!("Transparent proxy listener failed: {}", e);
+                        }
+                    } else {
+                        tracing::error!("Transparent inbound requires fake_ip and eBPF transparent engine to be enabled");
                     }
                 });
             }

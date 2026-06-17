@@ -462,12 +462,31 @@
     <script>
         let lastUp = 0; let lastDown = 0; let lastBpfSuccess = 0; let isFirstTick = true; let lastLogLines = 0;
         
-        // Canvas History
-        const HISTORY_LEN = 120;
+        // ==========================================
+        // 实时波形图：历史记录加载与同步逻辑
+        // ==========================================
+        const HISTORY_LEN = 120; // 定义波形图的最大点数，对应 2 分钟 (每秒一刷)
         let historyUp = new Array(HISTORY_LEN).fill(0);
         let historyDown = new Array(HISTORY_LEN).fill(0);
         let historyBpf = new Array(HISTORY_LEN).fill(0);
         let lastFetchTime = performance.now();
+
+        // 首次加载页面时，向后端拉取已被缓存的过去 120 秒的历史数据
+        // 这样可以保证刷新网页时，历史折线图无缝衔接，不需要从零重新绘制
+        async function fetchHistory() {
+            try {
+                const res = await fetch('/api/history');
+                const data = await res.json();
+                if (data.up && data.up.length === HISTORY_LEN) {
+                    historyUp = data.up;
+                    historyDown = data.down;
+                    historyBpf = data.bpf_success;
+                }
+            } catch(err) {}
+        }
+        
+        // 页面打开时立即执行一次全量历史拉取
+        fetchHistory();
 
         function formatBytes(bytes) {
             if (bytes === 0) return { val: '0', unit: 'B' };

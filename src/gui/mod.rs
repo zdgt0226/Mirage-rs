@@ -15,19 +15,87 @@ use crate::monitor::{GLOBAL_UP, GLOBAL_DOWN, GLOBAL_LOGGER};
 use crate::config_watcher::CoreState;
 use crate::proxy::outbound::OutboundNode;
 
+// 历史流量与拦截数据记录器
+// 使用高性能的 VecDeque (双端队列) 维持一个固定长度的滑动窗口
+pub struct HistoryData {
+    // 记录每秒钟增加的上行流量 (Bytes)
+    pub up: std::collections::VecDeque<u64>,
+    // 记录每秒钟增加的下行流量 (Bytes)
+    pub down: std::collections::VecDeque<u64>,
+    // 记录每秒钟 eBPF 成功在内核层拦截/处理的包数
+    pub bpf: std::collections::VecDeque<u64>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub state: Arc<ArcSwap<CoreState>>,
     pub ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     pub xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     pub config_path: String,
+    pub history: Arc<std::sync::RwLock<HistoryData>>,
 }
 
 pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>, xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>, config_path: String) {
-    let app_state = AppState { state, ebpf_engine, xdp_engine, config_path };
+    // 1. 初始化历史数据结构，窗口大小设定为 120 (即记录过去 120 秒 / 2分钟 的数据)
+    // 预先填充 0 以避免前端在数据不足时渲染异常
+    let history = Arc::new(std::sync::RwLock::new(HistoryData {
+        up: { let mut v = std::collections::VecDeque::new(); v.resize(120, 0); v },
+        down: { let mut v = std::collections::VecDeque::new(); v.resize(120, 0); v },
+        bpf: { let mut v = std::collections::VecDeque::new(); v.resize(120, 0); v },
+    }));
     
+    let app_state = AppState { state, ebpf_engine, xdp_engine, config_path, history: history.clone() };
+    
+    // 2. 启动一个常驻的后台监控协程 (Daemon Task)
+    // 目的：每秒钟醒来一次，计算过去一秒内各项指标的 Delta 差值 (即流速)，并压入历史队列
+    let bg_state = app_state.clone();
+    tokio::spawn(async move {
+        // 获取循环开始前的初始绝对数值
+        let mut last_up = crate::monitor::GLOBAL_UP.load(Ordering::Relaxed);
+        let mut last_down = crate::monitor::GLOBAL_DOWN.load(Ordering::Relaxed);
+        let mut last_bpf = 0;
+        
+        loop {
+            // 精确睡眠 1 秒
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            
+            // 采样当前时刻的绝对数值
+            let up = crate::monitor::GLOBAL_UP.load(Ordering::Relaxed);
+            let down = crate::monitor::GLOBAL_DOWN.load(Ordering::Relaxed);
+            let mut bpf_success = 0;
+            
+            // 尝试获取 eBPF 引擎的统计信息
+            if let Some(engine) = &bg_state.ebpf_engine {
+                if let Ok(lock) = engine.try_lock() {
+                    if let Ok((s, _)) = lock.get_stats() {
+                        bpf_success = s;
+                    }
+                }
+            }
+            
+            // 计算 Delta (流速) = 当前总数 - 上一秒总数
+            // saturating_sub 用于防止特殊情况下数值溢出导致 panic
+            let up_diff = up.saturating_sub(last_up);
+            let down_diff = down.saturating_sub(last_down);
+            let bpf_diff = bpf_success.saturating_sub(last_bpf);
+            
+            // 更新 last 值供下一轮使用
+            last_up = up;
+            last_down = down;
+            last_bpf = bpf_success;
+            
+            // 将计算出的流速数据压入双端队列，并剔除最老的数据，保持队列长度为 120
+            if let Ok(mut h) = bg_state.history.write() {
+                h.up.pop_front(); h.up.push_back(up_diff);
+                h.down.pop_front(); h.down.push_back(down_diff);
+                h.bpf.pop_front(); h.bpf.push_back(bpf_diff);
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/api/overview", get(get_overview))
+        .route("/api/history", get(get_history))
         .route("/api/logs", get(get_logs))
         .route("/api/proxies", get(get_proxies))
         .route("/api/proxies/select", post(select_proxy))
@@ -67,6 +135,18 @@ async fn get_overview(State(state): State<AppState>) -> Json<Value> {
         "bpf_fallback": bpf_fallback,
         "xdp_attached": xdp_attached
     }))
+}
+
+async fn get_history(State(state): State<AppState>) -> Json<Value> {
+    if let Ok(h) = state.history.read() {
+        Json(json!({
+            "up": h.up,
+            "down": h.down,
+            "bpf_success": h.bpf,
+        }))
+    } else {
+        Json(json!({}))
+    }
 }
 
 async fn get_logs() -> Json<Value> {

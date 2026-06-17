@@ -13,7 +13,7 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
         sleep(Duration::from_secs(2)).await;
 
         loop {
-            if let OutboundNode::Pyreality { pool, tag, .. } = &*node {
+            if let OutboundNode::Mirage { pool, tag, .. } = &*node {
                 let start = Instant::now();
                 
                 // Parse target from url

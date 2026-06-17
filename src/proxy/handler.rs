@@ -39,7 +39,7 @@ pub async fn handle_client(
             if let Some(outbound) = current_state.outbounds.get(default_outbound_tag) {
                 let leaf = outbound.resolve_leaf();
                 match &*leaf {
-                    OutboundNode::Pyreality { pool, .. } => {
+                    OutboundNode::Mirage { pool, .. } => {
                         udp_relay::handle_udp_associate(local, pool.clone()).await;
                     }
                     OutboundNode::Direct { .. } => {
@@ -66,7 +66,7 @@ pub async fn handle_client(
  * 核心流程：
  * 1. 域名还原：检查请求是否命中 Fake-IP（如命中，还原真实域名）。
  * 2. 路由分发：基于 RuleEngine 进行正则匹配与 IP 匹配，决定该走哪个出站节点。
- * 3. 动态拨号：如果出站是 Pyreality (Mirage 私有协议)，则直接从 WarmPool 中抽取一条极速隧道 (Zero-RTT)；如果是直连，则直接发起 TCP 连接。
+ * 3. 动态拨号：如果出站是 Mirage (Mirage 私有协议)，则直接从 WarmPool 中抽取一条极速隧道 (Zero-RTT)；如果是直连，则直接发起 TCP 连接。
  * 4. 全双工转发：启动 tokio 协程将本地和远端的读写流打通。
  */
 pub async fn proxy_tcp_target(
@@ -142,7 +142,7 @@ pub async fn proxy_tcp_target(
 
     let leaf = outbound.resolve_leaf();
     match &*leaf {
-        OutboundNode::Pyreality { pool, .. } => {
+        OutboundNode::Mirage { pool, .. } => {
             let mut tunnel = pool.get().await;
 
             let target_bytes = target.as_bytes();
@@ -228,7 +228,7 @@ pub async fn proxy_tcp_target(
             drop(_guard);   // ← 先从 set 移除，防止微秒级死 FD 暴露
             drop(tw);
             drop(tr);
-            debug!("Pyreality connection to {} gracefully closed", target);
+            debug!("Mirage connection to {} gracefully closed", target);
         }
         OutboundNode::Direct { .. } => {
             let mut target_stream = match tokio::net::TcpStream::connect(&target).await {

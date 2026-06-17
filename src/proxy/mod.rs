@@ -7,3 +7,5 @@ pub mod outbound;
 pub mod mirage_server;
 pub mod mixed;
 pub mod healthcheck;
+pub mod transparent;
+pub mod sniff;

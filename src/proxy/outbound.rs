@@ -6,7 +6,7 @@ use tracing::info;
 use crate::config::{Config, OutboundConfig};
 
 pub enum OutboundNode {
-    Pyreality {
+    Mirage {
         tag: String,
         pool: Arc<WarmPool>,
         server_host: String,
@@ -44,7 +44,7 @@ pub enum OutboundNode {
 impl OutboundNode {
     pub fn tag(&self) -> &str {
         match self {
-            Self::Pyreality { tag, .. } => tag,
+            Self::Mirage { tag, .. } => tag,
             Self::Direct { tag } => tag,
             Self::Block { tag } => tag,
             Self::Urltest { tag, .. } => tag,
@@ -55,7 +55,7 @@ impl OutboundNode {
 
     pub fn is_healthy(self: &Arc<Self>) -> bool {
         match &**self {
-            Self::Pyreality { pool, .. } => pool.stats.read().unwrap().is_healthy(),
+            Self::Mirage { pool, .. } => pool.stats.read().unwrap().is_healthy(),
             Self::Direct { .. } | Self::Block { .. } => true,
             Self::Urltest { children, .. } | Self::Fallback { children, .. } | Self::Selector { children, .. } => {
                 children.iter().any(|c| c.is_healthy())
@@ -65,7 +65,7 @@ impl OutboundNode {
 
     pub fn latency_rtt_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
-            Self::Pyreality { rtt_ms, .. } => {
+            Self::Mirage { rtt_ms, .. } => {
                 let rtt = rtt_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if rtt > 0 && rtt != u64::MAX { Some(rtt) } else { None }
             },
@@ -79,7 +79,7 @@ impl OutboundNode {
 
     pub fn latency_http_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
-            Self::Pyreality { pool, .. } => pool.stats.read().unwrap().latency_ms(),
+            Self::Mirage { pool, .. } => pool.stats.read().unwrap().latency_ms(),
             Self::Direct { .. } | Self::Block { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } => {
                 let leaf = self.resolve_leaf();
@@ -175,7 +175,7 @@ impl OutboundManager {
         // Pass 1: Leaf nodes
         for oc in &cfg.outbounds {
             match oc {
-                OutboundConfig::Pyreality { tag, server, server_port, password, camouflage_host, pool_size, brutal_rate_bytes_per_sec, brutal_base_rtt_ms } => {
+                OutboundConfig::Mirage { tag, server, server_port, password, camouflage_host, pool_size, brutal_rate_mbps, brutal_base_rtt_ms } => {
                     let pool_cfg = Arc::new(PoolConfig {
                         server_host: server.clone(),
                         server_port: *server_port,
@@ -183,14 +183,15 @@ impl OutboundManager {
                         camouflage_host: camouflage_host.clone(),
                         pool_size: *pool_size,
                     });
+                    let bytes_per_sec = brutal_rate_mbps.map(|m| m * 125_000);
                     let brutal_state = Arc::new(crate::proxy::pool::BrutalState {
-                        configured_rate: *brutal_rate_bytes_per_sec,
-                        current_rate: Arc::new(std::sync::atomic::AtomicU64::new(brutal_rate_bytes_per_sec.unwrap_or(8_000_000))),
+                        configured_rate: bytes_per_sec,
+                        current_rate: Arc::new(std::sync::atomic::AtomicU64::new(bytes_per_sec.unwrap_or(8_000_000))),
                         base_rtt: *brutal_base_rtt_ms,
                         active_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
                     });
                     let pool = Arc::new(WarmPool::new(pool_cfg, brutal_state));
-                    outbounds.insert(tag.clone(), Arc::new(OutboundNode::Pyreality {
+                    outbounds.insert(tag.clone(), Arc::new(OutboundNode::Mirage {
                         tag: tag.clone(),
                         pool,
                         server_host: server.clone(),
@@ -264,7 +265,7 @@ impl OutboundManager {
                 if resolved {
                     if hc_interval > 0 && !hc_url.is_empty() {
                         for child in &children {
-                            if let OutboundNode::Pyreality { .. } = &**child {
+                            if let OutboundNode::Mirage { .. } = &**child {
                                 crate::proxy::healthcheck::start_health_checker(child.clone(), hc_url.clone(), hc_interval);
                             }
                         }

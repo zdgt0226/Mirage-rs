@@ -128,7 +128,7 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
 
 
 
-    // 2.5 Send ServerHello template back to satisfy Pyreality Client's TLS state machine
+    // 2.5 Send ServerHello template back to satisfy Mirage Client's TLS state machine
     let template = crate::crypto::handshake_cache::get_server_hello(&camouflage_host, client_hello).await;
     if let Err(e) = stream.write_all(&template).await {
         tracing::error!("Mirage Server: write_all template failed: {}", e);

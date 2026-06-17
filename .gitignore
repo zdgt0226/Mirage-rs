@@ -1,2 +1,7 @@
-target/
+/target
+transparent_config.json
+sandbox_config.json
+output.log
 .geosite/
+.antigravity.md
+memory-bank/

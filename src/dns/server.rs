@@ -260,7 +260,7 @@ impl DnsForwarder {
                     debug!("DNS direct  {} -> {}", domain, cn_dns);
                     self.udp_query(req, cn_dns).await
                 }
-                OutboundNode::Pyreality { pool, .. } => {
+                OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
                         if qtype == 1 { // A
                             let fake_ip = mapper.lookup_or_assign(&domain);
