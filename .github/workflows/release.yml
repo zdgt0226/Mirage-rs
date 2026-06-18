@@ -63,10 +63,23 @@ jobs:
       - name: Build Binary (Musl via Cross)
         if: contains(matrix.target, 'musl')
         run: |
-          # cross-rs runs in a container, which may not have clang. We build BPF locally first.
-          cargo check --features ebpf # This will trigger build.rs locally and build BPF ELF
+          # 显式编译 BPF（不依赖 build.rs 隐式调用）
+          uname_m=$(uname -m)
+          for src in sockmap dns_xdp transparent; do
+              clang -O2 -g -target bpf -I/usr/include/${uname_m}-linux-gnu -c ebpf-src/${src}.c -o ebpf-src/${src}.elf
+              llvm-strip --strip-debug ebpf-src/${src}.elf
+              # 验证 ELF 合法性
+              file ebpf-src/${src}.elf
+              readelf -h ebpf-src/${src}.elf | grep -E "Machine|Class"
+              ls -la ebpf-src/${src}.elf
+          done
+
+          # 然后再 cross build
           cross build --release --target ${{ matrix.target }} --features ebpf
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
+
+          # 二次验证 binary 里嵌的 ELF 数量（不严格但可用）
+          grep -aob $$'\x7fELF' mirage-rs-${{ matrix.arch }} | head -5
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
