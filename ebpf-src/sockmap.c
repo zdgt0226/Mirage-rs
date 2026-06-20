@@ -64,20 +64,31 @@ struct {
 } mirage_rtt_map SEC(".maps");
 
 // 辅助函数：统一提取 IPv4/IPv6 为标准 ip_key 格式
-static inline void extract_ip(struct bpf_sock_ops *skops, struct ip_key *key) {
-    if (skops->family == 2) { // AF_INET (IPv4)
+//
+// BPF verifier 不允许 "ctx 指针 + 偏移 → 解引用" 模式 (dereference of
+// modified ctx ptr disallowed). 防御写法: 把所有 ctx 字段访问提前到
+// 函数开头的直线代码中, 存入局部变量; 分支只用局部变量做 store. 这样
+// 编译器即便做分支合并优化, 也不会产出"取 ctx 字段地址 → 跨分支解引用"
+// 的字节码. __always_inline 确保不被外联成调用导致 ctx 传参问题.
+static __always_inline void extract_ip(struct bpf_sock_ops *skops, struct ip_key *key) {
+    __u32 family = skops->family;
+    __u32 ip4    = skops->remote_ip4;
+    __u32 ip6_0  = skops->remote_ip6[0];
+    __u32 ip6_1  = skops->remote_ip6[1];
+    __u32 ip6_2  = skops->remote_ip6[2];
+    __u32 ip6_3  = skops->remote_ip6[3];
+
+    if (family == 2) { // AF_INET (IPv4) — caller 已 zero-init key
         key->data[0] = 2;
-        key->data[1] = 0;
-        key->data[2] = 0;
-        key->data[3] = 0;
-        key->data[4] = skops->remote_ip4;
-    } else { // AF_INET6 (IPv6)
-        key->data[0] = 10;
-        key->data[1] = skops->remote_ip6[0];
-        key->data[2] = skops->remote_ip6[1];
-        key->data[3] = skops->remote_ip6[2];
-        key->data[4] = skops->remote_ip6[3];
+        key->data[4] = ip4;
+        return;
     }
+    // AF_INET6 (IPv6)
+    key->data[0] = 10;
+    key->data[1] = ip6_0;
+    key->data[2] = ip6_1;
+    key->data[3] = ip6_2;
+    key->data[4] = ip6_3;
 }
 
 /**
