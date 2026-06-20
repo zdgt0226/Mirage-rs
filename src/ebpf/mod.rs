@@ -59,39 +59,51 @@ mod sys {
             program.load()?;
             program.attach(&sockmap_fd)?;
             
-            // Try attaching sockops for RTT monitoring
+            // Try attaching sockops for RTT monitoring — report the actual failure step.
             let mut sockops_attached = false;
-            if let Some(prog) = bpf.program_mut("mirage_sockops") {
-                if let Ok(sockops) = TryInto::<&mut SockOps>::try_into(prog) {
-                    if sockops.load().is_ok() {
-                        let mut cgroup_paths = vec![];
-                        if let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") {
-                            if let Some(line) = content.lines().find(|l| l.starts_with("0::")) {
-                                if let Some(rel) = line.strip_prefix("0::") {
-                                    cgroup_paths.push(format!("/sys/fs/cgroup{}", rel.trim()));
-                                }
-                            }
-                        }
-                        cgroup_paths.push("/sys/fs/cgroup".to_string());
-                        cgroup_paths.push("/sys/fs/cgroup/unified".to_string());
-                        
-                        for path in cgroup_paths {
-                            if let Ok(cg) = std::fs::File::open(&path) {
-                                match sockops.attach(cg, CgroupAttachMode::Single) {
-                                    Ok(_) => {
-                                        info!("eBPF SockOps attached to {}", path);
-                                        sockops_attached = true;
-                                        break;
+            let sockops_diag: String = match bpf.program_mut("mirage_sockops") {
+                None => "program `mirage_sockops` not found in BPF ELF (section name mismatch?)".to_string(),
+                Some(prog) => match TryInto::<&mut SockOps>::try_into(prog) {
+                    Err(e) => format!("type cast to SockOps failed: {e}"),
+                    Ok(sockops) => match sockops.load() {
+                        Err(e) => format!("sockops.load() rejected by kernel verifier: {e}"),
+                        Ok(()) => {
+                            let mut cgroup_paths = vec![];
+                            if let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") {
+                                if let Some(line) = content.lines().find(|l| l.starts_with("0::")) {
+                                    if let Some(rel) = line.strip_prefix("0::") {
+                                        cgroup_paths.push(format!("/sys/fs/cgroup{}", rel.trim()));
                                     }
-                                    Err(e) => tracing::warn!("eBPF SockOps attach to {} failed: {}", path, e),
                                 }
                             }
+                            cgroup_paths.push("/sys/fs/cgroup".to_string());
+                            cgroup_paths.push("/sys/fs/cgroup/unified".to_string());
+
+                            let mut attach_errors = vec![];
+                            for path in &cgroup_paths {
+                                match std::fs::File::open(path) {
+                                    Err(e) => attach_errors.push(format!("open({path}): {e}")),
+                                    Ok(cg) => match sockops.attach(cg, CgroupAttachMode::Single) {
+                                        Ok(_) => {
+                                            info!("eBPF SockOps attached to {}", path);
+                                            sockops_attached = true;
+                                            break;
+                                        }
+                                        Err(e) => attach_errors.push(format!("attach({path}): {e}")),
+                                    },
+                                }
+                            }
+                            if sockops_attached {
+                                String::new()
+                            } else {
+                                format!("all cgroup attach paths failed: [{}]", attach_errors.join("; "))
+                            }
                         }
-                    }
-                }
-            }
+                    },
+                },
+            };
             if !sockops_attached {
-                tracing::warn!("RTT monitoring unavailable: cgroup attach failed on all paths. Verify cgroup v2 mount and CAP_NET_ADMIN.");
+                tracing::warn!("RTT monitoring unavailable: {}", sockops_diag);
             }
             
             info!("eBPF Engine initialized! Waiting for registrations.");
