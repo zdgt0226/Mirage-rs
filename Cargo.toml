@@ -39,3 +39,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [features]
 default = []
 ebpf = ["dep:aya"]
+
+# Debug examples (require ebpf feature so they don't break default cargo check)
+[[example]]
+name = "test_align"
+path = "examples/test_align.rs"
+required-features = ["ebpf"]
+
+[[example]]
+name = "simulate_bdp"
+path = "examples/simulate_bdp.rs"

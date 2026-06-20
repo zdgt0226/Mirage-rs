@@ -5,3 +5,11 @@ output.log
 .geosite/
 .antigravity.md
 memory-bank/
+CLAUDE.md
+
+# Debug/scratch artifacts that occasionally end up in working tree
+/test_*.elf
+/test_*.rs
+/test_poly.rs
+/simulate_bdp
+/*.log
