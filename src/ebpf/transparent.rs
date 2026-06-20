@@ -98,7 +98,7 @@ mod sys {
 
     impl TransparentEngine {
         pub fn init() -> Result<Self> {
-            info!("eBPF Transparent Engine disabled (requires Linux and 'ebpf' feature). Transparent proxy will fallback to iptables TPROXY if configured.");
+            info!("eBPF Transparent Engine disabled (requires Linux and 'ebpf' feature). Use SOCKS5 / HTTP / Mixed inbound types for non-transparent operation.");
             Ok(Self {})
         }
 

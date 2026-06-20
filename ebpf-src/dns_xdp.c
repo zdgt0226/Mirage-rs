@@ -175,12 +175,14 @@ int mirage_xdp_dns(struct xdp_md *ctx) {
     udph->len = bpf_htons(new_udp_len);
     iph->tot_len = bpf_htons(bpf_ntohs(iph->tot_len) + 16);
     
-    // Zero checksums for hardware offload or ignore for simplicity
-    // Technically we should recalculate IP and UDP checksums.
-    // For UDP, 0 means no checksum.
-    // Note: Setting UDP checksum to 0 is generally allowed for IPv4 but 
-    // some middleboxes or strict firewalls might drop the packet.
-    // Since XDP_TX typically loops back on the local NIC, this is mostly safe.
+    // UDP checksum=0 means "no checksum" per RFC 768 — legal for IPv4 UDP.
+    // 实测在常见 Linux + 网卡组合下客户端能正确接收 (XDP_TX 通常直接回 NIC,
+    // 不经过路径上的 NAT/防火墙). 但存在已知风险:
+    //
+    //   如果用户反馈 "tcpdump 能抓到 XDP 返回的 DNS 响应包, 但客户端解析
+    //   失败/超时" → 大概率就是中间设备 (严格的企业防火墙 / 古怪 NAT) 丢
+    //   弃了 checksum=0 的 UDP 包. 此时需要补上 RFC 768 的 UDP 增量校验
+    //   和计算 (包括 IPv4 伪首部), 不能再用 0 偷懒.
     udph->check = 0;
     
     // Recalculate IP checksum (RFC 1071)
