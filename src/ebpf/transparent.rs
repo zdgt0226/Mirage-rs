@@ -30,7 +30,7 @@ mod sys {
 
     impl TransparentEngine {
         pub fn init() -> Result<Self> {
-            static TRANSPARENT_ELF: &[u8] = include_bytes!(env!("BPF_TRANSPARENT_ELF"));
+            static TRANSPARENT_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_TRANSPARENT_ELF"));
             let bpf = Ebpf::load(TRANSPARENT_ELF).context("Failed to load transparent.elf")?;
             tracing::info!("eBPF Transparent Engine initialized.");
             Ok(Self { 
