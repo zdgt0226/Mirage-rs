@@ -100,6 +100,7 @@ pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, ebp
         .route("/api/proxies", get(get_proxies))
         .route("/api/proxies/select", post(select_proxy))
         .route("/api/rules", get(get_rules).post(update_rules))
+        .route("/api/bpf/tunnels", get(get_bpf_tunnels))
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .with_state(app_state);
 
@@ -113,28 +114,60 @@ pub async fn start_server(listen_addr: &str, state: Arc<ArcSwap<CoreState>>, ebp
 async fn get_overview(State(state): State<AppState>) -> Json<Value> {
     let up = GLOBAL_UP.load(Ordering::Relaxed);
     let down = GLOBAL_DOWN.load(Ordering::Relaxed);
-    
+
     let mut bpf_success = 0;
     let mut bpf_fallback = 0;
+    let mut tunnel_count = 0usize;
+    let mut brutal_cc_active = false;
     if let Some(engine) = state.ebpf_engine {
         if let Ok(lock) = engine.try_lock() {
             if let Ok((s, f)) = lock.get_stats() {
                 bpf_success = s;
                 bpf_fallback = f;
             }
+            if let Ok(tunnels) = lock.get_all_tunnel_stats() {
+                tunnel_count = tunnels.len();
+                // 任何一条 tunnel 有 srtt_us > 0 即说明 RTT_CB 已生效, Brutal CC 拿得到反馈
+                brutal_cc_active = tunnels.iter().any(|(_, s)| s.srtt_us > 0);
+            }
         }
     }
-    
+
     let xdp_attached = state.xdp_engine.as_ref().map(|e| e.attached.load(Ordering::Relaxed)).unwrap_or(0);
-    
+
     Json(json!({
         "up": up,
         "down": down,
         "connections": 0,
         "bpf_success": bpf_success,
         "bpf_fallback": bpf_fallback,
-        "xdp_attached": xdp_attached
+        "xdp_attached": xdp_attached,
+        "tunnel_count": tunnel_count,
+        "brutal_cc_active": brutal_cc_active,
     }))
+}
+
+// 列出当前 BPF 跟踪的所有活跃 TCP tunnel.
+// cookie 为内核 SO_COOKIE, 唯一标识一条 socket; 字段为 sockmap.c::tcp_state.
+// srtt_us 已折算成毫秒返回; LRU 淘汰的 cookie 自动从列表消失.
+async fn get_bpf_tunnels(State(state): State<AppState>) -> Json<Value> {
+    let mut tunnels: Vec<Value> = Vec::new();
+    if let Some(engine) = state.ebpf_engine {
+        if let Ok(lock) = engine.try_lock() {
+            if let Ok(entries) = lock.get_all_tunnel_stats() {
+                tunnels = entries.into_iter().map(|(cookie, s)| {
+                    json!({
+                        "cookie": cookie,
+                        "rtt_ms": s.srtt_us as f64 / 1000.0,
+                        "cwnd": s.snd_cwnd,
+                        "retrans": s.total_retrans,
+                        "data_segs": s.data_segs_out,
+                    })
+                }).collect();
+            }
+        }
+    }
+    Json(json!({ "tunnels": tunnels }))
 }
 
 async fn get_history(State(state): State<AppState>) -> Json<Value> {

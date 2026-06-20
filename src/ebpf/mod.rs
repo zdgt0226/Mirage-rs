@@ -143,6 +143,20 @@ mod sys {
             let hash = HashMap::<_, u64, crate::ebpf::TcpState>::try_from(map)?;
             hash.get(&cookie, 0).map_err(|e| e.into())
         }
+
+        // 遍历 mirage_rtt_map 所有 cookie → 用于 GUI Active Tunnels 面板.
+        // LRU 淘汰过的 cookie 自动不会出现, 上层不用清理.
+        pub fn get_all_tunnel_stats(&self) -> Result<Vec<(u64, crate::ebpf::TcpState)>> {
+            let map = self.bpf.map("mirage_rtt_map").unwrap();
+            let hash = HashMap::<_, u64, crate::ebpf::TcpState>::try_from(map)?;
+            let mut out = Vec::new();
+            for entry in hash.iter() {
+                if let Ok((cookie, state)) = entry {
+                    out.push((cookie, state));
+                }
+            }
+            Ok(out)
+        }
         
         /**
          * [添加监控白名单]
@@ -250,6 +264,10 @@ mod sys {
         
         pub fn get_tcp_state_by_cookie(&self, _cookie: u64) -> Result<crate::ebpf::TcpState> {
             Err(anyhow::anyhow!("eBPF disabled"))
+        }
+
+        pub fn get_all_tunnel_stats(&self) -> Result<Vec<(u64, crate::ebpf::TcpState)>> {
+            Ok(Vec::new())
         }
         
         pub fn set_target_ip(&mut self, _ip: std::net::IpAddr) -> Result<()> {
