@@ -12,7 +12,10 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # Pin to 22.04 (glibc 2.35) so gnu binaries stay compatible with
+    # Debian 12 / Ubuntu 22.04+ / RHEL 9+. ubuntu-latest moved to 24.04
+    # (glibc 2.39) in 2025, which would silently raise our floor.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
