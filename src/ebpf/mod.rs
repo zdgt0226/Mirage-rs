@@ -46,7 +46,7 @@ mod sys {
 
     impl EbpfEngine {
         pub fn init() -> Result<Self> {
-            static SOCKMAP_ELF: &[u8] = include_bytes!(env!("BPF_SOCKMAP_ELF"));
+            static SOCKMAP_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_SOCKMAP_ELF"));
             let mut bpf = Ebpf::load(SOCKMAP_ELF)?;
             
             let sockmap_fd = {
@@ -149,7 +149,7 @@ mod sys {
 
     impl XdpEngine {
         pub fn init() -> Result<Self> {
-            static DNS_XDP_ELF: &[u8] = include_bytes!(env!("BPF_DNS_XDP_ELF"));
+            static DNS_XDP_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_DNS_XDP_ELF"));
             let xdp_bpf = Ebpf::load(DNS_XDP_ELF)?;
             Ok(Self { 
                 bpf: std::sync::Mutex::new(xdp_bpf),

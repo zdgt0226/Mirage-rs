@@ -52,34 +52,72 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      # === BPF compilation (shared by all targets) ===
+      # Compile BPF objects on the runner with the runner's clang BEFORE running
+      # cargo/cross build. This guarantees that:
+      #   1) ebpf-src/*.elf is valid (overwrites any stale committed fallback)
+      #   2) Even if cross container lacks clang and build.rs falls back to the
+      #      committed path, the fallback content is fresh and valid.
+      #   3) gnu build's build.rs has the same baseline (host clang) — eliminating
+      #      pre-built binary divergence between runs.
+      - name: Compile BPF objects (explicit)
+        run: |
+          set -euo pipefail
+          uname_m=$(uname -m)
+          mkdir -p ebpf-src
+          for src in sockmap dns_xdp transparent; do
+              echo "=== Compiling ebpf-src/${src}.c ==="
+              clang -O2 -g -target bpf \
+                  -I/usr/include/${uname_m}-linux-gnu \
+                  -c ebpf-src/${src}.c \
+                  -o ebpf-src/${src}.elf
+              llvm-strip --strip-debug ebpf-src/${src}.elf
+              # Hard verification — fail CI if any ELF is broken
+              file ebpf-src/${src}.elf | tee /tmp/file_${src}.txt
+              if ! grep -q "ELF.*eBPF" /tmp/file_${src}.txt; then
+                  echo "FATAL: ebpf-src/${src}.elf is not a valid BPF ELF" >&2
+                  exit 1
+              fi
+              readelf -h ebpf-src/${src}.elf | grep -E "Machine:.*Linux BPF" \
+                  || { echo "FATAL: wrong machine type for ${src}.elf" >&2; exit 1; }
+              size=$(stat -c%s ebpf-src/${src}.elf)
+              if [ "$size" -lt 200 ]; then
+                  echo "FATAL: ebpf-src/${src}.elf suspiciously small ($size bytes)" >&2
+                  exit 1
+              fi
+              echo "✓ ${src}.elf: $size bytes, valid BPF ELF"
+          done
+
       - name: Build Binary (Standard)
         if: "!contains(matrix.target, 'musl')"
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: |
+          set -euo pipefail
           cargo build --release --target ${{ matrix.target }} --features ebpf
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       - name: Build Binary (Musl via Cross)
         if: contains(matrix.target, 'musl')
         run: |
-          # 显式编译 BPF（不依赖 build.rs 隐式调用）
-          uname_m=$(uname -m)
-          for src in sockmap dns_xdp transparent; do
-              clang -O2 -g -target bpf -I/usr/include/${uname_m}-linux-gnu -c ebpf-src/${src}.c -o ebpf-src/${src}.elf
-              llvm-strip --strip-debug ebpf-src/${src}.elf
-              # 验证 ELF 合法性
-              file ebpf-src/${src}.elf
-              readelf -h ebpf-src/${src}.elf | grep -E "Machine|Class"
-              ls -la ebpf-src/${src}.elf
-          done
-
-          # 然后再 cross build
+          set -euo pipefail
           cross build --release --target ${{ matrix.target }} --features ebpf
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
-          # 二次验证 binary 里嵌的 ELF 数量（不严格但可用）
-          grep -aob $$'\x7fELF' mirage-rs-${{ matrix.arch }} | head -5
+      # Post-build: confirm the resulting binary actually embeds 3 ELF blobs
+      - name: Verify embedded BPF ELFs in artifact
+        run: |
+          set -euo pipefail
+          artifact="mirage-rs-${{ matrix.arch }}"
+          echo "=== ELF magic occurrences in $artifact (expect ≥ 3 for sockmap/dns_xdp/transparent) ==="
+          # ELF magic = \x7fELF. Use grep -aob to find all occurrences.
+          count=$(grep -aoc $'\x7fELF' "$artifact" || echo 0)
+          echo "Found $count ELF magic occurrences"
+          if [ "$count" -lt 3 ]; then
+              echo "FATAL: artifact missing embedded BPF ELFs (found $count, expected ≥ 3)" >&2
+              exit 1
+          fi
+          echo "✓ artifact embeds ≥ 3 ELF blobs"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
