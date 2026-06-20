@@ -20,8 +20,11 @@
 
 ### 1. 下载预编译版本 (推荐)
 前往项目的 [Releases 页面](#)，下载对应您系统架构的压缩包：
-*   **现代 Linux / Ubuntu / Debian / CentOS**：选择 `mirage-rs-amd64` (标准版) 或 `mirage-rs-amd64-musl` (最强静态版，哪怕 Debian 8 也能跑)。
-*   **ARM 架构 (如树莓派、甲骨文 ARM)**：选择 `mirage-rs-arm64-musl`。
+*   **推荐所有 Linux 用户**：`mirage-rs-amd64-musl` (静态链接, 不依赖宿主 glibc, 在所有现代 Linux 上"开箱即用")
+*   **gnu 动态链接版**：`mirage-rs-amd64` (要求 glibc ≥ 2.35, 即 Ubuntu 22.04+ / Debian 12+ / RHEL 9+)
+*   **ARM 架构** (树莓派 / 甲骨文 ARM 等)：`mirage-rs-arm64-musl`
+
+⚠️ **不论选哪个二进制, 你的内核版本必须 ≥ 5.10**。详见下方 [系统兼容性](#-系统兼容性) 矩阵。
 
 解压后，得到一个名为 `mirage` 的单文件可执行程序。
 
@@ -174,10 +177,42 @@ sudo modprobe tcp_brutal
 ### eBPF 性能巨兽开关（仅限 Linux 客户端/网关）
 我们在 `v0.2.x` 为核心路由链路植入了内核态网卡劫持。
 **启用条件**：
-1. 客户端系统为较新的 Linux (如 Ubuntu 22.04+, 具有 `libbpf` 支持)。
+1. 内核 ≥ 5.10 (sk_lookup 透明代理 + sockmap 加速 + XDP DNS 全部需要)。
 2. 使用 `sudo` 权限运行客户端 `sudo ./mirage client -c config...`
 3. 享受魔法：启动日志将提示 `[eBPF] XDP program successfully loaded and attached to primary interface`，并且您的 Neon 仪表盘上会出现耀眼的 **eBPF ENGINE: ONLINE**！它能直接在网卡接收端剥离解析包，无视系统网络栈延迟。
 
 ---
 
-*“在数字迷雾中构筑坚不可摧的幻象。” —— Mirage-rs 团队*
+## 🐧 系统兼容性
+
+Mirage-rs 是 **eBPF 原生**代理, 性能与隐蔽性深度依赖现代 Linux 内核能力。我们和 [dae](https://github.com/daeuniverse/dae) 一样选择**不为老内核做架构妥协** — 没有 TPROXY 后备模式, 没有 TUN 后备模式。
+
+### 内核版本要求
+
+| 内核版本 | 状态 | 说明 |
+|---|---|---|
+| **≥ 5.10** (LTS) | ✅ 全功能 | sk_lookup 透明代理 + sockmap splice + XDP DNS 全部可用 |
+| 5.9 | ⚠️ 边界版本 | sk_lookup 首版, 推荐升级至 5.10 LTS |
+| < 5.9 | ❌ 不支持 | 透明代理路径无法启动 |
+
+### 主流发行版查表
+
+| 发行版 | 默认内核 | 状态 |
+|---|---|---|
+| Debian 12 (Bookworm) | 6.1 | ✅ |
+| Debian 11 (Bullseye) | 5.10 | ✅ |
+| Debian 10 / 9 | 4.19 / 4.9 | ❌ |
+| Ubuntu 24.04 / 22.04 LTS | 6.8 / 5.15 | ✅ |
+| Ubuntu 20.04 LTS | 5.4 (HWE 内核可达 5.15) | ⚠️ 启用 HWE 后可用 |
+| Ubuntu 18.04 及更早 | < 5.4 | ❌ |
+| RHEL / Rocky / Alma 9 | 5.14 | ✅ |
+| RHEL / CentOS 8 | 4.18 (ELRepo 可装 kernel-ml) | ⚠️ 装 kernel-ml 后可用 |
+| RHEL / CentOS 7 | 3.10 | ❌ |
+| Alpine 3.18+ | 6.x | ✅ |
+| Arch Linux / Manjaro | 滚动最新 | ✅ |
+
+如果你需要 SOCKS5 / HTTP 普通入站, 老内核也能跑 (不启用 eBPF 模块即可), 但 v0.3 的透明代理核心特性会自动跳过。
+
+---
+
+*”在数字迷雾中构筑坚不可摧的幻象。” —— Mirage-rs 团队*
