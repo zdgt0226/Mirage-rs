@@ -48,8 +48,11 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
     // 默认的社区下载地址
     let mut geosite_url = "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat".to_string();
     let mut geoip_url = "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat".to_string();
-    
-    // 尝试读取现有的配置获取自定义参数
+
+    // 一次性扫一遍配置：取 tuning + 判断是否真的需要 geo 数据
+    // (服务端典型场景: outbounds=[], routing.rules=[] → geo 数据从不会被读 →
+    //  不下载，避免 25MB/天浪费 + 不向 GitHub 暴露指向 v2fly 仓库的可识别流量指纹)
+    let mut needs_geo = false;
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             if let Some(tuning) = config.tuning {
@@ -57,11 +60,19 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                 if let Some(s) = tuning.geosite_url { geosite_url = s; }
                 if let Some(i) = tuning.geoip_url { geoip_url = i; }
             }
+            // 仅当 routing.rules 真的引用 geosite / geoip 时才启动 updater
+            needs_geo = config.routing.rules.iter().any(|r|
+                !r.geosite.is_empty() || !r.geoip.is_empty()
+            );
         }
     }
 
-    // 启动 Geo 数据库自动下载与热更新任务
-    crate::router::geo_updater::spawn_updater(geodata_dir.clone(), geosite_url, geoip_url).await;
+    if needs_geo {
+        // 启动 Geo 数据库自动下载与热更新任务
+        crate::router::geo_updater::spawn_updater(geodata_dir.clone(), geosite_url, geoip_url).await;
+    } else {
+        info!("No geosite/geoip rules configured — skipping Geo data updater (saves bandwidth + avoids GitHub flow fingerprint).");
+    }
     
     // 如果 config.json 不存在，我们先写一个基础模板，避免启动直接崩溃
     if !std::path::Path::new(config_path).exists() {
