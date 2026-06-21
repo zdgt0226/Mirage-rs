@@ -119,11 +119,15 @@ async fn get_overview(State(state): State<AppState>) -> Json<Value> {
     let mut bpf_fallback = 0;
     let mut tunnel_count = 0usize;
     let mut brutal_cc_active = false;
+    // engine_online = sockmap/sockops 子系统在内核加载成功. 服务端没 XDP 但有 sockmap,
+    // 客户端两者都有. 之前 GUI 只看 xdp_attached 导致服务端永远 OFFLINE 误导用户.
+    let mut engine_online = false;
     if let Some(engine) = state.ebpf_engine {
         if let Ok(lock) = engine.try_lock() {
             if let Ok((s, f)) = lock.get_stats() {
                 bpf_success = s;
                 bpf_fallback = f;
+                engine_online = true; // get_stats 成功 = mirage_bpf_stats map 可读 = BPF 加载成功
             }
             if let Ok(tunnels) = lock.get_all_tunnel_stats() {
                 tunnel_count = tunnels.len();
@@ -142,6 +146,7 @@ async fn get_overview(State(state): State<AppState>) -> Json<Value> {
         "bpf_success": bpf_success,
         "bpf_fallback": bpf_fallback,
         "xdp_attached": xdp_attached,
+        "engine_online": engine_online,
         "tunnel_count": tunnel_count,
         "brutal_cc_active": brutal_cc_active,
     }))

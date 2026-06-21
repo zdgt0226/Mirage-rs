@@ -517,15 +517,21 @@
                 }
                 
                 // eBPF Status Indicator
+                // 之前只看 xdp_attached, 但服务端不挂 XDP (XDP 是客户端 DNS 拦截用),
+                // 服务端永远 OFFLINE 误导用户. 改成看 engine_online (sockmap/sockops
+                // 加载成功), 服务端和客户端都能正确显示.
                 const dot = document.getElementById('ebpfDot');
                 const text = document.getElementById('ebpfText');
-                if (data.xdp_attached === 1) {
+                if (data.engine_online === true) {
                     if (!dot.classList.contains('online')) {
                         dot.classList.add('online');
-                        text.innerText = 'eBPF ENGINE: ONLINE';
-                        text.style.color = '#10b981';
-                        text.style.textShadow = '0 0 10px rgba(16,185,129,0.5)';
                     }
+                    // 每次刷新都更新文案 (XDP 状态可能变化)
+                    text.innerText = data.xdp_attached === 1
+                        ? 'eBPF ENGINE: ONLINE (sockmap + XDP)'
+                        : 'eBPF ENGINE: ONLINE (sockmap)';
+                    text.style.color = '#10b981';
+                    text.style.textShadow = '0 0 10px rgba(16,185,129,0.5)';
                 } else {
                     dot.classList.remove('online');
                     text.innerText = 'eBPF ENGINE: OFFLINE';
