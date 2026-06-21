@@ -1,3 +1,4 @@
+pub mod brutal;
 pub mod pool;
 pub mod tunnel;
 pub mod socks5;

@@ -29,6 +29,7 @@ pub async fn start_server(
     password: &str,
     camouflage_host: &str,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
+    brutal_rate_bytes_per_sec: Option<u64>,
 ) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
@@ -38,6 +39,9 @@ pub async fn start_server(
         }
     };
     info!("Mirage Server listening on {}", listen_addr);
+    if let Some(bps) = brutal_rate_bytes_per_sec {
+        info!("Brutal CC enabled for downloads (server→client): {} Mbps", bps / 125_000);
+    }
 
     let password = password.to_string();
     loop {
@@ -50,6 +54,12 @@ pub async fn start_server(
                     if let Ok(mut e) = engine.try_lock() {
                         let _ = e.set_target_ip(peer_addr.ip());
                     }
+                }
+                // 控制 server→client 方向的发送速率 (下载速度). 这是代理用户
+                // 最关心的方向, 比客户端 outbound 那侧的 brutal 重要得多.
+                if let Some(rate) = brutal_rate_bytes_per_sec {
+                    use std::os::unix::io::AsRawFd;
+                    crate::proxy::brutal::apply_brutal(stream.as_raw_fd(), rate);
                 }
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();

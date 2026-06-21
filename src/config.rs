@@ -47,6 +47,11 @@ pub enum InboundConfig {
         port: u16,
         password: String,
         camouflage_host: Option<String>,
+        // 服务端 → 客户端 (下载) 方向的 brutal 速率上限, 单位 Mbps.
+        // 不设 (或 = 0) 则不启用 brutal, 走系统默认 CC (BBR/Cubic).
+        // Note: 服务端这一侧决定下载速度, 比客户端的 brutal 设置重要得多.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brutal_rate_mbps: Option<u64>,
     },
     Mixed {
         tag: String,

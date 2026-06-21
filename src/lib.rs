@@ -344,12 +344,16 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, .. } => {
+            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
                 let ebp = ebpf_clone.clone();
+                // 0 视为未启用 (兼容旧 install.sh 模板里写 0 表示 "no brutal")
+                let brutal_bps = brutal_rate_mbps
+                    .filter(|m| *m > 0)
+                    .map(|m| m * 125_000);
                 tokio::spawn(async move {
-                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp).await;
+                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps).await;
                 });
             }
             crate::config::InboundConfig::Mixed { listen, port, .. } => {
