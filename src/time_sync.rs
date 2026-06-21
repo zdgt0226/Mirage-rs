@@ -54,3 +54,129 @@ pub fn set_offset_from_server_time(server_time: u64) {
         tracing::debug!("TIME_SYNC: offset maintained at {}s", offset);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // TIME_OFFSET 是 process-global atomic, 并行测试会互相覆盖.
+    // 拿 Mutex 串行化, 每个测试运行期间独占 atomic.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn local_now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    fn reset_offset() {
+        TIME_OFFSET.store(0, Ordering::Relaxed);
+    }
+
+    /// 测完工后还原, 避免污染下一个测试 (即便它在隔壁文件).
+    struct OffsetGuard;
+    impl Drop for OffsetGuard {
+        fn drop(&mut self) {
+            TIME_OFFSET.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn positive_offset_accepted() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        set_offset_from_server_time(local + 5);
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!((4..=6).contains(&diff), "expected ~5s offset, got {}", diff);
+    }
+
+    #[test]
+    fn negative_offset_accepted() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        set_offset_from_server_time(local - 5);
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!((-6..=-4).contains(&diff), "expected ~-5s offset, got {}", diff);
+    }
+
+    #[test]
+    fn excessive_positive_offset_rejected() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        // > 1 day (86400s) → 被防御逻辑拒绝, offset 应保持 0
+        set_offset_from_server_time(local + 86401);
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!(diff.abs() <= 1, "offset should stay near 0 (rejected), got {}", diff);
+    }
+
+    #[test]
+    fn excessive_negative_offset_rejected() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        set_offset_from_server_time(local - 86401);
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!(diff.abs() <= 1, "offset should stay near 0 (rejected), got {}", diff);
+    }
+
+    #[test]
+    fn boundary_86400_accepted() {
+        // 边界值: offset == 86400 (exactly 1 day) 应该接受 (代码用 > 而非 >=)
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        set_offset_from_server_time(local + 86400);
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!((86399..=86401).contains(&diff),
+                "boundary 86400 should be accepted, got {}", diff);
+    }
+
+    #[test]
+    fn offset_overwrites_previous() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        set_offset_from_server_time(local + 10);
+        // 第二次同步应该覆盖第一次, 不是累加
+        set_offset_from_server_time(local + 20);
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!((19..=21).contains(&diff),
+                "expected ~20s after overwrite, got {}", diff);
+    }
+
+    #[test]
+    fn rejected_offset_preserves_previous_valid() {
+        // 已经同步到 +5s, 然后收到一个异常值 (>1 day), 应保留 +5s 不被冲掉
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local = local_now();
+        set_offset_from_server_time(local + 5);
+        set_offset_from_server_time(local + 200_000); // rejected
+
+        let diff = now_sec() as i64 - local_now() as i64;
+        assert!((4..=6).contains(&diff),
+                "rejected offset must not clobber prior valid +5s, got {}", diff);
+    }
+}
