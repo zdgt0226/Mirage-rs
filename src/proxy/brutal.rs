@@ -49,8 +49,14 @@ pub fn apply_brutal(fd: i32, rate_bytes_per_sec: u64) {
         }
 
         // 2. TCP_BRUTAL_PARAMS = { rate, cwnd_gain = 15 (=1.5x in 1/10 units) }
+        //
+        // 内核 apernet/tcp-brutal 模块的 struct brutal_params 是裸 C 定义,
+        // 自然 8 字节对齐 → sizeof = 16 (u64 + u32 + 4B trailing padding).
+        // setsockopt handler 校验 `optlen < sizeof(params) → -EINVAL`.
+        // 这里 #[repr(C)] 必须保持 NOT packed, 否则 Rust 算出 12 字节,
+        // 内核拒收, brutal rate 永远不生效, 静默退回 BBR/Cubic.
         const TCP_BRUTAL_PARAMS: libc::c_int = 23;
-        #[repr(C, packed)]
+        #[repr(C)]
         struct BrutalParams {
             rate: u64,
             cwnd_gain: u32,
