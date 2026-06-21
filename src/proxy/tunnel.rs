@@ -16,7 +16,11 @@ impl Tunnel {
             reader, 
             writer, 
             created_at: std::time::Instant::now(),
-            max_age_sec: 120 + fastrand::u64(0..60)
+            // 30 ~ 50s 随机抖动, 必须 < 服务端 first_chunk 超时 60s, 否则
+            // pool 会发出"服务端已 reap 但客户端以为还活着"的死 tunnel,
+            // 触发 handler 5 分钟级 read timeout (用户实测过).
+            // 抖动是为了避免大量 warmup 同时刷新冲垮服务端.
+            max_age_sec: 30 + fastrand::u64(0..20)
         }
     }
 

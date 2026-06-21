@@ -199,8 +199,20 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
         }
     }
 
-    // 4. Read first data chunk to determine TCP or UDP
-    let first_chunk = match tokio::time::timeout(std::time::Duration::from_secs(5), reader.recv_data()).await {
+    // 4. Read first data chunk to determine TCP or UDP.
+    //
+    // 60s 是这条连接握手完成到收到 target_header 的最大空闲时间. 设这么长
+    // 是为了配合客户端 WarmPool 的"预热长连"语义 — 客户端会持有空闲 tunnel
+    // 60s 内随时复用, 不能让服务端这边过早 (旧版 5s) 把它们 reap 掉, 否则
+    // pool 里全是"客户端以为活着、服务端已经关闭"的死 tunnel, 用户能复现
+    // "无响应 / 5 分钟后 handler timeout" 的诡异行为.
+    //
+    // 配合客户端 Tunnel::max_age_sec 上限 50s (见 src/proxy/tunnel.rs), 留
+    // 10s 余量, 保证 pool.get() 拿出来的 tunnel 在服务端这边一定还存活.
+    //
+    // DOS 防御: 这条 path 只在握手 (token 验证 + Poly1305 tag) 通过后才进
+    // 入, 攻击者拿不到 password 就过不了, 不构成 unauth 资源放大.
+    let first_chunk = match tokio::time::timeout(std::time::Duration::from_secs(60), reader.recv_data()).await {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {
             tracing::error!("Mirage Server: recv_data failed: {:?}", e);
