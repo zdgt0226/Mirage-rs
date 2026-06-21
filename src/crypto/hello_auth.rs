@@ -52,6 +52,13 @@ pub fn make_session_token(password: &str) -> [u8; 32] {
     token
 }
 
+/// Token 时间戳容忍窗口 (秒). v0.4 协议有内嵌时间同步, 不再需要 60s 的宽容窗口.
+/// ±10s 既能容忍 handshake 抖动 (RTT 几百毫秒), 又显著缩小重放攻击窗口.
+const TOKEN_TS_TOLERANCE_SECS: u64 = 10;
+
+/// ReplayCache 桶大小 (秒). 配合 TOKEN_TS_TOLERANCE_SECS 设置.
+const REPLAY_BUCKET_SECS: u64 = 10;
+
 pub struct TokenReplayCache {
     seen: Mutex<HashMap<u64, HashSet<Vec<u8>>>>,
 }
@@ -64,12 +71,12 @@ impl TokenReplayCache {
     }
 
     pub fn check_and_insert(&self, ts: u64, token: &[u8]) -> bool {
-        let current_bucket = ts / 60;
+        let current_bucket = ts / REPLAY_BUCKET_SECS;
         let mut cache = self.seen.lock().unwrap();
-        
-        // Retain only buckets within 2 minutes of the inserted ts (total 5 buckets = 300s window)
-        // Since ts is validated by the caller against time_sync, it accurately reflects true time.
-        cache.retain(|&k, _| (k as i64 - current_bucket as i64).abs() <= 2);
+
+        // 保留容忍窗口内的桶 (前后各 1 个 = 3 桶 × 10s = 30s 总窗口).
+        // 配合 v0.4 协议内嵌时间同步, 内存占用比旧 5×60s=300s 大幅下降.
+        cache.retain(|&k, _| (k as i64 - current_bucket as i64).abs() <= 1);
 
         let bucket = cache.entry(current_bucket).or_default();
         if bucket.len() > 100_000 {
@@ -108,8 +115,8 @@ pub fn verify_session_token(password: &str, token: &[u8; 32]) -> bool {
     
     let ts = u64::from_be_bytes(ts_bytes);
     let now = crate::time_sync::now_sec();
-    
-    if now > ts + 60 || ts > now + 60 {
+
+    if now > ts + TOKEN_TS_TOLERANCE_SECS || ts > now + TOKEN_TS_TOLERANCE_SECS {
         return false;
     }
     

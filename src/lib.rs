@@ -25,23 +25,10 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
 
     info!("Mirage-rs is starting...");
 
-    // 启动全局时间同步
-    if let Ok(content) = std::fs::read_to_string(config_path) {
-        if let Ok(cfg) = serde_json::from_str::<crate::config::Config>(&content) {
-            let mut py_host = None;
-            for out in &cfg.outbounds {
-                if let crate::config::OutboundConfig::Mirage { server, .. } = out {
-                    py_host = Some(server.clone());
-                    break;
-                }
-            }
-            if let Some(host) = py_host {
-                tokio::spawn(async move {
-                    crate::time_sync::start_time_sync(host).await;
-                });
-            }
-        }
-    }
+    // v0.4 协议: 时间同步从 NTP/HTTP 改为 server 在 handshake 后通过加密 channel
+    // 主动下发 (见 src/proxy/mirage_server.rs 和 src/proxy/pool.rs). 这里不再
+    // 启动后台 NTP 探测协程.
+
     // 启动 ConfigWatcher 监控配置热更新
     let mut geodata_dir = ".geosite".to_string();
 

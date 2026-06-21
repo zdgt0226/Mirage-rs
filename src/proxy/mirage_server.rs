@@ -166,13 +166,28 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
 
     // 3. Setup Crypto Stream
     let (read_half, write_half) = stream.into_split();
-    let (mut reader, writer) = crate::crypto::aead::create_crypto_pair(
+    let (mut reader, mut writer) = crate::crypto::aead::create_crypto_pair(
         read_half,
         write_half,
         &password,
         &client_random,
         false, // is_initiator = false (Server)
     );
+
+    // 3.5 v0.4 协议: 通过加密 channel 主动下发服务器时间, 让客户端无需 NTP/HTTP 探测.
+    //     帧格式: [0x01 type=TIME_SYNC][0x01 proto_ver][8B u64 BE server unix sec] = 10 字节
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut frame = [0u8; 10];
+        frame[0] = 0x01; // type = TIME_SYNC
+        frame[1] = 0x01; // proto version
+        frame[2..10].copy_from_slice(&now.to_be_bytes());
+        if let Err(e) = writer.send_data(&frame).await {
+            tracing::error!("Mirage Server: failed to send TIME_SYNC frame: {:?}", e);
+            return;
+        }
+    }
 
     // 4. Read first data chunk to determine TCP or UDP
     let first_chunk = match tokio::time::timeout(std::time::Duration::from_secs(5), reader.recv_data()).await {

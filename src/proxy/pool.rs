@@ -391,13 +391,38 @@ impl WarmPool {
         write_half.flush().await?;
 
         // 4. 派生会话密钥 (使用 client_random 作为 salt)
-        let (crypto_reader, crypto_writer) = create_crypto_pair(
+        let (mut crypto_reader, crypto_writer) = create_crypto_pair(
             read_half,
             write_half,
             &cfg.password,
             &client_random,
             true, // is_initiator = true (Client -> Server)
         );
+
+        // 5. v0.4 协议: 收 server 主动下发的 TIME_SYNC 帧, 写入全局 TIME_OFFSET.
+        //    帧格式: [0x01 type][0x01 ver][8B u64 BE server unix sec] = 10 字节
+        //    失败/超时降级: 用 local time 继续 (不阻塞连接), 仅 INFO 一次.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crypto_reader.recv_data()
+        ).await {
+            Ok(Ok(data)) if data.len() == 10 && data[0] == 0x01 && data[1] == 0x01 => {
+                let server_time = u64::from_be_bytes(data[2..10].try_into().unwrap());
+                crate::time_sync::set_offset_from_server_time(server_time);
+            }
+            Ok(Ok(data)) => {
+                tracing::warn!(
+                    "TIME_SYNC: unexpected frame (len={}, type={:?}), proceeding without sync",
+                    data.len(), data.first()
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("TIME_SYNC: recv failed: {:?}, proceeding without sync", e);
+            }
+            Err(_) => {
+                tracing::info!("TIME_SYNC: timeout waiting for server time (3s), proceeding with local time. Old server?");
+            }
+        }
 
         Ok(Tunnel::new(crypto_reader, crypto_writer))
     }
