@@ -1,5 +1,36 @@
 # Changelog - Mirage-rs
 
+## [v0.4.0-alpha.1] - In-band Time Sync + GUI BPF Tunnels API (2026-06-21)
+
+### ⚠️ Breaking Protocol Change (v0.3 ↔ v0.4 不兼容)
+- v0.4 服务端会在 crypto channel 建立后立即下发一帧 TIME_SYNC `[0x01][0x01][8B u64 BE]`. v0.3 客户端会把它误读为数据 → 必然挂. **两端必须同时升级**.
+- v0.4 客户端撞 v0.3 服务端: 优雅降级 — 3s 超时后 INFO 一条 "proceeding with local time", 仍能工作.
+
+### Protocol: In-band Time Sync (替代 NTP/HTTP 探测)
+- 服务端 handshake 完成后通过加密 channel 主动下发自己的 Unix 时间, 客户端写入全局 `TIME_OFFSET`. 0 外部依赖 + 0 指纹 + 自动校正漂移.
+- 删除 `src/time_sync.rs` 的 NTP/HTTP 探测代码 (~100 行) 和 `start_time_sync` 后台协程.
+- 删除 `chrono` 依赖 (仅旧 HTTP Date 解析用过).
+- Token 容忍 ±60s → **±10s**; ReplayCache 桶 5×60s=300s → **3×10s=30s** 窗口.
+
+### GUI: BPF Active Tunnels API
+- 新增 `/api/bpf/tunnels` endpoint, 返回 mirage_rtt_map 所有活跃 cookie 的 RTT/cwnd/重传/数据段数.
+- `/api/overview` 新增 `tunnel_count` + `brutal_cc_active` 字段.
+- 服务端 `mirage_server::start_server` accept 时把客户端 IP 登记到 BPF mirage_target_ips 白名单, 否则 RTT_CB 永远不写 map.
+
+### Deployment Fixes
+- **BPF ELF 对齐**: `aya::include_bytes_aligned!` 替代 `include_bytes!` (修 deployment "error parsing ELF data" 三处全部覆盖).
+- **CI 加固**: release.yml pin `ubuntu-22.04` (锁 glibc 2.35); 全 target BPF 编译硬验证 (file/readelf/size + post-build ELF magic).
+- **sockmap.c verifier 拒绝修复**: extract_ip 把 ctx 字段访问前置到直线代码, 避免 clang 分支合并优化产出 "dereference of modified ctx ptr" 模式.
+
+### UX / Quality
+- 服务端不下载 25MB geo 数据 (按 routing.rules 是否引用 geosite/geoip 条件化).
+- TCP brutal CC 默认关闭, 配置了 `brutal_rate_mbps` 才尝试启用 (消除大多数用户启动时的 WARN 噪音).
+- SockOps 失败时输出具体步骤 (program lookup → type cast → load → cgroup attach), 不再用 catch-all WARN 掩盖真因.
+- 非 root 跑客户端时 RTT WARN 降级 INFO + 提示 setcap.
+- README 加入内核 ≥ 5.10 兼容性矩阵 + Alpine 内核配置章节 (CGROUP_BPF 等).
+- install.sh 客户端默认 `mixed` inbound + 监听 `0.0.0.0`.
+- 测试 5 → 25 (新增 tests/test_fake_ip.rs + tests/test_sniff.rs).
+
 ## [v0.2.3-alpha] - XDP DNS Acceleration & Fine-Grained CC (2026-06-17)
 
 ### XDP DNS Acceleration (Zero-Copy Bypass)
