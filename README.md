@@ -208,11 +208,42 @@ Mirage-rs 是 **eBPF 原生**代理, 性能与隐蔽性深度依赖现代 Linux 
 | RHEL / Rocky / Alma 9 | 5.14 | ✅ |
 | RHEL / CentOS 8 | 4.18 (ELRepo 可装 kernel-ml) | ⚠️ 装 kernel-ml 后可用 |
 | RHEL / CentOS 7 | 3.10 | ❌ |
-| Alpine 3.18+ | 6.x | ✅ |
+| Alpine 3.18+ | 6.x | ⚠️ 需手动开启 BPF 内核配置, 见下方 |
 | Arch Linux / Manjaro | 滚动最新 | ✅ |
 
 如果你需要 SOCKS5 / HTTP 普通入站, 老内核也能跑 (不启用 eBPF 模块即可), 但 v0.3 的透明代理核心特性会自动跳过。
 
+### Alpine Linux 内核要求 ⚠️
+
+Alpine 默认的 `linux-lts` / `linux-virt` 内核**关闭了 BPF cgroup 子系统** (`CONFIG_CGROUP_BPF=n`), 导致 SockOps 加载时 `bpf_link_create failed`。Mirage-rs 启动会跑起来, 但 RTT 监控 + Brutal CC 动态速率全部失效。
+
+完整启用步骤参考 [dae 的 Alpine 教程](https://github.com/daeuniverse/dae/blob/main/docs/en/tutorials/run-on-alpine.md), 关键的内核配置:
+
+```
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_CGROUP_BPF=y          # ← Alpine 默认 =n, 必须开
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_BTF=y      # ← BTF 调试信息, CO-RE 用
+CONFIG_BPF_STREAM_PARSER=y   # ← sockmap splice 需要
+CONFIG_NET_INGRESS=y
+CONFIG_NET_EGRESS=y
+CONFIG_NET_CLS_BPF=m
+CONFIG_NET_CLS_ACT=y
+CONFIG_BPF_EVENTS=y
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+```
+
+验证当前内核是否支持:
+
+```sh
+zcat /proc/config.gz | grep -E 'CGROUP_BPF|BPF_SYSCALL|DEBUG_INFO_BTF|BPF_STREAM_PARSER'
+```
+
+如果上面输出有 `=n` 或没有, 你需要从 alpine-aports 源码重编内核, 或换用 `daeuniverse/dae` 仓库提供的预编译 Alpine 内核包。
+
 ---
 
-*”在数字迷雾中构筑坚不可摧的幻象。” —— Mirage-rs 团队*
+*"在数字迷雾中构筑坚不可摧的幻象。" —— Mirage-rs 团队*

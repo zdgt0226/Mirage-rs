@@ -240,8 +240,9 @@ config_client() {
     local pwd=$(ask "认证密码" "")
     local sni=$(ask_camouflage_host "www.apple.com")
     
-    local socks_port=$(ask "本地 Socks5 监听端口" "1080")
-    
+    local inbound_port=$(ask "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080")
+    local inbound_listen=$(ask "本地代理监听地址 (LAN 共享用 0.0.0.0; 仅本机用 127.0.0.1)" "0.0.0.0")
+
     local pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
     
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
@@ -254,10 +255,10 @@ config_client() {
     "log_level": "${log_str}",
     "inbounds": [
         {
-            "type": "socks",
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": ${socks_port}
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "${inbound_listen}",
+            "port": ${inbound_port}
         }
     ],
     "outbounds": [
