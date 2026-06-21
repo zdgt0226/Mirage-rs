@@ -360,8 +360,9 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
             crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
+                let ebp = ebpf_clone.clone();
                 tokio::spawn(async move {
-                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host).await;
+                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp).await;
                 });
             }
             crate::config::InboundConfig::Mixed { listen, port, .. } => {

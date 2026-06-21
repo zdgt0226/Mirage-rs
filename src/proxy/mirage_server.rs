@@ -24,7 +24,12 @@ impl Drop for IpSlotGuard {
 use tracing::{debug, error, info, warn};
 use std::sync::Arc;
 
-pub async fn start_server(listen_addr: &str, password: &str, camouflage_host: &str) {
+pub async fn start_server(
+    listen_addr: &str,
+    password: &str,
+    camouflage_host: &str,
+    ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
+) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -38,6 +43,14 @@ pub async fn start_server(listen_addr: &str, password: &str, camouflage_host: &s
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                // 把客户端 IP 登记到 BPF mirage_target_ips 白名单, 让 sockops
+                // RTT_CB 收集这条连接的 RTT/cwnd/重传 (没登记的连接 BPF 直接
+                // return 0 不写 map). 用 try_lock 避免阻塞 accept 循环.
+                if let Some(engine) = &ebpf_engine {
+                    if let Ok(mut e) = engine.try_lock() {
+                        let _ = e.set_target_ip(peer_addr.ip());
+                    }
+                }
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();
                 tokio::spawn(async move {
