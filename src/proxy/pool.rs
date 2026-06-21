@@ -313,20 +313,23 @@ impl WarmPool {
                 }
             }
             
-            // 3. Brutal 拥塞控制: 设置 TCP_CONGESTION 为 brutal (如果内核支持)
-            let brutal = b"brutal\0";
-            let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, brutal.as_ptr() as *const libc::c_void, 7);
-            
-            if ret < 0 {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static BRUTAL_WARNED: AtomicBool = AtomicBool::new(false);
-                let err = std::io::Error::last_os_error();
-                if !BRUTAL_WARNED.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "TCP brutal congestion control not available ({}). \
-                         Install `hysteria-tcp-brutal-dkms` for full Brutal performance.", err);
-                }
-            } else if brutal_state.configured_rate.is_some() {
+            // 3. Brutal 拥塞控制: 默认关闭. 仅当 config 显式配了 brutal_rate_mbps
+            // (= configured_rate.is_some()) 才尝试切到 brutal CC. 之前无条件尝试,
+            // 没装 hysteria-tcp-brutal-dkms 的用户启动就刷 WARN — 现在沉默.
+            if brutal_state.configured_rate.is_some() {
+                let brutal = b"brutal\0";
+                let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, brutal.as_ptr() as *const libc::c_void, 7);
+
+                if ret < 0 {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static BRUTAL_WARNED: AtomicBool = AtomicBool::new(false);
+                    let err = std::io::Error::last_os_error();
+                    if !BRUTAL_WARNED.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "Configured brutal_rate_mbps but TCP brutal CC not available ({}). \
+                             Install `hysteria-tcp-brutal-dkms` or remove brutal_rate_mbps from config.", err);
+                    }
+                } else {
                 let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
                 
                 let mut name = [0u8; 16];
@@ -363,6 +366,7 @@ impl WarmPool {
                 } else {
                     tracing::debug!("TCP_CONGESTION not set to brutal, skipping TCP_BRUTAL_PARAMS.");
                 }
+                }  // close inner `} else {` opened above
             }
         }
         // ------------------------------------------------
