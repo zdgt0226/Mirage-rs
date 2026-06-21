@@ -313,60 +313,13 @@ impl WarmPool {
                 }
             }
             
-            // 3. Brutal 拥塞控制: 默认关闭. 仅当 config 显式配了 brutal_rate_mbps
-            // (= configured_rate.is_some()) 才尝试切到 brutal CC. 之前无条件尝试,
-            // 没装 hysteria-tcp-brutal-dkms 的用户启动就刷 WARN — 现在沉默.
+            // 3. Brutal 拥塞控制 (客户端 → 服务端方向, 控制上传速度).
+            // 默认关闭: 仅当 config 显式配了 brutal_rate_mbps 才启用.
+            // 动态速率调节 (基于 BPF RTT 反馈) 在另一处循环里维护, 见
+            // BrutalState::current_rate 的所有 store 调用点.
             if brutal_state.configured_rate.is_some() {
-                let brutal = b"brutal\0";
-                let ret = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, brutal.as_ptr() as *const libc::c_void, 7);
-
-                if ret < 0 {
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    static BRUTAL_WARNED: AtomicBool = AtomicBool::new(false);
-                    let err = std::io::Error::last_os_error();
-                    if !BRUTAL_WARNED.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(
-                            "Configured brutal_rate_mbps but TCP brutal CC not available ({}). \
-                             Install `hysteria-tcp-brutal-dkms` or remove brutal_rate_mbps from config.", err);
-                    }
-                } else {
                 let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
-                
-                let mut name = [0u8; 16];
-                let mut name_len = name.len() as libc::socklen_t;
-                libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_CONGESTION, name.as_mut_ptr() as *mut libc::c_void, &mut name_len);
-                
-                let nul_pos = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-                if &name[..nul_pos] == b"brutal" {
-                    const TCP_BRUTAL_PARAMS: libc::c_int = 23;
-                    #[repr(C, packed)]
-                    struct BrutalParams { rate: u64, cwnd_gain: u32 }
-                    
-                    const CWND_GAIN_X10: u32 = 15;
-                    let params = BrutalParams { rate: current_rate, cwnd_gain: CWND_GAIN_X10 };
-                    
-                    let pret = libc::setsockopt(
-                        fd, 
-                        libc::IPPROTO_TCP, 
-                        TCP_BRUTAL_PARAMS,
-                        &params as *const _ as *const libc::c_void,
-                        std::mem::size_of::<BrutalParams>() as libc::socklen_t
-                    );
-                    
-                    if pret < 0 {
-                        use std::sync::atomic::{AtomicBool, Ordering};
-                        static BRUTAL_PARAMS_WARNED: AtomicBool = AtomicBool::new(false);
-                        let err = std::io::Error::last_os_error();
-                        if !BRUTAL_PARAMS_WARNED.swap(true, Ordering::Relaxed) {
-                            tracing::warn!(
-                                "Failed to set TCP_BRUTAL_PARAMS ({}). \
-                                 Possible causes: tcp-brutal module version mismatch, kernel TCP_FASTOPEN collision.", err);
-                        }
-                    }
-                } else {
-                    tracing::debug!("TCP_CONGESTION not set to brutal, skipping TCP_BRUTAL_PARAMS.");
-                }
-                }  // close inner `} else {` opened above
+                crate::proxy::brutal::apply_brutal(fd, current_rate);
             }
         }
         // ------------------------------------------------
