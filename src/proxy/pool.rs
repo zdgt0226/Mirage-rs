@@ -201,18 +201,37 @@ impl WarmPool {
                     debug!("WarmPool Manager: Elastic resizing target {} -> {} (RPS: {})", old_target, calculated_target, rps);
                 }
 
-                // 闲置连接裁剪机制：如果池中闲置连接远大于目标，则主动销毁过剩连接释放资源
                 let mut q = q_clone.lock().await;
                 let mut to_drop = Vec::new();
+
+                // Pass 1: 主动 evict 已过 max_age 的 tunnel.
+                // pool.get() 也会检查 max_age, 但只在用户发请求时触发. 如果用户
+                // 长时间不发请求, idle warmup 永远等不到 pool.get() 检查 → 服务端
+                // 60s 超时 reap → 日志刷 ERROR. 这里主动每 2s 扫一次, 让客户端
+                // 提前 send_close_notify 优雅关闭, 服务端识别为 graceful 不报错.
+                // (tunnel.created_at 是 std::time::Instant, 用 .elapsed() 而不是
+                // tokio::time::Instant::now().duration_since())
+                let mut alive = std::collections::VecDeque::with_capacity(q.len());
+                for tunnel in q.drain(..) {
+                    if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
+                        to_drop.push(tunnel);
+                    } else {
+                        alive.push_back(tunnel);
+                    }
+                }
+                *q = alive;
+
+                // Pass 2: 闲置连接裁剪 — 池中闲置连接远大于目标, 主动销毁过剩连接释放资源
                 while q.len() > calculated_target + 2 {
                     if let Some(tunnel) = q.pop_back() {
                         to_drop.push(tunnel);
                     }
                 }
+
                 for mut tunnel in to_drop {
                     tokio::spawn(async move {
                         let _ = tunnel.writer.send_close_notify().await;
-                        debug!("WarmPool Manager: Pruned excess idle connection.");
+                        debug!("WarmPool Manager: Closed expired/excess tunnel.");
                     });
                 }
             }

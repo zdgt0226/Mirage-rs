@@ -215,11 +215,21 @@ async fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, passwor
     let first_chunk = match tokio::time::timeout(std::time::Duration::from_secs(60), reader.recv_data()).await {
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {
-            tracing::error!("Mirage Server: recv_data failed: {:?}", e);
+            // close_notify 是客户端主动优雅关闭 (warmup expire 时 pool sweeper 触发),
+            // 不算错误. 其他 (crypto 解密失败 / 意外 EOF / 协议违反) 才算真错误.
+            let msg = e.to_string();
+            if msg.contains("close_notify") {
+                tracing::debug!("Mirage Server: warmup gracefully closed by client");
+            } else {
+                tracing::error!("Mirage Server: recv_data failed: {:?}", e);
+            }
             return;
         }
         Err(_) => {
-            tracing::error!("Mirage Server: recv_data timed out!");
+            // 60s idle 后客户端仍没发数据 → 预期清理路径 (理论上不会触发, 因为
+            // 客户端 sweeper 30-50s 内就会主动 close. 若真触发说明客户端 sweeper
+            // 没跑或者大幅延迟, DEBUG 即可, 别刷 ERROR).
+            tracing::debug!("Mirage Server: idle warmup reaped after 60s (client sweeper missed)");
             return;
         }
     };
