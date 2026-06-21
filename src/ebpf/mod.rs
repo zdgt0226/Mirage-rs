@@ -60,6 +60,9 @@ mod sys {
             program.attach(&sockmap_fd)?;
             
             // Try attaching sockops for RTT monitoring — report the actual failure step.
+            // 非 root + 无 CAP_BPF 的常见场景 (用户自己跑客户端) 失败是预期, 降级为 INFO
+            // 不刷 WARN; 真正 root 还失败才用 WARN.
+            let is_root = unsafe { libc::geteuid() } == 0;
             let mut sockops_attached = false;
             let sockops_diag: String = match bpf.program_mut("mirage_sockops") {
                 None => "program `mirage_sockops` not found in BPF ELF (section name mismatch?)".to_string(),
@@ -103,7 +106,15 @@ mod sys {
                 },
             };
             if !sockops_attached {
-                tracing::warn!("RTT monitoring unavailable: {}", sockops_diag);
+                if is_root {
+                    tracing::warn!("RTT monitoring unavailable: {}", sockops_diag);
+                } else {
+                    tracing::info!(
+                        "RTT monitoring disabled (non-root): {}. Brutal CC will run in static-rate mode. \
+                         Run as root or `sudo setcap cap_bpf,cap_net_admin+ep <binary>` to enable.",
+                        sockops_diag
+                    );
+                }
             }
             
             info!("eBPF Engine initialized! Waiting for registrations.");
