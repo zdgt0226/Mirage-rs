@@ -1,5 +1,29 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.1] - Active BPF Tunnels Dashboard + BPF struct 扩展 (2026-06-22)
+
+### feat(gui): Active BPF Tunnels 表格 + Brutal CC 指示灯
+- Neon Dashboard 新增 "Active BPF Tunnels" 面板, 实时展示每条 BPF 跟踪的 TCP tunnel: Remote 地址 / RTT (ms, < 50 绿 / < 150 黄 / > 150 红) / Retrans 重传 / 趋势箭头 (↑↓→, JS 5 点滚动窗口跟前次比 ±10%).
+- 行可点击展开详情: cookie 16-hex / cwnd / data_segs (调试视角).
+- 1Hz 轮询 `/api/bpf/tunnels`. LRU 淘汰的 cookie 自动从前端历史 Map GC.
+- 顶部状态条新增 "Brutal CC: ACTIVE/STATIC" 指示灯 (跟 eBPF ENGINE 并列). ACTIVE = 任一 tunnel `srtt_us > 0` (sock_ops RTT_CB 已生效).
+
+### BPF struct 扩展 (sockmap.c::tcp_state)
+- 加 `remote_ip[4]` (IPv4 在 `[0]`, IPv6 全 4 个 u32) + `remote_port` (u16) + `family` (u16). size: 16 → 36 字节.
+- Rust `TcpState` 严格对齐, C/Rust offset_of! 实测一致, sizeof 均 36.
+- `mirage_sockops` 沿用"ctx 字段全部 prefetch 到 locals"防御写法 (避免 v0.4.0 那个 verifier "modified ctx ptr" 坑). llvm-objdump 字节码确认无 modified ctx ptr 模式.
+
+### API
+- `/api/bpf/tunnels` 新增 `remote` 字段: 格式化成 `"192.0.2.5:443"` / `"[2001:db8::1]:443"` / `"?:?"`. IPv4 字节序: 内核 network byte order u32, 小端机加载后 `b0 = raw & 0xff` 即第一个 octet, 验证 1.2.3.4 解码无误.
+- `cookie` 字段从 JSON Number 改成 JSON String 序列化, 避开 JS Number 2^53 精度上限 (理论纰漏, 物理不可触发但 belt-and-suspenders).
+
+### 设计权衡声明 (重要)
+当前 BPF `target_ips` 白名单仅登记: 客户端 → mirage 服务器 IP / 服务端 ← 客户端 IP. **不跟踪 upstream 业务连接** (github.com / youtube 等). 因此 Active Tunnels 表格里:
+- 客户端: 全部 N 行 remote = mirage 服务器 IP (反映 WarmPool 健康度)
+- 服务端: 各客户端 IP (反映谁在连接)
+
+想展示业务目标域名需新增"服务端给每个 upstream 连接也注册 target_ips + 反向关联 cookie"那套, 单独立项.
+
 ## [v0.4.3-alpha.1] - 多源 Geo + 骨架重构 + 反馈算法 (2026-06-22)
 
 ### ⚠️ Breaking Schema Change (alpha 期硬升级, 无向后兼容)

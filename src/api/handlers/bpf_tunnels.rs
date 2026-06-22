@@ -51,7 +51,10 @@ pub async fn get_bpf_tunnels(State(state): State<AppState>) -> Json<Value> {
             if let Ok(entries) = lock.get_all_tunnel_stats() {
                 tunnels = entries.into_iter().map(|(cookie, s)| {
                     json!({
-                        "cookie": cookie,
+                        // 序列化为字符串避免 JSON Number 在 JS 端的 2^53 精度上限.
+                        // 实际触发要 SO_COOKIE > 9e15, 物理不可能, 但 belt-and-suspenders
+                        // 让前端用 BigInt(string) 完整接收 u64.
+                        "cookie": cookie.to_string(),
                         "remote": format_remote(s.remote_ip, s.remote_port, s.family),
                         "rtt_ms": s.srtt_us as f64 / 1000.0,
                         "cwnd": s.snd_cwnd,
