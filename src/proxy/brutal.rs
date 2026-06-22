@@ -48,15 +48,21 @@ pub fn apply_brutal(fd: i32, rate_bytes_per_sec: u64) {
             return;
         }
 
-        // 2. TCP_BRUTAL_PARAMS = { rate, cwnd_gain = 15 (=1.5x in 1/10 units) }
+        // 2. TCP_BRUTAL_PARAMS — 注意两件事:
         //
-        // 内核 apernet/tcp-brutal 模块的 struct brutal_params 是裸 C 定义,
-        // 自然 8 字节对齐 → sizeof = 16 (u64 + u32 + 4B trailing padding).
-        // setsockopt handler 校验 `optlen < sizeof(params) → -EINVAL`.
-        // 这里 #[repr(C)] 必须保持 NOT packed, 否则 Rust 算出 12 字节,
-        // 内核拒收, brutal rate 永远不生效, 静默退回 BBR/Cubic.
-        const TCP_BRUTAL_PARAMS: libc::c_int = 23;
-        #[repr(C)]
+        // (a) 常量值 = 23301, 不是 23. 23 是 Linux 标准 TCP_FASTOPEN, 内核协议
+        //     栈会先吃掉这个 opt, 我们的 brutal 模块根本看不到. TCP_FASTOPEN
+        //     在 ESTABLISHED 状态下直接返 -EINVAL → 之前 v0.x 的 brutal CC
+        //     全部 100% 静默失败. apernet/tcp-brutal 官方源码定义为 23301
+        //     以避开冲突. 实测验证 https://github.com/apernet/tcp-brutal.
+        //
+        // (b) struct 必须 #[repr(C, packed)] (12 字节, 不是 16). 内核源码
+        //     struct brutal_params { u64 rate; u32 cwnd_gain; } __packed;
+        //     sizeof = 12. 我们这边 Rust 也要 packed 才完全对齐. 之前
+        //     v0.4.1-alpha.1 把 packed 去掉是基于第三方分析的误判, 实测
+        //     拿 brutal.c 上游源码确认内核确实 __packed.
+        const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
+        #[repr(C, packed)]
         struct BrutalParams {
             rate: u64,
             cwnd_gain: u32,

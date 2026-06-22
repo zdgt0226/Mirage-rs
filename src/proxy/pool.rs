@@ -446,12 +446,11 @@ impl WarmPool {
         
         tokio::task::spawn_blocking(move || {
             for fd in fds {
-                const TCP_BRUTAL_PARAMS: libc::c_int = 23;
-                // #[repr(C)] 必须保持 NOT packed — 内核裸 struct 自然 8 字节对齐
-                // sizeof=16 (u64+u32+4B padding). packed 让 Rust 算成 12, 内核
-                // 校验 optlen<sizeof 直接 -EINVAL, brutal rate 永远不生效.
-                // 详见 src/proxy/brutal.rs 同一处的长注释.
-                #[repr(C)]
+                // 常量 23301 (非 23, 23 = TCP_FASTOPEN), struct packed (12B 匹
+                // 配内核 __packed). 详见 src/proxy/brutal.rs apply_brutal 的长
+                // 注释 + 实测上游源码确认.
+                const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
+                #[repr(C, packed)]
                 struct BrutalParams { rate: u64, cwnd_gain: u32 }
                 const CWND_GAIN_X10: u32 = 15;
                 let params = BrutalParams { rate: new_rate, cwnd_gain: CWND_GAIN_X10 };
