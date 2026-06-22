@@ -142,9 +142,17 @@ pub(crate) fn decide_new_target(
         (cur_target + increment).min(max_size)
     } else if wait_ratio == 0.0
         && expired_unused >= total_gets / 2
-        && total_gets > 0  // 完全无流量时不缩 (保留最低 idle)
         && cur_target > 2
     {
+        // 缩容触发条件:
+        // - 无任何等待 (wait_ratio = 0): 池子供给充足
+        // - expired ≥ gets/2: 建货量远超消费 (或纯 idle 期 gets=0, expired ≥ 0 恒成立)
+        // - cur_target > 2: 保留最低 idle floor
+        //
+        // 注意: 不能加 `total_gets > 0` 守护! 否则高峰期池子涨到 40 后用户睡觉
+        // 流量归零 → total_gets=0 → 跳过缩容 → builder 永远维持 40 个 idle 连接
+        // → max_age 到期 sweeper 杀 → builder 又建 → 一整夜烧 CPU 握手. floor=2
+        // 由 cur_target > 2 兜底, 不需要额外的 traffic 守护.
         cur_target - 1
     } else {
         cur_target
@@ -156,10 +164,18 @@ mod feedback_tests {
     use super::*;
 
     #[test]
-    fn idle_keeps_target() {
-        // 完全无流量 (total_gets=0): 不动
+    fn idle_at_floor_stays() {
+        // 完全无流量 + cur_target 已在 floor=2: 不动 (floor 保护)
         assert_eq!(decide_new_target(2, 0, 0, 0, 50), 2);
-        assert_eq!(decide_new_target(5, 0, 0, 0, 50), 5);
+    }
+
+    #[test]
+    fn idle_above_floor_drains() {
+        // 完全无流量 + cur_target > 2: 缓慢缩容 (每周期 -1) 直到 floor.
+        // 修复 #2 (前版 buggy 加了 total_gets > 0 守护, 导致高峰后池子锁死).
+        assert_eq!(decide_new_target(5, 0, 0, 0, 50), 4);
+        // 多周期连续应用最终收敛到 2:
+        assert_eq!(decide_new_target(3, 0, 0, 0, 50), 2);
     }
 
     #[test]
@@ -198,9 +214,10 @@ mod feedback_tests {
     }
 
     #[test]
-    fn no_traffic_no_shrink() {
-        // total_gets=0 时即便有 expired_unused 也不缩 (保留最低 idle)
-        assert_eq!(decide_new_target(5, 0, 0, 10, 50), 5);
+    fn no_traffic_with_expired_drains() {
+        // 无流量 + 有 expired (高峰后池子滞留, idle 期 max_age 到期被 sweeper 收掉):
+        // 应该立刻缩容 -1, 之后多周期收敛到 floor=2. 修复 #2: 资源燃烧 bug.
+        assert_eq!(decide_new_target(5, 0, 0, 10, 50), 4);
     }
 
     #[test]
