@@ -323,12 +323,24 @@ config_client() {
     },
     "tuning": {
         "geodata_dir": "${ETC_DIR}/geosite",
-        "geosite_url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
-        "geoip_url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
+        "geo_sources": [
+            {
+                "name": "geosite",
+                "kind": "geosite",
+                "url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
+                "via": "direct"
+            },
+            {
+                "name": "geoip",
+                "kind": "geoip",
+                "url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
+                "via": "direct"
+            }
+        ]
     }
 }
 EOF
-    
+
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
     setup_systemd "client"
     

@@ -32,25 +32,38 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     // 启动 ConfigWatcher 监控配置热更新
     let mut geodata_dir = ".geosite".to_string();
 
-    // 默认的社区下载地址
-    let mut geosite_url = "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat".to_string();
-    let mut geoip_url = "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat".to_string();
-
-    // 一次性扫一遍配置：取 tuning + 判断是否真的需要 geo 数据 + 取 ebpf_mode
+    // 一次性扫一遍配置: 取 tuning + 判断是否真的需要 geo 数据 + 取 ebpf_mode +
+    // 探测本地 socks/mixed inbound 端口 (供 geo_sources via=proxy 使用)
     let mut needs_geo = false;
     let mut ebpf_mode = crate::config::EbpfMode::Auto;
+    let mut geo_sources: Vec<crate::config::GeoSource> = Vec::new();
+    let mut geo_update_days: u32 = 7;
+    let mut socks_proxy_url: Option<String> = None;
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             if let Some(tuning) = config.tuning {
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }
-                if let Some(s) = tuning.geosite_url { geosite_url = s; }
-                if let Some(i) = tuning.geoip_url { geoip_url = i; }
                 if let Some(m) = tuning.ebpf_mode { ebpf_mode = m; }
+                geo_sources = tuning.geo_sources;
+                if let Some(d) = tuning.geo_update_days { geo_update_days = d; }
             }
             // 仅当 routing.rules 真的引用 geosite / geoip 时才启动 updater
             needs_geo = config.routing.rules.iter().any(|r|
                 !r.geosite.is_empty() || !r.geoip.is_empty()
             );
+
+            // 探测本地 socks/mixed inbound 给 geo via=proxy 用. 0.0.0.0 自动改 127.0.0.1
+            // (本地自连不能用通配地址).
+            for ib in &config.inbounds {
+                let (listen, port) = match ib {
+                    crate::config::InboundConfig::Socks { listen, port, .. } => (listen, port),
+                    crate::config::InboundConfig::Mixed { listen, port, .. } => (listen, port),
+                    _ => continue,
+                };
+                let host = if listen == "0.0.0.0" || listen == "::" { "127.0.0.1" } else { listen.as_str() };
+                socks_proxy_url = Some(format!("socks5://{}:{}", host, port));
+                break;
+            }
         }
     }
 
@@ -77,9 +90,17 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         }
     };
 
-    if needs_geo {
-        // 启动 Geo 数据库自动下载与热更新任务
-        crate::router::geo_updater::spawn_updater(geodata_dir.clone(), geosite_url, geoip_url).await;
+    if needs_geo && !geo_sources.is_empty() {
+        // 启动 Geo 数据库自动下载与热更新任务 (多源 + via direct/proxy)
+        crate::router::geo_updater::spawn_updater(
+            geodata_dir.clone(),
+            geo_sources,
+            geo_update_days,
+            socks_proxy_url,
+        ).await;
+    } else if needs_geo {
+        warn!("Routing rules reference geosite/geoip but `tuning.geo_sources` is empty. \
+               No geo data will be downloaded — rules referencing geo data will not match.");
     } else {
         info!("No geosite/geoip rules configured — skipping Geo data updater (saves bandwidth + avoids GitHub flow fingerprint).");
     }

@@ -209,8 +209,6 @@ pub struct ApiConfig {
 #[derive(Debug, Deserialize)]
 pub struct TuningConfig {
     pub geodata_dir: Option<String>,
-    pub geosite_url: Option<String>,
-    pub geoip_url: Option<String>,
     pub decision_cache_max_entries: Option<usize>,
     pub tcp_keepalive: Option<u64>,
     /// eBPF 加载策略. 默认 Auto (根据 CLI 子命令决定):
@@ -222,6 +220,18 @@ pub struct TuningConfig {
     /// - `off`: 不论 client/server 都跳过.
     #[serde(default)]
     pub ebpf_mode: Option<EbpfMode>,
+
+    /// 多源 Geo 数据下载. 每个 source 独立指定 URL + via (direct/proxy).
+    /// 下载后保存为 `<name>.dat`. 路由规则引用形如 `geosite: ["loyalsoldier.dat:cn"]`
+    /// 或借助 `routing.geo_alias` 起短名 (例如 `{"ls": "loyalsoldier.dat"}`,
+    /// 之后规则写 `geosite: ["ls:cn"]`).
+    ///
+    /// v0.4.3 起替代旧的 `geosite_url` + `geoip_url` 单 URL 字段.
+    #[serde(default)]
+    pub geo_sources: Vec<GeoSource>,
+
+    /// Geo 文件更新检查间隔 (天). 默认 7.
+    pub geo_update_days: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +240,35 @@ pub enum EbpfMode {
     Auto,
     Force,
     Off,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GeoSource {
+    /// 文件名 (不含 .dat 后缀, 自动加). 必须在 geo_sources 内唯一.
+    pub name: String,
+    /// 数据类型: geosite (域名规则) 或 geoip (IP CIDR 规则).
+    pub kind: GeoKind,
+    /// 下载 URL (通常是 GitHub release).
+    pub url: String,
+    /// 下载通道: direct (默认, 直连) 或 proxy (走客户端本地 socks/mixed inbound).
+    /// 国内服务器拉 GitHub 可设 proxy, 客户端通常 direct 即可 (除非 GitHub 被屏).
+    #[serde(default)]
+    pub via: GeoVia,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GeoKind {
+    Geosite,
+    Geoip,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GeoVia {
+    #[default]
+    Direct,
+    Proxy,
 }
 
 fn default_schema_version() -> u32 {
