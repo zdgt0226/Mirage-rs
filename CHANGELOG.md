@@ -1,5 +1,31 @@
 # Changelog - Mirage-rs
 
+## [v0.4.2-alpha.1] - 服务端 eBPF 自动跳过 + WarmPool 反馈算法 (2026-06-22)
+
+### feat(pool): WarmPool 反馈式弹性算法
+- 旧 `target = RPS*3+2` 开环算法存在"建-裁震荡"问题, 高 RPS 时频繁裁剪触发 close_notify 噪音.
+- 新算法基于实际指标 (wait_events / total_gets / expired_unused) 做 AIAD 闭环:
+  - `wait_ratio > 0.2` AND target < max → 扩 20% (最少 +1)
+  - `wait_ratio == 0` AND `expired ≥ gets/2` AND target > 2 → 缓慢缩 -1
+  - 否则维持
+- **不再做硬裁剪** (删除旧 `q.len() > target+2` 那段). target 只控制 builder 建货节奏, queue 自然在 max_age 到期被 sweeper 收掉. close_notify 频率大幅下降.
+- Manager 周期 2s → 5s (减噪 + 指标聚合更稳).
+- decide_new_target 提取为纯函数, 新增 8 个 unit test 覆盖 idle/pressure/clamp/floor/priority/no-traffic 场景. 总测试数 32 → 40.
+
+### feat(ebpf): 服务端自动跳过 eBPF + ebpf_mode 三态配置
+- 服务端跑 eBPF 全部子系统都无价值: sockmap splice 要明文 (服务端入站加密), sockops RTT 没人消费, XDP DNS 只对本地应用有意义, sk_lookup 只劫持本地流量. 之前服务端无条件加载浪费内存/CPU, 还卡 Alpine 用户的 CGROUP_BPF 内核要求.
+- CLI 子命令 server/client → `is_server` 参数透传到 `start_proxy`. 服务端默认 (auto 模式) 跳过 eBPF.
+- 新增 `tuning.ebpf_mode` 三态:
+  - `"auto"` (默认): client 启用, server 跳过
+  - `"force"`: 任何情况强制加载 (调试)
+  - `"off"`: 任何情况不加载
+- README Alpine 章节同步: 服务端 stock `linux-lts` / `linux-virt` 内核可直接用, 不再需要重编内核.
+
+### docs(brutal): brutal_rate_mbps 设计哲学
+- 用户反馈默认值 100 Mbps 与 Brutal CC 设计理念背道而驰 — Brutal 是为单连接全速设计, WarmPool 并发多条 brutal 连接各自独立打满设定值, 100 配 pool_size=50 实际需求 5 Gbps, 严重过载.
+- install.sh 加 23 行教育性提示 + 默认 100 → 8 Mbps + 超 10 Mbps 时 WARN.
+- README 新增 "brutal_rate_mbps 的设计哲学" 章节: 含取值对比表 (8/10/50/100 Mbps × 1G/100M 链路).
+
 ## [v0.4.1-alpha.2] - Brutal CC 真·能用了 — TCP_BRUTAL_PARAMS opt 号修正 (2026-06-22)
 
 ### Critical Fix (REAL root cause)
