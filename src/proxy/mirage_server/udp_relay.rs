@@ -67,86 +67,117 @@ pub(super) async fn handle_udp_relay(
         }
     });
 
+    // 修 bug: cancel-safety. 旧版用 tokio::select!(uplink, downlink), 一方完成
+    // 时 select! 暴力 drop 另一方, 若 downlink 正在 writer.send_data 半截
+    // (TLS 5 字节 header 已写出去, AEAD payload 没写完) 会留下半截帧, 接着外层
+    // send_close_notify 又写一个 alert, 客户端 AEAD MAC 校验崩 → bad record mac.
+    //
+    // 修复: 用 watch 频道做协作式停止信号. 两 task 都 tokio::join! (而不是 select),
+    // select! 仅围绕 read 点 (recv_data / rx.recv 都是 cancel-safe), write 全部
+    // 在 select! 外面执行, 永远不会被中途打断. 任一方退出时 send(true), 另一方
+    // 在下一次 read 边界 (changed() 返回) 检测到信号, 干净退出. 之后才 send_close_notify,
+    // 此时绝无半截帧.
+    let (stop_tx, _stop_rx_seed) = tokio::sync::watch::channel(false);
+    let mut stop_rx_down = stop_tx.subscribe();
+    let mut stop_rx_up = stop_tx.subscribe();
+    let stop_tx_down = stop_tx.clone();
+    let stop_tx_up = stop_tx.clone();
+
     let tunnel_downlink = async move {
-        while let Some(packet) = rx.recv().await {
+        loop {
+            let packet = tokio::select! {
+                biased;
+                _ = stop_rx_down.changed() => break,
+                p = rx.recv() => match p {
+                    Some(p) => p,
+                    None => break,
+                }
+            };
+            // AEAD 写在 select! 外, 不会被中途取消
             if writer_clone.lock().await.send_data(&packet).await.is_err() {
                 break;
             }
         }
+        let _ = stop_tx_down.send(true);
     };
 
     let tunnel_uplink = async move {
         let mut buffer = Vec::new();
         loop {
-            match reader.recv_data().await {
-                Ok(chunk) => {
-                    buffer.extend_from_slice(&chunk);
+            let chunk = tokio::select! {
+                biased;
+                _ = stop_rx_up.changed() => break,
+                r = reader.recv_data() => match r {
+                    Ok(c) => c,
+                    Err(_) => break,
+                }
+            };
 
-                    while buffer.len() >= 2 {
-                        let frame_len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
-                        if buffer.len() < 2 + frame_len {
-                            break;
-                        }
+            buffer.extend_from_slice(&chunk);
 
-                        let frame = buffer[2..2+frame_len].to_vec();
-                        buffer.drain(0..2+frame_len);
+            // 处理多包: 一次 recv 可能拿到多个 UDP 包帧
+            while buffer.len() >= 2 {
+                let frame_len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
+                if buffer.len() < 2 + frame_len {
+                    break;
+                }
 
-                        if frame.is_empty() { continue; }
+                let frame = buffer[2..2+frame_len].to_vec();
+                buffer.drain(0..2+frame_len);
 
-                        // Parse ATYP
-                        let atyp = frame[0];
-                        let mut offset = 1;
-                        let target_addr_str = match atyp {
-                            1 => {
-                                if frame.len() < offset + 4 { continue; }
-                                let ip = std::net::Ipv4Addr::new(frame[offset], frame[offset+1], frame[offset+2], frame[offset+3]);
-                                offset += 4;
-                                ip.to_string()
-                            }
-                            3 => {
-                                if frame.len() < offset + 1 { continue; }
-                                let domain_len = frame[offset] as usize;
-                                offset += 1;
-                                if frame.len() < offset + domain_len { continue; }
-                                let domain = String::from_utf8_lossy(&frame[offset..offset+domain_len]).to_string();
-                                offset += domain_len;
-                                domain
-                            }
-                            4 => {
-                                if frame.len() < offset + 16 { continue; }
-                                let mut octets = [0u8; 16];
-                                octets.copy_from_slice(&frame[offset..offset+16]);
-                                let ip = std::net::Ipv6Addr::from(octets);
-                                offset += 16;
-                                ip.to_string()
-                            }
-                            _ => continue,
-                        };
+                if frame.is_empty() { continue; }
 
-                        if frame.len() < offset + 2 { continue; }
-                        let port = u16::from_be_bytes([frame[offset], frame[offset+1]]);
-                        offset += 2;
+                // Parse ATYP
+                let atyp = frame[0];
+                let mut offset = 1;
+                let target_addr_str = match atyp {
+                    1 => {
+                        if frame.len() < offset + 4 { continue; }
+                        let ip = std::net::Ipv4Addr::new(frame[offset], frame[offset+1], frame[offset+2], frame[offset+3]);
+                        offset += 4;
+                        ip.to_string()
+                    }
+                    3 => {
+                        if frame.len() < offset + 1 { continue; }
+                        let domain_len = frame[offset] as usize;
+                        offset += 1;
+                        if frame.len() < offset + domain_len { continue; }
+                        let domain = String::from_utf8_lossy(&frame[offset..offset+domain_len]).to_string();
+                        offset += domain_len;
+                        domain
+                    }
+                    4 => {
+                        if frame.len() < offset + 16 { continue; }
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(&frame[offset..offset+16]);
+                        let ip = std::net::Ipv6Addr::from(octets);
+                        offset += 16;
+                        ip.to_string()
+                    }
+                    _ => continue,
+                };
 
-                        let payload = &frame[offset..];
+                if frame.len() < offset + 2 { continue; }
+                let port = u16::from_be_bytes([frame[offset], frame[offset+1]]);
+                offset += 2;
 
-                        // Convert to SocketAddr via tokio lookup or fast path
-                        if let Ok(mut addrs) = tokio::net::lookup_host((target_addr_str.clone(), port)).await {
-                            if let Some(socket_addr) = addrs.next() {
-                                let _ = udp_socket.send_to(payload, socket_addr).await;
-                            }
-                        }
+                let payload = &frame[offset..];
+
+                // udp_socket.send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为)
+                if let Ok(mut addrs) = tokio::net::lookup_host((target_addr_str.clone(), port)).await {
+                    if let Some(socket_addr) = addrs.next() {
+                        let _ = udp_socket.send_to(payload, socket_addr).await;
                     }
                 }
-                Err(_) => break,
             }
         }
+        let _ = stop_tx_up.send(true);
     };
 
-    tokio::select! {
-        _ = tunnel_uplink => {}
-        _ = tunnel_downlink => {}
-    }
+    // 用 join 而不是 select: 两 task 通过 stop_tx/rx 协作退出, 不被中途 drop.
+    tokio::join!(tunnel_uplink, tunnel_downlink);
 
+    // 此时两 task 都已干净退出, 没有任何 in-flight AEAD 写. close_notify 安全.
     let _ = writer.lock().await.send_close_notify().await;
     downlink.abort();
 }

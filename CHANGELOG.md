@@ -1,5 +1,22 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.2] - 4 个生产级 bug 修复 (2026-06-23)
+
+### Critical Fixes
+- **fix(pool): WarmPool 空闲期缩容锁死 (资源燃烧)** — `decide_new_target` 的 `total_gets > 0` 守护误把"高峰后回到 idle"的缩容路径禁用. 高峰把 target 涨到 max_size=40 后用户睡觉流量归零 → target 永久钉死 → builder 维持 40 个 idle TLS 连接 → max_age 到期 sweeper 杀 → builder 又建 → 一整夜烧 CPU 握手. `cur_target > 2` 已是 floor 保护, 删守护即可. 删 2 个误测试, 加 3 个新测试 (含 drain-to-floor 回归).
+- **fix(watcher): GeoUpdater 与 ConfigWatcher 启动时序空隙** — `spawn_watcher` 只 watch `config_path`, geo_updater 30s 后下载的 .dat 落地不触发 Router 重建, 所有 geosite/geoip 规则 silent no-op → 用户访问全部 fall back 到 `default_outbound`, 必须手动改 config.json 才能修复. 修复: 同时 watch `geodata_dir`, 不存在时主动 `create_dir_all`. 事件过滤只对 config 文件或 `.dat` 文件触发 reload (避免 .tmp 抖动).
+- **fix(tcp_relay): 服务端 TCP 转发僵尸任务泄露 (30 分钟资源燃烧)** — `tokio::join!(upload, download)` 在客户端断网时只让 upload 立刻退出, download 阻塞在 `up_read.read()` 等上游响应直到 1800s 超时. 弱网环境频繁闪断重连 → FD + tokio 协程泄露累积 → 耗尽内存. 修复: 两方共享 `Arc<AtomicI32>(upstream_fd)`, 任一方退出 swap -1 并 `libc::shutdown(SHUT_RDWR)` 强制关闭 upstream socket, 另一方 read/write 立即返回 Err 退出. 不用 select!/abort 是为了避免 cancel mid-write 损坏 AEAD 帧 (见下).
+- **fix(udp_relay): tokio::select! cancel-safety 导致 AEAD 帧损坏** — UDP relay 的 `tokio::select!(tunnel_uplink, tunnel_downlink)` 一方完成时暴力 drop 另一方, 若 downlink 正在 `writer.send_data` 半截 (TLS 5B header 已发出去, payload 没写完), 之后外层 `send_close_notify` 又写 alert → 客户端拼接半截帧 + alert 触发 AEAD MAC 校验崩, "bad record mac". 修复: 改用 watch 频道做协作式停止信号, 两 task 都 join (不 select!), select! 仅围绕 cancel-safe 的 read 点 (recv_data / rx.recv), AEAD 写在 select! 外永远不被中途打断.
+
+### 实际部署影响
+v0.4.4-alpha.1 的 4 个 bug 都已实际部署可触发:
+- pool 缩容锁死: 任何启用 brutal + 流量有早晚峰差异的客户端
+- geo 启动时序: 任何首次部署 + 配了 geo 规则的客户端 (重启过的也复现)
+- tcp 僵尸泄露: 任何服务端在弱网客户端场景下 (移动用户 / WiFi 不稳)
+- udp cancel-safety: 任何启用 UDP relay 的部署 (DNS/QUIC 等)
+
+强烈建议从 v0.4.4-alpha.1 升 alpha.2.
+
 ## [v0.4.4-alpha.1] - Active BPF Tunnels Dashboard + BPF struct 扩展 (2026-06-22)
 
 ### feat(gui): Active BPF Tunnels 表格 + Brutal CC 指示灯
