@@ -1,5 +1,38 @@
 # Changelog - Mirage-rs
 
+## [v0.4.3-alpha.1] - 多源 Geo + 骨架重构 + 反馈算法 (2026-06-22)
+
+### ⚠️ Breaking Schema Change (alpha 期硬升级, 无向后兼容)
+- **`tuning.geosite_url` + `tuning.geoip_url` 已删除**, 改为 `tuning.geo_sources` 数组. 旧 config 启动会被 serde 拒绝 (unknown field). **必须迁移**, 迁移示例见 README "客户端配置示例".
+
+### feat(geo): 多源 Geo 下载 + via=direct/proxy + 自定义命名
+- `tuning.geo_sources: [{name, kind, url, via}]` 数组. 每个 source 独立配置:
+  - `name`: 文件保存为 `<name>.dat`, 必须在 sources 内唯一 (重复直接 ERROR 不启动).
+  - `kind`: `"geosite"` (域名) 或 `"geoip"` (IP CIDR).
+  - `via`: `"direct"` (默认) 或 `"proxy"` (走客户端本地 socks/mixed inbound).
+- 国内服务器拉 GitHub 受阻时全部设 `"via": "proxy"` 即可走代理出口.
+- 配合 `routing.geo_alias` 起短名: `"geo_alias": {"ls": "loyalsoldier.dat"}` → 规则写 `"geosite": ["ls:cn"]` 自动解析.
+- 新增 `tuning.geo_update_days` 配置 (默认 7 天).
+- `Cargo.toml`: reqwest features 加 `"socks"`.
+
+### refactor: 骨架重构 (严格行为等价, 0 warning)
+- **`src/proxy/mirage_server.rs` (470 行 monolith) → 6 个职责单一子模块** (`mod / handshake / camouflage / control / tcp_relay / udp_relay`). 详见 commit 909cf4e.
+- **`src/gui/` → `src/api/` 改名 + `mod.rs` (313 行) 拆 9 个文件** (`mod / state / sampler / handlers/{overview,bpf_tunnels,history,logs,proxies,rules}`). 匹配"API 作为独立模块"的设计意向. 详见 commit e0db37c.
+- 后续功能演进 (DNS 转发器完善 / 多源 Geo per-source 配置 / 等) 都能在更清晰的模块边界上扩展.
+
+### feat(pool): WarmPool 反馈式弹性算法 (替代 RPS*3+2 开环)
+- 旧算法直接由 RPS 推 target, 高 RPS 时 pool 堆积 → 频繁裁剪触发 close_notify 噪音.
+- 新算法 AIAD 闭环, 测三个指标 (wait_events / total_gets / expired_unused) 决策扩缩容.
+- 不再做硬裁剪, target 只控制 builder 建货节奏, queue 自然到 max_age 被 sweeper 收掉.
+- Manager 周期 2s → 5s. 详见 commit e80adb7.
+
+### feat(ebpf): 服务端自动跳过 eBPF + ebpf_mode 三态配置
+- 新增 `tuning.ebpf_mode`: `"auto"` (默认, 跟 CLI 子命令走) / `"force"` / `"off"`.
+- 服务端跑 BPF 全部子系统都无价值, auto 模式服务端自动跳过. Alpine 服务端不再需要 `CONFIG_CGROUP_BPF` 内核重编. 详见 commit 1a63838.
+
+### docs(brutal): brutal_rate_mbps 设计哲学
+- install.sh 加 23 行教育性提示 + 默认 100 → 8 Mbps. README 新增 "brutal_rate_mbps 的设计哲学" 章节 (取值对比表 1G/100M × 8/10/50/100 Mbps).
+
 ## [v0.4.2-alpha.1] - 服务端 eBPF 自动跳过 + WarmPool 反馈算法 (2026-06-22)
 
 ### feat(pool): WarmPool 反馈式弹性算法

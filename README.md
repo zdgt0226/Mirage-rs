@@ -107,13 +107,17 @@
   ],
   "route": {
     "default": "auto",
+    "geo_alias": {
+      "ls-site": "loyalsoldier-site.dat",
+      "ls-ip":   "loyalsoldier-ip.dat"
+    },
     "rules": [
       {
-        "rule_set": ["loyalsoldier:category-ads-all"],
+        "geosite": ["ls-site:category-ads-all"],
         "outbound": "block"
       },
       {
-        "geoip": ["cn"],
+        "geoip": ["ls-ip:cn"],
         "outbound": "direct"
       },
       {
@@ -127,6 +131,23 @@
     "listen": "127.0.0.1:5353",
     "cn": "119.29.29.29",
     "remote": "8.8.8.8:53"
+  },
+  "tuning": {
+    "geodata_dir": ".geosite",
+    "geo_sources": [
+      {
+        "name": "loyalsoldier-site",
+        "kind": "geosite",
+        "url":  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+        "via":  "direct"
+      },
+      {
+        "name": "loyalsoldier-ip",
+        "kind": "geoip",
+        "url":  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+        "via":  "direct"
+      }
+    ]
   }
 }
 ```
@@ -140,6 +161,13 @@
     *   `type: urltest`: 自动测速组。把您的多个 VPS 节点 tag 塞进数组，它会自动帮你选延迟最低的用。**高阶细节**：我们的 urltest 并非无脑发送 HTTP 探针，而是**优先提取底层的 socket RTT（TCP 真实握手延迟）**进行决策，全程零开销！只有在连接池彻底闲置时，才会使用 HTTP probe 作为后备唤醒手段。
     *   `type: selector`: 手动点选组。与 Neon Dashboard 面板无缝联动，您可以在网页上自由指定流量出口，不爽自动选路时可以直接接管。
 *   `route`: **交通警察**。如果访问的 IP 在 `cn` 库中，走 `direct` 直连；如果访问谷歌，走 `auto` 出国；广告全走 `block` 丢弃。
+    *   `geo_alias`: 给 .dat 文件起短名, 规则里写 `"ls-site:cn"` 自动解析成 `"loyalsoldier-site.dat:cn"`. 不起别名时规则里必须写完整文件名 (如 `"geosite": ["loyalsoldier-site.dat:cn"]`).
+*   `tuning.geo_sources` (v0.4.3+): **Geo 数据多源下载**. 替代旧的 `geosite_url` / `geoip_url` 单字段:
+    *   每项 `{name, kind, url, via}` 独立配置. 下载后保存为 `<name>.dat`, 由 `geodata_dir` 决定存放路径.
+    *   `kind`: `"geosite"` (域名规则) 或 `"geoip"` (IP CIDR 规则).
+    *   `via`: `"direct"` (默认, 直连下载) 或 `"proxy"` (走客户端本地 socks/mixed inbound). 国内服务器拉 GitHub 抽风时改 `"proxy"` 即可走代理出口.
+    *   ⚠️ `name` 必须在 geo_sources 内唯一, 否则启动直接 ERROR (避免不同 source 互相覆盖文件).
+*   `tuning.geo_update_days` (可选): Geo 文件更新检查间隔, 单位天, 默认 7.
 *   `tuning.ebpf_mode` (可选): eBPF 加载策略, 默认 `"auto"`. 三态:
     *   `"auto"`: 跟 CLI 子命令走 — `mirage client` 启用, `mirage server` 跳过 (服务端 BPF 全部子系统都无价值)
     *   `"force"`: 强制启用 (调试用, server 模式下也加载)
