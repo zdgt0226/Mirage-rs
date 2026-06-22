@@ -26,11 +26,11 @@ enum Mode {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    
-    let config_path = match &args.mode {
-        Mode::Client { config } => config,
-        Mode::Server { config } => config,
+
+    let (config_path, is_server) = match &args.mode {
+        Mode::Client { config } => (config.as_str(), false),
+        Mode::Server { config } => (config.as_str(), true),
     };
 
-    mirage_rs::start_proxy(config_path).await
+    mirage_rs::start_proxy(config_path, is_server).await
 }

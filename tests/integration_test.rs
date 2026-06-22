@@ -87,11 +87,11 @@ async fn test_full_e2e_proxy() {
     std::fs::write("test_client_config.json", serde_json::to_string_pretty(&client_config).unwrap()).unwrap();
 
     tokio::spawn(async move {
-        let _ = mirage_rs::start_proxy("test_server_config.json").await;
+        let _ = mirage_rs::start_proxy("test_server_config.json", true).await;
     });
 
     tokio::spawn(async move {
-        let _ = mirage_rs::start_proxy("test_client_config.json").await;
+        let _ = mirage_rs::start_proxy("test_client_config.json", false).await;
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;

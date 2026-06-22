@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
     // 2. 启动我们的 Mirage-rs 代理内核
     tokio::spawn(async move {
         info!("[Sandbox] Starting Mirage-rs proxy core...");
-        if let Err(e) = mirage_rs::start_proxy("sandbox_config.json").await {
+        // sandbox 是 eBPF 调试工具, 走客户端模式 (server 模式默认会跳过 BPF)
+        if let Err(e) = mirage_rs::start_proxy("sandbox_config.json", false).await {
             tracing::error!("Proxy core failed: {}", e);
         }
     });

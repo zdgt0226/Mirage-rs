@@ -13,7 +13,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, warn, error, Level};
 
-pub async fn start_proxy(config_path: &str) -> Result<()> {
+pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(Level::DEBUG)
@@ -36,16 +36,16 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
     let mut geosite_url = "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat".to_string();
     let mut geoip_url = "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat".to_string();
 
-    // 一次性扫一遍配置：取 tuning + 判断是否真的需要 geo 数据
-    // (服务端典型场景: outbounds=[], routing.rules=[] → geo 数据从不会被读 →
-    //  不下载，避免 25MB/天浪费 + 不向 GitHub 暴露指向 v2fly 仓库的可识别流量指纹)
+    // 一次性扫一遍配置：取 tuning + 判断是否真的需要 geo 数据 + 取 ebpf_mode
     let mut needs_geo = false;
+    let mut ebpf_mode = crate::config::EbpfMode::Auto;
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             if let Some(tuning) = config.tuning {
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }
                 if let Some(s) = tuning.geosite_url { geosite_url = s; }
                 if let Some(i) = tuning.geoip_url { geoip_url = i; }
+                if let Some(m) = tuning.ebpf_mode { ebpf_mode = m; }
             }
             // 仅当 routing.rules 真的引用 geosite / geoip 时才启动 updater
             needs_geo = config.routing.rules.iter().any(|r|
@@ -53,6 +53,29 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
             );
         }
     }
+
+    // eBPF 加载决策: ebpf_mode (auto/force/off) × is_server (来自 CLI 子命令).
+    // 服务端跑 BPF 全部子系统都无价值 (详见 TuningConfig::ebpf_mode 注释), auto
+    // 模式下服务端自动跳过. Off 任何情况都不加载. Force 调试用, 强制加载.
+    let enable_ebpf = match ebpf_mode {
+        crate::config::EbpfMode::Off => {
+            info!("eBPF skipped (tuning.ebpf_mode = off).");
+            false
+        }
+        crate::config::EbpfMode::Force => {
+            info!("eBPF force-enabled (tuning.ebpf_mode = force).");
+            true
+        }
+        crate::config::EbpfMode::Auto => {
+            if is_server {
+                info!("eBPF auto-skipped: running in server mode (no client-side workload for sockmap/sockops/XDP/sk_lookup). \
+                       Set `tuning.ebpf_mode = \"force\"` to enable for debugging.");
+                false
+            } else {
+                true
+            }
+        }
+    };
 
     if needs_geo {
         // 启动 Geo 数据库自动下载与热更新任务
@@ -104,32 +127,38 @@ pub async fn start_proxy(config_path: &str) -> Result<()> {
         }
     };
 
-    // 初始化 eBPF 引擎
-    let ebpf_engine = match crate::ebpf::EbpfEngine::init() {
-        Ok(engine) => {
-            info!("eBPF acceleration ENABLED");
-            Some(Arc::new(tokio::sync::Mutex::new(engine)))
-        }
-        Err(e) => {
-            warn!("eBPF acceleration DISABLED: {}", e);
-            None
-        }
-    };
-    
-    let xdp_engine = match crate::ebpf::XdpEngine::init() {
-        Ok(engine) => Some(Arc::new(engine)),
-        Err(e) => {
-            tracing::warn!("XDP DNS acceleration unavailable: {}", e);
-            None
-        }
-    };
+    // 初始化 eBPF 引擎 (仅当 enable_ebpf 为 true, server-only 模式默认跳过)
+    let (ebpf_engine, xdp_engine, transparent_engine) = if enable_ebpf {
+        let ebpf_engine = match crate::ebpf::EbpfEngine::init() {
+            Ok(engine) => {
+                info!("eBPF acceleration ENABLED");
+                Some(Arc::new(tokio::sync::Mutex::new(engine)))
+            }
+            Err(e) => {
+                warn!("eBPF acceleration DISABLED: {}", e);
+                None
+            }
+        };
 
-    let transparent_engine = match crate::ebpf::TransparentEngine::init() {
-        Ok(engine) => Some(Arc::new(tokio::sync::Mutex::new(engine))),
-        Err(e) => {
-            tracing::warn!("eBPF Transparent proxy unavailable: {}", e);
-            None
-        }
+        let xdp_engine = match crate::ebpf::XdpEngine::init() {
+            Ok(engine) => Some(Arc::new(engine)),
+            Err(e) => {
+                tracing::warn!("XDP DNS acceleration unavailable: {}", e);
+                None
+            }
+        };
+
+        let transparent_engine = match crate::ebpf::TransparentEngine::init() {
+            Ok(engine) => Some(Arc::new(tokio::sync::Mutex::new(engine))),
+            Err(e) => {
+                tracing::warn!("eBPF Transparent proxy unavailable: {}", e);
+                None
+            }
+        };
+
+        (ebpf_engine, xdp_engine, transparent_engine)
+    } else {
+        (None, None, None)
     };
     
     // Start DNS resolution and RTT monitor loop if eBPF is enabled

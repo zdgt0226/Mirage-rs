@@ -213,6 +213,23 @@ pub struct TuningConfig {
     pub geoip_url: Option<String>,
     pub decision_cache_max_entries: Option<usize>,
     pub tcp_keepalive: Option<u64>,
+    /// eBPF 加载策略. 默认 Auto (根据 CLI 子命令决定):
+    /// - `auto` (默认): client 模式启用, server 模式跳过. 服务端 BPF 全部子系统
+    ///   都没价值 — sockmap splice 要明文流 (服务端入站是加密的, 必须 userspace
+    ///   解密), sockops RTT 数据没人消费, XDP DNS 只对本地应用有意义, sk_lookup
+    ///   透明代理只劫持本地流量.
+    /// - `force`: 不论 client/server 都强制加载 (调试用).
+    /// - `off`: 不论 client/server 都跳过.
+    #[serde(default)]
+    pub ebpf_mode: Option<EbpfMode>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EbpfMode {
+    Auto,
+    Force,
+    Off,
 }
 
 fn default_schema_version() -> u32 {

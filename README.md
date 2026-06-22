@@ -140,6 +140,10 @@
     *   `type: urltest`: 自动测速组。把您的多个 VPS 节点 tag 塞进数组，它会自动帮你选延迟最低的用。**高阶细节**：我们的 urltest 并非无脑发送 HTTP 探针，而是**优先提取底层的 socket RTT（TCP 真实握手延迟）**进行决策，全程零开销！只有在连接池彻底闲置时，才会使用 HTTP probe 作为后备唤醒手段。
     *   `type: selector`: 手动点选组。与 Neon Dashboard 面板无缝联动，您可以在网页上自由指定流量出口，不爽自动选路时可以直接接管。
 *   `route`: **交通警察**。如果访问的 IP 在 `cn` 库中，走 `direct` 直连；如果访问谷歌，走 `auto` 出国；广告全走 `block` 丢弃。
+*   `tuning.ebpf_mode` (可选): eBPF 加载策略, 默认 `"auto"`. 三态:
+    *   `"auto"`: 跟 CLI 子命令走 — `mirage client` 启用, `mirage server` 跳过 (服务端 BPF 全部子系统都无价值)
+    *   `"force"`: 强制启用 (调试用, server 模式下也加载)
+    *   `"off"`: 强制不加载 (调试或最小化部署)
 
 ### 服务端配置示例 (`config_server.json`)
 
@@ -227,14 +231,16 @@ Mirage-rs 是 **eBPF 原生**代理, 性能与隐蔽性深度依赖现代 Linux 
 | RHEL / Rocky / Alma 9 | 5.14 | ✅ |
 | RHEL / CentOS 8 | 4.18 (ELRepo 可装 kernel-ml) | ⚠️ 装 kernel-ml 后可用 |
 | RHEL / CentOS 7 | 3.10 | ❌ |
-| Alpine 3.18+ | 6.x | ⚠️ 需手动开启 BPF 内核配置, 见下方 |
+| Alpine 3.18+ | 6.x | ⚠️ 客户端需手动开启 BPF 内核配置 (见下方); 服务端无需 |
 | Arch Linux / Manjaro | 滚动最新 | ✅ |
 
 如果你需要 SOCKS5 / HTTP 普通入站, 老内核也能跑 (不启用 eBPF 模块即可), 但 v0.3 的透明代理核心特性会自动跳过。
 
-### Alpine Linux 内核要求 ⚠️
+### Alpine Linux 内核要求 ⚠️ (仅客户端)
 
-Alpine 默认的 `linux-lts` / `linux-virt` 内核**关闭了 BPF cgroup 子系统** (`CONFIG_CGROUP_BPF=n`), 导致 SockOps 加载时 `bpf_link_create failed`。Mirage-rs 启动会跑起来, 但 RTT 监控 + Brutal CC 动态速率全部失效。
+**服务端不受影响** — 自 v0.4.1-alpha.3 起, `mirage server` 默认完全跳过 eBPF 加载 (服务端走"协议解密 → 直连"路径, sockmap splice/sockops/XDP/sk_lookup 全部子系统在服务端都无价值). Alpine 服务端可以直接用 stock `linux-lts` / `linux-virt` 内核.
+
+**客户端需要手动开启 BPF 内核配置**: Alpine 默认的 `linux-lts` / `linux-virt` 内核**关闭了 BPF cgroup 子系统** (`CONFIG_CGROUP_BPF=n`), 导致 SockOps 加载时 `bpf_link_create failed`。Mirage-rs 客户端会启动但 RTT 监控 + Brutal CC 动态速率全部失效。
 
 完整启用步骤参考 [dae 的 Alpine 教程](https://github.com/daeuniverse/dae/blob/main/docs/en/tutorials/run-on-alpine.md), 关键的内核配置:
 
