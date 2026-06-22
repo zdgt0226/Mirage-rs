@@ -3,6 +3,7 @@ use crate::proxy::tunnel::Tunnel;
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use std::sync::RwLock;
@@ -91,6 +92,124 @@ impl PoolStats {
     }
 }
 
+/// WarmPool 反馈式弹性算法的运行时指标 (v0.4.2+).
+///
+/// 替代旧的 `RPS * 3 + 2` 开环算法. 每 5 秒由 Manager task 读取并归零,
+/// 根据 (wait_ratio, expired/total_gets) 做 AIAD 调节. 详见 decide_new_target.
+pub struct PoolMetrics {
+    /// pool.get() 等待 > 50ms 才拿到 tunnel 的次数. 反映"供给不足"压力.
+    pub wait_events: AtomicU64,
+    /// pool.get() 总调用数 (周期内).
+    pub total_gets: AtomicU64,
+    /// Sweeper 在 max_age 到期前没被 get 用过的 tunnel 数. 反映"建多了没人用".
+    pub expired_unused: AtomicU64,
+}
+
+impl PoolMetrics {
+    fn new() -> Self {
+        Self {
+            wait_events: AtomicU64::new(0),
+            total_gets: AtomicU64::new(0),
+            expired_unused: AtomicU64::new(0),
+        }
+    }
+}
+
+/// 反馈式 target 决策 — 纯函数, 便于单元测试.
+///
+/// AIAD (additive increase, additive decrease) 控制:
+/// - 上一周期有 > 20% 的 get 经历过 50ms+ 等待 → target 加 20% (最少 +1)
+/// - 上一周期 0 个 wait_event AND 过期未用 ≥ 一半使用数 → target 减 1
+/// - 否则维持
+///
+/// 不做硬裁剪 (旧版 q.len() > target+2 那段已删), target 只控制 builder 建货
+/// 节奏, queue 自然在 max_age 到期被 sweeper 收掉.
+pub(crate) fn decide_new_target(
+    cur_target: usize,
+    wait_events: u64,
+    total_gets: u64,
+    expired_unused: u64,
+    max_size: usize,
+) -> usize {
+    let wait_ratio = if total_gets == 0 {
+        0.0
+    } else {
+        wait_events as f64 / total_gets as f64
+    };
+
+    if wait_ratio > 0.2 && cur_target < max_size {
+        let increment = (cur_target / 5).max(1);
+        (cur_target + increment).min(max_size)
+    } else if wait_ratio == 0.0
+        && expired_unused >= total_gets / 2
+        && total_gets > 0  // 完全无流量时不缩 (保留最低 idle)
+        && cur_target > 2
+    {
+        cur_target - 1
+    } else {
+        cur_target
+    }
+}
+
+#[cfg(test)]
+mod feedback_tests {
+    use super::*;
+
+    #[test]
+    fn idle_keeps_target() {
+        // 完全无流量 (total_gets=0): 不动
+        assert_eq!(decide_new_target(2, 0, 0, 0, 50), 2);
+        assert_eq!(decide_new_target(5, 0, 0, 0, 50), 5);
+    }
+
+    #[test]
+    fn pressure_scales_up() {
+        // wait_ratio > 0.2: 扩
+        // 3/10 = 0.3 > 0.2, target 5 + max(1, 5/5)=1 = 6
+        assert_eq!(decide_new_target(5, 3, 10, 0, 50), 6);
+        // 大 target 时 +20%: 10 + 2 = 12
+        assert_eq!(decide_new_target(10, 3, 10, 0, 50), 12);
+    }
+
+    #[test]
+    fn pressure_clamped_by_max() {
+        // 已到上限不扩
+        assert_eq!(decide_new_target(50, 5, 10, 0, 50), 50);
+        // 增长后超上限被夹住
+        assert_eq!(decide_new_target(48, 5, 10, 0, 50), 50);
+    }
+
+    #[test]
+    fn over_provision_scales_down() {
+        // 0 wait, expired=6 ≥ gets/2=5 → 缩 1
+        assert_eq!(decide_new_target(10, 0, 10, 6, 50), 9);
+    }
+
+    #[test]
+    fn over_provision_floor_at_2() {
+        // target=2 不再缩
+        assert_eq!(decide_new_target(2, 0, 10, 10, 50), 2);
+    }
+
+    #[test]
+    fn waiting_blocks_shrinking() {
+        // 既有 wait 又有 expired: wait 优先, 扩而不是缩
+        assert_eq!(decide_new_target(10, 3, 10, 5, 50), 12);
+    }
+
+    #[test]
+    fn no_traffic_no_shrink() {
+        // total_gets=0 时即便有 expired_unused 也不缩 (保留最低 idle)
+        assert_eq!(decide_new_target(5, 0, 0, 10, 50), 5);
+    }
+
+    #[test]
+    fn moderate_use_no_change() {
+        // 10% wait_ratio (< 20%) AND 不到 expired 阈值: 不动
+        assert_eq!(decide_new_target(10, 1, 10, 2, 50), 10);
+    }
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use std::time::Duration;
@@ -159,7 +278,7 @@ pub struct WarmPool {
     notify: Arc<Notify>,                      // 阻塞唤醒器（当没有连接时挂起请求）
     pub stats: Arc<RwLock<PoolStats>>,        // 连接池的延迟统计和健康检查
     pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
-    recent_gets: Arc<AtomicUsize>,
+    metrics: Arc<PoolMetrics>,                // 反馈式弹性算法的运行时指标
 }
 
 impl WarmPool {
@@ -167,50 +286,42 @@ impl WarmPool {
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
         let notify = Arc::new(Notify::new());
         let stats = Arc::new(RwLock::new(PoolStats::new()));
-        let recent_gets = Arc::new(AtomicUsize::new(0));
+        let metrics = Arc::new(PoolMetrics::new());
 
         let pool = Self {
             queue: queue.clone(),
             notify: notify.clone(),
             stats: stats.clone(),
             brutal_state: brutal_state.clone(),
-            recent_gets: recent_gets.clone(),
+            metrics: metrics.clone(),
         };
 
         let target_size = Arc::new(AtomicUsize::new(2)); // 默认闲时保持2个长连接
         let in_flight = Arc::new(AtomicUsize::new(0));
 
-        // 弹性监控协程 (Manager Task)
-        let gets_clone = recent_gets.clone();
+        // 弹性监控协程 (Manager Task) — 反馈式 v0.4.2+
+        // 每 5s 读 metrics 决定 target 调整 + 顺手清理 max_age 过期连接.
+        // 不再做硬裁剪 (旧版 q.len() > target+2 那段), 让 target 只影响 builder
+        // 建货节奏, queue 自然到 max_age 被 sweeper 收掉.
+        let metrics_clone = metrics.clone();
         let target_clone = target_size.clone();
         let q_clone = queue.clone();
         let max_size = cfg.pool_size;
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let rps = gets_clone.swap(0, Ordering::Relaxed) / 2; // 每两秒取样，计算每秒速率
-                
-                // 弹性扩缩容协商算法：
-                // 如果当前 RPS 为 0，保持最少 2 个连接。
-                // 如果 RPS > 0，目标大小 = RPS * 3 + 2，最高不超过 max_size。
-                let calculated_target = (rps * 3 + 2).min(max_size);
-                
-                let old_target = target_clone.load(Ordering::Relaxed);
-                if calculated_target != old_target {
-                    target_clone.store(calculated_target, Ordering::Relaxed);
-                    debug!("WarmPool Manager: Elastic resizing target {} -> {} (RPS: {})", old_target, calculated_target, rps);
-                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
 
+                // 读三个计数器并归零, 进入下一周期
+                let wait = metrics_clone.wait_events.swap(0, Ordering::Relaxed);
+                let gets = metrics_clone.total_gets.swap(0, Ordering::Relaxed);
+
+                // expired_unused 在 sweeper 内累加, 这里读后归零
+                // (sweeper 即下方 q.drain 部分, 同一 task 内顺序执行无并发问题)
+                let cur_target = target_clone.load(Ordering::Relaxed);
+
+                // 清理 max_age 过期的 tunnel (顺手 close_notify), 同时统计 expired_unused
                 let mut q = q_clone.lock().await;
                 let mut to_drop = Vec::new();
-
-                // Pass 1: 主动 evict 已过 max_age 的 tunnel.
-                // pool.get() 也会检查 max_age, 但只在用户发请求时触发. 如果用户
-                // 长时间不发请求, idle warmup 永远等不到 pool.get() 检查 → 服务端
-                // 60s 超时 reap → 日志刷 ERROR. 这里主动每 2s 扫一次, 让客户端
-                // 提前 send_close_notify 优雅关闭, 服务端识别为 graceful 不报错.
-                // (tunnel.created_at 是 std::time::Instant, 用 .elapsed() 而不是
-                // tokio::time::Instant::now().duration_since())
                 let mut alive = std::collections::VecDeque::with_capacity(q.len());
                 for tunnel in q.drain(..) {
                     if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
@@ -220,19 +331,27 @@ impl WarmPool {
                     }
                 }
                 *q = alive;
-
-                // Pass 2: 闲置连接裁剪 — 池中闲置连接远大于目标, 主动销毁过剩连接释放资源
-                while q.len() > calculated_target + 2 {
-                    if let Some(tunnel) = q.pop_back() {
-                        to_drop.push(tunnel);
-                    }
-                }
+                let expired_now = to_drop.len() as u64;
+                metrics_clone.expired_unused.fetch_add(expired_now, Ordering::Relaxed);
+                let expired_total = metrics_clone.expired_unused.swap(0, Ordering::Relaxed);
+                drop(q);
 
                 for mut tunnel in to_drop {
                     tokio::spawn(async move {
                         let _ = tunnel.writer.send_close_notify().await;
-                        debug!("WarmPool Manager: Closed expired/excess tunnel.");
+                        debug!("WarmPool Manager: Closed max_age-expired tunnel.");
                     });
+                }
+
+                // 反馈式 target 决策 (纯函数)
+                let new_target = decide_new_target(cur_target, wait, gets, expired_total, max_size);
+                if new_target != cur_target {
+                    target_clone.store(new_target, Ordering::Relaxed);
+                    let wait_ratio = if gets == 0 { 0.0 } else { wait as f64 / gets as f64 };
+                    debug!(
+                        "WarmPool Manager: target {} → {} (gets={}, wait={} [{:.1}%], expired={})",
+                        cur_target, new_target, gets, wait, wait_ratio * 100.0, expired_total
+                    );
                 }
             }
         });
@@ -400,11 +519,15 @@ impl WarmPool {
     }
 
     /// O(1) 复杂度提取连接
-    /// 
+    ///
     /// 如果队列有现成连接，0 延迟返回。
     /// 如果队列为空，则无缝休眠等待 `notify` 唤醒。
+    ///
+    /// 反馈式弹性 (v0.4.2+) 仪表化: 入口记录开始时间, 拿到 tunnel 后若总耗时
+    /// > 50ms 计一次 wait_event. Manager task 用此比率决定下周期 target 调整.
     pub async fn get(&self) -> Tunnel {
-        self.recent_gets.fetch_add(1, Ordering::Relaxed);
+        self.metrics.total_gets.fetch_add(1, Ordering::Relaxed);
+        let wait_start = Instant::now();
 
         loop {
             // 先获取通知句柄（关键：避免检查队列为空和发生通知之间的竞态条件 Race Condition）
@@ -412,13 +535,17 @@ impl WarmPool {
 
             if let Some(tunnel) = self.queue.lock().await.pop_front() {
                 if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
-                    tracing::debug!("Tunnel reached max age ({}s), gracefully closing", 
+                    tracing::debug!("Tunnel reached max age ({}s), gracefully closing",
                         tunnel.created_at.elapsed().as_secs());
                     tokio::spawn(async move {
                         let mut t = tunnel;
                         let _ = t.writer.send_close_notify().await;
                     });
                     continue;
+                }
+                // 拿到可用 tunnel, 看是否经历过显著等待
+                if wait_start.elapsed() > Duration::from_millis(50) {
+                    self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
                 }
                 return tunnel;
             }
