@@ -7,7 +7,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use std::path::Path;
 use std::sync::Arc;
 use ipnet::IpNet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct CoreState {
     pub router: Arc<RouterEngine>,
@@ -121,7 +121,7 @@ impl ConfigWatcher {
     fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>) {
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
-            
+
             let mut watcher = match notify::recommended_watcher(tx) {
                 Ok(w) => w,
                 Err(e) => {
@@ -130,31 +130,69 @@ impl ConfigWatcher {
                 }
             };
 
-            let path = Path::new(&config_path);
-            if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+            // 1. Watch config file
+            let config_pathbuf = Path::new(&config_path).to_path_buf();
+            if let Err(e) = watcher.watch(&config_pathbuf, RecursiveMode::NonRecursive) {
                 error!("Failed to watch config file {}: {}", config_path, e);
                 return;
             }
-
             info!("Started hot-reload watcher on {}", config_path);
 
+            // 2. Watch geodata directory — geo_updater 下载新 .dat 后触发 Router 重建.
+            // 修复 bug #2 (启动时序空隙): 之前只 watch config_path, geo_updater 30s
+            // 后下载 .dat 落地, 但 ConfigWatcher 不知道, Router 内存里 geo 表始终空,
+            // 所有 geosite/geoip 规则 fall back 到 default_outbound. 用户除非手动改
+            // config.json 否则永远不会修复.
+            //
+            // 目录不存在时主动创建 (geo_updater 也会创建, 但 watcher 必须在 .dat 写入
+            // 前就 watch 上, 否则 inotify 错过 IN_CREATE 事件).
+            let geodir_pathbuf = Path::new(&geodata_dir).to_path_buf();
+            if !geodir_pathbuf.exists() {
+                if let Err(e) = std::fs::create_dir_all(&geodir_pathbuf) {
+                    warn!("Failed to create geodata dir {} (geo hot-reload disabled): {}", geodata_dir, e);
+                }
+            }
+            if geodir_pathbuf.exists() {
+                match watcher.watch(&geodir_pathbuf, RecursiveMode::NonRecursive) {
+                    Ok(_) => info!("Also watching geodata dir for .dat hot-reload: {}", geodata_dir),
+                    Err(e) => warn!(
+                        "Failed to watch geodata dir {} (geo downloads after startup will not auto-reload Router; touch config.json to force reload): {}",
+                        geodata_dir, e
+                    ),
+                }
+            }
+
+            // 3. Event loop — 过滤事件路径, 只对 config 文件本身或 .dat 文件触发
+            // (避免 .tmp 写入 + 其他无关文件抖动). create/modify/rename 都算变更.
             for res in rx {
                 match res {
-                    Ok(Event { kind, .. }) => {
-                        if kind.is_modify() {
-                            info!("Config file {} modified. Attempting hot-reload...", config_path);
-                            // Give the writer a moment to finish flushing the file
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            
-                            let current_outbounds = state.load().outbounds.clone();
-                            match Self::build_state(&config_path, &geodata_dir, Some(current_outbounds)) {
-                                Ok(new_state) => {
-                                    state.store(Arc::new(new_state));
-                                    info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
-                                }
-                                Err(e) => {
-                                    error!("Hot-reload failed! Keeping previous state. Error: {}", e);
-                                }
+                    Ok(Event { kind, paths, .. }) => {
+                        if !(kind.is_modify() || kind.is_create()) {
+                            continue;
+                        }
+                        let trigger = paths.iter().any(|p| {
+                            p == &config_pathbuf
+                                || p.extension().map_or(false, |e| e == "dat")
+                        });
+                        if !trigger {
+                            continue;
+                        }
+
+                        let what = paths.first()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        info!("Watched path {} changed. Attempting hot-reload...", what);
+                        // Give the writer a moment to finish flushing the file
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+
+                        let current_outbounds = state.load().outbounds.clone();
+                        match Self::build_state(&config_path, &geodata_dir, Some(current_outbounds)) {
+                            Ok(new_state) => {
+                                state.store(Arc::new(new_state));
+                                info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
+                            }
+                            Err(e) => {
+                                error!("Hot-reload failed! Keeping previous state. Error: {}", e);
                             }
                         }
                     }
