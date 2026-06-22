@@ -43,12 +43,22 @@ struct {
     __type(value, __u8);
 } mirage_target_ips SEC(".maps");
 
-// 用户态需要的 TCP 底层指标结构体
+// 用户态需要的 TCP 底层指标结构体.
+//
+// v0.4.4+: 扩展了 remote_ip / port / family, 用户态 GUI Active Tunnels 面板
+// 能展示 "这条 cookie 是连到哪". layout 必须跟 Rust src/ebpf/mod.rs::TcpState
+// 严格一一对应 (size_of 36 字节, 自然对齐 4).
+//
+// 内核 family 值: 2 = AF_INET, 10 = AF_INET6. 客户端的连接 remote = mirage
+// 服务器 IP, 服务端的连接 remote = 客户端 IP.
 struct tcp_state {
-    __u32 srtt_us;       // 平滑往返时间（微秒）
-    __u32 snd_cwnd;      // 当前发送拥塞窗口大小（报文段数）
-    __u32 total_retrans; // 累计重传次数（感知丢包率的核心）
-    __u32 data_segs_out; // 发送出去的总数据段数
+    __u32 srtt_us;       // 平滑往返时间（微秒）             offset 0
+    __u32 snd_cwnd;      // 当前发送拥塞窗口大小（报文段数）   offset 4
+    __u32 total_retrans; // 累计重传次数（感知丢包率的核心）   offset 8
+    __u32 data_segs_out; // 发送出去的总数据段数               offset 12
+    __u32 remote_ip[4];  // IPv4 在 [0], IPv6 全部 4 个 u32     offset 16
+    __u16 remote_port;   // 远端端口 (host byte order)         offset 32
+    __u16 family;        // 2=AF_INET, 10=AF_INET6              offset 34
 };
 
 /**
@@ -111,23 +121,59 @@ int mirage_sockops(struct bpf_sock_ops *skops)
     
     // 如果收到了我们订阅的回调（状态变更、RTT 刷新）
     if (op == BPF_SOCK_OPS_RTT_CB || op == BPF_SOCK_OPS_STATE_CB || op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB || op == BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB) {
+        // 跟 extract_ip 同样的防御写法: 所有 ctx 字段提前到直线代码读到 locals,
+        // 避免 clang -O2 分支合并产出 "取 ctx 字段地址 → 跨分支解引用" 的字节码
+        // (verifier 拒绝 "modified ctx ptr dereference"). 详见 commit 66138c4.
+        __u32 family = skops->family;
+        __u32 ip4    = skops->remote_ip4;
+        __u32 ip6_0  = skops->remote_ip6[0];
+        __u32 ip6_1  = skops->remote_ip6[1];
+        __u32 ip6_2  = skops->remote_ip6[2];
+        __u32 ip6_3  = skops->remote_ip6[3];
+        __u32 rport  = skops->remote_port;
+        __u32 srtt   = skops->srtt_us;
+        __u32 cwnd   = skops->snd_cwnd;
+        __u32 retr   = skops->total_retrans;
+        __u32 segs   = skops->data_segs_out;
+
+        // Build ip_key for whitelist lookup
         struct ip_key key = {};
-        extract_ip(skops, &key);
-        
+        if (family == 2) {
+            key.data[0] = 2;
+            key.data[4] = ip4;
+        } else {
+            key.data[0] = 10;
+            key.data[1] = ip6_0;
+            key.data[2] = ip6_1;
+            key.data[3] = ip6_2;
+            key.data[4] = ip6_3;
+        }
+
         // 白名单检查：过滤掉与 Mirage 无关的流量
         if (!bpf_map_lookup_elem(&mirage_target_ips, &key)) {
             return 0;
         }
 
+        // Build tcp_state with both metrics and remote endpoint info
         struct tcp_state s = {
-            .srtt_us = skops->srtt_us,
-            .snd_cwnd = skops->snd_cwnd,
-            .total_retrans = skops->total_retrans,
-            .data_segs_out = skops->data_segs_out,
+            .srtt_us = srtt,
+            .snd_cwnd = cwnd,
+            .total_retrans = retr,
+            .data_segs_out = segs,
+            .remote_port = (__u16)rport,
+            .family = (__u16)family,
         };
-        
+        if (family == 2) {
+            s.remote_ip[0] = ip4;
+        } else {
+            s.remote_ip[0] = ip6_0;
+            s.remote_ip[1] = ip6_1;
+            s.remote_ip[2] = ip6_2;
+            s.remote_ip[3] = ip6_3;
+        }
+
         // 只有当获取到了有效延迟时才更新 Map
-        if (s.srtt_us > 0) {
+        if (srtt > 0) {
             __u64 cookie = bpf_get_socket_cookie(skops);
             bpf_map_update_elem(&mirage_rtt_map, &cookie, &s, BPF_ANY);
         }

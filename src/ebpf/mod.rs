@@ -1,3 +1,9 @@
+/// Per-tunnel TCP 指标 + 远端 endpoint, 必须跟 ebpf-src/sockmap.c::tcp_state
+/// 字段顺序/大小严格一致 (size_of=36, 自然对齐 4). 改动时两边同步.
+///
+/// `family`: 2=AF_INET, 10=AF_INET6, 其他=未知.
+/// `remote_ip`: IPv4 在 [0] (network byte order), IPv6 全部 4 个 u32.
+/// `remote_port`: host byte order.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TcpState {
@@ -5,6 +11,9 @@ pub struct TcpState {
     pub snd_cwnd: u32,
     pub total_retrans: u32,
     pub data_segs_out: u32,
+    pub remote_ip: [u32; 4],
+    pub remote_port: u16,
+    pub family: u16,
 }
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]

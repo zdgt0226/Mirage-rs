@@ -401,9 +401,15 @@
         <div class="panel full-width neon-dashboard">
             <div class="neon-title-bar">
                 <h2 class="neon-title">THE NEON PULSE</h2>
-                <div class="ebpf-status">
-                    <div class="ebpf-dot" id="ebpfDot"></div>
-                    <span id="ebpfText" style="color: #6b7280;">eBPF ENGINE: OFFLINE</span>
+                <div style="display: flex; gap: 10px;">
+                    <div class="ebpf-status">
+                        <div class="ebpf-dot" id="ebpfDot"></div>
+                        <span id="ebpfText" style="color: #6b7280;">eBPF ENGINE: OFFLINE</span>
+                    </div>
+                    <div class="ebpf-status">
+                        <div class="ebpf-dot" id="brutalDot"></div>
+                        <span id="brutalText" style="color: #6b7280;">Brutal CC: STATIC</span>
+                    </div>
                 </div>
             </div>
             
@@ -440,6 +446,13 @@
         <div class="panel full-width">
             <h2>Outbounds & Proxies</h2>
             <div id="proxiesContainer">Loading proxies...</div>
+        </div>
+
+        <div class="panel full-width">
+            <h2>Active BPF Tunnels <span id="tunnelCount" style="font-size: 0.7em; color: var(--text-muted); font-weight: normal;">(0 active)</span></h2>
+            <div id="tunnelsContainer" style="overflow-x: auto;">
+                <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading tunnels...</div>
+            </div>
         </div>
 
         <div class="panel full-width">
@@ -537,6 +550,22 @@
                     text.innerText = 'eBPF ENGINE: OFFLINE';
                     text.style.color = '#6b7280';
                     text.style.textShadow = 'none';
+                }
+
+                // Brutal CC Status Indicator — 任一 tunnel 有 srtt_us > 0 即 ACTIVE
+                // (BPF sock_ops RTT_CB 已生效, 动态调速能拿到反馈). 否则 STATIC.
+                const brutalDot = document.getElementById('brutalDot');
+                const brutalText = document.getElementById('brutalText');
+                if (data.brutal_cc_active === true) {
+                    if (!brutalDot.classList.contains('online')) brutalDot.classList.add('online');
+                    brutalText.innerText = 'Brutal CC: ACTIVE';
+                    brutalText.style.color = '#10b981';
+                    brutalText.style.textShadow = '0 0 10px rgba(16,185,129,0.5)';
+                } else {
+                    brutalDot.classList.remove('online');
+                    brutalText.innerText = 'Brutal CC: STATIC';
+                    brutalText.style.color = '#6b7280';
+                    brutalText.style.textShadow = 'none';
                 }
 
                 historyUp.push(upSpeed); historyUp.shift();
@@ -839,11 +868,116 @@
             }
         }
 
+        // ──────────────────────────────────────────────────────────────────────
+        // Active BPF Tunnels: 1Hz 轮询 /api/bpf/tunnels, 表格化展示 cookie /
+        // remote / rtt / retrans / 趋势. 点击行展开 cookie / cwnd / data_segs
+        // 详情. RTT 趋势靠 JS 端维护 5 点滚动窗口跟当前值对比 ↑/↓/→.
+        // ──────────────────────────────────────────────────────────────────────
+        const tunnelRttHistory = new Map(); // cookie(string) -> [rtt, rtt, ...]
+        const tunnelExpanded = new Set();
+
+        function tunnelHtmlEscape(s) {
+            const d = document.createElement('div');
+            d.innerText = String(s);
+            return d.innerHTML;
+        }
+
+        function tunnelComputeTrend(hist) {
+            if (hist.length < 2) return '<span style="color: var(--text-muted);">→</span>';
+            const recent = hist[hist.length - 1];
+            const prev = hist[hist.length - 2];
+            if (recent > prev * 1.1) return '<span style="color: #ef4444;">↑</span>';
+            if (recent < prev * 0.9) return '<span style="color: #10b981;">↓</span>';
+            return '<span style="color: var(--text-muted);">→</span>';
+        }
+
+        function tunnelToggle(cookie) {
+            if (tunnelExpanded.has(cookie)) tunnelExpanded.delete(cookie);
+            else tunnelExpanded.add(cookie);
+            fetchTunnels(); // 重新渲染应用新展开状态
+        }
+
+        async function fetchTunnels() {
+            let data;
+            try {
+                const res = await fetch('/api/bpf/tunnels');
+                data = await res.json();
+            } catch (e) {
+                document.getElementById('tunnelsContainer').innerHTML =
+                    '<div style="color: #ef4444; padding: 20px;">Failed to load tunnels.</div>';
+                return;
+            }
+            const tunnels = data.tunnels || [];
+            document.getElementById('tunnelCount').innerText = `(${tunnels.length} active)`;
+
+            if (tunnels.length === 0) {
+                document.getElementById('tunnelsContainer').innerHTML =
+                    '<div style="color: var(--text-muted); text-align: center; padding: 20px;">' +
+                    'No active tunnels. BPF tracks RTT only after sock_ops callback fires — send real traffic through the proxy to generate samples.' +
+                    '</div>';
+                return;
+            }
+
+            // 维护 per-cookie RTT 历史 (5 点滚动)
+            const seen = new Set();
+            tunnels.forEach(t => {
+                const cookie = String(t.cookie);
+                seen.add(cookie);
+                if (!tunnelRttHistory.has(cookie)) tunnelRttHistory.set(cookie, []);
+                const h = tunnelRttHistory.get(cookie);
+                h.push(t.rtt_ms);
+                if (h.length > 5) h.shift();
+            });
+            // GC: cookie 不在新返回里 = LRU 已淘汰, 清掉历史
+            for (const k of [...tunnelRttHistory.keys()]) {
+                if (!seen.has(k)) tunnelRttHistory.delete(k);
+            }
+
+            let html = '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
+            html += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
+            html += '<th style="padding: 10px 6px;">REMOTE</th>';
+            html += '<th style="padding: 10px 6px;">RTT (ms)</th>';
+            html += '<th style="padding: 10px 6px;">RETRANS</th>';
+            html += '<th style="padding: 10px 6px; text-align: right;">TREND</th>';
+            html += '</tr></thead><tbody>';
+
+            tunnels.forEach(t => {
+                const cookie = String(t.cookie);
+                const hist = tunnelRttHistory.get(cookie) || [];
+                const trend = tunnelComputeTrend(hist);
+                const expanded = tunnelExpanded.has(cookie);
+                const rttColor = t.rtt_ms < 50 ? '#10b981' : (t.rtt_ms < 150 ? '#fbbf24' : '#ef4444');
+                const retransColor = t.retrans > 0 ? '#ef4444' : 'var(--text-muted)';
+
+                html += `<tr style="border-top: 1px solid rgba(255,255,255,0.05); cursor: pointer;" onclick="tunnelToggle('${cookie}')">`;
+                html += `<td style="padding: 10px 6px;">${tunnelHtmlEscape(t.remote || '?:?')}</td>`;
+                html += `<td style="padding: 10px 6px; color: ${rttColor}; text-shadow: 0 0 8px ${rttColor}40;">${t.rtt_ms.toFixed(1)}</td>`;
+                html += `<td style="padding: 10px 6px; color: ${retransColor};">${t.retrans}</td>`;
+                html += `<td style="padding: 10px 6px; text-align: right; font-size: 1.3em;">${trend}</td>`;
+                html += '</tr>';
+
+                if (expanded) {
+                    // Cookie 显示为 0x... 16 位 hex; cwnd/data_segs 详情
+                    const cookieHex = '0x' + BigInt(cookie).toString(16).padStart(16, '0');
+                    html += '<tr style="background: rgba(0,0,0,0.25);">';
+                    html += '<td colspan="4" style="padding: 10px 16px; font-size: 0.8em; color: var(--text-muted); letter-spacing: 0.5px;">';
+                    html += `cookie: <span style="color: var(--text);">${cookieHex}</span> &nbsp;|&nbsp; `;
+                    html += `cwnd: <span style="color: var(--text);">${t.cwnd}</span> &nbsp;|&nbsp; `;
+                    html += `data_segs: <span style="color: var(--text);">${t.data_segs.toLocaleString()}</span>`;
+                    html += '</td></tr>';
+                }
+            });
+
+            html += '</tbody></table>';
+            document.getElementById('tunnelsContainer').innerHTML = html;
+        }
+
         setInterval(fetchOverview, 1000);
         setInterval(fetchLogs, 2000);
         setInterval(fetchProxies, 5000);
-        
-        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules();
+        setInterval(fetchTunnels, 1000);
+
+        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules(); fetchTunnels();
     </script>
 </body>
 </html>
