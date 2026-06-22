@@ -188,8 +188,32 @@ config_server() {
     
     local brutal_rate_mbps=0
     if handle_brutal_optional; then
-        brutal_rate_mbps=$(ask "每条连接的 Brutal 速率上限（Mbps，填入您的单线程预期带宽上限）" "100")
-        info "Brutal 速率已设为: ${brutal_rate_mbps} Mbps / connection"
+        cat >&2 <<'EOM'
+
+═══════════════════════════════════════════════════
+  关于 Brutal CC 速率值的重要提示
+═══════════════════════════════════════════════════
+  Brutal 是为"单条 TCP 跑满目标速率"设计的拥塞控制算法.
+  它不主动让步, 设置多少就发多少.
+
+  但 Mirage 的 WarmPool 会同时持有多条 brutal 连接,
+  这些连接相互不知道彼此, 各自独立打满设定值.
+  因此 ★ 单连接的目标速率必须远低于链路总带宽 ★,
+  否则多连接并发时会引发持续拥塞和丢包.
+
+  推荐取值: 8 ~ 10 Mbps (不分 100M / 1G 出口)
+  上限红线: 10 Mbps. 超过会拖累整体速度.
+
+  原理: 即便 50 条 brutal 连接并发, 8 Mbps × 50 = 400 Mbps,
+  1G 链路有充足缓冲, 100M 链路也只在多并发极端场景才接近上限,
+  单流场景日常下载从单条 brutal 走就能保持稳定高速.
+═══════════════════════════════════════════════════
+EOM
+        brutal_rate_mbps=$(ask "Brutal 单连接目标速率 (Mbps, 推荐 8-10, 不超过 10)" "8")
+        if [[ "$brutal_rate_mbps" =~ ^[0-9]+$ ]] && (( brutal_rate_mbps > 10 )); then
+            warn "已设为 ${brutal_rate_mbps} Mbps, 超过推荐上限 10 Mbps. 多连接并发时可能引发拥塞."
+        fi
+        info "Brutal 单连接速率: ${brutal_rate_mbps} Mbps"
     fi
 
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
