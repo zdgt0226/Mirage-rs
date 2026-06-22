@@ -7,7 +7,7 @@ pub mod time_sync;
 pub mod config_watcher;
 pub mod ebpf;
 pub mod monitor;
-pub mod gui;
+pub mod api;
 
 use anyhow::Result;
 use std::sync::Arc;
@@ -341,7 +341,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         let listen = gui_listen.clone();
         let cfg_path = config_path.to_string();
         tokio::spawn(async move {
-            crate::gui::start_server(&listen, gui_state, ebp, xdp, cfg_path).await;
+            crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path).await;
         });
     }
 
