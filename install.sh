@@ -51,6 +51,106 @@ ask_choice() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 端口占用检测 + 节点 URI 编解码
+# ──────────────────────────────────────────────────────────────────────────────
+HAVE_SS=0
+command -v ss >/dev/null 2>&1 && HAVE_SS=1
+
+port_in_use() {
+    (( HAVE_SS )) || return 1
+    local port=$1 proto=${2:-tcp} flag
+    case "$proto" in
+        tcp) flag="-tlnH" ;;
+        udp) flag="-ulnH" ;;
+        *) return 1 ;;
+    esac
+    ss $flag "sport = :$port" 2>/dev/null | grep -q .
+}
+
+port_holder() {
+    local port=$1 proto=${2:-tcp} flag
+    case "$proto" in
+        tcp) flag="-tlnpH" ;;
+        udp) flag="-ulnpH" ;;
+        *) return ;;
+    esac
+    ss $flag "sport = :$port" 2>/dev/null | head -1
+}
+
+ask_port() {
+    local prompt=$1 default=${2:-} proto=${3:-tcp} p
+    while :; do
+        p=$(ask "$prompt" "$default")
+        if [[ ! "$p" =~ ^[0-9]+$ ]] || (( p < 1 || p > 65535 )); then
+            warn "无效端口号: $p"; continue
+        fi
+        if (( HAVE_SS )) && port_in_use "$p" "$proto"; then
+            warn "端口 $p/$proto 已被占用:"
+            echo "      $(port_holder "$p" "$proto" || echo '(无法查询占用进程)')" >&2
+            if ask_yn "仍然使用该端口? (冲突时服务无法启动)" n; then
+                echo "$p"; return
+            fi
+            continue
+        fi
+        echo "$p"; return
+    done
+}
+
+url_encode() {
+    local s=$1 out="" i ch
+    for (( i=0; i<${#s}; i++ )); do
+        ch="${s:i:1}"
+        case "$ch" in
+            [a-zA-Z0-9.~_-]) out+="$ch" ;;
+            *) out+=$(printf '%%%02X' "'$ch") ;;
+        esac
+    done
+    echo "$out"
+}
+
+url_decode() {
+    local s=$1
+    s="${s//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+
+# 节点 URI 格式: mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>[&brutal=<mbps>]
+# 注: 不支持带 [] 的 IPv6 主机 (regex 限制), 这种情况手动模式输入。
+build_node_uri() {
+    local pwd=$1 host=$2 port=$3 sni=$4 brutal=${5:-0}
+    local epwd esni q
+    epwd=$(url_encode "$pwd")
+    esni=$(url_encode "$sni")
+    q="sni=${esni}"
+    if [[ "$brutal" =~ ^[0-9]+$ ]] && (( brutal > 0 )); then
+        q+="&brutal=$brutal"
+    fi
+    echo "mirage://${epwd}@${host}:${port}?${q}"
+}
+
+# 解析 URI 写入全局 NODE_*。成功返回 0, 失败返回 1。
+parse_node_uri() {
+    local uri=$1
+    NODE_PWD=""; NODE_HOST=""; NODE_PORT=""; NODE_SNI=""; NODE_BRUTAL=0
+    if [[ ! "$uri" =~ ^mirage://([^@]+)@([^:/?]+):([0-9]+)(\?(.*))?$ ]]; then
+        return 1
+    fi
+    NODE_PWD=$(url_decode "${BASH_REMATCH[1]}")
+    NODE_HOST="${BASH_REMATCH[2]}"
+    NODE_PORT="${BASH_REMATCH[3]}"
+    local query="${BASH_REMATCH[5]:-}"
+    local IFS='&'; local pairs=($query); unset IFS
+    for p in "${pairs[@]}"; do
+        local k="${p%%=*}" v="${p#*=}"
+        case "$k" in
+            sni)    NODE_SNI=$(url_decode "$v") ;;
+            brutal) NODE_BRUTAL="$v" ;;
+        esac
+    done
+    [[ -n "$NODE_PWD" && -n "$NODE_HOST" && -n "$NODE_PORT" && -n "$NODE_SNI" ]]
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 依赖环境与编译
 # ──────────────────────────────────────────────────────────────────────────────
 # check_env() has been removed because typical end-users will use pre-compiled binaries 
@@ -136,9 +236,22 @@ setup_fhs() {
         info "检测到本地存在编译产物，直接拷贝。"
         cp target/release/mirage "$BIN_PATH"
     else
-        warn "本地未找到 mirage 文件，这里在真实发布时将通过 curl 下载 GitHub Actions 编译的产物。"
-        # curl -fsSL -o "$BIN_PATH" "https://github.com/your-repo/mirage-rs/releases/latest/download/mirage-linux-amd64"
-        touch "$BIN_PATH" # Placeholder for sandbox
+        info "本地未找到可执行文件，准备从 GitHub 拉取预编译产物..."
+        local arch
+        case $(uname -m) in
+            x86_64) arch="amd64" ;;
+            aarch64|arm64) arch="arm64" ;;
+            *) err "不支持的系统架构: $(uname -m)" ;;
+        esac
+        
+        local download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-linux-${arch}-musl"
+        info "下载链接: $download_url"
+        
+        # 使用 curl 下载，带进度条
+        if ! curl -# -fLo "$BIN_PATH" "$download_url"; then
+            warn "从 GitHub Releases 下载失败，请检查网络或手动下载编译。"
+            touch "$BIN_PATH" # Placeholder for sandbox/development fallback
+        fi
     fi
     
     chmod 755 "$BIN_PATH"
@@ -162,12 +275,13 @@ ExecStart=${BIN_PATH} ${role} -c ${ETC_DIR}/config_${role}.json
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+LimitMEMLOCK=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable "mirage-${role}.service"
+    systemctl enable "mirage-${role}.service" --now
     ok "Systemd 服务已创建并启用: mirage-${role}.service"
 }
 
@@ -181,7 +295,7 @@ generate_password() {
 config_server() {
     title "配置 Mirage-rs 服务端"
     
-    local port=$(ask "监听端口 [1-65535]" "443")
+    local port=$(ask_port "监听端口 [1-65535]" "443" tcp)
     local rand_pwd=$(generate_password)
     local pwd=$(ask "认证密码" "$rand_pwd")
     local sni=$(ask_camouflage_host "www.apple.com")
@@ -216,6 +330,11 @@ EOM
         info "Brutal 单连接速率: ${brutal_rate_mbps} Mbps"
     fi
 
+    local brutal_line=""
+    if [[ "$brutal_rate_mbps" =~ ^[0-9]+$ ]] && (( brutal_rate_mbps > 0 )); then
+        brutal_line=",\"brutal_rate_mbps\": ${brutal_rate_mbps}"
+    fi
+
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
@@ -231,8 +350,7 @@ EOM
             "listen": "0.0.0.0",
             "port": ${port},
             "password": "${pwd}",
-            "camouflage_host": "${sni}",
-            "brutal_rate_mbps": ${brutal_rate_mbps}
+            "camouflage_host": "${sni}"${brutal_line}
         }
     ],
     "outbounds": [],
@@ -252,22 +370,201 @@ EOF
     
     ok "服务端配置文件已保存至: ${ETC_DIR}/config_server.json"
     setup_systemd "server"
-    
+
+    # ── 节点导出 (供客户端导入) ──
+    local pub_host
+    pub_host=$(ask "公网地址 (域名/IP, 用于生成客户端节点导入串; 留空则跳过)" "")
+    if [[ -z "$pub_host" ]]; then
+        warn "未输入公网地址, 跳过节点导出. 如需手动构造:"
+        echo "      mirage://<密码>@<host>:${port}?sni=${sni}" >&2
+    else
+        local node_uri
+        node_uri=$(build_node_uri "$pwd" "$pub_host" "$port" "$sni" "$brutal_rate_mbps")
+        echo "$node_uri" > "${ETC_DIR}/node-export.txt"
+        chmod 600 "${ETC_DIR}/node-export.txt"
+
+        echo >&2
+        title "客户端节点导入串"
+        echo "  $(_c 32 "$node_uri")" >&2
+        echo >&2
+        echo "  已保存到: ${ETC_DIR}/node-export.txt (chmod 600)" >&2
+        echo "  客户端安装时选择 '粘贴节点导入' 直接复用. 内含密码, 妥善保管." >&2
+        if command -v qrencode >/dev/null 2>&1; then
+            echo >&2
+            qrencode -t UTF8 "$node_uri" >&2
+        fi
+        echo >&2
+    fi
+
     info "你可以使用以下命令启动服务端: systemctl start mirage-server"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 交互式路由高级分流
+# ──────────────────────────────────────────────────────────────────────────────
+ROUTE_ADV_RULES=()
+ROUTE_ADV_DEFAULT="proxy"
+
+_ask_rule() {
+    local label=$1 type=$2 tag=$3 default=$4
+    local v
+    v=$(ask "  ${label}" "$default")
+    case "$v" in
+        0|"") ;;
+        1) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"direct\"}") ;;
+        2) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"proxy\"}") ;;
+        3) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"block\"}") ;;
+        *) warn "无效输入 '$v'，跳过 $label"; ;;
+    esac
+}
+
+ask_route_advanced() {
+    info "高级路由：逐项配置常用 geo tag"
+    info "每项 4 选 1：0=跳过 / 1=direct（直连）/ 2=proxy / 3=block"
+    ROUTE_ADV_RULES=()
+    # 内网总是 direct（必须）
+    ROUTE_ADV_RULES+=('                {"ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outbound": "direct"}')
+    info "（内网 / 保留地址已固定 direct，不可关）"
+
+    _ask_rule "广告 (category-ads-all)"          "geosite" "category-ads-all"   "3"
+    _ask_rule "国内域名 (geosite:cn)"            "geosite" "cn"                  "1"
+    _ask_rule "国内 IP (geoip:cn)"               "geoip"   "cn"                  "1"
+    _ask_rule "Apple 中国 (apple-cn)"            "geosite" "apple-cn"            "1"
+    _ask_rule "Google 中国 (google-cn)"          "geosite" "google-cn"           "1"
+    _ask_rule "Microsoft 中国 (microsoft-cn)"    "geosite" "microsoft-cn"        "1"
+    _ask_rule "海外位置 (geolocation-!cn)"       "geosite" "geolocation-!cn"     "2"
+    _ask_rule "Netflix"                           "geosite" "netflix"             "0"
+    _ask_rule "YouTube"                           "geosite" "youtube"             "0"
+    _ask_rule "Telegram"                          "geosite" "telegram"            "0"
+
+    echo >&2
+    local d
+    d=$(ask "默认出口（未命中规则时；1=direct / 2=proxy）" "2")
+    case "$d" in
+        1) ROUTE_ADV_DEFAULT="direct" ;;
+        *) ROUTE_ADV_DEFAULT="proxy" ;;
+    esac
+    info "已配 $(( ${#ROUTE_ADV_RULES[@]} )) 条规则，默认出口：$ROUTE_ADV_DEFAULT"
 }
 
 config_client() {
     title "配置 Mirage-rs 客户端"
-    
-    local srv_host=$(ask "服务端 IP 或域名" "1.2.3.4")
-    local srv_port=$(ask "服务端端口" "443")
-    local pwd=$(ask "认证密码" "")
-    local sni=$(ask_camouflage_host "www.apple.com")
-    
-    local inbound_port=$(ask "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080")
+
+    local srv_host srv_port pwd sni
+    local imported_brutal=0
+
+    # ── 节点导入: 优先粘贴 URI ──
+    local local_node_default=""
+    if [[ -f "${ETC_DIR}/node-export.txt" ]]; then
+        local_node_default=$(cat "${ETC_DIR}/node-export.txt")
+        info "检测到本机刚生成的节点串, 输入时直接回车即可复用."
+    fi
+
+    local source
+    source=$(ask_choice "节点参数获取方式" \
+        "粘贴服务端导出的 mirage:// 节点串 (推荐)" \
+        "手动逐项输入")
+
+    if [[ "$source" == "1" ]]; then
+        while :; do
+            local uri
+            uri=$(ask "请粘贴 mirage:// 节点串" "$local_node_default")
+            if [[ -z "$uri" ]]; then
+                warn "未输入. 退回手动模式."
+                source="2"; break
+            fi
+            if parse_node_uri "$uri"; then
+                srv_host="$NODE_HOST"
+                srv_port="$NODE_PORT"
+                pwd="$NODE_PWD"
+                sni="$NODE_SNI"
+                imported_brutal="$NODE_BRUTAL"
+                ok "节点导入成功: ${srv_host}:${srv_port} (sni=${sni})"
+                if [[ "$imported_brutal" =~ ^[0-9]+$ ]] && (( imported_brutal > 0 )); then
+                    info "服务端启用了 Brutal (${imported_brutal} Mbps). 客户端对称启用需:"
+                    info "  1) 装 brutal 内核模块  2) outbounds[mirage] 加 \"brutal_rate_mbps\": ${imported_brutal}"
+                fi
+                break
+            fi
+            warn "节点串格式无效. 期望: mirage://<密码>@<host>:<port>?sni=<域名>[&brutal=<mbps>]"
+        done
+    fi
+
+    if [[ "$source" == "2" ]]; then
+        srv_host=$(ask "服务端 IP 或域名" "1.2.3.4")
+        srv_port=$(ask "服务端端口" "443")
+        pwd=$(ask "认证密码" "")
+        sni=$(ask_camouflage_host "www.apple.com")
+    fi
+
+    local inbound_port=$(ask_port "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080" tcp)
     local inbound_listen=$(ask "本地代理监听地址 (LAN 共享用 0.0.0.0; 仅本机用 127.0.0.1)" "0.0.0.0")
 
     local pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
+    
+    local routing_preset
+    routing_preset=$(ask_choice "客户端路由（分流）策略" \
+        "国内直连 / 局域网直连，其余走代理（经典中国分流，推荐）" \
+        "全部流量走代理（全局代理）" \
+        "自定义分流（通过交互选配常用 Geo Tag 去向）" \
+        "留空规则，全部走默认出口")
+        
+    local routing_json=""
+    case $routing_preset in
+        1)
+            routing_json='"routing": {
+        "default_outbound": "proxy",
+        "rules": [
+            {
+                "outbound": "direct",
+                "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+            },
+            {
+                "outbound": "direct",
+                "geosite": ["cn", "apple-cn", "google-cn", "microsoft-cn"]
+            },
+            {
+                "outbound": "direct",
+                "geoip": ["cn"]
+            }
+        ]
+    }'
+            ;;
+        2)
+            routing_json='"routing": {
+        "default_outbound": "proxy",
+        "rules": [
+            {
+                "outbound": "direct",
+                "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+            }
+        ]
+    }'
+            ;;
+        3)
+            ask_route_advanced
+            # 将 ROUTE_ADV_RULES 数组按逗号拼接
+            local rules_inner=""
+            for r in "${ROUTE_ADV_RULES[@]}"; do
+                rules_inner+="${r},
+"
+            done
+            rules_inner="${rules_inner%,
+}"
+            routing_json='"routing": {
+        "default_outbound": "'"${ROUTE_ADV_DEFAULT}"'",
+        "rules": [
+'"${rules_inner}"'
+        ]
+    }'
+            ;;
+        4)
+            routing_json='"routing": {
+        "default_outbound": "proxy",
+        "rules": []
+    }'
+            ;;
+    esac
     
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
@@ -287,7 +584,7 @@ config_client() {
     ],
     "outbounds": [
         {
-            "type": "pyreality",
+            "type": "mirage",
             "tag": "proxy",
             "server": "${srv_host}",
             "server_port": ${srv_port},
@@ -308,19 +605,7 @@ config_client() {
         "enabled": true,
         "listen": "127.0.0.1:9090"
     },
-    "routing": {
-        "default_outbound": "proxy",
-        "rules": [
-            {
-                "outbound": "direct",
-                "geosite": ["cn", "apple-cn"]
-            },
-            {
-                "outbound": "direct",
-                "ip_cidr": ["127.0.0.0/8", "192.168.0.0/16"]
-            }
-        ]
-    },
+    ${routing_json},
     "tuning": {
         "geodata_dir": "${ETC_DIR}/geosite",
         "geo_sources": [
@@ -354,11 +639,23 @@ print_brutal_hint() {
     echo "【极限性能优化建议】"
     echo "如果要完全发挥 Brutal CC 的极速性能并让 4MB 发送缓冲区生效，"
     echo "请手动执行以下步骤："
-    echo "  1. 安装 tcp-brutal 内核模块：https://github.com/apernet/tcp-brutal"
-    echo "  2. 运行：sudo sysctl -w net.core.wmem_max=8388608"
-    echo "  3. 在配置文件 outbounds[pyreality] 加 \"brutal_rate_bps\": 8000000"
-    echo "  4. 重启 mirage-rs：systemctl restart mirage-client"
+    echo "  1. 确保 tcp-brutal 内核模块已安装：https://github.com/apernet/tcp-brutal"
+    echo "  2. 在客户端配置文件 outbounds[mirage] 块中添加 \"brutal_rate_mbps\": 8"
+    echo "  3. 重启 mirage-rs：systemctl restart mirage-client"
     echo "=========================================================="
+}
+
+optimize_sysctl() {
+    info "正在优化系统网络参数 (BBR, wmem_max)..."
+    cat > /etc/sysctl.d/99-mirage.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.wmem_max=8388608
+net.core.rmem_max=8388608
+net.ipv4.tcp_fastopen=3
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+    ok "系统网络参数优化完毕 (BBR/缓冲放大已开启)。"
 }
 
 main() {
@@ -370,6 +667,7 @@ main() {
     local mode=$(ask_choice "请选择安装类型" "部署服务端 (Server)" "部署客户端 (Client)" "同时部署服务端与客户端")
     
     setup_fhs
+    optimize_sysctl
     
     case $mode in
         1)
