@@ -31,7 +31,13 @@ pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>)
     info!("UDP Relay started on port {}", port);
 
     // 3. Acquire tunnel and send UDP Mode Sentinel (\x00)
-    let mut tunnel = pool.get().await;
+    let mut tunnel = match pool.get().await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("UDP relay: pool unavailable ({}). Session aborted.", e);
+            return;
+        }
+    };
     if tunnel.writer.send_data(&[0x00]).await.is_err() {
         error!("Failed to send UDP sentinel");
         return;

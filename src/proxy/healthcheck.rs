@@ -31,12 +31,13 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
                     "/success.txt"
                 };
 
-                // Acquire a tunnel
+                // Acquire a tunnel. pool.get 自身有 10s timeout, healthcheck 再加 5s
+                // 上限避免单次 probe 阻塞太久. 双重 Result: 外层 timeout / 内层 pool 错.
                 let tunnel_res = timeout(Duration::from_secs(5), async {
                     pool.get().await
                 }).await;
 
-                if let Ok(mut tunnel) = tunnel_res {
+                if let Ok(Ok(mut tunnel)) = tunnel_res {
                     // Send connection target header
                     let target_bytes = target.as_bytes();
                     let mut target_header = Vec::with_capacity(2 + target_bytes.len());

@@ -296,8 +296,14 @@ impl DnsForwarder {
     }
 
     async fn tcp_over_tunnel(&self, req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
-        let mut tunnel = pool.get().await;
-        
+        let mut tunnel = match pool.get().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("DNS over tunnel: pool unavailable for {}:{} ({}). Query will fail.", remote_host, remote_port, e);
+                return None;
+            }
+        };
+
         let target_addr = pack_address(remote_host, remote_port);
         let mut payload = Vec::new();
         payload.extend_from_slice(&target_addr);

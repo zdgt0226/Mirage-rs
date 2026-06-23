@@ -143,7 +143,13 @@ pub async fn proxy_tcp_target(
     let leaf = outbound.resolve_leaf();
     match &*leaf {
         OutboundNode::Mirage { pool, .. } => {
-            let mut tunnel = pool.get().await;
+            let mut tunnel = match pool.get().await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("Mirage outbound unavailable for {}: {}", target, e);
+                    return;
+                }
+            };
 
             let target_bytes = target.as_bytes();
             let mut target_header = Vec::with_capacity(2 + target_bytes.len());

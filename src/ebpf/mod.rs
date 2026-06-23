@@ -224,13 +224,18 @@ mod sys {
             let map = bpf.map_mut("mirage_dns_cache").unwrap();
             let mut lru = aya::maps::HashMap::<_, u64, u32>::try_from(map)?;
             
-            // DJB2 hash of the domain name
+            // DJB2 hash of the domain name.
+            // ★ 全部用 wrapping_* — Rust debug build 默认 overflow-checks=true,
+            // 任何 + 一旦 u64 溢出就 panic. C 端 (dns_xdp.c) 的 u64 + 天然 2's
+            // complement 截断, 必须显式 wrapping 对齐才能哈希一致. 之前只在
+            // 末尾 wrapping_add(b) 而 (hash << 5) + hash 的 + 没保护, 长域名
+            // 攻击会精准 panic 用户态. 见 commit:bug1 修复.
             let mut hash: u64 = 5381;
             for part in domain.split('.') {
                 for &c in part.as_bytes() {
                     let mut b = c;
                     if b >= b'A' && b <= b'Z' { b += 32; }
-                    hash = ((hash << 5) + hash).wrapping_add(b as u64);
+                    hash = (hash << 5).wrapping_add(hash).wrapping_add(b as u64);
                 }
             }
             

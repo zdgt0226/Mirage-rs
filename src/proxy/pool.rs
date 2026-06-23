@@ -535,41 +535,49 @@ impl WarmPool {
         Ok(Tunnel::new(crypto_reader, crypto_writer))
     }
 
-    /// O(1) 复杂度提取连接
+    /// O(1) 复杂度提取连接.
     ///
-    /// 如果队列有现成连接，0 延迟返回。
-    /// 如果队列为空，则无缝休眠等待 `notify` 唤醒。
+    /// 如果队列有现成连接, 0 延迟返回. 队列空时挂起等待 `notify` 唤醒.
+    ///
+    /// ★ 10s 超时硬上限 (修 bug: 雪崩) — 之前签名是 `-> Tunnel` infallible,
+    /// builder 上游死后只 log + sleep 重试, 永不调 notify_one. 每个 pool.get()
+    /// 死等, 浏览器请求堆积成百上千 → FD 耗尽 OOM. 现在返回 `Result<Tunnel>`,
+    /// 10s 还拿不到就报错让调用方放弃这次请求, 不堆积.
     ///
     /// 反馈式弹性 (v0.4.2+) 仪表化: 入口记录开始时间, 拿到 tunnel 后若总耗时
     /// > 50ms 计一次 wait_event. Manager task 用此比率决定下周期 target 调整.
-    pub async fn get(&self) -> Tunnel {
+    pub async fn get(&self) -> Result<Tunnel> {
         self.metrics.total_gets.fetch_add(1, Ordering::Relaxed);
         let wait_start = Instant::now();
 
-        loop {
-            // 先获取通知句柄（关键：避免检查队列为空和发生通知之间的竞态条件 Race Condition）
-            let notified = self.notify.notified();
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                // 先获取通知句柄（关键：避免检查队列为空和发生通知之间的竞态条件 Race Condition）
+                let notified = self.notify.notified();
 
-            if let Some(tunnel) = self.queue.lock().await.pop_front() {
-                if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
-                    tracing::debug!("Tunnel reached max age ({}s), gracefully closing",
-                        tunnel.created_at.elapsed().as_secs());
-                    tokio::spawn(async move {
-                        let mut t = tunnel;
-                        let _ = t.writer.send_close_notify().await;
-                    });
-                    continue;
+                if let Some(tunnel) = self.queue.lock().await.pop_front() {
+                    if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
+                        tracing::debug!("Tunnel reached max age ({}s), gracefully closing",
+                            tunnel.created_at.elapsed().as_secs());
+                        tokio::spawn(async move {
+                            let mut t = tunnel;
+                            let _ = t.writer.send_close_notify().await;
+                        });
+                        continue;
+                    }
+                    // 拿到可用 tunnel, 看是否经历过显著等待
+                    if wait_start.elapsed() > Duration::from_millis(50) {
+                        self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return tunnel;
                 }
-                // 拿到可用 tunnel, 看是否经历过显著等待
-                if wait_start.elapsed() > Duration::from_millis(50) {
-                    self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
-                }
-                return tunnel;
+
+                // 队列真的空了，挂起当前协程等待补货
+                notified.await;
             }
+        }).await;
 
-            // 队列真的空了，挂起当前协程等待补货
-            notified.await;
-        }
+        result.map_err(|_| anyhow::anyhow!("pool.get() timed out after 10s — upstream likely unreachable"))
     }
 
     pub async fn update_brutal_rate(&self, new_rate: u64) {

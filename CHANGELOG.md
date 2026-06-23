@@ -1,5 +1,18 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.3] - 2 个隐蔽生产 bug 修复 (2026-06-23)
+
+### Critical Fixes
+- **fix(ebpf): DJB2 哈希算法 Rust 溢出 panic (恶意域名远程崩溃)** — `src/ebpf/mod.rs::update_dns_cache` 的 DJB2 哈希 `hash = ((hash << 5) + hash).wrapping_add(b as u64)` 末尾 wrapping 是对的, 但前面的 `+ hash` 是普通加. Rust debug build (含任何启用 `overflow-checks = true` 的 release) 一旦 u64 溢出就 panic. **攻击者可构造超长恶意域名通过 XDP 触发, 精准 panic 用户态管控平面**. 修复: 改为 `(hash << 5).wrapping_add(hash).wrapping_add(b as u64)`, 全部 wrapping 跟 C 端 dns_xdp.c 的 u64 + 截断语义一致.
+- **fix(pool): WarmPool.get() 无超时导致雪崩 OOM** — 旧签名 `pub async fn get(&self) -> Tunnel` infallible, 池子空 + builder 反复连接上游失败时只 log + sleep 1s, **永不调用 notify_one**. 每个 pool.get() 死等, 浏览器请求堆积成百上千 → FD 耗尽 → OOM 进程被 OS 强杀. 修复: 改成 `Result<Tunnel>` + 内部 10s `tokio::time::timeout`. 4 个调用点 (handler/dns/healthcheck/udp_relay) 全部更新, Err 时 log + 优雅 return.
+
+### 实际部署影响
+v0.4.4-alpha.2 也带这两个 bug:
+- DJB2 panic: 配置了 fakeip + XDP 的客户端, 攻击者发恶意域名 XDP 触发崩溃
+- pool 雪崩: 客户端上游服务器宕机 / 网络抽风时, 浏览器多个 tab 同时使用代理 → FD 在分钟级别耗尽
+
+强烈建议从任何 v0.4.x 升 alpha.3.
+
 ## [v0.4.4-alpha.2] - 4 个生产级 bug 修复 (2026-06-23)
 
 ### Critical Fixes
