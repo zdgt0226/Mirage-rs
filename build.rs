@@ -5,9 +5,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PATH");
 
     // Inject `git describe` so --version shows actual build state independent
-    // of Cargo.toml. Rerun if HEAD moves or new tags appear.
+    // of Cargo.toml. Rerun when:
+    //   .git/HEAD            分支切换 (HEAD 文件内容变)
+    //   .git/refs/heads      在当前分支新 commit (refs/heads/<branch> SHA 变)
+    //   .git/refs/tags       新打 tag
+    //   .git/index           staged 变化 (能让 --dirty 状态及时刷新)
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads");
     println!("cargo:rerun-if-changed=.git/refs/tags");
+    println!("cargo:rerun-if-changed=.git/index");
     let git_desc = std::process::Command::new("git")
         .args(["describe", "--tags", "--always", "--dirty"])
         .output()
