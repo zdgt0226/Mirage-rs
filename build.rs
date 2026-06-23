@@ -4,6 +4,21 @@ fn main() {
     println!("cargo:rerun-if-changed=ebpf-src/transparent.c");
     println!("cargo:rerun-if-env-changed=PATH");
 
+    // Inject `git describe` so --version shows actual build state independent
+    // of Cargo.toml. Rerun if HEAD moves or new tags appear.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/tags");
+    let git_desc = std::process::Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=MIRAGE_GIT={}", git_desc);
+
     let uname = std::process::Command::new("uname").arg("-m").output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "x86_64".to_string());

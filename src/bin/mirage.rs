@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("MIRAGE_GIT"), ")");
+
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Mirage-rs Proxy Engine\nHigh-performance eBPF-accelerated proxy", long_about = None)]
+#[command(author, version = VERSION, about = "Mirage-rs Proxy Engine\nHigh-performance eBPF-accelerated proxy", long_about = None)]
 struct Args {
     #[command(subcommand)]
     mode: Mode,
