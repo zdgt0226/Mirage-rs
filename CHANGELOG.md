@@ -1,5 +1,31 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.4] - 安装体验 + 版本治理 (2026-06-24)
+
+### feat(install): 节点 URI 导出 / 导入
+- 服务端配置完成后询问公网地址, 生成 `mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>[&brutal=<mbps>]` 单行节点串, 存到 `/etc/mirage-rs/node-export.txt` (chmod 600) 并在终端打印. 装了 `qrencode` 同时出 UTF8 二维码.
+- 客户端 `config_client` 启动加 "粘贴 URI 自动填" / "手动输入" 分支. 同机部署 mode 3 时, URI 默认自动填入本机刚生成的, 一回车复用.
+- URL 编解码 UTF-8 安全 (中文密码可用), 6 类非法 URI (空 / 错协议 / 缺端口 / 非数字端口 / 空 SNI / 残缺) 全拒. 不支持 `[::1]` 形 IPv6 主机 (regex 限制), 这种走手动模式.
+
+### feat(install): 监听端口占用检测
+- 服务端 port + 客户端 inbound_port 接 `ask_port()` (基于 `ss -tlnH`). 占用即 warn + 显示占用进程名, 用户可选 force-continue. `ss` 不可用 (HAVE_SS=0) 自动跳过, 不阻塞流程.
+
+### chore(version): 三层同步 binary 版本信息
+- **L1**: `Cargo.toml` 0.2.3 → 0.4.4-alpha.4. 历史欠账 — 该字段从未更新, 5 个 tag 以来 `mirage --version` 一直输出 "0.2.3".
+- **L2**: `build.rs` 跑 `git describe --tags --always --dirty` 注入 `MIRAGE_GIT` env, `src/bin/mirage.rs` 用 `concat!(CARGO_PKG_VERSION, " (", MIRAGE_GIT, ")")` 作为 clap version. 现在输出:
+  ```
+  mirage-rs 0.4.4-alpha.4 (v0.4.4-alpha.4)
+  ```
+  dev build 自带 `-dirty`. rerun 钩子 watch `.git/HEAD/refs/heads/refs/tags/index`, commit/staged 都触发 rebuild.
+- **L3**: `release.yml` 加 sanity check, tag vXYZ 与 Cargo.toml XYZ 不一致 CI 立刻 fail 并提示先 bump. checkout 加 `fetch-depth: 0` 让 git describe 拿全 tag 历史.
+
+### chore(test): 综合 bug 验证脚本 `scripts/test_bugfixes.sh`
+- 覆盖 v0.4.4-alpha.x 6 个 bug (pool 缩容锁死 / Geo 启动时序 / TCP 僵尸 / UDP cancel-safety / DJB2 panic / pool 雪崩). 3 种模式: `quick` 全自动 3 个 / `all` 全套需手动配合 / 指定 bug 号. 末尾自动 PASS/FAIL/SKIP 汇总.
+
+### 升级影响
+- 无代码层 bug 修复 (alpha.3 已修齐). 本版纯 DX/UX. 已部署 alpha.3 没有 OOM/panic 实战问题的不必急升.
+- 升级后 `mirage --version` 会反映真实版本; 之后的 alpha.5/alpha.6 不会再静默输出 alpha.3 hash.
+
 ## [v0.4.4-alpha.3] - 2 个隐蔽生产 bug 修复 (2026-06-23)
 
 ### Critical Fixes
