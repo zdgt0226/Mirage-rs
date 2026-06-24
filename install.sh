@@ -97,6 +97,7 @@ ask_port() {
 }
 
 url_encode() {
+    local LC_ALL=C
     local s=$1 out="" i ch
     for (( i=0; i<${#s}; i++ )); do
         ch="${s:i:1}"
@@ -109,6 +110,7 @@ url_encode() {
 }
 
 url_decode() {
+    local LC_ALL=C
     local s=$1
     s="${s//+/ }"
     printf '%b' "${s//%/\\x}"
