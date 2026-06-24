@@ -189,6 +189,27 @@ brutal_loaded() {
         grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control
 }
 
+# 探测本机公网 IP. 顺序尝试多个公共 echo 服务, 取第一个返回合法 IPv4 的.
+# IPv6 / 域名 / NAT 后端: 用户手动输入覆盖. 探测失败 (网络断 / 服务全挂) 返
+# 回空字符串, 不阻塞流程.
+detect_public_ip() {
+    local services=(
+        "https://api.ipify.org"
+        "https://ifconfig.me/ip"
+        "https://ipv4.icanhazip.com"
+        "https://checkip.amazonaws.com"
+    )
+    local ip
+    for svc in "${services[@]}"; do
+        ip=$(curl -4 -sfL --max-time 3 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
 handle_brutal_optional() {
     info "Brutal 是给单条连接定速的内核模块（Hysteria2 思路），极大地优化高丢包线路"
     if brutal_loaded; then
@@ -454,8 +475,16 @@ EOF
     setup_systemd "server"
 
     # ── 节点导出 (供客户端导入) ──
-    local pub_host
-    pub_host=$(ask "公网地址 (域名/IP, 用于生成客户端节点导入串; 留空则跳过)" "")
+    # 自动探测本机公网 IP 作为默认值; 用户可回车采纳 / 输域名覆盖 / 留空跳过
+    local detected_ip pub_host
+    info "正在探测本机公网 IP..."
+    detected_ip=$(detect_public_ip || true)
+    if [[ -n "$detected_ip" ]]; then
+        ok "探测到公网 IP: $detected_ip"
+    else
+        warn "公网 IP 探测失败 (网络断 / 全部回源服务超时), 需手动输入"
+    fi
+    pub_host=$(ask "公网地址 (域名/IP, 用于生成客户端节点导入串; 留空则跳过)" "$detected_ip")
     if [[ -z "$pub_host" ]]; then
         warn "未输入公网地址, 跳过节点导出. 如需手动构造:"
         echo "      mirage://<密码>@<host>:${port}?sni=${sni}" >&2
