@@ -139,11 +139,19 @@ jobs:
           fi
           echo "✓ artifact embeds ≥ 3 ELF blobs"
 
+      - name: Generate SHA256
+        run: |
+          set -euo pipefail
+          sha256sum mirage-rs-${{ matrix.arch }} > mirage-rs-${{ matrix.arch }}.sha256
+          echo "--- $(cat mirage-rs-${{ matrix.arch }}.sha256) ---"
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: mirage-rs-${{ matrix.arch }}
-          path: mirage-rs-${{ matrix.arch }}
+          path: |
+            mirage-rs-${{ matrix.arch }}
+            mirage-rs-${{ matrix.arch }}.sha256
 
   release:
     needs: build
@@ -162,7 +170,11 @@ jobs:
         with:
           files: |
             artifacts/mirage-rs-amd64/mirage-rs-amd64
+            artifacts/mirage-rs-amd64/mirage-rs-amd64.sha256
             artifacts/mirage-rs-arm64/mirage-rs-arm64
+            artifacts/mirage-rs-arm64/mirage-rs-arm64.sha256
             artifacts/mirage-rs-amd64-musl/mirage-rs-amd64-musl
+            artifacts/mirage-rs-amd64-musl/mirage-rs-amd64-musl.sha256
             artifacts/mirage-rs-arm64-musl/mirage-rs-arm64-musl
+            artifacts/mirage-rs-arm64-musl/mirage-rs-arm64-musl.sha256
           generate_release_notes: true

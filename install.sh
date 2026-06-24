@@ -212,6 +212,83 @@ handle_brutal_optional() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 二进制完整性校验 (防 release 资产被劫持)
+# ──────────────────────────────────────────────────────────────────────────────
+# 策略 (进阶档): 优先走 GitHub API 拿 release digest, 与 CDN 走的下载链路
+# 不同 (api.github.com vs objects.githubusercontent.com), 两通道都对才认.
+# API 不可用或 digest 缺失 (旧 release / GH 新功能未铺开) 时, 回落到同 CDN
+# 拿 .sha256 文件 (单通道, 仍能防大部分 MITM/CDN 缓存污染).
+verify_binary_integrity() {
+    local binary_path=$1 download_url=$2
+    local binary_name; binary_name=$(basename "$download_url")
+    local expected_sha="" sha_source=""
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        warn "sha256sum 不可用 (coreutils 缺失?), 跳过完整性校验"
+        return 0
+    fi
+
+    local actual_sha
+    actual_sha=$(sha256sum "$binary_path" | cut -d' ' -f1)
+
+    # 进阶: GitHub API 双通道 (需 python3 解 JSON)
+    if command -v python3 >/dev/null 2>&1; then
+        info "向 GitHub API 取期望 digest..."
+        local api_resp
+        api_resp=$(curl -sfL --max-time 10 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/zdgt0226/Mirage-rs/releases/latest" 2>/dev/null || true)
+        if [[ -n "$api_resp" ]]; then
+            expected_sha=$(BINARY_NAME="$binary_name" python3 -c '
+import json, os, sys
+name = os.environ["BINARY_NAME"]
+try:
+    data = json.loads(sys.stdin.read())
+    for a in data.get("assets", []):
+        if a.get("name") == name:
+            d = a.get("digest") or ""
+            if d.startswith("sha256:"):
+                print(d[7:])
+                break
+except Exception:
+    pass
+' <<< "$api_resp")
+            [[ -n "$expected_sha" ]] && sha_source="GitHub API (api.github.com)"
+        fi
+    fi
+
+    # 入门 fallback: 同 release 的 .sha256
+    if [[ -z "$expected_sha" ]]; then
+        info "API digest 不可用, fallback 到 release .sha256 文件..."
+        local sha_url="${download_url}.sha256"
+        local sha_tmp; sha_tmp=$(mktemp)
+        if curl -sfL --max-time 30 -o "$sha_tmp" "$sha_url" 2>/dev/null; then
+            expected_sha=$(cut -d' ' -f1 "$sha_tmp" 2>/dev/null || true)
+            [[ -n "$expected_sha" ]] && sha_source="release .sha256 文件"
+        fi
+        rm -f "$sha_tmp"
+    fi
+
+    if [[ -z "$expected_sha" ]]; then
+        warn "无法获取期望 SHA256 (旧 release 或 GitHub 限流)"
+        if ! ask_yn "跳过校验继续? (生产环境不推荐)" n; then
+            rm -f "$binary_path"
+            err "用户取消安装"
+        fi
+        return 0
+    fi
+
+    info "实际 SHA256: $actual_sha"
+    info "期望 SHA256: $expected_sha"
+    info "来源:        $sha_source"
+    if [[ "$expected_sha" != "$actual_sha" ]]; then
+        rm -f "$binary_path"
+        err "★ SHA256 校验失败! 二进制可能被劫持, 已删除可疑文件 ★"
+    fi
+    ok "SHA256 校验通过 ($sha_source)"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FHS 路径与文件部署
 # ──────────────────────────────────────────────────────────────────────────────
 BIN_PATH="/usr/local/bin/mirage-rs"
@@ -244,13 +321,16 @@ setup_fhs() {
             *) err "不支持的系统架构: $(uname -m)" ;;
         esac
         
-        local download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-linux-${arch}-musl"
+        # 文件名跟 release.yml 上传命名严格一致 (mirage-rs-<arch>-musl)
+        local download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-rs-${arch}-musl"
         info "下载链接: $download_url"
-        
+
         # 使用 curl 下载，带进度条
         if ! curl -# -fLo "$BIN_PATH" "$download_url"; then
             warn "从 GitHub Releases 下载失败，请检查网络或手动下载编译。"
             touch "$BIN_PATH" # Placeholder for sandbox/development fallback
+        else
+            verify_binary_integrity "$BIN_PATH" "$download_url"
         fi
     fi
     
