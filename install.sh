@@ -96,6 +96,30 @@ ask_port() {
     done
 }
 
+# 询问 GUI 监听配置. 调用方:
+#   read gui_enabled gui_listen <<< "$(ask_gui 9090)"
+# 返回单行: "<enabled> <addr>:<port>", 其中 enabled = true|false.
+# 注意不能用全局变量传 enabled, 因为 $(ask_gui) 是子 shell, 出不来.
+# 用户拒绝时 listen 用 "127.0.0.1:9090" 占位 (enabled=false 时 mirage 忽略).
+ask_gui() {
+    local default_port=${1:-9090}
+    if ! ask_yn "启用 Web GUI 管理面板 (Neon Dashboard)" y; then
+        echo "false 127.0.0.1:9090"
+        return
+    fi
+    local scope listen_addr
+    scope=$(ask_choice "GUI 监听范围" \
+        "仅本机 127.0.0.1 (推荐)" \
+        "全网开放 0.0.0.0 (LAN/远程访问, 自行加反代+鉴权)")
+    case "$scope" in
+        1) listen_addr="127.0.0.1" ;;
+        2) listen_addr="0.0.0.0" ;;
+    esac
+    local port
+    port=$(ask_port "GUI 端口" "$default_port" tcp)
+    echo "true ${listen_addr}:${port}"
+}
+
 url_encode() {
     local LC_ALL=C
     local s=$1 out="" i ch
@@ -441,7 +465,10 @@ EOM
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
-    
+
+    local server_gui_enabled server_gui_listen
+    read server_gui_enabled server_gui_listen <<< "$(ask_gui 9090)"
+
     cat > "${ETC_DIR}/config_server.json" <<EOF
 {
     "schema_version": 1,
@@ -458,8 +485,8 @@ EOM
     ],
     "outbounds": [],
     "gui": {
-        "enabled": true,
-        "listen": "127.0.0.1:9090"
+        "enabled": ${server_gui_enabled},
+        "listen": "${server_gui_listen}"
     },
     "routing": {
         "default_outbound": "direct",
@@ -681,6 +708,11 @@ config_client() {
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
+    # mode 3 同机部署时, 服务端可能已占 9090, ask_gui 内的 ask_port 会自动
+    # 检测占用并提示改成 9091 等. 单独 client (mode 2) 直接 9090 即可.
+    local client_gui_enabled client_gui_listen
+    read client_gui_enabled client_gui_listen <<< "$(ask_gui 9090)"
+
     cat > "${ETC_DIR}/config_client.json" <<EOF
 {
     "schema_version": 1,
@@ -713,8 +745,8 @@ config_client() {
         }
     ],
     "gui": {
-        "enabled": true,
-        "listen": "127.0.0.1:9090"
+        "enabled": ${client_gui_enabled},
+        "listen": "${client_gui_listen}"
     },
     ${routing_json},
     "tuning": {
