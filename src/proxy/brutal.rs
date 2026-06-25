@@ -67,7 +67,10 @@ pub fn apply_brutal(fd: i32, rate_bytes_per_sec: u64) {
             rate: u64,
             cwnd_gain: u32,
         }
-        const CWND_GAIN_X10: u32 = 15;
+        // X10 编码: 20 = 2.0× BDP. 匹配 apernet/tcp-brutal 内核默认值.
+        // 之前用 15 (= 1.5× BDP) 在低 RTT 链路上 cwnd 偏紧, ACK 没回 cwnd 就满,
+        // 实测吞吐 < 设定 rate (E rate=20 ≈ F rate=50 的根因).
+        const CWND_GAIN_X10: u32 = 20;
         let params = BrutalParams {
             rate: rate_bytes_per_sec,
             cwnd_gain: CWND_GAIN_X10,

@@ -1,5 +1,30 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.5] - Brutal cwnd_gain 修正 (2026-06-25)
+
+### perf(brutal): cwnd_gain 15 → 20 (匹配 apernet 内核默认)
+
+实际部署反馈, 服务端启用 brutal 后 YouTube 等场景下连接速度反而比关
+闭 brutal 慢. 7 组 A/B 对照表 (brutal=0/2/8/20/50, pool=1/5/50) 显示:
+
+- pool 越大越慢 (50 > 5 > 1 → 不是 N 流互挤, 因为单视频流只占 1-2 条)
+- E (rate=20, pool=5) ≈ F (rate=50, pool=5) — **rate 不是瓶颈**
+- 所有 brutal 启用配置都 < 无 brutal (C)
+
+诊断结论: cwnd_gain 是瓶颈. brutal cwnd = BDP × cwnd_gain / 10. 我们之前
+代码里硬塞 `CWND_GAIN_X10 = 15` (= 1.5× BDP), 在低 RTT/高带宽链路 (国
+内访问海外 CDN 经常 < 50ms) cwnd 偏紧, ACK 还没回 cwnd 就满, 实际吞
+吐 < 设定 rate, 表现就是 E ≈ F (都被 cwnd 卡同一上限). apernet/tcp-brutal
+内核模块默认是 `CWND_GAIN_DEFAULT 20` (= 2.0× BDP), 我们对齐.
+
+修改:
+- `src/proxy/brutal.rs:73`  CWND_GAIN_X10 15 → 20  (静态 apply_brutal)
+- `src/proxy/pool.rs:608`   CWND_GAIN_X10 15 → 20  (动态 update_brutal_rate)
+
+两处必须同步, 否则客户端 BPF 反馈 loop (lib.rs:250-318) 跑起来后会用
+旧值覆盖. 此 alpha 仅一行实质改动, 待用户验证后再决定是否进一步暴露
+为 advanced 可调字段.
+
 ## [v0.4.4-alpha.4] - 安装体验 + 版本治理 (2026-06-24)
 
 ### feat(install): 节点 URI 导出 / 导入
