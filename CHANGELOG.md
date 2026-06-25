@@ -1,5 +1,51 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.6] - Brutal CC 自适应回落 + install.sh 文本修正 (2026-06-25)
+
+### feat(brutal): retrans 率超阈值自动 setsockopt 切回 BBR
+
+alpha.5 把 cwnd_gain 从 15 改到 20 之后实测仍慢, ss -tipn 数据显示问
+题不在 cwnd_gain 而在链路本身:
+
+- RTT 162-190ms (跨洲)
+- retrans 12-15% (链路真在丢包, 不是噪声)
+- pacing_rate 5 Mbps (brutal 在按 config 走), delivery_rate 0.5 Mbps
+- BBR 在同一链路上能跑满 5 Mbps 因为它感知到 RTT/loss 主动收敛
+
+brutal CC 的设计哲学 ("丢包是噪声, 死磕速率") 与高丢包链路冲突, 死磕
+导致重传放大反而吃光带宽. 这是算法本质, 不是 bug.
+
+但服务端不能因此就放弃 brutal — 高 RTT 低丢包的跨洲专线场景 brutal
+仍然胜 BBR. 取舍解法: **保留默认开启, 同时跑运行时自适应监测**.
+
+实现 (src/proxy/brutal.rs::spawn_fallback_monitor):
+- 每条 brutal-enabled accept socket 起一个轻量 tokio task
+- 每 10s 调 getsockopt(TCP_INFO) 读 total_retrans / segs_out
+- 单窗口 retrans > 5% 且 segs > 500 (流量足够判断) → setsockopt
+  TCP_CONGESTION=bbr 立即切走, log warn 解释原因
+- 连续 6 个窗口正常 (1 分钟) 认为链路稳定, 停止监测省 CPU
+- 最长 3 分钟无定论也停止
+- 用 SO_COOKIE 防 fd 复用错认 (socket 关闭后 fd 可能立即被新连接拿
+  到, 仅靠 fd 监测会误改无关 socket)
+
+libc 0.2.186 的 tcp_info 只到 tcpi_total_retrans, 没暴露 segs_out
+等 Linux 3.15+ 字段. 自定义 TcpInfoExt 完整 struct (144 字节,
+segs_out offset 136, 匹配 Linux upstream ABI), getsockopt 长度匹配,
+老内核场景下尾部字段保 0, MIN_SEGS_PER_WINDOW 阈值自然兜底, 安全
+降级不需特殊处理.
+
+### fix(install): 误导的 brutal_rate 建议值
+
+旧文本推荐 8-10 Mbps/单连接, 实际是给 100M/1G 链路设的过保守值,
+单流 YouTube 直接被 cap. 新文本基于"链路带宽 30-50%"建议, 100M
+出口 → 30-50 Mbps, 1G → 300-500. 自适应 fallback 兜底, 设过头
+也不会比 BBR 差.
+
+### 升级影响
+- 服务端无需手改 config, 重启即享受自适应 brutal
+- 用户在不合适的链路 (跨洲 CDN / 国内移动) 部署也不会比 BBR 慢
+- 高 RTT 低丢包链路 (跨洲专线) brutal 加速依然有效
+
 ## [v0.4.4-alpha.5] - Brutal cwnd_gain 修正 (2026-06-25)
 
 ### perf(brutal): cwnd_gain 15 → 20 (匹配 apernet 内核默认)

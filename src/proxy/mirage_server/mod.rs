@@ -71,9 +71,17 @@ pub async fn start_server(
                 }
                 // 控制 server→client 方向的发送速率 (下载速度). 这是代理用户
                 // 最关心的方向, 比客户端 outbound 那侧的 brutal 重要得多.
+                //
+                // apply_brutal 同时启自适应回落 monitor: 部分链路 (跨洲 CDN 等)
+                // 实际丢包率高, brutal 死磕设定速率会让 retrans 吃光带宽. monitor
+                // 检测到单窗口 retrans > 5% 自动 setsockopt 切回 BBR, 让 kernel
+                // 自适应. 这样服务端默认开 brutal 在适合的链路 (高 RTT 低丢包)
+                // 享受加速, 不适合的链路 (高丢包) 也不会比 BBR 差.
                 if let Some(rate) = brutal_rate_bytes_per_sec {
                     use std::os::unix::io::AsRawFd;
-                    crate::proxy::brutal::apply_brutal(stream.as_raw_fd(), rate);
+                    let fd = stream.as_raw_fd();
+                    crate::proxy::brutal::apply_brutal(fd, rate);
+                    crate::proxy::brutal::spawn_fallback_monitor(fd);
                 }
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();

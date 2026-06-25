@@ -432,29 +432,26 @@ config_server() {
         cat >&2 <<'EOM'
 
 ═══════════════════════════════════════════════════
-  关于 Brutal CC 速率值的重要提示
+  Brutal CC 单连接目标速率
 ═══════════════════════════════════════════════════
-  Brutal 是为"单条 TCP 跑满目标速率"设计的拥塞控制算法.
-  它不主动让步, 设置多少就发多少.
+  Brutal 给单条 TCP 死磕设定速率, 不让步. 适合"高 RTT 低
+  丢包"链路 (跨洲专线 / 移动 4G/5G), BBR 这种自适应 CC 在
+  丢包链路上会被拖慢, brutal 反而能跑满.
 
-  但 Mirage 的 WarmPool 会同时持有多条 brutal 连接,
-  这些连接相互不知道彼此, 各自独立打满设定值.
-  因此 ★ 单连接的目标速率必须远低于链路总带宽 ★,
-  否则多连接并发时会引发持续拥塞和丢包.
+  v0.4.4-alpha.6 起服务端自动监测每条连接的 retrans 率,
+  超过 5%/10s 窗口判定不适合 brutal, 自动 setsockopt 切回
+  BBR. 因此设错也不会更差, 顶多回到 BBR 的速度.
 
-  推荐取值: 8 ~ 10 Mbps (不分 100M / 1G 出口)
-  上限红线: 10 Mbps. 超过会拖累整体速度.
-
-  原理: 即便 50 条 brutal 连接并发, 8 Mbps × 50 = 400 Mbps,
-  1G 链路有充足缓冲, 100M 链路也只在多并发极端场景才接近上限,
-  单流场景日常下载从单条 brutal 走就能保持稳定高速.
+  推荐取值: 链路带宽的 30~50%.
+    100M 出口  → 30~50 Mbps
+    1G   出口  → 300~500 Mbps
+  太高 → 触发 autofallback (自动切 BBR). 太低 → 自我限速.
 ═══════════════════════════════════════════════════
 EOM
-        brutal_rate_mbps=$(ask "Brutal 单连接目标速率 (Mbps, 推荐 8-10, 不超过 10)" "8")
-        if [[ "$brutal_rate_mbps" =~ ^[0-9]+$ ]] && (( brutal_rate_mbps > 10 )); then
-            warn "已设为 ${brutal_rate_mbps} Mbps, 超过推荐上限 10 Mbps. 多连接并发时可能引发拥塞."
-        fi
-        info "Brutal 单连接速率: ${brutal_rate_mbps} Mbps"
+        # 探测公网链路带宽以建议默认值 (失败回退到 50)
+        local default_rate=50
+        brutal_rate_mbps=$(ask "Brutal 单连接目标速率 (Mbps, 推荐链路带宽 30-50%)" "$default_rate")
+        info "Brutal 单连接速率: ${brutal_rate_mbps} Mbps (不适合的链路会自动回落到 BBR)"
     fi
 
     local brutal_line=""
