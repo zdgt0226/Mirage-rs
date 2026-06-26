@@ -1,5 +1,40 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.7] - eBPF SockMap 直连转发问题临时禁用 (2026-06-26)
+
+### fix(install): 客户端 config 默认 ebpf_mode = "off"
+
+实测发现: 客户端访问 direct outbound 网站 (如 .cn 域名走直连) 时,
+日志显示 "eBPF SockMap: spliced ... (Zero-copy bypass activated)",
+但浏览器无响应, 5-15s 后超时重连, 周而复始。
+
+根因 (代码层): `src/proxy/handler.rs:258-312` 的 direct outbound 路径
+里, `EbpfEngine::register_splice()` 把两个 socket 的 cookie 插入
+SockHash, 然后 handler 进入 epoll 等 EPOLLRDHUP, **完全不再 Tokio
+读写**。问题:
+  1. `register_splice()` 的 Ok() 仅代表 map.insert 成功
+  2. 不代表 BPF stream_verdict 程序在数据到达时真能正确转发
+  3. 一旦 BPF redirect 静默失败 (cookie 时序、kernel 版本 ABI 差异、
+     sk_psock 初始化竞争等), 数据全静默丢, 也不会 fallback 回 Tokio
+
+实测确认: 客户端 config 加 `"tuning": { "ebpf_mode": "off" }` 后
+direct 立即正常。
+
+短期方案 (本版): install.sh 客户端 config 默认 `ebpf_mode = "off"`,
+让用户开箱即用。
+长期方案 (待调研): 根治 SockMap stream_verdict 不可靠转发, 可能需要
+在 register_splice 后做"健康探测"才标记 ebpf_spliced = true, 或改成
+Tokio + BPF 双路监听 (BPF 接管成功则 Tokio 退出, 否则 BPF 旁路只做
+统计)。
+
+### 影响
+- 本版客户端不享受 BPF zero-copy direct outbound 加速 (但 direct 走
+  Tokio 性能也完全够用, 一般用户感知不到差别)
+- BPF sock_ops RTT_CB / XDP DNS 等其他 BPF 功能也被一并停用 (它们都
+  在 ebpf_mode 总开关下), 客户端动态 brutal 调节失效。但客户端 brutal
+  默认本来就关闭, 影响面 ≈ 0
+- 服务端不受影响 (服务端本就 auto-skip BPF)
+
 ## [v0.4.4-alpha.6] - Brutal CC 自适应回落 + install.sh 文本修正 (2026-06-25)
 
 ### feat(brutal): retrans 率超阈值自动 setsockopt 切回 BBR

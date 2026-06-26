@@ -747,6 +747,7 @@ config_client() {
     },
     ${routing_json},
     "tuning": {
+        "ebpf_mode": "off",
         "geodata_dir": "${ETC_DIR}/geosite",
         "geo_sources": [
             {
