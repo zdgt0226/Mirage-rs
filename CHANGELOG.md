@@ -1,5 +1,52 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.8] - Brutal CC 应用时机修正 (匹配 Python POC) (2026-06-26)
+
+### fix(brutal): listener 上预设算法名, accepted socket 只补速率
+
+跟 Python POC (/opt/claude/mirage/server.py:349-360) 对比发现关键
+应用时序差异:
+
+Python POC:
+  1. listener socket 上 setsockopt(TCP_CONGESTION, "brutal")
+  2. accept → 子 socket 自动继承 brutal 算法名
+  3. accepted socket 上仅 setsockopt(TCP_BRUTAL_PARAMS, rate, ...)
+
+Rust (alpha.7 之前):
+  1. listener socket 上不设, 用 kernel 默认 CC (bbr/cubic)
+  2. accept → 子 socket = bbr
+  3. accepted socket 上 setsockopt(TCP_CONGESTION, "brutal") 中途切换
+  4. 然后 setsockopt(TCP_BRUTAL_PARAMS, rate, ...)
+
+中途切换 CC 在 Linux 是合法的, 但 brutal kernel 模块的 init/pacing
+状态过渡可能不干净 — 子 socket 已 ESTABLISHED, kernel 默认 pacing
+路径已激活, 切到 brutal 后 sk_pacing_status 转换 + brutal 自己的
+pacer 之间状态可能不一致, 导致实测吞吐塌方. POC 子 socket 从 SYN-ACK
+起就在 brutal 算法下, kernel 状态干净, 跑得很顺.
+
+修复 (src/proxy/brutal.rs + mirage_server/mod.rs):
+- 新增 `set_brutal_on_listener(fd)` — 仅设算法名, 在 bind 后第一次
+  accept 前调用一次
+- 新增 `set_brutal_rate(fd, rate)` — 仅设 TCP_BRUTAL_PARAMS, 给每个
+  accepted socket 用
+- 保留旧 `apply_brutal(fd, rate)` 给 pool.rs (客户端出站) — 客户端
+  是主动 connect, 无 listener 可继承, 只能在 connect 后 apply
+
+### 验证方法
+
+部署后:
+```bash
+sudo journalctl -u mirage-server --since "2 min ago" | grep "Brutal CC pre-set"
+```
+应有一行 "Brutal CC pre-set on listener fd=X (will be inherited by
+accepted sockets)".
+
+然后 ss -tipn 看 cwnd 走向 — 跟 POC 在同链路上跑应该数据相近.
+
+cwnd_gain 仍保持 20 (apernet 默认), 不改成 Python 的 15 是因为
+alpha.4 (15) 和 alpha.5/6 (20) 实测都慢, 真正瓶颈是算法应用时序,
+不是 cwnd_gain 取值.
+
 ## [v0.4.4-alpha.7] - eBPF SockMap 直连转发问题临时禁用 (2026-06-26)
 
 ### fix(install): 客户端 config 默认 ebpf_mode = "off"
