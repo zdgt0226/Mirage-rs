@@ -10,7 +10,7 @@
 #   bash scripts/test_bugfixes.sh 1 4 6     # 指定 bug 号
 #
 # 配置 (环境变量覆盖):
-#   CLIENT_LOG=/tmp/mirage-client.log     客户端日志路径 (Bug 1 需要 DEBUG)
+#   CLIENT_LOG=/tmp/mirage-rs-client.log     客户端日志路径 (Bug 1 需要 DEBUG)
 #   SOCKS_PROXY=socks5://127.0.0.1:1080  客户端 SOCKS5 入口
 #   SOCKS_HOST=127.0.0.1:1080            裸 host:port (curl --socks5)
 #   DNS_PORT=5353                         客户端 DNS inbound 端口
@@ -19,7 +19,7 @@
 
 set -u
 
-CLIENT_LOG="${CLIENT_LOG:-/tmp/mirage-client.log}"
+CLIENT_LOG="${CLIENT_LOG:-/tmp/mirage-rs-client.log}"
 SOCKS_PROXY="${SOCKS_PROXY:-socks5://127.0.0.1:1080}"
 SOCKS_HOST="${SOCKS_HOST:-127.0.0.1:1080}"
 DNS_PORT="${DNS_PORT:-5353}"
@@ -158,7 +158,7 @@ test_bug2() {
     note "删除 $GEO_DIR/*.dat..."
     sudo rm -f "$GEO_DIR"/*.dat 2>/dev/null || rm -f "$GEO_DIR"/*.dat 2>/dev/null || true
 
-    note "请手动重启客户端 (systemctl restart mirage-client 或 kill+再启), 等启动后回车继续"
+    note "请手动重启客户端 (systemctl restart mirage-rs-client 或 kill+再启), 等启动后回车继续"
     prompt "客户端重启完成?"
 
     if [[ ! -f "$CLIENT_LOG" ]]; then

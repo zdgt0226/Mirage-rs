@@ -387,7 +387,7 @@ setup_fhs() {
 
 setup_systemd() {
     local role=$1
-    local service_path="/etc/systemd/system/mirage-${role}.service"
+    local service_path="/etc/systemd/system/mirage-rs-${role}.service"
     
     cat > "$service_path" <<EOF
 [Unit]
@@ -408,8 +408,8 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable "mirage-${role}.service" --now
-    ok "Systemd 服务已创建并启用: mirage-${role}.service"
+    systemctl enable "mirage-rs-${role}.service" --now
+    ok "Systemd 服务已创建并启用: mirage-rs-${role}.service"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -531,7 +531,7 @@ EOF
         echo >&2
     fi
 
-    info "你可以使用以下命令启动服务端: systemctl start mirage-server"
+    info "你可以使用以下命令启动服务端: systemctl start mirage-rs-server"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -770,7 +770,7 @@ EOF
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
     setup_systemd "client"
     
-    info "你可以使用以下命令启动客户端: systemctl start mirage-client"
+    info "你可以使用以下命令启动客户端: systemctl start mirage-rs-client"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -782,7 +782,7 @@ print_brutal_hint() {
     echo "请手动执行以下步骤："
     echo "  1. 确保 tcp-brutal 内核模块已安装：https://github.com/apernet/tcp-brutal"
     echo "  2. 在客户端配置文件 outbounds[mirage] 块中添加 \"brutal_rate_mbps\": 8"
-    echo "  3. 重启 mirage-rs：systemctl restart mirage-client"
+    echo "  3. 重启 mirage-rs：systemctl restart mirage-rs-client"
     echo "=========================================================="
 }
 
@@ -799,17 +799,93 @@ EOF
     ok "系统网络参数优化完毕 (BBR/缓冲放大已开启)。"
 }
 
+uninstall() {
+    title "Mirage-rs 卸载"
+
+    # 兼容两种命名: 新 (mirage-rs-*) + 旧 (mirage-*, alpha.8 之前的旧机器)
+    local services=(mirage-rs-server mirage-rs-client mirage-server mirage-client)
+
+    info "停止并禁用所有 mirage 相关 systemd 服务..."
+    for svc in "${services[@]}"; do
+        if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+            systemctl stop "${svc}.service" 2>/dev/null || true
+        fi
+        if systemctl is-enabled --quiet "${svc}.service" 2>/dev/null; then
+            systemctl disable "${svc}.service" 2>/dev/null || true
+        fi
+        local unit_path="/etc/systemd/system/${svc}.service"
+        if [[ -f "$unit_path" ]]; then
+            rm -f "$unit_path"
+            info "已删除 ${unit_path}"
+        fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    ok "Systemd 服务清理完毕"
+
+    # 二进制
+    if [[ -f "$BIN_PATH" ]]; then
+        rm -f "$BIN_PATH"
+        ok "已删除二进制 $BIN_PATH"
+    fi
+
+    # 日志目录 (默认 y, 卸载场景下日志通常不需要保留)
+    if [[ -d "$LOG_DIR" ]]; then
+        if ask_yn "是否删除日志目录 $LOG_DIR ?" y; then
+            rm -rf "$LOG_DIR"
+            ok "已删除 $LOG_DIR"
+        fi
+    fi
+
+    # 配置目录 (默认 n, 包含 config_*.json / geo 数据 / node-export.txt,
+    # 用户重装可复用, 谨慎默认不删)
+    if [[ -d "$ETC_DIR" ]]; then
+        if ask_yn "是否删除配置目录 $ETC_DIR ? (含 config / geo / node-export)" n; then
+            rm -rf "$ETC_DIR"
+            ok "已删除 $ETC_DIR"
+        fi
+    fi
+
+    # 状态目录 (默认 y, 一般是 systemd WorkingDirectory 残留)
+    if [[ -d "$STATE_DIR" ]]; then
+        if ask_yn "是否删除状态目录 $STATE_DIR ?" y; then
+            rm -rf "$STATE_DIR"
+            ok "已删除 $STATE_DIR"
+        fi
+    fi
+
+    # 系统级 sysctl (默认 n, 移除会影响系统其他服务的 BBR/wmem 配置)
+    if [[ -f /etc/sysctl.d/99-mirage.conf ]]; then
+        if ask_yn "是否删除 sysctl 优化 /etc/sysctl.d/99-mirage.conf ? (会影响系统 BBR/wmem 设置)" n; then
+            rm -f /etc/sysctl.d/99-mirage.conf
+            sysctl --system >/dev/null 2>&1 || true
+            ok "已删除 sysctl 优化, 系统参数已重载"
+        fi
+    fi
+
+    title "卸载完成"
+    echo -e "  Mirage-rs 已从本机移除. 感谢使用." >&2
+}
+
 main() {
-    title "Mirage-rs 极速安装向导"
+    title "Mirage-rs 安装向导"
     if [[ $EUID -ne 0 ]]; then
         err "需要 Root 权限。请使用 sudo bash install.sh 运行。"
     fi
-    
-    local mode=$(ask_choice "请选择安装类型" "部署服务端 (Server)" "部署客户端 (Client)" "同时部署服务端与客户端")
-    
+
+    local mode=$(ask_choice "请选择操作" \
+        "部署服务端 (Server)" \
+        "部署客户端 (Client)" \
+        "同时部署服务端与客户端" \
+        "卸载 (Uninstall)")
+
+    if [[ "$mode" == "4" ]]; then
+        uninstall
+        return
+    fi
+
     setup_fhs
     optimize_sysctl
-    
+
     case $mode in
         1)
             config_server
@@ -824,11 +900,11 @@ main() {
             print_brutal_hint
             ;;
     esac
-    
+
     title "安装完成！"
     echo -e "  配置目录: $(_c 36 "${ETC_DIR}")"
     echo -e "  数据目录: $(_c 36 "${STATE_DIR}")"
-    echo -e "  日志命令: $(_c 36 "journalctl -u mirage-server -f")"
+    echo -e "  日志命令: $(_c 36 "journalctl -u mirage-rs-server -f")"
     echo -e "\n  感谢使用 Mirage-rs，极致性能尽在掌握。"
 }
 
