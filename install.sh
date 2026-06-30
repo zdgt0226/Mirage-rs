@@ -438,14 +438,16 @@ config_server() {
   丢包"链路 (跨洲专线 / 移动 4G/5G), BBR 这种自适应 CC 在
   丢包链路上会被拖慢, brutal 反而能跑满.
 
-  v0.4.4-alpha.6 起服务端自动监测每条连接的 retrans 率,
-  超过 5%/10s 窗口判定不适合 brutal, 自动 setsockopt 切回
-  BBR. 因此设错也不会更差, 顶多回到 BBR 的速度.
+  v0.4.4-alpha.10 起跟 Python POC 完全对齐 (cwnd_gain=15,
+  无 autofallback, 死磕速率到底). 不适合的链路 (低 RTT 高
+  丢包 / CDN) 上 brutal 反而拖慢吞吐 — 这种链路请设 rate=0
+  关掉, 让系统默认 BBR 自适应.
 
   推荐取值: 链路带宽的 30~50%.
     100M 出口  → 30~50 Mbps
     1G   出口  → 300~500 Mbps
-  太高 → 触发 autofallback (自动切 BBR). 太低 → 自我限速.
+  太高 → 拥塞导致重传放大. 太低 → 自我限速. 设错就改 config
+  里 brutal_rate_mbps 重启服务即可.
 ═══════════════════════════════════════════════════
 EOM
         # 探测公网链路带宽以建议默认值 (失败回退到 50)
