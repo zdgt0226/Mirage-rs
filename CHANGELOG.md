@@ -1,5 +1,51 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.9] - 砍掉 Brutal autofallback, 跟 POC 行为对齐 (2026-06-30)
+
+### fix(brutal): 不再自动从 brutal 切回 BBR
+
+alpha.8 修对了 brutal 应用时机 (listener 预设算法), 实测 brutal 真的
+在跑, 但**速度仍达不到 Python POC 水平**. 服务端日志铁证:
+
+```
+09:00:17.066  brutal 连接建立, pacing_rate 10 Mbps, cwnd 308
+09:00:27.474  WARN Brutal CC unsuitable... retrans 16.3% in 10s window.
+              Auto-fallback to BBR.
+```
+
+只跑 10 秒, alpha.6 加的 autofallback 监测就因 retrans > 5% 把 brutal
+切掉了. 这恰恰违反了 brutal CC 的设计哲学:
+
+> **brutal 的工作原理就是"丢包是噪声, 死磕设定速率, 让上层应用见到稳
+> 定吞吐"**. 高 retrans 是 brutal 工作过程中**正常现象**, 不是"不适合"
+> 的信号. POC 实测可用就证明这条链路是 brutal-friendly 的, 重传是预期
+> 的代价, 净吞吐仍优于 BBR.
+
+修复 (src/proxy/mirage_server/mod.rs:78-93):
+- 移除 accept 循环里的 `spawn_fallback_monitor(fd)` 调用
+- `set_brutal_rate(fd, rate)` 保留, listener 预设算法名机制不变
+- 行为现在 100% 跟 POC 对齐: 设了 brutal_rate_mbps 就硬跑到连接关闭
+
+`spawn_fallback_monitor` 函数本身保留在 brutal.rs (含 TcpInfoExt
+struct + getsockopt 包装), 留作未来 `tuning.brutal_autofallback = true`
+opt-in 高级选项. 默认不调用, 代码也不删, 因为这套基础设施做对了
+(SO_COOKIE 防 fd 复用 / Linux 3.15+ ABI 完整结构), 留着不浪费.
+
+### 用户行动建议
+- 不适合 brutal 的链路: 把 config 里 `"brutal_rate_mbps"` 改 0 或删掉
+  字段 (server 端会自动 fallback 到系统默认 CC = BBR)
+- 适合 brutal 的链路: 默认行为就是对的, 不必动
+
+### alpha.5 → alpha.9 整段 brutal 排错总结
+
+|alpha|改动|结论|
+|---|---|---|
+|.5|cwnd_gain 15 → 20|对的, 跟 apernet 默认对齐, 保留|
+|.6|加 autofallback|本意是安全网, **实际是误杀 brutal**, 本版砍|
+|.7|client 关 BPF|跟 brutal 无关, 解 direct outbound 卡死|
+|.8|listener 预设算法 (POC 对齐)|关键修复, 让 brutal 真生效|
+|.9|砍 autofallback|本版, **正式跟 POC 行为对齐**|
+
 ## [v0.4.4-alpha.8] - Brutal CC 应用时机修正 (匹配 Python POC) (2026-06-26)
 
 ### fix(brutal): listener 上预设算法名, accepted socket 只补速率

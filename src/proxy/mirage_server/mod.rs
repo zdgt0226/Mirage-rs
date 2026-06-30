@@ -77,15 +77,17 @@ pub async fn start_server(
                     }
                 }
                 // accepted socket 已从 listener 继承 brutal 算法名, 只需补
-                // 速率参数 (TCP_BRUTAL_PARAMS). 同时启自适应回落 monitor:
-                // 部分链路 (跨洲 CDN 等) 实际丢包率高, brutal 死磕设定速率会
-                // 让 retrans 吃光带宽. monitor 检测到单窗口 retrans > 5%
-                // 自动 setsockopt 切回 BBR, 让 kernel 自适应.
+                // 速率参数 (TCP_BRUTAL_PARAMS). brutal 的设计哲学就是"丢包
+                // 是噪声, 死磕设定速率", 高 retrans 是 brutal 工作中的正常
+                // 现象, 不是 brutal "不适合"的信号. alpha.6 加的 autofallback
+                // 在 10s 内就因 retrans > 5% 把 brutal 切掉, 反而让 brutal
+                // 没机会发挥, 实测速度低于 Python POC (POC 无 autofallback,
+                // brutal 顶着丢包硬跑). spawn_fallback_monitor 代码保留在
+                // brutal.rs, 留作未来 tuning.brutal_autofallback = true 的
+                // opt-in 高级选项, 默认不调用.
                 if let Some(rate) = brutal_rate_bytes_per_sec {
                     use std::os::unix::io::AsRawFd;
-                    let fd = stream.as_raw_fd();
-                    crate::proxy::brutal::set_brutal_rate(fd, rate);
-                    crate::proxy::brutal::spawn_fallback_monitor(fd);
+                    crate::proxy::brutal::set_brutal_rate(stream.as_raw_fd(), rate);
                 }
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();
