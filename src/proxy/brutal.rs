@@ -72,7 +72,10 @@ pub fn set_brutal_rate(fd: i32, rate_bytes_per_sec: u64) {
             rate: u64,
             cwnd_gain: u32,
         }
-        const CWND_GAIN_X10: u32 = 20;
+        // X10 编码: 15 = 1.5× BDP. 跟 Python POC 一致 (/opt/claude/mirage
+        // /core/brutal.py::_DEFAULT_CWND_GAIN), 实测吞吐显著高于 20. 之前
+        // alpha.5 改成 20 是基于"apernet 内核默认 20"的误判.
+        const CWND_GAIN_X10: u32 = 15;
         let params = BrutalParams {
             rate: rate_bytes_per_sec,
             cwnd_gain: CWND_GAIN_X10,
@@ -153,10 +156,9 @@ pub fn apply_brutal(fd: i32, rate_bytes_per_sec: u64) {
             rate: u64,
             cwnd_gain: u32,
         }
-        // X10 编码: 20 = 2.0× BDP. 匹配 apernet/tcp-brutal 内核默认值.
-        // 之前用 15 (= 1.5× BDP) 在低 RTT 链路上 cwnd 偏紧, ACK 没回 cwnd 就满,
-        // 实测吞吐 < 设定 rate (E rate=20 ≈ F rate=50 的根因).
-        const CWND_GAIN_X10: u32 = 20;
+        // X10 编码: 15 = 1.5× BDP. 跟 Python POC 对齐 (实测吞吐显著优于 20).
+        // 之前 alpha.5 改成 20 是基于 "apernet 默认 20" 误判, 实测 POC=15 更快.
+        const CWND_GAIN_X10: u32 = 15;
         let params = BrutalParams {
             rate: rate_bytes_per_sec,
             cwnd_gain: CWND_GAIN_X10,

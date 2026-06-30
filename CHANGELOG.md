@@ -1,5 +1,47 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.10] - cwnd_gain 20 → 15 跟 POC 对齐 (2026-07-01)
+
+### perf(brutal): cwnd_gain 改回 15, 跟 Python POC 实测一致
+
+alpha.9 砍了 autofallback 后 brutal 真的全程在跑了, 但实测速度仍不
+及 Python POC. 全面对比两边 setsockopt 序列发现仅剩两处差异:
+
+|项|POC|Rust alpha.9|备注|
+|---|---|---|---|
+|brutal cwnd_gain|**15**|20|本版改|
+|TCP_NODELAY|未设|set_nodelay(true)|握手期间降低首包延迟, 数据阶段无影响|
+|SO_KEEPALIVE|开启|未设|仅死连接检测, 无吞吐影响|
+
+POC `_DEFAULT_CWND_GAIN = 15` 注释写"对齐参考实现". 我在 alpha.5 改成
+20 是基于"apernet 内核默认 20"的判断, 但实测 POC 的 15 反而更快.
+推测原因: cwnd_gain=2.0× BDP 在高丢包链路上会放大重传成本 — 同时在
+途的包多了, 单个丢包会拖累更多窗口前进, 净吞吐反不如 1.5× 紧凑.
+
+修改 (3 处必须同步, 否则 BPF 反馈环会用旧值覆盖):
+- `src/proxy/brutal.rs:78`  (set_brutal_rate, accepted socket)
+- `src/proxy/brutal.rs:161` (apply_brutal, client outbound)
+- `src/proxy/pool.rs:608`   (update_brutal_rate, 动态调节)
+
+不动 NODELAY: 它在 TLS 握手期间是必要的 (小包不被 Nagle 拖延首包延迟).
+数据传输阶段, Mirage 应用层 AEAD send 都是大块 (≥ MSS), Nagle 本就不
+会缓存它们, NODELAY 设不设没区别. POC 没设只是没人写而已, 不是因为
+跟 brutal 冲突.
+
+### alpha.5 → alpha.10 brutal 排错全表 (汇总)
+
+|alpha|改动|结果|
+|---|---|---|
+|.5|cwnd_gain 15 → 20 (误判 apernet 默认)|无效, 反而是错的|
+|.6|加 autofallback (5% 阈值)|本意安全网, 实测误杀 brutal|
+|.7|client 关 BPF|跟 brutal 无关, 解 direct outbound 卡死|
+|.8|listener 预设算法 (POC 对齐)|关键修复, 让 brutal 真生效|
+|.9|砍 autofallback|brutal 全程跑, 不再被切走|
+|.10|cwnd_gain 20 → 15 (POC 对齐)|**本版**, 期望追平 POC 速度|
+
+跟 POC 还剩的不影响吞吐的小差异: SO_KEEPALIVE (仅死连接检测). 后续
+有需要再加.
+
 ## [v0.4.4-alpha.9] - 砍掉 Brutal autofallback, 跟 POC 行为对齐 (2026-06-30)
 
 ### fix(brutal): 不再自动从 brutal 切回 BBR

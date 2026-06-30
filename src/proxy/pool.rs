@@ -604,8 +604,8 @@ impl WarmPool {
                 const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
                 #[repr(C, packed)]
                 struct BrutalParams { rate: u64, cwnd_gain: u32 }
-                // 与 brutal.rs::apply_brutal 保持一致: 20 = 2.0× BDP (apernet 默认).
-                const CWND_GAIN_X10: u32 = 20;
+                // 与 brutal.rs 保持一致: 15 = 1.5× BDP (跟 Python POC 实测最优).
+                const CWND_GAIN_X10: u32 = 15;
                 let params = BrutalParams { rate: new_rate, cwnd_gain: CWND_GAIN_X10 };
                 unsafe {
                     libc::setsockopt(
