@@ -39,7 +39,11 @@ pub struct CryptoWriter<W> {
     writer: W,
     cipher: LessSafeKey,
     nonce: u64,
+    /// 加密临时区: [chunk_bytes, content_type=0x17] → seal_in_place 后附 tag
     buffer: Vec<u8>,
+    /// 出线组帧区: [5B TLS header, encrypted_buffer]. 单次 write_all 送出,
+    /// 修 alpha.21 之前的两次 write_all + flush 碎片化问题.
+    framed: Vec<u8>,
     is_initiator: bool,
     rng: fastrand::Rng,
 }
@@ -54,6 +58,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             nonce: 0,
             // 预分配最大容量，杜绝运行时内存分配开销
             buffer: Vec::with_capacity(MAX_RECORD_SIZE + TAG_SIZE),
+            framed: Vec::with_capacity(5 + MAX_RECORD_SIZE + TAG_SIZE),
             is_initiator,
             rng: fastrand::Rng::new(),
         }
@@ -97,13 +102,17 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
                 .seal_in_place_append_tag(nonce_bytes, aead::Aad::empty(), &mut self.buffer)
                 .map_err(|e| anyhow!("encryption failed: {:?}", e))?;
 
-            // 构造 5 字节 TLS Header: [0x17, 0x03, 0x03, len_hi, len_lo]
-            let mut header = [0x17, 0x03, 0x03, 0x00, 0x00];
-            let len = self.buffer.len() as u16;
-            header[3..5].copy_from_slice(&len.to_be_bytes());
-
-            self.writer.write_all(&header).await?;
-            self.writer.write_all(&self.buffer).await?;
+            // 单次 write_all 送出 [5B header + encrypted body], 避免:
+            // - 分成两次 write_all 每次都在 TCP_NODELAY=on 下变成独立小包
+            // - 帧间 flush 让 kernel 立刻 send 每一小片, 网络碎片化
+            // 老代码 (alpha.21 之前) 每帧 3 次 syscall (header/body/flush),
+            // 新代码 1 次 write_all, syscall 数量 3× 降.
+            let body_len = self.buffer.len() as u16;
+            self.framed.clear();
+            self.framed.extend_from_slice(&[0x17, 0x03, 0x03]);
+            self.framed.extend_from_slice(&body_len.to_be_bytes());
+            self.framed.extend_from_slice(&self.buffer);
+            self.writer.write_all(&self.framed).await?;
         }
         // 显式 flush 保证数据推向 OS 网络层
         self.writer.flush().await?;
@@ -123,12 +132,13 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             .seal_in_place_append_tag(nonce_bytes, aead::Aad::empty(), &mut self.buffer)
             .map_err(|e| anyhow!("encryption failed: {:?}", e))?;
 
-        let mut header = [0x17, 0x03, 0x03, 0x00, 0x00];
-        let len = self.buffer.len() as u16;
-        header[3..5].copy_from_slice(&len.to_be_bytes());
-
-        self.writer.write_all(&header).await?;
-        self.writer.write_all(&self.buffer).await?;
+        // 单次 write_all + flush (关闭是终态, 必须立即刷到网络层保证对端 EOF)
+        let body_len = self.buffer.len() as u16;
+        self.framed.clear();
+        self.framed.extend_from_slice(&[0x17, 0x03, 0x03]);
+        self.framed.extend_from_slice(&body_len.to_be_bytes());
+        self.framed.extend_from_slice(&self.buffer);
+        self.writer.write_all(&self.framed).await?;
         self.writer.flush().await?;
         Ok(())
     }

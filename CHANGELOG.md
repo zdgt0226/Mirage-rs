@@ -1,5 +1,37 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.22] - CryptoWriter 单次 write_all 消除 3× syscall 碎片化 (2026-07-01)
+
+外部审计指出核心 IO 瓶颈: `CryptoWriter::send_data` **每帧两次
+`write_all` + `flush`**, 在 `TCP_NODELAY=on` 下 kernel 每次 `write_all`
+都触发独立 segment 发送, 网络流量严重碎片化 (5B header + N KB body
+分成两个 packet 各带 40B TCP header + IP header, per-byte 开销爆炸).
+
+### 修改
+
+- `CryptoWriter` 加 `framed: Vec<u8>` (预分配) 作出线组帧临时区
+- `send_data` 每帧构造 `framed = [5B header, encrypted_body]`, 一次
+  `write_all` 送出. Header 不再单独 `write_all`
+- `send_close_notify` 同样合并 (但保留 flush, 因为终态需要立即刷网络层)
+
+### 效果
+
+单帧 syscall 数: `2× write_all + flush` → `1× write_all + flush`.
+combined with TCP_NODELAY: kernel 每帧发一个 segment (16 KB), 而不是
+两个 (5 B + 16 KB), 减少 TCP/IP header 开销, 提高 payload 占比.
+
+### 未完成的分析师建议 (留 alpha.23)
+
+分析师还提出:
+- **方向一 Part 2**: 用 `tokio::io::BufWriter(64KB)` 内嵌 CryptoWriter,
+  多帧写入自动聚合为一次 syscall (需重构 send_data flush 策略)
+- **方向二**: 服务端 tcp_relay + 客户端 handler 用 `try_read` 贪婪收割
+  kernel recv buffer 数据攒到 64KB 再一次 send. 打破"读一帧就等一帧"
+  串行 (alpha.21 的 mpsc channel 方案分析师指出被 Tokio 调度器立即
+  唤醒 consumer 导致批量失效)
+
+先测本版单点改动效果, 再决定 alpha.23 深度重构范围.
+
 ## [v0.4.4-alpha.21] - IO 大缓冲 + producer/consumer 批量 (rwnd_limited 67% → 期望 <10%) (2026-07-01)
 
 用户实测发现: 客户端 tcp 长连接 `rwnd_limited 67%` 卡住, brutal 有力
