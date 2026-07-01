@@ -96,19 +96,26 @@ async fn update_one(dir: &str, source: &GeoSource, proxy_url: Option<&str>) -> R
     Ok(())
 }
 
+// 每次 fetch 尝试的最大耗时. 覆盖 connect + TLS + body 全流程. proxy 抽风或
+// 服务端出网卡住时不至于挂死整个 updater 循环 (老版本 timeout=None 会永远等).
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// 下载后至少 N 字节才认为是合法响应. 200 但空 body 的 CDN 边缘缓存 miss 场景
+// 直接覆盖旧 .dat 会导致下次 load 失败, 规则集体失效. dlc.dat / geoip.dat
+// 正常都 > 1MB, 1 KB 阈值宽松防误伤.
+const MIN_VALID_BYTES: usize = 1024;
+
 fn build_client(
     via: GeoVia,
     proxy_url: Option<&str>,
     source_name: &str,
 ) -> Result<reqwest::Client> {
+    let base = reqwest::Client::builder().timeout(FETCH_TIMEOUT);
     match via {
-        GeoVia::Direct => Ok(reqwest::Client::builder().build()?),
+        GeoVia::Direct => Ok(base.build()?),
         GeoVia::Proxy => match proxy_url {
             Some(url) => {
                 debug!("GeoUpdater: source '{}' via proxy {}", source_name, url);
-                Ok(reqwest::Client::builder()
-                    .proxy(reqwest::Proxy::all(url)?)
-                    .build()?)
+                Ok(base.proxy(reqwest::Proxy::all(url)?).build()?)
             }
             None => {
                 warn!(
@@ -116,22 +123,29 @@ fn build_client(
                      Falling back to direct fetch.",
                     source_name
                 );
-                Ok(reqwest::Client::builder().build()?)
+                Ok(base.build()?)
             }
         },
     }
 }
 
-/// 单次 fetch: send → check status → read body. 所有失败都返 Err.
+/// 单次 fetch: send → check status → read body → 校验 body 大小. 所有失败都返 Err.
 async fn do_fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     let resp = client.get(url).send().await
         .map_err(|e| anyhow!("send: {}", e))?;
     if !resp.status().is_success() {
         return Err(anyhow!("HTTP {}", resp.status()));
     }
-    resp.bytes().await
+    let bytes = resp.bytes().await
         .map(|b| b.to_vec())
-        .map_err(|e| anyhow!("read body: {}", e))
+        .map_err(|e| anyhow!("read body: {}", e))?;
+    if bytes.len() < MIN_VALID_BYTES {
+        return Err(anyhow!(
+            "body too small ({} bytes < {}), refusing to overwrite existing .dat",
+            bytes.len(), MIN_VALID_BYTES
+        ));
+    }
+    Ok(bytes)
 }
 
 /// 带 fallback 的 fetch: 主要按 source.via 走, 失败且原是 Proxy 时自动

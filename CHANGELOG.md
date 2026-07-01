@@ -1,5 +1,25 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.15] - geo_updater 30s 超时 + 空 body 拦截 (2026-07-01)
+
+### fix(geo_updater): 补 alpha.14 审计出的 2 处纰漏
+
+自查 alpha.14 后发现 2 个 alpha.14 引入或没解决的问题:
+
+1. **reqwest client 无 timeout**: `build_client()` 用 `Client::builder().build()`,
+   默认 timeout=None. proxy 抽风或服务端出网卡住时 `send()` 无限阻塞,
+   fetch_with_fallback 里的 direct 重试永远等不到, updater 整个循环
+   卡死. 加 `FETCH_TIMEOUT = 30s` 覆盖 connect + TLS + body 全流程.
+
+2. **`bytes.len() == 0` 也会覆盖旧 .dat**: 服务端返回 200 但 body 空
+   (中间 CDN 缓存 miss / 部署过程中的短暂空窗) 时, alpha.14 的
+   `do_fetch` 会把 empty 字节写入 tmp 再 rename 覆盖旧 geosite.dat.
+   下次 load 就报错, 全部规则失效. 加 `MIN_VALID_BYTES = 1024` 阈值,
+   小于这个的 body 判定为异常, 不覆盖旧文件.
+
+真实的 dlc.dat / geoip.dat 都 >= 1 MB, 1 KB 阈值宽松防误伤边缘 case
+(理论上没有 legit 场景 < 1 KB).
+
 ## [v0.4.4-alpha.14] - log_file / geo 完整性 / geo proxy fallback (Issue 2/3/5) (2026-07-01)
 
 ### feat(log): 配置 log_file 字段生效 + log_level 真的读了 (Issue 2)
