@@ -1,5 +1,45 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.11] - WarmPool 缩容底线 2 → 10 (突发无 wait) (2026-07-01)
+
+### fix(pool): 提高 idle 期最低 tunnel 数, 解决突发并发 66% wait build
+
+用户实测 alpha.10 后发现:
+
+|场景|POC (rate=10 × 多流)|mirage-rs (rate=40 单流)|
+|---|---|---|
+|YouTube 视频|流畅|流畅但 CPU 更低|
+|突发多标签开页|流畅|明显卡顿|
+
+client 日志确认原因:
+```
+WarmPool Manager: target 2 → 3 (gets=6, wait=4 [66.7%], expired=0)
+```
+
+浏览器突发 6 个 SOCKS5 CONNECT 时, adaptive pool 已缩到 target=2, 只
+有 2 条 tunnel 现成, 剩 4 条得等 build (770-2000ms 每条握手), **66%
+的请求实际排队**. POC 因 pool_size=20 固定不缩, 6 并发时 6 条 tunnel
+立刻各分一条, 每条 rate=10 也够 → 用户感受"多流并行"很流畅.
+
+### 修改
+`src/proxy/pool.rs::decide_new_target` — 缩容底线从 2 提到 10:
+- `const MIN_TARGET_FLOOR: usize = 10;`
+- 实际 floor = `MIN_TARGET_FLOOR.min(max_size)`, pool_size < 10 时自动
+  降为 max_size (小 pool 场景不会被卡死)
+
+### 效果
+- idle 期至少保 10 条常温 tunnel (BDP × 10 × TLS ≈ 5-10 MB RAM, 可接受)
+- 常见浏览器最大并发 (Chrome/Firefox 每 host 6-8) 都能立刻分到 tunnel
+- 突发 wait_ratio 应从 66% 降到 0-10%
+- 高峰后 idle 仍会缩容, 只是不缩到 2 而已 (不影响资源节省的主旨)
+
+### 用户行动
+本版无需改 config, 直接部署 alpha.11 即享受. 浏览器多标签开页会明显
+不卡, 突发 wait 日志应几乎消失.
+
+未来 (alpha.12+) 可考虑加 tuning.pool_min_floor 配置字段, 让重内存
+环境的用户按需调低. 本版先固定 10 观察实测.
+
 ## [v0.4.4-alpha.10] - cwnd_gain 20 → 15 跟 POC 对齐 (2026-07-01)
 
 ### perf(brutal): cwnd_gain 改回 15, 跟 Python POC 实测一致

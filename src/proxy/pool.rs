@@ -124,6 +124,16 @@ impl PoolMetrics {
 ///
 /// 不做硬裁剪 (旧版 q.len() > target+2 那段已删), target 只控制 builder 建货
 /// 节奏, queue 自然在 max_age 到期被 sweeper 收掉.
+/// WarmPool 缩容底线. 突发 N 并发请求时 pool 至少要有 N 条常温 tunnel,
+/// 否则 N-target 条会 wait build (770-2000ms 每条), 用户感受"卡顿".
+///
+/// alpha.10 之前是 2, 实测浏览器 YouTube 突发经常 6 并发, 66% wait.
+/// 提到 10 = 常见浏览器并发上限, 突发时立刻各分 1 条 tunnel 无 wait.
+///
+/// pool_size < 10 时 floor 自动降为 max_size (下面 .min(max_size)), 避免
+/// pool 永远缩不动.
+const MIN_TARGET_FLOOR: usize = 10;
+
 pub(crate) fn decide_new_target(
     cur_target: usize,
     wait_events: u64,
@@ -136,23 +146,24 @@ pub(crate) fn decide_new_target(
     } else {
         wait_events as f64 / total_gets as f64
     };
+    let floor = MIN_TARGET_FLOOR.min(max_size);
 
     if wait_ratio > 0.2 && cur_target < max_size {
         let increment = (cur_target / 5).max(1);
         (cur_target + increment).min(max_size)
     } else if wait_ratio == 0.0
         && expired_unused >= total_gets / 2
-        && cur_target > 2
+        && cur_target > floor
     {
         // 缩容触发条件:
         // - 无任何等待 (wait_ratio = 0): 池子供给充足
         // - expired ≥ gets/2: 建货量远超消费 (或纯 idle 期 gets=0, expired ≥ 0 恒成立)
-        // - cur_target > 2: 保留最低 idle floor
+        // - cur_target > floor: 保留最低 idle floor (见 MIN_TARGET_FLOOR)
         //
         // 注意: 不能加 `total_gets > 0` 守护! 否则高峰期池子涨到 40 后用户睡觉
         // 流量归零 → total_gets=0 → 跳过缩容 → builder 永远维持 40 个 idle 连接
-        // → max_age 到期 sweeper 杀 → builder 又建 → 一整夜烧 CPU 握手. floor=2
-        // 由 cur_target > 2 兜底, 不需要额外的 traffic 守护.
+        // → max_age 到期 sweeper 杀 → builder 又建 → 一整夜烧 CPU 握手.
+        // 由 cur_target > floor 兜底, 不需要额外的 traffic 守护.
         cur_target - 1
     } else {
         cur_target
@@ -165,17 +176,21 @@ mod feedback_tests {
 
     #[test]
     fn idle_at_floor_stays() {
-        // 完全无流量 + cur_target 已在 floor=2: 不动 (floor 保护)
-        assert_eq!(decide_new_target(2, 0, 0, 0, 50), 2);
+        // 完全无流量 + cur_target 已在 floor=10: 不动 (floor 保护)
+        assert_eq!(decide_new_target(10, 0, 0, 0, 50), 10);
+        // floor 在 pool_size < 10 时降为 max_size, 已到 max_size 也不动
+        assert_eq!(decide_new_target(5, 0, 0, 0, 5), 5);
     }
 
     #[test]
     fn idle_above_floor_drains() {
-        // 完全无流量 + cur_target > 2: 缓慢缩容 (每周期 -1) 直到 floor.
+        // 完全无流量 + cur_target > floor: 缓慢缩容 (每周期 -1) 直到 floor.
         // 修复 #2 (前版 buggy 加了 total_gets > 0 守护, 导致高峰后池子锁死).
-        assert_eq!(decide_new_target(5, 0, 0, 0, 50), 4);
-        // 多周期连续应用最终收敛到 2:
-        assert_eq!(decide_new_target(3, 0, 0, 0, 50), 2);
+        assert_eq!(decide_new_target(15, 0, 0, 0, 50), 14);
+        // 到 floor+1 再缩最后一次到 floor:
+        assert_eq!(decide_new_target(11, 0, 0, 0, 50), 10);
+        // 到 floor 后就不再缩:
+        assert_eq!(decide_new_target(10, 0, 0, 0, 50), 10);
     }
 
     #[test]
@@ -197,14 +212,14 @@ mod feedback_tests {
 
     #[test]
     fn over_provision_scales_down() {
-        // 0 wait, expired=6 ≥ gets/2=5 → 缩 1
-        assert_eq!(decide_new_target(10, 0, 10, 6, 50), 9);
+        // 0 wait, expired=6 ≥ gets/2=5 → 缩 1. cur=15 > floor=10 才能缩
+        assert_eq!(decide_new_target(15, 0, 10, 6, 50), 14);
     }
 
     #[test]
-    fn over_provision_floor_at_2() {
-        // target=2 不再缩
-        assert_eq!(decide_new_target(2, 0, 10, 10, 50), 2);
+    fn over_provision_floor_at_floor() {
+        // cur=floor=10, 即便 expired 全部, 也不再缩
+        assert_eq!(decide_new_target(10, 0, 10, 10, 50), 10);
     }
 
     #[test]
@@ -216,8 +231,8 @@ mod feedback_tests {
     #[test]
     fn no_traffic_with_expired_drains() {
         // 无流量 + 有 expired (高峰后池子滞留, idle 期 max_age 到期被 sweeper 收掉):
-        // 应该立刻缩容 -1, 之后多周期收敛到 floor=2. 修复 #2: 资源燃烧 bug.
-        assert_eq!(decide_new_target(5, 0, 0, 10, 50), 4);
+        // 应该立刻缩容 -1, 之后多周期收敛到 floor=10. 修复 #2: 资源燃烧 bug.
+        assert_eq!(decide_new_target(20, 0, 0, 10, 50), 19);
     }
 
     #[test]
