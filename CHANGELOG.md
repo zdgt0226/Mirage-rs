@@ -1,5 +1,48 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.18] - alpha.17 遗留边界修复 (tuning 删除 + update_days=0) (2026-07-01)
+
+外部审计 + 自查发现 alpha.17 方案 C 的两个边界:
+
+### fix(config_watcher): 用户删除整个 tuning 块 (外部审计发现)
+
+`extract_updater_state` 老实现:
+```rust
+let tuning = config.tuning?;   // ⚠️ 早退 None
+```
+用户运行中删除整个 `"tuning"` 块 (想放弃 geo) → `config.tuning` 为 None
+→ 函数返 None → ConfigWatcher `if let Some(new_updater)` 跳过 update()
+→ **updater 继续持有旧快照**, 每 7 天照样悄悄拉 GitHub, 违反用户意图.
+
+修: `match config.tuning` 显式处理 None 分支, 视为空 sources, 返
+`Some(UpdaterState{sources: vec![]})`. updater 收到后进入 idle 阻塞
+在 `wake.notified()` 上, 不再周期性访问 GitHub.
+
+### fix(pool ecosystem): geo_update_days = 0 tight-loop 防御 (自查发现)
+
+顺着上面思路自查, `Duration::from_secs(update_days as u64 * 86_400)`
+在 `update_days = 0` 时变成 `Duration::from_secs(0)`. tokio select! 里
+`sleep(Duration::from_secs(0))` 立刻 ready → 循环无 sleep → tight loop
+把 CPU 打满 + **每秒往 GitHub 猛拉直接被 IP-ban**.
+
+老代码 (alpha.17 之前) 也有这个隐雷但没触发过, 因为默认值 7 且用户很少
+误输 0. alpha.17 加了 wake 之后, sleep(0) 会立刻被 wake 覆盖后立刻醒
+的组合 → tight loop 触发概率反而更高.
+
+3 层防御 (belt+suspenders):
+- L1 `src/lib.rs` 冷启动: `if d == 0 { warn + clamp 1 }`
+- L2 `src/config_watcher.rs::extract_updater_state`: `MIN_UPDATE_DAYS = 1`
+- L3 `src/router/geo_updater.rs` 循环: `snap.update_days.max(1)` 防守
+
+3 层里任何一层都足够消除风险, 但也不冗余到伤脑. 未来新增其他 UpdaterState
+构造路径不必额外记忆 clamp.
+
+### 自查结论 — TuningConfig 剩下的字段都不构成类似陷阱
+- `decision_cache_max_entries` / `tcp_keepalive`: 定义了但从没被用 (dead
+  field, 不影响)
+- `geodata_dir` / `ebpf_mode`: 非数值, 无 clamp 需求
+- `geo_sources`: 空是合法状态 (updater 进 idle wait)
+
 ## [v0.4.4-alpha.17] - 外部审计 4 处纰漏修复 (2026-07-01)
 
 外部代码审计发现 4 个真实问题, 全部修:

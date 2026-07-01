@@ -111,7 +111,17 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }
                 if let Some(m) = tuning.ebpf_mode { ebpf_mode = m; }
                 geo_sources = tuning.geo_sources;
-                if let Some(d) = tuning.geo_update_days { geo_update_days = d; }
+                if let Some(d) = tuning.geo_update_days {
+                    // clamp 下限 1 天. 用户误输 0 会让 updater sleep(0) tight
+                    // loop, 每秒往 GitHub 猛拉直接被限流封 IP. 上限不设 (u32
+                    // MAX ≈ 4 亿 × 86400 秒, 事实上就是"永不更新").
+                    if d == 0 {
+                        warn!("tuning.geo_update_days = 0 out of safe range, clamped to 1. Tight-loop pull would flood GitHub and get IP-banned.");
+                        geo_update_days = 1;
+                    } else {
+                        geo_update_days = d;
+                    }
+                }
             }
             // 仅当 routing.rules 真的引用 geosite / geoip 时才启动 updater
             needs_geo = config.routing.rules.iter().any(|r|

@@ -34,17 +34,40 @@ impl ConfigWatcher {
         Ok(watcher)
     }
 
-    /// 从 config 文件里抽出 UpdaterState. proxy_url 保留旧值 (inbounds 不
-    /// 热更新, 每次都从 inbounds 推导会得到相同结果, 保留旧值省一步).
+    /// 从 config 文件里抽出 UpdaterState.
+    ///
+    /// 语义:
+    /// - 文件读不到 / JSON 解析错 → None (调用方保留老 state, 不动)
+    /// - `tuning` 被删 → 视为空 tuning, 返 `Some(UpdaterState{sources空})` 让
+    ///   updater 进 idle. 修 alpha.17 外部审计发现的 "删 tuning updater 仍
+    ///   偷偷跑" 纰漏.
+    /// - `update_days` 为 0 或缺失 → clamp 到 min 1 (24 小时). 避免 tight
+    ///   loop 打满 CPU + 被 GitHub 限流封 IP.
+    /// - `proxy_url` + `geodata_dir` 保留 old 值 (跟 inbounds 语义一致, 属
+    ///   于 startup-only 字段, 用户改必须 restart).
     fn extract_updater_state(config_path: &str, old: &UpdaterState) -> Option<UpdaterState> {
+        const MIN_UPDATE_DAYS: u32 = 1;
+
         let content = std::fs::read_to_string(config_path).ok()?;
         let config: Config = serde_json::from_str(&content).ok()?;
-        let tuning = config.tuning?;
-        let sources = tuning.geo_sources;
-        let update_days = tuning.geo_update_days.unwrap_or(7);
-        let geodata_dir = tuning.geodata_dir.unwrap_or_else(|| ".geosite".to_string());
+
+        let (sources, update_days_raw) = match config.tuning {
+            Some(tuning) => (tuning.geo_sources, tuning.geo_update_days.unwrap_or(7)),
+            None => (Vec::new(), 7),
+        };
+        // Clamp: 用户误输 0 或负 clamp 到 1 天, 避免 tight loop.
+        // (u32 无负值, 但 0 也是致命 — Duration::from_secs(0) 让 select! 立刻 fire.)
+        let update_days = update_days_raw.max(MIN_UPDATE_DAYS);
+        if update_days != update_days_raw {
+            warn!(
+                "tuning.geo_update_days = {} out of safe range, clamped to {}. \
+                 Tight-loop pull would flood GitHub and get IP-banned.",
+                update_days_raw, update_days
+            );
+        }
+
         Some(UpdaterState {
-            geodata_dir,
+            geodata_dir: old.geodata_dir.clone(),
             sources,
             update_days,
             proxy_url: old.proxy_url.clone(),

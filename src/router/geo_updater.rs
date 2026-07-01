@@ -104,7 +104,11 @@ pub async fn spawn_updater(handle: UpdaterHandle) {
             }
 
             // 用当前 update_days 决定 interval. drop snap 后再 sleep, 释放 Arc.
-            let interval = Duration::from_secs(snap.update_days as u64 * 86_400);
+            // 防御性 clamp: 主 clamp 在 lib.rs 冷启动 + config_watcher::extract_updater_state
+            // 两处. 这里再 max(1) 是 belt+suspenders, 万一将来新增其他 UpdaterState
+            // 构造路径没走那两个 clamp, update_days=0 也不会 tight-loop 打满 CPU.
+            let days = snap.update_days.max(1) as u64;
+            let interval = Duration::from_secs(days * 86_400);
             drop(snap);
 
             // 定期 sleep, 期间若热更新触发 wake 立刻退出 sleep 重跑
