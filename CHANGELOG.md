@@ -1,5 +1,37 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.20] - WarmPool DEBUG 日志加当前状态快照 (2026-07-01)
+
+### feat(pool): DEBUG 日志显示 idle / inflight / 即将过期 tunnel 数
+
+之前的 Manager DEBUG 日志:
+```
+WarmPool Manager: target 2 → 3 (gets=6, wait=4 [66.7%], expired=0)
+```
+只在 target 变化时打, 缺当下时刻的池快照. 用户看到 wait_ratio 高时只
+能猜: "是 pool 空? 是全在用? 还是全在过期挤波谷?"
+
+改成每周期 (5s) 都打一行:
+```
+WarmPool: target=10 [idle=8 inflight=2 exp<10s=1] gets=15 wait=0(0.0%) expired=3
+WarmPool: target=10→12 [idle=5 inflight=5 exp<10s=1] gets=30 wait=10(33.3%) expired=1
+```
+
+新字段:
+- `idle`: 队列里现存可用 tunnel 数
+- `inflight`: 已被 handler 借走的 tunnel 数 (in_flight AtomicUsize)
+- `exp<10s`: 剩余寿命 < 10 秒的 tunnel 数 (即将波谷指示器)
+
+诊断价值:
+- wait_ratio 高 + inflight >> pool_size 想扩 pool_size
+- wait_ratio 高 + idle 已经满 想查 handler 泄漏 (借走没还)
+- wait_ratio 高 + exp<10s 很多 = 波谷, 想加 max_age_sec 减 refresh 频率
+- wait_ratio 0 + idle 满 + expired 高 = 过供给, 可以缩 pool_size
+
+只 DEBUG 级别, INFO 用户不受影响. 每 5s 一行, DEBUG 用户 12 行/分.
+每周期 queue 遍历 O(pool_size) 微秒级. `saturating_sub` 防 elapsed
+> max_age_sec 边界下溢.
+
 ## [v0.4.4-alpha.19] - 清理死字段 + README 大更新 (2026-07-01)
 
 ### chore(config): 清理 TuningConfig 里两个 dead field

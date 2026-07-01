@@ -342,6 +342,7 @@ impl WarmPool {
         let metrics_clone = metrics.clone();
         let target_clone = target_size.clone();
         let q_clone = queue.clone();
+        let in_flight_clone_mgr = in_flight.clone();
         let max_size = cfg.pool_size;
         tokio::spawn(async move {
             loop {
@@ -370,7 +371,20 @@ impl WarmPool {
                 let expired_now = to_drop.len() as u64;
                 metrics_clone.expired_unused.fetch_add(expired_now, Ordering::Relaxed);
                 let expired_total = metrics_clone.expired_unused.swap(0, Ordering::Relaxed);
+
+                // 快照 pool 当前状态 (idle 数 + 即将过期 tunnel 数), 供 DEBUG log 用.
+                // idle = 队列里现存可用 tunnel; expiring_soon = 队列里剩余寿命 < 10s
+                // 的条数 (max_age_sec - elapsed < 10 视为即将波谷). in_flight 通过
+                // in_flight_clone_mgr.load 拿, 表示 handler 借走还没归还的 tunnel 数.
+                const EXPIRING_THRESHOLD_SEC: u64 = 10;
+                let idle_count = q.len();
+                let expiring_soon = q.iter().filter(|t| {
+                    let elapsed = t.created_at.elapsed().as_secs();
+                    let remaining = t.max_age_sec.saturating_sub(elapsed);
+                    remaining < EXPIRING_THRESHOLD_SEC
+                }).count();
                 drop(q);
+                let in_flight_now = in_flight_clone_mgr.load(Ordering::Relaxed);
 
                 for mut tunnel in to_drop {
                     tokio::spawn(async move {
@@ -383,12 +397,25 @@ impl WarmPool {
                 let new_target = decide_new_target(cur_target, wait, gets, expired_total, max_size);
                 if new_target != cur_target {
                     target_clone.store(new_target, Ordering::Relaxed);
-                    let wait_ratio = if gets == 0 { 0.0 } else { wait as f64 / gets as f64 };
-                    debug!(
-                        "WarmPool Manager: target {} → {} (gets={}, wait={} [{:.1}%], expired={})",
-                        cur_target, new_target, gets, wait, wait_ratio * 100.0, expired_total
-                    );
                 }
+                let wait_ratio = if gets == 0 { 0.0 } else { wait as f64 / gets as f64 };
+                let target_display = if new_target != cur_target {
+                    format!("{}→{}", cur_target, new_target)
+                } else {
+                    format!("{}", cur_target)
+                };
+                debug!(
+                    "WarmPool: target={} [idle={} inflight={} exp<{}s={}] gets={} wait={}({:.1}%) expired={}",
+                    target_display,
+                    idle_count,
+                    in_flight_now,
+                    EXPIRING_THRESHOLD_SEC,
+                    expiring_soon,
+                    gets,
+                    wait,
+                    wait_ratio * 100.0,
+                    expired_total
+                );
             }
         });
 
