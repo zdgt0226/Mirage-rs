@@ -72,6 +72,27 @@ lazy_static::lazy_static! {
     pub static ref GLOBAL_LOGGER: MemoryWriter = MemoryWriter::new();
 }
 
+/// 磁盘日志写入器. 用 Arc<Mutex<File>> 支持 Clone (每次 tracing 事件触发
+/// 都要 make_writer, 所以要能廉价 clone). Mutex 保证多线程 append 不错乱.
+/// config.log_file 设了才会实例化.
+#[derive(Clone)]
+pub struct FileLogger(std::sync::Arc<std::sync::Mutex<std::fs::File>>);
+
+impl FileLogger {
+    pub fn new(file: std::fs::File) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(file)))
+    }
+}
+
+impl std::io::Write for FileLogger {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 use tokio::io::{AsyncRead, ReadBuf};
 use std::pin::Pin;
 use std::task::{Context, Poll};

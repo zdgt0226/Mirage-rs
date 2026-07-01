@@ -472,6 +472,7 @@ EOM
 {
     "schema_version": 1,
     "log_level": "${log_str}",
+    "log_file": "${LOG_DIR}/server.log",
     "inbounds": [
         {
             "type": "mirage_server",
@@ -716,6 +717,7 @@ config_client() {
 {
     "schema_version": 1,
     "log_level": "${log_str}",
+    "log_file": "${LOG_DIR}/client.log",
     "inbounds": [
         {
             "type": "mixed",
@@ -756,13 +758,13 @@ config_client() {
                 "name": "geosite",
                 "kind": "geosite",
                 "url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
-                "via": "direct"
+                "via": "proxy"
             },
             {
                 "name": "geoip",
                 "kind": "geoip",
                 "url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
-                "via": "direct"
+                "via": "proxy"
             }
         ]
     }

@@ -306,48 +306,60 @@ impl RouterEngine {
                     // filename.dat:tag
                     let parts: Vec<&str> = actual_site.splitn(2, ':').collect();
                     let path = Path::new(geodata_dir).join(parts[0]);
-                    if let Ok(domains) = load_geosite_dat(&path, parts[1]) {
-                        for d in domains {
-                            match d.dtype {
-                                DomainType::Plain => {
-                                    patterns.push(d.value);
-                                    pattern_to_rule_id.push(rule.id);
-                                }
-                                DomainType::Regex => {
-                                    regex_patterns.push(d.value);
-                                    regex_to_rule_id.push(rule.id);
-                                }
-                                DomainType::RootDomain => {
-                                    domain_trie.insert(&d.value, rule.id);
-                                }
-                                DomainType::Full => {
-                                    exact_domain.entry(d.value).or_default().push(rule.id);
+                    match load_geosite_dat(&path, parts[1]) {
+                        Ok(domains) => {
+                            for d in domains {
+                                match d.dtype {
+                                    DomainType::Plain => {
+                                        patterns.push(d.value);
+                                        pattern_to_rule_id.push(rule.id);
+                                    }
+                                    DomainType::Regex => {
+                                        regex_patterns.push(d.value);
+                                        regex_to_rule_id.push(rule.id);
+                                    }
+                                    DomainType::RootDomain => {
+                                        domain_trie.insert(&d.value, rule.id);
+                                    }
+                                    DomainType::Full => {
+                                        exact_domain.entry(d.value).or_default().push(rule.id);
+                                    }
                                 }
                             }
                         }
+                        Err(e) => tracing::error!(
+                            "Router: geosite '{}' (path={:?}, tag={}) load failed: {}. Rules referencing this tag will match nothing.",
+                            actual_site, path, parts[1], e
+                        ),
                     }
                 } else {
                     // Standard v2ray geosite.dat
                     let path = Path::new(geodata_dir).join("geosite.dat");
-                    if let Ok(domains) = load_geosite_dat(&path, actual_site) {
-                        for d in domains {
-                            match d.dtype {
-                                DomainType::Plain => {
-                                    patterns.push(d.value);
-                                    pattern_to_rule_id.push(rule.id);
-                                }
-                                DomainType::Regex => {
-                                    regex_patterns.push(d.value);
-                                    regex_to_rule_id.push(rule.id);
-                                }
-                                DomainType::RootDomain => {
-                                    domain_trie.insert(&d.value, rule.id);
-                                }
-                                DomainType::Full => {
-                                    exact_domain.entry(d.value).or_default().push(rule.id);
+                    match load_geosite_dat(&path, actual_site) {
+                        Ok(domains) => {
+                            for d in domains {
+                                match d.dtype {
+                                    DomainType::Plain => {
+                                        patterns.push(d.value);
+                                        pattern_to_rule_id.push(rule.id);
+                                    }
+                                    DomainType::Regex => {
+                                        regex_patterns.push(d.value);
+                                        regex_to_rule_id.push(rule.id);
+                                    }
+                                    DomainType::RootDomain => {
+                                        domain_trie.insert(&d.value, rule.id);
+                                    }
+                                    DomainType::Full => {
+                                        exact_domain.entry(d.value).or_default().push(rule.id);
+                                    }
                                 }
                             }
                         }
+                        Err(e) => tracing::error!(
+                            "Router: geosite '{}' load failed from {:?}: {}. Rules referencing this tag will match nothing. Check /etc/mirage-rs/geosite/geosite.dat exists and is valid v2ray format.",
+                            actual_site, path, e
+                        ),
                     }
                 }
             }
@@ -358,26 +370,44 @@ impl RouterEngine {
                 
                 if actual_ip_list.ends_with(".json") {
                     let path = Path::new(geodata_dir).join(actual_ip_list);
-                    if let Ok((_, cidrs)) = load_singbox_json(&path) {
-                        for net in cidrs {
-                            ip_trie.insert(net, rule.id);
+                    match load_singbox_json(&path) {
+                        Ok((_, cidrs)) => {
+                            for net in cidrs {
+                                ip_trie.insert(net, rule.id);
+                            }
                         }
+                        Err(e) => tracing::error!(
+                            "Router: geoip singbox '{}' load failed from {:?}: {}. Rules referencing this list will match nothing.",
+                            actual_ip_list, path, e
+                        ),
                     }
                 } else if actual_ip_list.contains(':') {
                     // filename.dat:tag
                     let parts: Vec<&str> = actual_ip_list.splitn(2, ':').collect();
                     let path = Path::new(geodata_dir).join(parts[0]);
-                    if let Ok(cidrs) = load_geoip_dat(&path, parts[1]) {
-                        for net in cidrs {
-                            ip_trie.insert(net, rule.id);
+                    match load_geoip_dat(&path, parts[1]) {
+                        Ok(cidrs) => {
+                            for net in cidrs {
+                                ip_trie.insert(net, rule.id);
+                            }
                         }
+                        Err(e) => tracing::error!(
+                            "Router: geoip '{}' (path={:?}, tag={}) load failed: {}. Rules referencing this tag will match nothing.",
+                            actual_ip_list, path, parts[1], e
+                        ),
                     }
                 } else {
                     let path = Path::new(geodata_dir).join("geoip.dat");
-                    if let Ok(cidrs) = load_geoip_dat(&path, actual_ip_list) {
-                        for net in cidrs {
-                            ip_trie.insert(net, rule.id);
+                    match load_geoip_dat(&path, actual_ip_list) {
+                        Ok(cidrs) => {
+                            for net in cidrs {
+                                ip_trie.insert(net, rule.id);
+                            }
                         }
+                        Err(e) => tracing::error!(
+                            "Router: geoip '{}' load failed from {:?}: {}. Rules referencing this tag will match nothing. Check /etc/mirage-rs/geosite/geoip.dat exists and is valid v2ray format.",
+                            actual_ip_list, path, e
+                        ),
                     }
                 }
             }

@@ -18,6 +18,11 @@ pub struct Config {
     pub schema_version: u32,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// 可选日志文件路径. 设了就同时写文件 (append 模式) 和 stdout, systemd
+    /// journalctl 也仍能抓到 stdout 副本. 不设保持 stdout-only (老行为).
+    /// 常见值 "/var/log/mirage-rs/server.log" 或 client.log.
+    #[serde(default)]
+    pub log_file: Option<String>,
     pub inbounds: Vec<InboundConfig>,
     pub outbounds: Vec<OutboundConfig>,
     pub routing: RoutingConfig,

@@ -15,13 +15,79 @@ use tracing::{info, warn, error, Level};
 
 pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
-        .with_writer(
-            std::io::stdout.and(|| crate::monitor::GLOBAL_LOGGER.clone())
-        )
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    // 早读 config, 取 log_level + log_file 作 subscriber 初始化输入.
+    // subscriber 只能 set_global_default 一次, 所以必须在 info!/error! 前.
+    // 早失败 (config 读不到 / 解析错) 用 eprintln 输出到 stderr, 不依赖 tracing.
+    let (log_level_str, log_file_path) = {
+        let mut level = "info".to_string();
+        let mut file: Option<String> = None;
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            if let Ok(cfg) = serde_json::from_str::<crate::config::Config>(&content) {
+                level = cfg.log_level;
+                file = cfg.log_file;
+            }
+        }
+        (level, file)
+    };
+    let max_level = match log_level_str.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "info" => Level::INFO,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        other => {
+            eprintln!(
+                "[startup] unknown log_level '{}', falling back to info",
+                other
+            );
+            Level::INFO
+        }
+    };
+
+    // 打开 log_file (若配置了). 结果放 Option<FileLogger>, 它 Clone 廉价
+    // (Arc<Mutex<File>>). subscriber 用 || file_logger.clone() 作 writer.
+    let file_logger_opt: Option<crate::monitor::FileLogger> = match log_file_path.as_deref() {
+        Some(path) if !path.is_empty() => {
+            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                Ok(file) => Some(crate::monitor::FileLogger::new(file)),
+                Err(e) => {
+                    eprintln!(
+                        "[startup] cannot open log_file '{}': {}, falling back to stdout only",
+                        path, e
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // 组装 subscriber. 两种分支类型不同, 各自 set_global_default. 不用
+    // BoxMakeWriter 是因为 closure/GLOBAL_LOGGER.clone() 都需要私有类型.
+    if let Some(fl) = file_logger_opt.clone() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(
+                std::io::stdout
+                    .and(|| crate::monitor::GLOBAL_LOGGER.clone())
+                    .and(move || fl.clone()),
+            )
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    } else {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(max_level)
+            .with_writer(std::io::stdout.and(|| crate::monitor::GLOBAL_LOGGER.clone()))
+            .finish();
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    }
+
+    if let Some(ref p) = log_file_path {
+        if !p.is_empty() && file_logger_opt.is_some() {
+            info!("Logging to file: {}", p);
+        }
+    }
 
     info!("Mirage-rs is starting...");
 

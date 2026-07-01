@@ -1,5 +1,63 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.14] - log_file / geo 完整性 / geo proxy fallback (Issue 2/3/5) (2026-07-01)
+
+### feat(log): 配置 log_file 字段生效 + log_level 真的读了 (Issue 2)
+
+之前 `log_level` 字段 config 里定义了但**代码 hardcode `Level::DEBUG`**,
+用户改 config 完全无效. `log_file` 字段甚至连 schema 都没有, install.sh
+建的 /var/log/mirage-rs 目录闲置.
+
+修改:
+- `config.rs::Config` 加 `log_file: Option<String>` 字段
+- `lib.rs::start_proxy` subscriber 初始化前主动读 config, 取:
+  - `log_level` (info/warn/debug/error/trace, 严格 lowercase)
+  - `log_file` (可选文件路径)
+- 若 log_file 有效: append 打开, 用 `monitor::FileLogger` (Arc<Mutex<File>>
+  + Clone + Write) 作 tracing MakeWriter, 同时保留 stdout + GLOBAL_LOGGER
+  (GUI 内存 buffer). systemd journalctl 仍能抓 stdout 副本.
+- 文件打开失败: eprintln + 降级到 stdout only, 不阻塞启动.
+- install.sh: server 和 client config 默认写入
+  `"log_file": "${LOG_DIR}/{server,client}.log"`
+
+### fix(router): geo .dat load 失败静默 → error! 显式报错 (Issue 3)
+
+`src/router/mod.rs` 5 处 `if let Ok(domains) = load_geosite_dat(...)` /
+`load_geoip_dat` / `load_singbox_json` 静默吞错. 用户 geo 文件损坏时规
+则集体消失, 无任何提示. 改成显式 `match` + `tracing::error!` 打出:
+- 引用的 tag 名
+- 完整文件路径
+- 底层错误信息
+- 提示 "Rules referencing this tag will match nothing"
+
+方便用户知道"我这规则为啥不生效"是文件问题.
+
+### feat(geo_updater): via=Proxy 失败真 fallback direct + install.sh 默认 via=proxy (Issue 5)
+
+之前:
+- install.sh 默认 `"via": "direct"`, 大陆用户 GitHub 直连超时/被墙,
+  geo 数据永远拉不到, 路由规则全 fallback 到 default_outbound.
+- geo_updater 里 via=Proxy 只在 proxy_url=None 时 fallback direct.
+  实际 send/HTTP 失败**不 fallback**, 直接 return Err.
+
+修改:
+- `install.sh`: 两处 `"via": "direct"` → `"via": "proxy"`
+- `geo_updater::update_one`: 拆成 `do_fetch` + `fetch_with_fallback`.
+  via=Proxy 失败时自动重试 Direct 一次, info! 记录 fallback 成功.
+  两次都失败 → error! 告知用户 "both proxy and direct fetch failed".
+
+### 升级路径
+现有 client 部署重装 (`sudo bash install.sh`) → 新 config 自动写
+`log_file` + `via=proxy`. 手动 config 用户:
+```json
+"log_file": "/var/log/mirage-rs/client.log",
+...
+"geo_sources": [
+  {"name": "geosite", "kind": "geosite", "url": "...", "via": "proxy"},
+  {"name": "geoip",   "kind": "geoip",   "url": "...", "via": "proxy"}
+]
+```
+
 ## [v0.4.4-alpha.13] - TIME_SYNC 日志降噪 (Issue 1) (2026-07-01)
 
 ### fix(time_sync): |Δ| < 3s 的小抖动降到 DEBUG 级

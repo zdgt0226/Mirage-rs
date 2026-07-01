@@ -67,36 +67,16 @@ async fn update_one(dir: &str, source: &GeoSource, proxy_url: Option<&str>) -> R
     let path = Path::new(dir).join(&filename);
     let tmp_path = Path::new(dir).join(format!("{}.tmp", filename));
 
-    let client = build_client(source.via, proxy_url, &source.name)?;
-
     debug!(
         "GeoUpdater: Downloading {} (kind={:?}, via={:?}) from {}",
         source.name, source.kind, source.via, source.url
     );
 
-    let resp = match client.get(&source.url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("GeoUpdater: Failed to fetch {} from {}: {:?}", source.name, source.url, e);
-            return Err(anyhow!("Fetch failed"));
-        }
-    };
-
-    if !resp.status().is_success() {
-        error!(
-            "GeoUpdater: HTTP {} from {} for source {}",
-            resp.status(), source.url, source.name
-        );
-        return Err(anyhow!("HTTP error"));
-    }
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("GeoUpdater: Failed to read body of {}: {:?}", source.name, e);
-            return Err(anyhow!("Read body failed"));
-        }
-    };
+    // Fetch with automatic fallback: via=proxy 失败时 (connect/HTTP error /
+    // body read error) 自动重试一次 direct. 大陆用户 config 默认 via=proxy
+    // 走 mirage 代理拿, 服务端出网了就能穿墙 GitHub; 代理不通时也仍能靠
+    // 直连拉回来 (至少偶尔 GitHub 直连能过).
+    let bytes = fetch_with_fallback(source, proxy_url).await?;
 
     // 写到 .tmp 再原子重命名, 避免下载中途文件损坏被读
     if !Path::new(dir).exists() {
@@ -139,5 +119,54 @@ fn build_client(
                 Ok(reqwest::Client::builder().build()?)
             }
         },
+    }
+}
+
+/// 单次 fetch: send → check status → read body. 所有失败都返 Err.
+async fn do_fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let resp = client.get(url).send().await
+        .map_err(|e| anyhow!("send: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("HTTP {}", resp.status()));
+    }
+    resp.bytes().await
+        .map(|b| b.to_vec())
+        .map_err(|e| anyhow!("read body: {}", e))
+}
+
+/// 带 fallback 的 fetch: 主要按 source.via 走, 失败且原是 Proxy 时自动
+/// 重试一次 Direct. 便于配置默认 via=proxy 时不至于因为 mirage 出网抖动
+/// 而拉不到 geo. 两次都失败视为整体失败.
+async fn fetch_with_fallback(
+    source: &GeoSource,
+    proxy_url: Option<&str>,
+) -> Result<Vec<u8>> {
+    let primary_client = build_client(source.via, proxy_url, &source.name)?;
+    match do_fetch(&primary_client, &source.url).await {
+        Ok(b) => Ok(b),
+        Err(e) if matches!(source.via, GeoVia::Proxy) => {
+            warn!(
+                "GeoUpdater: source '{}' via proxy failed ({}), retrying via direct",
+                source.name, e
+            );
+            let direct_client = build_client(GeoVia::Direct, None, &source.name)?;
+            match do_fetch(&direct_client, &source.url).await {
+                Ok(b) => {
+                    info!("GeoUpdater: direct fallback succeeded for '{}'", source.name);
+                    Ok(b)
+                }
+                Err(e2) => {
+                    error!(
+                        "GeoUpdater: source '{}' both proxy and direct failed. proxy err: {}, direct err: {}",
+                        source.name, e, e2
+                    );
+                    Err(anyhow!("both proxy and direct fetch failed"))
+                }
+            }
+        }
+        Err(e) => {
+            error!("GeoUpdater: source '{}' fetch failed: {}", source.name, e);
+            Err(anyhow!("Fetch failed"))
+        }
     }
 }
