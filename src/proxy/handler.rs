@@ -38,6 +38,7 @@ pub async fn handle_client(
             let default_outbound_tag = &current_state.router.default_outbound;
             if let Some(outbound) = current_state.outbounds.get(default_outbound_tag) {
                 let leaf = outbound.resolve_leaf();
+                drop(current_state);
                 match &*leaf {
                     OutboundNode::Mirage { pool, .. } => {
                         udp_relay::handle_udp_associate(local, pool.clone()).await;
@@ -141,6 +142,7 @@ pub async fn proxy_tcp_target(
     };
 
     let leaf = outbound.resolve_leaf();
+    drop(current_state);
     match &*leaf {
         OutboundNode::Mirage { pool, .. } => {
             let mut tunnel = match pool.get().await {

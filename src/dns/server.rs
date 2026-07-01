@@ -250,6 +250,8 @@ impl DnsForwarder {
         let action = st.router.route(routing_req);
         
         let node = st.outbounds.get(action.as_str()).map(|n| n.resolve_leaf());
+        drop(st);
+        
         if let Some(n) = node {
             match &*n {
                 OutboundNode::Block { .. } => {

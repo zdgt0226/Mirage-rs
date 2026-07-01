@@ -170,18 +170,20 @@ impl ConfigWatcher {
                         if !(kind.is_modify() || kind.is_create()) {
                             continue;
                         }
-                        let trigger = paths.iter().any(|p| {
-                            p == &config_pathbuf
+                        // find 触发路径, 而不是 paths.first(). rename 事件 paths
+                        // 里可能 .tmp 在前 .dat 在后, 老 first() 会 log 出误导
+                        // 的 .tmp 路径. find 匹配 trigger predicate 保证 log 显
+                        // 示的就是真正被认可导致 reload 的那条路径.
+                        let trigger_path = paths.iter().find(|p| {
+                            *p == &config_pathbuf
                                 || p.extension().map_or(false, |e| e == "dat")
                         });
-                        if !trigger {
-                            continue;
-                        }
+                        let trigger_path = match trigger_path {
+                            Some(p) => p,
+                            None => continue, // 无路径命中 trigger, skip
+                        };
 
-                        let what = paths.first()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<unknown>".to_string());
-                        info!("Watched path {} changed. Attempting hot-reload...", what);
+                        info!("Watched path {} changed. Attempting hot-reload...", trigger_path.display());
                         // Give the writer a moment to finish flushing the file
                         std::thread::sleep(std::time::Duration::from_millis(100));
 

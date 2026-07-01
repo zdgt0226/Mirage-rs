@@ -1,5 +1,56 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.16] - reload log 显示纠正 + ArcSwap guard 提前释放 (Issue 6 + drop) (2026-07-01)
+
+### fix(config_watcher): reload log 显示真正触发 reload 的路径 (Issue 6)
+
+之前用 `paths.first()` 取事件里第一个路径打日志:
+```
+INFO Watched path /etc/mirage-rs/geosite/geoip.dat.tmp changed. Attempting hot-reload...
+```
+
+但 notify 在 rename 事件里 paths 可能 `.tmp` 在前 `.dat` 在后, 而实际
+的 reload 触发预测是 `.dat` (`.tmp` 被 predicate 过滤掉). log 显示的
+路径跟真正被认可的路径不一致, 用户可能疑惑"是不是没原子 rename?".
+
+修改 `src/config_watcher.rs::watch_config`:
+- `paths.first()` → `paths.iter().find(<same predicate as trigger>)`
+- 保证 log 显示的是真正满足 trigger 的 `.dat` 或 config 文件路径
+
+不动 reload 触发逻辑本身, 只改 log 输出。
+
+### perf(handler,dns): ArcSwap guard 提前 `drop()`, 让 hot-reload 后旧 state 立即可回收
+
+3 处 (`src/dns/server.rs`, `src/proxy/handler.rs` 两处) 在提取 `Arc<OutboundNode>`
+后立即 `drop(guard)`:
+
+```rust
+let leaf = outbound.resolve_leaf();
+drop(current_state);  // ← 新增, guard 到此为止
+match &*leaf {
+    OutboundNode::Mirage { pool, .. } => {
+        // 长期占用连接的 await, 此时不再引用旧 CoreState
+    }
+    ...
+}
+```
+
+之前 guard 一直活到整个 `handle_client / proxy_tcp_target / DNS 转发`
+结束 (几秒到几分钟). 期间 hot-reload swap 新 CoreState 时旧的**内存不
+能立即回收**, 内存里存的是"用户所有 activeconnection 都放了 guard 才
+能 drop 旧配置".
+
+改后 guard 提取完 leaf 立刻释放, hot-reload 旧 state 内存能马上被 Arc
+的 strong_count 降到 0 从而回收. 功能行为完全不变.
+
+Rust NLL 保证 borrow 检查通过: `outbound` 引用在 `resolve_leaf()` 后
+就不再使用, lifetime 已结束, `drop(current_state)` 合法.
+
+### 影响
+- Issue 6: 纯 log 显示问题, 无运行时行为改变
+- drop: hot-reload 场景内存回收更快, 无功能变化
+- 编译: 18 tests 全过, default + ebpf feature 都无 warning
+
 ## [v0.4.4-alpha.15] - geo_updater 30s 超时 + 空 body 拦截 (2026-07-01)
 
 ### fix(geo_updater): 补 alpha.14 审计出的 2 处纰漏
