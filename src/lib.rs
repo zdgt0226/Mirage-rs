@@ -126,7 +126,20 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     crate::config::InboundConfig::Mixed { listen, port, .. } => (listen, port),
                     _ => continue,
                 };
-                let host = if listen == "0.0.0.0" || listen == "::" { "127.0.0.1" } else { listen.as_str() };
+                // 0.0.0.0 / :: 通配符改回环 loopback (URL 里指自身). IPv6 主机 (含 ::1 /
+                // fd00:: 等) 按 RFC 3986 必须用 [] 包裹, 否则 reqwest::Proxy::all() InvalidUrl.
+                let host_raw = if listen == "0.0.0.0" {
+                    "127.0.0.1"
+                } else if listen == "::" {
+                    "::1"
+                } else {
+                    listen.as_str()
+                };
+                let host = if host_raw.contains(':') && !host_raw.starts_with('[') {
+                    format!("[{}]", host_raw)
+                } else {
+                    host_raw.to_string()
+                };
                 socks_proxy_url = Some(format!("socks5://{}:{}", host, port));
                 break;
             }
@@ -156,19 +169,23 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         }
     };
 
-    if needs_geo && !geo_sources.is_empty() {
-        // 启动 Geo 数据库自动下载与热更新任务 (多源 + via direct/proxy)
-        crate::router::geo_updater::spawn_updater(
-            geodata_dir.clone(),
-            geo_sources,
-            geo_update_days,
-            socks_proxy_url,
-        ).await;
-    } else if needs_geo {
+    // 无条件建 UpdaterHandle + spawn updater. 冷启动无 sources 时 updater 阻
+    // 塞在 wake 上不消耗资源, 热更新加了 sources 后 ConfigWatcher 会 notify
+    // 醒它立刻拉一轮. 修 Issue 4 方案 C.
+    let updater_handle = crate::router::geo_updater::UpdaterHandle::new(
+        crate::router::geo_updater::UpdaterState {
+            geodata_dir: geodata_dir.clone(),
+            sources: geo_sources,
+            update_days: geo_update_days,
+            proxy_url: socks_proxy_url,
+        },
+    );
+    crate::router::geo_updater::spawn_updater(updater_handle.clone()).await;
+    if needs_geo && updater_handle.state.load().sources.is_empty() {
         warn!("Routing rules reference geosite/geoip but `tuning.geo_sources` is empty. \
-               No geo data will be downloaded — rules referencing geo data will not match.");
-    } else {
-        info!("No geosite/geoip rules configured — skipping Geo data updater (saves bandwidth + avoids GitHub flow fingerprint).");
+               Updater is waiting for hot-reload to add sources.");
+    } else if !needs_geo {
+        info!("No geosite/geoip rules configured — geo updater running but idle (no sources).");
     }
     
     // 如果 config.json 不存在，我们先写一个基础模板，避免启动直接崩溃
@@ -206,7 +223,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     }
     
     // ConfigWatcher::new() 会立刻解析配置并加载 Router 和 Outbounds，同时启动后台文件监控线程
-    let watcher = match crate::config_watcher::ConfigWatcher::new(config_path, &geodata_dir) {
+    let watcher = match crate::config_watcher::ConfigWatcher::new(config_path, &geodata_dir, updater_handle.clone()) {
         Ok(w) => w,
         Err(e) => {
             tracing::error!("Failed to initialize config watcher: {}", e);

@@ -279,28 +279,34 @@ impl RouterEngine {
                 
                 if actual_site.ends_with(".json") {
                     let path = Path::new(geodata_dir).join(actual_site);
-                    if let Ok((domains, cidrs)) = load_singbox_json(&path) {
-                        for net in cidrs {
-                            ip_trie.insert(net, rule.id);
-                        }
-                        for d in domains {
-                            match d.dtype {
-                                DomainType::Plain => {
-                                    patterns.push(d.value);
-                                    pattern_to_rule_id.push(rule.id);
-                                }
-                                DomainType::Regex => {
-                                    regex_patterns.push(d.value);
-                                    regex_to_rule_id.push(rule.id);
-                                }
-                                DomainType::RootDomain => {
-                                    domain_trie.insert(&d.value, rule.id);
-                                }
-                                DomainType::Full => {
-                                    exact_domain.entry(d.value).or_default().push(rule.id);
+                    match load_singbox_json(&path) {
+                        Ok((domains, cidrs)) => {
+                            for net in cidrs {
+                                ip_trie.insert(net, rule.id);
+                            }
+                            for d in domains {
+                                match d.dtype {
+                                    DomainType::Plain => {
+                                        patterns.push(d.value);
+                                        pattern_to_rule_id.push(rule.id);
+                                    }
+                                    DomainType::Regex => {
+                                        regex_patterns.push(d.value);
+                                        regex_to_rule_id.push(rule.id);
+                                    }
+                                    DomainType::RootDomain => {
+                                        domain_trie.insert(&d.value, rule.id);
+                                    }
+                                    DomainType::Full => {
+                                        exact_domain.entry(d.value).or_default().push(rule.id);
+                                    }
                                 }
                             }
                         }
+                        Err(e) => tracing::error!(
+                            "Router: geosite singbox '{}' load failed from {:?}: {}. Rules referencing this file will match nothing.",
+                            actual_site, path, e
+                        ),
                     }
                 } else if actual_site.contains(':') {
                     // filename.dat:tag

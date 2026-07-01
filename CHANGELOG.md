@@ -1,5 +1,68 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.17] - 外部审计 4 处纰漏修复 (2026-07-01)
+
+外部代码审计发现 4 个真实问题, 全部修:
+
+### fix(router): singbox JSON geosite 分支也不再静默吞错 (纰漏 1)
+
+alpha.14 修 Issue 3 (geo integrity) 时改了 4 处 v2ray .dat load 站点,
+**唯独遗漏了 `src/router/mod.rs:282` 的 geosite singbox JSON 分支**.
+用户配 `"geosite": ["cn.json"]` 时若文件损坏或缺失, 依然静默跳过, 所
+有依赖该 tag 的规则失效. 改成 match + tracing::error! 显式报错.
+
+### fix(pool): WarmPool::get() timeout 分支补 wait_events (纰漏 2)
+
+指标失真 + 反馈算法逻辑倒挂:
+- 入口: `total_gets.fetch_add(1)` 一定加
+- 队列拿到 tunnel 且等待 > 50ms: `wait_events.fetch_add(1)` 加
+- **10s timeout 分支返 Err 时: 之前不加!**
+
+100 请求全饿死超时 → total_gets=100 wait_events=0 → wait_ratio=0.0
+→ Manager 判定"供给完美", 不但不扩容还可能触发缩容. 反馈算法在池
+饿死时反而告诉自己"没问题". timeout 到这里意味着实际等了 10s 全被
+阻塞, 显式计一次修 wait_events 语义.
+
+### fix(lib): IPv6 SOCKS5 URL 加 RFC 3986 [] 包裹 (纰漏 3)
+
+`src/lib.rs:129-130` 拼 socks5:// URL 时不区分 IPv4/IPv6:
+```rust
+format!("socks5://{}:{}", host, port)
+```
+用户配 `"listen": "::1"` → URL 变 `socks5://::1:37683` → 多个未包裹
+冒号 → reqwest::Proxy::all() InvalidUrl → geo_updater 的 proxy 通
+道直接崩. RFC 3986: URL 里 IPv6 主机必须 `[::1]` 包裹. `host.contains(':')
+&& !starts_with('[')` 时自动加 `[...]`. 同时 `::` 通配符规范化到 `::1`
+(loopback), 跟 `0.0.0.0` → `127.0.0.1` 对齐.
+
+### feat(geo_updater, config_watcher): geo_sources 真正热更新 (纰漏 4, 方案 C)
+
+老架构: `spawn_updater` 只在 `start_proxy` 时基于冷启动配置调一次,
+task 内 sources / update_days 是 `move` 进闭包的死值. 后果:
+1. 冷启动无 geo → 热改 config 加 geo → updater 永远未 spawn
+2. 热改 tuning.geo_sources / geo_update_days → updater 循环用旧值
+
+方案 C (完整热更新):
+- 新增 `UpdaterState` (geodata_dir / sources / update_days / proxy_url)
+- 新增 `UpdaterHandle { state: Arc<ArcSwap<UpdaterState>>, wake: Arc<Notify> }`
+- `spawn_updater(handle)` 每次循环 `state.load_full()` 拿当前快照
+- sources 空: 阻塞在 `wake.notified().await` 不空转
+- 循环 sleep 用 `select!` 与 wake 争抢, 热改配置 100% ms 级响应
+- 冷启动**无条件** spawn updater (不再有 `if !sources.is_empty()` 门)
+- `ConfigWatcher` 接 `UpdaterHandle` clone. 文件变化时用
+  `extract_updater_state` 重解析 tuning, 调 `handle.update(new)` 一次性
+  Arc swap + notify_one. proxy_url 保留旧值 (inbounds 不热更新, 同步无意义)
+- 全字段 update 幂等 (不做部分差分, 避免漏字段 bug)
+
+行为对齐 CoreState hot-reload: 用户改 config 秒生效, 无需 restart.
+
+### 自我审计通过项
+
+- 0 编译警告 (default + ebpf feature 都通过)
+- 18 tests 全过 (含 pool feedback + time_sync 全套)
+- Rust borrow 检查通过 (NLL 保证 arc_swap Guard 生命周期)
+- notify_one 语义正确 (permit-based, 顺序无关)
+
 ## [v0.4.4-alpha.16] - reload log 显示纠正 + ArcSwap guard 提前释放 (Issue 6 + drop) (2026-07-01)
 
 ### fix(config_watcher): reload log 显示真正触发 reload 的路径 (Issue 6)

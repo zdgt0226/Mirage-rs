@@ -596,7 +596,14 @@ impl WarmPool {
             }
         }).await;
 
-        result.map_err(|_| anyhow::anyhow!("pool.get() timed out after 10s — upstream likely unreachable"))
+        // 修 Issue 2: 老版本 timeout 分支只 total_gets++ 没 wait_events++.
+        // 池饿死 100 个请求全 10s timeout → total=100 wait=0 → wait_ratio=0.0
+        // → Manager 认为"供给完美"甚至触发缩容, 反馈算法逻辑倒挂. timeout 到
+        // 这里意味着确实等了 10s 全被阻塞过, 显式计一次.
+        result.map_err(|_| {
+            self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
+            anyhow::anyhow!("pool.get() timed out after 10s — upstream likely unreachable")
+        })
     }
 
     pub async fn update_brutal_rate(&self, new_rate: u64) {

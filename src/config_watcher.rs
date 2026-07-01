@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::proxy::outbound::OutboundManager;
 use crate::router::{RouterEngine, Rule};
+use crate::router::geo_updater::{UpdaterHandle, UpdaterState};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use notify::{Event, RecursiveMode, Watcher};
@@ -20,17 +21,34 @@ pub struct ConfigWatcher {
 }
 
 impl ConfigWatcher {
-    pub fn new(config_path: &str, geodata_dir: &str) -> Result<Self> {
+    pub fn new(config_path: &str, geodata_dir: &str, updater_handle: UpdaterHandle) -> Result<Self> {
         let state = Self::build_state(config_path, geodata_dir, None)?;
         let arc_state = Arc::new(ArcSwap::from_pointee(state));
-        
+
         let watcher = Self {
             state: arc_state.clone(),
         };
 
-        Self::spawn_watcher(config_path.to_string(), geodata_dir.to_string(), arc_state);
+        Self::spawn_watcher(config_path.to_string(), geodata_dir.to_string(), arc_state, updater_handle);
 
         Ok(watcher)
+    }
+
+    /// 从 config 文件里抽出 UpdaterState. proxy_url 保留旧值 (inbounds 不
+    /// 热更新, 每次都从 inbounds 推导会得到相同结果, 保留旧值省一步).
+    fn extract_updater_state(config_path: &str, old: &UpdaterState) -> Option<UpdaterState> {
+        let content = std::fs::read_to_string(config_path).ok()?;
+        let config: Config = serde_json::from_str(&content).ok()?;
+        let tuning = config.tuning?;
+        let sources = tuning.geo_sources;
+        let update_days = tuning.geo_update_days.unwrap_or(7);
+        let geodata_dir = tuning.geodata_dir.unwrap_or_else(|| ".geosite".to_string());
+        Some(UpdaterState {
+            geodata_dir,
+            sources,
+            update_days,
+            proxy_url: old.proxy_url.clone(),
+        })
     }
 
     fn build_state(config_path: &str, geodata_dir: &str, old_outbounds: Option<Arc<OutboundManager>>) -> Result<CoreState> {
@@ -118,7 +136,7 @@ impl ConfigWatcher {
         })
     }
 
-    fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>) {
+    fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>, updater_handle: UpdaterHandle) {
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
 
@@ -195,6 +213,30 @@ impl ConfigWatcher {
                             }
                             Err(e) => {
                                 error!("Hot-reload failed! Keeping previous state. Error: {}", e);
+                            }
+                        }
+
+                        // 修 Issue 4 方案 C: 也重建 UpdaterState 让 geo_updater
+                        // 拿到新 sources / update_days. proxy_url 保留旧值
+                        // (inbounds 不热更新, 同步无意义).
+                        //
+                        // 无脏比较全字段总是 update: GeoSource 字段太多 (name/url/
+                        // kind/via), 手写差分容易漏字段 (例如只改 via 从 direct
+                        // 到 proxy). update() 幂等 = 一次 Arc swap + notify_one,
+                        // 成本很低. 只有 config 文件本身改动才触发 (`.dat` 变化
+                        // 不影响 updater 配置).
+                        if trigger_path == &config_pathbuf {
+                            let old_updater = (**updater_handle.state.load()).clone();
+                            if let Some(new_updater) = Self::extract_updater_state(&config_path, &old_updater) {
+                                let sources_delta = new_updater.sources.len() as i64
+                                    - old_updater.sources.len() as i64;
+                                info!(
+                                    "Geo updater config reloaded ({} source(s), interval {} days, Δsources={:+}). Notifying updater.",
+                                    new_updater.sources.len(),
+                                    new_updater.update_days,
+                                    sources_delta,
+                                );
+                                updater_handle.update(new_updater);
                             }
                         }
                     }
