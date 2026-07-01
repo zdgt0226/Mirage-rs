@@ -211,55 +211,31 @@ pub async fn proxy_tcp_target(
             };
 
             let download = async {
-                // Producer/consumer 拆分: 老版本 loop 内 read + write 串行,
-                // 读到 1 帧 (≤16KB) 就得等 write 完再读下一帧. 视频下载场景
-                // (server → client 大量 AEAD 帧连发) 客户端 recv 队列被 kernel
-                // 排空慢 → advertised window 缩 → server 见 rwnd_limited 67%.
+                // alpha.21 曾尝试 mpsc(32) producer/consumer 批量, 但外部审计
+                // 指出 tokio 调度器倾向立刻醒 consumer, `try_recv` 抓空, 批量
+                // 失效. alpha.23 撤回改直连: recv_data → write_all 一对一.
                 //
-                // 新架构: 单 task 读进 mpsc channel, 消费端从 channel 拉多帧
-                // 攒到 64KB 再一次 write_all. TCP 层面: 读者持续排空 kernel
-                // recv buffer, advertised window 稳定大; 应用层: 一次系统调
-                // 用搬 4 帧 payload, per-byte 开销降 4×.
+                // 真正的批量在两个别的地方发生:
+                // 1. 服务端 CryptoWriter 内嵌 BufWriter(64KB), send_data 里
+                //    多帧 write_all 自动合成 syscall
+                // 2. 服务端 tcp_relay 用 try_read 贪婪收割 upstream
                 //
-                // channel 容量 32 帧 (~512KB) 平衡"生产者不阻塞" vs "内存占用".
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-                let mut reader = tunnel_reader;
+                // 客户端接收侧因为 CryptoReader 的 read_exact 语义无法安全
+                // 加 try_recv (中途取消会丢帧半读). 保持一对一直连最稳.
+                let mut tunnel_reader = tunnel_reader;
 
-                let producer = tokio::spawn(async move {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(300), async {
                     loop {
-                        match reader.recv_data().await {
+                        match tunnel_reader.recv_data().await {
                             Ok(data) => {
-                                if tx.send(data.to_vec()).await.is_err() { break; }
+                                if local_write.write_all(&data).await.is_err() {
+                                    break;
+                                }
                             }
                             Err(_) => break,
                         }
                     }
-                    reader
-                });
-
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-                    const BATCH_TARGET: usize = 65536;
-                    while let Some(first) = rx.recv().await {
-                        let mut batch = first;
-                        // 攒足 64KB 或 channel 暂空
-                        while batch.len() < BATCH_TARGET {
-                            match rx.try_recv() {
-                                Ok(more) => batch.extend_from_slice(&more),
-                                Err(_) => break,
-                            }
-                        }
-                        if local_write.write_all(&batch).await.is_err() { break; }
-                    }
                 }).await;
-
-                // consumer 退出 → drop rx → producer 的 tx.send 会返 Err → 循环退出
-                drop(rx);
-                let mut tunnel_reader = producer.await.unwrap_or_else(|_| {
-                    // 极罕见 producer 被外部 panic. 用一个 dummy 结构做兜底不太可能.
-                    // 实际实现里 producer body 里的 recv_data 只会返 Ok/Err, 不会
-                    // panic. 保留 unwrap_or_else 作静态防御, 生产不会触发.
-                    panic!("download producer task panicked unexpectedly");
-                });
 
                 // 退出前排空远端发来的残留数据, 确保发给服务端的是 FIN 而不是 RST (核心隐蔽特征)
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {

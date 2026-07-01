@@ -1,5 +1,59 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.23] - BufWriter 内嵌 + server 贪婪 try_read + 客户端撤 mpsc (2026-07-01)
+
+外部审计三方向剩余两项落地, 加上 alpha.21 客户端 mpsc 方案的撤回.
+
+### feat(crypto): CryptoWriter 内嵌 tokio::io::BufWriter(64KB)
+
+`src/crypto/aead.rs::CryptoWriter` 内部 `writer: W` 改为
+`writer: BufWriter<W>`, 容量 64KB = 4× MAX_RECORD_SIZE.
+
+send_data 处理一次 64KB plaintext 会内部拆 4 帧, 4× `write_all(framed)`
+之前直接 4 次 syscall, 现在攒到 BufWriter 里, 末尾 flush() 一次
+syscall 送出 64KB.
+
+**关键: caller 契约完全不变**. send_data 尾部保留 flush() 主动 drain
+BufWriter, healthcheck / dns / control / handler 所有 caller 全部无
+需修改. BufWriter 的收益仅在 send_data 内部多帧写入时体现 (一次
+send_data 处理大 plaintext), send_data 一次少 plaintext 时 flush 立即
+drain 也不留任何数据.
+
+### feat(server): tcp_relay download 用 try_read 贪婪收割 upstream
+
+alpha.21 加大 read buf 到 64KB 只解决"能装多少", 没解决"每次装到多少":
+tokio `read()` 只返回 kernel recv buffer 当前现成的数据, 剩下的等下
+一轮 poll. 长 BDP 链路 kernel 里可能连续来了 64KB 但一次读只拿 8KB.
+
+改法: blocking `read` 拿第一片后, 立刻 `try_read` 非阻塞收割 kernel
+里剩余数据, 填满 64KB 或 WouldBlock 为止. 一次 `send_data(64KB)` 大
+批送出 → CryptoWriter BufWriter 里 4 帧合成 1 syscall.
+
+打破"读一片写一片"串行的碎片化.
+
+### fix(handler): 撤回 alpha.21 的 mpsc channel 批量方案
+
+外部审计明确指出: alpha.21 的 `mpsc::channel(32)` + producer/consumer
++ `try_recv` 攒 batch, 实际上被 tokio 抢占调度 立刻唤醒 consumer,
+`try_recv` 大多找不到后续帧, 批量失效, 往往还是一帧一写.
+
+alpha.23 撤回改回直连 `recv_data → write_all` 一对一 pattern. 简洁
++ 分析师验证无副作用. 真正的批量优化在服务端 CryptoWriter BufWriter
+和 tcp_relay try_read 两处. 客户端接收侧因 CryptoReader 的 read_exact
+语义无法安全加 try_recv (中途取消会丢帧半读), 保持一对一最稳.
+
+### 综合预期
+
+alpha.21 三方向 + alpha.22 concat + alpha.23 三处 联合起来:
+- 服务端 syscall 数量: 每 64KB 从 9 次 (2 write + 1 flush × 3 帧) →
+  1 次 (BufWriter 攒 3 帧 + flush drain)
+- 服务端 read syscall 数量: 每 burst 从 4 次 (4 个 read) → 1 次
+  (1 read + 3 try_read 非阻塞)
+- 客户端复杂度: 撤 mpsc 后代码更简洁, 少 1 个 tokio task 少 1 个
+  channel, 少内存占用
+
+期望 rwnd_limited 从 alpha.22 的中间值 → 接近 POC 的 <5%.
+
 ## [v0.4.4-alpha.22] - CryptoWriter 单次 write_all 消除 3× syscall 碎片化 (2026-07-01)
 
 外部审计指出核心 IO 瓶颈: `CryptoWriter::send_data` **每帧两次

@@ -2,7 +2,13 @@ use anyhow::{anyhow, Result};
 use ring::aead::{self, LessSafeKey, UnboundKey, Nonce as RingNonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
+
+/// CryptoWriter 内嵌 BufWriter 容量 (方向一 Part 2). 64KB = 4× MAX_RECORD_SIZE:
+/// send_data 处理 64KB plaintext 时内部拆 4 个 16KB 帧, 4× write_all 全部
+/// 攒在 BufWriter 里, 最后 flush() 一次 syscall 送出 64KB. 老代码是 4 次
+/// 独立 syscall + TCP_NODELAY 各自成小段. 视频下载单方向 4× syscall 缩减.
+const WRITER_BUF_CAPACITY: usize = 65536;
 
 pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
@@ -35,8 +41,11 @@ fn format_nonce(n: u64) -> RingNonce {
 // CryptoWriter (发送端)
 // ============================================================================
 
-pub struct CryptoWriter<W> {
-    writer: W,
+pub struct CryptoWriter<W: AsyncWrite + Unpin> {
+    /// 内嵌 BufWriter(64KB): 多帧写入自动 coalesce 为一次 syscall (方向一 Part 2).
+    /// send_data 尾部的 flush() 会主动 drain BufWriter, 契约与 alpha.22 完全
+    /// 一致 — 所有 caller (healthcheck / dns / control / handler 等) 无需改.
+    writer: BufWriter<W>,
     cipher: LessSafeKey,
     nonce: u64,
     /// 加密临时区: [chunk_bytes, content_type=0x17] → seal_in_place 后附 tag
@@ -53,7 +62,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         let info = if is_initiator { b"c2s" } else { b"s2c" };
         let cipher = expand_key(master_key, info);
         Self {
-            writer,
+            writer: BufWriter::with_capacity(WRITER_BUF_CAPACITY, writer),
             cipher,
             nonce: 0,
             // 预分配最大容量，杜绝运行时内存分配开销

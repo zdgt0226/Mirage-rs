@@ -90,17 +90,32 @@ pub(super) async fn handle_tcp_relay(
     };
 
     let download = async move {
-        // 老 16KB 太小: 长 BDP 链路一次 syscall 只搬 4 帧, 频繁 poll wait 增加
-        // per-byte 开销. 加大到 64KB 后一次系统调用能吃掉 4 倍数据, 减少
-        // context switch, 上游 (YouTube 等) 有大量待读数据时能一口气吃干净.
-        // 用 vec! 而非 [_;N] 数组是为了避免栈上 64KB 大对象 (tokio task stack
-        // 不大, 有大 buf 时用堆更稳).
+        // 老 16KB 太小 (alpha.21 加大到 64KB), 但仅仅加大 buf 只解决"能装多少",
+        // 没解决"实际每次装了多少": tokio 的 read() 返回 kernel recv buffer 里
+        // 现成的数据 (可能只有 8KB), 剩余到达的数据只能靠下一轮 poll 才拿到.
+        //
+        // 方向二 (greedy try_read): blocking read 拿到第一片后, 立刻 try_read
+        // 非阻塞收割 kernel 里更多已到达的数据, 一次填到 64KB 或没更多为止.
+        // 一次 send_data 送出大批 → CryptoWriter 里 BufWriter (alpha.23 加的)
+        // 把多帧 syscall 合成一个大 write. 打破"读一片写一片"串行的碎片.
         let mut buf = vec![0u8; 65536];
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(1800), up_read.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    if writer.send_data(&buf[..n]).await.is_err() {
+                    let mut total = n;
+                    // 贪婪收割: 非阻塞 try_read 继续填 buf 剩余空间, kernel 里有
+                    // 多少数据就装多少, WouldBlock (E_AGAIN) 时立即退出. 不会
+                    // 因为等 kernel 而增加延迟.
+                    while total < buf.len() {
+                        match up_read.try_read(&mut buf[total..]) {
+                            Ok(0) => break,   // upstream 半关闭
+                            Ok(more) => total += more,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                    if writer.send_data(&buf[..total]).await.is_err() {
                         break;
                     }
                 }
