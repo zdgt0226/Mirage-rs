@@ -491,26 +491,43 @@ impl WarmPool {
         let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
         let stream = TcpStream::connect(&addr).await?;
         
-        // --- 性能优化：TCP 发送缓冲区与 Brutal 拥塞控制 ---
+        // --- 性能优化：TCP 收发缓冲区 + Brutal 拥塞控制 ---
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
         unsafe {
-            // 2. 发送缓冲区优化: 增加 Pool 中连接的发送 buffer size
-            let sndbuf: libc::c_int = 4 * 1024 * 1024; // 4MB
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &sndbuf as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-            
-            let mut actual: libc::c_int = 0;
-            let mut sndbuf_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &mut actual as *mut _ as *mut libc::c_void, &mut sndbuf_len);
-            
-            if actual < sndbuf * 2 {
+            // SO_SNDBUF: 客户端 → 服务端方向 (HTTP 请求 / ACK). 一般较小,
+            // 但保留大值不亏, kernel 只在真需要时分配.
+            // SO_RCVBUF: 服务端 → 客户端方向 (视频下载). 长 BDP 链路 (200ms
+            // × 40 Mbps ≈ 1MB) 起手 buffer 太小会让 advertised window 撑
+            // 不开, 服务端 rwnd_limited 高. auto-tune 慢启动, 显式设大值
+            // 让 kernel 直接给固定 buffer.
+            let buf_size: libc::c_int = 8 * 1024 * 1024;
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+
+            // 检查 kernel 有没有 clamp 到 wmem_max/rmem_max
+            let mut actual_snd: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                &mut actual_snd as *mut _ as *mut libc::c_void, &mut len);
+            let mut actual_rcv: libc::c_int = 0;
+            let mut len2 = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                &mut actual_rcv as *mut _ as *mut libc::c_void, &mut len2);
+
+            if actual_snd < buf_size * 2 || actual_rcv < buf_size * 2 {
                 use std::sync::atomic::{AtomicBool, Ordering};
-                static SNDBUF_WARNED: AtomicBool = AtomicBool::new(false);
-                if !SNDBUF_WARNED.swap(true, Ordering::Relaxed) {
+                static BUF_WARNED: AtomicBool = AtomicBool::new(false);
+                if !BUF_WARNED.swap(true, Ordering::Relaxed) {
                     tracing::warn!(
-                        "SO_SNDBUF capped at {} bytes (requested {}). \
-                         Run `sysctl -w net.core.wmem_max=8388608` for Brutal CC and large buffer performance.",
-                        actual, sndbuf);
+                        "Socket buffer capped: SNDBUF={} RCVBUF={} (requested {}×2). \
+                         Run `sysctl -w net.core.wmem_max=8388608 net.core.rmem_max=8388608` \
+                         for full brutal + high-BDP performance.",
+                        actual_snd, actual_rcv, buf_size);
                 }
             }
             

@@ -33,14 +33,29 @@ pub(super) async fn handle_tcp_relay(
         }
     };
 
+    // 在 split 前抓 FD: split 后两个 OwnedHalf 不再共享 as_raw_fd 接口
+    let upstream_fd = upstream.as_raw_fd();
+
+    // 显式设 SO_SNDBUF + SO_RCVBUF = 8MB. 老版本靠 kernel auto-tune, 长
+    // BDP 链路 (200ms RTT × 40Mbps ≈ 1MB) 起手 buffer 太小会导致 rwnd_limited
+    // 卡住 server → client 转发. 手动置大值 kernel 会 disable auto-tune,
+    // 直接用固定 buffer. 上限由 install.sh 的 optimize_sysctl 设的
+    // net.core.{rmem,wmem}_max=8388608 决定, 到不了 8MB 就 warn 一次.
+    unsafe {
+        let val: libc::c_int = 8 * 1024 * 1024;
+        libc::setsockopt(upstream_fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(upstream_fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+
     if let Some(payload) = initial_payload {
         if !payload.is_empty() {
             let _ = upstream.write_all(&payload).await;
         }
     }
-
-    // 在 split 前抓 FD: split 后两个 OwnedHalf 不再共享 as_raw_fd 接口
-    let upstream_fd = upstream.as_raw_fd();
     let (mut up_read, mut up_write) = upstream.into_split();
 
     // 共享 atomic: 第一个 swap 到 -1 的 task 负责 shutdown, 另一方自然 break.
@@ -75,7 +90,12 @@ pub(super) async fn handle_tcp_relay(
     };
 
     let download = async move {
-        let mut buf = [0u8; 16384];
+        // 老 16KB 太小: 长 BDP 链路一次 syscall 只搬 4 帧, 频繁 poll wait 增加
+        // per-byte 开销. 加大到 64KB 后一次系统调用能吃掉 4 倍数据, 减少
+        // context switch, 上游 (YouTube 等) 有大量待读数据时能一口气吃干净.
+        // 用 vec! 而非 [_;N] 数组是为了避免栈上 64KB 大对象 (tokio task stack
+        // 不大, 有大 buf 时用堆更稳).
+        let mut buf = vec![0u8; 65536];
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(1800), up_read.read(&mut buf)).await {
                 Ok(Ok(0)) => break,

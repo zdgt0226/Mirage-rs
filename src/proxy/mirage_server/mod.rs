@@ -89,6 +89,25 @@ pub async fn start_server(
                     use std::os::unix::io::AsRawFd;
                     crate::proxy::brutal::set_brutal_rate(stream.as_raw_fd(), rate);
                 }
+
+                // 显式设 SO_SNDBUF + SO_RCVBUF = 8MB. server→client 是视频下
+                // 载的主要方向, 长 BDP 链路 (200ms × 40Mbps ≈ 1MB) 起手 buffer
+                // 太小会 rwnd_limited 反复卡. kernel auto-tune 慢启动, 手动置
+                // 大值 disable auto-tune 立即拿满 buffer.
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = stream.as_raw_fd();
+                    unsafe {
+                        let val: libc::c_int = 8 * 1024 * 1024;
+                        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+                            &val as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+                            &val as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    }
+                }
+
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();
                 tokio::spawn(async move {

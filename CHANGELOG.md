@@ -1,5 +1,63 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.21] - IO 大缓冲 + producer/consumer 批量 (rwnd_limited 67% → 期望 <10%) (2026-07-01)
+
+用户实测发现: 客户端 tcp 长连接 `rwnd_limited 67%` 卡住, brutal 有力
+使不出. POC 版本同链路只有 2-5% rwnd_limited. 三方向系统性改造:
+
+### 方向 1: server upstream 读缓冲 16KB → 64KB
+
+`src/proxy/mirage_server/tcp_relay.rs:98`:
+- 老 `let mut buf = [0u8; 16384];` — 单次 syscall 只搬 16KB
+- 新 `let mut buf = vec![0u8; 65536];` — 一次搬 4× 数据, 减少 poll cycle 开销
+
+用 vec! 而非 [_;N] 数组: tokio task 栈不大, 64KB 大对象放堆上更稳.
+
+### 方向 3: 显式设 SO_SNDBUF / SO_RCVBUF = 8MB (三处 socket)
+
+老代码只在 client outbound 设了 SO_SNDBUF=4MB, 其他 socket 完全靠
+kernel auto-tune. Auto-tune 有慢启动, 长 BDP (200ms × 40Mbps ≈ 1MB)
+链路起手 buffer 太小 → advertised window 撑不开 → rwnd_limited.
+
+三处补 setsockopt (全 8MB):
+1. **`src/proxy/mirage_server/mod.rs`** accept socket: SO_SNDBUF +
+   SO_RCVBUF — server→client 视频下载主方向
+2. **`src/proxy/mirage_server/tcp_relay.rs`** upstream socket:
+   SO_SNDBUF + SO_RCVBUF — server 从 YouTube 等上游拉数据方向
+3. **`src/proxy/pool.rs`** client outbound socket: SO_SNDBUF 从 4MB 抬到
+   8MB, 新增 SO_RCVBUF = 8MB — server → client 视频下载客户端接收方向
+
+8MB 匹配 install.sh `optimize_sysctl` 已经设的 `net.core.{rmem,wmem}_max
+= 8388608`. kernel 内部会 clamp 到 cap, 代码有 getsockopt 校验实际值,
+拿不到时 warn 一次提示用户重跑 install.sh 或手动 sysctl.
+
+### 方向 2: client download 循环 producer/consumer + 64KB batching
+
+`src/proxy/handler.rs` proxy_tcp_target 里 mirage outbound 的 download
+分支:
+
+- 老 `loop { recv_data().await → write_all().await }` 串行, 读到 1
+  帧就得等 write 完再读下一帧, kernel recv buffer 排空慢
+- 新: 单 task 读进 `mpsc::channel(capacity=32)`, consumer 从 channel
+  拉多帧攒到 64KB 再一次 write_all
+
+效果: TCP 层面读者持续排空 kernel recv buffer, advertised window 稳定
+大. 应用层单次 write 搬 4 倍 payload, per-byte 开销 4× 降。
+
+### 综合效果预期
+
+服务端 ss -tipn 上 `rwnd_limited` 应从 67% → <10%. brutal pacing_rate
+真正生效. 追平 Python POC 的应用层吞吐效率. `delivery_rate` 与
+`pacing_rate` 比值从 30-40% 升到 90%+.
+
+### 边缘 case + 兜底
+
+- kernel clamp: 检查 getsockopt 返回值, capped 时 warn 一次
+- producer panic: `unwrap_or_else(|_| panic!(...))` 静态防御, 实际
+  recv_data 只返 Ok/Err 不 panic
+- consumer timeout / 客户端断开: drop rx → producer tx.send Err → 循环
+  正常退出, tunnel_reader 正确回收
+
 ## [v0.4.4-alpha.20] - WarmPool DEBUG 日志加当前状态快照 (2026-07-01)
 
 ### feat(pool): DEBUG 日志显示 idle / inflight / 即将过期 tunnel 数
