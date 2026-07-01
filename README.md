@@ -1,55 +1,66 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.2.3-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.4.4--alpha-10b981.svg)
 
-基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。在继承了 Python 版 `Mirage` (Shadow-TLS + Reality) 的极致隐藏特性的基础上，`Mirage-rs` 进行了彻底的底层重构，引入了真正的内核级流量加速与赛博朋克风格的监控面板。
+基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 内核级 eBPF 加速 + 内置 Neon Dashboard。
 
-## 🌟 核心特性 (v0.2.x 新纪元)
+## 核心特性
 
-- **无锁化异步架构 (Lock-free)**：全异步数据搬运，摆脱历史包袱。即便在千兆网络、过万连接的高压环境下，内存占用依旧极低，CPU 利用率接近理论极限。
-- **eBPF / XDP 内核级加速**（独占）：在网卡驱动层（XDP）直接挂载 eBPF 字节码，毫秒级捕获 DNS 数据包与特定的碎包流量。相比经过内核网络栈 (TCP/IP) 处理，**PPS 处理能力提升百倍**。
-- **动态自适应 Brutal 拥塞控制**（独占）：打破了传统 TCP Brutal 需要“猜”死板速率的困境！引入动态 BDP（带宽延迟乘积）与 RTT 探测计算，在网络通畅时保持极限压榨，在丢包抖动时平滑退避，实现“暴力”与“优雅”的完美结合。
-- **零延迟认证与伪装**：继承系列优良传统，首包完成身份验证并即刻开启 TLS 1.3 握手回放，实现 0 RTT 和与伪装站点绝对一致的响应时序特征。
-- **科幻级 Neon Pulse 可视化大屏**（独占）：引擎内置极具未来感的网页 Dashboard，以时间序列 Canvas 曲线为您描绘每一秒的 eBPF 命中率、下行吞吐量与连接动态。
+- **无锁化异步架构**: 全异步数据搬运, 千兆网络 + 上万连接场景下内存低占用, CPU 接近理论极限
+- **eBPF sockmap / XDP / sk_lookup**: 内核级零拷贝转发 + DNS 解析 + 透明代理 (Linux ≥ 5.10)
+- **TCP Brutal 拥塞控制**: 单条 TCP 死磕设定速率, 跨洲专线 / 高丢包链路吊打 BBR (设计哲学见下方专章)
+- **零延迟认证与伪装**: 首包完成身份验证 + TLS 1.3 握手回放, 时序特征 100% 复刻真实站点
+- **Neon Pulse Dashboard**: 内置网页大屏, Canvas 时序图展示 eBPF 命中率 / 吞吐量 / 连接动态
 
 ---
 
-## 🛠️ 安装与部署 (对小白绝对友好！)
+## 一键安装 (推荐)
 
-得益于 Rust 的特性，您**不需要安装任何依赖环境（不需要 Python，不需要 pip）**！我们通过强大的 CI/CD 流水线，为您准备好了能在任何系统上“点开即用”的静态二进制包。
+**alpha.4+ 起提供交互式安装向导 `install.sh`**, 会自动 (需 root):
+- 下载最新预编译二进制到 `/usr/local/bin/mirage-rs` (含 SHA256 双通道校验)
+- 探测公网 IP + 端口占用检测 + Brutal 内核模块
+- 生成服务端 / 客户端 config, 写 systemd unit `mirage-rs-{server,client}.service`
+- 交互配置 GUI 端口 / SNI 伪装 / brutal 速率 / geo 分流策略
+- 服务端配完可直接输出 `mirage://` 节点 URI (含二维码), 客户端安装时一步导入
 
-### 1. 下载预编译版本 (推荐)
-前往项目的 [Releases 页面](#)，下载对应您系统架构的压缩包：
-*   **推荐所有 Linux 用户**：`mirage-rs-amd64-musl` (静态链接, 不依赖宿主 glibc, 在所有现代 Linux 上"开箱即用")
-*   **gnu 动态链接版**：`mirage-rs-amd64` (要求 glibc ≥ 2.35, 即 Ubuntu 22.04+ / Debian 12+ / RHEL 9+)
-*   **ARM 架构** (树莓派 / 甲骨文 ARM 等)：`mirage-rs-arm64-musl`
-
-⚠️ **不论选哪个二进制, 你的内核版本必须 ≥ 5.10**。详见下方 [系统兼容性](#-系统兼容性) 矩阵。
-
-解压后，得到一个名为 `mirage` 的单文件可执行程序。
-
-### 2. 启动服务
-
-**作为客户端运行（本地机器/路由器）：**
 ```bash
-./mirage client -c config_client.json
+# 一键运行 (选 1=服务端 / 2=客户端 / 3=同机 / 4=卸载)
+curl -fsSL https://raw.githubusercontent.com/zdgt0226/Mirage-rs/main/install.sh | sudo bash
+# 或先 clone 再看内容:
+git clone https://github.com/zdgt0226/Mirage-rs.git && cd Mirage-rs
+sudo bash install.sh
 ```
 
-**作为服务端运行（墙外 VPS）：**
+装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`.
+
+## 手动部署 (熟悉用户)
+
+前往 [Releases](https://github.com/zdgt0226/Mirage-rs/releases) 拉最新二进制:
+- **`mirage-rs-amd64-musl`** — 推荐, 静态链接, 全 Linux 通吃
+- `mirage-rs-amd64` — gnu 动态链接, glibc ≥ 2.35 (Ubuntu 22.04+ / Debian 12+ / RHEL 9+)
+- `mirage-rs-arm64-musl` — ARM (树莓派 / 甲骨文云 / Ampere)
+
+每个 binary 都有配套 `.sha256`, 校验:
 ```bash
-./mirage server -c config_server.json
+sha256sum -c mirage-rs-amd64-musl.sha256
 ```
 
-*(想要在后台挂机运行？可以使用 `tmux` 或者配置 `systemd` 守护进程)*
+启动:
+```bash
+./mirage-rs-amd64-musl client -c /etc/mirage-rs/config_client.json
+./mirage-rs-amd64-musl server -c /etc/mirage-rs/config_server.json
+```
+
+⚠️ **内核必须 ≥ 5.10**, 详见下方 [系统兼容性](#系统兼容性)。
 
 ---
 
 ## 🖥️ 科幻大屏：Neon Pulse Dashboard
 
-我们为 Mirage-rs 打造了一个令人惊叹的前端 Web UI。
-只要在 `config_client.json` 中配置了 `gui_listen`（默认开启）：
+我们为 Mirage-rs 打造了一个前端 Web UI。
+只要在 config 里 `gui.enabled: true`, `gui.listen: "127.0.0.1:9090"` (install.sh 默认开启):
 
-1. 打开浏览器，访问：`http://127.0.0.1:9090`
+1. 打开浏览器, 访问: `http://127.0.0.1:9090`
 2. 您将看到一个炫酷的 **THE NEON PULSE** 面板。
 3. **功能一览**：
    - **历史流速全景图**：上下行速率、eBPF 硬件加速拦截量的 2 分钟滚动折线图，F5 刷新数据不会丢失。
@@ -61,130 +72,131 @@
 
 ---
 
-## ⚙️ 配置文件全解
+## 配置文件
 
-`mirage` 使用标准的 JSON 进行配置。
+`install.sh` 生成的 config 已经是可用状态, 手动配置需要注意 alpha.14+ 引入的新字段。
 
-### 客户端配置示例 (`config_client.json`)
+### 客户端配置示例 (`/etc/mirage-rs/config_client.json`)
 
 ```json
 {
-  "fakeip": {
-    "inet4_range": "198.18.0.0/15"
-  },
+  "schema_version": 1,
+  "log_level": "info",
+  "log_file": "/var/log/mirage-rs/client.log",
   "inbounds": [
     {
-      "type": "mixed", 
-      "listen": "127.0.0.1:1080"
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "port": 1080
     }
   ],
   "outbounds": [
     {
-      "tag": "my-tokyo-node",
       "type": "mirage",
-      "server": "198.51.100.1",
+      "tag": "proxy",
+      "server": "vps.example.com",
       "server_port": 443,
       "password": "your-strong-password",
-      "camouflage_host": "www.apple.com",
-      "pool_size": 20,
-      "brutal_rate_mbps": 8
-    },
-    {
-      "tag": "auto",
-      "type": "urltest",
-      "outbounds": ["my-tokyo-node"],
-      "interval": 60,
-      "tolerance": 50
-    },
-    {
-      "tag": "manual-pick",
-      "type": "selector",
-      "outbounds": ["my-tokyo-node", "auto"],
-      "default": "auto"
+      "camouflage_host": "www.cloudflare.com",
+      "pool_size": 50
     },
     { "tag": "direct", "type": "direct" },
     { "tag": "block", "type": "block" }
   ],
-  "route": {
-    "default": "auto",
-    "geo_alias": {
-      "ls-site": "loyalsoldier-site.dat",
-      "ls-ip":   "loyalsoldier-ip.dat"
-    },
+  "gui": {
+    "enabled": true,
+    "listen": "127.0.0.1:9090"
+  },
+  "routing": {
+    "default_outbound": "proxy",
     "rules": [
-      {
-        "geosite": ["ls-site:category-ads-all"],
-        "outbound": "block"
-      },
-      {
-        "geoip": ["ls-ip:cn"],
-        "outbound": "direct"
-      },
-      {
-        "domain_suffix": ["google.com", "youtube.com"],
-        "outbound": "auto"
-      }
+      { "outbound": "direct", "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] },
+      { "outbound": "direct", "geosite": ["cn", "apple-cn", "google-cn"] },
+      { "outbound": "direct", "geoip": ["cn"] }
     ]
   },
-  "gui_listen": "127.0.0.1:9090",
-  "dns": {
-    "listen": "127.0.0.1:5353",
-    "cn": "119.29.29.29",
-    "remote": "8.8.8.8:53"
-  },
   "tuning": {
-    "geodata_dir": ".geosite",
+    "ebpf_mode": "off",
+    "geodata_dir": "/etc/mirage-rs/geosite",
+    "geo_update_days": 7,
     "geo_sources": [
       {
-        "name": "loyalsoldier-site",
+        "name": "geosite",
         "kind": "geosite",
-        "url":  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
-        "via":  "direct"
+        "url":  "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
+        "via":  "proxy"
       },
       {
-        "name": "loyalsoldier-ip",
+        "name": "geoip",
         "kind": "geoip",
-        "url":  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-        "via":  "direct"
+        "url":  "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
+        "via":  "proxy"
       }
     ]
   }
 }
 ```
 
-#### 关键字段释疑（哪怕是小白也要看这里）：
-*   `fakeip`: **DNS 伪装响应**。开启后，代理引擎会拦截所有 DNS 请求并立即返回 `198.18.x.x` 网段的保留 IP，彻底根除 DNS 泄漏问题与 DNS 解析延迟。在遇到网络请求时，系统会自动将伪装 IP 还原成真实域名并进行路由分发。
-*   `inbounds`: **数据入口**。`mixed` 类型代表它同时支持 SOCKS5 和 HTTP 代理。您只需在操作系统的网络代理设置里填入 `127.0.0.1:1080` 即可。
-*   `outbounds`: **数据出口**。
-    *   `type: mirage` 就是您的境外 VPS 节点配置（旧版名称 `pyreality` 同样兼容，但强烈推荐改用 `mirage` 保持规范）。
-    *   `brutal_rate_mbps`: **单条 TCP 连接的目标速率** (不是总带宽). 推荐 8-10, 上限 10. 多连接并发时各自独立打满设定值, 设高会拖累总速度. 详见下方 "Brutal 设计哲学" 章节.
-    *   `type: urltest`: 自动测速组。把您的多个 VPS 节点 tag 塞进数组，它会自动帮你选延迟最低的用。**高阶细节**：我们的 urltest 并非无脑发送 HTTP 探针，而是**优先提取底层的 socket RTT（TCP 真实握手延迟）**进行决策，全程零开销！只有在连接池彻底闲置时，才会使用 HTTP probe 作为后备唤醒手段。
-    *   `type: selector`: 手动点选组。与 Neon Dashboard 面板无缝联动，您可以在网页上自由指定流量出口，不爽自动选路时可以直接接管。
-*   `route`: **交通警察**。如果访问的 IP 在 `cn` 库中，走 `direct` 直连；如果访问谷歌，走 `auto` 出国；广告全走 `block` 丢弃。
-    *   `geo_alias`: 给 .dat 文件起短名, 规则里写 `"ls-site:cn"` 自动解析成 `"loyalsoldier-site.dat:cn"`. 不起别名时规则里必须写完整文件名 (如 `"geosite": ["loyalsoldier-site.dat:cn"]`).
-*   `tuning.geo_sources` (v0.4.3+): **Geo 数据多源下载**. 替代旧的 `geosite_url` / `geoip_url` 单字段:
-    *   每项 `{name, kind, url, via}` 独立配置. 下载后保存为 `<name>.dat`, 由 `geodata_dir` 决定存放路径.
-    *   `kind`: `"geosite"` (域名规则) 或 `"geoip"` (IP CIDR 规则).
-    *   `via`: `"direct"` (默认, 直连下载) 或 `"proxy"` (走客户端本地 socks/mixed inbound). 国内服务器拉 GitHub 抽风时改 `"proxy"` 即可走代理出口.
-    *   ⚠️ `name` 必须在 geo_sources 内唯一, 否则启动直接 ERROR (避免不同 source 互相覆盖文件).
-*   `tuning.geo_update_days` (可选): Geo 文件更新检查间隔, 单位天, 默认 7.
-*   `tuning.ebpf_mode` (可选): eBPF 加载策略, 默认 `"auto"`. 三态:
-    *   `"auto"`: 跟 CLI 子命令走 — `mirage client` 启用, `mirage server` 跳过 (服务端 BPF 全部子系统都无价值)
-    *   `"force"`: 强制启用 (调试用, server 模式下也加载)
-    *   `"off"`: 强制不加载 (调试或最小化部署)
+#### 关键字段说明
 
-### 服务端配置示例 (`config_server.json`)
+- **`log_file`** (alpha.14+): 可选日志文件路径, 同时输出 stdout (journalctl) + 该文件. 不设保持老 stdout-only 行为
+- **`inbounds[]`**: 标准结构化 (数组), `type: mixed` 同时支持 SOCKS5 + HTTP
+- **`outbounds[]`**: `type: mirage` 是代理节点 (旧名 `pyreality` 已弃用)
+  - `pool_size`: WarmPool 上限 (默认 50). alpha.11+ 有自动 floor=10 保证突发无 wait build
+  - `brutal_rate_mbps` (可选): 客户端出站 brutal 速率. 默认不开 (0 或不写字段)
+- **`gui.enabled`** + **`gui.listen`**: alpha.4+ 结构化 (老的 `gui_listen` 单字段弃用)
+- **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` 等
+- **`tuning.ebpf_mode`**: `"auto"` / `"force"` / `"off"`. alpha.7 起 install.sh 客户端默认 `"off"` (BPF SockMap 直连转发有已知问题, 见 CHANGELOG alpha.7)
+- **`tuning.geo_sources[]`**: 多源 geo 数据下载 (v0.4.3+ 替代旧的 `geosite_url` / `geoip_url`)
+  - `via`: `"direct"` 或 `"proxy"`. **`"proxy"` 走客户端 mirage 出口拉 GitHub** — 大陆用户强烈推荐, `install.sh` 默认就是它
+  - alpha.14+ 自动 fallback: via=proxy 失败会自动重试 direct
+  - alpha.15+ 30s timeout + 空 body 拒收覆盖旧 .dat
+  - alpha.17+ 支持热更新: 改 config 加/删 geo_sources 秒生效不必 restart
+- **`tuning.geo_update_days`**: 更新间隔天数, 默认 7. alpha.18 起硬 clamp min=1 防 tight loop 打死 CPU
+
+### 服务端配置示例 (`/etc/mirage-rs/config_server.json`)
 
 ```json
 {
-  "listen_host": "0.0.0.0",
-  "listen_port": 443,
-  "password": "your-strong-password",
-  "camouflage_host": "www.apple.com",
-  "camouflage_port": 443
+  "schema_version": 1,
+  "log_level": "info",
+  "log_file": "/var/log/mirage-rs/server.log",
+  "inbounds": [
+    {
+      "type": "mirage_server",
+      "tag": "mirage-in",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "password": "your-strong-password",
+      "camouflage_host": "www.cloudflare.com",
+      "brutal_rate_mbps": 50
+    }
+  ],
+  "outbounds": [],
+  "gui": {
+    "enabled": true,
+    "listen": "127.0.0.1:9090"
+  },
+  "routing": {
+    "default_outbound": "direct",
+    "rules": []
+  },
+  "tuning": {
+    "geodata_dir": "/etc/mirage-rs/geosite"
+  }
 }
 ```
-*(就这么简短！保持密码和客户端一致，找一个干净的伪装站点即可。)*
+
+密码 + `camouflage_host` 必须跟客户端完全一致。`brutal_rate_mbps` 是服务端到客户端方向 (下载) 的 brutal 目标速率, 见下方 Brutal 章节。
+
+### 节点 URI 导出/导入 (alpha.4+)
+
+服务端 `install.sh` 配完自动输出:
+```
+mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>&brutal=<mbps>
+```
+保存到 `/etc/mirage-rs/node-export.txt` (chmod 600). 客户端 `install.sh` 选"粘贴节点导入", 直接一步填充 host / port / password / SNI. 装了 `qrencode` 还能出 UTF8 二维码方便手机拍照。
 
 ---
 
@@ -206,24 +218,33 @@ sudo modprobe tcp_brutal
 ```
 *提示：Mirage-rs 会自动检测内核是否有该模块，如果没有，会自动回退到默认的 BBR 或 Cubic，绝不崩溃。*
 
-### brutal_rate_mbps 的设计哲学 (看了再设值)
+### brutal_rate_mbps 的设计哲学 (v0.4.4-alpha.10+ 新解, 请务必看)
 
-**Brutal CC 是 ★ 单条 TCP ★ 跑满目标速率的拥塞控制**, 跟 BBR / Cubic 随网络情况自适应不同 — 它不主动让步, 设置多少就发多少, 直接对抗高延迟/丢包链路的概率性退让.
+**Brutal CC 死磕设定速率, 不响应丢包**, 适合"高 RTT + 低丢包"的**跨洲专线 / 移动 4G/5G 无线**链路 — 这种链路上 BBR/Cubic 见丢包就退让, brutal 反而能吃满。
 
-但 Mirage 的 WarmPool 会同时持有多条 brutal 连接, 它们互相不知道彼此存在, **各自独立打满设定值**. 因此设值哲学跟"链路总带宽"无关:
+**关键设计** (alpha.8+ 修正):
+- 服务端在 **listener socket 预设** `TCP_CONGESTION = brutal`, accept 出来的子 socket 从 SYN-ACK 起就跑 brutal (kernel pacing 状态干净)
+- accepted socket 只补 `TCP_BRUTAL_PARAMS` (rate + cwnd_gain=15)
+- 无 autofallback (alpha.9+): brutal 顶着丢包硬跑到底, 跟 Python POC 行为一致
 
-| 单连接 rate | 50 条并发总需求 | 1G 链路效果 | 100M 链路效果 |
-|---|---|---|---|
-| **8 Mbps (推荐)** | 400 Mbps | 充足缓冲 | 高并发场景接近上限, 日常单流稳定 |
-| 10 Mbps (上限) | 500 Mbps | 仍有余量 | 多并发可能进入拥塞边缘 |
-| 50 Mbps (危险) | 2.5 Gbps | 严重过载 | 完全拥塞崩溃 |
-| 100 Mbps (错误) | 5 Gbps | 灾难 | 灾难 |
+**速率取值**:
 
-**推荐**: 不分 100M / 1G 链路, 一律配 **8-10 Mbps**。**上限红线 10 Mbps**。
+| 场景 | 单连接 rate 建议 | 说明 |
+|---|---|---|
+| 100M 出口 (家宽) | 30~50 Mbps | 链路带宽的 30-50% |
+| 1G 出口 (VPS) | 300~500 Mbps | 链路带宽的 30-50% |
+| 极限吃满 (跨洲专线) | 链路带宽的 1.5-2 倍 | Hysteria2 派设值哲学, 让 brutal 有余量填满信道 |
+| 关闭 brutal | `0` 或不设 | 系统默认 BBR, 适合低 RTT 高丢包的 CDN 链路 |
 
-原理: 单流场景 (一个大文件下载, 一段视频) 单条 brutal 连接 8 Mbps 已经稳得很; 多流场景 (一堆并发请求) brutal 不会主动让步, 必须靠 ★ 单连接低 rate ★ 留出多连接共用空间, 而不是靠"我有 1G 链路就把每条设到 100 Mbps"那种直觉算法.
+**为什么单连接可以设这么高**? WarmPool 里同一时刻真正在传数据的通常只有 1-3 条 tunnel (浏览器每 host 6-8 并发), 空闲 tunnel 不占用带宽. 所以"单条 × pool_size 总和"这个公式**不成立**, brutal 的单条 rate 可以直接对齐链路带宽。
 
-> 不建议超过 10 Mbps. 超过会拖累整体速度而不是提升, 因为多连接并发总需求超出链路 → 持续丢包 → Brutal 不响应丢包继续发 → 路径上的队列填满 → 全部连接都被拖累.
+**如果发现慢**:
+1. 用 `ss -tipn 'sport = :你的端口'` 看 `retrans` 比例
+2. `retrans < 5%` → 链路适合 brutal, rate 可以往上加
+3. `retrans > 15%` → 链路不适合 brutal (低 RTT 高丢包 CDN 常见), 把 rate 设 0 关掉走 BBR 反而更快
+4. 观察 `pacing_rate` 是否达到设定, `delivery_rate` 是否接近 `pacing_rate`
+
+alpha.5-11 的排错长征见 [CHANGELOG](CHANGELOG.md), 大约 8 个 alpha 版本才把这套调准。
 
 ### eBPF 性能巨兽开关（仅限 Linux 客户端/网关）
 我们在 `v0.2.x` 为核心路由链路植入了内核态网卡劫持。
@@ -296,6 +317,38 @@ zcat /proc/config.gz | grep -E 'CGROUP_BPF|BPF_SYSCALL|DEBUG_INFO_BTF|BPF_STREAM
 ```
 
 如果上面输出有 `=n` 或没有, 你需要从 alpine-aports 源码重编内核, 或换用 `daeuniverse/dae` 仓库提供的预编译 Alpine 内核包。
+
+---
+
+## 卸载
+
+`install.sh` 主菜单第 4 项 "卸载 (Uninstall)":
+- 停止 + 禁用 `mirage-rs-server` / `mirage-rs-client` systemd 服务 (同时清老名字 `mirage-server` / `mirage-client` 兼容 alpha.8 之前的部署)
+- 删除 unit 文件 + 二进制 `/usr/local/bin/mirage-rs`
+- 交互询问是否删 `/var/log/mirage-rs` (默认 y) / `/etc/mirage-rs` config (默认 n, 重装可复用) / `/var/lib/mirage-rs` / `/etc/sysctl.d/99-mirage.conf`
+
+```bash
+sudo bash install.sh
+# 选 4 → 全自动清理
+```
+
+## 版本演进
+
+alpha.4 → 现在 (alpha.18) 的重要里程碑:
+
+| 版本 | 关键改动 |
+|---|---|
+| alpha.4-9 | Brutal 排错长征 (cwnd_gain / listener 时序 / autofallback / cwnd_gain 15) |
+| alpha.7 | eBPF SockMap 直连转发临时禁用 (待根治) |
+| alpha.10-11 | WarmPool 反馈算法修正 (cwnd_gain=15 对齐 POC, floor 提到 10) |
+| alpha.12-13 | 初始 target 修正, TIME_SYNC 降噪 |
+| alpha.14 | log_file 生效, geo 完整性校验, geo via proxy fallback |
+| alpha.15 | geo 30s timeout + 空 body 拒收覆盖 |
+| alpha.16 | reload log 显示纠正, ArcSwap guard 提前释放 |
+| alpha.17 | 4 处外部审计纰漏 (含 geo_updater 完整热更新架构 UpdaterHandle) |
+| alpha.18 | tuning=None 边界 + update_days 三层 clamp 防 tight loop |
+
+完整清单见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 

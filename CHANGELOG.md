@@ -1,5 +1,38 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.19] - 清理死字段 + README 大更新 (2026-07-01)
+
+### chore(config): 清理 TuningConfig 里两个 dead field
+
+- `decision_cache_max_entries: Option<usize>` — 定义了但**从没被任何代码路径引用**
+- `tcp_keepalive: Option<u64>` — 同上, dead field
+
+老用户 config 里如果写了这两个字段, serde 默认忽略未知字段, 不会
+break 现有部署. 删掉是为了避免用户以为配了这两个就有效果, 属于 schema
+诚实性修正.
+
+### docs(README): 全面更新到 v0.4.4-alpha.18 现状
+
+原 README 大量过时:
+- 版本 badge 还是 v0.2.3
+- 配置示例用老的 `listen_host` / `gui_listen` 单字段
+- brutal 推荐值 "8-10 Mbps 上限 10" 是 alpha.4 时代的错误理解, alpha.10+
+  实测正确值应该是"链路带宽 30-50%"
+- 缺 install.sh / log_file / 节点 URI 导出 / 卸载 章节
+- 缺"版本演进"章节让用户快速把握 alpha 系列变化
+
+改动:
+- 版本 badge 改 v0.4.4-alpha
+- 装机流程首推 install.sh, 手动部署放次位
+- 配置示例改成 install.sh 实际输出的结构 (schema_version + inbounds[]
+  + gui 结构化 + tuning.ebpf_mode = "off" + via=proxy 等)
+- brutal 章节按 alpha.5-11 苦学出的新哲学重写 (30-50% 链路带宽 /
+  跨洲专线可到 150-200%, `ss -tipn` 观察 retrans 决策 rate)
+- 加节点 URI 导出/导入 + 卸载章节
+- 结尾加 alpha 版本演进表
+
+保持原 README 结构 + Neon Dashboard / eBPF / Alpine 兼容性等章节不动.
+
 ## [v0.4.4-alpha.18] - alpha.17 遗留边界修复 (tuning 删除 + update_days=0) (2026-07-01)
 
 外部审计 + 自查发现 alpha.17 方案 C 的两个边界:

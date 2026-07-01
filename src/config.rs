@@ -214,8 +214,9 @@ pub struct ApiConfig {
 #[derive(Debug, Deserialize)]
 pub struct TuningConfig {
     pub geodata_dir: Option<String>,
-    pub decision_cache_max_entries: Option<usize>,
-    pub tcp_keepalive: Option<u64>,
+    // decision_cache_max_entries + tcp_keepalive 在 alpha.18 删除: 定义但从
+    // 未在任何代码路径引用, 保留只会误导用户以为配置生效. serde 遇未知字段
+    // 默认忽略, 不会 break 已部署 config 文件.
     /// eBPF 加载策略. 默认 Auto (根据 CLI 子命令决定):
     /// - `auto` (默认): client 模式启用, server 模式跳过. 服务端 BPF 全部子系统
     ///   都没价值 — sockmap splice 要明文流 (服务端入站是加密的, 必须 userspace
