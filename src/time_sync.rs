@@ -45,10 +45,20 @@ pub fn set_offset_from_server_time(server_time: u64) {
     }
 
     let old = TIME_OFFSET.swap(offset, Ordering::Relaxed);
-    if old != offset {
+    let delta = offset - old;
+    // 只在 |Δ| ≥ SIGNIFICANT_DELTA 时打 INFO. 系统时钟正常 jitter 通常 ≤ 1s,
+    // 每条 WarmPool tunnel 建立就 flip ±1s 会淹没 log. 真正的时钟不同步 (NTP
+    // 缺失 / VM 时钟漂移) 通常一次性纠 ≥ 3s, 用户需要看到.
+    const SIGNIFICANT_DELTA: i64 = 3;
+    if delta.abs() >= SIGNIFICANT_DELTA {
         tracing::info!(
             "TIME_SYNC: offset updated {}s → {}s (Δ {}s) from server's encrypted handshake",
-            old, offset, offset - old
+            old, offset, delta
+        );
+    } else if delta != 0 {
+        tracing::debug!(
+            "TIME_SYNC: minor drift {}s → {}s (Δ {}s, < {}s threshold)",
+            old, offset, delta, SIGNIFICANT_DELTA
         );
     } else {
         tracing::debug!("TIME_SYNC: offset maintained at {}s", offset);

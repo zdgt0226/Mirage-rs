@@ -1,5 +1,30 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.13] - TIME_SYNC 日志降噪 (Issue 1) (2026-07-01)
+
+### fix(time_sync): |Δ| < 3s 的小抖动降到 DEBUG 级
+
+Issue 1 修复. 之前 `set_offset_from_server_time` 只要 old != offset
+就打 INFO, 但客户端系统时钟正常 jitter 通常 ±1s, 每条 WarmPool tunnel
+建立都触发一次:
+
+```
+INFO TIME_SYNC: offset updated 0s → -1s (Δ -1s) from server...
+INFO TIME_SYNC: offset updated -1s → 0s (Δ 1s) from server...
+INFO TIME_SYNC: offset updated 0s → -1s (Δ -1s) from server...
+```
+
+pool_size=10 时启动就 10 行, 之后每次 tunnel refresh 又来一次, INFO
+级别用户被淹没却看不到有意义的时钟事件.
+
+修改 `src/time_sync.rs::set_offset_from_server_time`:
+- `SIGNIFICANT_DELTA = 3` 秒阈值
+- `|Δ| ≥ 3s`: INFO (真实时钟不同步, 用户需要知道)
+- `0 < |Δ| < 3s`: DEBUG "minor drift" (小抖动, 想看细节可以调 log 级)
+- `Δ == 0`: DEBUG "offset maintained" (保持原语义)
+
+不改变 offset 存储行为, 7 项 time_sync 单测全过.
+
 ## [v0.4.4-alpha.12] - WarmPool 初始 target 修复 (alpha.11 遗漏) (2026-07-01)
 
 ### fix(pool): 初始 target 也应用 MIN_TARGET_FLOOR (alpha.11 遗漏)
