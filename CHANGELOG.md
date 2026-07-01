@@ -1,5 +1,57 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.24] - BufWriter 容量算错 22B×N 加密开销 (外部审计) (2026-07-01)
+
+### fix(crypto): WRITER_BUF_CAPACITY 65536 → 68 * 1024 (69632)
+
+外部审计精确定位: alpha.23 `WRITER_BUF_CAPACITY = 65536` **漏算了每
+帧的 22 字节 AEAD/TLS 封装 overhead**, 满载时 syscall 不聚合.
+
+### 数理推演 (逐位复核 aead.rs 源码)
+
+单帧密文封装:
+- 5 字节 TLS Header `[0x17, 0x03, 0x03, len_hi, len_lo]`
+- chunk_len 字节明文
+- 1 字节 inner content type `0x17` (encrypted with tag)
+- 16 字节 Poly1305 tag (append after encrypt)
+
+每帧 overhead: **22 字节**.
+
+### Worst case 演练
+
+上游 `tcp_relay::buf = vec![0u8; 65536]`, greedy 填满 65536 明文
+后送 `send_data(65536)`. send_data 内部 chunk size 是 rng 三分桶
+(50%=16384, 35%=8192, 15%=4096):
+
+- 4 帧 16KB: 4 × 16406 = 65624 bytes (外部审计的例子)
+- 16 帧 4KB (worst): 16 × 4118 = **65888 bytes** (更极端)
+
+老 65536 容量:
+- 前 3 帧 16KB 后 buffer 49218 已用
+- 第 4 帧 16406 加入: 65624 > 65536 → BufWriter **flush 前 49218 一次
+  syscall**, 剩 16406 buffer
+- 末尾 `flush()`: 剩 16406 syscall 二次
+
+**满载退化为 2 次 syscall**, 原本设计目标 1 次 syscall 打空.
+
+### 修改
+
+`const WRITER_BUF_CAPACITY: usize = 68 * 1024` (69632 bytes).
+
+覆盖 65888 worst case + 3744 bytes headroom (未来提高 tcp_relay buf
+到 65KB+ 也不必再改).
+
+### 自审: 是否其他 send_data 调用点会超 65536
+
+全项目 grep 确认:
+- `src/proxy/mirage_server/tcp_relay.rs`: buf 65536 ✓ (主要用例)
+- `src/proxy/handler.rs` upload: buf 16384 ✓ 远小
+- `src/proxy/udp_relay.rs` (client): 小 UDP 帧 ✓
+- `src/proxy/mirage_server/udp_relay.rs`: 小 UDP 包 ✓
+- healthcheck / dns / control: 小控制帧 ✓
+
+无其他大 send_data 输入, 68KB BufWriter 全覆盖.
+
 ## [v0.4.4-alpha.23] - BufWriter 内嵌 + server 贪婪 try_read + 客户端撤 mpsc (2026-07-01)
 
 外部审计三方向剩余两项落地, 加上 alpha.21 客户端 mpsc 方案的撤回.

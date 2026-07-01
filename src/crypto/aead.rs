@@ -4,11 +4,22 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 
-/// CryptoWriter 内嵌 BufWriter 容量 (方向一 Part 2). 64KB = 4× MAX_RECORD_SIZE:
-/// send_data 处理 64KB plaintext 时内部拆 4 个 16KB 帧, 4× write_all 全部
-/// 攒在 BufWriter 里, 最后 flush() 一次 syscall 送出 64KB. 老代码是 4 次
-/// 独立 syscall + TCP_NODELAY 各自成小段. 视频下载单方向 4× syscall 缩减.
-const WRITER_BUF_CAPACITY: usize = 65536;
+/// CryptoWriter 内嵌 BufWriter 容量 (方向一 Part 2).
+///
+/// 上游 tcp_relay `buf = vec![0u8; 65536]` 是本 CryptoWriter 单次 send_data
+/// 接收的最大 plaintext. 加密封装单帧开销 = 5B TLS header + 1B inner
+/// content type + 16B Poly1305 tag = 22 字节.
+///
+/// alpha.23 曾用 64KB (65536), **漏算了这 22 字节 × N 帧 overhead**, 满载
+/// 时最后一帧塞不进导致 2 次 syscall (外部审计发现). 精确计算 worst case:
+///
+/// - alpha.23 帧 size 分桶 rng (50%=16384, 35%=8192, 15%=4096)
+/// - 65536 plaintext 全 4KB chunk → 16 帧, 16 × 4118 = **65888 bytes**
+/// - 65536 plaintext 全 16KB chunk → 4 帧, 4 × 16406 = 65624 bytes
+///
+/// 68 KB = 69632 覆盖 worst case (65888) 还有 3744 headroom, 未来提高 tcp_relay
+/// buf size 也有小 buffer 缓冲.
+const WRITER_BUF_CAPACITY: usize = 68 * 1024;
 
 pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
