@@ -1,5 +1,26 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.12] - WarmPool 初始 target 修复 (alpha.11 遗漏) (2026-07-01)
+
+### fix(pool): 初始 target 也应用 MIN_TARGET_FLOOR (alpha.11 遗漏)
+
+alpha.11 把 decide_new_target 的缩容底线从 2 提到 10, 但**忘了改初始
+化**. 用户实测日志:
+
+```
+02:23:43  WarmPool Manager: target 2 → 3 (gets=2, wait=2 [100.0%])
+```
+
+初始 target=2 (硬编码), 启动后前 2 个请求就 wait build, decide_new_target
+5s 后才发现要扩, 每周期 +1 慢慢爬到 floor=10. 启动前几秒仍然卡.
+
+修改 `src/proxy/pool.rs:331`:
+- 之前: `AtomicUsize::new(2)`
+- 现在: `AtomicUsize::new(MIN_TARGET_FLOOR.min(cfg.pool_size))`
+
+现在客户端启动瞬间就有 10 (或 pool_size, 取较小者) 条常温 tunnel, 突发
+真正无 wait.
+
 ## [v0.4.4-alpha.11] - WarmPool 缩容底线 2 → 10 (突发无 wait) (2026-07-01)
 
 ### fix(pool): 提高 idle 期最低 tunnel 数, 解决突发并发 66% wait build

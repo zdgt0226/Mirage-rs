@@ -328,7 +328,11 @@ impl WarmPool {
             metrics: metrics.clone(),
         };
 
-        let target_size = Arc::new(AtomicUsize::new(2)); // 默认闲时保持2个长连接
+        // 初始 target = floor (跟 decide_new_target 的缩容底线一致), 保证客户端
+        // 启动瞬间就能承接常见浏览器并发, 突发不用 wait build. floor 定义见
+        // MIN_TARGET_FLOOR (=10). pool_size < floor 时降到 pool_size.
+        let initial_target = MIN_TARGET_FLOOR.min(cfg.pool_size);
+        let target_size = Arc::new(AtomicUsize::new(initial_target));
         let in_flight = Arc::new(AtomicUsize::new(0));
 
         // 弹性监控协程 (Manager Task) — 反馈式 v0.4.2+
