@@ -1,5 +1,74 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.1] - eBPF SockMap 零拷贝直连修复 (P0 长期未解 bug 根治) (2026-07-02)
+
+### fix(ebpf): register_splice 顺序竞态修复
+
+**背景**: alpha.7 (2026-06-24) 起 install.sh 客户端默认 `"ebpf_mode":
+"off"` 因为发现 SockMap 直连零拷贝转发不工作: `register_splice()` 声
+明"activated"但数据永远不流动, 浏览器超时。alpha.7 只是临时禁用整
+个 BPF 客户端功能作为 workaround, 真正 root cause 未修. 影响:
+- 直连 (.cn 域名) 走用户态 Tokio, 失去零拷贝加速
+- 客户端 sockops RTT 反馈不可用, 动态 brutal CC 无法启用
+- XDP DNS + sk_lookup 透明代理全部功能被停用
+
+### 根因诊断
+
+`src/proxy/handler.rs::proxy_tcp_target` 的 Direct 分支老顺序:
+```
+1. target_stream.write_all(&initial_payload)  ← 发到 target
+2. (0-N ms 时间窗)                             ← 竞态窗口
+3. register_splice(local, target_stream)      ← sk_psock 才安装到 target RX
+4. epoll wait EPOLLRDHUP                      ← 只等 close
+```
+
+target (小 HTTP 请求场景, 如 .cn 门户站) 通常在 < 1ms 回响应, 响应
+到达 target socket RX 队列时 sk_psock 还没安装, 数据被跳过 verdict
+拦截. 然后 sk_psock 装好后已经在队列里的这段数据无人读 (handler
+仅 epoll wait 不做 recv), 就永久卡在 kernel RX buffer 里. 客户端超
+时后连接断开.
+
+### 修复
+
+`src/proxy/handler.rs:270-306` 交换 register_splice 和 write_all 顺序:
+```
+1. register_splice(local, target_stream)  ← 先装 sk_psock
+2. target_stream.write_all(&initial_payload)  ← 用 target TX 路径, sk_psock 不拦
+3. epoll wait                              ← target 响应到 RX 时 sk_psock 就位, verdict 立即 redirect
+```
+
+**为什么 write_all 在 register_splice 后仍能工作**: sk_skb/stream_verdict
+BPF 程序只拦截 RX (received data) 路径, TX (send/write) 完全不受影响.
+Tokio 的 `write_all` 走 tcp_sendmsg 直接送 kernel TX buffer, 与
+sk_psock 的 RX 拦截正交.
+
+### install.sh: 客户端 config 默认 ebpf_mode 改回 auto
+
+`install.sh:754` 从 `"off"` 改回 `"auto"` (alpha.7 之前的原值). server
+仍自动 skip BPF, 只有 client 启用. 新装用户直接享受零拷贝直连.
+
+老用户 (config 里手动 `"ebpf_mode": "off"`) 升级后需要手动改成
+`"auto"` 才生效:
+```bash
+sed -i 's/"ebpf_mode": "off"/"ebpf_mode": "auto"/' /etc/mirage-rs/config_client.json
+sudo systemctl restart mirage-rs-client
+```
+
+或重跑 `install.sh` 让脚本重新生成 config.
+
+### 影响 (再启用后恢复的功能)
+
+- ★ 直连零拷贝 (Router 命中 direct outbound 时 kernel-side splice)
+- sockops RTT_CB 收集 → 动态 brutal CC 速率调节 (客户端出站)
+- XDP DNS 高速解析
+- sk_lookup 透明代理 (kernel ≥ 5.9)
+
+### 版本序列变化
+
+v0.4.4-alpha (25 个 alpha 版本, 修了海量 bug + IO 性能) → **v0.4.5-alpha.1**
+新序列开始, 主题是"eBPF 全栈重启用". 后续 alpha 若稳可能直接发 v0.4.5
+stable.
+
 ## [v0.4.4-alpha.25] - 撤回 alpha.21 的显式 SO_SNDBUF/SO_RCVBUF (7× 回归元凶) (2026-07-01)
 
 用户实测 alpha.21+ 相比 alpha.20 出现 **7× 吞吐回归** (Cloudflare 15

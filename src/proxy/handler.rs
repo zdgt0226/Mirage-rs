@@ -259,14 +259,24 @@ pub async fn proxy_tcp_target(
                     return;
                 }
             };
-            
-            if !initial_payload.is_empty() {
-                if let Err(e) = target_stream.write_all(&initial_payload).await {
-                    error!("Failed to send initial payload to direct target: {:?}", e);
-                    return;
-                }
-            }
-            
+
+            // v0.4.5-alpha.1 修复 SockMap 竞态 bug (alpha.7 起 install.sh 默认关
+            // ebpf 就是因为这个):
+            //
+            // 老顺序: 1) write_all(initial_payload) → target
+            //         2) register_splice (sk_psock 才安装到 target 的 RX)
+            //         → 如果 target 极速回响应 (< 1ms, 常见于小 HTTP), 数据
+            //           在 sk_psock 安装前到达 target RX 队列, 之后 sk_psock
+            //           拦不到这段已经在队列里的数据. handler 只 epoll wait
+            //           EPOLLRDHUP 不读 → 数据永远卡住 → 客户端超时.
+            //
+            // 新顺序: 1) register_splice (先安装 sk_psock)
+            //         2) write_all(initial_payload) 用 target 的 TX 路径
+            //         → target 响应到达 RX 时 sk_psock 已就位, 立即 verdict
+            //           → redirect 到 local socket → 浏览器收到.
+            //
+            // sk_skb/stream_verdict 只拦 RX, TX (send/write) 完全不影响, Tokio
+            // write_all 在 register_splice 后仍正常工作.
             let mut ebpf_spliced = false;
             if let Some(engine) = ebpf_engine {
                 let mut lock = engine.lock().await;
@@ -278,6 +288,13 @@ pub async fn proxy_tcp_target(
                     Err(e) => {
                         debug!("eBPF splicing failed: {}. Falling back to userspace forwarding.", e);
                     }
+                }
+            }
+
+            if !initial_payload.is_empty() {
+                if let Err(e) = target_stream.write_all(&initial_payload).await {
+                    error!("Failed to send initial payload to direct target: {:?}", e);
+                    return;
                 }
             }
 
