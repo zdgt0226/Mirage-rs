@@ -36,20 +36,11 @@ pub(super) async fn handle_tcp_relay(
     // 在 split 前抓 FD: split 后两个 OwnedHalf 不再共享 as_raw_fd 接口
     let upstream_fd = upstream.as_raw_fd();
 
-    // 显式设 SO_SNDBUF + SO_RCVBUF = 8MB. 老版本靠 kernel auto-tune, 长
-    // BDP 链路 (200ms RTT × 40Mbps ≈ 1MB) 起手 buffer 太小会导致 rwnd_limited
-    // 卡住 server → client 转发. 手动置大值 kernel 会 disable auto-tune,
-    // 直接用固定 buffer. 上限由 install.sh 的 optimize_sysctl 设的
-    // net.core.{rmem,wmem}_max=8388608 决定, 到不了 8MB 就 warn 一次.
-    unsafe {
-        let val: libc::c_int = 8 * 1024 * 1024;
-        libc::setsockopt(upstream_fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-        libc::setsockopt(upstream_fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-            &val as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-    }
+    // alpha.25 撤回 alpha.21 的显式 SO_SNDBUF/SO_RCVBUF setsockopt:
+    // 手动设 buffer size 会 disable Linux TCP window auto-tuning, 固定
+    // 8MB 窗口在高丢包链路上反而造成 bufferbloat (8MB in-flight → loss
+    // 后大量重传排队 → 拖垮吞吐). 用户实测 alpha.22 就慢, 定位到这段
+    // sockopt 是元凶. 让 kernel auto-tune 自己按 BDP + 丢包动态调节.
 
     if let Some(payload) = initial_payload {
         if !payload.is_empty() {

@@ -491,54 +491,23 @@ impl WarmPool {
         let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
         let stream = TcpStream::connect(&addr).await?;
         
-        // --- 性能优化：TCP 收发缓冲区 + Brutal 拥塞控制 ---
+        // --- Brutal 拥塞控制 ---
+        //
+        // alpha.25 撤回 alpha.21 加的显式 SO_SNDBUF/SO_RCVBUF = 8MB.
+        // 手动固定 buffer size 会 disable Linux TCP auto-tuning, 反而在高
+        // 丢包链路 (7% loss) 上造成 bufferbloat, in-flight 太多导致重传
+        // 排队拖垮吞吐. 用户实测 alpha.22 (仅带这段 sockopt) 就从 15 Mbps
+        // 掉到 2 Mbps, 7× 回归元凶. 让 kernel auto-tune 自适应 BDP+丢包.
         use std::os::unix::io::AsRawFd;
         let fd = stream.as_raw_fd();
-        unsafe {
-            // SO_SNDBUF: 客户端 → 服务端方向 (HTTP 请求 / ACK). 一般较小,
-            // 但保留大值不亏, kernel 只在真需要时分配.
-            // SO_RCVBUF: 服务端 → 客户端方向 (视频下载). 长 BDP 链路 (200ms
-            // × 40 Mbps ≈ 1MB) 起手 buffer 太小会让 advertised window 撑
-            // 不开, 服务端 rwnd_limited 高. auto-tune 慢启动, 显式设大值
-            // 让 kernel 直接给固定 buffer.
-            let buf_size: libc::c_int = 8 * 1024 * 1024;
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-                &buf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t);
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-                &buf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t);
 
-            // 检查 kernel 有没有 clamp 到 wmem_max/rmem_max
-            let mut actual_snd: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
-                &mut actual_snd as *mut _ as *mut libc::c_void, &mut len);
-            let mut actual_rcv: libc::c_int = 0;
-            let mut len2 = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
-                &mut actual_rcv as *mut _ as *mut libc::c_void, &mut len2);
-
-            if actual_snd < buf_size * 2 || actual_rcv < buf_size * 2 {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static BUF_WARNED: AtomicBool = AtomicBool::new(false);
-                if !BUF_WARNED.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "Socket buffer capped: SNDBUF={} RCVBUF={} (requested {}×2). \
-                         Run `sysctl -w net.core.wmem_max=8388608 net.core.rmem_max=8388608` \
-                         for full brutal + high-BDP performance.",
-                        actual_snd, actual_rcv, buf_size);
-                }
-            }
-            
-            // 3. Brutal 拥塞控制 (客户端 → 服务端方向, 控制上传速度).
-            // 默认关闭: 仅当 config 显式配了 brutal_rate_mbps 才启用.
-            // 动态速率调节 (基于 BPF RTT 反馈) 在另一处循环里维护, 见
-            // BrutalState::current_rate 的所有 store 调用点.
-            if brutal_state.configured_rate.is_some() {
-                let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
-                crate::proxy::brutal::apply_brutal(fd, current_rate);
-            }
+        // Brutal 拥塞控制 (客户端 → 服务端方向, 控制上传速度).
+        // 默认关闭: 仅当 config 显式配了 brutal_rate_mbps 才启用.
+        // 动态速率调节 (基于 BPF RTT 反馈) 在另一处循环里维护, 见
+        // BrutalState::current_rate 的所有 store 调用点.
+        if brutal_state.configured_rate.is_some() {
+            let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
+            crate::proxy::brutal::apply_brutal(fd, current_rate);
         }
         // ------------------------------------------------
         

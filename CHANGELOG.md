@@ -1,5 +1,43 @@
 # Changelog - Mirage-rs
 
+## [v0.4.4-alpha.25] - 撤回 alpha.21 的显式 SO_SNDBUF/SO_RCVBUF (7× 回归元凶) (2026-07-01)
+
+用户实测 alpha.21+ 相比 alpha.20 出现 **7× 吞吐回归** (Cloudflare 15
+Mbps → 2 Mbps). 二分定位: alpha.22 已慢, 罪魁在 alpha.21 加的显式
+`setsockopt(SO_SNDBUF/SO_RCVBUF = 8MB)`.
+
+### 根因
+
+Linux 上手动 `setsockopt(SO_SNDBUF/SO_RCVBUF)` 会**disable TCP window
+auto-tuning**. auto-tune 会根据实际 BDP + 观测丢包动态调节窗口, 是
+现代 Linux 的默认 (通常表现最优). 手动固定 8MB 反而在**高丢包链路**
+(用户 iperf3 测出 7% 丢包) 造成 bufferbloat:
+
+- 8MB 窗口 → TCP 允许 8MB in-flight
+- 高丢包 → 大量重传排队在 8MB buffer 里
+- BBR/brutal 都被拖垮, 有效吞吐掉 7×
+
+alpha.20 没有这段代码, kernel auto-tune 智能调节, 因此稳定 15 Mbps.
+
+### 修改
+
+三处 socket 全撤回:
+- `src/proxy/mirage_server/mod.rs`: server accept socket (server→client 方向)
+- `src/proxy/mirage_server/tcp_relay.rs`: server upstream socket (server←YouTube)
+- `src/proxy/pool.rs`: client outbound socket (client←server)
+
+保留 alpha.21-24 的其他改动:
+- server 读缓冲 16→64 KB (无副作用)
+- alpha.22 header+body 合并 write_all (纯优化)
+- alpha.23 CryptoWriter BufWriter + greedy try_read + 撤 mpsc
+- alpha.24 BufWriter 容量 68KB 修算
+
+### 教训
+
+"手动置大值 disable auto-tune" 这种"性能优化"在**理论上正确, 实际上
+灾难**. Linux TCP auto-tuning 是几十年优化沉淀的成果, 手动覆盖需要
+非常精确的针对场景分析, 通用场景一律不动最好.
+
 ## [v0.4.4-alpha.24] - BufWriter 容量算错 22B×N 加密开销 (外部审计) (2026-07-01)
 
 ### fix(crypto): WRITER_BUF_CAPACITY 65536 → 68 * 1024 (69632)
