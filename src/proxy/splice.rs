@@ -22,7 +22,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::io::Interest;
 use tokio::net::TcpStream;
 
@@ -64,6 +64,10 @@ impl Pipe {
 }
 
 fn pipe_pool() -> &'static Mutex<VecDeque<Pipe>> {
+    // TODO(perf): 若火焰图显示 Mutex::lock 占 CPU > 1% (估计需 50K+ conn/sec 且
+    // 32+ 核并发), 换 crossbeam_queue::ArrayQueue 无锁池化. 当前锁持有 ~30ns vs
+    // 工作时间 ms 级, 竞争概率 ≈ 0, 家用/SOHO/SME 网关不换也罢. dae 用 Go
+    // buffered channel (底层 mutex+condvar) 生产验证过不是瓶颈.
     static POOL: OnceLock<Mutex<VecDeque<Pipe>>> = OnceLock::new();
     POOL.get_or_init(|| Mutex::new(VecDeque::with_capacity(POOL_CAPACITY)))
 }
@@ -103,27 +107,34 @@ pub fn pool_stats() -> (u64, u64, usize) {
 }
 
 /// 双向共享的活动时间戳. 任一方向 splice 成功就 touch(), watchdog 只读它判断
-/// 是否 idle. 用 AtomicU64 (epoch 秒) 而不是 Mutex<Instant>, 因为热路径 (每次
-/// splice 后) 会 touch, 无锁最省事.
+/// 是否 idle. 用 AtomicU64 (自进程启动后单调递增秒) 而不是 Mutex<Instant>,
+/// 因为热路径 (每次 splice 后) 会 touch, 无锁最省事.
+///
+/// alpha.6: 从 SystemTime epoch 换成 Instant 单调时钟 (Linux CLOCK_MONOTONIC).
+/// 免疫 NTP 前跳误杀 — 之前用 SystemTime, 虚拟机 RTC 不准 + NTP 突然 +30 min
+/// 会让所有连接瞬间被 watchdog 报 idle. Instant 是单调时钟不会前跳.
+/// (副作用: Linux CLOCK_MONOTONIC 不计 suspend 时长, VM 从 suspend 恢复后
+/// 连接被视为"刚活跃过", 第一个请求正常, 之后 15 min 才淘汰. 合理.)
 struct ActivityTracker(AtomicU64);
 
 impl ActivityTracker {
     fn new() -> Self {
-        Self(AtomicU64::new(now_epoch_secs()))
+        Self(AtomicU64::new(monotonic_secs()))
     }
     fn touch(&self) {
-        self.0.store(now_epoch_secs(), Ordering::Relaxed);
+        self.0.store(monotonic_secs(), Ordering::Relaxed);
     }
     fn idle_secs(&self) -> u64 {
-        now_epoch_secs().saturating_sub(self.0.load(Ordering::Relaxed))
+        monotonic_secs().saturating_sub(self.0.load(Ordering::Relaxed))
     }
 }
 
-fn now_epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// 自进程启动 (首次调用 monotonic_secs) 起的单调递增秒数. OnceLock 保证
+/// ORIGIN 只被第一次调用初始化一次, 之后所有调用都读 elapsed(). Instant
+/// 底层是 CLOCK_MONOTONIC, 免疫 NTP 前后跳.
+fn monotonic_secs() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 /// RAII: 成功走 release_pipe (归池), 出错走 Drop (关 fd).

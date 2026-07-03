@@ -1,5 +1,47 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.6] - splice idle watchdog 时钟单调化 (NTP 前跳防御) (2026-07-04)
+
+### fix(proxy): ActivityTracker 从 SystemTime 换成 Instant 单调时钟
+
+**背景**: alpha.4 引入 `ActivityTracker` 时用 `SystemTime::now().duration_since(UNIX_EPOCH)`
+拿墙钟秒数. `saturating_sub` 已经防了倒流下溢, 但**前跳**没防:
+
+- **VM 启动 RTC 不准 → NTP 突然 +30 分钟同步**: watchdog 计算 `idle_secs =
+  now(墙钟) - last_touch(旧墙钟) > 900s`, **所有活跃连接被瞬间误杀**
+- **VM 从 suspend 恢复**: 墙钟跳过 suspend 时长, 同样触发误杀 (虽然此场景
+  连接可能确实死了, 但决策不该建立在墙钟上)
+
+### 实现
+
+```rust
+fn monotonic_secs() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_secs()
+}
+```
+
+- 首次调用初始化 `ORIGIN = Instant::now()` (进程启动基准)
+- 之后所有 `touch()` / `idle_secs()` 都读相对秒数
+- Linux 底层 `CLOCK_MONOTONIC` — 免疫 NTP 前后跳
+
+### 副作用 (合理不改)
+
+Linux `CLOCK_MONOTONIC` **不计 suspend 时长** (kernel 4.17+ 明确). VM 从
+suspend 恢复后:
+- SystemTime 视角: 已过了 20 小时, 连接被认为 idle 20h → 误杀
+- Instant 视角: elapsed() 只涨了 suspend 前的相对时间 → 连接被视为"刚活跃过"
+
+后者更合理 — 恢复后用户的第一个请求正常, 之后 15 分钟无活动才被淘汰。若真
+需要计入 suspend 时长, kernel 有 `CLOCK_BOOTTIME` 可用, 但 Rust std::Instant
+用的是 `CLOCK_MONOTONIC`, 目前 stable API 无法切换, 也无必要。
+
+### 影响面
+
+- 只有 splice_relay 里的 idle watchdog 用 tracker, 无外部 API
+- 无配置迁移, 无行为破坏 (只修 NTP 边界)
+- 对于 RTC 稳定的机器 (物理服务器 / 校时准确的容器), 表现跟 alpha.4 完全一致
+
 ## [v0.4.5-alpha.5] - splice pipe pool + 详细 debug 日志 (2026-07-03)
 
 ### perf(proxy): 加 pipe pool 复用, 消除每连接 pipe2()+F_SETPIPE_SZ() syscall
