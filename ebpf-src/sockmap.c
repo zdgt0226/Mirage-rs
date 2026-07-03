@@ -1,30 +1,13 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
-/**
- * [Socket 重定向 Map]
- * 将网络包直接重定向到对应的 Socket 的关键结构。
- * 键(Key)是 Socket Cookie (__u64)，值(Value)是 Socket 的文件描述符映射。
- */
-struct {
-    __uint(type, BPF_MAP_TYPE_SOCKHASH);
-    __uint(max_entries, 65536);
-    __type(key, __u64);   
-    __type(value, __u32); 
-} mirage_sockmap SEC(".maps");
-
-/**
- * [eBPF 核心统计信息 Map]
- * 每 CPU 数组，用于记录 BPF fast-path 的命中和失败包数。
- * 0: Success (命中并短路转发)
- * 2: Fallback (回退给 Linux 内核协议栈)
- */
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 4);
-    __type(key, __u32);
-    __type(value, __u64);
-} mirage_bpf_stats SEC(".maps");
+// v0.4.5-alpha.3: mirage_sockmap (SOCKHASH) + mirage_bpf_stats (PERCPU_ARRAY) +
+// sk_skb/stream_verdict 已全部删除. 参考 dae 结论 (control/kern/tproxy.c:178) sockmap
+// redirect 家族 (sk_msg/sk_skb + bpf_*_redirect_hash) 在 kernel 6.x 有 panic + 静默
+// 丢包问题, 生产不可用. Mirage 客户端直连零拷贝改用 splice(2)+pipe (userspace 触发
+// kernel 搬 page 引用), 见 src/proxy/splice.rs.
+//
+// 本 ELF 现只提供 sockops (RTT 反馈用于 brutal CC 动态速率) + IP 白名单.
 
 // IP 地址在 BPF 映射中的键格式（支持 IPv4 / IPv6）
 struct ip_key {
@@ -179,30 +162,6 @@ int mirage_sockops(struct bpf_sock_ops *skops)
         }
     }
     return 0;
-}
-
-/**
- * [SK_SKB 挂载点：Stream Verdict]
- * 基于 Socket Cookie 执行零拷贝的 L4 旁路转发。
- * 这里不走 Linux 漫长的网络栈，直接引导数据包抵达目标 Socket 缓冲区。
- */
-SEC("sk_skb/stream_verdict")
-int mirage_stream_verdict(struct __sk_buff *skb)
-{
-    __u64 cookie = bpf_get_socket_cookie(skb);
-    
-    // 尝试在 SockMap 中寻找对应 Cookie 的关联 Socket 并转发
-    int ret = bpf_sk_redirect_hash(skb, &mirage_sockmap, &cookie, 0);
-    
-    // 记录统计数据，供 GUI 前端 Neon Dashboard 展示
-    // 0: success, 2: drop/fallback
-    __u32 key = (ret == SK_PASS) ? 0 : 2;
-    __u64 *val = bpf_map_lookup_elem(&mirage_bpf_stats, &key);
-    if (val) {
-        (*val)++;
-    }
-    
-    return ret;
 }
 
 char _license[] SEC("license") = "GPL";

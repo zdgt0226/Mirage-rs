@@ -252,6 +252,17 @@ pub async fn proxy_tcp_target(
             debug!("Mirage connection to {} gracefully closed", target);
         }
         OutboundNode::Direct { .. } => {
+            // v0.4.5-alpha.3: 直连数据面 = splice(2)+pipe 零拷贝 (学 dae/control/tcp_copy_linux.go).
+            //
+            // 历史: alpha.1/alpha.2 尝试用 sockmap sk_skb/stream_verdict + bpf_sk_redirect_hash
+            // 做零拷贝, kernel 6.x 静默丢包 (verdict SK_PASS 但 curl 0 字节). dae 官方在 sk_msg
+            // 侧遇到 kernel panic 明确放弃整套 sockmap redirect 家族, 改用 tc-bpf 路由 +
+            // splice(2) 数据面. 我们的 SOCKS5 场景不需要 tc-bpf 路由 (客户端主动 opt-in), 只
+            // 需要 splice 就够了. sk_psock 家族的整块数据面已删除.
+            //
+            // splice(2) 是 SPLICE_F_MOVE 只搬 page 引用的 syscall, kernel 3.x 起稳定, 真正的
+            // 零拷贝且无 sk_psock 的坑.
+            let _ = ebpf_engine; // eBPF 数据面已经不用了; 参数保留为下游兼容, 但这里不用.
             let mut target_stream = match tokio::net::TcpStream::connect(&target).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -260,37 +271,6 @@ pub async fn proxy_tcp_target(
                 }
             };
 
-            // v0.4.5-alpha.1 修复 SockMap 竞态 bug (alpha.7 起 install.sh 默认关
-            // ebpf 就是因为这个):
-            //
-            // 老顺序: 1) write_all(initial_payload) → target
-            //         2) register_splice (sk_psock 才安装到 target 的 RX)
-            //         → 如果 target 极速回响应 (< 1ms, 常见于小 HTTP), 数据
-            //           在 sk_psock 安装前到达 target RX 队列, 之后 sk_psock
-            //           拦不到这段已经在队列里的数据. handler 只 epoll wait
-            //           EPOLLRDHUP 不读 → 数据永远卡住 → 客户端超时.
-            //
-            // 新顺序: 1) register_splice (先安装 sk_psock)
-            //         2) write_all(initial_payload) 用 target 的 TX 路径
-            //         → target 响应到达 RX 时 sk_psock 已就位, 立即 verdict
-            //           → redirect 到 local socket → 浏览器收到.
-            //
-            // sk_skb/stream_verdict 只拦 RX, TX (send/write) 完全不影响, Tokio
-            // write_all 在 register_splice 后仍正常工作.
-            let mut ebpf_spliced = false;
-            if let Some(engine) = ebpf_engine {
-                let mut lock = engine.lock().await;
-                match lock.register_splice(&local, &target_stream) {
-                    Ok(_) => {
-                        info!("eBPF TCP Splicing activated for {}. Tokio bypass enabled.", target);
-                        ebpf_spliced = true;
-                    }
-                    Err(e) => {
-                        debug!("eBPF splicing failed: {}. Falling back to userspace forwarding.", e);
-                    }
-                }
-            }
-
             if !initial_payload.is_empty() {
                 if let Err(e) = target_stream.write_all(&initial_payload).await {
                     error!("Failed to send initial payload to direct target: {:?}", e);
@@ -298,72 +278,14 @@ pub async fn proxy_tcp_target(
                 }
             }
 
-            if ebpf_spliced {
-                use std::os::unix::io::AsRawFd;
-                use tokio::io::unix::AsyncFd;
-                
-                struct EpollHandle(std::os::unix::io::RawFd);
-                impl AsRawFd for EpollHandle {
-                    fn as_raw_fd(&self) -> std::os::unix::io::RawFd { self.0 }
+            match crate::proxy::splice::splice_relay(local, target_stream).await {
+                Ok((up, down)) => {
+                    debug!("Direct splice relay to {} closed: up={}B down={}B", target, up, down);
                 }
-                impl Drop for EpollHandle {
-                    fn drop(&mut self) { unsafe { libc::close(self.0); } }
+                Err(e) => {
+                    debug!("Direct splice relay to {} error: {}", target, e);
                 }
-
-                let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-                if epfd >= 0 {
-                    let mut ev1 = libc::epoll_event { events: libc::EPOLLRDHUP as u32, u64: 1 };
-                    let r1 = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, local.as_raw_fd(), &mut ev1) };
-                    if r1 < 0 { tracing::warn!("epoll_ctl ADD local failed: {}", std::io::Error::last_os_error()); }
-                    
-                    let mut ev2 = libc::epoll_event { events: libc::EPOLLRDHUP as u32, u64: 2 };
-                    let r2 = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, target_stream.as_raw_fd(), &mut ev2) };
-                    if r2 < 0 { tracing::warn!("epoll_ctl ADD target failed: {}", std::io::Error::last_os_error()); }
-
-                    if let Ok(async_epoll) = AsyncFd::new(EpollHandle(epfd)) {
-                        let _ = tokio::time::timeout(std::time::Duration::from_secs(1800), async {
-                            loop {
-                                let mut guard = match async_epoll.readable().await {
-                                    Ok(g) => g,
-                                    Err(_) => break,
-                                };
-                                let mut events = [libc::epoll_event { events: 0, u64: 0 }; 2];
-                                let n = unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), 2, 0) };
-                                if n > 0 {
-                                    break;
-                                }
-                                guard.clear_ready();
-                            }
-                        }).await;
-                    }
-                }
-                debug!("eBPF connection to {} gracefully closed", target);
-                return;
             }
-
-            let (target_read, mut target_write) = target_stream.into_split();
-            let (local_read, mut local_write) = local.into_split();
-
-            let mut monitored_local_read = crate::monitor::MonitoredReader::new(local_read, true);
-            let mut monitored_target_read = crate::monitor::MonitoredReader::new(target_read, false);
-
-            let upload = async {
-                if tokio::io::copy(&mut monitored_local_read, &mut target_write).await.is_err() {
-                    return Err::<(), ()>(());
-                }
-                let _ = target_write.shutdown().await;
-                Ok::<(), ()>(())
-            };
-            let download = async {
-                if tokio::io::copy(&mut monitored_target_read, &mut local_write).await.is_err() {
-                    return Err::<(), ()>(());
-                }
-                let _ = local_write.shutdown().await;
-                Ok::<(), ()>(())
-            };
-
-            let _ = tokio::try_join!(upload, download);
-            debug!("Direct connection to {} gracefully closed", target);
         }
         OutboundNode::Block { .. } => {
             debug!("Connection to {} blocked by routing rule", target);

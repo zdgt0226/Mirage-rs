@@ -1,5 +1,87 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.3] - 直连零拷贝换用 splice(2)+pipe (参考 dae) (2026-07-03)
+
+### fix(proxy): sockmap sk_skb 数据面全部删除, 改 splice(2)+pipe
+
+**背景**: alpha.1 顺序修 + alpha.2 bpf_printk 诊断跑完后, 现网仍然复现 "verdict SK_PASS
+4 次但 curl 0 字节". 参考 dae 源码 `control/kern/tproxy.c:178` 官方注释:
+
+> "BPF_PROG_TYPE_SOCK_OPS + BPF_PROG_TYPE_SK_MSG (bpf_msg_redirect_hash) combination
+>  has been proven to cause Kernel Panic. We use TC-based redirect instead."
+
+dae 团队在 sk_msg 侧遇到 kernel panic, 明确放弃整套 sockmap redirect 家族; 我们的
+sk_skb + `bpf_sk_redirect_hash` 共享同一 sk_psock 底层, 表现是"静默丢包"而不是 panic,
+但本质是同类问题, kernel 6.x 上不可靠。
+
+### 换掉的技术方案
+
+dae 数据面真身 = `control/tcp_copy_linux.go::relaySpliceCopyExact`:
+- `pipe2(O_CLOEXEC | O_NONBLOCK)` 建 pipe
+- `fcntl(F_SETPIPE_SZ, 256KB)` 设 pipe 缓冲
+- `splice(src_sock, pipe_w, SPLICE_F_MOVE | MORE | NONBLOCK)` — 从 src socket 搬 page 到 pipe
+- `splice(pipe_r, dst_sock, ...)` — 从 pipe 搬 page 到 dst socket
+- 无 userspace 中转, kernel 只搬 page 引用, **真正零拷贝**
+
+Mirage 客户端 SOCKS5 场景不需要 dae 的 tc-bpf 路由 (客户端主动 opt-in), 只搬数据面
+到 splice 就够了。
+
+### 具体改动
+
+- **删** `src/ebpf/mod.rs::register_splice()` (aya SockHash 一整套)
+- **删** `src/ebpf/mod.rs::init()` 里 SkSkb attach + sockmap fd
+- **删** `ebpf-src/sockmap.c::mirage_stream_verdict` (SEC sk_skb) + `mirage_sockmap` (SOCKHASH)
+  + `mirage_bpf_stats` (PERCPU_ARRAY) + alpha.2 bpf_printk
+- **删** `src/proxy/handler.rs::proxy_tcp_target` Direct 分支 alpha.1 的 register_splice
+  顺序修 + epoll RDHUP 等待循环 (共 ~90 行)
+- **新增** `src/proxy/splice.rs`: `splice_relay(local, target)` 双向 tokio::try_join,
+  每方向独立 256KB pipe, `TcpStream::async_io` 处理 EAGAIN 重试
+- `EbpfEngine::get_stats()` 保留签名返回 `Ok((0, 0))`, sampler.rs/GUI 图不用改, 显示
+  稳定 0 (新架构下 BPF fast-path counter 无语义)
+
+### 保留的 eBPF 功能 (未受影响)
+
+- ✅ `mirage_sockops` + `mirage_rtt_map` + `mirage_target_ips` — Brutal CC 动态速率反馈
+- ✅ XDP DNS 加速 (`dns_xdp.c`, `mirage_dns_cache`)
+- ✅ 服务端 `sk_lookup` 透明代理 (跟 sockmap redirect 是完全不同的 API)
+
+### 客户端配置
+
+`install.sh` `ebpf_mode: "off"` (alpha.7 起的临时 workaround) 可以在 alpha.3 上手工
+测试 OK 后恢复 `"auto"`, 因为 alpha.3 不再依赖 sockmap 数据面, sockops+RTT 是纯反馈,
+安全。
+
+### 测试计划
+
+1. cachefly 100MB 下载 (alpha.25 基线 25.8Mbps) — 期望 splice(2) 至少等同
+2. `curl -x socks5://127.0.0.1:3180 https://www.baidu.com -o /dev/null -m 30` — 期望
+   200 状态码, 非 0 字节, 无 timeout
+3. `curl ... https://api.m.jd.com/...` — .cn 直连域名, 期望正常
+4. YouTube 4K 播放 — 期望缓冲流畅 (走 Mirage 隧道, 直连路径不影响它)
+
+## [v0.4.5-alpha.2] - eBPF verdict trace_pipe 诊断 (临时调试, 非生产) (2026-07-03)
+
+### debug(ebpf): sockmap.c verdict 加 bpf_printk
+
+alpha.1 顺序修复上线后现网仍复现: `curl -x socks5://... https://baidu.com -m 5`
+超时 0 字节. bpftool 读 mirage_bpf_stats 显示 key=0 (SK_PASS) = 4, key=2 (SK_DROP) = 0.
+矛盾: verdict fire 且 redirect_hash 声明成功, 但数据一字节都不到 curl.
+
+**加 bpf_printk 定位 cookie/len/ret 真实值**:
+```c
+bpf_printk("verdict: cookie=%llu len=%u ret=%d", cookie, len, ret);
+```
+
+诊断步骤:
+1. 客户端 `sudo cat /sys/kernel/debug/tracing/trace_pipe`
+2. 另开 shell `curl -x socks5://127.0.0.1:3180 https://www.baidu.com -o /dev/null -m 5`
+3. trace_pipe 输出的 cookie 值对比 `eBPF SockMap: spliced local_cookie=X <-> remote_cookie=Y`
+   - 如 verdict 里 cookie 完全不匹配 Rust 日志 → cookie 语义错
+   - 如匹配但 ret=SK_PASS 但数据不通 → EGRESS 方向反了 (需切 BPF_F_INGRESS)
+   - 如 len 为 0 → skb 是空包 (只 TCP 控制帧, ACK 之类)
+
+**警告**: bpf_printk 有 buffer 抢锁 + string table 开销, 每次生产化前 remove.
+
 ## [v0.4.5-alpha.1] - eBPF SockMap 零拷贝直连修复 (P0 长期未解 bug 根治) (2026-07-02)
 
 ### fix(ebpf): register_splice 顺序竞态修复

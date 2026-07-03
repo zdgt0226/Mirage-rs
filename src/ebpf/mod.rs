@@ -22,9 +22,8 @@ unsafe impl aya::Pod for TcpState {}
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod sys {
     use anyhow::Result;
-    use aya::{Ebpf, programs::{SkSkb, SockOps, CgroupAttachMode, Xdp, XdpFlags}};
-    use aya::maps::{SockHash, PerCpuArray, HashMap};
-    use std::os::unix::io::AsRawFd;
+    use aya::{Ebpf, programs::{SockOps, CgroupAttachMode, Xdp, XdpFlags}};
+    use aya::maps::HashMap;
     
     pub fn ip_to_key(ip: std::net::IpAddr) -> [u32; 5] {
         match ip {
@@ -41,7 +40,6 @@ mod sys {
             }
         }
     }
-    use tokio::net::TcpStream;
     use tracing::info;
 
     pub struct EbpfEngine {
@@ -57,17 +55,12 @@ mod sys {
         pub fn init() -> Result<Self> {
             static SOCKMAP_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_SOCKMAP_ELF"));
             let mut bpf = Ebpf::load(SOCKMAP_ELF)?;
-            
-            let sockmap_fd = {
-                let map = bpf.map("mirage_sockmap").unwrap();
-                let sock_map = SockHash::<_, u64>::try_from(map)?;
-                sock_map.fd().try_clone()?.try_into()?
-            };
-            
-            let program: &mut SkSkb = bpf.program_mut("mirage_stream_verdict").unwrap().try_into()?;
-            program.load()?;
-            program.attach(&sockmap_fd)?;
-            
+
+            // v0.4.5-alpha.3: sk_skb/stream_verdict + sockhash 数据面已彻底删除 (kernel 6.x
+            // sockmap redirect 家族静默丢包, 参考 dae 结论). 客户端直连零拷贝改用
+            // splice(2)+pipe (见 src/proxy/splice.rs). ELF 里 sockmap.c 只剩 sockops +
+            // mirage_rtt_map + mirage_target_ips, 用于 brutal CC 的 RTT 反馈.
+
             // Try attaching sockops for RTT monitoring — report the actual failure step.
             // 非 root + 无 CAP_BPF 的常见场景 (用户自己跑客户端) 失败是预期, 降级为 INFO
             // 不刷 WARN; 真正 root 还失败才用 WARN.
@@ -130,27 +123,11 @@ mod sys {
             Ok(Self { bpf })
         }
 
-        pub fn register_splice(&mut self, local: &TcpStream, remote: &TcpStream) -> Result<()> {
-            let mut map = SockHash::<_, u64>::try_from(self.bpf.map_mut("mirage_sockmap").unwrap())?;
-            
-            let local_cookie = get_socket_cookie(local.as_raw_fd())?;
-            let remote_cookie = get_socket_cookie(remote.as_raw_fd())?;
-            
-            let local_fd = local.as_raw_fd();
-            let remote_fd = remote.as_raw_fd();
-            
-            map.insert(local_cookie, remote_fd, 0)?;
-            map.insert(remote_cookie, local_fd, 0)?;
-            
-            info!("eBPF SockMap: spliced local_cookie={} <-> remote_cookie={} (Zero-copy bypass activated)", local_cookie, remote_cookie);
-            Ok(())
-        }
+        // v0.4.5-alpha.3: register_splice 删除, 直连零拷贝走 splice(2)+pipe.
+        // get_stats 保留签名返回 0, 兼容 sampler.rs / GUI 拿 BPF hit 数的调用点.
+        // BPF fast-path counter 语义在新架构下没了意义, GUI 图会稳定显示 0.
         pub fn get_stats(&self) -> Result<(u64, u64)> {
-            let map = self.bpf.map("mirage_bpf_stats").unwrap();
-            let hash = PerCpuArray::<_, u64>::try_from(map)?;
-            let sum_up = hash.get(&0, 0)?.iter().copied().sum();
-            let sum_down = hash.get(&2, 0)?.iter().copied().sum();
-            Ok((sum_up, sum_down))
+            Ok((0, 0))
         }
         
         /**
@@ -267,22 +244,16 @@ mod sys {
 #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
 mod sys {
     use anyhow::Result;
-    use tokio::net::TcpStream;
     use tracing::info;
 
     pub struct EbpfEngine {}
 
     impl EbpfEngine {
         pub fn init() -> Result<Self> {
-            info!("eBPF Engine is disabled (Requires feature 'ebpf' and Linux OS). Falling back to Tokio userspace forwarding.");
+            info!("eBPF Engine is disabled (Requires feature 'ebpf' and Linux OS). Falling back to userspace forwarding.");
             Ok(Self {})
         }
 
-        pub fn register_splice(&mut self, _local: &TcpStream, _remote: &TcpStream) -> Result<()> {
-            // No-op. Tokio io::copy will take over.
-            Ok(())
-        }
-        
         pub fn get_stats(&self) -> Result<(u64, u64)> {
             Ok((0, 0))
         }

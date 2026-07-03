@@ -10,3 +10,4 @@ pub mod mixed;
 pub mod healthcheck;
 pub mod transparent;
 pub mod sniff;
+pub mod splice;
