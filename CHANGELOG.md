@@ -1,5 +1,50 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.4] - splice_relay idle timeout (透明网关场景准备) (2026-07-03)
+
+### feat(proxy): splice_relay 加双向共享 idle timeout
+
+**背景**: alpha.3 上线后 splice_relay 无任何 idle timeout — SOCKS5 客户端本地
+场景下 keepalive + 短会话足够, 但**下一阶段计划让 Mirage 承担透明代理网关**
+角色, 网关场景下僵尸连接会啃 fd + 内核内存, 需要主动止损. 参考 dae 也有
+`relayCore.forceClose()` 靠外层 SetReadDeadline(past) 主动打断.
+
+### 设计
+
+- `ActivityTracker` 一个 `AtomicU64` (epoch 秒), 双向共享
+- 每次 `splice()` 成功 (n > 0) 后 `tracker.touch()` — 热路径无锁, 性能可忽略
+- `idle_watchdog` 每 30s 检查一次, 双向都静默 > 15 分钟 → 返回 TimedOut
+- `splice_relay` 用 `tokio::select!` 包 `try_join!(up, down)` + `watchdog`,
+  watchdog 触发时立刻取消双向 futures, sockets 走 Drop, kernel fd 自动释放
+
+### 为什么是"双向共享"而非"每向独立"
+
+若每向独立, HTTP 大文件上传场景 (up 忙, down 静默 20 分钟) 会误杀 down 方向.
+双向共享确保**任一方向活跃就整条连接不 idle**, 只有真正双向都死才回收.
+
+### 权衡: 15 分钟阈值
+
+- 传统 SSE 心跳: 30s-5 分钟 → 安全
+- WebSocket ping frame: 一般 30s-60s → 安全
+- HTTP long-poll: 通常 25-30s → 安全
+- 严重卡的 API (罕见 batch 处理 > 15 分钟) → 会被误杀, 但这类 API 本就该
+  改设计, 不算合理场景
+
+超时阈值可以未来提到 config, 目前硬编码常量即可.
+
+### 影响面
+
+- Direct 分支的 SOCKS5 客户端场景: 短连接不受影响, 长连接会在 15 分钟静默
+  后被强关 (以前会挂到内核 keepalive 2 小时超时)
+- 未来透明网关: 直接受益, 网关连接密度高时特别重要
+- 无 API 变化, 无配置迁移
+
+### 未做的
+
+- 硬 max_lifetime cap (例如 24h 强制关) — 目前不需要, idle 足够兜底
+- 配置化超时阈值 — 硬编码常量, 上生产观察后再决定要不要暴露
+- 分方向独立超时 — 前述反例排除
+
 ## [v0.4.5-alpha.3] - 直连零拷贝换用 splice(2)+pipe (参考 dae) (2026-07-03)
 
 ### fix(proxy): sockmap sk_skb 数据面全部删除, 改 splice(2)+pipe
