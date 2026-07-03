@@ -10,9 +10,12 @@
 
 mod handshake;
 mod camouflage;
+mod camouflage_pool;
 mod control;
 mod tcp_relay;
 mod udp_relay;
+
+use camouflage_pool::CamouflagePool;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -64,6 +67,10 @@ pub async fn start_server(
         info!("Brutal CC enabled for downloads (server→client): {} Mbps", bps / 125_000);
     }
 
+    // v0.4.5-alpha.7: 启动 camouflage_host 预热连接池, 消除 auth-fail 分支
+    // TCP 3-way RTT 时序侧信道. 详见 camouflage_pool.rs 顶注释.
+    let cam_pool = CamouflagePool::new(camouflage_host.to_string());
+
     let password = password.to_string();
     loop {
         match listener.accept().await {
@@ -96,8 +103,9 @@ pub async fn start_server(
 
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();
+                let pool = cam_pool.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, pwd, cam).await;
+                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool).await;
                 });
             }
             Err(e) => {

@@ -80,9 +80,14 @@ impl TokenReplayCache {
 
         let bucket = cache.entry(current_bucket).or_default();
         if bucket.len() > 100_000 {
-            // Bypass rather than fake positive replay if we are under DDoS
-            tracing::warn!("ReplayCache bucket saturated at {} entries, bypassing replay protection!", bucket.len());
-            return true;
+            // v0.4.5-alpha.7: fail-closed. 老版满桶时 return true (放行) 是"避免误
+            // 杀合法请求"取舍, 但攻击者可以 DDoS 拉满桶后无限重放合法 token, 让
+            // 重放防护完全失效. 现在满桶 → return false (拒绝) → 桶满期间合法 token
+            // 也会被误判重放, 但同时攻击者的重放也被拦, 保守安全大于可用性.
+            // 100k 桶 = 60 秒内 10 万个不同 token, 正常业务达不到这个量级,
+            // 只有 DDoS 才可能触发, 拒绝是对的.
+            tracing::warn!("ReplayCache bucket saturated at {} entries, denying (fail-closed)", bucket.len());
+            return false;
         }
 
         bucket.insert(token.to_vec())

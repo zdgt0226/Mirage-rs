@@ -1,5 +1,83 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.7] - Mirage 协议握手三项安全强化 (2026-07-04)
+
+### ⚠️ 破坏性变更: 客户端 + 服务端必须同步升级到 alpha.7+
+
+Fake Client Finished tail 尺寸从 63B → 64B (Body 52 → 53). 旧版客户端连接新版
+服务端会被 read_exact 卡 5s 超时后 close, 反之亦然. 必须成对升级.
+
+### fix(server): ClientHello 精确 5B header + body 分段读取
+
+**背景**: 老版 `stream.read(&mut vec![0u8; 1024])` 一次性读最多 1024B, 遇到:
+- iOS Safari 完整 ECH + Encrypted SNI 扩展 → ClientHello ~1300B
+- Chrome 带 4 个 QUIC ALPN + PSK ticket → ~1200B
+- 会被截断 → auth 校验虽然能过 (session_id 在前 76B), 但转发到 camouflage_host
+  时是**残缺 ClientHello**, 触发对面回 TLS alert, camouflage 路径失败
+
+**修法** (`handshake.rs`):
+```rust
+let mut header = [0u8; 5];
+stream.read_exact(&mut header).await?;
+let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+if record_len > 16384 { return; } // RFC 8446 §5.1 硬 cap 2^14
+let mut body = vec![0u8; record_len];
+stream.read_exact(&mut body).await?;
+```
+
+TLS 记录最大合法长度 16384 (2^14), 超出即恶意报文, 静默丢包不给 camouflage
+消耗对面连接. `client_random` / `session_id` offset 全部从 `body` 相对偏移
+重新推导, 边界更清晰.
+
+### fix(crypto): Fake Client Finished tail body 52 → 53B
+
+**背景**: `build_fake_client_tail()` 假 Finished 密文体固定 52B, 但真实 TLS 1.3
+Client Finished (ChaCha20-Poly1305 + SHA-256 HMAC) 加密后 record body 是:
+```
+4B handshake header + 32B HMAC digest + 1B content_type + 16B AEAD tag = 53B
+```
+
+52 → 53 后跟主流浏览器 Client Finished record body 长度分布完全一致, 消除
+DPI histogram 潜在识别特征.
+
+### feat(server): CamouflagePool 预热连接池, 消除 auth-fail 分支时序侧信道
+
+**问题**: auth-fail 分支需要 `TcpStream::connect(camouflage_host:443)` 新建 TCP,
+1 个 RTT (5-100ms) vs auth-succ 分支的本地模板拷贝 (~0-1ms). GFW 用大量样本
+统计首字节返程时间可分类为 mirage 服务器.
+
+**修法** (`camouflage_pool.rs`):
+- 后台 task 维护 8 条 pre-warmed TCP 连接到 camouflage_host:443
+- 500ms 补给间隔, 10s max_age 淘汰 (camouflage_host 通常 30s idle timeout, 留余量)
+- 3s connect 超时, 对面抖动时不 hammer
+- auth-fail 时 `pool.acquire()` 抢一条已建 TCP → 无 3-way RTT
+- 池空 fallback 到即时 connect (跟老版行为一致)
+
+**残余时序差**: 仍有 1 个 RTT (camouflage_host 回 ServerHello) 无法消除. 完全对齐
+需要 auth-succ 分支延迟注入, 权衡后**暂不做** — 会增加合法用户 WarmPool 补给
+延迟, 且残余 RTT 差异对 GFW 需要成千上万样本才能识别, 单个用户不足以触发.
+
+### fix(crypto): ReplayCache 满桶 fail-closed (拒绝) 而非 bypass (放行)
+
+**攻击场景**: 老版满桶 (>100k) 时直接 `return true` 放行, 攻击者 DDoS 拉高
+认证请求量填桶后, 就能**无限重放**截获的合法 token 直到桶回落到阈值以下.
+
+**修法** (`hello_auth.rs`): 满桶 → `return false` (拒绝). 满桶期间合法 token 也会
+被误判重放, 但同时攻击者的 replay 也被拦, 保守安全 > 可用性.
+
+100k 桶 = 60s 内 10 万个不同 token, 正常业务不可能触发, 只有 DDoS 才可能碰到,
+拒绝是对的.
+
+### 未修的 (残余风险, 记录):
+
+- **UNAUTH 限流对 IPv6 无效**: `map.entry(peer_addr.ip())` 用完整 IPv6 (128 位) 做
+  key, 攻击者控制 /64 段可造 2^64 独立 IP 逃逸. IPv6 应按 /64 或 /48 归一.
+  留 alpha.8+ 修.
+- **auth-succ 路径残余 1 RTT 时序差**: 见上面 CamouflagePool 段末. 需要 config
+  开关 + startup 测 camouflage RTT + auth-succ delay_injection. alpha.8+.
+- **客户端 `read_server_handshake` 12s / 1.5s 固定超时**: 客户端行为指纹, GFW
+  观察客户端断连时间可识别. 优先级低, 客户端行为不是主要防御面.
+
 ## [v0.4.5-alpha.6] - splice idle watchdog 时钟单调化 (NTP 前跳防御) (2026-07-04)
 
 ### fix(proxy): ActivityTracker 从 SystemTime 换成 Instant 单调时钟

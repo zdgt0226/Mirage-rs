@@ -232,10 +232,14 @@ pub fn build_client_hello(server_name: &str, session_id: &[u8; 32]) -> (Vec<u8>,
 }
 
 pub fn build_fake_client_tail() -> Vec<u8> {
+    // v0.4.5-alpha.7: 尾巴 body 52 → 53 匹配真实 TLS 1.3 Client Finished 尺寸.
+    // ChaCha20-Poly1305 + SHA-256 HMAC 时: 4B handshake header + 32B HMAC digest
+    // + 1B content_type + 16B AEAD auth tag = 53B encrypted record body.
+    // 老版 52B 差 1 字节, DPI histogram 大样本可识别.
     let ccs = b"\x14\x03\x03\x00\x01\x01";
-    let mut finished_body = [0u8; 52];
+    let mut finished_body = [0u8; 53];
     rand::fill(&mut finished_body);
-    
+
     let mut record = Vec::with_capacity(ccs.len() + 5 + finished_body.len());
     record.extend_from_slice(ccs);
     record.extend_from_slice(b"\x17\x03\x03");
