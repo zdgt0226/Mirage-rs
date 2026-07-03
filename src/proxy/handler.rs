@@ -263,27 +263,66 @@ pub async fn proxy_tcp_target(
             // splice(2) 是 SPLICE_F_MOVE 只搬 page 引用的 syscall, kernel 3.x 起稳定, 真正的
             // 零拷贝且无 sk_psock 的坑.
             let _ = ebpf_engine; // eBPF 数据面已经不用了; 参数保留为下游兼容, 但这里不用.
+            let t_start = std::time::Instant::now();
+            let peer_str = local.peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            let initial_len = initial_payload.len();
+
             let mut target_stream = match tokio::net::TcpStream::connect(&target).await {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("Direct connection to {} failed: {}", target, e);
+                    error!("Direct connect fail: peer={} target={} err='{}'", peer_str, target, e);
                     return;
                 }
             };
+            let t_connect_ms = t_start.elapsed().as_millis();
 
-            if !initial_payload.is_empty() {
+            if initial_len > 0 {
                 if let Err(e) = target_stream.write_all(&initial_payload).await {
-                    error!("Failed to send initial payload to direct target: {:?}", e);
+                    error!(
+                        "Direct initial_payload write fail: peer={} target={} initial={}B err='{}'",
+                        peer_str, target, initial_len, e
+                    );
                     return;
                 }
             }
 
+            let (pool_hits_pre, pool_misses_pre, _) = crate::proxy::splice::pool_stats();
+            debug!(
+                "splice open: peer={} target={} initial={}B connect={}ms pool_hits={} pool_misses={}",
+                peer_str, target, initial_len, t_connect_ms, pool_hits_pre, pool_misses_pre
+            );
+
+            let relay_start = std::time::Instant::now();
             match crate::proxy::splice::splice_relay(local, target_stream).await {
                 Ok((up, down)) => {
-                    debug!("Direct splice relay to {} closed: up={}B down={}B", target, up, down);
+                    let (pool_hits, pool_misses, pool_len) = crate::proxy::splice::pool_stats();
+                    debug!(
+                        "splice close: peer={} target={} up={}B down={}B relay={}ms total={}ms \
+                         pool_hits={} pool_misses={} pool_idle={}",
+                        peer_str, target, up, down,
+                        relay_start.elapsed().as_millis(), t_start.elapsed().as_millis(),
+                        pool_hits, pool_misses, pool_len
+                    );
                 }
                 Err(e) => {
-                    debug!("Direct splice relay to {} error: {}", target, e);
+                    let reason = match e.kind() {
+                        std::io::ErrorKind::TimedOut => {
+                            if e.to_string().contains("idle") { "idle_timeout" } else { "timeout" }
+                        }
+                        std::io::ErrorKind::ConnectionReset => "conn_reset",
+                        std::io::ErrorKind::ConnectionAborted => "conn_aborted",
+                        std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+                        std::io::ErrorKind::BrokenPipe => "broken_pipe",
+                        std::io::ErrorKind::WriteZero => "write_zero",
+                        _ => "other",
+                    };
+                    debug!(
+                        "splice err: peer={} target={} reason={} err='{}' relay={}ms total={}ms",
+                        peer_str, target, reason, e,
+                        relay_start.elapsed().as_millis(), t_start.elapsed().as_millis()
+                    );
                 }
             }
         }

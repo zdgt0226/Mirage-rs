@@ -7,14 +7,21 @@
 //! 组合会静默丢包 (dae 团队也在 sk_msg 侧遇到 kernel panic, 明确放弃整套
 //! sockmap redirect). splice(2) 从 kernel 3.x 稳定, 无 sk_psock 家族的坑.
 //!
-//! Idle timeout 语义 (v0.4.5-alpha.4): 双向共享 ActivityTracker, 任一方向有数据
-//! 流通就 touch(). watchdog 每 30 秒检查, 双向都静默 > 15 分钟 → 报 TimedOut
-//! 关连接. 网关场景防僵尸连接堆积占 fd, 同时兼顾长连接 (SSE/WebSocket 只要
-//! 应用层心跳 < 15 分钟就不会误杀).
+//! Idle timeout (alpha.4): 双向共享 ActivityTracker, 15 分钟双向都静默 →
+//! watchdog 报 TimedOut 关连接.
+//!
+//! Pipe pool (alpha.5): 64 容量 pool 复用 pipe (学 dae relaySplicePipePool).
+//! 避免每连接一次 pipe2()+F_SETPIPE_SZ() 两次 syscall. 出错 pipe 走 Drop 关 fd,
+//! 成功归池 (成功路径 in_pipe 保证为 0, 无残留).
+//!
+//! Byte accounting: 每次 splice→dst 成功后 counter(m) 立即更新 GLOBAL_UP/DOWN,
+//! 出错也保留 partial 已传输字节 (alpha.4 是函数末尾统一 add 会丢 partial).
 
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -29,9 +36,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// watchdog 检查频率. IDLE_TIMEOUT / 30 = 30s, 单条连接每 15 分钟最多多活半分钟.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
-struct Pipe {
-    r: OwnedFd,
-    w: OwnedFd,
+/// pipe pool 容量. dae 也是 64. 高并发瞬时开新 pipe 是 fallback, 无上限阻塞.
+const POOL_CAPACITY: usize = 64;
+
+pub(crate) struct Pipe {
+    pub(crate) r: OwnedFd,
+    pub(crate) w: OwnedFd,
 }
 
 impl Pipe {
@@ -51,6 +61,45 @@ impl Pipe {
             w: unsafe { OwnedFd::from_raw_fd(fds[1]) },
         })
     }
+}
+
+fn pipe_pool() -> &'static Mutex<VecDeque<Pipe>> {
+    static POOL: OnceLock<Mutex<VecDeque<Pipe>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(VecDeque::with_capacity(POOL_CAPACITY)))
+}
+
+static POOL_HITS: AtomicU64 = AtomicU64::new(0);
+static POOL_MISSES: AtomicU64 = AtomicU64::new(0);
+
+fn acquire_pipe() -> io::Result<Pipe> {
+    if let Ok(mut pool) = pipe_pool().lock() {
+        if let Some(pipe) = pool.pop_front() {
+            POOL_HITS.fetch_add(1, Ordering::Relaxed);
+            return Ok(pipe);
+        }
+    }
+    POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+    Pipe::new()
+}
+
+fn release_pipe(pipe: Pipe) {
+    if let Ok(mut pool) = pipe_pool().lock() {
+        if pool.len() < POOL_CAPACITY {
+            pool.push_back(pipe);
+            return;
+        }
+    }
+    // pool 满 / lock poisoned — pipe 走 Drop, OwnedFd 关 fd, 无泄漏.
+    drop(pipe);
+}
+
+/// 当前 (hits, misses, in_use_estimate) 供 debug/GUI 用. in_use 是启动至今
+/// misses - hits + pool_len 的粗略估计 (不精确, 但足够 debug).
+pub fn pool_stats() -> (u64, u64, usize) {
+    let hits = POOL_HITS.load(Ordering::Relaxed);
+    let misses = POOL_MISSES.load(Ordering::Relaxed);
+    let pool_len = pipe_pool().lock().map(|p| p.len()).unwrap_or(0);
+    (hits, misses, pool_len)
 }
 
 /// 双向共享的活动时间戳. 任一方向 splice 成功就 touch(), watchdog 只读它判断
@@ -77,18 +126,41 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// RAII: 成功走 release_pipe (归池), 出错走 Drop (关 fd).
+/// 通过 finish() 显式转移 pipe 到 pool; 如 finish 未调用 (提前 return / panic),
+/// Drop 兜底关 fd.
+struct PipeGuard(Option<Pipe>);
+
+impl PipeGuard {
+    fn new(pipe: Pipe) -> Self {
+        Self(Some(pipe))
+    }
+    fn as_fds(&self) -> (RawFd, RawFd) {
+        let pipe = self.0.as_ref().unwrap();
+        (pipe.r.as_raw_fd(), pipe.w.as_raw_fd())
+    }
+    fn finish(mut self) {
+        if let Some(pipe) = self.0.take() {
+            release_pipe(pipe);
+        }
+    }
+}
+
 /// 单方向 splice: src socket → pipe → dst socket 循环, 直到 src EOF.
 /// src EOF 后主动 shutdown(dst, SHUT_WR) 让对端知道我方已关.
+///
+/// counter: 每次 pipe→dst 成功后调用, 用于 GLOBAL_UP/DOWN 计数. 出错也保留
+/// 已传输的 partial bytes 到 counter (调用点已经加过).
 async fn splice_one_way(
     src: &TcpStream,
     dst: &TcpStream,
     tracker: &ActivityTracker,
+    counter: fn(u64),
 ) -> io::Result<u64> {
-    let pipe = Pipe::new()?;
+    let pipe_guard = PipeGuard::new(acquire_pipe()?);
+    let (pipe_r, pipe_w) = pipe_guard.as_fds();
     let src_fd = src.as_raw_fd();
     let dst_fd = dst.as_raw_fd();
-    let pipe_r: RawFd = pipe.r.as_raw_fd();
-    let pipe_w: RawFd = pipe.w.as_raw_fd();
 
     let mut total: u64 = 0;
     let mut in_pipe: usize = 0;
@@ -159,10 +231,13 @@ async fn splice_one_way(
             }
             in_pipe -= m;
             total += m as u64;
+            counter(m as u64);
             tracker.touch();
         }
     }
 
+    // 成功路径: in_pipe == 0 (loop 出口条件), pipe 无残留, 归池复用.
+    pipe_guard.finish();
     Ok(total)
 }
 
@@ -189,21 +264,14 @@ async fn idle_watchdog(tracker: &ActivityTracker) -> io::Error {
 ///
 /// 错误行为: 任一方向报错 (ECONNRESET/ETIMEDOUT/Idle Watchdog TimedOut) → 立刻
 /// 取消另一方向 Future 并返回 Err → sockets Drop → kernel fd 释放, 无泄漏.
+/// partial 字节数已通过 counter 上报到 GLOBAL_UP/DOWN, 不丢.
 ///
 /// idle 语义: 见文件头注释. 15 分钟双向都静默 → watchdog 报 TimedOut 强关.
 pub async fn splice_relay(local: TcpStream, target: TcpStream) -> io::Result<(u64, u64)> {
     let tracker = ActivityTracker::new();
 
-    let up_fut = async {
-        let n = splice_one_way(&local, &target, &tracker).await?;
-        crate::monitor::add_up(n);
-        io::Result::Ok(n)
-    };
-    let down_fut = async {
-        let n = splice_one_way(&target, &local, &tracker).await?;
-        crate::monitor::add_down(n);
-        io::Result::Ok(n)
-    };
+    let up_fut = splice_one_way(&local, &target, &tracker, crate::monitor::add_up);
+    let down_fut = splice_one_way(&target, &local, &tracker, crate::monitor::add_down);
     let watchdog_fut = idle_watchdog(&tracker);
 
     tokio::select! {

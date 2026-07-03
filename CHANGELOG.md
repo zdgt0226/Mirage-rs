@@ -1,5 +1,69 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.5] - splice pipe pool + 详细 debug 日志 (2026-07-03)
+
+### perf(proxy): 加 pipe pool 复用, 消除每连接 pipe2()+F_SETPIPE_SZ() syscall
+
+学 dae `control/tcp_copy_linux.go::relaySplicePipePool`:
+
+- `OnceLock<Mutex<VecDeque<Pipe>>>` 静态 pool, 容量 64
+- `acquire_pipe()` 先 pop_front, 无则 fallback 到 `Pipe::new()` (含 pipe2 +
+  F_SETPIPE_SZ 两次 syscall)
+- `release_pipe()` 归池, 池满则 Drop 关 fd, 无上限阻塞
+- `PipeGuard` RAII: 出错走 Drop 关 fd; 成功走 `finish()` 归池 (成功路径
+  in_pipe 保证为 0, 无残留数据)
+- POOL_HITS / POOL_MISSES 全局 atomic, 供 debug 日志读
+
+**收益**: 高频短连接场景 (每连接 2 个 pipe) 从 4 次 pipe 相关 syscall 降到 0.
+低频场景无变化 (fallback 到 new 路径). dae 用同样机制, 生产验证过。
+
+### fix(proxy): byte accounting 从函数末尾移到 splice 内部
+
+alpha.4 的 `crate::monitor::add_up(n)` 在 `splice_one_way` 返回 Ok 后统一
+调用 — 出错时 partial 字节数丢失。改为每次 `pipe→dst` 成功后立即 `counter(m)`,
+出错也保留已传输的 partial:
+
+```rust
+async fn splice_one_way(..., counter: fn(u64)) -> io::Result<u64> {
+    ...
+    counter(m as u64); // 每 chunk 立即上报, 无 buffered 丢失
+    ...
+}
+```
+
+`splice_relay` 传 `crate::monitor::add_up` / `add_down` 函数指针, 类型安全,
+无 closure lifetime 复杂度。
+
+### feat(proxy): Direct 分支 debug 日志加详细字段
+
+从
+
+```
+Direct splice relay to <target> closed: up=<N>B down=<N>B
+```
+
+改成
+
+```
+splice open: peer=<addr> target=<host> initial=<N>B connect=<M>ms
+             pool_hits=<H> pool_misses=<M>
+splice close: peer=<addr> target=<host> up=<N>B down=<N>B relay=<M>ms
+              total=<M>ms pool_hits=<H> pool_misses=<M> pool_idle=<L>
+splice err: peer=<addr> target=<host> reason=<class> err='<msg>'
+            relay=<M>ms total=<M>ms
+```
+
+`reason` 分类: `idle_timeout` | `timeout` | `conn_reset` | `conn_aborted` |
+`unexpected_eof` | `broken_pipe` | `write_zero` | `other`。
+
+网关运维观察点: peer_addr 定位客户端, pool_hits/misses 看池命中率是否合理,
+duration 分布定位慢查询, reason 分布定位问题类型。
+
+### 无 API/config 变化, 向前兼容
+
+pipe pool 完全内部实现, splice_relay 签名不变。debug 日志格式改变但只有
+运维人肉观察, 无自动化 parser 依赖。
+
 ## [v0.4.5-alpha.4] - splice_relay idle timeout (透明网关场景准备) (2026-07-03)
 
 ### feat(proxy): splice_relay 加双向共享 idle timeout
