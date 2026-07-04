@@ -11,3 +11,4 @@ pub mod healthcheck;
 pub mod transparent;
 pub mod sniff;
 pub mod splice;
+pub mod resolver;

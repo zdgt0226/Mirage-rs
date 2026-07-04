@@ -269,7 +269,9 @@ pub async fn proxy_tcp_target(
                 .unwrap_or_else(|_| "?".to_string());
             let initial_len = initial_payload.len();
 
-            let mut target_stream = match tokio::net::TcpStream::connect(&target).await {
+            // v0.4.5-alpha.8: connect_smart = DNS 缓存 + IPv4 优先 + 每尝试超时.
+            // 修 musl 无 DNS 缓存导致每连接 getaddrinfo 120ms + 受限 IPv6 hang.
+            let mut target_stream = match crate::proxy::resolver::connect_smart(&target).await {
                 Ok(s) => s,
                 Err(e) => {
                     error!("Direct connect fail: peer={} target={} err='{}'", peer_str, target, e);
