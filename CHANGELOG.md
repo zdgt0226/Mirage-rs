@@ -1,5 +1,119 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.10] - UNAUTH 限流 IPv6 /64 归一 (逃逸修复) (2026-07-05)
+
+### fix(server): UNAUTH 限流 key IPv6 归一到 /64
+
+**背景**: 握手审计 #4. `handshake.rs` 的 auth-fail 每 IP 限流用完整 `peer_addr.ip()`
+(IPv6 128 位) 做 key. 攻击者控制一个 /64 段 (家宽/VPS 常见分配) 可造 2^64 个"独立
+IP", 每个用满 100 次, **完全逃逸单 IP 限流**, 把 camouflage 路径打到 GLOBAL_UNAUTH
+5000 全局上限.
+
+**修法**: 新增 `rate_limit_key(ip)`:
+- IPv4 → 原样 (单地址已是最细粒度)
+- IPv6 → 清零低 64 位, 归一到 /64 前缀
+
+同一 /64 段的所有地址共享一个限流计数 → 攻击者一个 /64 只能发 100 次 auth-fail.
+`IpSlotGuard` 持有归一后的 IP, Drop 时递减同一 key, 计数一致. 日志仍打印完整
+`peer_addr` (定位真实来源不受影响).
+
+/64 是 IPv6 最小终端分配单位 (RFC 6177), 按 /64 归一既拦得住段内洪泛, 又不会误伤
+不同真实用户 (不同用户在不同 /64).
+
+### 影响面
+
+- 仅服务端 auth-fail 限流路径; 正常认证/客户端不受影响
+- 非破坏性, 无协议/配置变化
+
+## [v0.4.5-alpha.9] - 透明代理 fake-IP 本地路由自动管理 (网关拦截修复) (2026-07-04)
+
+### fix(transparent): sk_lookup 网关/客户端拦截静默失效的根因修复
+
+**审计发现**: sk_lookup 只在内核【本地投递路径】的 socket 查找时触发, 而路由
+决策发生在它之前 (`ip_route_input` → `ip_local_deliver` vs `ip_forward`).
+fake-IP (198.18.0.0/15) 在网关/客户端上默认**不是本机地址**:
+
+- **网关转发场景**: LAN 设备发 fake-IP 包到网关 → 内核判定"转发" → 走 ip_forward
+  → 绕过本地投递 → **sk_lookup 从不运行** → 包发往默认路由 → fake-IP 不可路由丢弃
+- **客户端本机场景**: app connect(fake-IP) → 输出路由走默认 → 不回本地投递 →
+  sk_lookup 同样不触发
+
+即透明拦截**静默失效**. 之前若"能用"大概率是测试环境外部/手动加过 local 路由.
+
+**根因**: 缺一条把 fake-IP 段标记为本机可投递的路由. 全仓库 (install.sh /
+Rust / systemd / README) 都没有设置它.
+
+### 修法: 自动管理 (`transparent_net.rs` 新增)
+
+fake-IP 透明代理启用时 (`start_transparent` attach sk_lookup 成功后) 自动装:
+```
+ip route replace local <fakeip_net>/<prefix> dev lo
+```
+让内核把 fake-IP 段当本机可投递 → 包进 socket 查找路径 → sk_lookup 触发 →
+bpf_sk_assign 到 mirage listener. 进程退出 (SIGTERM/ctrl_c) 时 `ip route del`
+清理. **用户无感, 跟随 fake-IP 开关生命周期** (dae/sing-box/clash 同款做法).
+
+- `ip route replace` 幂等 (已存在不报错)
+- 装失败仅 warn 不 panic (提示需 CAP_NET_ADMIN)
+- 退出清理 best-effort (失败无害: fake-IP 不可路由, mirage 停后 DNS 也不再下发)
+
+### 只装严格必需的一条路由
+
+- **不碰 rp_filter**: 它校验的是【源地址】(LAN 客户端合法可达), fake-IP 是目标
+  地址, 不受影响 —— 之前审计报告里担心的 rp_filter/martian 实际不触发
+- **不碰 ip_forward / NAT**: 那是直连流量转发的网关级配置, 与 sk_lookup 拦截
+  无关, 由用户/install.sh 另行负责 (`sysctl net.ipv4.ip_forward=1` +
+  `iptables MASQUERADE`)
+
+### 影响面
+
+- 只在透明代理 + fake-IP 启用时生效; SOCKS5/HTTP/Mixed 入站不受影响
+- 需要进程有 CAP_NET_ADMIN (透明模式本来就要 root 跑 eBPF attach, 权限已具备)
+- 非破坏性, 无协议变化, 无配置迁移
+
+## [v0.4.5-alpha.8] - 直连 DNS 缓存 + IPv4 优先 (国内延迟修复) (2026-07-04)
+
+### perf(proxy): connect_smart 替代裸 TcpStream::connect(域名)
+
+**现网诊断** (客户端 Alpine musl):
+```
+getent hosts jra.jd.com   → 0.12s  (DNS 解析 120ms)
+curl -4 connect            → 0.065s (拿到 IP 后连接快)
+IPv6                       → 受限
+```
+
+**根因**: musl libc 无内建 DNS 缓存, Alpine 默认无 nscd/systemd-resolved.
+`handler.rs` Direct 分支 `TcpStream::connect(域名)` 每连接走一次完整 getaddrinfo
+(~120ms, GSLB/CDN 域名更慢). 一个网页 200 子请求, 未缓存域名各 +120ms → 累积
+秒级延迟. 透明代理模式下浏览器自己缓存 DNS 所以感觉快, SOCKS5h 模式把域名甩给
+mirage 现场解析, 压力堆在连接热路径.
+
+此外 tokio `TcpStream::connect` 顺序试地址无 Happy-Eyeballs, 域名有 AAAA 记录 +
+IPv6 受限时会 hang 在 v6 尝试.
+
+### 实现 (`resolver.rs` 新增)
+
+- **DNS 缓存**: 解析结果按 60s TTL 缓存, 重复访问 0 网络开销. 容量上限 8192,
+  超限先清过期项, 仍超则整体清空 (有界)
+- **IPv4 优先**: 解析结果 stable sort v4 在前, 受限 IPv6 网络不 hang 在 v6
+- **每尝试 3s 超时**: 单个坏地址 (如不通的 v6) 不拖垮整体, 快速 fallback 下一个
+- **IP 直连短路**: target 本身是 IP 字面量 (如 180.101.49.44:443) 直接连, 不解析
+  不缓存, 保持原 6ms 快路径
+
+只改 Direct 分支 (`handler.rs`), Mirage 隧道出站不受影响 (target 域名由服务端解析).
+
+### 60s TTL 权衡
+
+GSLB/CDN (如 *.gslb.qianxun.com) IP 会轮转, 60s 缓存平衡"重复访问加速"与"IP
+新鲜度". 家用/网关域名基数下缓存表内存可忽略.
+
+### 未覆盖 (记录)
+
+- 服务端 `tcp_relay` 也 `TcpStream::connect(域名)`, 但服务端通常在机房 DNS 快,
+  暂不加缓存. 若未来服务端也慢再补.
+- 未做真 Happy-Eyeballs (v4/v6 并发赛跑). 当前"v4 优先 + 每尝试超时"对受限 IPv6
+  场景已足够, 且更简单. 若未来遇到 v4 慢 v6 快的场景再升级.
+
 ## [v0.4.5-alpha.7] - Mirage 协议握手三项安全强化 (2026-07-04)
 
 ### ⚠️ 破坏性变更: 客户端 + 服务端必须同步升级到 alpha.7+

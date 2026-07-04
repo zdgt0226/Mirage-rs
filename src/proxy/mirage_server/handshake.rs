@@ -27,6 +27,21 @@ use super::{IpSlotGuard, GLOBAL_UNAUTH, UNAUTH_CONNS};
 const TLS_RECORD_HEADER_LEN: usize = 5;
 const TLS_RECORD_MAX_BODY: usize = 16384; // 2^14, RFC 8446 §5.1
 
+/// UNAUTH 限流 key: IPv6 归一到 /64 前缀 (清零低 64 位), 防攻击者用一个 /64
+/// 段造 2^64 个"独立 IP" 逃逸限流. IPv4 原样返回 (单地址已是最细粒度).
+fn rate_limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(_) => ip,
+        std::net::IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            for b in &mut octets[8..] {
+                *b = 0;
+            }
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    }
+}
+
 pub(super) async fn handle_connection(
     mut stream: TcpStream,
     peer_addr: SocketAddr,
@@ -101,7 +116,9 @@ pub(super) async fn handle_connection(
             return;
         }
 
-        let ip = peer_addr.ip();
+        // v0.4.5-alpha.10: 限流 key 用 /64 归一后的 IP, 防攻击者用 /64 段造
+        // 2^64 独立 IPv6 地址逃逸限流. IPv4 保持单地址 (已是最细粒度).
+        let ip = rate_limit_key(peer_addr.ip());
         let _slot_guard = {
             let mut map = UNAUTH_CONNS
                 .get_or_init(|| Mutex::new(HashMap::new()))
