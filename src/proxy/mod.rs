@@ -12,3 +12,4 @@ pub mod transparent;
 pub mod sniff;
 pub mod splice;
 pub mod resolver;
+pub mod transparent_net;

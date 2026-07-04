@@ -566,5 +566,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         }
     }
     info!("Shutting down Mirage-rs...");
+    // 清理透明代理 fake-IP 本地路由 (若装过). best-effort, 失败无害.
+    crate::proxy::transparent_net::cleanup().await;
     std::process::exit(0);
 }

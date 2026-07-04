@@ -38,6 +38,11 @@ pub async fn start_transparent(
         engine.attach_to_netns(fake_ip_net, fake_ip_prefix)?;
     }
 
+    // 2.5 装 fake-IP 本地路由: sk_lookup 只在本地投递路径触发, 不加这条路由
+    // fake-IP 会被内核判为转发/默认路由发出, 拦截静默失效. 自动装, 退出清理,
+    // 用户无感. 见 transparent_net.rs 顶注释.
+    crate::proxy::transparent_net::install(fake_ip_net, fake_ip_prefix).await;
+
     info!("Transparent proxy pipeline fully initialized and attached.");
 
     loop {
