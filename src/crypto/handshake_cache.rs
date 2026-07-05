@@ -120,6 +120,15 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     if tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut header)).await.is_err() {
         return Ok(buf);
     }
+    // 首记录必须是 Handshake(0x16). 若对端回 Alert(0x15) 说明 ClientHello 被拒,
+    // 决不能把 alert 当模板缓存 (会毒化 cache 让所有客户端收到 alert). 返回 Err
+    // 让上层回落到 fallback_server_hello.
+    if header[0] != 0x16 {
+        return Err(anyhow::anyhow!(
+            "camouflage host rejected ClientHello (first record type 0x{:02x}, not Handshake)",
+            header[0]
+        ));
+    }
     buf.extend_from_slice(&header);
     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
     let mut body = vec![0u8; len];

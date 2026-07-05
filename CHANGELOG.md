@@ -1,5 +1,53 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.11] - TLS 指纹 byte-exact 重写为真实 Chromium 150 (2026-07-05)
+
+### ⚠️ 破坏性变更: client + server 必须同步升级
+
+ClientHello 结构大改 (~550B → ~1786B). 无协议帧格式变化 (session_id token 机制
+不变), 但强烈建议成对升级以保持行为一致.
+
+### security(crypto): tls_raw.rs 重写 —— 旧三浏览器指纹全是 2019 年老货
+
+**审计发现** (抓真实 Edge 150.0.4078 / Chrome 150.0.7871 字节 + JA4 交叉验证):
+旧 build_chrome/firefox/safari 的 JA3/JA4 匹配不上任何真实浏览器 —— Chrome 缺
+ChaCha20 (cca9/cca8)、有假 00ff cipher、缺 ML-KEM 后量子 key_share、缺 ECH/ALPS/
+cert_compress/SCT, 大小仅 ~550B (真实 Chromium 150 因后量子 key_share 达 1786B).
+即旧指纹相当于 Chrome 70, 反而成为**独有可识别特征**, 彻底违背 mimicry 初衷.
+
+**重写为 byte-exact Chromium 150** (Chrome/Edge 同 Chromium, 一份模板通吃):
+- 15 cipher (含 cca9/cca8), 删假 00ff
+- **X25519MLKEM768 (0x11ec) 后量子 key_share** —— 2024+ Chromium 默认. ML-KEM-768
+  ek 按 FIPS 203 生成合法系数 (768 系数取 [0,q=3329), 12-bit Kyber 打包), 通过真实
+  服务器模数校验 (随机字节会被 illegal_parameter 拒绝). 每连接新生成避免固定 key
+  成指纹.
+- ECH GREASE (fe0d 250B) / ALPS (44cd) / cert_compress brotli (001b) / SCT (0012)
+- 扩展中段每连接 Fisher-Yates 随机洗牌 (复刻 Chrome 110+), 首尾 GREASE 书挡且
+  保证两值不同 (撞值会产生重复扩展 → 服务器拒绝)
+- 动态: client_random / session_id (Poly1305 token) / SNI / key_share 公钥 /
+  ECH enc / 各 GREASE 每连接随机
+
+**验证**: 生成的 ClientHello JA4 = `t13d1516h2_8daaf6152771_806a8c22fdea`, 与真实
+Chromium 150 完全一致; 实测被 cloudflare 等真实 TLS 服务器接受 (回 ServerHello).
+
+### fix(crypto): handshake_cache fetch 校验首记录 0x16, 防 alert 毒化缓存
+
+`fetch_real_server_hello` 之前不校验对端响应类型, 若 camouflage_host 拒绝
+ClientHello 回 Alert (0x15), 会把 alert 当 ServerHello 模板缓存 → 所有客户端收到
+alert 握手全挂. 现在首记录非 0x16 (Handshake) 即返回 Err → 上层回落
+fallback_server_hello. (此 bug 由上面 ClientHello 变大偶发暴露, 属既有隐患根治.)
+
+### test: 新增 tests/test_tls_fingerprint.rs
+
+锁定 Chromium 150 JA4 决定成分: cipher 集合 / 扩展集合 / 无重复扩展 (200 次随机)
+/ ML-KEM key_share 系数合法性 / CH 大小 ~1786B. 防未来改动静默破坏 mimicry.
+
+### 后续 (记录)
+
+- TODO(v2): 增加 Android OkHttp profile (稳定指纹 + SNI 灵活) 做客户端多样性.
+- 扩展洗牌已做; GREASE 跨槽关联 (Chrome 确定性派生) 未复刻, 但 JA3/JA4 排除
+  GREASE, 不影响指纹, 低优先.
+
 ## [v0.4.5-alpha.10] - UNAUTH 限流 IPv6 /64 归一 (逃逸修复) (2026-07-05)
 
 ### fix(server): UNAUTH 限流 key IPv6 归一到 /64
