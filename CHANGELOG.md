@@ -1,5 +1,30 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.12] - CamouflagePool 死连接检测 (探针一致性硬化) (2026-07-05)
+
+### fix(server): camouflage 预热池探活 + 转发三级降级
+
+**背景**: CamouflagePool (alpha.7) 预热的 TCP 连接可能被 camouflage_host 的 idle
+timeout 提前关闭 (FIN/RST). 之前 acquire 直接交出, 转发写入立即失败, 探针收到
+RST —— 与真实站点行为不一致, 反而暴露 camouflage (GFW 探针做后端一致性检测时可
+识别).
+
+**修复**:
+- `camouflage_pool.rs::is_alive`: 非阻塞 `try_read` 探活. 未发 ClientHello 的预热
+  连接健康态应无可读数据无 EOF → WouldBlock=活; Ok(0)=FIN 死; Ok(n)=意外数据
+  不可用; 其他 Err=RST 死.
+- `acquire()`: 逐条探活, 跳过并丢弃死连接, 返回首条存活的 (全死则 None).
+- `maintain()` 清理: 过期条件加上 `is_alive`, 主动清死连接不只按 age.
+- `camouflage.rs`: 三级降级 + 写失败探测 —— pooled (已探活) → 写失败则即时
+  connect → 再失败才回落 HandshakeCache 模板. 堵住 acquire 后的微秒级 TOCTOU
+  竞态 (拿到时活写入前刚关), 确保探针永远收到真实站点响应或干净降级, 不会收到
+  死连接的 RST.
+
+### 影响面
+
+- 仅服务端 auth-fail (探针) 路径; 正常认证/数据转发不受影响
+- 非破坏性, 无协议/配置变化
+
 ## [v0.4.5-alpha.11] - TLS 指纹 byte-exact 重写为真实 Chromium 150 (2026-07-05)
 
 ### ⚠️ 破坏性变更: client + server 必须同步升级

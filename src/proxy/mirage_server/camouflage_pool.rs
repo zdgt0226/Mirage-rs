@@ -29,6 +29,23 @@ struct Pooled {
     created_at: Instant,
 }
 
+/// 探活: 一条尚未发送 ClientHello 的预热连接, 健康态应【无可读数据且无 EOF】.
+/// 非阻塞 try_read 一字节:
+///   Err(WouldBlock)  无数据无 EOF → 活 (正常)
+///   Ok(0)            对端已发 FIN (idle 超时优雅关闭) → 死
+///   Ok(n>0)          对端意外发来数据 (不该发生) → 不可用
+///   其他 Err         RST / 错误 → 死
+///
+/// 防止把已被 camouflage_host idle-timeout 关掉的死连接交出去 —— 否则转发写入
+/// 立即失败, 探针收到 RST, 与真实站点行为不一致, 暴露 camouflage.
+fn is_alive(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    matches!(
+        stream.try_read(&mut buf),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
 pub struct CamouflagePool {
     host: String,
     pool: Mutex<VecDeque<Pooled>>,
@@ -48,10 +65,18 @@ impl CamouflagePool {
         arc
     }
 
-    /// pop 一条 pre-warmed 连接. 无可用则返回 None, 由调用方 fallback 到新建.
+    /// pop 一条 **存活的** pre-warmed 连接. 逐条探活, 跳过并丢弃已被对端关闭的
+    /// 死连接. 全部死/池空则返回 None, 由调用方 fallback 到即时新建.
     pub async fn acquire(&self) -> Option<TcpStream> {
         let mut pool = self.pool.lock().await;
-        pool.pop_front().map(|p| p.stream)
+        while let Some(p) = pool.pop_front() {
+            if is_alive(&p.stream) {
+                return Some(p.stream);
+            }
+            // 死连接: 丢弃, 试下一条
+            debug!("CamouflagePool: discarded dead stream on acquire");
+        }
+        None
     }
 
     async fn maintain(self: Arc<Self>) {
@@ -59,15 +84,17 @@ impl CamouflagePool {
         loop {
             tokio::time::sleep(REFILL_INTERVAL).await;
 
-            // 淘汰过期连接
+            // 淘汰过期 + 已死 (对端 FIN/RST) 连接
             {
                 let mut pool = self.pool.lock().await;
                 let now = Instant::now();
                 let before = pool.len();
-                pool.retain(|p| now.duration_since(p.created_at) < STREAM_MAX_AGE);
+                pool.retain(|p| {
+                    now.duration_since(p.created_at) < STREAM_MAX_AGE && is_alive(&p.stream)
+                });
                 let purged = before - pool.len();
                 if purged > 0 {
-                    debug!("CamouflagePool: purged {} stale streams", purged);
+                    debug!("CamouflagePool: purged {} stale/dead streams", purged);
                 }
             }
 
