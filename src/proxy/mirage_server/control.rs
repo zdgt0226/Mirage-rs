@@ -29,7 +29,9 @@ pub(super) async fn dispatch_authenticated(
     //     帧格式: [0x01 type=TIME_SYNC][0x01 proto_ver][8B u64 BE server unix sec] = 10 字节
     {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // unwrap_or_default: 服务端时钟 < epoch (嵌入式无 RTC 未同步 NTP) 不 panic
+        // 崩溃, 回落 0. 见 time_sync::now_sec 注释.
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut frame = [0u8; 10];
         frame[0] = 0x01; // type = TIME_SYNC
         frame[1] = 0x01; // proto version

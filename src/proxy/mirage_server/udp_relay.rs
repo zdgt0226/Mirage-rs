@@ -163,11 +163,14 @@ pub(super) async fn handle_udp_relay(
 
                 let payload = &frame[offset..];
 
-                // udp_socket.send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为)
-                if let Ok(mut addrs) = tokio::net::lookup_host((target_addr_str.clone(), port)).await {
-                    if let Some(socket_addr) = addrs.next() {
-                        let _ = udp_socket.send_to(payload, socket_addr).await;
-                    }
+                // v0.4.5-alpha.16: 走 resolver::resolve_first (60s 缓存 + IPv4 优先 +
+                // 并发限流), 不再每 UDP 包裸调 lookup_host 打满阻塞池 (高频 QUIC /
+                // 唯一域名洪泛防护). IP 字面量 (ATYP 1/4) 直接构造不解析.
+                // send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为).
+                if let Ok(socket_addr) =
+                    crate::proxy::resolver::resolve_first(&target_addr_str, port).await
+                {
+                    let _ = udp_socket.send_to(payload, socket_addr).await;
                 }
             }
         }

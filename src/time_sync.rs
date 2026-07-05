@@ -19,9 +19,13 @@ static TIME_OFFSET: AtomicI64 = AtomicI64::new(0);
 /// auth token、replay cache 等所有协议层时间运算都用这个, 不要直接
 /// SystemTime::now() 否则会绕过同步.
 pub fn now_sec() -> u64 {
+    // unwrap_or_default: 嵌入式/软路由 (OpenWRT 无 RTC) 开机未同步 NTP 时系统时钟
+    // 可能 < UNIX_EPOCH → duration_since 返回 Err. 绝不能在核心时间基准里 panic
+    // 崩掉整个进程. 回落到 0 (epoch), NTP 同步后自动恢复; 服务端 TIME_SYNC 也会
+    // 纠正客户端 offset.
     let local = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs() as i64;
     let offset = TIME_OFFSET.load(Ordering::Relaxed);
     (local + offset) as u64
@@ -32,7 +36,7 @@ pub fn now_sec() -> u64 {
 pub fn set_offset_from_server_time(server_time: u64) {
     let local = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default() // 时钟 < epoch 不 panic, 见 now_sec 注释
         .as_secs() as i64;
     let offset = (server_time as i64) - local;
 
@@ -75,7 +79,7 @@ mod tests {
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn local_now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
     }
 
     fn reset_offset() {

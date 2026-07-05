@@ -1,5 +1,40 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.16] - UDP DNS 缓存/限流 + 时钟回拨 panic 兜底 (2026-07-06)
+
+### fix(server): UDP 转发 DNS 走缓存 + 并发限流 (防阻塞池饿死)
+
+**问题**: `mirage_server/udp_relay.rs` 对每个域名类型 (ATYP=3) 的 UDP 包**裸调
+`tokio::net::lookup_host`**, 完全绕过 resolver.rs 的 60s DNS 缓存. UDP 无连接,
+高频 QUIC/HTTP3 (网页瞬间数百包) 或恶意唯一域名洪泛 (每包随机 `*.invalid`) 会瞬间
+向 tokio spawn_blocking 阻塞池 (默认 512 线程) 发起海量 getaddrinfo, 打满阻塞池
+饿死其他异步任务 (文件 IO / 其他 TCP 解析).
+
+**修复**:
+- `resolver.rs` 新增 `pub(crate) resolve_first(host, port) -> SocketAddr`: IP 字面量
+  直接构造; 域名走 60s 缓存 + IPv4 优先. UDP relay 改用它.
+- `resolver.rs` 加**全局 DNS 并发信号量** (128 permit): resolve_cached 实际
+  lookup_host 前先拿 permit, 唯一域名洪泛时新解析排队而非无限 spawn, 给阻塞池留
+  384 线程. 缓存命中不占 permit. 同时保护 TCP connect_smart + UDP resolve_first.
+
+### fix: 时钟 < UNIX_EPOCH 时的 panic 兜底 (嵌入式/软路由)
+
+**问题**: OpenWRT 路由器/无 RTC 软路由开机未同步 NTP 时, 系统时钟可能 < UNIX_EPOCH,
+`SystemTime::now().duration_since(UNIX_EPOCH)` 返回 Err, `.unwrap()` 直接 panic 崩溃
+整个进程. 排查发现 **3 处生产 + 1 处测试** 同类隐患 (报告只提了 control.rs 一处,
+最致命的是核心时间基准 `now_sec`):
+- `time_sync::now_sec` (全代码库时间基准, token/replay 都用) 🔴
+- `time_sync::set_offset_from_server_time` (客户端 offset 计算)
+- `mirage_server/control.rs` TIME_SYNC 帧 (报告指出的)
+- `time_sync` test helper
+
+全部 `.unwrap()` → `.unwrap_or_default()`: 时钟异常回落 0 (epoch), NTP 同步后自动
+恢复, 服务端 TIME_SYNC 也纠正客户端 offset. 绝不在核心协议时间运算里 panic.
+
+### 影响面
+
+- 仅服务端 (UDP relay) + 全平台 (时钟兜底); 非破坏性, 无协议/配置变化
+
 ## [v0.4.5-alpha.15] - handshake_cache 启动主动预热 (消除冷启动窗口) (2026-07-06)
 
 ### security(server): HandshakeCache 服务端启动时主动预热
