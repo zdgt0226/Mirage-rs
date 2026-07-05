@@ -71,6 +71,11 @@ pub async fn start_server(
     // TCP 3-way RTT 时序侧信道. 详见 camouflage_pool.rs 顶注释.
     let cam_pool = CamouflagePool::new(camouflage_host.to_string());
 
+    // v0.4.5-alpha.15: accept 前主动预热 HandshakeCache. 消除懒预热的冷启动窗口
+    // (重启后首个连接不再触发 fetch 或拿 fallback → 时序异常). camouflage 不可达
+    // 时最多阻塞 ~5s 后放行 (懒路径兜底), 不长期挂起启动.
+    crate::crypto::handshake_cache::prewarm(camouflage_host).await;
+
     let password = password.to_string();
     loop {
         match listener.accept().await {

@@ -3,11 +3,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use rand::RngExt;
 
 static HANDSHAKE_CACHE: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 static WARMING_UP: AtomicBool = AtomicBool::new(false);
+/// 30 分钟刷新后台任务只 spawn 一次 (主动预热或懒预热谁先谁 spawn).
+static REFRESH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
 struct WarmGuard;
 impl Drop for WarmGuard {
@@ -16,80 +18,107 @@ impl Drop for WarmGuard {
     }
 }
 
+fn cache() -> &'static Mutex<Vec<Vec<u8>>> {
+    HANDSHAKE_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 并发拉 5 个真实 ServerHello 模板, 收集成功的.
+async fn fetch_batch(host: &str) -> Vec<Vec<u8>> {
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..5 {
+        let h = host.to_string();
+        set.spawn(async move { fetch_real_server_hello(&h).await });
+    }
+    let mut out = Vec::new();
+    while let Some(res) = set.join_next().await {
+        if let Ok(Ok(t)) = res {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// 启动一次性的 30 分钟刷新后台任务 (幂等, 全局只一个).
+fn spawn_refresh_task(camouflage_host: &str) {
+    if REFRESH_SPAWNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let host = camouflage_host.to_string();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            let templates = fetch_batch(&host).await;
+            if !templates.is_empty() {
+                *cache().lock().await = templates;
+            }
+        }
+    });
+}
+
+/// 服务端启动时主动预热 HandshakeCache: 抢先拉真实模板填充 cache + 启动刷新任务.
+/// 消除懒预热的冷启动窗口 —— 首个连接不再触发 fetch 或拿 fallback, 避免重启后
+/// 头几个连接时序异常被探针识别. 应在 accept loop 之前 await.
+///
+/// camouflage 不可达时最多阻塞 ~5s (fetch 内建超时) 后返回, cache 留空由懒路径
+/// 在首连接时重试 (降级但不阻塞启动过久).
+pub async fn prewarm(camouflage_host: &str) {
+    if !cache().lock().await.is_empty() {
+        return; // 已有模板
+    }
+    if WARMING_UP.swap(true, Ordering::SeqCst) {
+        return; // 已在预热 (启动阶段理论上不会撞)
+    }
+    let _guard = WarmGuard;
+    info!("Prewarming HandshakeCache from {} at startup", camouflage_host);
+    let templates = fetch_batch(camouflage_host).await;
+    if !templates.is_empty() {
+        let mut guard = cache().lock().await;
+        guard.extend(templates);
+        info!("HandshakeCache prewarmed with {} real templates", guard.len());
+    } else {
+        warn!(
+            "HandshakeCache prewarm got no templates from {} — will retry lazily on first connection",
+            camouflage_host
+        );
+    }
+    spawn_refresh_task(camouflage_host);
+}
+
 pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec<u8> {
     let client_session_id = get_session_id(client_hello).unwrap_or(&[]);
-    
-    let cache = HANDSHAKE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
-    let mut cache_guard = cache.lock().await;
 
-    if cache_guard.is_empty() {
+    if cache().lock().await.is_empty() {
+        // 主动预热正常应已填充; 走到这说明预热失败或未运行 —— 懒预热兜底.
         if !WARMING_UP.swap(true, Ordering::SeqCst) {
-            drop(cache_guard);
             let _guard = WarmGuard;
-            info!("Fetching real ServerHello from {} to warm up HandshakeCache", camouflage_host);
-            let mut set = tokio::task::JoinSet::new();
-            for _ in 0..5 {
-                let host = camouflage_host.to_string();
-                set.spawn(async move {
-                    fetch_real_server_hello(&host).await
-                });
-            }
-            let mut new_templates = Vec::new();
-            while let Some(res) = set.join_next().await {
-                if let Ok(Ok(template)) = res {
-                    new_templates.push(template);
-                }
-            }
-            
-            let mut guard = cache.lock().await;
-            if !new_templates.is_empty() {
-                guard.extend(new_templates);
+            info!("HandshakeCache empty, lazy-warming from {}", camouflage_host);
+            let templates = fetch_batch(camouflage_host).await;
+            let mut guard = cache().lock().await;
+            if !templates.is_empty() {
+                guard.extend(templates);
             } else {
                 error!("Failed to fetch any templates from {}. Using fallback.", camouflage_host);
                 guard.push(fallback_server_hello(client_hello, client_session_id));
             }
-            cache_guard = guard;
-
-            // Spawn background task to refresh cache every 30 minutes
-            let host_bg = camouflage_host.to_string();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
-                    let mut set = tokio::task::JoinSet::new();
-                    for _ in 0..5 {
-                        let h = host_bg.clone();
-                        set.spawn(async move { fetch_real_server_hello(&h).await });
-                    }
-                    let mut templates = Vec::new();
-                    while let Some(res) = set.join_next().await {
-                        if let Ok(Ok(template)) = res {
-                            templates.push(template);
-                        }
-                    }
-                    if !templates.is_empty() {
-                        let cache = HANDSHAKE_CACHE.get().unwrap();
-                        let mut guard = cache.lock().await;
-                        *guard = templates;
-                    }
-                }
-            });
+            drop(guard);
+            spawn_refresh_task(camouflage_host);
         } else {
-            drop(cache_guard);
+            // 别人正在预热, 等它完成
             let mut attempts = 0;
             while WARMING_UP.load(Ordering::SeqCst) && attempts < 50 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 attempts += 1;
             }
-            cache_guard = cache.lock().await;
-            if cache_guard.is_empty() {
+            if cache().lock().await.is_empty() {
                 return fallback_server_hello(client_hello, client_session_id);
             }
         }
     }
 
-    let mut rng = rand::rng();
-    let template_idx = rng.random_range(0..cache_guard.len());
-    let response = cache_guard[template_idx].clone();
+    let guard = cache().lock().await;
+    let template_idx = rand::rng().random_range(0..guard.len());
+    let response = guard[template_idx].clone();
+    drop(guard);
 
     patch_server_hello(&response, client_session_id)
 }

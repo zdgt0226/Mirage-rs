@@ -1,5 +1,32 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.15] - handshake_cache 启动主动预热 (消除冷启动窗口) (2026-07-06)
+
+### security(server): HandshakeCache 服务端启动时主动预热
+
+**背景**: 旧版 HandshakeCache 是**懒预热** —— 首个连接调 get_server_hello 时才
+fetch 真实模板. 造成冷启动窗口: 服务端重启后头几个连接明显更慢 (触发/等待 fetch)
+或拿到 fallback. GFW 探针在重启窗口打过来能捕获这个时序异常, 识别差别对待.
+
+**修复**:
+- 新增 `handshake_cache::prewarm(camouflage_host)`: 抢先拉真实模板填充 cache +
+  启动 30min 刷新任务.
+- `mirage_server::start_server` 在 **accept loop 之前 await prewarm** —— 首个连接
+  到来时 cache 已就绪, 无冷启动窗口.
+- camouflage 不可达时 prewarm 最多阻塞 ~5s (fetch 内建超时) 后放行, cache 留空由
+  懒路径在首连接兜底, 不长期挂起启动.
+
+### refactor: 去重 warmup 逻辑
+
+抽出 `fetch_batch` (并发拉 5 模板) + `spawn_refresh_task` (幂等, REFRESH_SPAWNED
+守卫全局只一个刷新任务) + `cache()` helper. prewarm 与懒路径共用, 消除原
+get_server_hello 里内联重复的 fetch-loop + refresh-spawn.
+
+### 影响面
+
+- 仅服务端; 启动多 ~1 RTT (camouflage 可达时) 或 ~5s (不可达时) 换取无冷启动窗口
+- 非破坏性, 无协议/配置变化. 懒预热路径保留作兜底
+
 ## [v0.4.5-alpha.14] - fallback 合成 ServerHello 质量提升 (2026-07-06)
 
 ### fix(crypto): handshake_cache fallback 合成模板结构合法化
