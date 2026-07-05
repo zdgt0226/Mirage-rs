@@ -281,10 +281,13 @@ verify_binary_integrity() {
     # 进阶: GitHub API 双通道 (需 python3 解 JSON)
     if command -v python3 >/dev/null 2>&1; then
         info "向 GitHub API 取期望 digest..."
+        # 指定了 tag 走 releases/tags/<tag>, 否则 releases/latest.
+        local api_url="https://api.github.com/repos/zdgt0226/Mirage-rs/releases/latest"
+        [[ -n "$MIRAGE_TAG" ]] && api_url="https://api.github.com/repos/zdgt0226/Mirage-rs/releases/tags/${MIRAGE_TAG}"
         local api_resp
         api_resp=$(curl -sfL --max-time 10 \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/zdgt0226/Mirage-rs/releases/latest" 2>/dev/null || true)
+            "$api_url" 2>/dev/null || true)
         if [[ -n "$api_resp" ]]; then
             expected_sha=$(BINARY_NAME="$binary_name" python3 -c '
 import json, os, sys
@@ -343,6 +346,64 @@ ETC_DIR="/etc/mirage-rs"
 STATE_DIR="/var/lib/mirage-rs"
 LOG_DIR="/var/log/mirage-rs"
 
+# 安装版本: 空 = 最新 release; 可用环境变量 MIRAGE_TAG=v0.4.5-alpha.10 预设 (跳过交互).
+MIRAGE_TAG="${MIRAGE_TAG:-}"
+# init 系统: main 启动时 detect_init 填充 (systemd / openrc / none).
+INIT_SYS=""
+
+# 让用户选择安装的 release tag (留空装 latest). 已通过环境变量指定则不交互.
+select_version() {
+    if [[ -n "$MIRAGE_TAG" ]]; then
+        info "使用环境变量指定的版本: $MIRAGE_TAG"
+        return
+    fi
+    echo "" >&2
+    info "安装版本 (留空 = 最新 release):"
+    echo "    可在 https://github.com/zdgt0226/Mirage-rs/releases 查看; 例: v0.4.5-alpha.10" >&2
+    MIRAGE_TAG=$(ask "指定版本 tag (留空装最新)" "")
+    if [[ -n "$MIRAGE_TAG" ]]; then
+        info "将安装指定版本: $MIRAGE_TAG"
+    else
+        info "将安装最新 release (latest)"
+    fi
+}
+
+# 探测服务管理器. 优先级: systemd (需真正在跑, 光有二进制不算) > OpenRC
+# (Alpine/Gentoo) > SysV init (老 Debian/CentOS6/精简系统) > none.
+detect_init() {
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        echo systemd
+    elif command -v rc-service >/dev/null 2>&1 || command -v openrc-run >/dev/null 2>&1 \
+        || [ -x /sbin/openrc-run ]; then
+        echo openrc
+    elif [ -d /etc/init.d ] && { command -v update-rc.d >/dev/null 2>&1 \
+        || command -v chkconfig >/dev/null 2>&1 || command -v service >/dev/null 2>&1; }; then
+        echo sysvinit
+    else
+        echo none
+    fi
+}
+
+# 输出 init-aware 的启动/日志命令提示 (供安装完成后打印).
+svc_start_hint() { # role
+    case "$INIT_SYS" in
+        openrc)   echo "rc-service mirage-rs-$1 start" ;;
+        sysvinit) echo "service mirage-rs-$1 start" ;;
+        *)        echo "systemctl start mirage-rs-$1" ;;
+    esac
+}
+svc_restart_hint() { # role
+    case "$INIT_SYS" in
+        openrc)   echo "rc-service mirage-rs-$1 restart" ;;
+        sysvinit) echo "service mirage-rs-$1 restart" ;;
+        *)        echo "systemctl restart mirage-rs-$1" ;;
+    esac
+}
+svc_log_hint() { # role
+    # 仅 systemd 有 journald; OpenRC/SysV 落到日志文件.
+    if [ "$INIT_SYS" = systemd ]; then echo "journalctl -u mirage-rs-$1 -f"; else echo "tail -f ${LOG_DIR}/$1.log"; fi
+}
+
 setup_fhs() {
     info "创建 FHS 标准目录..."
     mkdir -p "$ETC_DIR" "$ETC_DIR/geosite" "$STATE_DIR" "$LOG_DIR"
@@ -368,9 +429,16 @@ setup_fhs() {
             *) err "不支持的系统架构: $(uname -m)" ;;
         esac
         
-        # 文件名跟 release.yml 上传命名严格一致 (mirage-rs-<arch>-musl)
-        local download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-rs-${arch}-musl"
-        info "下载链接: $download_url"
+        # 文件名跟 release.yml 上传命名严格一致 (mirage-rs-<arch>-musl).
+        # MIRAGE_TAG 非空 → 指定版本; 否则 latest.
+        local download_url
+        if [[ -n "$MIRAGE_TAG" ]]; then
+            download_url="https://github.com/zdgt0226/Mirage-rs/releases/download/${MIRAGE_TAG}/mirage-rs-${arch}-musl"
+            info "下载指定版本 ${MIRAGE_TAG}: $download_url"
+        else
+            download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-rs-${arch}-musl"
+            info "下载最新版本: $download_url"
+        fi
 
         # 使用 curl 下载，带进度条
         if ! curl -# -fLo "$BIN_PATH" "$download_url"; then
@@ -383,6 +451,142 @@ setup_fhs() {
     
     chmod 755 "$BIN_PATH"
     ok "核心程序部署完毕 (Aya CO-RE eBPF Ready)。"
+}
+
+# 按探测到的 init 系统分派服务注册. 未识别则打印手动启动命令.
+setup_service() {
+    local role=$1
+    case "$INIT_SYS" in
+        systemd)  setup_systemd "$role" ;;
+        openrc)   setup_openrc  "$role" ;;
+        sysvinit) setup_sysv    "$role" ;;
+        *)
+            warn "未识别的 init 系统 (非 systemd/OpenRC/SysV), 跳过服务注册。"
+            info "可手动前台运行: ${BIN_PATH} ${role} -c ${ETC_DIR}/config_${role}.json"
+            ;;
+    esac
+}
+
+# SysV init (老 Debian/CentOS6/精简系统). LSB 头 + 自包含 nohup+pidfile 管理,
+# 不依赖 start-stop-daemon 或 RHEL /etc/init.d/functions, 最大可移植性.
+# 注意: SysV 无 supervisor, 崩溃不自动重启 (systemd/OpenRC 才有). 可接受降级.
+setup_sysv() {
+    local role=$1
+    local svc="mirage-rs-${role}"
+    local init_path="/etc/init.d/${svc}"
+
+    cat > "$init_path" <<EOF
+#!/bin/sh
+# chkconfig: 2345 20 80
+# description: Mirage-rs High-Performance Proxy (${role})
+### BEGIN INIT INFO
+# Provides:          ${svc}
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Mirage-rs High-Performance Proxy (${role})
+### END INIT INFO
+
+NAME="${svc}"
+BIN="${BIN_PATH}"
+ARGS="${role} -c ${ETC_DIR}/config_${role}.json"
+# /var/run 而非 /run: 老系统 (CentOS6) 只有 /var/run; 新系统 /var/run→/run symlink, 通吃.
+PIDFILE="/var/run/${svc}.pid"
+LOGFILE="${LOG_DIR}/${role}.log"
+WORKDIR="${STATE_DIR}"
+
+is_running() {
+    [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+start() {
+    if is_running; then echo "\$NAME already running (pid \$(cat "\$PIDFILE"))"; return 0; fi
+    echo "Starting \$NAME..."
+    cd "\$WORKDIR" 2>/dev/null || true
+    ulimit -n 1048576 2>/dev/null || true
+    ulimit -l unlimited 2>/dev/null || true
+    nohup "\$BIN" \$ARGS >> "\$LOGFILE" 2>&1 &
+    echo \$! > "\$PIDFILE"
+    sleep 1
+    if is_running; then echo "\$NAME started (pid \$(cat "\$PIDFILE"))"; else
+        echo "\$NAME failed to start, see \$LOGFILE"; rm -f "\$PIDFILE"; return 1; fi
+}
+
+stop() {
+    if ! is_running; then echo "\$NAME not running"; rm -f "\$PIDFILE"; return 0; fi
+    echo "Stopping \$NAME..."
+    kill "\$(cat "\$PIDFILE")" 2>/dev/null
+    i=0; while is_running && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); done
+    is_running && kill -9 "\$(cat "\$PIDFILE")" 2>/dev/null
+    rm -f "\$PIDFILE"
+    echo "\$NAME stopped"
+}
+
+case "\$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  if is_running; then echo "\$NAME running (pid \$(cat "\$PIDFILE"))"; else echo "\$NAME stopped"; exit 3; fi ;;
+    *)       echo "Usage: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+EOF
+    chmod 755 "$init_path"
+
+    # 注册开机自启: Debian 系 update-rc.d, RHEL 系 chkconfig, 都没有则仅装脚本
+    if command -v update-rc.d >/dev/null 2>&1; then
+        update-rc.d "$svc" defaults >/dev/null 2>&1 || true
+    elif command -v chkconfig >/dev/null 2>&1; then
+        chkconfig --add "$svc" >/dev/null 2>&1 || true
+        chkconfig "$svc" on >/dev/null 2>&1 || true
+    else
+        warn "无 update-rc.d/chkconfig, 已装 init 脚本但未注册开机自启。"
+    fi
+
+    "$init_path" restart >/dev/null 2>&1 || "$init_path" start >/dev/null 2>&1 || true
+    ok "SysV init 服务已创建并启用: ${svc} (${init_path})"
+    warn "SysV 无进程守护, 崩溃不会自动重启 (如需守护请用 systemd/OpenRC 系统)。"
+}
+
+# OpenRC (Alpine / Gentoo) 服务. 用 supervise-daemon 实现崩溃自动重启 (对齐
+# systemd Restart=on-failure). memlock unlimited 供 eBPF 用.
+setup_openrc() {
+    local role=$1
+    local svc="mirage-rs-${role}"
+    local init_path="/etc/init.d/${svc}"
+
+    cat > "$init_path" <<EOF
+#!/sbin/openrc-run
+
+name="Mirage-rs (${role})"
+description="Mirage-rs High-Performance Proxy (${role})"
+
+supervisor=supervise-daemon
+command="${BIN_PATH}"
+command_args="${role} -c ${ETC_DIR}/config_${role}.json"
+directory="${STATE_DIR}"
+pidfile="/run/${svc}.pid"
+respawn_delay=3
+output_log="${LOG_DIR}/${role}.log"
+error_log="${LOG_DIR}/${role}.log"
+
+# 高 fd 上限 + memlock 无限 (eBPF map 分配需要, 老内核尤其)
+rc_ulimit="-n 1048576 -l unlimited"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    chmod 755 "$init_path"
+    rc-update add "$svc" default >/dev/null 2>&1 || true
+    # restart 兼容首次安装 (未运行时 restart 等价 start)
+    if rc-service "$svc" restart >/dev/null 2>&1; then
+        ok "OpenRC 服务已创建并启用: ${svc} (/etc/init.d/${svc})"
+    else
+        rc-service "$svc" start >/dev/null 2>&1 || true
+        ok "OpenRC 服务已创建: ${svc}。若未自动启动请查看 ${LOG_DIR}/${role}.log"
+    fi
 }
 
 setup_systemd() {
@@ -499,7 +703,7 @@ EOM
 EOF
     
     ok "服务端配置文件已保存至: ${ETC_DIR}/config_server.json"
-    setup_systemd "server"
+    setup_service "server"
 
     # ── 节点导出 (供客户端导入) ──
     # 自动探测本机公网 IP 作为默认值; 用户可回车采纳 / 输域名覆盖 / 留空跳过
@@ -534,7 +738,7 @@ EOF
         echo >&2
     fi
 
-    info "你可以使用以下命令启动服务端: systemctl start mirage-rs-server"
+    info "你可以使用以下命令启动服务端: $(svc_start_hint server)"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -772,9 +976,9 @@ config_client() {
 EOF
 
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
-    setup_systemd "client"
-    
-    info "你可以使用以下命令启动客户端: systemctl start mirage-rs-client"
+    setup_service "client"
+
+    info "你可以使用以下命令启动客户端: $(svc_start_hint client)"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -786,7 +990,7 @@ print_brutal_hint() {
     echo "请手动执行以下步骤："
     echo "  1. 确保 tcp-brutal 内核模块已安装：https://github.com/apernet/tcp-brutal"
     echo "  2. 在客户端配置文件 outbounds[mirage] 块中添加 \"brutal_rate_mbps\": 8"
-    echo "  3. 重启 mirage-rs：systemctl restart mirage-rs-client"
+    echo "  3. 重启 mirage-rs：$(svc_restart_hint client)"
     echo "=========================================================="
 }
 
@@ -809,22 +1013,59 @@ uninstall() {
     # 兼容两种命名: 新 (mirage-rs-*) + 旧 (mirage-*, alpha.8 之前的旧机器)
     local services=(mirage-rs-server mirage-rs-client mirage-server mirage-client)
 
-    info "停止并禁用所有 mirage 相关 systemd 服务..."
-    for svc in "${services[@]}"; do
-        if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
-            systemctl stop "${svc}.service" 2>/dev/null || true
-        fi
-        if systemctl is-enabled --quiet "${svc}.service" 2>/dev/null; then
-            systemctl disable "${svc}.service" 2>/dev/null || true
-        fi
-        local unit_path="/etc/systemd/system/${svc}.service"
-        if [[ -f "$unit_path" ]]; then
-            rm -f "$unit_path"
-            info "已删除 ${unit_path}"
-        fi
-    done
-    systemctl daemon-reload 2>/dev/null || true
-    ok "Systemd 服务清理完毕"
+    # systemd 清理 (有 systemctl 才做)
+    if command -v systemctl >/dev/null 2>&1; then
+        info "停止并禁用所有 mirage 相关 systemd 服务..."
+        for svc in "${services[@]}"; do
+            if systemctl is-active --quiet "${svc}.service" 2>/dev/null; then
+                systemctl stop "${svc}.service" 2>/dev/null || true
+            fi
+            if systemctl is-enabled --quiet "${svc}.service" 2>/dev/null; then
+                systemctl disable "${svc}.service" 2>/dev/null || true
+            fi
+            local unit_path="/etc/systemd/system/${svc}.service"
+            if [[ -f "$unit_path" ]]; then
+                rm -f "$unit_path"
+                info "已删除 ${unit_path}"
+            fi
+        done
+        systemctl daemon-reload 2>/dev/null || true
+        ok "Systemd 服务清理完毕"
+    fi
+
+    # OpenRC 清理 (有 rc-service 才做)
+    if command -v rc-service >/dev/null 2>&1; then
+        info "停止并禁用所有 mirage 相关 OpenRC 服务..."
+        for svc in "${services[@]}"; do
+            rc-service "$svc" stop 2>/dev/null || true
+            rc-update del "$svc" default 2>/dev/null || true
+            if [[ -f "/etc/init.d/${svc}" ]]; then
+                rm -f "/etc/init.d/${svc}"
+                info "已删除 /etc/init.d/${svc}"
+            fi
+        done
+        ok "OpenRC 服务清理完毕"
+    fi
+
+    # SysV init 清理 (仅当不是 OpenRC —— 两者都用 /etc/init.d, OpenRC 分支已处理过).
+    # 用 update-rc.d/chkconfig 反注册, 停掉并删脚本.
+    if ! command -v rc-service >/dev/null 2>&1 \
+        && { command -v update-rc.d >/dev/null 2>&1 || command -v chkconfig >/dev/null 2>&1 || command -v service >/dev/null 2>&1; }; then
+        info "停止并禁用所有 mirage 相关 SysV init 服务..."
+        for svc in "${services[@]}"; do
+            local sysv_path="/etc/init.d/${svc}"
+            [[ -f "$sysv_path" ]] || continue
+            "$sysv_path" stop 2>/dev/null || true
+            if command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d -f "$svc" remove 2>/dev/null || true
+            elif command -v chkconfig >/dev/null 2>&1; then
+                chkconfig --del "$svc" 2>/dev/null || true
+            fi
+            rm -f "$sysv_path"
+            info "已删除 ${sysv_path}"
+        done
+        ok "SysV init 服务清理完毕"
+    fi
 
     # 二进制
     if [[ -f "$BIN_PATH" ]]; then
@@ -876,6 +1117,13 @@ main() {
         err "需要 Root 权限。请使用 sudo bash install.sh 运行。"
     fi
 
+    # 探测 init 系统 (systemd / openrc / none), 供服务注册 + 提示分派.
+    INIT_SYS=$(detect_init)
+    info "检测到 init 系统: ${INIT_SYS}"
+    if [ "$INIT_SYS" = none ]; then
+        warn "未检测到 systemd / OpenRC / SysV init, 服务将不会自动注册 (可手动前台运行)。"
+    fi
+
     local mode=$(ask_choice "请选择操作" \
         "部署服务端 (Server)" \
         "部署客户端 (Client)" \
@@ -886,6 +1134,9 @@ main() {
         uninstall
         return
     fi
+
+    # 选择安装版本 (留空 = latest)
+    select_version
 
     setup_fhs
     optimize_sysctl
@@ -908,7 +1159,7 @@ main() {
     title "安装完成！"
     echo -e "  配置目录: $(_c 36 "${ETC_DIR}")"
     echo -e "  数据目录: $(_c 36 "${STATE_DIR}")"
-    echo -e "  日志命令: $(_c 36 "journalctl -u mirage-rs-server -f")"
+    echo -e "  日志命令: $(_c 36 "$(svc_log_hint server)")"
     echo -e "\n  感谢使用 Mirage-rs，极致性能尽在掌握。"
 }
 
