@@ -247,12 +247,19 @@ use tokio::time::timeout;
 use std::time::Duration;
 
 pub async fn read_server_handshake(stream: &mut tokio::net::tcp::OwnedReadHalf) -> Result<()> {
+    // v0.4.5-alpha.17: 放弃超时随机化, 消除固定 12s/1.5s 阈值的客户端时序指纹.
+    // GFW 若主动操纵服务端响应时序 (拦截/延迟 ServerHello) 测客户端恒定放弃时间可
+    // 识别 Mirage 客户端. 每连接各随机一次 (非每轮, 保持单次握手内一致), 围绕原值
+    // 抖动: pre-CCS 10~14s, post-CCS 1.2~1.8s —— 仍足够宽容真实慢链路, 但不再恒定.
+    let pre_ccs_timeout = Duration::from_millis(10_000 + fastrand::u64(0..=4_000));
+    let post_ccs_timeout = Duration::from_millis(1_200 + fastrand::u64(0..=600));
+
     let mut saw_sh = false;
     let mut saw_ccs = false;
     let mut saw_enc = false;
 
     loop {
-        let t = if saw_ccs { Duration::from_millis(1500) } else { Duration::from_secs(12) };
+        let t = if saw_ccs { post_ccs_timeout } else { pre_ccs_timeout };
         let mut header = [0u8; 5];
         match timeout(t, stream.read_exact(&mut header)).await {
             Ok(Ok(_)) => {
