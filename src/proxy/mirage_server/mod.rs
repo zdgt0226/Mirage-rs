@@ -33,10 +33,20 @@ pub(super) struct IpSlotGuard(pub(super) IpAddr);
 impl Drop for IpSlotGuard {
     fn drop(&mut self) {
         GLOBAL_UNAUTH.fetch_sub(1, Ordering::SeqCst);
-        let mut map = UNAUTH_CONNS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        if let Some(c) = map.get_mut(&self.0) {
-            *c = c.saturating_sub(1);
-            if *c == 0 { map.remove(&self.0); }
+        // ⚠️ 决不在 Drop 里对锁 .unwrap(): 若此 drop 发生在 panic 栈展开中, 锁又
+        // 恰好中毒 (持锁线程 panic 过), unwrap 二次 panic → double-panic abort
+        // 当场杀进程. 用 into_inner 容忍中毒继续 —— 临界区只做 get_mut/
+        // saturating_sub/remove, 数据结构不会被破坏到不可用. get() 而非
+        // get_or_init: 能存在 Guard 说明插入侧已初始化过 map, 没有就没东西可减.
+        if let Some(mutex) = UNAUTH_CONNS.get() {
+            let mut map = match mutex.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(c) = map.get_mut(&self.0) {
+                *c = c.saturating_sub(1);
+                if *c == 0 { map.remove(&self.0); }
+            }
         }
     }
 }

@@ -120,10 +120,12 @@ pub(super) async fn handle_connection(
         // 2^64 独立 IPv6 地址逃逸限流. IPv4 保持单地址 (已是最细粒度).
         let ip = rate_limit_key(peer_addr.ip());
         let _slot_guard = {
-            let mut map = UNAUTH_CONNS
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap();
+            // 锁中毒容忍 (into_inner), 不 unwrap panic —— 跟 IpSlotGuard::drop 同锁
+            // 同原则. HashMap 数据没被破坏 (临界区无 panic 源).
+            let mut map = match UNAUTH_CONNS.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             let count = map.entry(ip).or_insert(0);
             if *count >= 100 {
                 GLOBAL_UNAUTH.fetch_sub(1, Ordering::SeqCst);
