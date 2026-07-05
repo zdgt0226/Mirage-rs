@@ -1,5 +1,36 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.14] - fallback 合成 ServerHello 质量提升 (2026-07-06)
+
+### fix(crypto): handshake_cache fallback 合成模板结构合法化
+
+**背景**: camouflage_host 从启动起不可达时, get_server_hello 回落
+`fallback_server_hello` 合成模板. 旧版有三处破绽:
+- **key_share 畸形**: `0033 0004 001d 0017` 声明 X25519 key 长 23B 但后面 0 字节
+  → 真实 TLS 解析直接报错
+- **加密 flight 仅 21B**: 真实 TLS 1.3 的 EncryptedExtensions+Certificate+
+  CertVerify+Finished flight 约 2-5KB (证书链主导), 21B 一眼假
+- **cipher 硬编码 0x1301**: 不看 ClientHello 是否提供
+
+**修复**:
+- key_share 改合法: `0033 0024 001d 0020` + 真实 32B X25519 随机公钥
+- `pick_cipher`: 从 ClientHello 解析并选客户端**确实提供**的 TLS 1.3 cipher
+  (偏好 AES256>AES128>ChaCha)
+- 加密 flight 改 ~2.8-4.2KB 随机 (单条 ApplicationData record), 模拟真实证书
+  flight 尺寸
+
+### ⚠️ 根本限制 (诚实声明)
+
+fallback 无真实后端, 无法产出有效证书/CertVerify/Finished. 完成完整握手的**深度
+探针必然识破** (推导密钥解密加密 flight → MAC 失败). 本次改进只骗过被动观测 +
+浅层探针 (只读 ServerHello 不完成握手). **真正的解**: 保持 camouflage 可达 /
+多域名备份 —— fallback 是最后回落, 不是主防线.
+
+### test
+
+新增 handshake_cache 单元测试: pick_cipher 从提供列表选中 / fallback ServerHello
+结构合法 (key_share X25519 32B、supported_versions TLS1.3、flight 尺寸、长度自洽).
+
 ## [v0.4.5-alpha.13] - auth-succ/fail 时序对齐 (消除差别对待侧信道) (2026-07-06)
 
 ### security(server): auth-succ 注入匹配延迟消除时序侧信道

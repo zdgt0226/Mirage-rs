@@ -46,7 +46,7 @@ pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec
                 guard.extend(new_templates);
             } else {
                 error!("Failed to fetch any templates from {}. Using fallback.", camouflage_host);
-                guard.push(fallback_server_hello(client_session_id));
+                guard.push(fallback_server_hello(client_hello, client_session_id));
             }
             cache_guard = guard;
 
@@ -82,7 +82,7 @@ pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec
             }
             cache_guard = cache.lock().await;
             if cache_guard.is_empty() {
-                return fallback_server_hello(client_session_id);
+                return fallback_server_hello(client_hello, client_session_id);
             }
         }
     }
@@ -208,34 +208,173 @@ fn get_session_id(client_hello: &[u8]) -> Option<&[u8]> {
     }
 }
 
-fn fallback_server_hello(client_session_id: &[u8]) -> Vec<u8> {
-    let mut hs_body = vec![0x03, 0x03]; // Version
+/// 从 ClientHello 选一个客户端**确实提供**的 TLS 1.3 cipher (否则真实服务器不会
+/// 选它没提供的套件, 浅层探针可识破). 偏好 AES256>AES128>ChaCha; 解析失败退 1301.
+fn pick_cipher(client_hello: &[u8]) -> [u8; 2] {
+    let default = [0x13, 0x01];
+    if client_hello.len() < 44 { return default; }
+    let sid_len = client_hello[43] as usize;
+    let off = 44 + sid_len;
+    if client_hello.len() < off + 2 { return default; }
+    let cl = u16::from_be_bytes([client_hello[off], client_hello[off + 1]]) as usize;
+    let end = (off + 2 + cl).min(client_hello.len());
+    let ciphers = &client_hello[off + 2..end];
+    for pref in [[0x13u8, 0x02], [0x13, 0x01], [0x13, 0x03]] {
+        if ciphers.chunks_exact(2).any(|c| c == pref) {
+            return pref;
+        }
+    }
+    default
+}
+
+/// 合成 ServerHello flight (camouflage_host 不可达时的最后回落).
+///
+/// ⚠️ 根本限制: 无真实后端, 无法产出有效证书/CertVerify/Finished. 完成完整握手的
+/// **深度探针必然识破** (推导密钥解密加密 flight → MAC 失败). 本函数只求骗过被动
+/// 观测 + 浅层探针 (只读 ServerHello 不完成握手): 结构合法 + 尺寸可信.
+/// 真正的解是保持 camouflage 可达 / 多域名备份.
+fn fallback_server_hello(client_hello: &[u8], client_session_id: &[u8]) -> Vec<u8> {
+    let cipher = pick_cipher(client_hello);
+
+    let mut hs_body = Vec::with_capacity(80);
+    hs_body.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS 1.2
     let mut rnd = [0u8; 32];
     rand::fill(&mut rnd);
-    hs_body.extend_from_slice(&rnd);
+    hs_body.extend_from_slice(&rnd); // server_random
     hs_body.push(client_session_id.len() as u8);
-    hs_body.extend_from_slice(client_session_id);
-    hs_body.extend_from_slice(&[
-        0x13, 0x01, // Cipher Suite
-        0x00, // Compression
-        0x00, 0x0e, // Extensions Length
-        0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, // Supported Versions (TLS 1.3)
-        0x00, 0x33, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17, // Key Share
-    ]);
+    hs_body.extend_from_slice(client_session_id); // echo legacy_session_id
+    hs_body.extend_from_slice(&cipher); // cipher_suite
+    hs_body.push(0x00); // compression_method
 
-    let mut server_hello = vec![0x16, 0x03, 0x03]; // ServerHello Record
-    let record_len = (4 + hs_body.len()) as u16;
-    server_hello.extend_from_slice(&record_len.to_be_bytes());
-    server_hello.push(0x02); // Handshake: ServerHello
-    let hs_len = hs_body.len() as u32;
-    server_hello.extend_from_slice(&hs_len.to_be_bytes()[1..4]);
-    server_hello.extend_from_slice(&hs_body);
+    // extensions: supported_versions(TLS1.3) + key_share(X25519 合法 32B 公钥)
+    let mut ks = [0u8; 32];
+    rand::fill(&mut ks);
+    let mut exts = Vec::with_capacity(48);
+    exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]); // supported_versions
+    exts.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]); // key_share X25519 len=32
+    exts.extend_from_slice(&ks);
+    hs_body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    hs_body.extend_from_slice(&exts);
 
-    // ChangeCipherSpec & ApplicationData
-    server_hello.extend_from_slice(&[
-        0x14, 0x03, 0x03, 0x00, 0x01, 0x01, // ChangeCipherSpec
-        0x17, 0x03, 0x03, 0x00, 0x15, // Application Data
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-    ]);
-    server_hello
+    let mut out = Vec::with_capacity(hs_body.len() + 4096);
+    // ServerHello record
+    out.extend_from_slice(&[0x16, 0x03, 0x03]);
+    out.extend_from_slice(&((4 + hs_body.len()) as u16).to_be_bytes());
+    out.push(0x02); // Handshake: ServerHello
+    out.extend_from_slice(&(hs_body.len() as u32).to_be_bytes()[1..4]);
+    out.extend_from_slice(&hs_body);
+
+    // ChangeCipherSpec (兼容)
+    out.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+    // ApplicationData: 模拟加密的 {EncryptedExtensions, Certificate, CertVerify,
+    // Finished} flight. 真实约 2-5KB (证书链主导). 加密内容不可读, 随机字节 +
+    // 可信尺寸即可骗过被动/浅层. 用 ~2.8-4.2KB 随机, 单条 record (< 16KB 上限).
+    let flight_len = 2800 + fastrand::usize(0..1400);
+    out.extend_from_slice(&[0x17, 0x03, 0x03]);
+    out.extend_from_slice(&(flight_len as u16).to_be_bytes());
+    let base = out.len();
+    out.resize(base + flight_len, 0);
+    rand::fill(&mut out[base..]);
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fallback_server_hello, pick_cipher};
+
+    // 构造一个最小合法 ClientHello 骨架, cipher 列表 = [1301,1302,1303].
+    fn make_client_hello() -> Vec<u8> {
+        let mut ch = vec![0x16, 0x03, 0x01, 0x00, 0x00]; // record header (len 占位)
+        let mut hs = vec![0x01, 0x00, 0x00, 0x00]; // hs type + len 占位
+        hs.extend_from_slice(&[0x03, 0x03]); // version
+        hs.extend_from_slice(&[0u8; 32]); // random
+        hs.push(32); // sid_len
+        hs.extend_from_slice(&[0xAB; 32]); // session_id (token)
+        hs.extend_from_slice(&6u16.to_be_bytes()); // cipher_len
+        hs.extend_from_slice(&[0x13, 0x01, 0x13, 0x02, 0x13, 0x03]); // ciphers
+        hs.extend_from_slice(&[0x01, 0x00]); // compression
+        hs.extend_from_slice(&[0x00, 0x00]); // extensions len = 0
+        let body_len = (hs.len() - 4) as u32;
+        hs[1..4].copy_from_slice(&body_len.to_be_bytes()[1..4]);
+        let rec_len = hs.len() as u16;
+        ch[3..5].copy_from_slice(&rec_len.to_be_bytes());
+        ch.extend_from_slice(&hs);
+        ch
+    }
+
+    fn u16(b: &[u8], i: usize) -> usize {
+        ((b[i] as usize) << 8) | b[i + 1] as usize
+    }
+
+    #[test]
+    fn pick_cipher_from_offered() {
+        let ch = make_client_hello();
+        // 偏好 1302 (AES256), 且必须在提供列表里
+        assert_eq!(pick_cipher(&ch), [0x13, 0x02]);
+    }
+
+    #[test]
+    fn fallback_is_structurally_valid() {
+        let ch = make_client_hello();
+        let sid = [0xABu8; 32];
+        let sh = fallback_server_hello(&ch, &sid);
+
+        // ---- ServerHello record ----
+        assert_eq!(sh[0], 0x16, "record type Handshake");
+        let rec_len = u16(&sh, 3);
+        assert_eq!(sh[5], 0x02, "handshake type ServerHello");
+        // session_id 回显 (offset 43 = sid_len, 44.. = sid)
+        assert_eq!(sh[43], 32, "echo sid_len");
+        assert_eq!(&sh[44..76], &sid, "echo session_id");
+        // cipher (紧跟 sid) = 客户端提供的
+        let cipher = [sh[76], sh[77]];
+        assert!(
+            [[0x13, 0x01], [0x13, 0x02], [0x13, 0x03]].contains(&cipher),
+            "cipher 必须是 TLS1.3 且客户端提供的"
+        );
+
+        // ---- 遍历 extensions, 校验 key_share 合法 ----
+        // hs_body: 03 03 | random32 | sid_len(1)+sid | cipher(2) | comp(1) | extlen(2) | exts
+        let ext_len_off = 76 + 2 + 1; // cipher(2)+comp(1) 之后
+        let ext_len = u16(&sh, ext_len_off);
+        let mut i = ext_len_off + 2;
+        let ext_end = i + ext_len;
+        let mut saw_keyshare = false;
+        let mut saw_supver = false;
+        while i + 4 <= ext_end {
+            let et = u16(&sh, i);
+            let el = u16(&sh, i + 2);
+            let data = &sh[i + 4..i + 4 + el];
+            if et == 0x0033 {
+                // ServerHello key_share: group(2) + key_len(2) + key
+                saw_keyshare = true;
+                let group = u16(data, 0);
+                let klen = u16(data, 2);
+                assert_eq!(group, 0x001d, "X25519");
+                assert_eq!(klen, 32, "X25519 公钥 32 字节");
+                assert_eq!(data.len(), 4 + 32, "key_share 内容长度自洽 (旧版畸形已修)");
+            }
+            if et == 0x002b {
+                saw_supver = true;
+                assert_eq!(data, &[0x03, 0x04], "supported_versions = TLS 1.3");
+            }
+            i += 4 + el;
+        }
+        assert!(saw_keyshare && saw_supver, "必须有 key_share + supported_versions");
+
+        // ---- CCS + ApplicationData flight ----
+        let mut j = 5 + rec_len; // ServerHello record 之后
+        assert_eq!(&sh[j..j + 6], &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01], "ChangeCipherSpec");
+        j += 6;
+        assert_eq!(sh[j], 0x17, "ApplicationData");
+        let flight_len = u16(&sh, j + 3);
+        assert!(
+            (2800..=4200).contains(&flight_len),
+            "加密 flight 应 ~2.8-4.2KB (旧版仅 21B), 实际 {}",
+            flight_len
+        );
+        assert_eq!(j + 5 + flight_len, sh.len(), "总长度自洽");
+    }
 }
