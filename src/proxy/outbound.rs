@@ -55,7 +55,7 @@ impl OutboundNode {
 
     pub fn is_healthy(self: &Arc<Self>) -> bool {
         match &**self {
-            Self::Mirage { pool, .. } => pool.stats.read().unwrap().is_healthy(),
+            Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).is_healthy(),
             Self::Direct { .. } | Self::Block { .. } => true,
             Self::Urltest { children, .. } | Self::Fallback { children, .. } | Self::Selector { children, .. } => {
                 children.iter().any(|c| c.is_healthy())
@@ -79,7 +79,7 @@ impl OutboundNode {
 
     pub fn latency_http_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
-            Self::Mirage { pool, .. } => pool.stats.read().unwrap().latency_ms(),
+            Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).latency_ms(),
             Self::Direct { .. } | Self::Block { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } => {
                 let leaf = self.resolve_leaf();
@@ -109,7 +109,7 @@ impl OutboundNode {
                     .collect();
 
                 if with_lat.is_empty() {
-                    let mut curr_guard = current.write().unwrap();
+                    let mut curr_guard = current.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = curr_guard.as_ref() {
                         if c.is_healthy() {
                             return c.resolve_leaf();
@@ -123,7 +123,7 @@ impl OutboundNode {
                     .min_by_key(|&(_, lat)| lat)
                     .unwrap();
 
-                let mut curr_guard = current.write().unwrap();
+                let mut curr_guard = current.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(curr) = curr_guard.as_ref() {
                     if let Some(curr_lat) = curr.latency_ms(test_type) {
                         if curr_lat <= best.1 + *tolerance_ms {
@@ -149,7 +149,7 @@ impl OutboundNode {
                 }
             }
             Self::Selector { children, current, .. } => {
-                let curr_guard = current.read().unwrap();
+                let curr_guard = current.read().unwrap_or_else(|e| e.into_inner());
                 if let Some(c) = curr_guard.as_ref() {
                     return c.resolve_leaf();
                 }

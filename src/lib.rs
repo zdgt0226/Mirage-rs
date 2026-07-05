@@ -310,7 +310,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                     }
                                 }
                                 if let Some(ip) = v4.or(v6) {
-                                    *ip_arc.write().unwrap() = Some(ip);
+                                    *ip_arc.write().unwrap_or_else(|e| e.into_inner()) = Some(ip);
                                     if let Ok(mut engine) = bpf_lock.try_lock() {
                                         let _ = engine.set_target_ip(ip);
                                     }
@@ -335,7 +335,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 if let Ok(lock) = lock_clone.try_lock() {
                     for (_, node) in &st.outbounds.outbounds {
                         if let crate::proxy::outbound::OutboundNode::Mirage { server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, .. } = node.as_ref() {
-                            if let Some(_ip) = *server_ip.read().unwrap() {
+                            if let Some(_ip) = *server_ip.read().unwrap_or_else(|e| e.into_inner()) {
                                 if let Ok(actives) = pool.brutal_state.active_fds.lock() {
                                     let mut sum_retrans = 0;
                                     let mut sum_segs = 0;

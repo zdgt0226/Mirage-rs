@@ -51,14 +51,14 @@ impl FakeIpMapper {
         
         // 1. Check if already mapped
         {
-            let map = self.domain_to_ip.read().unwrap();
+            let map = self.domain_to_ip.read().unwrap_or_else(|e| e.into_inner());
             if let Some(&ip) = map.get(&domain) {
                 return ip;
             }
         }
         
         // 2. Assign new IP
-        let mut next_guard = self.next_ip.write().unwrap();
+        let mut next_guard = self.next_ip.write().unwrap_or_else(|e| e.into_inner());
         let mut ip_u32 = *next_guard;
         *next_guard += 1;
         
@@ -73,7 +73,7 @@ impl FakeIpMapper {
         let mut attempts = 0;
         
         // Conflict resolution: skip already mapped IPs if wrapped around
-        while self.ip_to_domain.read().unwrap().contains_key(&ip) {
+        while self.ip_to_domain.read().unwrap_or_else(|e| e.into_inner()).contains_key(&ip) {
             attempts += 1;
             if attempts >= max_attempts {
                 tracing::warn!("Fake-IP range {} exhausted", self.network);
@@ -87,14 +87,14 @@ impl FakeIpMapper {
             ip = Ipv4Addr::from(ip_u32);
         }
         
-        self.domain_to_ip.write().unwrap().insert(domain.clone(), ip);
-        self.ip_to_domain.write().unwrap().insert(ip, domain);
+        self.domain_to_ip.write().unwrap_or_else(|e| e.into_inner()).insert(domain.clone(), ip);
+        self.ip_to_domain.write().unwrap_or_else(|e| e.into_inner()).insert(ip, domain);
         
         ip
     }
 
     pub fn lookup_domain(&self, ip: &Ipv4Addr) -> Option<String> {
-        self.ip_to_domain.read().unwrap().get(ip).cloned()
+        self.ip_to_domain.read().unwrap_or_else(|e| e.into_inner()).get(ip).cloned()
     }
 
     pub fn is_fake_ip(&self, ip: &Ipv4Addr) -> bool {

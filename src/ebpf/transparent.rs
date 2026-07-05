@@ -40,7 +40,7 @@ mod sys {
         }
 
         pub fn attach_to_netns(&mut self, fakeip_net: std::net::Ipv4Addr, prefix_len: u8) -> Result<()> {
-            let mut bpf = self.bpf.lock().unwrap();
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
 
             // 1. Write the fake-ip range to the BPF map
             let mut fakeip_map = Array::<_, FakeIpCfg>::try_from(bpf.map_mut("mirage_fakeip_cfg").unwrap())?;
@@ -73,7 +73,7 @@ mod sys {
         }
         
         pub fn register_listener(&self, listener: &TcpListener) -> Result<()> {
-            let mut bpf = self.bpf.lock().unwrap();
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
             let fd = listener.as_raw_fd();
             let cookie = get_socket_cookie(fd)?;
 

@@ -72,7 +72,7 @@ impl TokenReplayCache {
 
     pub fn check_and_insert(&self, ts: u64, token: &[u8]) -> bool {
         let current_bucket = ts / REPLAY_BUCKET_SECS;
-        let mut cache = self.seen.lock().unwrap();
+        let mut cache = self.seen.lock().unwrap_or_else(|e| e.into_inner());
 
         // 保留容忍窗口内的桶 (前后各 1 个 = 3 桶 × 10s = 30s 总窗口).
         // 配合 v0.4 协议内嵌时间同步, 内存占用比旧 5×60s=300s 大幅下降.

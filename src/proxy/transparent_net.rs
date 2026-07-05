@@ -34,7 +34,7 @@ pub async fn install(net: Ipv4Addr, prefix: u8) {
         .await
     {
         Ok(o) if o.status.success() => {
-            *installed().lock().unwrap() = Some((net, prefix));
+            *installed().lock().unwrap_or_else(|e| e.into_inner()) = Some((net, prefix));
             info!(
                 "Fake-IP transparent route installed: local {} dev lo (sk_lookup interception active)",
                 dst
@@ -56,7 +56,7 @@ pub async fn install(net: Ipv4Addr, prefix: u8) {
 /// 进程退出清理. 无安装记录则 no-op. 即使清理失败也无害 (fake-IP 不可路由,
 /// 且 mirage 停了 DNS 也不再下发 fake-IP).
 pub async fn cleanup() {
-    let route = installed().lock().unwrap().take();
+    let route = installed().lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some((net, prefix)) = route {
         let dst = format!("{net}/{prefix}");
         let _ = tokio::process::Command::new("ip")

@@ -52,24 +52,24 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
                                 let resp = String::from_utf8_lossy(&data);
                                 if resp.contains("HTTP/1.1 204") || resp.contains("HTTP/1.1 200") {
                                     let rtt = start.elapsed().as_millis() as u64;
-                                    pool.stats.write().unwrap().record_latency(rtt);
+                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_latency(rtt);
                                     debug!("HealthCheck [{}] ok: {}ms", tag, rtt);
                                 } else {
-                                    pool.stats.write().unwrap().record_failure();
+                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                                     debug!("HealthCheck [{}] failed (bad status)", tag);
                                 }
                             } else {
-                                pool.stats.write().unwrap().record_failure();
+                                pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                                 debug!("HealthCheck [{}] failed (recv timeout/err)", tag);
                             }
                         } else {
-                            pool.stats.write().unwrap().record_failure();
+                            pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                         }
                     } else {
-                        pool.stats.write().unwrap().record_failure();
+                        pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                     }
                 } else {
-                    pool.stats.write().unwrap().record_failure();
+                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                     debug!("HealthCheck [{}] failed (pool get timeout/err)", tag);
                 }
             }

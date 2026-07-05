@@ -181,7 +181,7 @@ mod sys {
         }
         
         pub fn attach(&self, iface: &str) -> Result<()> {
-            let mut bpf = self.bpf.lock().unwrap();
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
             let program: &mut Xdp = bpf.program_mut("mirage_xdp_dns").unwrap().try_into()?;
             program.load()?;
             if program.attach(iface, XdpFlags::DRV_MODE).is_err() {
@@ -197,7 +197,7 @@ mod sys {
          * 此后该域名的 DNS 查询包将由硬件直接拦截并伪装打回，实现纳秒级响应。
          */
         pub fn update_dns_cache(&self, domain: &str, fake_ip: std::net::Ipv4Addr) -> Result<()> {
-            let mut bpf = self.bpf.lock().unwrap();
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
             let map = bpf.map_mut("mirage_dns_cache").unwrap();
             let mut lru = aya::maps::HashMap::<_, u64, u32>::try_from(map)?;
             

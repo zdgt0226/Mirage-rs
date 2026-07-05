@@ -24,7 +24,7 @@ pub async fn get_proxies(State(app_state): State<AppState>) -> Json<Value> {
                     }));
                 }
 
-                let selected = current.read().unwrap().as_ref().map(|n| n.tag().to_string()).unwrap_or_default();
+                let selected = current.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|n| n.tag().to_string()).unwrap_or_default();
                 let node_type = if matches!(node.as_ref(), OutboundNode::Selector { .. }) { "Selector" } else { "UrlTest" };
 
                 proxies.push(json!({
@@ -68,7 +68,7 @@ pub async fn select_proxy(State(app_state): State<AppState>, headers: HeaderMap,
     if let Some(group_node) = st.outbounds.outbounds.get(&req.group) {
         if let OutboundNode::Selector { children, current, .. } = group_node.as_ref() {
             if let Some(target_node) = children.iter().find(|c| c.tag() == req.target) {
-                let mut curr = current.write().unwrap();
+                let mut curr = current.write().unwrap_or_else(|e| e.into_inner());
                 *curr = Some(target_node.clone());
                 return Json(json!({"status": "success", "message": format!("Switched {} to {}", req.group, req.target)}));
             }

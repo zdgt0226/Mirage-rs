@@ -465,7 +465,7 @@ impl WarmPool {
                     match Self::connect_upstream(&cfg_task, &bs_task).await {
                         Ok(tunnel) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            stats_task.write().unwrap().record_latency(elapsed);
+                            stats_task.write().unwrap_or_else(|e| e.into_inner()).record_latency(elapsed);
                             
                             q_task.lock().await.push_back(tunnel);
                             n_task.notify_one();
@@ -473,7 +473,7 @@ impl WarmPool {
                             debug!("WarmPool: 预热连接就绪 ({}ms)", elapsed);
                         }
                         Err(e) => {
-                            stats_task.write().unwrap().record_failure();
+                            stats_task.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                             in_flight_task.fetch_sub(1, Ordering::Relaxed);
                             error!("WarmPool: 上游连接失败: {:?}", e);
                             tokio::time::sleep(Duration::from_secs(1)).await;
