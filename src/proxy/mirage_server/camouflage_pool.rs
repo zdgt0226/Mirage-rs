@@ -13,6 +13,7 @@
 //! - 池空时 acquire() 返回 None, 上层降级到即时 connect
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -23,6 +24,8 @@ const POOL_TARGET_SIZE: usize = 8;
 const REFILL_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const STREAM_MAX_AGE: Duration = Duration::from_secs(10);
+/// RTT EWMA 上限, 防测量毛刺注入荒谬延迟 (远 camouflage 是坏部署, 另行建议就近选).
+const RTT_MAX_US: u64 = 1_000_000;
 
 struct Pooled {
     stream: TcpStream,
@@ -49,6 +52,9 @@ fn is_alive(stream: &TcpStream) -> bool {
 pub struct CamouflagePool {
     host: String,
     pool: Mutex<VecDeque<Pooled>>,
+    /// 到 camouflage_host 的 RTT EWMA (微秒, 0=未知). 由 maintain 连接时测量,
+    /// 供 auth-succ 时序对齐用 (注入等量延迟消除 auth-succ/fail 时序侧信道).
+    rtt_us: AtomicU64,
 }
 
 impl CamouflagePool {
@@ -57,12 +63,18 @@ impl CamouflagePool {
         let arc = Arc::new(Self {
             host,
             pool: Mutex::new(VecDeque::with_capacity(POOL_TARGET_SIZE)),
+            rtt_us: AtomicU64::new(0),
         });
         let bg = arc.clone();
         tokio::spawn(async move {
             bg.maintain().await;
         });
         arc
+    }
+
+    /// 当前估计的 camouflage_host RTT (微秒, 0=尚未测到). 供 auth-succ 时序对齐.
+    pub fn rtt_us(&self) -> u64 {
+        self.rtt_us.load(Ordering::Relaxed)
     }
 
     /// pop 一条 **存活的** pre-warmed 连接. 逐条探活, 跳过并丢弃已被对端关闭的
@@ -105,6 +117,7 @@ impl CamouflagePool {
                 if cur >= POOL_TARGET_SIZE {
                     break;
                 }
+                let t0 = Instant::now();
                 let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
                     .await
                 {
@@ -118,6 +131,14 @@ impl CamouflagePool {
                         break;
                     }
                 };
+                // TCP 3-way 耗时 ≈ 1 网络 RTT, 是 auth-fail 转发延迟 (预热连接省了
+                // 3-way, 只剩 1 个 ClientHello→ServerHello app RTT) 的良好近似.
+                // EWMA 平滑 (1/8 新样本), 上限防毛刺.
+                let rtt = (t0.elapsed().as_micros() as u64).min(RTT_MAX_US);
+                let prev = self.rtt_us.load(Ordering::Relaxed);
+                let ewma = if prev == 0 { rtt } else { (prev * 7 + rtt) / 8 };
+                self.rtt_us.store(ewma, Ordering::Relaxed);
+
                 let mut pool = self.pool.lock().await;
                 pool.push_back(Pooled {
                     stream,

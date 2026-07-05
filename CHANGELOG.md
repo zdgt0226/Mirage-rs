@@ -1,5 +1,39 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.13] - auth-succ/fail 时序对齐 (消除差别对待侧信道) (2026-07-06)
+
+### security(server): auth-succ 注入匹配延迟消除时序侧信道
+
+**背景**: camouflage 系列最后一个时序侧信道.
+- auth-**成功** (真实用户): 本地缓存模板回放, 首字节 ~0-1ms
+- auth-**失败** (探针): 预热池转发到 camouflage_host, 首字节 ~1 RTT
+
+真实服务器对所有连接延迟一致. Mirage 对认证/未认证**差别对待** (快/慢) → GFW
+关联"真实用户秒回、我的探针慢回" → 识破服务器区别对待 = 暴露 Reality 式代理.
+
+**为何只能延后 auth-succ**: auth-fail 无法变快 —— 探针要完成**真实 TLS 握手**,
+必须转发到真站 (回放缓存模板过不了探针的真实 TLS 校验, 见 alpha.11 的教训). 所以
+在 auth-succ 注入等量延迟, 使两路时序一致.
+
+**实现**:
+- `CamouflagePool`: 补给连接时测 TCP 3-way 耗时 (≈1 网络 RTT ≈ auth-fail 转发
+  延迟), EWMA 平滑 (1/8 新样本) 存入 `rtt_us` atomic, 上限 1s 防毛刺.
+- `handshake.rs` auth-succ: 发模板前 `sleep(rtt × [75%,125%])`. ±25% 抖动模拟
+  网络方差 (固定延迟太规整反成特征).
+- rtt=0 (camouflage 未测到/不可达) 时不注入, 不影响降级路径.
+
+**代价**: 每次 tunnel build 服务端多 ~1 RTT. WarmPool 客户端预建吸收, **用户
+无感** (池里有现成 tunnel).
+
+**残余** (v2): 注入用均匀 ±25% 抖动, 真实网络抖动是右偏分布. 深度分析抖动分布
+形状理论上可区分, 但需海量样本 + 分布分析, 远超当前 GFW 能力. 一阶信号 (均值差)
+已消除.
+
+### 部署建议
+
+即使有时序对齐, 仍建议 camouflage_host 选**网络就近** (同区域/同 CDN 回源) 的站,
+让 auth-fail 转发的绝对延迟本身就小 —— 对齐是兜底, 就近是根本.
+
 ## [v0.4.5-alpha.12] - CamouflagePool 死连接检测 (探针一致性硬化) (2026-07-05)
 
 ### fix(server): camouflage 预热池探活 + 转发三级降级

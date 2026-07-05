@@ -142,6 +142,21 @@ pub(super) async fn handle_connection(
     // 2.5 Send ServerHello template back to satisfy Mirage Client's TLS state machine
     let template =
         crate::crypto::handshake_cache::get_server_hello(&camouflage_host, &client_hello).await;
+
+    // v0.4.5-alpha.13: 消除 auth-succ vs auth-fail 时序侧信道.
+    // auth-fail 走 camouflage 转发有 ~1 RTT 延迟 (探针→server→camouflage→回),
+    // auth-succ 本地模板回放 ~0ms. 差异让 GFW 关联"真实用户秒回、探针慢回"识破
+    // 差别对待 = 暴露 Reality 式代理. auth-fail 无法变快 (探针要真实 TLS 握手必须
+    // 转发真站), 故在 auth-succ 注入等量抖动延迟对齐. RTT 由 CamouflagePool 实测,
+    // ±25% 抖动模拟网络方差 (固定延迟太规整反而是特征). WarmPool 预建吸收此延迟,
+    // 用户无感.
+    let rtt = cam_pool.rtt_us();
+    if rtt > 0 {
+        let jitter_num = 75 + fastrand::u64(0..=50); // 75%~125%
+        let delay_us = rtt.saturating_mul(jitter_num) / 100;
+        tokio::time::sleep(Duration::from_micros(delay_us)).await;
+    }
+
     if let Err(e) = stream.write_all(&template).await {
         tracing::error!("Mirage Server: write_all template failed: {}", e);
         return;
