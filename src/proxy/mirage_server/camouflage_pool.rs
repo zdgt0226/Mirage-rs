@@ -127,3 +127,54 @@ impl CamouflagePool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_alive;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    // 健康空闲连接 (对端 accept 后不发数据, 模拟等 ClientHello 的 camouflage_host)
+    // 必须判为活; 对端关闭 (FIN) 后必须判为死. 防 is_alive 把好连接误杀导致池静默
+    // 废掉.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_alive_healthy_true_closed_false() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // 服务端 accept 后持有 socket 不发数据 (健康态)
+        let accepted = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            sock
+        });
+
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server_sock = accepted.await.unwrap();
+
+        // 健康空闲: 无数据无 EOF → 活
+        assert!(is_alive(&client), "健康空闲连接应判为活");
+
+        // 服务端关闭 → 客户端收到 FIN
+        drop(server_sock);
+        // 给 FIN 一点传播时间
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!is_alive(&client), "对端 FIN 后应判为死");
+    }
+
+    // 对端发来意外数据的连接判为不可用 (预热连接不该收到 server 主动数据).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_alive_unexpected_data_false() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"x").await.unwrap();
+            sock.flush().await.unwrap();
+            sock
+        });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let _server = accepted.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!is_alive(&client), "收到意外数据的连接应判为不可用");
+    }
+}
