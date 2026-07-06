@@ -453,12 +453,14 @@ impl WarmPool {
 
                 in_flight_clone.fetch_add(1, Ordering::Relaxed);
 
-                // 引入 0.2s 阶梯延迟 (SYN Staggering)，防止网络拥塞和暴露特征
+                // SYN Staggering: 阶梯延迟防止暖池一次性喷 SYN (突发本身是特征)。
+                // 用抖动区间 200~500ms 而非固定 200ms —— 固定间隔会形成精确节拍器,
+                // 时序图谱分析能识别为定时器调度; 抖动把尖峰打散成宽带分布。
                 let now = Instant::now();
                 if next_build_at > now {
                     tokio::time::sleep_until(next_build_at).await;
                 }
-                next_build_at = Instant::now() + Duration::from_millis(200);
+                next_build_at = Instant::now() + Duration::from_millis(200 + fastrand::u64(0..=300));
 
                 let cfg_task = cfg_clone.clone();
                 let q_task = q_clone_builder.clone();
