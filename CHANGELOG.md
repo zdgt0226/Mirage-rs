@@ -1,5 +1,30 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.19] - Release CI 增加 32 位构建目标 (2026-07-06)
+
+### ci(release): i686 + armv7 (gnu/musl, 纯用户态)
+
+**背景**: 面向老式 x86 软路由与 ARMv7 路由器 (OpenWrt/树莓派). 这类设备内核多
+<5.9, sk_lookup 透明代理不可用, 故新目标**不含 ebpf feature** (纯用户态 SOCKS/
+上游代理).
+
+**新增 4 个 release 产物**:
+
+- `mirage-rs-i386`       — i686-unknown-linux-gnu
+- `mirage-rs-i386-musl`  — i686-unknown-linux-musl (静态)
+- `mirage-rs-armv7`      — armv7-unknown-linux-gnueabihf
+- `mirage-rs-armv7-musl` — armv7-unknown-linux-musleabihf (静态)
+
+**实现**: matrix 每行加 `ebpf` 布尔字段; BPF 编译与嵌入校验两步 `if: matrix.ebpf`;
+构建命令按 `ebpf` 字段条件注入 `--features ebpf`; 补 i686/armv7 gnu 交叉工具链与
+armv7 LINKER env; musl 目标复用现有 cross-rs 分支. `build.rs` 缺 clang 时回退已
+提交的 `ebpf-src/*.elf`, 且 `include_bytes!` 受 `#[cfg(feature=ebpf)]` 门控, 故
+无 ebpf 构建在 cross 容器内不会因缺 clang 失败.
+
+### 影响面
+
+- 仅 CI/发布产物; 无源码/协议/配置变化
+
 ## [v0.4.5-alpha.18] - GUI 面板闪烁 + 日志方块修复 (2026-07-06)
 
 ### fix(gui): eBPF/Brutal/Tunnels 面板闪烁 (try_lock → lock().await)
