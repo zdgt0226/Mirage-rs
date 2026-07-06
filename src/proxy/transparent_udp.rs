@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -38,6 +38,49 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_BUF: usize = 65536;
 
 type FlowKey = (SocketAddrV4, SocketAddrV4); // (client, orig_dst)
+
+/// 会话槽. Setting = setup_flow 正在建流 (占位, 防突发包重复 spawn);
+/// Ready = 出口 socket 就绪, 主循环快路径直接转发。
+enum FlowSlot {
+    Setting,
+    Ready(Arc<UdpSocket>),
+}
+
+/// 回包 socket + 引用计数 (同 orig_dst 的多客户端 flow 共享一个)。refs 归 0
+/// 即从表移除 → drop → 关 FD, 防句柄泄漏。
+struct ReplyEntry {
+    sock: Arc<UdpSocket>,
+    refs: usize,
+}
+
+type Sessions = Arc<StdMutex<HashMap<FlowKey, FlowSlot>>>;
+type Replies = Arc<StdMutex<HashMap<SocketAddrV4, ReplyEntry>>>;
+
+fn lock_sessions(s: &Sessions) -> std::sync::MutexGuard<'_, HashMap<FlowKey, FlowSlot>> {
+    s.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn lock_replies(r: &Replies) -> std::sync::MutexGuard<'_, HashMap<SocketAddrV4, ReplyEntry>> {
+    r.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// setup_flow 早退 (路由/解析/bind 失败) 时, 移除主循环占位的 Setting 槽,
+/// 否则该 key 永远卡在 Setting, 后续包被当"建流中"丢弃 → 该目标彻底黑洞。
+/// commit 成功后 disarm, 不误删已升级的 Ready。
+struct PlaceholderGuard {
+    key: FlowKey,
+    sessions: Sessions,
+    armed: bool,
+}
+impl Drop for PlaceholderGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut s = lock_sessions(&self.sessions);
+            if matches!(s.get(&self.key), Some(FlowSlot::Setting)) {
+                s.remove(&self.key);
+            }
+        }
+    }
+}
 
 fn new_dgram_fd() -> anyhow::Result<OwnedFd> {
     Ok(socket(
@@ -112,10 +155,9 @@ pub async fn start_transparent_udp(
         listen_addr
     );
 
-    // (client, orig_dst) → 出口 socket; orig_dst → 回包 socket
-    let sessions: Arc<Mutex<HashMap<FlowKey, Arc<UdpSocket>>>> = Arc::new(Mutex::new(HashMap::new()));
-    let replies: Arc<Mutex<HashMap<SocketAddrV4, Arc<UdpSocket>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    // (client, orig_dst) → 会话槽; orig_dst → 回包 socket (引用计数)
+    let sessions: Sessions = Arc::new(StdMutex::new(HashMap::new()));
+    let replies: Replies = Arc::new(StdMutex::new(HashMap::new()));
 
     let fd = main.as_raw_fd();
     let mut buf = vec![0u8; UDP_BUF];
@@ -133,22 +175,36 @@ pub async fn start_transparent_udp(
             }
         };
 
-        // 已有会话 → 快路径直接转发
+        // 单锁内决策 (原子): Ready→取出 socket; Setting→建流中丢包; None→占位并建流。
+        // 关键: 只在锁内取 Arc, 出锁再 await send —— 不把锁跨越 .await (原实现把
+        // sessions 锁持有到 send().await 期间, 阻塞其他锁者)。
         let key = (client, orig_dst);
-        if let Some(out) = sessions.lock().await.get(&key).cloned() {
-            let _ = out.send(&buf[..size]).await;
-            continue;
-        }
+        let mut do_setup = false;
+        let forward = {
+            let mut s = lock_sessions(&sessions);
+            match s.get(&key) {
+                Some(FlowSlot::Ready(out)) => Some(out.clone()),
+                Some(FlowSlot::Setting) => None, // 建流中, 丢本包 (UDP 可丢, 应用会重传)
+                None => {
+                    s.insert(key, FlowSlot::Setting);
+                    do_setup = true;
+                    None
+                }
+            }
+        };
 
-        // 新流 → 反查/路由/建 socket (异步, 不阻塞收包循环)
-        let payload = buf[..size].to_vec();
-        let st = state.clone();
-        let fm = fake_ip_mapper.clone();
-        let sessions = sessions.clone();
-        let replies = replies.clone();
-        tokio::spawn(async move {
-            setup_flow(client, orig_dst, payload, st, fm, sessions, replies).await;
-        });
+        if let Some(out) = forward {
+            let _ = out.send(&buf[..size]).await;
+        } else if do_setup {
+            let payload = buf[..size].to_vec();
+            let st = state.clone();
+            let fm = fake_ip_mapper.clone();
+            let sessions = sessions.clone();
+            let replies = replies.clone();
+            tokio::spawn(async move {
+                setup_flow(client, orig_dst, payload, st, fm, sessions, replies).await;
+            });
+        }
     }
 }
 
@@ -159,10 +215,16 @@ async fn setup_flow(
     first_payload: Vec<u8>,
     state: Arc<ArcSwap<CoreState>>,
     fake_ip_mapper: Arc<FakeIpMapper>,
-    sessions: Arc<Mutex<HashMap<FlowKey, Arc<UdpSocket>>>>,
-    replies: Arc<Mutex<HashMap<SocketAddrV4, Arc<UdpSocket>>>>,
+    sessions: Sessions,
+    replies: Replies,
 ) {
     let key = (client, orig_dst);
+    // 任何早退都要清掉主循环占位的 Setting 槽 (否则该 key 永久黑洞)。commit 后 disarm。
+    let mut guard = PlaceholderGuard {
+        key,
+        sessions: sessions.clone(),
+        armed: true,
+    };
     let fake_ip = *orig_dst.ip();
     let port = orig_dst.port();
     let domain = fake_ip_mapper.lookup_domain(&fake_ip);
@@ -241,16 +303,17 @@ async fn setup_flow(
         return;
     }
 
-    // 回包 socket (按 orig_dst 复用)
+    // 回包 socket (按 orig_dst 复用, refs++)。build 失败 → 早退 (guard 清占位)。
     let reply = {
-        let mut r = replies.lock().await;
-        if let Some(rs) = r.get(&orig_dst) {
-            rs.clone()
+        let mut r = lock_replies(&replies);
+        if let Some(e) = r.get_mut(&orig_dst) {
+            e.refs += 1;
+            e.sock.clone()
         } else {
             match build_reply_socket(orig_dst) {
                 Ok(rs) => {
                     let rs = Arc::new(rs);
-                    r.insert(orig_dst, rs.clone());
+                    r.insert(orig_dst, ReplyEntry { sock: rs.clone(), refs: 1 });
                     rs
                 }
                 Err(e) => {
@@ -261,7 +324,9 @@ async fn setup_flow(
         }
     };
 
-    sessions.lock().await.insert(key, out.clone());
+    // commit: Setting → Ready, disarm guard (至此不再早退)。
+    lock_sessions(&sessions).insert(key, FlowSlot::Ready(out.clone()));
+    guard.armed = false;
     debug!(
         "udp-t: new flow {} → {} (fake {} → real {})",
         client,
@@ -274,7 +339,6 @@ async fn setup_flow(
     let _ = out.send(&first_payload).await;
 
     // downlink: 真目标 → 客户端 (经透明回包 socket, 伪源 = fake-IP:port)
-    let sessions_gc = sessions.clone();
     let mut buf = vec![0u8; UDP_BUF];
     loop {
         match tokio::time::timeout(IDLE_TIMEOUT, out.recv(&mut buf)).await {
@@ -284,6 +348,25 @@ async fn setup_flow(
             _ => break, // 空闲超时或出错
         }
     }
-    sessions_gc.lock().await.remove(&key);
+
+    // teardown: 只在槽仍是"我们这条 socket"时移除 (防误删被新 setup 替换的会话);
+    // 回包 socket refs-- 归 0 即移除 → 关 FD (防句柄泄漏)。
+    {
+        let mut s = lock_sessions(&sessions);
+        if let Some(FlowSlot::Ready(cur)) = s.get(&key) {
+            if Arc::ptr_eq(cur, &out) {
+                s.remove(&key);
+            }
+        }
+    }
+    {
+        let mut r = lock_replies(&replies);
+        if let Some(e) = r.get_mut(&orig_dst) {
+            e.refs = e.refs.saturating_sub(1);
+            if e.refs == 0 {
+                r.remove(&orig_dst);
+            }
+        }
+    }
     debug!("udp-t: flow {:?} closed", key);
 }
