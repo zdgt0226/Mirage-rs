@@ -9,10 +9,11 @@
 //! 池设计:
 //! - 目标容量 8 (低负载充足)
 //! - 500ms 补给一次, 每次尝试补到目标容量
-//! - 单连接 25s max age (camouflage_host 通常 30s idle timeout, 留 5s 余量)。
+//! - 单连接 15~27s 随机 max age (camouflage_host 通常 30s idle timeout, 留余量)。
 //!   之前 10s 过激: 8 条暖连接每 10s 全部过期重建 = 对 camouflage_host 持续
 //!   ~0.8 conn/s 纯 TCP 不发数据、10s 关, 6.9万次/天, 像 bot 可能被对面限流/
-//!   标记。25s 把 churn 降到 ~0.32 conn/s (2.5x), is_alive 兜底已死连接。
+//!   标记。延长降 churn (~0.32 conn/s), 且**每条独立随机寿命**错峰过期, 避免
+//!   同龄批量到期→8-SYN 脉冲的定时器特征。is_alive 兜底已死连接。
 //! - 池空时 acquire() 返回 None, 上层降级到即时 connect
 
 use std::collections::VecDeque;
@@ -26,13 +27,20 @@ use tracing::{debug, warn};
 const POOL_TARGET_SIZE: usize = 8;
 const REFILL_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const STREAM_MAX_AGE: Duration = Duration::from_secs(25);
+/// 单连接寿命 = MIN + rand(0..=JITTER) 秒 (15~27s)。**每条独立随机**而非统一硬限:
+/// 否则同批建立的 8 条同龄连接会在同刻集体过期 → maintain 一次性补 8 条 = 每
+/// STREAM 周期一次"8-SYN 脉冲",对伪装源仍是规律定时器特征。随机寿命让它们错峰
+/// 陆续过期, refill 平滑成涓流。上限 27s < camouflage_host 常见 30s idle。
+const STREAM_MIN_AGE_S: u64 = 15;
+const STREAM_AGE_JITTER_S: u64 = 12;
 /// RTT EWMA 上限, 防测量毛刺注入荒谬延迟 (远 camouflage 是坏部署, 另行建议就近选).
 const RTT_MAX_US: u64 = 1_000_000;
 
 struct Pooled {
     stream: TcpStream,
     created_at: Instant,
+    /// 本连接的随机过期时长 (错峰老化, 见 STREAM_MIN_AGE_S 注释)。
+    max_age: Duration,
 }
 
 /// 探活: 一条尚未发送 ClientHello 的预热连接, 健康态应【无可读数据且无 EOF】.
@@ -105,7 +113,7 @@ impl CamouflagePool {
                 let now = Instant::now();
                 let before = pool.len();
                 pool.retain(|p| {
-                    now.duration_since(p.created_at) < STREAM_MAX_AGE && is_alive(&p.stream)
+                    now.duration_since(p.created_at) < p.max_age && is_alive(&p.stream)
                 });
                 let purged = before - pool.len();
                 if purged > 0 {
@@ -146,6 +154,9 @@ impl CamouflagePool {
                 pool.push_back(Pooled {
                     stream,
                     created_at: Instant::now(),
+                    max_age: Duration::from_secs(
+                        STREAM_MIN_AGE_S + fastrand::u64(0..=STREAM_AGE_JITTER_S),
+                    ),
                 });
             }
         }
