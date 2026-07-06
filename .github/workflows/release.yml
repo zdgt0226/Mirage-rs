@@ -22,12 +22,31 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: amd64
+            ebpf: true
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+            ebpf: true
           - target: x86_64-unknown-linux-musl
             arch: amd64-musl
+            ebpf: true
           - target: aarch64-unknown-linux-musl
             arch: arm64-musl
+            ebpf: true
+          # === 32-bit targets (纯用户态, 无 ebpf) ===
+          # 老式 x86 软路由/瘦客户机 与 ARMv7 路由器(OpenWrt/树莓派).
+          # 这些设备内核多 <5.9, sk_lookup 透明代理不可用, 故不含 ebpf feature.
+          - target: i686-unknown-linux-gnu
+            arch: i386
+            ebpf: false
+          - target: i686-unknown-linux-musl
+            arch: i386-musl
+            ebpf: false
+          - target: armv7-unknown-linux-gnueabihf
+            arch: armv7
+            ebpf: false
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7-musl
+            ebpf: false
 
     steps:
       - uses: actions/checkout@v4
@@ -55,11 +74,12 @@ jobs:
           sudo apt-get install -y clang llvm llvm-dev libclang-dev protobuf-compiler libbpf-dev linux-headers-generic
           if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-          elif [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            sudo apt-get install -y musl-tools
-          elif [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
-            # We use an external toolchain or musl-cross for aarch64-musl
-            # But the easiest way for musl cross is using cross-rs
+          elif [[ "${{ matrix.target }}" == "armv7-unknown-linux-gnueabihf" ]]; then
+            sudo apt-get install -y gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+          elif [[ "${{ matrix.target }}" == "i686-unknown-linux-gnu" ]]; then
+            sudo apt-get install -y gcc-multilib libc6-dev-i386
+          elif [[ "${{ matrix.target }}" == *-musl* ]]; then
+            # musl 目标一律走 cross-rs (容器内自带工具链)
             echo "We will use cross-rs for musl"
           fi
 
@@ -81,6 +101,7 @@ jobs:
       #   3) gnu build's build.rs has the same baseline (host clang) — eliminating
       #      pre-built binary divergence between runs.
       - name: Compile BPF objects (explicit)
+        if: matrix.ebpf
         run: |
           set -euo pipefail
           uname_m=$(uname -m)
@@ -112,20 +133,22 @@ jobs:
         if: "!contains(matrix.target, 'musl')"
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
         run: |
           set -euo pipefail
-          cargo build --release --target ${{ matrix.target }} --features ebpf
+          cargo build --release --target ${{ matrix.target }} ${{ matrix.ebpf && '--features ebpf' || '' }}
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       - name: Build Binary (Musl via Cross)
         if: contains(matrix.target, 'musl')
         run: |
           set -euo pipefail
-          cross build --release --target ${{ matrix.target }} --features ebpf
+          cross build --release --target ${{ matrix.target }} ${{ matrix.ebpf && '--features ebpf' || '' }}
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       # Post-build: confirm the resulting binary actually embeds 3 ELF blobs
       - name: Verify embedded BPF ELFs in artifact
+        if: matrix.ebpf
         run: |
           set -euo pipefail
           artifact="mirage-rs-${{ matrix.arch }}"
@@ -177,4 +200,12 @@ jobs:
             artifacts/mirage-rs-amd64-musl/mirage-rs-amd64-musl.sha256
             artifacts/mirage-rs-arm64-musl/mirage-rs-arm64-musl
             artifacts/mirage-rs-arm64-musl/mirage-rs-arm64-musl.sha256
+            artifacts/mirage-rs-i386/mirage-rs-i386
+            artifacts/mirage-rs-i386/mirage-rs-i386.sha256
+            artifacts/mirage-rs-i386-musl/mirage-rs-i386-musl
+            artifacts/mirage-rs-i386-musl/mirage-rs-i386-musl.sha256
+            artifacts/mirage-rs-armv7/mirage-rs-armv7
+            artifacts/mirage-rs-armv7/mirage-rs-armv7.sha256
+            artifacts/mirage-rs-armv7-musl/mirage-rs-armv7-musl
+            artifacts/mirage-rs-armv7-musl/mirage-rs-armv7-musl.sha256
           generate_release_notes: true
