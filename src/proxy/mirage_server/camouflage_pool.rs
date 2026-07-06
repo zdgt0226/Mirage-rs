@@ -9,7 +9,10 @@
 //! 池设计:
 //! - 目标容量 8 (低负载充足)
 //! - 500ms 补给一次, 每次尝试补到目标容量
-//! - 单连接 10s max age (camouflage_host 通常 30s idle timeout, 留余量)
+//! - 单连接 25s max age (camouflage_host 通常 30s idle timeout, 留 5s 余量)。
+//!   之前 10s 过激: 8 条暖连接每 10s 全部过期重建 = 对 camouflage_host 持续
+//!   ~0.8 conn/s 纯 TCP 不发数据、10s 关, 6.9万次/天, 像 bot 可能被对面限流/
+//!   标记。25s 把 churn 降到 ~0.32 conn/s (2.5x), is_alive 兜底已死连接。
 //! - 池空时 acquire() 返回 None, 上层降级到即时 connect
 
 use std::collections::VecDeque;
@@ -23,7 +26,7 @@ use tracing::{debug, warn};
 const POOL_TARGET_SIZE: usize = 8;
 const REFILL_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const STREAM_MAX_AGE: Duration = Duration::from_secs(10);
+const STREAM_MAX_AGE: Duration = Duration::from_secs(25);
 /// RTT EWMA 上限, 防测量毛刺注入荒谬延迟 (远 camouflage 是坏部署, 另行建议就近选).
 const RTT_MAX_US: u64 = 1_000_000;
 
