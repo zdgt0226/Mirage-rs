@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -36,6 +37,14 @@ use crate::router::RoutingRequest;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_BUF: usize = 65536;
+/// 并发透明 UDP 流上限。每流 ≈ 1 出口 socket FD + 1 task + 64KB downlink buf
+/// (+ 共享 reply socket)。透明 UDP 仅跑在 64 位网关 (内核≥5.9+CAP_NET_ADMIN),
+/// 内存充裕; 家用/小企业合法峰值数百~低千, 4096 留足余量, 同时给恶意 LAN
+/// 客户端狂建流封一个天花板 (最坏 ~256MB downlink buf + ~4-8K FD)。
+const MAX_FLOWS: usize = 4096;
+
+/// 到顶丢包累计计数, 用于限流打印 (每 1000 次告警一次, 免刷屏)。
+static CAP_DROPS: AtomicU64 = AtomicU64::new(0);
 
 type FlowKey = (SocketAddrV4, SocketAddrV4); // (client, orig_dst)
 
@@ -205,11 +214,17 @@ pub async fn start_transparent_udp(
         // sessions 锁持有到 send().await 期间, 阻塞其他锁者)。
         let key = (client, orig_dst);
         let mut do_setup = false;
+        let mut at_cap = false;
         let forward = {
             let mut s = lock_sessions(&sessions);
             match s.get(&key) {
                 Some(FlowSlot::Ready(out)) => Some(out.clone()),
                 Some(FlowSlot::Setting) => None, // 建流中, 丢本包 (UDP 可丢, 应用会重传)
+                None if s.len() >= MAX_FLOWS => {
+                    // 并发流到顶: 丢新流的包, 防恶意 LAN 客户端狂建流耗尽 FD/内存。
+                    at_cap = true;
+                    None
+                }
                 None => {
                     s.insert(key, FlowSlot::Setting);
                     do_setup = true;
@@ -217,6 +232,19 @@ pub async fn start_transparent_udp(
                 }
             }
         };
+
+        if at_cap {
+            // 出锁后再记 (不在锁内 format/写日志)。限流打印, 免刷屏。
+            let n = CAP_DROPS.fetch_add(1, Ordering::Relaxed);
+            if n % 1000 == 0 {
+                warn!(
+                    "udp-t: 并发流到上限 {} , 丢弃新流 (累计丢 {})",
+                    MAX_FLOWS,
+                    n + 1
+                );
+            }
+            continue;
+        }
 
         if let Some(out) = forward {
             let _ = out.send(&buf[..size]).await;
