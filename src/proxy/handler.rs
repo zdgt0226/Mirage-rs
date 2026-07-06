@@ -44,7 +44,7 @@ pub async fn handle_client(
                         udp_relay::handle_udp_associate(local, pool.clone()).await;
                     }
                     OutboundNode::Direct { .. } => {
-                        info!("UDP associate on Direct is currently dropping silently");
+                        udp_relay::handle_udp_associate_direct(local).await;
                     }
                     OutboundNode::Block { .. } => {
                         return;
