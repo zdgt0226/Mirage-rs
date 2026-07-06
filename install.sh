@@ -426,6 +426,12 @@ setup_fhs() {
         case $(uname -m) in
             x86_64) arch="amd64" ;;
             aarch64|arm64) arch="arm64" ;;
+            i386|i486|i586|i686)
+                arch="i386"
+                warn "32 位 x86: 纯用户态代理, 内核 <5.9 无 sk_lookup 透明模式。" ;;
+            armv7l|armv7)
+                arch="armv7"
+                warn "32 位 ARMv7: 纯用户态代理, 内核 <5.9 无 sk_lookup 透明模式。" ;;
             *) err "不支持的系统架构: $(uname -m)" ;;
         esac
         
