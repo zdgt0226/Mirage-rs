@@ -897,24 +897,36 @@
             fetchTunnels(); // 重新渲染应用新展开状态
         }
 
+        // 内容不变就不写 innerHTML: 每秒轮询若数据一致 (idle / 无变化), 避免整块
+        // DOM 销毁重建导致的重绘闪烁 + 丢失选中/滚动态. 数据真变了才更新.
+        function setHtmlIfChanged(id, html) {
+            const el = document.getElementById(id);
+            if (el && el.__lastHtml !== html) {
+                el.__lastHtml = html;
+                el.innerHTML = html;
+            }
+        }
+
         async function fetchTunnels() {
             let data;
             try {
                 const res = await fetch('/api/bpf/tunnels');
                 data = await res.json();
             } catch (e) {
-                document.getElementById('tunnelsContainer').innerHTML =
-                    '<div style="color: #ef4444; padding: 20px;">Failed to load tunnels.</div>';
+                setHtmlIfChanged('tunnelsContainer',
+                    '<div style="color: #ef4444; padding: 20px;">Failed to load tunnels.</div>');
                 return;
             }
             const tunnels = data.tunnels || [];
-            document.getElementById('tunnelCount').innerText = `(${tunnels.length} active)`;
+            const countLabel = `(${tunnels.length} active)`;
+            const countEl = document.getElementById('tunnelCount');
+            if (countEl.innerText !== countLabel) countEl.innerText = countLabel;
 
             if (tunnels.length === 0) {
-                document.getElementById('tunnelsContainer').innerHTML =
+                setHtmlIfChanged('tunnelsContainer',
                     '<div style="color: var(--text-muted); text-align: center; padding: 20px;">' +
                     'No active tunnels. BPF tracks RTT only after sock_ops callback fires — send real traffic through the proxy to generate samples.' +
-                    '</div>';
+                    '</div>');
                 return;
             }
 
@@ -969,7 +981,7 @@
             });
 
             html += '</tbody></table>';
-            document.getElementById('tunnelsContainer').innerHTML = html;
+            setHtmlIfChanged('tunnelsContainer', html);
         }
 
         setInterval(fetchOverview, 1000);
