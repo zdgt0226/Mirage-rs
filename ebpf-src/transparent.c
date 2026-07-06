@@ -1,13 +1,25 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 
-// 用于存储监听 socket 结构体的映射，大小为 1
+#ifndef IPPROTO_UDP
+#define IPPROTO_UDP 17
+#endif
+
+// 用于存储 TCP 监听 socket 的映射，大小为 1
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKMAP);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u32);
 } mirage_listener_sk SEC(".maps");
+
+// 用于存储 UDP 透明 socket 的映射，大小为 1
+struct {
+    __uint(type, BPF_MAP_TYPE_SOCKMAP);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} mirage_udp_sk SEC(".maps");
 
 // 定义 fake_ip 网段，包含网络地址和子网掩码
 struct fakeip_cfg { 
@@ -40,13 +52,20 @@ int mirage_sk_lookup(struct bpf_sk_lookup *ctx) {
         return SK_PASS;  // 不是 fake-ip，让正常流量走
     }
 
-    // 2. 通过 sockmap 获取实际的 socket 引用
-    struct bpf_sock *sk = bpf_map_lookup_elem(&mirage_listener_sk, &zero);
+    // 2. 按协议选择目标 socket: UDP → udp socket, 其余 (TCP) → listener socket.
+    //    sk_lookup 对 TCP/UDP 都会触发, 必须分流, 否则 UDP 包被 assign 到 TCP
+    //    socket → 协议不匹配 → 丢弃 (原 UDP 透明失效的根因)。
+    struct bpf_sock *sk;
+    if (ctx->protocol == IPPROTO_UDP) {
+        sk = bpf_map_lookup_elem(&mirage_udp_sk, &zero);
+    } else {
+        sk = bpf_map_lookup_elem(&mirage_listener_sk, &zero);
+    }
     if (!sk) {
         return SK_PASS;
     }
 
-    // 3. 将该连接指派给 mirage 的透明代理监听 socket
+    // 3. 将该连接/数据报指派给对应的透明代理 socket
     bpf_sk_assign(ctx, sk, 0);
     
     // 释放对 socket 的引用

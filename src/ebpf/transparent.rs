@@ -9,7 +9,7 @@ mod sys {
     };
     use aya::maps::{Array, SockMap};
     use std::os::unix::io::AsRawFd;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
     use tracing::info;
     use crate::ebpf::get_socket_cookie;
 
@@ -85,13 +85,25 @@ mod sys {
             info!("eBPF Transparent Engine: listener registered (cookie: {}, fd: {})", cookie, fd);
             Ok(())
         }
+
+        pub fn register_udp_listener(&self, socket: &UdpSocket) -> Result<()> {
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
+            let fd = socket.as_raw_fd();
+            let cookie = get_socket_cookie(fd)?;
+
+            let mut sk_map = SockMap::<_>::try_from(bpf.map_mut("mirage_udp_sk").unwrap())?;
+            sk_map.set(0, socket, 0).context("Failed to insert UDP socket fd")?;
+
+            info!("eBPF Transparent Engine: UDP socket registered (cookie: {}, fd: {})", cookie, fd);
+            Ok(())
+        }
     }
 }
 
 #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
 mod sys {
     use anyhow::Result;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, UdpSocket};
     use tracing::info;
 
     pub struct TransparentEngine {}
@@ -107,6 +119,10 @@ mod sys {
         }
 
         pub fn register_listener(&self, _listener: &TcpListener) -> Result<()> {
+            Ok(())
+        }
+
+        pub fn register_udp_listener(&self, _socket: &UdpSocket) -> Result<()> {
             Ok(())
         }
     }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{error, info, debug};
+use tracing::{error, info, debug, warn};
 
 use crate::config_watcher::CoreState;
 use crate::dns::fake_ip::FakeIpMapper;
@@ -42,6 +42,23 @@ pub async fn start_transparent(
     // fake-IP 会被内核判为转发/默认路由发出, 拦截静默失效. 自动装, 退出清理,
     // 用户无感. 见 transparent_net.rs 顶注释.
     crate::proxy::transparent_net::install(fake_ip_net, fake_ip_prefix).await;
+
+    // UDP 透明代理: 与 TCP 并行. sk_lookup 按 protocol 把 UDP 分流到 udp sockmap.
+    // (QUIC/HTTP3/DNS-over-UDP 的网关支持)
+    if let Ok(std::net::SocketAddr::V4(udp_bind)) = listen_addr.parse::<std::net::SocketAddr>() {
+        let st = state.clone();
+        let fm = fake_ip_mapper.clone();
+        let te = transparent_engine.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::proxy::transparent_udp::start_transparent_udp(udp_bind, st, fm, te).await
+            {
+                error!("Transparent UDP proxy failed: {}", e);
+            }
+        });
+    } else {
+        warn!("Transparent UDP proxy skipped: listen addr {} is not IPv4", listen_addr);
+    }
 
     info!("Transparent proxy pipeline fully initialized and attached.");
 

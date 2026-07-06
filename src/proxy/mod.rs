@@ -9,6 +9,7 @@ pub mod mirage_server;
 pub mod mixed;
 pub mod healthcheck;
 pub mod transparent;
+pub mod transparent_udp;
 pub mod sniff;
 pub mod splice;
 pub mod resolver;
