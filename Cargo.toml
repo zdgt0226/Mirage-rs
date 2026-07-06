@@ -47,5 +47,10 @@ path = "examples/test_align.rs"
 required-features = ["ebpf"]
 
 [[example]]
+name = "verify_udp_transparent"
+path = "examples/verify_udp_transparent.rs"
+required-features = ["ebpf"]
+
+[[example]]
 name = "simulate_bdp"
 path = "examples/simulate_bdp.rs"
