@@ -63,20 +63,45 @@ fn lock_replies(r: &Replies) -> std::sync::MutexGuard<'_, HashMap<SocketAddrV4, 
     r.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// setup_flow 早退 (路由/解析/bind 失败) 时, 移除主循环占位的 Setting 槽,
-/// 否则该 key 永远卡在 Setting, 后续包被当"建流中"丢弃 → 该目标彻底黑洞。
-/// commit 成功后 disarm, 不误删已升级的 Ready。
-struct PlaceholderGuard {
+/// flow 生命周期的 RAII 清理, **保证执行**(含 panic 展开 / 任何 early-return):
+///   - out=None (未 commit): 移除主循环占位的 Setting 槽, 否则该 key 永久卡
+///     Setting → 后续包被当"建流中"丢弃 → 目标黑洞。
+///   - out=Some (已 commit): 守卫移除 Ready 槽 (Arc::ptr_eq 防误删被替换的会话)
+///     + reply refs-- 归 0 移除关 FD。
+/// 关键: 清理内联在 downlink 循环后会被 panic/未来 early-return 跳过 → 泄漏,
+/// 故收进 Drop 强制保证 (同 reply-socket FD 泄漏那次的教训)。
+struct FlowGuard {
     key: FlowKey,
+    orig_dst: SocketAddrV4,
     sessions: Sessions,
-    armed: bool,
+    replies: Replies,
+    out: Option<Arc<UdpSocket>>,
 }
-impl Drop for PlaceholderGuard {
+impl Drop for FlowGuard {
     fn drop(&mut self) {
-        if self.armed {
-            let mut s = lock_sessions(&self.sessions);
-            if matches!(s.get(&self.key), Some(FlowSlot::Setting)) {
-                s.remove(&self.key);
+        match &self.out {
+            None => {
+                let mut s = lock_sessions(&self.sessions);
+                if matches!(s.get(&self.key), Some(FlowSlot::Setting)) {
+                    s.remove(&self.key);
+                }
+            }
+            Some(out) => {
+                {
+                    let mut s = lock_sessions(&self.sessions);
+                    if let Some(FlowSlot::Ready(cur)) = s.get(&self.key) {
+                        if Arc::ptr_eq(cur, out) {
+                            s.remove(&self.key);
+                        }
+                    }
+                }
+                let mut r = lock_replies(&self.replies);
+                if let Some(e) = r.get_mut(&self.orig_dst) {
+                    e.refs = e.refs.saturating_sub(1);
+                    if e.refs == 0 {
+                        r.remove(&self.orig_dst);
+                    }
+                }
             }
         }
     }
@@ -219,11 +244,13 @@ async fn setup_flow(
     replies: Replies,
 ) {
     let key = (client, orig_dst);
-    // 任何早退都要清掉主循环占位的 Setting 槽 (否则该 key 永久黑洞)。commit 后 disarm。
-    let mut guard = PlaceholderGuard {
+    // RAII 清理: 早退清占位, commit 后清完整会话。始终保证执行 (含 panic)。
+    let mut guard = FlowGuard {
         key,
+        orig_dst,
         sessions: sessions.clone(),
-        armed: true,
+        replies: replies.clone(),
+        out: None,
     };
     let fake_ip = *orig_dst.ip();
     let port = orig_dst.port();
@@ -324,9 +351,9 @@ async fn setup_flow(
         }
     };
 
-    // commit: Setting → Ready, disarm guard (至此不再早退)。
+    // commit: Setting → Ready, guard 转入"已建流"模式 (drop 时做完整 teardown)。
     lock_sessions(&sessions).insert(key, FlowSlot::Ready(out.clone()));
-    guard.armed = false;
+    guard.out = Some(out.clone());
     debug!(
         "udp-t: new flow {} → {} (fake {} → real {})",
         client,
@@ -349,24 +376,7 @@ async fn setup_flow(
         }
     }
 
-    // teardown: 只在槽仍是"我们这条 socket"时移除 (防误删被新 setup 替换的会话);
-    // 回包 socket refs-- 归 0 即移除 → 关 FD (防句柄泄漏)。
-    {
-        let mut s = lock_sessions(&sessions);
-        if let Some(FlowSlot::Ready(cur)) = s.get(&key) {
-            if Arc::ptr_eq(cur, &out) {
-                s.remove(&key);
-            }
-        }
-    }
-    {
-        let mut r = lock_replies(&replies);
-        if let Some(e) = r.get_mut(&orig_dst) {
-            e.refs = e.refs.saturating_sub(1);
-            if e.refs == 0 {
-                r.remove(&orig_dst);
-            }
-        }
-    }
+    // teardown (session 移除 + reply refs--) 由 FlowGuard::drop 保证执行,
+    // 即使 downlink 循环里 panic 也不泄漏。
     debug!("udp-t: flow {:?} closed", key);
 }
