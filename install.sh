@@ -140,24 +140,21 @@ url_decode() {
     printf '%b' "${s//%/\\x}"
 }
 
-# 节点 URI 格式: mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>[&brutal=<mbps>]
+# 节点 URI 格式: mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>
 # 注: 不支持带 [] 的 IPv6 主机 (regex 限制), 这种情况手动模式输入。
+# Brutal 是服务端单边加速 (下行发送侧), 客户端无需感知, 不进节点串。
 build_node_uri() {
-    local pwd=$1 host=$2 port=$3 sni=$4 brutal=${5:-0}
-    local epwd esni q
+    local pwd=$1 host=$2 port=$3 sni=$4
+    local epwd esni
     epwd=$(url_encode "$pwd")
     esni=$(url_encode "$sni")
-    q="sni=${esni}"
-    if [[ "$brutal" =~ ^[0-9]+$ ]] && (( brutal > 0 )); then
-        q+="&brutal=$brutal"
-    fi
-    echo "mirage://${epwd}@${host}:${port}?${q}"
+    echo "mirage://${epwd}@${host}:${port}?sni=${esni}"
 }
 
 # 解析 URI 写入全局 NODE_*。成功返回 0, 失败返回 1。
 parse_node_uri() {
     local uri=$1
-    NODE_PWD=""; NODE_HOST=""; NODE_PORT=""; NODE_SNI=""; NODE_BRUTAL=0
+    NODE_PWD=""; NODE_HOST=""; NODE_PORT=""; NODE_SNI=""
     if [[ ! "$uri" =~ ^mirage://([^@]+)@([^:/?]+):([0-9]+)(\?(.*))?$ ]]; then
         return 1
     fi
@@ -170,7 +167,6 @@ parse_node_uri() {
         local k="${p%%=*}" v="${p#*=}"
         case "$k" in
             sni)    NODE_SNI=$(url_decode "$v") ;;
-            brutal) NODE_BRUTAL="$v" ;;
         esac
     done
     [[ -n "$NODE_PWD" && -n "$NODE_HOST" && -n "$NODE_PORT" && -n "$NODE_SNI" ]]
@@ -605,7 +601,7 @@ show_server_node() {
             local ip host
             ip=$(detect_public_ip || true)
             host=$(ask "公网地址 (域名/IP, 用于生成节点串)" "$ip")
-            [[ -n "$host" ]] && node_uri=$(build_node_uri "$pwd" "$host" "$port" "$sni" "$brutal")
+            [[ -n "$host" ]] && node_uri=$(build_node_uri "$pwd" "$host" "$port" "$sni")
         fi
     fi
 
@@ -918,7 +914,7 @@ EOF
         echo "      mirage://<密码>@<host>:${port}?sni=${sni}" >&2
     else
         local node_uri
-        node_uri=$(build_node_uri "$pwd" "$pub_host" "$port" "$sni" "$brutal_rate_mbps")
+        node_uri=$(build_node_uri "$pwd" "$pub_host" "$port" "$sni")
         echo "$node_uri" > "${ETC_DIR}/node-export.txt"
         chmod 600 "${ETC_DIR}/node-export.txt"
 
@@ -990,7 +986,6 @@ config_client() {
     title "配置 Mirage-rs 客户端"
 
     local srv_host srv_port pwd sni
-    local imported_brutal=0
 
     # ── 节点导入: 优先粘贴 URI ──
     local local_node_default=""
@@ -1017,15 +1012,10 @@ config_client() {
                 srv_port="$NODE_PORT"
                 pwd="$NODE_PWD"
                 sni="$NODE_SNI"
-                imported_brutal="$NODE_BRUTAL"
                 ok "节点导入成功: ${srv_host}:${srv_port} (sni=${sni})"
-                if [[ "$imported_brutal" =~ ^[0-9]+$ ]] && (( imported_brutal > 0 )); then
-                    info "服务端启用了 Brutal (${imported_brutal} Mbps). 客户端对称启用需:"
-                    info "  1) 装 brutal 内核模块  2) outbounds[mirage] 加 \"brutal_rate_mbps\": ${imported_brutal}"
-                fi
                 break
             fi
-            warn "节点串格式无效. 期望: mirage://<密码>@<host>:<port>?sni=<域名>[&brutal=<mbps>]"
+            warn "节点串格式无效. 期望: mirage://<密码>@<host>:<port>?sni=<域名>"
         done
     fi
 
@@ -1181,16 +1171,6 @@ EOF
 # ──────────────────────────────────────────────────────────────────────────────
 # 主入口
 # ──────────────────────────────────────────────────────────────────────────────
-print_brutal_hint() {
-    echo "【极限性能优化建议】"
-    echo "如果要完全发挥 Brutal CC 的极速性能并让 4MB 发送缓冲区生效，"
-    echo "请手动执行以下步骤："
-    echo "  1. 确保 tcp-brutal 内核模块已安装：https://github.com/apernet/tcp-brutal"
-    echo "  2. 在客户端配置文件 outbounds[mirage] 块中添加 \"brutal_rate_mbps\": 8"
-    echo "  3. 重启 mirage-rs：$(svc_restart_hint client)"
-    echo "=========================================================="
-}
-
 optimize_sysctl() {
     info "正在优化系统网络参数 (BBR, wmem_max)..."
     cat > /etc/sysctl.d/99-mirage.conf <<EOF
@@ -1347,12 +1327,10 @@ main() {
             ;;
         2)
             config_client
-            print_brutal_hint
             ;;
         3)
             config_server
             config_client
-            print_brutal_hint
             ;;
     esac
 
