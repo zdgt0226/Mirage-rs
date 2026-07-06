@@ -404,6 +404,225 @@ svc_log_hint() { # role
     if [ "$INIT_SYS" = systemd ]; then echo "journalctl -u mirage-rs-$1 -f"; else echo "tail -f ${LOG_DIR}/$1.log"; fi
 }
 
+# uname -m → release 资产架构名. 32 位映射到 alpha.19 起发布的纯用户态产物.
+detect_arch() {
+    case $(uname -m) in
+        x86_64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        i386|i486|i586|i686)
+            warn "32 位 x86: 纯用户态代理, 内核 <5.9 无 sk_lookup 透明模式。"
+            echo "i386" ;;
+        armv7l|armv7)
+            warn "32 位 ARMv7: 纯用户态代理, 内核 <5.9 无 sk_lookup 透明模式。"
+            echo "armv7" ;;
+        *) err "不支持的系统架构: $(uname -m)" ;;
+    esac
+}
+
+# 探测架构并从 Release 下载二进制到 $1, 带完整性校验. MIRAGE_TAG 空=latest.
+# 下载成功(且校验通过)返回 0; 下载失败返回 1 (由调用方决定回退).
+fetch_release_binary() {
+    local dest=$1 arch
+    arch=$(detect_arch)
+    # 文件名跟 release.yml 上传命名严格一致 (mirage-rs-<arch>-musl).
+    local download_url
+    if [[ -n "$MIRAGE_TAG" ]]; then
+        download_url="https://github.com/zdgt0226/Mirage-rs/releases/download/${MIRAGE_TAG}/mirage-rs-${arch}-musl"
+        info "下载指定版本 ${MIRAGE_TAG}: $download_url"
+    else
+        download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-rs-${arch}-musl"
+        info "下载最新版本: $download_url"
+    fi
+    if ! curl -# -fLo "$dest" "$download_url"; then
+        warn "从 GitHub Releases 下载失败，请检查网络或手动下载编译。"
+        return 1
+    fi
+    verify_binary_integrity "$dest" "$download_url"
+}
+
+# 本机已装二进制的版本 (CARGO_PKG_VERSION). 无/损坏返回非 0.
+# `mirage --version` 输出: "mirage-rs 0.4.5-alpha.19 (v0.4.5-alpha.19-...)"
+local_version() {
+    [[ -x "$BIN_PATH" ]] || return 1
+    local out ver
+    out=$("$BIN_PATH" --version 2>/dev/null) || return 1
+    ver=$(awk '{print $2}' <<< "$out")
+    [[ -n "$ver" ]] || return 1
+    echo "$ver"
+}
+
+# 仓库目标版本 (去前导 v). MIRAGE_TAG 非空直接返回它, 否则查 GitHub latest.
+remote_version() {
+    if [[ -n "$MIRAGE_TAG" ]]; then
+        echo "${MIRAGE_TAG#v}"; return 0
+    fi
+    local resp
+    resp=$(curl -sfL --max-time 10 -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/zdgt0226/Mirage-rs/releases/latest" 2>/dev/null || true)
+    [[ -n "$resp" ]] || return 1
+    grep -m1 '"tag_name"' <<< "$resp" \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/'
+}
+
+# init-aware 服务控制 (start/stop/restart) 与运行状态查询. 未装服务时静默.
+svc_ctl() { # action role
+    local action=$1 svc="mirage-rs-$2"
+    case "$INIT_SYS" in
+        openrc)   rc-service "$svc" "$action" 2>/dev/null || true ;;
+        sysvinit) service "$svc" "$action" 2>/dev/null || "/etc/init.d/$svc" "$action" 2>/dev/null || true ;;
+        systemd)  systemctl "$action" "$svc" 2>/dev/null || true ;;
+        *) : ;;
+    esac
+}
+service_active() { # role
+    local svc="mirage-rs-$1"
+    case "$INIT_SYS" in
+        systemd)  systemctl is-active --quiet "$svc" 2>/dev/null ;;
+        openrc)   rc-service "$svc" status >/dev/null 2>&1 ;;
+        sysvinit) [[ -x "/etc/init.d/$svc" ]] && "/etc/init.d/$svc" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 从 config JSON 取字段 (先查 inbounds[0], 再查顶层). python3 优先, 否则 grep.
+json_get() { # file key
+    local file=$1 key=$2
+    if command -v python3 >/dev/null 2>&1; then
+        FILE="$file" KEY="$key" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["FILE"]))
+    ib = (d.get("inbounds") or [{}])[0]
+    v = ib.get(os.environ["KEY"])
+    if v is None: v = d.get(os.environ["KEY"])
+    if v is not None: print(v)
+except Exception:
+    pass'
+    else
+        grep -oE "\"$key\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[0-9]+)" "$file" | head -1 \
+            | sed -E "s/\"$key\"[[:space:]]*:[[:space:]]*//; s/^\"//; s/\"$//"
+    fi
+}
+
+# ── 二进制更新: 识别本地版本 → 对比仓库版本 → 校验下载 → 原子替换 → 重启活动服务 ──
+update_binary() {
+    title "Mirage-rs 二进制更新"
+    if [[ ! -f "$BIN_PATH" ]]; then
+        warn "未检测到已安装的二进制 ($BIN_PATH)。请先运行部署 (菜单 1/2/3)。"
+        return
+    fi
+
+    local lv
+    if lv=$(local_version); then
+        info "本地版本: $lv"
+    else
+        lv=""
+        warn "无法识别本地版本 (二进制损坏或占位文件)。"
+    fi
+
+    # 允许指定目标 tag (留空=latest). 复用 select_version 填充 MIRAGE_TAG.
+    select_version
+
+    local rv
+    if ! rv=$(remote_version) || [[ -z "$rv" ]]; then
+        rv=""
+        warn "无法获取仓库版本 (GitHub 限流 / 网络断)。"
+        ask_yn "仍要强制重新下载并覆盖?" n || { info "已取消更新。"; return; }
+    else
+        info "仓库版本: $rv"
+        if [[ -n "$lv" && "$lv" == "$rv" ]]; then
+            ok "已是最新版本 ($lv)。"
+            ask_yn "仍要强制重新下载覆盖?" n || return
+        else
+            local newest=""
+            newest=$(printf '%s\n%s\n' "$lv" "$rv" | sort -V 2>/dev/null | tail -1) || true
+            if [[ -z "$lv" || -z "$newest" ]]; then
+                info "将安装仓库版本: $rv"
+            elif [[ "$newest" == "$rv" ]]; then
+                info "发现新版本: $lv → $rv"
+            else
+                warn "本地版本 ($lv) 似乎比仓库 ($rv) 更新 (开发构建?)。"
+            fi
+            ask_yn "确认更新到 ${rv:-仓库版本} ?" y || { info "已取消更新。"; return; }
+        fi
+    fi
+
+    # 下到同目录临时文件 → 校验通过再 rename 替换 (同 fs 原子, 避免覆盖运行中二进制的 ETXTBSY)
+    local tmp
+    tmp=$(mktemp "${BIN_PATH}.new.XXXXXX")
+    if ! fetch_release_binary "$tmp"; then
+        rm -f "$tmp"
+        err "下载失败, 现有二进制保持不变。"
+    fi
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$BIN_PATH"
+    ok "二进制已更新: $BIN_PATH"
+    local nv; nv=$(local_version 2>/dev/null || true)
+    [[ -n "$nv" ]] && ok "当前版本: $nv"
+
+    # 重启当前活动的服务以加载新二进制 (未运行的不动)
+    local restarted=0 role
+    for role in server client; do
+        if service_active "$role"; then
+            info "重启 mirage-rs-$role 以加载新二进制 ..."
+            svc_ctl restart "$role"
+            restarted=1
+        fi
+    done
+    (( restarted )) || info "未发现运行中的 mirage-rs 服务, 无需重启。"
+}
+
+# ── 显示服务端节点配置 (供复制到客户端做节点配置) ──
+show_server_node() {
+    title "服务端节点配置信息"
+    local cfg="${ETC_DIR}/config_server.json"
+    local export_file="${ETC_DIR}/node-export.txt"
+
+    if [[ ! -f "$cfg" && ! -f "$export_file" ]]; then
+        warn "未找到服务端配置 ($cfg)。请先在本机部署服务端 (菜单 1)。"
+        return
+    fi
+
+    local node_uri=""
+    [[ -f "$export_file" ]] && node_uri=$(cat "$export_file")
+
+    if [[ -f "$cfg" ]]; then
+        local port pwd sni brutal
+        port=$(json_get "$cfg" port)
+        pwd=$(json_get "$cfg" password)
+        sni=$(json_get "$cfg" camouflage_host)
+        brutal=$(json_get "$cfg" brutal_rate_mbps); [[ -n "$brutal" ]] || brutal=0
+
+        echo "  监听端口:   $(_c 36 "${port:-?}")" >&2
+        echo "  认证密码:   $(_c 36 "${pwd:-?}")" >&2
+        echo "  伪装 SNI:   $(_c 36 "${sni:-?}")" >&2
+        [[ "$brutal" =~ ^[0-9]+$ ]] && (( brutal > 0 )) && \
+            echo "  Brutal:     $(_c 36 "${brutal} Mbps")" >&2
+        echo >&2
+
+        # 无现成导出串 → 现场探测公网 IP 重建
+        if [[ -z "$node_uri" && -n "$pwd" && -n "$port" && -n "$sni" ]]; then
+            local ip host
+            ip=$(detect_public_ip || true)
+            host=$(ask "公网地址 (域名/IP, 用于生成节点串)" "$ip")
+            [[ -n "$host" ]] && node_uri=$(build_node_uri "$pwd" "$host" "$port" "$sni" "$brutal")
+        fi
+    fi
+
+    if [[ -n "$node_uri" ]]; then
+        title "客户端节点导入串 (复制到客户端)"
+        echo "  $(_c 32 "$node_uri")" >&2
+        echo >&2
+        if command -v qrencode >/dev/null 2>&1; then
+            qrencode -t UTF8 "$node_uri" >&2
+            echo >&2
+        fi
+    else
+        warn "未能生成节点串 (缺公网地址)。手动格式:"
+        echo "      mirage://<密码>@<host>:<port>?sni=<sni>" >&2
+    fi
+}
+
 setup_fhs() {
     info "创建 FHS 标准目录..."
     mkdir -p "$ETC_DIR" "$ETC_DIR/geosite" "$STATE_DIR" "$LOG_DIR"
@@ -422,39 +641,11 @@ setup_fhs() {
         cp target/release/mirage "$BIN_PATH"
     else
         info "本地未找到可执行文件，准备从 GitHub 拉取预编译产物..."
-        local arch
-        case $(uname -m) in
-            x86_64) arch="amd64" ;;
-            aarch64|arm64) arch="arm64" ;;
-            i386|i486|i586|i686)
-                arch="i386"
-                warn "32 位 x86: 纯用户态代理, 内核 <5.9 无 sk_lookup 透明模式。" ;;
-            armv7l|armv7)
-                arch="armv7"
-                warn "32 位 ARMv7: 纯用户态代理, 内核 <5.9 无 sk_lookup 透明模式。" ;;
-            *) err "不支持的系统架构: $(uname -m)" ;;
-        esac
-        
-        # 文件名跟 release.yml 上传命名严格一致 (mirage-rs-<arch>-musl).
-        # MIRAGE_TAG 非空 → 指定版本; 否则 latest.
-        local download_url
-        if [[ -n "$MIRAGE_TAG" ]]; then
-            download_url="https://github.com/zdgt0226/Mirage-rs/releases/download/${MIRAGE_TAG}/mirage-rs-${arch}-musl"
-            info "下载指定版本 ${MIRAGE_TAG}: $download_url"
-        else
-            download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-rs-${arch}-musl"
-            info "下载最新版本: $download_url"
-        fi
-
-        # 使用 curl 下载，带进度条
-        if ! curl -# -fLo "$BIN_PATH" "$download_url"; then
-            warn "从 GitHub Releases 下载失败，请检查网络或手动下载编译。"
+        if ! fetch_release_binary "$BIN_PATH"; then
             touch "$BIN_PATH" # Placeholder for sandbox/development fallback
-        else
-            verify_binary_integrity "$BIN_PATH" "$download_url"
         fi
     fi
-    
+
     chmod 755 "$BIN_PATH"
     ok "核心程序部署完毕 (Aya CO-RE eBPF Ready)。"
 }
@@ -1134,14 +1325,17 @@ main() {
         "部署服务端 (Server)" \
         "部署客户端 (Client)" \
         "同时部署服务端与客户端" \
+        "更新二进制 (Update binary)" \
+        "显示服务端节点配置 (Show node info)" \
         "卸载 (Uninstall)")
 
-    if [[ "$mode" == "4" ]]; then
-        uninstall
-        return
-    fi
+    case "$mode" in
+        4) update_binary; return ;;
+        5) show_server_node; return ;;
+        6) uninstall; return ;;
+    esac
 
-    # 选择安装版本 (留空 = latest)
+    # 部署路径 (1/2/3): 选择安装版本 (留空 = latest)
     select_version
 
     setup_fhs
