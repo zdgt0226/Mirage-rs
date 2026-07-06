@@ -47,7 +47,9 @@ fn format_remote(remote_ip: [u32; 4], port: u16, family: u16) -> String {
 pub async fn get_bpf_tunnels(State(state): State<AppState>) -> Json<Value> {
     let mut tunnels: Vec<Value> = Vec::new();
     if let Some(engine) = state.ebpf_engine {
-        if let Ok(lock) = engine.try_lock() {
+        // lock().await 而非 try_lock: 避免锁被短暂占用那帧返回空列表导致面板闪烁.
+        let lock = engine.lock().await;
+        {
             if let Ok(entries) = lock.get_all_tunnel_stats() {
                 tunnels = entries.into_iter().map(|(cookie, s)| {
                     json!({

@@ -65,9 +65,13 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
 
     // 组装 subscriber. 两种分支类型不同, 各自 set_global_default. 不用
     // BoxMakeWriter 是因为 closure/GLOBAL_LOGGER.clone() 都需要私有类型.
+    // with_ansi(false): 关掉 ANSI 颜色转义码. 同一 formatter 的字节同时写 stdout +
+    // GUI MemoryLogger + 文件, 带颜色码的日志在 GUI/文件里渲染成方块 (mojibake).
+    // 服务端 daemon 不需要终端颜色, 纯文本全通道干净且 grep 友好.
     if let Some(fl) = file_logger_opt.clone() {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(max_level)
+            .with_ansi(false)
             .with_writer(
                 std::io::stdout
                     .and(|| crate::monitor::GLOBAL_LOGGER.clone())
@@ -78,6 +82,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     } else {
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(max_level)
+            .with_ansi(false)
             .with_writer(std::io::stdout.and(|| crate::monitor::GLOBAL_LOGGER.clone()))
             .finish();
         let _ = tracing::subscriber::set_global_default(subscriber);

@@ -1,5 +1,32 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.18] - GUI 面板闪烁 + 日志方块修复 (2026-07-06)
+
+### fix(gui): eBPF/Brutal/Tunnels 面板闪烁 (try_lock → lock().await)
+
+**问题**: GUI 的 "Active BPF Tunnels" / "eBPF Engine" / "Brutal CC" 状态时有时无
+闪烁. 根因: `overview` + `bpf_tunnels` handler 用 `engine.try_lock()` 读 BPF map,
+锁被 sampler (每秒读 stats) / brutal 动态速率 (读 RTT) 短暂占用那一帧 try_lock
+失败 → 返回 engine_online=false / tunnel_count=0 / brutal_cc_active=false / 空
+tunnel 列表 → 面板消失; 下一帧拿到锁又出现.
+
+**修复**: 两个 handler 改 `engine.lock().await`. handler 是 async, 锁只被持有
+~µs (读内核 map), await 等一下即可, 消除闪烁. (accept loop 的 try_lock 保留 —
+那里不能阻塞 accept.)
+
+### fix(log): GUI/文件日志 ANSI 颜色码渲染成方块
+
+**问题**: GUI 日志面板 (和 log_file) 满屏方块. 根因: tracing fmt subscriber 默认
+开 ANSI 颜色, 同一 formatter 的带颜色码字节同时写 stdout + GUI MemoryLogger +
+文件, GUI/文件把 ESC 转义码渲染成方块 (mojibake).
+
+**修复**: subscriber 加 `.with_ansi(false)`. 服务端 daemon 不需要终端颜色, 纯文本
+全通道 (stdout/GUI/文件) 干净且 grep 友好.
+
+### 影响面
+
+- 仅 GUI/日志展示; 非破坏性, 无协议/配置变化
+
 ## [v0.4.5-alpha.17] - 客户端握手放弃超时随机化 (消除时序指纹) (2026-07-06)
 
 ### security(client): read_server_handshake 超时随机化
