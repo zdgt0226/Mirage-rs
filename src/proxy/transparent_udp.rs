@@ -46,6 +46,34 @@ const MAX_FLOWS: usize = 4096;
 /// 到顶丢包累计计数, 用于限流打印 (每 1000 次告警一次, 免刷屏)。
 static CAP_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// Mirage 路由的 UDP 流**子上限**。每条 Mirage-UDP 流独占一条到服务器的 TCP 隧道
+/// (per-flow, 未做多路复用), 若不限, 局域网 UDP 噪音 (大量代理域名的 QUIC/游戏)
+/// 会把 WarmPool 隧道抽干, 饿死高价值的 TCP 网页浏览。设为 MAX_FLOWS 的一小部分
+/// (256), UDP 隧道占用封顶, 其余留给 TCP。超限时该 UDP 流丢弃 → 客户端 QUIC 回落
+/// 已透明的 TCP。
+const MAX_MIRAGE_UDP_FLOWS: usize = 256;
+static MIRAGE_UDP_FLOWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Mirage-UDP 流并发额度的 RAII 令牌: 获取即占一个名额, drop 即释放。
+struct MirageUdpPermit;
+impl MirageUdpPermit {
+    /// 名额未满则占一个返回 Some; 满则 None。fetch_add 后回滚的软上限 (高并发下
+    /// 可能瞬时略超, 自校正, 对软限足够)。
+    fn try_acquire() -> Option<Self> {
+        if MIRAGE_UDP_FLOWS.fetch_add(1, Ordering::Relaxed) >= MAX_MIRAGE_UDP_FLOWS {
+            MIRAGE_UDP_FLOWS.fetch_sub(1, Ordering::Relaxed);
+            None
+        } else {
+            Some(MirageUdpPermit)
+        }
+    }
+}
+impl Drop for MirageUdpPermit {
+    fn drop(&mut self) {
+        MIRAGE_UDP_FLOWS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 type FlowKey = (SocketAddrV4, SocketAddrV4); // (client, orig_dst)
 
 /// 递增 flow id, 供 teardown 守卫辨认"是不是自己那条"(两种 sink 通用, 取代
@@ -489,6 +517,14 @@ async fn setup_flow(
                 Some(d) if d.len() <= 255 => d.clone(),
                 _ => {
                     warn!("udp-t: Mirage flow needs domain (fake-ip {}), dropping", fake_ip);
+                    return;
+                }
+            };
+            // 子上限: 占一个 Mirage-UDP 隧道名额 (drop 时释放)。满则丢, 别抽干隧道池。
+            let _udp_permit = match MirageUdpPermit::try_acquire() {
+                Some(p) => p,
+                None => {
+                    debug!("udp-t: Mirage-UDP 流到子上限 {}, 丢弃 (客户端回落 TCP)", MAX_MIRAGE_UDP_FLOWS);
                     return;
                 }
             };
