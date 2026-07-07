@@ -97,9 +97,14 @@ struct FlowGuard {
     sessions: Sessions,
     replies: Replies,
     committed_id: Option<u64>,
+    /// acquire_reply 成功后立即置 true。reply refs-- 与 commit **解耦**: 只要
+    /// 取过 reply 就在 drop 时减 —— 否则若 acquire 与 committed_id 赋值之间发生
+    /// panic/未来 early-return, refs 会虚漏 (socket FD 永不归 0)。
+    reply_acquired: bool,
 }
 impl Drop for FlowGuard {
     fn drop(&mut self) {
+        // ① 会话槽: 按是否 commit 分支移除
         match self.committed_id {
             None => {
                 let mut s = lock_sessions(&self.sessions);
@@ -108,19 +113,19 @@ impl Drop for FlowGuard {
                 }
             }
             Some(id) => {
-                {
-                    let mut s = lock_sessions(&self.sessions);
-                    if matches!(s.get(&self.key), Some(FlowSlot::Ready { id: cur, .. }) if *cur == id)
-                    {
-                        s.remove(&self.key);
-                    }
+                let mut s = lock_sessions(&self.sessions);
+                if matches!(s.get(&self.key), Some(FlowSlot::Ready { id: cur, .. }) if *cur == id) {
+                    s.remove(&self.key);
                 }
-                let mut r = lock_replies(&self.replies);
-                if let Some(e) = r.get_mut(&self.orig_dst) {
-                    e.refs = e.refs.saturating_sub(1);
-                    if e.refs == 0 {
-                        r.remove(&self.orig_dst);
-                    }
+            }
+        }
+        // ② reply refs--: 独立于 commit, 只要取过就减 (堵住虚漏)
+        if self.reply_acquired {
+            let mut r = lock_replies(&self.replies);
+            if let Some(e) = r.get_mut(&self.orig_dst) {
+                e.refs = e.refs.saturating_sub(1);
+                if e.refs == 0 {
+                    r.remove(&self.orig_dst);
                 }
             }
         }
@@ -373,6 +378,7 @@ async fn setup_flow(
         sessions: sessions.clone(),
         replies: replies.clone(),
         committed_id: None,
+        reply_acquired: false,
     };
     let fake_ip = *orig_dst.ip();
     let port = orig_dst.port();
@@ -457,6 +463,7 @@ async fn setup_flow(
                 Some(r) => r,
                 None => return,
             };
+            guard.reply_acquired = true; // 与 commit 解耦, 保证 refs-- 不虚漏
             lock_sessions(&sessions).insert(
                 key,
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Direct(out.clone()) },
@@ -500,6 +507,7 @@ async fn setup_flow(
                 Some(r) => r,
                 None => return,
             };
+            guard.reply_acquired = true; // 与 commit 解耦, 保证 refs-- 不虚漏
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
             lock_sessions(&sessions).insert(
                 key,

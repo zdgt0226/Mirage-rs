@@ -10,6 +10,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
 
+/// Mirage 隧道 relay 的**空闲**超时 (每次 read/recv 无数据满此值才断)。
+/// 与服务端 mirage_server/tcp_relay.rs 的 1800s 对齐, 两端一致不互相早关。
+/// ⚠️ 必须包在每次 read **内层** —— 包在整个 loop 外层会变成绝对墙钟寿命,
+/// 满 300s 无条件斩断 SSH/视频/大下载/长连接 (曾经的 bug)。
+const MIRAGE_RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(1800);
+
 /**
  * [SOCKS5 客户端接入点]
  * 负责接收局域网设备或本机发来的代理请求，执行 SOCKS5 握手，
@@ -178,26 +184,26 @@ pub async fn proxy_tcp_target(
             let mut tunnel_writer = tunnel.writer;
 
             let upload = async {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-                    let mut buf = [0u8; 16384];
-                    loop {
-                        match local_read.read(&mut buf).await {
-                            Ok(0) => {
-                                let _ = tunnel_writer.send_close_notify().await;
-                                break;
-                            }
-                            Ok(n) => {
-                                if tunnel_writer.send_data(&buf[..n]).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => {
-                                let _ = tunnel_writer.send_close_notify().await;
+                let mut buf = [0u8; 16384];
+                loop {
+                    // 空闲超时包在每次 read 内层 (非整个 loop 外层, 见 MIRAGE_RELAY_IDLE 注释)
+                    match tokio::time::timeout(MIRAGE_RELAY_IDLE, local_read.read(&mut buf)).await {
+                        Ok(Ok(0)) => {
+                            let _ = tunnel_writer.send_close_notify().await;
+                            break;
+                        }
+                        Ok(Ok(n)) => {
+                            if tunnel_writer.send_data(&buf[..n]).await.is_err() {
                                 break;
                             }
                         }
+                        Ok(Err(_)) => {
+                            let _ = tunnel_writer.send_close_notify().await;
+                            break;
+                        }
+                        Err(_) => break, // 空闲超时: 双向 1800s 无数据
                     }
-                }).await;
+                }
 
                 // 退出前排空残留的本地数据，确保发送给本地的是 FIN 而不是 RST
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
@@ -224,18 +230,18 @@ pub async fn proxy_tcp_target(
                 // 加 try_recv (中途取消会丢帧半读). 保持一对一直连最稳.
                 let mut tunnel_reader = tunnel_reader;
 
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-                    loop {
-                        match tunnel_reader.recv_data().await {
-                            Ok(data) => {
-                                if local_write.write_all(&data).await.is_err() {
-                                    break;
-                                }
+                loop {
+                    // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
+                    match tokio::time::timeout(MIRAGE_RELAY_IDLE, tunnel_reader.recv_data()).await {
+                        Ok(Ok(data)) => {
+                            if local_write.write_all(&data).await.is_err() {
+                                break;
                             }
-                            Err(_) => break,
                         }
+                        Ok(Err(_)) => break,
+                        Err(_) => break, // 空闲超时
                     }
-                }).await;
+                }
 
                 // 退出前排空远端发来的残留数据, 确保发给服务端的是 FIN 而不是 RST (核心隐蔽特征)
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {

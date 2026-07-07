@@ -136,13 +136,25 @@ pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>)
         let _ = local_tcp.read(&mut buf).await;
     });
     
+    // abort_handle 只借用不消费, 可在 select 移动 handle 前取。
+    let ah_up = uplink.abort_handle();
+    let ah_down = downlink.abort_handle();
+    let ah_tcp = tcp_watcher.abort_handle();
+
     // Terminate when any task ends
     tokio::select! {
         _ = uplink => {},
         _ = downlink => {},
         _ = tcp_watcher => {},
     }
-    
+
+    // ⚠️ select! 结束只 drop 另两个 JoinHandle —— drop JoinHandle **不 abort** task,
+    // uplink 会作为僵尸永久阻塞在 recv_from, 泄漏那个临时 UDP socket。必须显式
+    // abort 未完成的 (已完成的 abort 是 no-op)。(服务端 udp_relay 早有 downlink.abort())
+    ah_up.abort();
+    ah_down.abort();
+    ah_tcp.abort();
+
     let _ = tunnel_writer.lock().await.send_close_notify().await;
 
     debug!("UDP Relay gracefully closed for port {}", port);
