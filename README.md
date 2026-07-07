@@ -143,7 +143,7 @@ sha256sum -c mirage-rs-amd64-musl.sha256
 - **`log_file`** (alpha.14+): 可选日志文件路径, 同时输出 stdout (journalctl) + 该文件. 不设保持老 stdout-only 行为
 - **`inbounds[]`**: 标准结构化 (数组), `type: mixed` 同时支持 SOCKS5 + HTTP
 - **`outbounds[]`**: `type: mirage` 是代理节点 (旧名 `pyreality` 已弃用)
-  - `pool_size`: WarmPool 上限 (默认 50). alpha.11+ 有自动 floor=10 保证突发无 wait build
+  - `pool_size`: WarmPool 上限 (默认 16). alpha.11+ 有自动 floor=10 保证突发无 wait build
   - `brutal_rate_mbps` (可选): 客户端出站 brutal 速率. 默认不开 (0 或不写字段)
 - **`gui.enabled`** + **`gui.listen`**: alpha.4+ 结构化 (老的 `gui_listen` 单字段弃用)
 - **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` 等

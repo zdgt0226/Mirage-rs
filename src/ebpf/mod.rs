@@ -25,6 +25,12 @@ mod sys {
     use aya::{Ebpf, programs::{SockOps, CgroupAttachMode, Xdp, XdpFlags}};
     use aya::maps::HashMap;
     
+    /// 构造 mirage_target_ips 的 key [family, ...ip]。**字节序必须与 BPF 端
+    /// sockmap.c::extract_ip 一致 = 网络序** (skops->remote_ip4 / remote_ip6[]
+    /// 都是网络序)。已核对: 两分支写法不同但都产出网络序内存布局, 匹配 BPF 端:
+    ///   - IPv4 `u32::from(v4).to_be()`   → 内存 [a,b,c,d] 网络序;
+    ///   - IPv6 `from_ne_bytes(网络序octets)` → 内存原样网络序。
+    /// (等价于都用 from_ne_bytes(octets); 写法虽不对称但**非 bug**, 勿"修")。
     pub fn ip_to_key(ip: std::net::IpAddr) -> [u32; 5] {
         match ip {
             std::net::IpAddr::V4(v4) => [2, 0, 0, 0, u32::from(v4).to_be()],

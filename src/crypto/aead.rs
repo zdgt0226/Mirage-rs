@@ -29,6 +29,9 @@ pub const MAX_RECORD_SIZE: usize = 16384;
 fn derive_master(password: &str, salt: &[u8]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(salt), password.as_bytes());
     let mut okm = [0u8; 32];
+    // ⚠️ 协议冻结常量: "pyrealiy" 是 "pyreality" 的历史拼写错误。**切勿"修正"** ——
+    // 客户端/服务端必须用完全相同的 info 字节才能派生同一密钥, 改了会让新旧版本
+    // 密钥不兼容、静默解密失败。要动必须两端同步 + bump 协议版本。
     hk.expand(b"pyrealiy-session", &mut okm).unwrap();
     okm
 }
