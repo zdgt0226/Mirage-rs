@@ -1,5 +1,50 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5-alpha.20] - UDP 透明代理 + Mirage-UDP 隧道腿 (2026-07-07)
+
+真机测试里程碑版。alpha.19 以来 16 个 commit, 补齐 UDP 透明代理整条线。
+
+### feat: UDP 透明代理 (sk_lookup + IP_TRANSPARENT)
+
+- `transparent.c` 按 `ctx->protocol` 分流, UDP → 新 `mirage_udp_sk` sockmap
+  (原来 UDP 被 assign 给 TCP socket 而丢, QUIC/HTTP3/DNS-over-UDP 走不了)。
+- `transparent_udp.rs`: 主 socket IP_TRANSPARENT+IP_RECVORIGDSTADDR recvmsg 取
+  (client, orig_dst); 反查域名 → 路由 Direct 直发 / Block 丢 / **Mirage 走加密
+  隧道**; 回包经绑 fake-IP:port 的 IP_TRANSPARENT+FREEBIND reply socket 伪源发回。
+- **Mirage-UDP 隧道腿**: FlowSink{Direct|Mirage} per-flow mpsc, 封帧 ATYP=3 域名
+  让服务端远程解析, 帧格式对齐 mirage_server::udp_relay。
+- 健壮性: FlowSlot::Setting 原子占位 (防突发重复建流), reply socket 引用计数 +
+  FlowGuard RAII 保证清理, MAX_FLOWS=4096 总上限 + MAX_MIRAGE_UDP_FLOWS=256 子上限。
+- **内核机制已在 kernel 6.1 隔离 netns 实测** (`examples/verify_udp_transparent.rs`):
+  IP_ORIGDSTADDR 正确报 fake-IP, IP_TRANSPARENT 源伪造 ✅, 无需退回 TPROXY。
+
+### feat(client): Direct 出口 UDP 转发 (SOCKS5 UDP ASSOCIATE)
+
+- `handle_udp_associate_direct`: 直连出口 UDP 不再静默丢弃。
+
+### fix: 并发/资源 bug (用户 review)
+
+- [高危] handler.rs Mirage TCP relay 300s "绝对墙钟寿命" → 空闲超时 (长连接不再
+  满 5 分钟必断)。
+- [泄漏] 客户端 SOCKS UDP handle_udp_associate spawn 后 select! 无 abort → 僵尸
+  泄漏 UDP socket, 补 abort。
+- reply socket FD 泄漏 / 建流竞态 / 锁跨 await / reply refcount 虚漏 (transparent_udp)。
+
+### fix(camouflage): 抗识别时序
+
+- 暖池 SYN 阶梯延迟改抖动 (200→200~500ms, 消除机械节拍)。
+- camouflage 暖连接随机寿命 15~27s (消除 8-SYN 集体过期脉冲)。
+
+### install.sh
+
+- 识别 32 位架构 (i686/armv7); 二进制更新选项 (版本比对); 显示服务端节点配置;
+  节点串移除 brutal (单边加速服务端专属)。
+
+### ⚠️ 未竟
+
+- IPv6 (Direct/透明 UDP 仍 v4-only); 真机整链路端到端冒烟未做; SNI 伪装身份取舍
+  (speedtest QoS vs 被动隐蔽)。见 known_issues。
+
 ## [v0.4.5-alpha.19] - Release CI 增加 32 位构建目标 (2026-07-06)
 
 ### ci(release): i686 + armv7 (gnu/musl, 纯用户态)
