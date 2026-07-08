@@ -1184,6 +1184,118 @@ EOF
     ok "系统网络参数优化完毕 (BBR/缓冲放大已开启)。"
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 透明网关系统配置 (IP 转发 + WAN NAT) —— 可选, 询问开关
+# ──────────────────────────────────────────────────────────────────────────────
+# mirage-rs 进程自身只做 fake-IP 本地路由 + sk_lookup 拦截 (代理流量走本地投递,
+# 免 iptables)。但**直连流量(真实IP)走内核转发**, 需要 ip_forward + WAN NAT,
+# 这两个是系统层的事, mirage-rs 不管。
+GW_NAT_SCRIPT="/usr/local/sbin/mirage-gw-nat"
+GW_NFT_TABLE="mirage_gw"
+
+detect_wan_iface() {
+    ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+# 生成幂等的 NAT 应用脚本 (当下 + 开机都跑它)。nft 优先, iptables 兜底。
+write_gw_nat_script() {
+    local wan=$1
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Mirage-rs 透明网关 NAT (install.sh 自动生成, 幂等)。卸载用 install.sh。'
+        echo 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1'
+        if command -v nft >/dev/null 2>&1; then
+            echo "nft add table inet ${GW_NFT_TABLE} 2>/dev/null || true"
+            echo "nft flush table inet ${GW_NFT_TABLE} 2>/dev/null || true"
+            echo "nft add chain inet ${GW_NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; }'"
+            echo "nft add rule inet ${GW_NFT_TABLE} postrouting oifname \"${wan}\" masquerade"
+        else
+            echo "iptables -t nat -C POSTROUTING -o \"${wan}\" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o \"${wan}\" -j MASQUERADE"
+        fi
+    } > "$GW_NAT_SCRIPT"
+    chmod 755 "$GW_NAT_SCRIPT"
+}
+
+setup_transparent_gateway() {
+    title "透明网关系统配置 (可选)"
+    info "透明代理需系统层配合 (进程只拦截 fake-IP, 直连流量靠内核转发+NAT):"
+    info "  ① net.ipv4.ip_forward=1   ② WAN 口 NAT MASQUERADE"
+    info "  (fake-IP 本地路由 + sk_lookup 拦截由 mirage-rs 自动做, 无需 iptables)"
+    if ! ask_yn "本机作为透明网关, 现在配置 IP 转发 + NAT 吗?" y; then
+        warn "跳过。代理流量(fake-IP)仍可用; 直连流量转发需你自行开 ip_forward + NAT。"
+        return
+    fi
+    if ! command -v nft >/dev/null 2>&1 && ! command -v iptables >/dev/null 2>&1; then
+        warn "既无 nft 也无 iptables, 无法自动配 NAT。请手动配置后再用透明模式。"
+        return
+    fi
+
+    # ① IP 转发持久化 (追加到已有的 99-mirage.conf)
+    if [[ -f /etc/sysctl.d/99-mirage.conf ]] && ! grep -q 'net.ipv4.ip_forward' /etc/sysctl.d/99-mirage.conf; then
+        echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.d/99-mirage.conf
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+
+    # ② WAN 出口探测
+    local wan; wan=$(detect_wan_iface)
+    [[ -z "$wan" ]] && wan=$(ask "未探测到默认路由出口, 手动输入 WAN 网卡名" "eth0")
+    info "WAN 出口: $wan"
+
+    # ③ 生成脚本并立即应用
+    write_gw_nat_script "$wan"
+    if "$GW_NAT_SCRIPT"; then
+        local backend; command -v nft >/dev/null 2>&1 && backend=nftables || backend=iptables
+        ok "已应用: IP 转发 + NAT ($backend, oif $wan)"
+    else
+        warn "NAT 应用失败, 请检查 $GW_NAT_SCRIPT 与网卡名 $wan。"
+    fi
+
+    # ④ 开机持久化 (nft/iptables 规则默认不跨重启)
+    case "$INIT_SYS" in
+        systemd)
+            cat > /etc/systemd/system/mirage-gw-nat.service <<EOF
+[Unit]
+Description=Mirage-rs transparent gateway NAT
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=${GW_NAT_SCRIPT}
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable mirage-gw-nat.service >/dev/null 2>&1 || true
+            ok "开机持久化: systemd mirage-gw-nat.service"
+            ;;
+        *)
+            warn "非 systemd: NAT 已应用但**重启后失效**。请把 ${GW_NAT_SCRIPT} 加进开机启动。"
+            ;;
+    esac
+
+    # ⑤ LAN 侧指引 (这步在你的路由器/设备上做)
+    local lan_ip; lan_ip=$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1 | cut -d/ -f1)
+    echo >&2
+    title "还需在 LAN 侧配置 (路由器/设备上)"
+    echo "  把 LAN 设备的【默认网关】和【DNS】都指向本机: ${lan_ip:-<本机_LAN_IP>}" >&2
+    echo "  ⚠️ DNS 必须指过来才能拿到 fake-IP; 不指则所有流量都当直连、不走代理。" >&2
+    echo >&2
+}
+
+teardown_transparent_gateway() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now mirage-gw-nat.service 2>/dev/null || true
+        rm -f /etc/systemd/system/mirage-gw-nat.service
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    command -v nft >/dev/null 2>&1 && nft delete table inet "$GW_NFT_TABLE" 2>/dev/null || true
+    if [[ -f "$GW_NAT_SCRIPT" ]]; then
+        rm -f "$GW_NAT_SCRIPT"
+        info "已移除透明网关 NAT (脚本/服务/nft 表)。iptables 规则若用过请手动删。"
+    fi
+}
+
 uninstall() {
     title "Mirage-rs 卸载"
 
@@ -1275,6 +1387,9 @@ uninstall() {
         fi
     fi
 
+    # 透明网关 NAT (若配过): 移除脚本/systemd 服务/nft 表
+    teardown_transparent_gateway
+
     # 系统级 sysctl (默认 n, 移除会影响系统其他服务的 BBR/wmem 配置)
     if [[ -f /etc/sysctl.d/99-mirage.conf ]]; then
         if ask_yn "是否删除 sysctl 优化 /etc/sysctl.d/99-mirage.conf ? (会影响系统 BBR/wmem 设置)" n; then
@@ -1327,10 +1442,12 @@ main() {
             ;;
         2)
             config_client
+            setup_transparent_gateway
             ;;
         3)
             config_server
             config_client
+            setup_transparent_gateway
             ;;
     esac
 
