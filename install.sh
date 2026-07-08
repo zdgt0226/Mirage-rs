@@ -346,6 +346,8 @@ LOG_DIR="/var/log/mirage-rs"
 MIRAGE_TAG="${MIRAGE_TAG:-}"
 # init 系统: main 启动时 detect_init 填充 (systemd / openrc / none).
 INIT_SYS=""
+# 客户端是否配成透明网关 (config_client 里按用户选择置位, main 据此决定是否配 NAT).
+CLIENT_IS_GATEWAY=false
 
 # 让用户选择安装的 release tag (留空装 latest). 已通过环境变量指定则不交互.
 select_version() {
@@ -1029,6 +1031,61 @@ config_client() {
     local inbound_port=$(ask_port "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080" tcp)
     local inbound_listen=$(ask "本地代理监听地址 (LAN 共享用 0.0.0.0; 仅本机用 127.0.0.1)" "0.0.0.0")
 
+    # ── 部署模式: 本地代理 vs 透明网关 ──
+    # 本地代理 = 只 mixed 入站, 应用手动指向本机:1080。
+    # 透明网关 = 加 transparent(sk_lookup 拦截) + dns(fake-IP) 入站, LAN 设备无感,
+    #            需内核≥5.9 + eBPF 二进制 (64 位 release)。见 README 透明网关章节。
+    CLIENT_IS_GATEWAY=false
+    local inbounds_json advanced_dns_line=""
+    local deploy_mode
+    deploy_mode=$(ask_choice "部署模式" \
+        "本地代理 (SOCKS5/HTTP, 应用手动指向本机:${inbound_port})" \
+        "透明网关 (fake-IP + sk_lookup 拦截 LAN 流量, 需内核≥5.9 + eBPF)")
+
+    if [[ "$deploy_mode" == "2" ]]; then
+        CLIENT_IS_GATEWAY=true
+        local transparent_port dns_listen dns_port fakeip_range direct_dns remote_dns
+        transparent_port=$(ask_port "透明代理监听端口 (sk_lookup 内部用, 随意)" "12345" tcp)
+        dns_listen=$(ask "DNS 服务监听地址" "0.0.0.0")
+        dns_port=$(ask_port "DNS 监听端口 (LAN 设备 DNS 指这里; 标准 53)" "53" udp)
+        fakeip_range=$(ask "Fake-IP 网段 (RFC2544 基准段, 一般不改)" "198.18.0.0/15")
+        direct_dns=$(ask "直连(国内)DNS" "223.5.5.5:53")
+        remote_dns=$(ask "代理(境外)DNS, 经隧道查" "8.8.8.8")
+        inbounds_json='{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "'"$inbound_listen"'",
+            "port": '"$inbound_port"'
+        },
+        {
+            "type": "transparent",
+            "tag": "transparent-in",
+            "listen": "0.0.0.0",
+            "port": '"$transparent_port"'
+        },
+        {
+            "type": "dns",
+            "tag": "dns-in",
+            "listen": "'"$dns_listen"'",
+            "port": '"$dns_port"'
+        }'
+        advanced_dns_line='"advanced_dns": {
+        "resolvers": [
+            { "tag": "direct", "address": "'"$direct_dns"'" },
+            { "tag": "remote", "address": "'"$remote_dns"'", "via": "proxy" }
+        ],
+        "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'" }
+    },'
+        info "透明网关模式: 生成 transparent(:$transparent_port) + dns(:$dns_port) 入站 + fake-IP($fakeip_range)"
+    else
+        inbounds_json='{
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "'"$inbound_listen"'",
+            "port": '"$inbound_port"'
+        }'
+    fi
+
     local pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
     
     local routing_preset
@@ -1110,12 +1167,7 @@ config_client() {
     "log_level": "${log_str}",
     "log_file": "${LOG_DIR}/client.log",
     "inbounds": [
-        {
-            "type": "mixed",
-            "tag": "mixed-in",
-            "listen": "${inbound_listen}",
-            "port": ${inbound_port}
-        }
+        ${inbounds_json}
     ],
     "outbounds": [
         {
@@ -1141,6 +1193,7 @@ config_client() {
         "listen": "${client_gui_listen}"
     },
     ${routing_json},
+    ${advanced_dns_line}
     "tuning": {
         "ebpf_mode": "auto",
         "geodata_dir": "${ETC_DIR}/geosite",
@@ -1442,12 +1495,12 @@ main() {
             ;;
         2)
             config_client
-            setup_transparent_gateway
+            [[ "$CLIENT_IS_GATEWAY" == true ]] && setup_transparent_gateway
             ;;
         3)
             config_server
             config_client
-            setup_transparent_gateway
+            [[ "$CLIENT_IS_GATEWAY" == true ]] && setup_transparent_gateway
             ;;
     esac
 
