@@ -1245,6 +1245,7 @@ EOF
 # 这两个是系统层的事, mirage-rs 不管。
 GW_NAT_SCRIPT="/usr/local/sbin/mirage-gw-nat"
 GW_NFT_TABLE="mirage_gw"
+GW_IPT_CHAIN="MIRAGE_POSTROUTING"  # iptables 自定义链, 卸载可精准清除不误伤
 
 detect_wan_iface() {
     ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
@@ -1263,7 +1264,11 @@ write_gw_nat_script() {
             echo "nft add chain inet ${GW_NFT_TABLE} postrouting '{ type nat hook postrouting priority 100 ; }'"
             echo "nft add rule inet ${GW_NFT_TABLE} postrouting oifname \"${wan}\" masquerade"
         else
-            echo "iptables -t nat -C POSTROUTING -o \"${wan}\" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o \"${wan}\" -j MASQUERADE"
+            # 规则收进自定义链 MIRAGE_POSTROUTING, 卸载时精准清除, 不碰用户原有规则
+            echo "iptables -t nat -N ${GW_IPT_CHAIN} 2>/dev/null || true"
+            echo "iptables -t nat -C POSTROUTING -j ${GW_IPT_CHAIN} 2>/dev/null || iptables -t nat -A POSTROUTING -j ${GW_IPT_CHAIN}"
+            echo "iptables -t nat -F ${GW_IPT_CHAIN}"
+            echo "iptables -t nat -A ${GW_IPT_CHAIN} -o \"${wan}\" -j MASQUERADE"
         fi
     } > "$GW_NAT_SCRIPT"
     chmod 755 "$GW_NAT_SCRIPT"
@@ -1343,9 +1348,15 @@ teardown_transparent_gateway() {
         systemctl daemon-reload 2>/dev/null || true
     fi
     command -v nft >/dev/null 2>&1 && nft delete table inet "$GW_NFT_TABLE" 2>/dev/null || true
+    # iptables: 从 POSTROUTING 摘掉跳转, flush + 删自定义链 (与 nft delete table 对齐, 100% 干净)
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t nat -D POSTROUTING -j "$GW_IPT_CHAIN" 2>/dev/null || true
+        iptables -t nat -F "$GW_IPT_CHAIN" 2>/dev/null || true
+        iptables -t nat -X "$GW_IPT_CHAIN" 2>/dev/null || true
+    fi
     if [[ -f "$GW_NAT_SCRIPT" ]]; then
         rm -f "$GW_NAT_SCRIPT"
-        info "已移除透明网关 NAT (脚本/服务/nft 表)。iptables 规则若用过请手动删。"
+        info "已移除透明网关 NAT (脚本/服务/nft 表/iptables 自定义链)。"
     fi
 }
 
