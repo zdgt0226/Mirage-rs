@@ -232,7 +232,7 @@ fn acquire_reply(replies: &Replies, orig_dst: SocketAddrV4) -> Option<Arc<UdpSoc
                 Some(rs)
             }
             Err(e) => {
-                error!("udp-t: reply socket for {} failed: {}", orig_dst, e);
+                error!("[TPROXY-UDP] reply socket for {} failed: {}", orig_dst, e);
                 None
             }
         }
@@ -357,7 +357,7 @@ pub async fn start_transparent_udp(
             let n = CAP_DROPS.fetch_add(1, Ordering::Relaxed);
             if n % 1000 == 0 {
                 warn!(
-                    "udp-t: 并发流到上限 {} , 丢弃新流 (累计丢 {})",
+                    "[TPROXY-UDP] 并发流到上限 {} , 丢弃新流 (累计丢 {})",
                     MAX_FLOWS,
                     n + 1
                 );
@@ -430,7 +430,7 @@ async fn setup_flow(
     let outbound = match snapshot.outbounds.get(&tag) {
         Some(o) => o.clone(),
         None => {
-            warn!("udp-t: outbound [{}] not found, dropping", tag);
+            warn!("[TPROXY-UDP] outbound [{}] not found, dropping", tag);
             return;
         }
     };
@@ -443,12 +443,12 @@ async fn setup_flow(
     let route = match &*leaf {
         OutboundNode::Direct { .. } => Route::Direct,
         OutboundNode::Block { .. } => {
-            debug!("udp-t: blocked {:?}", domain);
+            debug!("[TPROXY-UDP] blocked {:?}", domain);
             return;
         }
         OutboundNode::Mirage { pool, .. } => Route::Mirage(pool.clone()),
         other => {
-            warn!("udp-t: unsupported outbound leaf {:?}, dropping", other.tag());
+            warn!("[TPROXY-UDP] unsupported outbound leaf {:?}, dropping", other.tag());
             return;
         }
     };
@@ -463,23 +463,23 @@ async fn setup_flow(
                 Some(d) => match crate::proxy::resolver::resolve_first(d, port).await {
                     Ok(sa) => sa,
                     Err(_) => {
-                        debug!("udp-t: resolve {} failed", d);
+                        debug!("[TPROXY-UDP] resolve {} failed", d);
                         return;
                     }
                 },
                 None => {
-                    warn!("udp-t: no domain for fake-ip {}, dropping", fake_ip);
+                    warn!("[TPROXY-UDP] no domain for fake-ip {}, dropping", fake_ip);
                     return;
                 }
             };
             if real.is_ipv6() {
-                warn!("udp-t: IPv6 target {} unsupported in v1, dropping", real);
+                warn!("[TPROXY-UDP] IPv6 target {} unsupported in v1, dropping", real);
                 return;
             }
             let out = match UdpSocket::bind("0.0.0.0:0").await {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
-                    error!("udp-t: bind outbound failed: {}", e);
+                    error!("[TPROXY-UDP] bind outbound failed: {}", e);
                     return;
                 }
             };
@@ -497,7 +497,7 @@ async fn setup_flow(
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Direct(out.clone()) },
             );
             guard.committed_id = Some(flow_id);
-            debug!("udp-t: new Direct flow {} → {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
+            debug!("[TPROXY-UDP] new Direct flow {} → {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
 
             let _ = out.send(&first_payload).await;
             let mut dbuf = vec![0u8; UDP_BUF];
@@ -516,7 +516,7 @@ async fn setup_flow(
             let domain = match &domain {
                 Some(d) if d.len() <= 255 => d.clone(),
                 _ => {
-                    warn!("udp-t: Mirage flow needs domain (fake-ip {}), dropping", fake_ip);
+                    warn!("[TPROXY-UDP] Mirage flow needs domain (fake-ip {}), dropping", fake_ip);
                     return;
                 }
             };
@@ -524,14 +524,14 @@ async fn setup_flow(
             let _udp_permit = match MirageUdpPermit::try_acquire() {
                 Some(p) => p,
                 None => {
-                    debug!("udp-t: Mirage-UDP 流到子上限 {}, 丢弃 (客户端回落 TCP)", MAX_MIRAGE_UDP_FLOWS);
+                    debug!("[TPROXY-UDP] Mirage-UDP 流到子上限 {}, 丢弃 (客户端回落 TCP)", MAX_MIRAGE_UDP_FLOWS);
                     return;
                 }
             };
             let mut tunnel = match pool.get().await {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("udp-t: Mirage pool unavailable: {}", e);
+                    error!("[TPROXY-UDP] Mirage pool unavailable: {}", e);
                     return;
                 }
             };
@@ -550,7 +550,7 @@ async fn setup_flow(
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Mirage(tx.clone()) },
             );
             guard.committed_id = Some(flow_id);
-            debug!("udp-t: new Mirage flow {} → {} (via tunnel)", client, domain);
+            debug!("[TPROXY-UDP] new Mirage flow {} → {} (via tunnel)", client, domain);
 
             // 首包入 channel, 由 uplink 统一封帧
             let _ = tx.try_send(first_payload);
@@ -606,7 +606,7 @@ async fn setup_flow(
     }
 
     // teardown (session 移除 + reply refs--) 由 FlowGuard::drop 保证执行。
-    debug!("udp-t: flow {:?} closed", key);
+    debug!("[TPROXY-UDP] flow {:?} closed", key);
 }
 
 #[cfg(test)]

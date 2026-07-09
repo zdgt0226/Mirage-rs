@@ -515,10 +515,31 @@ impl RouterEngine {
         for id in valid_candidates {
             let rule = &self.rule_table[id as usize];
             if rule.matches_port(req.port) && rule.matches_extra(&req) {
+                tracing::debug!(
+                    "[ROUTE] {} :{}/{} → [{}] (命中规则 #{})",
+                    req.domain
+                        .map(|d| d.to_string())
+                        .or_else(|| req.ip.map(|i| i.to_string()))
+                        .unwrap_or_else(|| "?".into()),
+                    req.port,
+                    req.protocol,
+                    rule.outbound,
+                    id
+                );
                 return rule.outbound.clone();
             }
         }
 
+        tracing::debug!(
+            "[ROUTE] {} :{}/{} → [{}] (默认出口, 无规则命中)",
+            req.domain
+                .map(|d| d.to_string())
+                .or_else(|| req.ip.map(|i| i.to_string()))
+                .unwrap_or_else(|| "?".into()),
+            req.port,
+            req.protocol,
+            self.default_outbound
+        );
         self.default_outbound.clone()
     }
 }

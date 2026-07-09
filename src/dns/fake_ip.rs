@@ -88,8 +88,10 @@ impl FakeIpMapper {
         if let Some(old_domain) = i2d.insert(ip, domain.clone()) {
             if old_domain != domain {
                 d2i.remove(&old_domain);
+                tracing::debug!("[FAKEIP] {} 槽位复用 → 淘汰旧域名 [{}]", ip, old_domain);
             }
         }
+        tracing::debug!("[FAKEIP] assign [{}] → {} (已用 {}/~{})", domain, ip, d2i.len() + 1, !self.mask);
         d2i.insert(domain, ip);
 
         ip

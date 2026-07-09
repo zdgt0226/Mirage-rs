@@ -83,13 +83,13 @@ pub async fn start_transparent(
                                 None => format!("{}:{}", dst_v4, dst_addr.port()),
                             };
                             
-                            debug!("Transparent connection from {} aimed at fake_ip {} -> resolved to {}", peer_addr, dst_addr, target_host);
+                            debug!("[TPROXY] TCP {} → fake-IP {} → 反查 [{}]", peer_addr, dst_addr, target_host);
 
                             // 2. 为了精准路由，我们再嗅探一下协议特征 (TLS SNI 或 HTTP Host)
                             // 比如某些情况并不是通过 fake-ip 查询的，而是直接透明劫持了纯 IP 的请求
                             let sniffed_domain = sniff_first_kb(&stream).await;
                             if let Some(sniffed) = sniffed_domain {
-                                debug!("Sniffed domain {} from transparent connection", sniffed);
+                                debug!("[TPROXY] TCP 嗅探到 SNI/Host [{}] (纠偏目标)", sniffed);
                                 // 如果嗅探到了域名，我们就优先使用嗅探到的域名作为目标
                                 target_host = format!("{}:{}", sniffed, dst_addr.port());
                             }

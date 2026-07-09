@@ -255,28 +255,28 @@ impl DnsForwarder {
         if let Some(n) = node {
             match &*n {
                 OutboundNode::Block { .. } => {
-                    debug!("DNS block   {}", domain);
+                    debug!("[DNS] block   [{}] → NXDOMAIN", domain);
                     Some(make_nxdomain(req))
                 }
                 OutboundNode::Direct { .. } => {
-                    debug!("DNS direct  {} -> {}", domain, cn_dns);
+                    debug!("[DNS] direct  [{}] → 真实解析 via {}", domain, cn_dns);
                     self.udp_query(req, cn_dns).await
                 }
                 OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
                         if qtype == 1 { // A
                             let fake_ip = mapper.lookup_or_assign(&domain);
-                            debug!("DNS Fake-IP {} -> {}", domain, fake_ip);
+                            debug!("[DNS] proxy   [{}] → fake-IP {} (A)", domain, fake_ip);
                             if let Some(engine) = &self.xdp_engine {
                                 let _ = engine.update_dns_cache(&domain, fake_ip);
                             }
                             return make_fake_ip_response(req, fake_ip);
                         } else if qtype == 28 { // AAAA
-                            debug!("DNS Fake-IP {} -> AAAA empty", domain);
+                            debug!("[DNS] proxy   [{}] → AAAA 空 (强制 v4 fake-IP)", domain);
                             return make_empty_response(req);
                         }
                     }
-                    debug!("DNS proxy {} -> {}:{} via {}", domain, remote_dns_host, remote_dns_port, n.tag());
+                    debug!("[DNS] proxy   [{}] → 隧道查 {}:{} via {}", domain, remote_dns_host, remote_dns_port, n.tag());
                     self.tcp_over_tunnel(req, &pool, &remote_dns_host, remote_dns_port).await.unwrap_or_else(|| make_nxdomain(req)).into()
                 }
                 _ => Some(make_nxdomain(req)),
