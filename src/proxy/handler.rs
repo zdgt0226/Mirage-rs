@@ -16,6 +16,17 @@ use tracing::{debug, error, info};
 /// 满 300s 无条件斩断 SSH/视频/大下载/长连接 (曾经的 bug)。
 const MIRAGE_RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(1800);
 
+/// 人类可读字节数 (日志用): 1536 → "1.5K", 3145728 → "3.0M"。
+fn human_bytes(n: u64) -> String {
+    if n >= 1 << 20 {
+        format!("{:.1}M", n as f64 / (1 << 20) as f64)
+    } else if n >= 1 << 10 {
+        format!("{:.1}K", n as f64 / (1 << 10) as f64)
+    } else {
+        format!("{}B", n)
+    }
+}
+
 /**
  * [SOCKS5 客户端接入点]
  * 负责接收局域网设备或本机发来的代理请求，执行 SOCKS5 握手，
@@ -179,12 +190,16 @@ pub async fn proxy_tcp_target(
             let active_fd = tunnel.get_raw_fd();
             let _guard = pool.active_fd_guard(active_fd);
 
+            debug!("[TUNNEL] {} 建立 (隧道就绪, 目标头已发)", target);
+            let t_start = std::time::Instant::now();
+
             let (mut local_read, mut local_write) = local.into_split();
             let tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
 
             let upload = async {
                 let mut buf = [0u8; 16384];
+                let mut up_bytes: u64 = 0;
                 loop {
                     // 空闲超时包在每次 read 内层 (非整个 loop 外层, 见 MIRAGE_RELAY_IDLE 注释)
                     match tokio::time::timeout(MIRAGE_RELAY_IDLE, local_read.read(&mut buf)).await {
@@ -196,6 +211,7 @@ pub async fn proxy_tcp_target(
                             if tunnel_writer.send_data(&buf[..n]).await.is_err() {
                                 break;
                             }
+                            up_bytes += n as u64;
                         }
                         Ok(Err(_)) => {
                             let _ = tunnel_writer.send_close_notify().await;
@@ -212,8 +228,8 @@ pub async fn proxy_tcp_target(
                         if n == 0 { break; }
                     }
                 }).await;
-                
-                tunnel_writer
+
+                (tunnel_writer, up_bytes)
             };
 
             let download = async {
@@ -229,6 +245,7 @@ pub async fn proxy_tcp_target(
                 // 客户端接收侧因为 CryptoReader 的 read_exact 语义无法安全
                 // 加 try_recv (中途取消会丢帧半读). 保持一对一直连最稳.
                 let mut tunnel_reader = tunnel_reader;
+                let mut down_bytes: u64 = 0;
 
                 loop {
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
@@ -237,6 +254,7 @@ pub async fn proxy_tcp_target(
                             if local_write.write_all(&data).await.is_err() {
                                 break;
                             }
+                            down_bytes += data.len() as u64;
                         }
                         Ok(Err(_)) => break,
                         Err(_) => break, // 空闲超时
@@ -248,14 +266,20 @@ pub async fn proxy_tcp_target(
                     while let Ok(_) = tunnel_reader.recv_data().await {}
                 }).await;
 
-                tunnel_reader
+                (tunnel_reader, down_bytes)
             };
 
-            let (tw, tr) = tokio::join!(upload, download);
+            let ((tw, up_bytes), (tr, down_bytes)) = tokio::join!(upload, download);
             drop(_guard);   // ← 先从 set 移除，防止微秒级死 FD 暴露
             drop(tw);
             drop(tr);
-            debug!("Mirage connection to {} gracefully closed", target);
+            debug!(
+                "[TUNNEL] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                target,
+                human_bytes(up_bytes),
+                human_bytes(down_bytes),
+                t_start.elapsed().as_secs_f64()
+            );
         }
         OutboundNode::Direct { .. } => {
             // v0.4.5-alpha.3: 直连数据面 = splice(2)+pipe 零拷贝 (学 dae/control/tcp_copy_linux.go).
