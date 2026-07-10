@@ -17,7 +17,7 @@ use tracing::{debug, error, info};
 const MIRAGE_RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// 人类可读字节数 (日志用): 1536 → "1.5K", 3145728 → "3.0M"。
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     if n >= 1 << 20 {
         format!("{:.1}M", n as f64 / (1 << 20) as f64)
     } else if n >= 1 << 10 {
@@ -322,8 +322,8 @@ pub async fn proxy_tcp_target(
 
             let (pool_hits_pre, pool_misses_pre, _) = crate::proxy::splice::pool_stats();
             debug!(
-                "splice open: peer={} target={} initial={}B connect={}ms pool_hits={} pool_misses={}",
-                peer_str, target, initial_len, t_connect_ms, pool_hits_pre, pool_misses_pre
+                "[DIRECT] {} 建立 (peer={} initial={}B connect={}ms pool_hits={} pool_misses={})",
+                target, peer_str, initial_len, t_connect_ms, pool_hits_pre, pool_misses_pre
             );
 
             let relay_start = std::time::Instant::now();
@@ -331,10 +331,10 @@ pub async fn proxy_tcp_target(
                 Ok((up, down)) => {
                     let (pool_hits, pool_misses, pool_len) = crate::proxy::splice::pool_stats();
                     debug!(
-                        "splice close: peer={} target={} up={}B down={}B relay={}ms total={}ms \
-                         pool_hits={} pool_misses={} pool_idle={}",
-                        peer_str, target, up, down,
-                        relay_start.elapsed().as_millis(), t_start.elapsed().as_millis(),
+                        "[DIRECT] {} 关闭 (↑{} ↓{}, 存活 {:.1}s, peer={} relay={}ms \
+                         pool_hits={} pool_misses={} pool_idle={})",
+                        target, human_bytes(up), human_bytes(down), t_start.elapsed().as_secs_f64(),
+                        peer_str, relay_start.elapsed().as_millis(),
                         pool_hits, pool_misses, pool_len
                     );
                 }
@@ -351,9 +351,8 @@ pub async fn proxy_tcp_target(
                         _ => "other",
                     };
                     debug!(
-                        "splice err: peer={} target={} reason={} err='{}' relay={}ms total={}ms",
-                        peer_str, target, reason, e,
-                        relay_start.elapsed().as_millis(), t_start.elapsed().as_millis()
+                        "[DIRECT] {} 出错 (reason={} 存活 {:.1}s peer={} err='{}')",
+                        target, reason, t_start.elapsed().as_secs_f64(), peer_str, e
                     );
                 }
             }

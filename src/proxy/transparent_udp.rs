@@ -17,7 +17,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use nix::sys::socket::{
@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 use crate::config_watcher::CoreState;
 use crate::dns::fake_ip::FakeIpMapper;
 use crate::ebpf::TransparentEngine;
+use crate::proxy::handler::human_bytes;
 use crate::proxy::outbound::OutboundNode;
 use crate::router::RoutingRequest;
 
@@ -455,6 +456,10 @@ async fn setup_flow(
     drop(snapshot);
 
     let flow_id = NEXT_FLOW_ID.fetch_add(1, Ordering::Relaxed);
+    // 下行字节计数 (供关闭汇总)。downlink 均在本任务单线程推进 (Direct 内联循环 /
+    // Mirage select! 分支), Relaxed 足够。上行在主循环逐包分发, 不按流计, 故只汇总下行。
+    let t_start = Instant::now();
+    let down_ctr = Arc::new(AtomicU64::new(0));
 
     match route {
         // ── Direct 腿: 本地解析 + 直发 UDP socket ──
@@ -505,6 +510,7 @@ async fn setup_flow(
                 match tokio::time::timeout(IDLE_TIMEOUT, out.recv(&mut dbuf)).await {
                     Ok(Ok(n)) => {
                         let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
+                        down_ctr.fetch_add(n as u64, Ordering::Relaxed);
                     }
                     _ => break,
                 }
@@ -578,6 +584,7 @@ async fn setup_flow(
             };
 
             // downlink: 隧道 → 解帧取 payload → reply_socket 发回客户端 (伪源 orig_dst)
+            let dl_ctr = down_ctr.clone();
             let downlink = async move {
                 let mut acc: Vec<u8> = Vec::new();
                 loop {
@@ -589,6 +596,7 @@ async fn setup_flow(
                     while let Some((payload, consumed)) = parse_udp_frame_payload(&acc) {
                         if !payload.is_empty() {
                             let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
+                            dl_ctr.fetch_add(payload.len() as u64, Ordering::Relaxed);
                         }
                         acc.drain(0..consumed);
                     }
@@ -606,7 +614,12 @@ async fn setup_flow(
     }
 
     // teardown (session 移除 + reply refs--) 由 FlowGuard::drop 保证执行。
-    debug!("[TPROXY-UDP] flow {:?} closed", key);
+    debug!(
+        "[TPROXY-UDP] flow {:?} 关闭 (↓{}, 存活 {:.1}s)",
+        key,
+        human_bytes(down_ctr.load(Ordering::Relaxed)),
+        t_start.elapsed().as_secs_f64()
+    );
 }
 
 #[cfg(test)]
