@@ -52,5 +52,10 @@ path = "examples/verify_udp_transparent.rs"
 required-features = ["ebpf"]
 
 [[example]]
+name = "verify_tc_divert"
+path = "examples/verify_tc_divert.rs"
+required-features = ["ebpf"]
+
+[[example]]
 name = "simulate_bdp"
 path = "examples/simulate_bdp.rs"

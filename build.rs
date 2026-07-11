@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=ebpf-src/sockmap.c");
     println!("cargo:rerun-if-changed=ebpf-src/dns_xdp.c");
     println!("cargo:rerun-if-changed=ebpf-src/transparent.c");
+    println!("cargo:rerun-if-changed=ebpf-src/tc_divert.c");
     println!("cargo:rerun-if-env-changed=PATH");
 
     // Inject `git describe` so --version shows actual build state independent
@@ -37,6 +38,7 @@ fn main() {
         ("ebpf-src/sockmap.c", "sockmap.elf", "BPF_SOCKMAP_ELF"),
         ("ebpf-src/dns_xdp.c", "dns_xdp.elf", "BPF_DNS_XDP_ELF"),
         ("ebpf-src/transparent.c", "transparent.elf", "BPF_TRANSPARENT_ELF"),
+        ("ebpf-src/tc_divert.c", "tc_divert.elf", "BPF_TC_DIVERT_ELF"),
     ] {
         let src_path = manifest_dir.join(src);
         let dst_path = out_dir.join(elf_name);
