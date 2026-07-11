@@ -16,22 +16,48 @@ pub struct CoreState {
     pub advanced_dns: Option<crate::config::AdvancedDnsConfig>,
 }
 
+impl CoreState {
+    /// 供 eBPF tc_divert 的 direct_cidr map 用: 直连快路径 v4 CIDR (geoip ∪ 用户
+    /// 手动 ip_cidr, 已排除与非直连规则重叠的段)。is_direct 仅认 Direct 类出站 ——
+    /// Block/代理都不算 (否则会绕过丢弃/代理)。
+    pub fn direct_v4_cidrs(&self) -> Vec<ipnet::Ipv4Net> {
+        use crate::proxy::outbound::OutboundNode;
+        let outbounds = &self.outbounds.outbounds;
+        self.router.direct_v4_cidrs(|tag| {
+            matches!(outbounds.get(tag).map(|n| &**n), Some(OutboundNode::Direct { .. }))
+        })
+    }
+}
+
+/// reload 成功后触发的回调 (如刷新 eBPF direct_cidr map)。lib.rs 在 eBPF 引擎
+/// 建好后用 set_reload_hook 注入; watcher 线程每次热重载后调用。
+type ReloadHook = Box<dyn Fn(&CoreState) + Send + Sync>;
+
 pub struct ConfigWatcher {
     pub state: Arc<ArcSwap<CoreState>>,
+    reload_hook: Arc<std::sync::Mutex<Option<ReloadHook>>>,
 }
 
 impl ConfigWatcher {
     pub fn new(config_path: &str, geodata_dir: &str, updater_handle: UpdaterHandle) -> Result<Self> {
         let state = Self::build_state(config_path, geodata_dir, None)?;
         let arc_state = Arc::new(ArcSwap::from_pointee(state));
+        let reload_hook: Arc<std::sync::Mutex<Option<ReloadHook>>> = Arc::new(std::sync::Mutex::new(None));
 
         let watcher = Self {
             state: arc_state.clone(),
+            reload_hook: reload_hook.clone(),
         };
 
-        Self::spawn_watcher(config_path.to_string(), geodata_dir.to_string(), arc_state, updater_handle);
+        Self::spawn_watcher(config_path.to_string(), geodata_dir.to_string(), arc_state, updater_handle, reload_hook);
 
         Ok(watcher)
+    }
+
+    /// 注入 reload 回调 (幂等覆盖)。lib.rs 在 tc_divert 引擎建好后调用, 使热重载
+    /// 后 direct_cidr map 随新规则刷新。
+    pub fn set_reload_hook(&self, hook: impl Fn(&CoreState) + Send + Sync + 'static) {
+        *self.reload_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
     }
 
     /// 从 config 文件里抽出 UpdaterState.
@@ -159,7 +185,7 @@ impl ConfigWatcher {
         })
     }
 
-    fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>, updater_handle: UpdaterHandle) {
+    fn spawn_watcher(config_path: String, geodata_dir: String, state: Arc<ArcSwap<CoreState>>, updater_handle: UpdaterHandle, reload_hook: Arc<std::sync::Mutex<Option<ReloadHook>>>) {
         std::thread::spawn(move || {
             let (tx, rx) = std::sync::mpsc::channel();
 
@@ -233,6 +259,10 @@ impl ConfigWatcher {
                             Ok(new_state) => {
                                 state.store(Arc::new(new_state));
                                 info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
+                                // 刷新 eBPF direct_cidr map (若已注入 hook)
+                                if let Some(hook) = reload_hook.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                    hook(&state.load());
+                                }
                             }
                             Err(e) => {
                                 error!("Hot-reload failed! Keeping previous state. Error: {}", e);

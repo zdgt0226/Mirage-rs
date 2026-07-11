@@ -67,6 +67,10 @@ pub enum InboundConfig {
         tag: String,
         listen: String,
         port: u16,
+        // 挂 tc_divert 的 LAN 网卡 (纯 eBPF 抓裸-IP 转发流量)。不设则只跑
+        // sk_lookup fake-IP 拦截, 不接管裸-IP 转发流量。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
     },
 }
 

@@ -1044,8 +1044,9 @@ config_client() {
 
     if [[ "$deploy_mode" == "2" ]]; then
         CLIENT_IS_GATEWAY=true
-        local transparent_port dns_listen dns_port fakeip_range direct_dns remote_dns
+        local transparent_port lan_iface dns_listen dns_port fakeip_range direct_dns remote_dns
         transparent_port=$(ask_port "透明代理监听端口 (sk_lookup 内部用, 随意)" "12345" tcp)
+        lan_iface=$(ask "LAN 网卡名 (tc_divert 挂这张卡抓裸-IP 转发流量, 面向内网设备的那张)" "$(detect_wan_iface)")
         dns_listen=$(ask "DNS 服务监听地址" "0.0.0.0")
         dns_port=$(ask_port "DNS 监听端口 (LAN 设备 DNS 指这里; 标准 53)" "53" udp)
         fakeip_range=$(ask "Fake-IP 网段 (RFC2544 基准段, 一般不改)" "198.18.0.0/15")
@@ -1061,7 +1062,8 @@ config_client() {
             "type": "transparent",
             "tag": "transparent-in",
             "listen": "0.0.0.0",
-            "port": '"$transparent_port"'
+            "port": '"$transparent_port"',
+            "interface": "'"$lan_iface"'"
         },
         {
             "type": "dns",
@@ -1076,7 +1078,7 @@ config_client() {
         ],
         "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'" }
     },'
-        info "透明网关模式: 生成 transparent(:$transparent_port) + dns(:$dns_port) 入站 + fake-IP($fakeip_range)"
+        info "透明网关模式: transparent(:$transparent_port, tc_divert@$lan_iface) + dns(:$dns_port) 入站 + fake-IP($fakeip_range)"
     else
         inbounds_json='{
             "type": "mixed",
@@ -1258,6 +1260,11 @@ write_gw_nat_script() {
         echo '#!/usr/bin/env bash'
         echo '# Mirage-rs 透明网关 NAT (install.sh 自动生成, 幂等)。卸载用 install.sh。'
         echo 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1'
+        # tc_divert 用 bpf_sk_assign 把裸-IP 转发流量偷进本地透明 socket, 并打 fwmark 1。
+        # 这条策略路由把 fwmark 1 的包引到 local 路由表 → 走本地投递 (标准 TPROXY 配方,
+        # 属 iproute2 策略路由, 非 iptables/nftables)。
+        echo 'ip rule add fwmark 1 lookup 100 2>/dev/null || true'
+        echo 'ip route add local default dev lo table 100 2>/dev/null || true'
         if command -v nft >/dev/null 2>&1; then
             echo "nft add table inet ${GW_NFT_TABLE} 2>/dev/null || true"
             echo "nft flush table inet ${GW_NFT_TABLE} 2>/dev/null || true"
@@ -1276,9 +1283,10 @@ write_gw_nat_script() {
 
 setup_transparent_gateway() {
     title "透明网关系统配置 (可选)"
-    info "透明代理需系统层配合 (进程只拦截 fake-IP, 直连流量靠内核转发+NAT):"
+    info "透明代理需系统层配合 (进程拦 fake-IP + tc_divert 抓裸-IP 转发流量):"
     info "  ① net.ipv4.ip_forward=1   ② WAN 口 NAT MASQUERADE"
-    info "  (fake-IP 本地路由 + sk_lookup 拦截由 mirage-rs 自动做, 无需 iptables)"
+    info "  ③ fwmark 1 → local 路由表 (tc_divert sk_assign 的包走本地投递, TPROXY 配方)"
+    info "  (fake-IP 本地路由 + sk_lookup/tc_divert 拦截由 mirage-rs 自动做, 无需 iptables 分流)"
     if ! ask_yn "本机作为透明网关, 现在配置 IP 转发 + NAT 吗?" y; then
         warn "跳过。代理流量(fake-IP)仍可用; 直连流量转发需你自行开 ip_forward + NAT。"
         return
@@ -1347,6 +1355,9 @@ teardown_transparent_gateway() {
         rm -f /etc/systemd/system/mirage-gw-nat.service
         systemctl daemon-reload 2>/dev/null || true
     fi
+    # tc_divert 策略路由 (fwmark→local 路由表) 清理
+    ip rule del fwmark 1 lookup 100 2>/dev/null || true
+    ip route del local default dev lo table 100 2>/dev/null || true
     command -v nft >/dev/null 2>&1 && nft delete table inet "$GW_NFT_TABLE" 2>/dev/null || true
     # iptables: 从 POSTROUTING 摘掉跳转, flush + 删自定义链 (与 nft delete table 对齐, 100% 干净)
     if command -v iptables >/dev/null 2>&1; then

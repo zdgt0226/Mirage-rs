@@ -522,8 +522,38 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::Transparent { listen, port, .. } => {
+            crate::config::InboundConfig::Transparent { listen, port, interface, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                // 纯 eBPF 抓裸-IP 转发流量 (与 sk_lookup fake-IP 拦截互补): 配了网卡才挂 tc_divert。
+                if let Some(iface) = interface {
+                    if enable_ebpf {
+                        match crate::ebpf::TcDivertEngine::init(port) {
+                            Ok(engine) => {
+                                let engine = std::sync::Arc::new(engine);
+                                let cidrs = watcher.state.load().direct_v4_cidrs();
+                                if let Err(e) = engine.sync_direct_cidrs(&cidrs) {
+                                    warn!("tc_divert direct_cidr 初始加载失败: {}", e);
+                                }
+                                match engine.attach(&iface) {
+                                    Ok(()) => {
+                                        info!("tc_divert 已接管 {} 上的裸-IP 转发流量 ({} 段直连快路径)", iface, cidrs.len());
+                                        // 热重载后按新规则刷新 direct_cidr map
+                                        let eng = engine.clone();
+                                        watcher.set_reload_hook(move |st| {
+                                            if let Err(e) = eng.sync_direct_cidrs(&st.direct_v4_cidrs()) {
+                                                warn!("tc_divert direct_cidr 热重载刷新失败: {}", e);
+                                            }
+                                        });
+                                    }
+                                    Err(e) => error!("tc_divert attach {} 失败, 裸-IP 转发流量不接管: {}", iface, e),
+                                }
+                            }
+                            Err(e) => warn!("tc_divert 初始化失败, 裸-IP 转发流量不接管: {}", e),
+                        }
+                    } else {
+                        warn!("Transparent interface={} 已配置但 eBPF 未启用, tc_divert 跳过", iface);
+                    }
+                }
                 let trans_eng = transparent_engine.clone();
                 tokio::spawn(async move {
                     if let (Some(te), Some(fm)) = (trans_eng, fake_mapper_clone) {

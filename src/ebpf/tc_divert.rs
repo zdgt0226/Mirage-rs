@@ -1,0 +1,119 @@
+//! tc-bpf 透明分流引擎: 把转发的裸-IP 流量 sk_assign 进本地透明监听 socket
+//! (纯 eBPF, 无 iptables/nftables)。与 sk_lookup 的 fake-IP 拦截互补 ——
+//! sk_lookup 只在本地投递触发, 抓不到转发的裸-IP 流量, 本引擎补上。
+//!
+//! 机制细节与 netns 实测见 ebpf-src/tc_divert.c、examples/verify_tc_divert.{rs,sh}。
+//! 部署侧还需 (install.sh 网关模式已配): ip rule fwmark 1 lookup 100 +
+//! ip route add local default dev lo table 100, 否则 sk_assign 的包走转发不投本地。
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod sys {
+    use anyhow::{Context, Result};
+    use aya::maps::lpm_trie::{Key, LpmTrie};
+    use aya::maps::Array;
+    use aya::programs::{tc, SchedClassifier, TcAttachType};
+    use aya::Ebpf;
+    use ipnet::Ipv4Net;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use tracing::info;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct DivertCfg {
+        listen_port: u32,
+    }
+    unsafe impl aya::Pod for DivertCfg {}
+
+    pub struct TcDivertEngine {
+        bpf: Mutex<Ebpf>,
+        // 当前 direct_cidr map 里的 (网络序 u32, 前缀长度), 供热重载差量增删。
+        loaded: Mutex<HashSet<(u32, u8)>>,
+    }
+
+    impl TcDivertEngine {
+        pub fn init(listen_port: u16) -> Result<Self> {
+            static TC_DIVERT_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_TC_DIVERT_ELF"));
+            let mut bpf = Ebpf::load(TC_DIVERT_ELF).context("Failed to load tc_divert.elf")?;
+            {
+                let mut cfg = Array::<_, DivertCfg>::try_from(
+                    bpf.map_mut("tc_divert_cfg").context("tc_divert_cfg map missing")?,
+                )?;
+                cfg.set(0, DivertCfg { listen_port: listen_port as u32 }, 0)?;
+            }
+            info!("eBPF tc_divert engine initialized (listen_port={}).", listen_port);
+            Ok(Self {
+                bpf: Mutex::new(bpf),
+                loaded: Mutex::new(HashSet::new()),
+            })
+        }
+
+        /// 挂到 LAN 网卡 ingress (clsact)。
+        pub fn attach(&self, iface: &str) -> Result<()> {
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
+            // clsact 可能已存在, 忽略错误。
+            let _ = tc::qdisc_add_clsact(iface);
+            let prog: &mut SchedClassifier = bpf
+                .program_mut("tc_divert")
+                .context("tc_divert program missing")?
+                .try_into()?;
+            prog.load()?;
+            prog.attach(iface, TcAttachType::Ingress)
+                .with_context(|| format!("tc_divert attach to {} ingress failed", iface))?;
+            info!("eBPF tc_divert attached to {} ingress.", iface);
+            Ok(())
+        }
+
+        /// 全量同步 direct_cidr map 到给定直连集 (增删差量, 支持热重载)。
+        /// key.addr = 网络序 u32 (与 BPF __be32 同布局); 用 to_be() 令 LE 原生字节==网络序。
+        pub fn sync_direct_cidrs(&self, cidrs: &[Ipv4Net]) -> Result<()> {
+            let want: HashSet<(u32, u8)> = cidrs
+                .iter()
+                .map(|c| (u32::from(c.network()).to_be(), c.prefix_len()))
+                .collect();
+
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
+            let mut trie = LpmTrie::<_, u32, u8>::try_from(
+                bpf.map_mut("direct_cidr").context("direct_cidr map missing")?,
+            )?;
+            let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+
+            for (net, plen) in loaded.iter() {
+                if !want.contains(&(*net, *plen)) {
+                    let _ = trie.remove(&Key::new(*plen as u32, *net));
+                }
+            }
+            for (net, plen) in want.iter() {
+                if !loaded.contains(&(*net, *plen)) {
+                    trie.insert(&Key::new(*plen as u32, *net), 1u8, 0)?;
+                }
+            }
+            let n = want.len();
+            *loaded = want;
+            info!("eBPF tc_divert direct_cidr synced: {} 段直连快路径", n);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+mod sys {
+    use anyhow::Result;
+    use ipnet::Ipv4Net;
+
+    pub struct TcDivertEngine {}
+
+    impl TcDivertEngine {
+        pub fn init(_listen_port: u16) -> Result<Self> {
+            Err(anyhow::anyhow!("eBPF disabled"))
+        }
+        pub fn attach(&self, _iface: &str) -> Result<()> {
+            Ok(())
+        }
+        pub fn sync_direct_cidrs(&self, _cidrs: &[Ipv4Net]) -> Result<()> {
+            Ok(())
+        }
+    }
+}
+
+pub use sys::TcDivertEngine;

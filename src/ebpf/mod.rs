@@ -304,3 +304,6 @@ pub use sys::get_socket_cookie;
 
 pub mod transparent;
 pub use transparent::TransparentEngine;
+
+pub mod tc_divert;
+pub use tc_divert::TcDivertEngine;
