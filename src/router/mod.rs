@@ -1,11 +1,16 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use regex::RegexSet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
 pub type OutboundTag = String;
 pub type RuleId = usize;
+
+/// 两个 v4 CIDR 是否重叠 (较短前缀的一方包含另一方的网络地址即重叠)。
+fn cidr_overlaps(a: &Ipv4Net, b: &Ipv4Net) -> bool {
+    a.contains(&b.network()) || b.contains(&a.network())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rule {
@@ -220,6 +225,10 @@ pub struct RouterEngine {
     
     pub rule_table: Vec<Rule>,
     pub default_outbound: OutboundTag,
+
+    // 所有解析后的 v4 CIDR 及其所属规则 (ip_cidr 手动 + geoip/geosite 解析统一在此)。
+    // 供 eBPF tc_divert direct_cidr map 用, 见 direct_v4_cidrs()。
+    all_v4_cidrs: Vec<(Ipv4Net, RuleId)>,
 }
 
 pub struct RoutingRequest<'a> {
@@ -245,6 +254,7 @@ impl RouterEngine {
         let mut regex_patterns = Vec::new();
         let mut regex_to_rule_id = Vec::new();
         let mut ip_trie = IpTrie::default();
+        let mut all_v4_cidrs: Vec<(Ipv4Net, RuleId)> = Vec::new();
         let mut any_network_rules = Vec::new();
 
         for rule in &rules {
@@ -255,6 +265,9 @@ impl RouterEngine {
 
             for cidr in &rule.ip_cidr {
                 ip_trie.insert(*cidr, rule.id);
+                if let IpNet::V4(v4) = cidr {
+                    all_v4_cidrs.push((*v4, rule.id));
+                }
             }
             for suffix in &rule.domain_suffix {
                 domain_trie.insert(suffix, rule.id);
@@ -283,6 +296,9 @@ impl RouterEngine {
                         Ok((domains, cidrs)) => {
                             for net in cidrs {
                                 ip_trie.insert(net, rule.id);
+                                if let IpNet::V4(v4) = net {
+                                    all_v4_cidrs.push((v4, rule.id));
+                                }
                             }
                             for d in domains {
                                 match d.dtype {
@@ -380,6 +396,9 @@ impl RouterEngine {
                         Ok((_, cidrs)) => {
                             for net in cidrs {
                                 ip_trie.insert(net, rule.id);
+                                if let IpNet::V4(v4) = net {
+                                    all_v4_cidrs.push((v4, rule.id));
+                                }
                             }
                         }
                         Err(e) => tracing::error!(
@@ -395,6 +414,9 @@ impl RouterEngine {
                         Ok(cidrs) => {
                             for net in cidrs {
                                 ip_trie.insert(net, rule.id);
+                                if let IpNet::V4(v4) = net {
+                                    all_v4_cidrs.push((v4, rule.id));
+                                }
                             }
                         }
                         Err(e) => tracing::error!(
@@ -408,6 +430,9 @@ impl RouterEngine {
                         Ok(cidrs) => {
                             for net in cidrs {
                                 ip_trie.insert(net, rule.id);
+                                if let IpNet::V4(v4) = net {
+                                    all_v4_cidrs.push((v4, rule.id));
+                                }
                             }
                         }
                         Err(e) => tracing::error!(
@@ -446,7 +471,31 @@ impl RouterEngine {
             any_network_rules,
             rule_table: rules,
             default_outbound,
+            all_v4_cidrs,
         })
+    }
+
+    /// 收集会被"直连"的 v4 CIDR 集, 供 eBPF tc_divert 的 direct_cidr map 用作内核
+    /// 直连快路径。来源是 new() 已统一解析的 all_v4_cidrs (用户手动 ip_cidr ∪
+    /// geoip/geosite), 按规则出站是否直连筛选。
+    ///
+    /// 安全约束: 若某直连 CIDR 与任一"非直连"规则的 CIDR 重叠, 则排除它 —— 宁可
+    /// 该段少走内核快路径、交用户态 router 权威判定, 也绝不能把本该代理的流量误
+    /// 直连出去 (泄漏)。因此结果是"绝对直连"的保守子集。
+    pub fn direct_v4_cidrs(&self, is_direct: impl Fn(&OutboundTag) -> bool) -> Vec<Ipv4Net> {
+        let mut direct = Vec::new();
+        let mut nondirect = Vec::new();
+        for (cidr, id) in &self.all_v4_cidrs {
+            if is_direct(&self.rule_table[*id].outbound) {
+                direct.push(*cidr);
+            } else {
+                nondirect.push(*cidr);
+            }
+        }
+        direct.retain(|c| !nondirect.iter().any(|nd| cidr_overlaps(c, nd)));
+        direct.sort_unstable();
+        direct.dedup();
+        direct
     }
 
     pub fn route(&self, req: RoutingRequest) -> OutboundTag {
@@ -712,5 +761,44 @@ mod tests {
             source_mac: None,
         });
         assert_eq!(out, "block");
+    }
+
+    fn ip_rule(id: RuleId, outbound: &str, cidrs: &[&str]) -> Rule {
+        Rule {
+            id,
+            mode: "or".to_string(),
+            outbound: outbound.to_string(),
+            domain_suffix: vec![],
+            domain_keyword: vec![],
+            domain_regex: vec![],
+            geosite: vec![],
+            ip_cidr: cidrs.iter().map(|c| c.parse().unwrap()).collect(),
+            source_ip_cidr: vec![],
+            source_mac: vec![],
+            geoip: vec![],
+            port: vec![],
+            protocol: vec![],
+        }
+    }
+
+    #[test]
+    fn test_direct_v4_cidrs_unify_and_exclude_overlap() {
+        // 手动 ip_cidr 与 geoip 走同一条 all_v4_cidrs 汇聚路径, 这里用手动 CIDR 验证
+        // "统一收集 + 安全排除重叠"。
+        let rules = vec![
+            // id0 (高优先级): 1.2.3.0/24 → proxy
+            ip_rule(0, "proxy", &["1.2.3.0/24"]),
+            // id1: 直连段, 其中 1.2.0.0/16 与上面 proxy 段重叠 → 应被排除
+            ip_rule(1, "direct", &["10.0.0.0/8", "1.2.0.0/16"]),
+        ];
+        let engine = RouterEngine::new(rules, "proxy".to_string(), "/nonexistent", &HashMap::new()).unwrap();
+
+        let direct = engine.direct_v4_cidrs(|t| t == "direct");
+        assert!(direct.contains(&"10.0.0.0/8".parse().unwrap()), "纯直连段应保留");
+        assert!(
+            !direct.contains(&"1.2.0.0/16".parse().unwrap()),
+            "与 proxy 段重叠的直连段必须排除, 否则会绕过代理泄漏"
+        );
+        assert_eq!(direct.len(), 1);
     }
 }
