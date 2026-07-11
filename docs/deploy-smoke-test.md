@@ -116,16 +116,16 @@ curl -s --max-time 3 http://169.254.169.254/ -o /dev/null -w '%{http_code}\n'
 - ✅ 都应正常(走直连/转发)。网关日志**不应**出现把 100.64/169.254 当 proxy 的 `[ROUTE]`。
 - ❌ mesh 断了 → `is_direct_dst` 没含该段(确认跑的是 alpha.22+)。
 
-## 6. ⚠️ TCP listener 分水岭(头号未知,失败优先查这)
+## 6. TCP listener 分水岭(已 netns 验证通过,真机复核)
 
-`tc_divert` 抓 TCP 裸-IP 后 sk_assign 到透明 listener,accept 出的 socket 能否拿到**原始 foreign 目的**(`local_addr()`),决定透明 TCP 是否成立。
+`tc_divert` 抓 TCP 裸-IP 后 sk_assign 到透明 listener,accept 出的 socket 拿到**原始 foreign 目的**(`local_addr()`),决定透明 TCP 是否成立。**已在 netns 实测跑通**(`examples/verify_tc_divert_tcp.sh`,`v0.4.5-alpha.23+`):listener 用 IP_TRANSPARENT + BPF 只对首 SYN sk_assign、已建流仅打 fwmark。真机上再复核:
 
 ```bash
-# 网关上,代理一条 TCP 时抓 accept 的 local_addr 是否 = 原始目的(而非 127/网关IP)
-journalctl -u mirage-rs-client -f | grep -E '\[ROUTE\]|local_addr|transparent'
+# 网关上,代理一条 TCP 时看反查目标是否 = 原始目的
+journalctl -u mirage-rs-client -f | grep -E '\[TPROXY\].*TCP|\[ROUTE\]'
 ```
 
-- ❌ 代理 TCP 全部失败、但 UDP/DNS 正常 → 极可能是透明 TCP listener **缺 `IP_TRANSPARENT`** 或 accept socket 拿不到原始目的。这是已知待验项,反馈现象我来补 listener sockopt。
+- ❌ 若代理 TCP 全部失败、但 UDP/DNS 正常 → 确认跑的是 `alpha.23+`(含 IP_TRANSPARENT listener + BPF SYN-only assign 两处修复);仍失败则抓包看 SYN-ACK 是否以原始 foreign IP 为源发出。
 
 ## 7. 🔬 LPM 是否成为 CPU 热点(决定要不要加 flow cache)
 
@@ -181,6 +181,6 @@ journalctl -u mirage-rs-client -f | grep -E 'Hot-reload|direct_cidr synced'
 | 3 | 代理链路 | `ipinfo.io/ip` 显示服务端出口 |
 | 4 | 裸-IP 分流 | 境外裸 IP 走代理,国内裸 IP 直连 |
 | 5 | mesh/元数据 | 100.64/169.254 不被劫持(alpha.22) |
-| 6 | TCP 分水岭 | 代理 TCP 通(失败先查 IP_TRANSPARENT) |
+| 6 | TCP 分水岭 | 代理 TCP 通(netns 已验;失败确认 alpha.23+) |
 | 7 | LPM 热点 | `trie_lookup_elem` <1% → 不加缓存 |
 | 8 | 热重载 | 改规则后 `direct_cidr synced` 自动刷 |
