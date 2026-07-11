@@ -33,6 +33,21 @@ struct {
     __type(value, struct divert_cfg);
 } tc_divert_cfg SEC(".maps");
 
+// 直连 CIDR 集 (用户态灌: 国内 geoip)。命中 → 不劫持, 交内核正常转发。
+// 私网/本地/组播已由 is_direct_dst 硬编码兜底, 这里只放可加载的 geoip 段。
+struct lpm_key {
+    __u32 prefixlen;
+    __be32 addr; // 网络序, 与 ip->daddr 同布局
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, 65536);
+    __type(key, struct lpm_key);
+    __type(value, __u8);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} direct_cidr SEC(".maps");
+
 // 私网/本地/组播/广播 → 不劫持 (交内核正常处理)
 static __always_inline int is_direct_dst(__u32 daddr_be) {
     __u32 d = bpf_ntohl(daddr_be);
@@ -62,6 +77,10 @@ int tc_divert(struct __sk_buff *skb) {
     if (ip->ihl != 5) // 有 IP options 的少见, 简化跳过
         return TC_ACT_OK;
     if (is_direct_dst(ip->daddr))
+        return TC_ACT_OK;
+    // 命中 geoip 直连段 → 不劫持
+    struct lpm_key k = { .prefixlen = 32, .addr = ip->daddr };
+    if (bpf_map_lookup_elem(&direct_cidr, &k))
         return TC_ACT_OK;
 
     __u32 zero = 0;

@@ -9,6 +9,7 @@
 //! 运行 (需 root + CAP_BPF/NET_ADMIN, 在新 netns 内, veth 已建好):
 //!   见 verify_tc_divert.sh 或本文件尾注释。
 
+use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::Array;
 use aya::programs::{tc, SchedClassifier, TcAttachType};
 use aya::Ebpf;
@@ -29,8 +30,10 @@ unsafe impl aya::Pod for DivertCfg {}
 
 const IFACE: &str = "veth1"; // tc ingress 挂这里 (client 发的包从 veth0 出 → veth1 入)
 const LPORT: u16 = 19999; // 透明监听端口
-const FOREIGN: &str = "8.8.8.8"; // 裸 foreign IP (路由出 veth0)
+const FOREIGN: &str = "8.8.8.8"; // 裸 foreign IP (不在直连段 → 应被代理)
 const FOREIGN_PORT: u16 = 9999; // foreign 服务端口 (应作为 origdst 保留)
+const DIRECT_CIDR: &str = "1.1.1.0"; // geoip 直连段 1.1.1.0/24 (灌进 direct_cidr)
+const DIRECT_IP: &str = "1.1.1.1"; // 命中直连段 → 应 TC_ACT_OK, 不进代理 socket
 
 fn build_transparent_udp(bind_addr: SocketAddrV4) -> anyhow::Result<std::net::UdpSocket> {
     let fd = socket(AddressFamily::Inet, SockType::Datagram, SockFlag::empty(), None)?;
@@ -74,6 +77,13 @@ fn main() -> anyhow::Result<()> {
         let mut cfg = Array::<_, DivertCfg>::try_from(bpf.map_mut("tc_divert_cfg").unwrap())?;
         cfg.set(0, DivertCfg { listen_port: LPORT as u32 }, 0)?;
     }
+    {
+        // 灌直连段 1.1.1.0/24。key.addr 需与 BPF __be32 同布局 (网络序):
+        // aya 按原生字节传 K, to_be() 让 LE 机器的原生字节 == 网络序。
+        let mut trie = LpmTrie::<_, u32, u8>::try_from(bpf.map_mut("direct_cidr").unwrap())?;
+        let net: u32 = u32::from(DIRECT_CIDR.parse::<Ipv4Addr>().unwrap()).to_be();
+        trie.insert(&Key::new(24, net), 1u8, 0)?;
+    }
 
     // 2. veth1 ingress 挂 clsact + tc_divert
     let _ = tc::qdisc_add_clsact(IFACE);
@@ -82,30 +92,42 @@ fn main() -> anyhow::Result<()> {
     prog.attach(IFACE, TcAttachType::Ingress)?;
     println!("  [setup] tc_divert attached @ {} ingress, listen_port={}", IFACE, LPORT);
 
-    // 3. 透明监听 socket (网关侧)。裸-IP 包由**另一个 netns 的 client** 发来
-    //    (双 netns 拓扑, ARP 正常), 目的 8.8.8.8:9999。
+    // 3. 透明监听 socket (网关侧)。client (另一 netns) 会发两个裸-IP UDP:
+    //    → 1.1.1.1:9999 (命中直连段, 应 TC_ACT_OK 不进 socket)
+    //    → 8.8.8.8:9999 (不在直连段, 应 sk_assign 进 socket)
     let sock = build_transparent_udp(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, LPORT))?;
-    let target = SocketAddrV4::new(FOREIGN.parse().unwrap(), FOREIGN_PORT);
-    println!("  [ready] 等 client 发裸-IP UDP → {} (5s)...", target);
+    let proxied = SocketAddrV4::new(FOREIGN.parse().unwrap(), FOREIGN_PORT);
+    let direct = SocketAddrV4::new(DIRECT_IP.parse().unwrap(), FOREIGN_PORT);
+    println!("  [ready] 等 client 发 {} (直连) + {} (代理)...", direct, proxied);
 
-    // 4. 透明 socket 应收到, origdst = 8.8.8.8:9999
+    // 4. 收到的第一个包应是 8.8.8.8 (代理); 1.1.1.1 (直连) 绝不该到。
     let mut buf = [0u8; 2048];
-    match recv_origdst(sock.as_raw_fd(), &mut buf) {
-        Ok((n, client, orig)) => {
-            println!("  [recv] {} 字节, client={}, origdst={:?}", n, client, orig);
-            match orig {
-                Some(od) if od == target => {
-                    println!("  ✅ PASS: tc sk_assign 把裸-IP 包偷进本地 socket, origdst={} 保留", od);
+    let mut got_proxied = false;
+    let mut leaked_direct = false;
+    loop {
+        match recv_origdst(sock.as_raw_fd(), &mut buf) {
+            Ok((n, client, orig)) => {
+                println!("  [recv] {} 字节, client={}, origdst={:?}", n, client, orig);
+                match orig {
+                    Some(od) if od == proxied => got_proxied = true,
+                    Some(od) if od == direct => leaked_direct = true,
+                    other => println!("  ⚠️  未知 origdst={:?}", other),
                 }
-                Some(od) => println!("  ⚠️  origdst={} 与目标 {} 不符", od, target),
-                None => println!("  ⚠️  收到包但无 origdst cmsg"),
+            }
+            Err(nix::errno::Errno::EAGAIN) => break, // 无更多包
+            Err(e) => {
+                println!("  ❌ recvmsg 错误: {}", e);
+                break;
             }
         }
-        Err(nix::errno::Errno::EAGAIN) => {
-            println!("  ❌ 3s 未收到 —— tc_divert 未把包 sk_assign 进本地 socket");
-            println!("     (可能: verifier 拒绝 / sk_lookup 没找到监听 / rp_filter 丢包)");
-        }
-        Err(e) => println!("  ❌ recvmsg 错误: {}", e),
+    }
+
+    if got_proxied && !leaked_direct {
+        println!("  ✅ PASS: {} 被 sk_assign 进代理; {} 走直连未进 socket (LPM 分流生效)", proxied, direct);
+    } else if leaked_direct {
+        println!("  ❌ FAIL: 直连段 {} 被错误劫持进代理 socket", direct);
+    } else {
+        println!("  ❌ FAIL: 代理目标 {} 未收到 (sk_assign 路径断)", proxied);
     }
     Ok(())
 }

@@ -37,12 +37,13 @@ ip netns exec ns_gw "$BIN" &
 GW=$!
 sleep 1.5
 
-# client 侧: 发裸-IP UDP → 8.8.8.8:9999
+# client 侧: 先发直连段 1.1.1.1 (应被内核直连丢弃), 再发 8.8.8.8 (应被代理)
 ip netns exec ns_cli python3 -c '
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.sendto(b"direct-leak?", ("1.1.1.1", 9999))
 s.sendto(b"raw-ip-hello", ("8.8.8.8", 9999))
-print("  [cli] sent raw-ip UDP -> 8.8.8.8:9999")
+print("  [cli] sent 1.1.1.1 (direct) + 8.8.8.8 (proxy)")
 ' || true
 
 wait $GW
