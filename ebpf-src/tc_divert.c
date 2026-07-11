@@ -54,6 +54,8 @@ static __always_inline int is_direct_dst(__u32 daddr_be) {
     if ((d & 0xff000000) == 0x0a000000) return 1; // 10.0.0.0/8
     if ((d & 0xfff00000) == 0xac100000) return 1; // 172.16.0.0/12
     if ((d & 0xffff0000) == 0xc0a80000) return 1; // 192.168.0.0/16
+    if ((d & 0xffc00000) == 0x64400000) return 1; // 100.64.0.0/10 (CGNAT/Tailscale/mesh/K8s)
+    if ((d & 0xffff0000) == 0xa9fe0000) return 1; // 169.254.0.0/16 (链路本地/云元数据)
     if ((d & 0xff000000) == 0x7f000000) return 1; // 127.0.0.0/8
     if ((d & 0xf0000000) == 0xe0000000) return 1; // 224.0.0.0/4 multicast
     if (d == 0xffffffff) return 1;                // 255.255.255.255
