@@ -10,6 +10,28 @@ use arc_swap::ArcSwap;
 // 引入嗅探器
 use crate::proxy::sniff::sniff_first_kb;
 
+/// 构造带 IP_TRANSPARENT 的 TCP listener (v4)。与 transparent_udp.rs 的
+/// build_main_socket 同范式 (nix socket + setsockopt + from_std)。
+fn build_transparent_listener(listen_addr: &str) -> anyhow::Result<TcpListener> {
+    use nix::sys::socket::{
+        bind, listen, setsockopt, socket, sockopt, AddressFamily, Backlog, SockFlag, SockType,
+        SockaddrIn,
+    };
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+    let addr: std::net::SocketAddrV4 = listen_addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("透明 TCP listen 地址非 IPv4 ({}): {}", listen_addr, e))?;
+    let fd = socket(AddressFamily::Inet, SockType::Stream, SockFlag::SOCK_NONBLOCK, None)?;
+    setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+    setsockopt(&fd, sockopt::IpTransparent, &true)?;
+    bind(fd.as_raw_fd(), &SockaddrIn::from(addr))?;
+    listen(&fd, Backlog::new(1024)?)?;
+    let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
+    std_listener.set_nonblocking(true)?;
+    Ok(TcpListener::from_std(std_listener)?)
+}
+
 /**
  * [eBPF 透明代理监听服务]
  * 这个服务会绑定到一个本地端口，并通过 eBPF sk_lookup 截获所有针对 fake_ip 的流量。
@@ -23,8 +45,12 @@ pub async fn start_transparent(
     fake_ip_net: std::net::Ipv4Addr,
     fake_ip_prefix: u8,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen_addr).await?;
-    info!("Transparent proxy listener bound to {}", listen_addr);
+    // IP_TRANSPARENT listener: tc_divert 用 sk_assign 把外网-IP 的 TCP SYN 偷进来后,
+    // listener 必须透明才能以非本地目的地址完成三次握手, accept 出的 socket 的
+    // local_addr() = 原始 foreign 目的 (裸-IP 分流的分水岭)。fake-IP 路径靠本地
+    // 路由已是"本地"、不依赖此选项, 但开着无害且统一。
+    let listener = build_transparent_listener(listen_addr)?;
+    info!("Transparent proxy listener bound to {} (IP_TRANSPARENT)", listen_addr);
 
     // 1. 注册 listener socket 到 eBPF map 中，告知内核将流量抛给哪个 Socket
     {

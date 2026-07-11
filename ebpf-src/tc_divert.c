@@ -98,25 +98,23 @@ int tc_divert(struct __sk_buff *skb) {
         if ((void *)(th + 1) > data_end)
             return TC_ACT_OK;
 
-        // 1) 已建流 (同 4 元组): 该流之前已 assign 给代理 accept 出的 socket
-        //    (其 local_addr = 原始 foreign dst, 靠 IP_TRANSPARENT 保留)。
-        struct bpf_sock_tuple ft = {};
-        ft.ipv4.saddr = ip->saddr;
-        ft.ipv4.daddr = ip->daddr;
-        ft.ipv4.sport = th->source;
-        ft.ipv4.dport = th->dest;
-        sk = bpf_sk_lookup_tcp(skb, &ft, sizeof(ft.ipv4), BPF_F_CURRENT_NETNS, 0);
-        if (sk)
+        // 只对新连接的首 SYN 做 sk_assign → 透明 listener。已建连接的后续包
+        // (含完成握手的 3rd ACK, 此时内核侧是 NEW_SYN_RECV request_sock) 若也
+        // sk_assign 会打断 tcp_check_req 把 child 入 accept 队列的正常流程 →
+        // 握手悬死 + RST。对它们只打 fwmark 走本地投递, 让内核自身的 established
+        // 查找命中 child (child 靠 IP_TRANSPARENT 绑非本地 foreign 目的)。
+        if (th->syn && !th->ack) {
+            struct bpf_sock_tuple lt = {};
+            lt.ipv4.daddr = bpf_htonl(0x7f000001); // 通配匹配 0.0.0.0:lport
+            lt.ipv4.dport = lport;
+            sk = bpf_sk_lookup_tcp(skb, &lt, sizeof(lt.ipv4), BPF_F_CURRENT_NETNS, 0);
+            if (!sk)
+                return TC_ACT_OK;
             goto assign;
-
-        // 2) 新流 (SYN): 查透明监听 socket (127.0.0.1:lport, 通配匹配 0.0.0.0)
-        struct bpf_sock_tuple lt = {};
-        lt.ipv4.daddr = bpf_htonl(0x7f000001);
-        lt.ipv4.dport = lport;
-        sk = bpf_sk_lookup_tcp(skb, &lt, sizeof(lt.ipv4), BPF_F_CURRENT_NETNS, 0);
-        if (!sk)
-            return TC_ACT_OK;
-        goto assign;
+        }
+        // 已建流: 仅打 mark, 交内核本地投递 + established 查找。
+        skb->mark = MIRAGE_FWMARK;
+        return TC_ACT_OK;
     } else if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *uh = (void *)(ip + 1);
         if ((void *)(uh + 1) > data_end)

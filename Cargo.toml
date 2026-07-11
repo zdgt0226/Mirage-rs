@@ -57,5 +57,10 @@ path = "examples/verify_tc_divert.rs"
 required-features = ["ebpf"]
 
 [[example]]
+name = "verify_tc_divert_tcp"
+path = "examples/verify_tc_divert_tcp.rs"
+required-features = ["ebpf"]
+
+[[example]]
 name = "simulate_bdp"
 path = "examples/simulate_bdp.rs"
