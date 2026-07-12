@@ -271,8 +271,13 @@ impl DnsForwarder {
                                 let _ = engine.update_dns_cache(&domain, fake_ip);
                             }
                             return make_fake_ip_response(req, fake_ip);
-                        } else if qtype == 28 { // AAAA
-                            debug!("[DNS] proxy   [{}] → AAAA 空 (强制 v4 fake-IP)", domain);
+                        } else if qtype == 28 || qtype == 65 { // AAAA / HTTPS(SVCB, type 65)
+                            // fake-IP 模式下非 A 记录无需真解析: 客户端用 A 的 fake-IP
+                            // 连接、代理按域名建连。尤其 type 65 (HTTPS RR) 现代浏览器
+                            // 对每个域名都发, 若逐个走 tcp_over_tunnel 会各消耗+销毁一条
+                            // 预热隧道 → 开页面 20-30 域名瞬间打空 WarmPool。返回 NODATA
+                            // 空答复 (同 AAAA), 客户端回落 A 记录 fake-IP 连接, 功能无损。
+                            debug!("[DNS] proxy   [{}] → qtype {} 空答复 (fake-IP 免隧道)", domain, qtype);
                             return make_empty_response(req);
                         }
                     }
