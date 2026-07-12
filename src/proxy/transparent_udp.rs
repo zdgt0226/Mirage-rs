@@ -256,6 +256,20 @@ fn frame_udp_domain(domain: &str, port: u16, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+/// 封 Mirage UDP 隧道帧 (裸 IPv4 目的): [2B bodyLen][ATYP=1][4B IP][2B port][payload]。
+/// tc_divert 抓来的无 DNS 裸公网 IP UDP (QUIC/网游) 走这条, 服务端 udp_relay 按
+/// ATYP=1 直接构造地址不解析。调用方须保证 7+payload ≤ u16::MAX。
+fn frame_udp_ipv4(ip: &Ipv4Addr, port: u16, payload: &[u8]) -> Vec<u8> {
+    let body_len = 1 + 4 + 2 + payload.len();
+    let mut f = Vec::with_capacity(2 + body_len);
+    f.extend_from_slice(&(body_len as u16).to_be_bytes());
+    f.push(0x01);
+    f.extend_from_slice(&ip.octets());
+    f.extend_from_slice(&port.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
 /// 从累积 buffer 解一帧回程 [2B len][ATYP][ADDR][2B port][payload], 返回
 /// (payload, 消费字节数=2+len)。不完整返回 None。源地址被忽略 —— 透明回包一律从
 /// orig_dst 发回客户端。畸形内层(坏 ATYP/越界)仍消费整帧以重同步, payload 空。
@@ -413,6 +427,19 @@ async fn setup_flow(
     let port = orig_dst.port();
     let domain = fake_ip_mapper.lookup_domain(&fake_ip);
 
+    // 实际转发目标: fake-IP 反查到域名 → 用域名; 否则若是 tc_divert 抓来的裸公网
+    // IP (非 fake-IP 段) → 用裸 IP 直发/隧道 ATYP=1; fake-IP 但查不到域名(被淘汰)
+    // → 无目标, 只能丢 (无从恢复原域名)。补齐与 TCP 侧一致的裸-IP 兼容。
+    enum UdpTarget {
+        Domain(String),
+        Ip(Ipv4Addr),
+    }
+    let target = match &domain {
+        Some(d) => Some(UdpTarget::Domain(d.clone())),
+        None if !fake_ip_mapper.is_fake_ip(&fake_ip) => Some(UdpTarget::Ip(fake_ip)),
+        None => None,
+    };
+
     // 路由决策
     let snapshot = state.load();
     let mut req = RoutingRequest {
@@ -464,16 +491,17 @@ async fn setup_flow(
     match route {
         // ── Direct 腿: 本地解析 + 直发 UDP socket ──
         Route::Direct => {
-            let real: SocketAddr = match &domain {
-                Some(d) => match crate::proxy::resolver::resolve_first(d, port).await {
+            let real: SocketAddr = match &target {
+                Some(UdpTarget::Domain(d)) => match crate::proxy::resolver::resolve_first(d, port).await {
                     Ok(sa) => sa,
                     Err(_) => {
                         debug!("[TPROXY-UDP] resolve {} failed", d);
                         return;
                     }
                 },
+                Some(UdpTarget::Ip(ip)) => SocketAddr::V4(SocketAddrV4::new(*ip, port)),
                 None => {
-                    warn!("[TPROXY-UDP] no domain for fake-ip {}, dropping", fake_ip);
+                    warn!("[TPROXY-UDP] 淘汰的 fake-ip {} 无域名可恢复, dropping", fake_ip);
                     return;
                 }
             };
@@ -517,14 +545,24 @@ async fn setup_flow(
             }
         }
 
-        // ── Mirage 腿: 走加密隧道, 目标发**域名**让服务端远程解析 ──
+        // ── Mirage 腿: 走加密隧道。有域名发 ATYP=3 让服务端远程解析; tc_divert 抓来的
+        //    裸公网 IP (无 DNS, QUIC/网游) 发 ATYP=1 让服务端直接构造地址不解析 ──
         Route::Mirage(pool) => {
-            let domain = match &domain {
-                Some(d) if d.len() <= 255 => d.clone(),
-                _ => {
-                    warn!("[TPROXY-UDP] Mirage flow needs domain (fake-ip {}), dropping", fake_ip);
+            let target = match target {
+                Some(UdpTarget::Domain(d)) if d.len() <= 255 => UdpTarget::Domain(d),
+                Some(UdpTarget::Domain(_)) => {
+                    warn!("[TPROXY-UDP] Mirage 域名过长, dropping");
                     return;
                 }
+                Some(UdpTarget::Ip(ip)) => UdpTarget::Ip(ip),
+                None => {
+                    warn!("[TPROXY-UDP] Mirage 淘汰的 fake-ip {} 无目标, dropping", fake_ip);
+                    return;
+                }
+            };
+            let tdesc = match &target {
+                UdpTarget::Domain(d) => d.clone(),
+                UdpTarget::Ip(ip) => ip.to_string(),
             };
             // 子上限: 占一个 Mirage-UDP 隧道名额 (drop 时释放)。满则丢, 别抽干隧道池。
             let _udp_permit = match MirageUdpPermit::try_acquire() {
@@ -556,16 +594,15 @@ async fn setup_flow(
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Mirage(tx.clone()) },
             );
             guard.committed_id = Some(flow_id);
-            debug!("[TPROXY-UDP] new Mirage flow {} → {} (via tunnel)", client, domain);
+            debug!("[TPROXY-UDP] new Mirage flow {} → {} (via tunnel)", client, tdesc);
 
             // 首包入 channel, 由 uplink 统一封帧
             let _ = tx.try_send(first_payload);
 
             let mut writer = tunnel.writer;
             let mut reader = tunnel.reader;
-            let domain_up = domain.clone();
 
-            // uplink: channel → 封帧 [len][ATYP=3][domain][port][payload] → 隧道
+            // uplink: channel → 封帧 (域名 ATYP=3 / 裸 IP ATYP=1) → 隧道
             let uplink = async move {
                 loop {
                     let pkt = match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
@@ -573,10 +610,20 @@ async fn setup_flow(
                         _ => break, // idle / channel 关
                     };
                     // 超大包无法用 u16 帧长表示, 丢 (真实 UDP 极少 >60KB)
-                    if 4 + domain_up.len() + pkt.len() > u16::MAX as usize {
-                        continue;
-                    }
-                    let frame = frame_udp_domain(&domain_up, port, &pkt);
+                    let frame = match &target {
+                        UdpTarget::Domain(d) => {
+                            if 1 + 1 + d.len() + 2 + pkt.len() > u16::MAX as usize {
+                                continue;
+                            }
+                            frame_udp_domain(d, port, &pkt)
+                        }
+                        UdpTarget::Ip(ip) => {
+                            if 1 + 4 + 2 + pkt.len() > u16::MAX as usize {
+                                continue;
+                            }
+                            frame_udp_ipv4(ip, port, &pkt)
+                        }
+                    };
                     if writer.send_data(&frame).await.is_err() {
                         break;
                     }
@@ -624,7 +671,22 @@ async fn setup_flow(
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_udp_domain, parse_udp_frame_payload};
+    use super::{frame_udp_domain, frame_udp_ipv4, parse_udp_frame_payload};
+
+    #[test]
+    fn frame_ipv4_bytes_and_roundtrip() {
+        // ATYP=1 8.8.8.8:53 payload "dns"; body=1+4+2+3=10
+        let f = frame_udp_ipv4(&"8.8.8.8".parse().unwrap(), 53, b"dns");
+        assert_eq!(&f[0..2], &[0x00, 0x0A]); // bodyLen=10
+        assert_eq!(f[2], 0x01); // ATYP IPv4
+        assert_eq!(&f[3..7], &[8, 8, 8, 8]);
+        assert_eq!(&f[7..9], &[0x00, 0x35]); // 53
+        assert_eq!(&f[9..12], b"dns");
+        // 服务端/回程解析器按 ATYP=1 跳过 4B 地址后能取回 payload
+        let (payload, consumed) = parse_udp_frame_payload(&f).unwrap();
+        assert_eq!(payload, b"dns");
+        assert_eq!(consumed, f.len());
+    }
 
     #[test]
     fn frame_domain_bytes() {
