@@ -168,13 +168,16 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     }
     buf.extend_from_slice(&body);
 
-    // Read subsequent flights (ChangeCipherSpec, ApplicationData/EncryptedExtensions)
+    // Read subsequent flights (ChangeCipherSpec, ApplicationData/EncryptedExtensions)。
+    // header 必须推迟到 body 也读全后再与 body 一起 append —— 否则 body 读超时 break
+    // 会在 buf 尾留下有头无体的截断 record, 缓存后客户端解析到该帧报 TLS decode 错。
+    // 只追加"完整整数帧", 超时则 buf 停在此前完好帧边界。
     for _ in 0..2 {
         if tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut header)).await.is_ok() {
-            buf.extend_from_slice(&header);
             let len = u16::from_be_bytes([header[3], header[4]]) as usize;
             let mut body = vec![0u8; len];
             if tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut body)).await.is_ok() {
+                buf.extend_from_slice(&header);
                 buf.extend_from_slice(&body);
             } else {
                 break;
