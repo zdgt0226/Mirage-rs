@@ -145,9 +145,11 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut header = [0u8; 5];
     
-    // Read ServerHello (0x16)
+    // Read ServerHello (0x16)。超时/读不全绝不能返回 Ok(空 buf) —— fetch_batch
+    // 无长度过滤会把它当合法模板灌进 cache 毒化全局 (所有连接随机取到空/残破模板 →
+    // 客户端 read_server_handshake 校验崩)。抖动丢包时返回 Err 让上层回落 fallback。
     if tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut header)).await.is_err() {
-        return Ok(buf);
+        return Err(anyhow::anyhow!("timeout reading ServerHello header from camouflage host"));
     }
     // 首记录必须是 Handshake(0x16). 若对端回 Alert(0x15) 说明 ClientHello 被拒,
     // 决不能把 alert 当模板缓存 (会毒化 cache 让所有客户端收到 alert). 返回 Err
@@ -162,7 +164,7 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
     let mut body = vec![0u8; len];
     if tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut body)).await.is_err() {
-        return Ok(buf);
+        return Err(anyhow::anyhow!("timeout reading ServerHello body (len={}) from camouflage host", len));
     }
     buf.extend_from_slice(&body);
 

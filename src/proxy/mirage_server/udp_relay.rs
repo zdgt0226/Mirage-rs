@@ -5,8 +5,14 @@
 //! ATYP: 1=IPv4, 3=Domain, 4=IPv6
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, error};
+
+/// UDP 会话双向 idle 上限。任一方向静默超此值即拆流, 防客户端弱网断连(无 FIN)
+/// 导致 task/UdpSocket/64KB buf 僵尸泄露 (对齐 tcp_relay 的 1800s 兜底思路; UDP
+/// 流更短, 且客户端透明 UDP 自身 60s idle 即拆, 300s 只作服务端兜底不误杀活跃流)。
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) async fn handle_udp_relay(
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
@@ -32,8 +38,8 @@ pub(super) async fn handle_udp_relay(
     let downlink = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
-            match udp_clone.recv_from(&mut buf).await {
-                Ok((size, addr)) => {
+            match tokio::time::timeout(UDP_IDLE_TIMEOUT, udp_clone.recv_from(&mut buf)).await {
+                Ok(Ok((size, addr))) => {
                     // Frame format: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
                     let atyp: u8; // Declared but assigned in match
                     let mut addr_bytes = Vec::new();
@@ -62,7 +68,7 @@ pub(super) async fn handle_udp_relay(
                         break;
                     }
                 }
-                Err(_) => break,
+                _ => break, // 上游静默超 UDP_IDLE_TIMEOUT 或 socket 错误 → 拆流
             }
         }
     });
@@ -107,9 +113,9 @@ pub(super) async fn handle_udp_relay(
             let chunk = tokio::select! {
                 biased;
                 _ = stop_rx_up.changed() => break,
-                r = reader.recv_data() => match r {
-                    Ok(c) => c,
-                    Err(_) => break,
+                r = tokio::time::timeout(UDP_IDLE_TIMEOUT, reader.recv_data()) => match r {
+                    Ok(Ok(c)) => c,
+                    _ => break, // 隧道静默超 UDP_IDLE_TIMEOUT (客户端弱网断连无 FIN) 或读错误
                 }
             };
 

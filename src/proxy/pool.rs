@@ -498,7 +498,13 @@ impl WarmPool {
     /// 核心握手逻辑：建立 TCP 并包装 AEAD Crypto 层
     async fn connect_upstream(cfg: &PoolConfig, brutal_state: &BrutalState) -> Result<Tunnel> {
         let addr = format!("{}:{}", cfg.server_host, cfg.server_port);
-        let stream = TcpStream::connect(&addr).await?;
+        // 建连必须有上限: 黑洞路由 (丢 SYN 不回 RST) 下 TcpStream::connect 会挂到内核
+        // tcp_syn_retries (~127s), 期间 in_flight 一直 +1, builder 判 idle+in_flight
+        // 达标而停止补货 → 池饿死、pool.get() 反复 10s 超时。8s 超时快速失败, 走 Err
+        // 分支回滚 in_flight + 退避重试, 让弹性池能切换/重连。
+        let stream = timeout(Duration::from_secs(8), TcpStream::connect(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect to {} timed out (8s, 黑洞路由?)", addr))??;
         
         // --- Brutal 拥塞控制 ---
         //
