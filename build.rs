@@ -4,6 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=ebpf-src/transparent.c");
     println!("cargo:rerun-if-changed=ebpf-src/tc_divert.c");
     println!("cargo:rerun-if-changed=ebpf-src/cgroup_connect.c");
+    println!("cargo:rerun-if-changed=ebpf-src/mss_clamp.c");
     println!("cargo:rerun-if-env-changed=PATH");
 
     // Inject `git describe` so --version shows actual build state independent
@@ -41,6 +42,7 @@ fn main() {
         ("ebpf-src/transparent.c", "transparent.elf", "BPF_TRANSPARENT_ELF"),
         ("ebpf-src/tc_divert.c", "tc_divert.elf", "BPF_TC_DIVERT_ELF"),
         ("ebpf-src/cgroup_connect.c", "cgroup_connect.elf", "BPF_CGROUP_CONNECT_ELF"),
+        ("ebpf-src/mss_clamp.c", "mss_clamp.elf", "BPF_MSS_CLAMP_ELF"),
     ] {
         let src_path = manifest_dir.join(src);
         let dst_path = out_dir.join(elf_name);

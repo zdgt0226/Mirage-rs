@@ -67,5 +67,10 @@ path = "examples/verify_cgroup_connect.rs"
 required-features = ["ebpf"]
 
 [[example]]
+name = "verify_mss_clamp"
+path = "examples/verify_mss_clamp.rs"
+required-features = ["ebpf"]
+
+[[example]]
 name = "simulate_bdp"
 path = "examples/simulate_bdp.rs"
