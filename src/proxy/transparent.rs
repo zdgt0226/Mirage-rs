@@ -146,26 +146,25 @@ pub async fn start_transparent(
                         }
                         if let std::net::IpAddr::V4(dst_v4) = dst_addr.ip() {
 
-                            // 1. 从 fake-ip mapper 中反查真实域名
-                            let domain_opt = fake_ip_mapper_clone.lookup_domain(&dst_v4);
-
-                            let mut target_host = match domain_opt {
+                            // 从 fake-ip mapper 反查真实域名。
+                            // 优化: fake-IP 已反查到域名的 —— 客户端连的就是它、SNI 必与之
+                            // 一致, 直接用, **不再阻塞 sniff**(省掉每条网页连接的一次嗅探)。
+                            // sniff 只对**裸-IP**(无 fake-IP 映射)才做: 嗅 SNI 拿域名交服务端
+                            // 在干净网络解析(抗污染), 拿不到才退回裸 IP。
+                            let target_host = match fake_ip_mapper_clone.lookup_domain(&dst_v4) {
                                 Some(d) => format!("{}:{}", d, dst_addr.port()),
-                                None => format!("{}:{}", dst_v4, dst_addr.port()),
+                                None => match sniff_first_kb(&stream).await {
+                                    Some(sniffed) => {
+                                        debug!("[TPROXY] TCP {} 裸-IP 嗅探到 SNI/Host [{}]", peer_addr, sniffed);
+                                        format!("{}:{}", sniffed, dst_addr.port())
+                                    }
+                                    None => format!("{}:{}", dst_v4, dst_addr.port()),
+                                },
                             };
 
-                            debug!("[TPROXY] TCP {} → fake-IP {} → 反查 [{}]", peer_addr, dst_addr, target_host);
+                            debug!("[TPROXY] TCP {} → {} → [{}]", peer_addr, dst_addr, target_host);
 
-                            // 2. 为了精准路由，我们再嗅探一下协议特征 (TLS SNI 或 HTTP Host)
-                            // 比如某些情况并不是通过 fake-ip 查询的，而是直接透明劫持了纯 IP 的请求
-                            let sniffed_domain = sniff_first_kb(&stream).await;
-                            if let Some(sniffed) = sniffed_domain {
-                                debug!("[TPROXY] TCP 嗅探到 SNI/Host [{}] (纠偏目标)", sniffed);
-                                // 如果嗅探到了域名，我们就优先使用嗅探到的域名作为目标
-                                target_host = format!("{}:{}", sniffed, dst_addr.port());
-                            }
-                            
-                            // 3. 复用现有的 TCP 处理逻辑，根据 rule_engine 进行路由分发
+                            // 复用现有的 TCP 处理逻辑，根据 rule_engine 进行路由分发
                             crate::proxy::handler::proxy_tcp_target(
                                 stream,
                                 target_host,
