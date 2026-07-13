@@ -20,10 +20,10 @@
 char _license[] SEC("license") = "GPL";
 
 struct connect_cfg {
-    __u32 listen_ip;   // 网络序 (127.0.0.1)
-    __u32 listen_port; // host 序
-    __u32 server_ip;   // 网络序, 防环路旁路
-    __u32 server_port; // host 序
+    __u32 listen_ip;    // 网络序 (127.0.0.1)
+    __u32 listen_port;  // host 序
+    __u32 fakeip_net;   // 网络序, 只重定向 fake-IP 网段
+    __u32 fakeip_mask;  // 网络序
 };
 
 struct {
@@ -54,17 +54,6 @@ struct {
     __type(value, struct orig_dst);
 } cc_port SEC(".maps");
 
-static __always_inline int is_direct(__u32 daddr_be) {
-    __u32 d = bpf_ntohl(daddr_be);
-    if ((d & 0xff000000) == 0x0a000000) return 1; // 10/8
-    if ((d & 0xfff00000) == 0xac100000) return 1; // 172.16/12
-    if ((d & 0xffff0000) == 0xc0a80000) return 1; // 192.168/16
-    if ((d & 0xff000000) == 0x7f000000) return 1; // 127/8 (含 listener 自身)
-    if ((d & 0xffc00000) == 0x64400000) return 1; // 100.64/10
-    if ((d & 0xffff0000) == 0xa9fe0000) return 1; // 169.254/16
-    return 0;
-}
-
 SEC("cgroup/connect4")
 int cc_connect4(struct bpf_sock_addr *ctx) {
     if (ctx->protocol != IPPROTO_TCP)
@@ -77,11 +66,9 @@ int cc_connect4(struct bpf_sock_addr *ctx) {
     __u32 dip = ctx->user_ip4;              // 网络序
     __be16 dport = (__be16)ctx->user_port;  // 网络序
 
-    // 防环路: 连 Mirage 服务端本身
-    if (dip == cfg->server_ip && dport == bpf_htons((__u16)cfg->server_port))
-        return 1;
-    // 直连/私网/loopback 不改写
-    if (is_direct(dip))
+    // 只重定向 fake-IP 网段: 直连域名/CN 是真实 IP、隧道到服务端也是真实 IP、
+    // geo_updater 亦然 —— 全部不在 fake-IP 段 → 天然旁路, 环路预防自动成立。
+    if ((dip & cfg->fakeip_mask) != cfg->fakeip_net)
         return 1;
 
     __u64 cookie = bpf_get_socket_cookie(ctx);

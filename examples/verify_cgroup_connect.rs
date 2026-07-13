@@ -21,10 +21,10 @@ use nix::sys::socket::{
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct ConnectCfg {
-    listen_ip: u32,   // 网络序
-    listen_port: u32, // host 序
-    server_ip: u32,   // 网络序
-    server_port: u32, // host 序
+    listen_ip: u32,    // 网络序
+    listen_port: u32,  // host 序
+    fakeip_net: u32,   // 网络序
+    fakeip_mask: u32,  // 网络序
 }
 unsafe impl aya::Pod for ConnectCfg {}
 
@@ -62,8 +62,9 @@ fn main() -> anyhow::Result<()> {
             ConnectCfg {
                 listen_ip: u32::from(Ipv4Addr::LOCALHOST).to_be(),
                 listen_port: LPORT as u32,
-                server_ip: 0, // 无旁路 (测试里不连服务端)
-                server_port: 0,
+                // fake-IP 段 198.18.0.0/15
+                fakeip_net: u32::from(Ipv4Addr::new(198, 18, 0, 0)).to_be(),
+                fakeip_mask: (!0u32 << (32 - 15)).to_be(),
             },
             0,
         )?;
