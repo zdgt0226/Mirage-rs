@@ -12,7 +12,23 @@ use crate::proxy::sniff::sniff_first_kb;
 
 /// 构造带 IP_TRANSPARENT 的 TCP listener (v4)。与 transparent_udp.rs 的
 /// build_main_socket 同范式 (nix socket + setsockopt + from_std)。
+/// 构建透明 listener, 保证成功: 先试 IP_TRANSPARENT 路径 (raw-IP 分流需要), 任何
+/// 一步失败就回落普通 TcpListener::bind (fake-IP 靠 local 路由已是本地、完全够用,
+/// 只损 raw-IP 直连分流)。绝不因 setsockopt/listen EINVAL 而让整个透明代理起不来。
 fn build_transparent_listener(listen_addr: &str) -> anyhow::Result<TcpListener> {
+    match build_transparent_listener_inner(listen_addr) {
+        Ok(l) => Ok(l),
+        Err(e) => {
+            warn!("IP_TRANSPARENT listener 构建失败 ({}); 回落普通 listener —— fake-IP 转发可用, raw-IP 直连分流受限", e);
+            let std_l = std::net::TcpListener::bind(listen_addr)?;
+            std_l.set_nonblocking(true)?;
+            Ok(TcpListener::from_std(std_l)?)
+        }
+    }
+}
+
+fn build_transparent_listener_inner(listen_addr: &str) -> anyhow::Result<TcpListener> {
+    use anyhow::Context;
     use nix::sys::socket::{
         bind, listen, setsockopt, socket, sockopt, AddressFamily, Backlog, SockFlag, SockType,
         SockaddrIn,
@@ -22,11 +38,18 @@ fn build_transparent_listener(listen_addr: &str) -> anyhow::Result<TcpListener> 
     let addr: std::net::SocketAddrV4 = listen_addr
         .parse()
         .map_err(|e| anyhow::anyhow!("透明 TCP listen 地址非 IPv4 ({}): {}", listen_addr, e))?;
-    let fd = socket(AddressFamily::Inet, SockType::Stream, SockFlag::SOCK_NONBLOCK, None)?;
-    setsockopt(&fd, sockopt::ReuseAddr, &true)?;
-    setsockopt(&fd, sockopt::IpTransparent, &true)?;
-    bind(fd.as_raw_fd(), &SockaddrIn::from(addr))?;
-    listen(&fd, Backlog::new(1024)?)?;
+    let fd = socket(AddressFamily::Inet, SockType::Stream, SockFlag::SOCK_NONBLOCK, None)
+        .context("socket(AF_INET, SOCK_STREAM)")?;
+    setsockopt(&fd, sockopt::ReuseAddr, &true).context("setsockopt SO_REUSEADDR")?;
+    // IP_TRANSPARENT 非致命: 仅 tc_divert 的 raw-IP 路径需要 (以非本地目的完成握手);
+    // fake-IP 路径靠 `ip route add local` 已是本地地址, 普通 listener 即可 accept。
+    // 某些内核/受限环境 setsockopt 会 EINVAL —— 失败则降级为普通 listener, fake-IP
+    // 转发照常, 只有 raw-IP 直连分流受限。绝不能因它 drop 掉整个 listener。
+    if let Err(e) = setsockopt(&fd, sockopt::IpTransparent, &true) {
+        warn!("透明 listener IP_TRANSPARENT 设置失败 ({}); fake-IP 仍可用, raw-IP 分流受限", e);
+    }
+    bind(fd.as_raw_fd(), &SockaddrIn::from(addr)).with_context(|| format!("bind {}", addr))?;
+    listen(&fd, Backlog::new(1024)?).context("listen")?;
     let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
     std_listener.set_nonblocking(true)?;
     Ok(TcpListener::from_std(std_listener)?)
