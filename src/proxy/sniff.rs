@@ -7,7 +7,9 @@ use tracing::debug;
  * 注意，窥探必须使用 peek，不能消费（读走）数据，以免破坏代理后的握手流程。
  */
 pub async fn sniff_first_kb(stream: &TcpStream) -> Option<String> {
-    let mut buf = [0u8; 1024];
+    // 4096: 后量子 TLS 1.3 (X25519MLKEM768/Kyber) 的 ClientHello 因 key_share 膨胀到
+    // 1.2~1.8KB, 1024 装不下。SNI 扩展在前段, 但下面 parse 还需容忍截断 (见 ext_end clamp)。
+    let mut buf = [0u8; 4096];
     
     // 使用 peek 查看数据，不从流中移除它，并加上 2 秒超时防止慢速 DoS 攻击
     let n = match tokio::time::timeout(std::time::Duration::from_secs(2), stream.peek(&mut buf)).await {
@@ -56,9 +58,10 @@ fn parse_tls_sni(data: &[u8]) -> Option<String> {
     let ext_total_len = ((data[offset] as usize) << 8) | (data[offset + 1] as usize);
     offset += 2;
     
-    let ext_end = offset + ext_total_len;
-    if ext_end > data.len() { return None; }
-    
+    // 容忍截断: ext_total_len 可能超出 peek 到的字节 (PQC key_share 在后段撑大总长),
+    // 但 SNI 在前段。clamp 到 data.len() 继续遍历, 而不是一见越界就放弃 SNI。
+    let ext_end = std::cmp::min(offset + ext_total_len, data.len());
+
     // 遍历 Extensions
     while offset + 4 <= ext_end {
         let ext_type = ((data[offset] as usize) << 8) | (data[offset + 1] as usize);

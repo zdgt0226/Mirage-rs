@@ -266,6 +266,11 @@ pub async fn proxy_tcp_target(
                     while let Ok(_) = tunnel_reader.recv_data().await {}
                 }).await;
 
+                // 半关闭传播: 远端已 EOF, 给本地客户端发 FIN (write 端半关), 让守规矩的
+                // 客户端随之关闭 → upload 的 local_read 读到 EOF 自然退出。否则客户端
+                // keep-alive/不发 FIN 时 upload 会干等到 1800s idle, join! 被拖成 30min 僵尸。
+                let _ = local_write.shutdown().await;
+
                 (tunnel_reader, down_bytes)
             };
 

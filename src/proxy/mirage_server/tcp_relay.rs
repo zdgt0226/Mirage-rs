@@ -25,32 +25,13 @@ pub(super) async fn handle_tcp_relay(
     mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>
 ) {
     debug!("Mirage Server: Connecting to TCP target {}", target);
-    // 目标解析: IP 字面量直接构造; 域名走 resolver 的 60s 缓存 —— 避免每条连接都
-    // 裸调 getaddrinfo (同域名多连接/浏览器扇出时重复解析, 累积延迟)。
-    let sock_addr = if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
-        addr
-    } else if let Some((host, port_s)) = target.rsplit_once(':') {
-        match port_s.parse::<u16>() {
-            Ok(port) => match crate::proxy::resolver::resolve_first(host, port).await {
-                Ok(sa) => sa,
-                Err(e) => {
-                    warn!("Mirage Server resolve {} failed: {}", target, e);
-                    return;
-                }
-            },
-            Err(_) => {
-                warn!("Mirage Server bad target port {}", target);
-                return;
-            }
-        }
-    } else {
-        warn!("Mirage Server bad target {}", target);
-        return;
-    };
-    let mut upstream = match tokio::net::TcpStream::connect(sock_addr).await {
+    // connect_smart: 60s DNS 缓存 + IP 字面量零解析快车道 + **多候选 IP 逐一带超时** ——
+    // 既有缓存(免每连接重解析), 又保证首个 IP 丢包时跳到下一个, 不会卡死内核 connect 超时。
+    // (eb322b9 曾误用 resolve_first+裸connect, 只取第一个 IP 无 failover, 已回退。)
+    let mut upstream = match crate::proxy::resolver::connect_smart(&target).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("Mirage Server failed to connect to {} ({}): {}", target, sock_addr, e);
+            warn!("Mirage Server failed to connect to {}: {}", target, e);
             return;
         }
     };

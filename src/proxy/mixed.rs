@@ -51,7 +51,14 @@ pub async fn handle_client(
             }
         }
 
-        let header_str = String::from_utf8_lossy(&header_buf);
+        // 精确按 \r\n\r\n 切出 header 段与被同包多读进来的 body/ClientHello,
+        // 只对 header 段做 lossy (纯 ASCII 安全), body 原始字节零破坏。
+        let hdr_end = match header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(p) => p + 4,
+            None => return,
+        };
+        let body_extra = header_buf[hdr_end..].to_vec();
+        let header_str = String::from_utf8_lossy(&header_buf[..hdr_end]);
         let mut lines = header_str.lines();
         let first_line = match lines.next() {
             Some(l) => l,
@@ -70,6 +77,10 @@ pub async fn handle_client(
 
         if is_connect {
             target = uri.to_string();
+            // CONNECT 后若客户端同包带了 TLS ClientHello (\r\n\r\n 之后), 原样作首包转发, 别丢。
+            if !body_extra.is_empty() {
+                initial_payload = Some(body_extra);
+            }
         } else {
             if uri.starts_with("http://") {
                 let without_scheme = &uri[7..];
@@ -92,10 +103,13 @@ pub async fn handle_client(
                 
                 let mut new_req = new_first_line.into_bytes();
                 new_req.extend_from_slice(b"\r\n");
-                
-                let remaining_headers = header_str[first_line.len()..].trim_start_matches("\r\n");
-                new_req.extend_from_slice(remaining_headers.as_bytes());
-                
+                // 首行之后的一切 (剩余 header + 可能的二进制 body) 原样拼接, 不经 lossy 破坏。
+                let fl_end = header_buf
+                    .windows(2)
+                    .position(|w| w == b"\r\n")
+                    .map(|p| p + 2)
+                    .unwrap_or(hdr_end);
+                new_req.extend_from_slice(&header_buf[fl_end..]);
                 initial_payload = Some(new_req);
             } else {
                 let mut host = None;
