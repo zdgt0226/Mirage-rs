@@ -71,6 +71,10 @@ pub enum InboundConfig {
         // sk_lookup fake-IP 拦截, 不接管裸-IP 转发流量。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interface: Option<String>,
+        // 是否让网关本机自身流量也走代理 (cgroup/connect4 重定向本机出向 fake-IP)。
+        // 需本机 DNS 指向 mirage 才能拿到 fake-IP。默认 false (仅转发流量走代理)。
+        #[serde(default)]
+        proxy_local: bool,
     },
 }
 

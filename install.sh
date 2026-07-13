@@ -348,6 +348,9 @@ MIRAGE_TAG="${MIRAGE_TAG:-}"
 INIT_SYS=""
 # 客户端是否配成透明网关 (config_client 里按用户选择置位, main 据此决定是否配 NAT).
 CLIENT_IS_GATEWAY=false
+# 网关本机自身流量是否走代理 (cgroup/connect4)。开启则 setup 时把本机 DNS 指向 mirage.
+CLIENT_PROXY_LOCAL=false
+RESOLV_BAK=/etc/resolv.conf.mirage-bak
 
 # 让用户选择安装的 release tag (留空装 latest). 已通过环境变量指定则不交互.
 select_version() {
@@ -1044,9 +1047,17 @@ config_client() {
 
     if [[ "$deploy_mode" == "2" ]]; then
         CLIENT_IS_GATEWAY=true
-        local transparent_port lan_iface dns_listen dns_port fakeip_range direct_dns remote_dns
+        local transparent_port lan_iface dns_listen dns_port fakeip_range direct_dns remote_dns proxy_local
         transparent_port=$(ask_port "透明代理监听端口 (sk_lookup 内部用, 随意)" "12345" tcp)
         lan_iface=$(ask "LAN 网卡名 (tc_divert 挂这张卡抓裸-IP 转发流量, 面向内网设备的那张)" "$(detect_wan_iface)")
+        # 本机出向: 让网关这台机器自己的流量也走代理 (cgroup/connect4)。开启则需把
+        # 本机 DNS 指向 mirage 才能拿到 fake-IP —— 下面会自动改 /etc/resolv.conf 并备份。
+        if ask_yn "让网关本机自身的流量也走代理? (否则仅转发的 LAN 流量走代理)" n; then
+            proxy_local=true
+        else
+            proxy_local=false
+        fi
+        CLIENT_PROXY_LOCAL=$proxy_local
         dns_listen=$(ask "DNS 服务监听地址" "0.0.0.0")
         dns_port=$(ask_port "DNS 监听端口 (LAN 设备 DNS 指这里; 标准 53)" "53" udp)
         fakeip_range=$(ask "Fake-IP 网段 (RFC2544 基准段, 一般不改)" "198.18.0.0/15")
@@ -1063,7 +1074,8 @@ config_client() {
             "tag": "transparent-in",
             "listen": "0.0.0.0",
             "port": '"$transparent_port"',
-            "interface": "'"$lan_iface"'"
+            "interface": "'"$lan_iface"'",
+            "proxy_local": '"$proxy_local"'
         },
         {
             "type": "dns",
@@ -1340,6 +1352,22 @@ EOF
             ;;
     esac
 
+    # ④.5 本机出向走代理: 把网关自身 DNS 指向 mirage (127.0.0.1), 本机应用才能拿到
+    # fake-IP、被 cgroup/connect4 重定向进代理。备份原 resolv.conf, 卸载时还原。
+    if [[ "$CLIENT_PROXY_LOCAL" == true ]]; then
+        if [[ ! -e "$RESOLV_BAK" ]]; then
+            if [[ -L /etc/resolv.conf ]]; then
+                readlink /etc/resolv.conf > "${RESOLV_BAK}.symlink" 2>/dev/null || true
+            fi
+            cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
+        fi
+        rm -f /etc/resolv.conf
+        printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+        ok "本机 DNS 已指向 mirage (127.0.0.1); 原 resolv.conf 备份于 $RESOLV_BAK"
+        warn "若本机跑 NetworkManager/dhclient/systemd-resolved, 可能覆盖 /etc/resolv.conf;"
+        warn "  被覆盖会导致本机拿不到 fake-IP。必要时 chattr +i /etc/resolv.conf 锁定。"
+    fi
+
     # ⑤ LAN 侧指引 (这步在你的路由器/设备上做)
     local lan_ip; lan_ip=$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1 | cut -d/ -f1)
     echo >&2
@@ -1358,6 +1386,19 @@ teardown_transparent_gateway() {
     # tc_divert 策略路由 (fwmark→local 路由表) 清理
     ip rule del fwmark 1 lookup 100 2>/dev/null || true
     ip route del local default dev lo table 100 2>/dev/null || true
+    # 还原本机 resolv.conf (proxy_local 开启时改过)
+    if [[ -e "$RESOLV_BAK" ]]; then
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        if [[ -e "${RESOLV_BAK}.symlink" ]]; then
+            ln -sf "$(cat "${RESOLV_BAK}.symlink")" /etc/resolv.conf 2>/dev/null || cp -a "$RESOLV_BAK" /etc/resolv.conf
+            rm -f "${RESOLV_BAK}.symlink"
+        else
+            cp -a "$RESOLV_BAK" /etc/resolv.conf
+        fi
+        rm -f "$RESOLV_BAK"
+        info "已还原本机 resolv.conf。"
+    fi
     command -v nft >/dev/null 2>&1 && nft delete table inet "$GW_NFT_TABLE" 2>/dev/null || true
     # iptables: 从 POSTROUTING 摘掉跳转, flush + 删自定义链 (与 nft delete table 对齐, 100% 干净)
     if command -v iptables >/dev/null 2>&1; then

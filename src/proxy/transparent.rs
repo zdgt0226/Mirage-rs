@@ -44,6 +44,9 @@ pub async fn start_transparent(
     transparent_engine: Arc<tokio::sync::Mutex<TransparentEngine>>,
     fake_ip_net: std::net::Ipv4Addr,
     fake_ip_prefix: u8,
+    // 本机出向重定向引擎: cgroup/connect4 把本机 fake-IP 连接改写进本 listener,
+    // local_addr() 变成 127.0.0.1:lport, 需按 peer 端口查回原始 fake-IP。
+    cgroup_engine: Option<Arc<crate::ebpf::CgroupConnectEngine>>,
 ) -> anyhow::Result<()> {
     // IP_TRANSPARENT listener: tc_divert 用 sk_assign 把外网-IP 的 TCP SYN 偷进来后,
     // listener 必须透明才能以非本地目的地址完成三次握手, accept 出的 socket 的
@@ -102,21 +105,30 @@ pub async fn start_transparent(
                 let state_clone = state.clone();
                 let fake_ip_mapper_clone = fake_ip_mapper.clone();
                 let ebpf_clone = ebpf_engine.clone();
+                let cgroup_clone = cgroup_engine.clone();
 
                 tokio::spawn(async move {
-                    // 获取连接原本想要访问的真实目标 IP (也就是 fake-ip)
+                    // 原始目的: tc_divert 路径下 local_addr() 即 fake-IP; cgroup/connect4
+                    // 路径下被改写成 127.0.0.1:lport, 需按 peer 源端口查回原始 fake-IP。
                     let dst = stream.local_addr();
-                    if let Ok(dst_addr) = dst {
+                    if let Ok(mut dst_addr) = dst {
+                        if dst_addr.ip().is_loopback() {
+                            if let Some(eng) = &cgroup_clone {
+                                if let Some((ip, port)) = eng.lookup_origdst(peer_addr.port()) {
+                                    dst_addr = std::net::SocketAddr::from((ip, port));
+                                }
+                            }
+                        }
                         if let std::net::IpAddr::V4(dst_v4) = dst_addr.ip() {
-                            
+
                             // 1. 从 fake-ip mapper 中反查真实域名
                             let domain_opt = fake_ip_mapper_clone.lookup_domain(&dst_v4);
-                            
+
                             let mut target_host = match domain_opt {
                                 Some(d) => format!("{}:{}", d, dst_addr.port()),
                                 None => format!("{}:{}", dst_v4, dst_addr.port()),
                             };
-                            
+
                             debug!("[TPROXY] TCP {} → fake-IP {} → 反查 [{}]", peer_addr, dst_addr, target_host);
 
                             // 2. 为了精准路由，我们再嗅探一下协议特征 (TLS SNI 或 HTTP Host)

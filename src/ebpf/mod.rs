@@ -307,3 +307,6 @@ pub use transparent::TransparentEngine;
 
 pub mod tc_divert;
 pub use tc_divert::TcDivertEngine;
+
+pub mod cgroup_connect;
+pub use cgroup_connect::CgroupConnectEngine;

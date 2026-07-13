@@ -522,8 +522,31 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::Transparent { listen, port, interface, .. } => {
+            crate::config::InboundConfig::Transparent { listen, port, interface, proxy_local, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                // 本机出向重定向 (cgroup/connect4): 开启后网关本机自身 fake-IP 流量也走代理。
+                let cgroup_engine = if let (true, true, Some(fm)) = (proxy_local, enable_ebpf, &fake_ip_mapper) {
+                    let net = fm.network();
+                    let prefix = fm.prefix_len();
+                    match crate::ebpf::CgroupConnectEngine::init(port, net, prefix) {
+                        Ok(eng) => match eng.attach("/sys/fs/cgroup") {
+                            Ok(()) => {
+                                info!("cgroup_connect 已接管本机出向 fake-IP 流量 (本机也走代理)");
+                                Some(std::sync::Arc::new(eng))
+                            }
+                            Err(e) => {
+                                error!("cgroup_connect attach 失败, 本机流量不走代理: {}", e);
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            warn!("cgroup_connect 初始化失败, 本机流量不走代理: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 // 纯 eBPF 抓裸-IP 转发流量 (与 sk_lookup fake-IP 拦截互补): 配了网卡才挂 tc_divert。
                 if let Some(iface) = interface {
                     if enable_ebpf {
@@ -560,7 +583,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                         let net = fm.network();
                         let prefix = fm.prefix_len();
                         if let Err(e) = crate::proxy::transparent::start_transparent(
-                            &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix
+                            &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix, cgroup_engine
                         ).await {
                             tracing::error!("Transparent proxy listener failed: {}", e);
                         }
