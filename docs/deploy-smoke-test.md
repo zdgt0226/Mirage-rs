@@ -184,3 +184,48 @@ journalctl -u mirage-rs-client -f | grep -E 'Hot-reload|direct_cidr synced'
 | 6 | TCP 分水岭 | 代理 TCP 通(netns 已验;失败确认 alpha.23+) |
 | 7 | LPM 热点 | `trie_lookup_elem` <1% → 不加缓存 |
 | 8 | 热重载 | 改规则后 `direct_cidr synced` 自动刷 |
+
+---
+
+## 常见故障排查(真机踩坑实录)
+
+### A. 客户端拿到 fake-IP 但连不上 / 网关日志只有 `[ROUTE] :53/udp`、无 `[TPROXY] TCP`
+
+代理链路没建立。按下面顺序排(每步二选一,直接定位):
+
+```bash
+# ① 透明 listener 端口在监听吗?
+ss -tlnp | grep 12345
+#   有 → listener 正常, 往 ② ; 没有 → listener 没起来, 看 ③
+
+# ② 客户端 curl 时, 网关收到发往 fake-IP 的 SYN 了吗?
+tcpdump -ni <LAN网卡> tcp and host 198.18.0.0/15
+#   抓到 SYN (dst 198.18.x) → SYN 到了网关, 问题在代理侧 (回 ①/③)
+#   若同一 SYN 出现两次、第二次 src 变成【网关自身IP】→ 被 MASQUERADE 转发了(没被代理), 多半 listener 没起
+#   完全抓不到 → 客户端【默认网关】没指向本网关 (只改了 DNS 没改网关)
+
+# ③ listener 为什么没起来 / IP_TRANSPARENT 状态
+journalctl -u mirage-rs-client -b | grep -iE 'listener|IP_TRANSPARENT|回落|EINVAL'
+```
+
+**客户端配置铁律**:LAN 客户端必须**默认网关 + DNS 都指向本网关**。只改 DNS(拿得到 fake-IP)
+但默认网关仍是原路由器 → SYN 发去原路由器 → 丢弃 → 超时。这是最常见的"DNS 通但网页打不开"。
+
+### B. `Transparent proxy listener failed: EINVAL` / `ss` 看不到 12345 监听
+
+历史真机坑(alpha.30 起已修/兜底,记录以备类似问题排查):
+
+- **根因**:`nix::Backlog::new(1024)` 要求 backlog **< `SOMAXCONN`**(多数内核 =128),1024 直接
+  返回 EINVAL,拖垮整个透明 listener → 12345 无人监听 → tc_divert `sk_lookup` 查不到 socket →
+  fake-IP SYN 被当普通流量 MASQUERADE 转发 → 超时。**与 IP_TRANSPARENT、sockmap 都无关。**
+- **修复**:`Backlog::MAXCONN`(=SOMAXCONN,恒合法);且 listener 构建失败会**回落普通 bind**
+  保证 fake-IP 可用。升级到 **alpha.31+** 即可。
+- **通用教训**:遇 `EINVAL` 别猜是哪个 syscall —— 给每个 syscall 加 `.context()`,让日志直接
+  说出是 `bind`/`listen`/`setsockopt` 哪步。凭空断言会连错好几版(本坑误判了 3 次)。
+- **确认已根治**:`journalctl ... | grep 回落` 应**无输出**(不再回落),`ss -tlnp | grep 12345` 有 listener。
+
+### C. 网关本机自己 `curl` 外网不通,但 LAN 客户端正常
+
+预期行为,不是 bug。`tc_divert` 挂 ingress,只抓**转发**流量;网关**本机自身**出向走 egress、
+碰不到,天生直连(→ 被墙)。要让本机也走代理需 `proxy_local`(见 alpha.29,cgroup/connect4),
+且本机 DNS 要指向 mirage。见 README / install.sh「本机流量走代理」选项。
