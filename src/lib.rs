@@ -550,7 +550,10 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 // 纯 eBPF 抓裸-IP 转发流量 (与 sk_lookup fake-IP 拦截互补): 配了网卡才挂 tc_divert。
                 if let Some(iface) = interface {
                     if enable_ebpf {
-                        match crate::ebpf::TcDivertEngine::init(port) {
+                        // MSS clamp 的 mtu: 取该网卡 MTU (PPPoE 会是 1492), 读不到则 1500。
+                        let mtu: u32 = std::fs::read_to_string(format!("/sys/class/net/{}/mtu", iface))
+                            .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1500);
+                        match crate::ebpf::TcDivertEngine::init(port, mtu) {
                             Ok(engine) => {
                                 let engine = std::sync::Arc::new(engine);
                                 let cidrs = watcher.state.load().direct_v4_cidrs();

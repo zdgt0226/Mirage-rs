@@ -22,6 +22,7 @@ mod sys {
     #[derive(Clone, Copy, Default)]
     struct DivertCfg {
         listen_port: u32,
+        mtu: u32, // MSS clamp: max_mss=mtu-40; 0 关闭
     }
     unsafe impl aya::Pod for DivertCfg {}
 
@@ -32,16 +33,16 @@ mod sys {
     }
 
     impl TcDivertEngine {
-        pub fn init(listen_port: u16) -> Result<Self> {
+        pub fn init(listen_port: u16, mtu: u32) -> Result<Self> {
             static TC_DIVERT_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_TC_DIVERT_ELF"));
             let mut bpf = Ebpf::load(TC_DIVERT_ELF).context("Failed to load tc_divert.elf")?;
             {
                 let mut cfg = Array::<_, DivertCfg>::try_from(
                     bpf.map_mut("tc_divert_cfg").context("tc_divert_cfg map missing")?,
                 )?;
-                cfg.set(0, DivertCfg { listen_port: listen_port as u32 }, 0)?;
+                cfg.set(0, DivertCfg { listen_port: listen_port as u32, mtu }, 0)?;
             }
-            info!("eBPF tc_divert engine initialized (listen_port={}).", listen_port);
+            info!("eBPF tc_divert engine initialized (listen_port={}, mss_clamp mtu={}).", listen_port, mtu);
             Ok(Self {
                 bpf: Mutex::new(bpf),
                 loaded: Mutex::new(HashSet::new()),
@@ -104,7 +105,7 @@ mod sys {
     pub struct TcDivertEngine {}
 
     impl TcDivertEngine {
-        pub fn init(_listen_port: u16) -> Result<Self> {
+        pub fn init(_listen_port: u16, _mtu: u32) -> Result<Self> {
             Err(anyhow::anyhow!("eBPF disabled"))
         }
         pub fn attach(&self, _iface: &str) -> Result<()> {

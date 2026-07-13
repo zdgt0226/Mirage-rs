@@ -21,6 +21,7 @@ use nix::sys::socket::{
 #[derive(Clone, Copy, Default)]
 struct DivertCfg {
     listen_port: u32,
+    mtu: u32,
 }
 unsafe impl aya::Pod for DivertCfg {}
 
@@ -47,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     let mut bpf = Ebpf::load(ELF)?;
     {
         let mut cfg = Array::<_, DivertCfg>::try_from(bpf.map_mut("tc_divert_cfg").unwrap())?;
-        cfg.set(0, DivertCfg { listen_port: LPORT as u32 }, 0)?;
+        cfg.set(0, DivertCfg { listen_port: LPORT as u32, mtu: 1400 }, 0)?;
     }
     let _ = tc::qdisc_add_clsact(IFACE);
     let prog: &mut SchedClassifier = bpf.program_mut("tc_divert").unwrap().try_into()?;

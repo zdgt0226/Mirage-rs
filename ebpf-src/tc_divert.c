@@ -11,6 +11,7 @@
 // 地由 IP_TRANSPARENT/IP_RECVORIGDSTADDR 保留, 无需改包、无需 conntrack。
 
 #include <linux/bpf.h>
+#include <stddef.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/in.h>
@@ -24,7 +25,54 @@
 
 struct divert_cfg {
     __u32 listen_port; // 透明监听端口 (host order)
+    __u32 mtu;         // MSS clamp: max_mss = mtu-40; 0 或 <68 表示关闭
 };
+
+// TCP SYN MSS clamp: 转发的 SYN/SYN-ACK 若 MSS 选项超 (mtu-40) 则钳制, 防小 MTU
+// 路径 (PPPoE/隧道) 大段无法分片致大传输卡死。借鉴 landscape xdp_mss。
+static __always_inline void clamp_tcp_mss(struct __sk_buff *skb, struct tcphdr *th,
+                                          __u16 max_mss, void *data_end) {
+    __u8 doff = th->doff * 4;
+    if (doff <= 20)
+        return;
+    __u32 opt_base = ETH_HLEN + sizeof(struct iphdr) + 20; // 54 (ihl==5)
+    __u32 csum_off = ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, check);
+    __u8 *opt = (__u8 *)th + 20;
+    __u8 opts_len = doff - 20;
+    __u8 pos = 0;
+
+#pragma unroll
+    for (int i = 0; i < 10; i++) {
+        if (pos + 2 > opts_len)
+            break;
+        if ((void *)(opt + 2) > data_end)
+            break;
+        __u8 kind = opt[0];
+        if (kind == 0)
+            break;
+        if (kind == 1) {
+            opt++;
+            pos++;
+            continue;
+        }
+        __u8 olen = opt[1];
+        if (olen < 2)
+            break;
+        if (kind == 2 && olen == 4) {
+            if ((void *)(opt + 4) > data_end)
+                break;
+            __be16 old_mss = *(__be16 *)(opt + 2);
+            if (bpf_ntohs(old_mss) > max_mss) {
+                __be16 new_mss = bpf_htons(max_mss);
+                bpf_l4_csum_replace(skb, csum_off, old_mss, new_mss, 2);
+                bpf_skb_store_bytes(skb, opt_base + pos + 2, &new_mss, sizeof(new_mss), 0);
+            }
+            break;
+        }
+        pos += olen;
+        opt += olen;
+    }
+}
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -78,6 +126,29 @@ int tc_divert(struct __sk_buff *skb) {
         return TC_ACT_OK;
     if (ip->ihl != 5) // 有 IP options 的少见, 简化跳过
         return TC_ACT_OK;
+    // cfg 上移 (MSS clamp 需 mtu; listen_port 后面 assign 用)。
+    __u32 zero = 0;
+    struct divert_cfg *cfg = bpf_map_lookup_elem(&tc_divert_cfg, &zero);
+    if (!cfg)
+        return TC_ACT_OK;
+
+    // 转发 TCP SYN 钳 MSS: 放在分流判定前, 覆盖直连 (TC_ACT_OK) 路径 —— 直连转发的
+    // 大段才是 PMTU 黑洞高发区。改包后指针失效, 重新取。
+    if (cfg->mtu >= 68 && ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *th = (void *)(ip + 1);
+        if ((void *)(th + 1) <= data_end && th->syn) {
+            clamp_tcp_mss(skb, th, (__u16)(cfg->mtu - 40), data_end);
+            data = (void *)(long)skb->data;
+            data_end = (void *)(long)skb->data_end;
+            eth = data;
+            if ((void *)(eth + 1) > data_end)
+                return TC_ACT_OK;
+            ip = (void *)(eth + 1);
+            if ((void *)(ip + 1) > data_end)
+                return TC_ACT_OK;
+        }
+    }
+
     if (is_direct_dst(ip->daddr))
         return TC_ACT_OK;
     // 命中 geoip 直连段 → 不劫持
@@ -85,10 +156,6 @@ int tc_divert(struct __sk_buff *skb) {
     if (bpf_map_lookup_elem(&direct_cidr, &k))
         return TC_ACT_OK;
 
-    __u32 zero = 0;
-    struct divert_cfg *cfg = bpf_map_lookup_elem(&tc_divert_cfg, &zero);
-    if (!cfg)
-        return TC_ACT_OK;
     __be16 lport = bpf_htons((__u16)cfg->listen_port);
 
     struct bpf_sock *sk = 0;
