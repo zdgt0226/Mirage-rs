@@ -52,16 +52,24 @@ pub async fn start_transparent(
     let listener = build_transparent_listener(listen_addr)?;
     info!("Transparent proxy listener bound to {} (IP_TRANSPARENT)", listen_addr);
 
-    // 1. 注册 listener socket 到 eBPF map 中，告知内核将流量抛给哪个 Socket
+    // 1./2. sk_lookup 旧路径 (sockmap + attach netns): 非致命。tc_divert 已用内核
+    // bpf_sk_lookup_tcp 直接在 socket 表找本 listener 并 sk_assign, 不依赖 sockmap。
+    // 而 register_listener 把 TCP_LISTEN socket 塞进 SOCKMAP 在多数内核返回 EINVAL ——
+    // 若此处 `?` 硬失败会连累整个 start_transparent 返回 Err、把 listener socket 也
+    // drop 掉, 导致 tc_divert 无 socket 可 assign、fake-IP TCP 全部放行转发被墙。
+    // 故降级为 warn: sk_lookup 能装则装 (覆盖本机 local 流量), 装不上也不影响
+    // tc_divert 对转发流量的接管。
     {
         let engine = transparent_engine.lock().await;
-        engine.register_listener(&listener)?;
+        if let Err(e) = engine.register_listener(&listener) {
+            warn!("sk_lookup register_listener 失败 (不影响 tc_divert 转发拦截): {}", e);
+        }
     }
-
-    // 2. 将 sk_lookup 程序 attach 到当前 Network Namespace，并下发 fake_ip 规则
     {
         let mut engine = transparent_engine.lock().await;
-        engine.attach_to_netns(fake_ip_net, fake_ip_prefix)?;
+        if let Err(e) = engine.attach_to_netns(fake_ip_net, fake_ip_prefix) {
+            warn!("sk_lookup attach_to_netns 失败 (不影响 tc_divert 转发拦截): {}", e);
+        }
     }
 
     // 2.5 装 fake-IP 本地路由: sk_lookup 只在本地投递路径触发, 不加这条路由

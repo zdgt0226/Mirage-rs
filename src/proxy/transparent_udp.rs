@@ -314,14 +314,13 @@ pub async fn start_transparent_udp(
     transparent_engine: Arc<Mutex<TransparentEngine>>,
 ) -> anyhow::Result<()> {
     let main = Arc::new(build_main_socket(listen_addr)?);
-    transparent_engine
-        .lock()
-        .await
-        .register_udp_listener(&main)?;
-    info!(
-        "Transparent UDP proxy on {} (sk_lookup UDP map registered)",
-        listen_addr
-    );
+    // sk_lookup UDP sockmap 注册非致命: tc_divert 用内核 bpf_sk_lookup_udp 直接找本
+    // socket 并 sk_assign, 不依赖 sockmap。把 UDP socket 塞 SOCKMAP 在多数内核 EINVAL,
+    // 若 `?` 硬失败会 drop main socket → tc_divert 无 socket 可 assign、UDP 全断。
+    if let Err(e) = transparent_engine.lock().await.register_udp_listener(&main) {
+        warn!("sk_lookup register_udp_listener 失败 (不影响 tc_divert 转发拦截): {}", e);
+    }
+    info!("Transparent UDP proxy on {}", listen_addr);
 
     // (client, orig_dst) → 会话槽; orig_dst → 回包 socket (引用计数)
     let sessions: Sessions = Arc::new(StdMutex::new(HashMap::new()));
