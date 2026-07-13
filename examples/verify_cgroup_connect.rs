@@ -45,7 +45,7 @@ fn build_listener() -> anyhow::Result<TcpListener> {
     setsockopt(&fd, sockopt::ReuseAddr, &true)?;
     setsockopt(&fd, sockopt::ReceiveTimeout, &nix::sys::time::TimeVal::new(5, 0))?;
     bind(fd.as_raw_fd(), &SockaddrIn::from(std::net::SocketAddrV4::new(Ipv4Addr::LOCALHOST, LPORT)))?;
-    listen(&fd, Backlog::new(128)?)?;
+    listen(&fd, Backlog::MAXCONN)?;
     Ok(unsafe { TcpListener::from_raw_fd(fd.into_raw_fd()) })
 }
 

@@ -37,7 +37,7 @@ fn build_transparent_listener(bind_addr: SocketAddrV4) -> anyhow::Result<TcpList
     // accept 超时: 5s 没连接就放弃 (SO_RCVTIMEO 对 listen socket 的 accept 生效)
     setsockopt(&fd, sockopt::ReceiveTimeout, &nix::sys::time::TimeVal::new(5, 0))?;
     bind(fd.as_raw_fd(), &SockaddrIn::from(bind_addr))?;
-    listen(&fd, Backlog::new(128)?)?;
+    listen(&fd, Backlog::MAXCONN)?;
     Ok(unsafe { TcpListener::from_raw_fd(fd.into_raw_fd()) })
 }
 

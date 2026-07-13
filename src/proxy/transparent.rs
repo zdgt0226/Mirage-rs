@@ -49,7 +49,9 @@ fn build_transparent_listener_inner(listen_addr: &str) -> anyhow::Result<TcpList
         warn!("透明 listener IP_TRANSPARENT 设置失败 ({}); fake-IP 仍可用, raw-IP 分流受限", e);
     }
     bind(fd.as_raw_fd(), &SockaddrIn::from(addr)).with_context(|| format!("bind {}", addr))?;
-    listen(&fd, Backlog::new(1024)?).context("listen")?;
+    // Backlog::MAXCONN (=SOMAXCONN) 恒合法; 早前 Backlog::new(1024) 在 SOMAXCONN=128
+    // 的内核上直接 EINVAL (nix 校验 val < SOMAXCONN), 是真机 listener 起不来的真凶。
+    listen(&fd, Backlog::MAXCONN).context("listen")?;
     let std_listener = unsafe { std::net::TcpListener::from_raw_fd(fd.into_raw_fd()) };
     std_listener.set_nonblocking(true)?;
     Ok(TcpListener::from_std(std_listener)?)
