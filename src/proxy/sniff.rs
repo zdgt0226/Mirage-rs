@@ -38,11 +38,13 @@ pub async fn sniff_first_kb(stream: &TcpStream) -> Option<String> {
 fn parse_tls_sni(data: &[u8]) -> Option<String> {
     // 这个解析非常基础，跳过了 Record Header (5) + Handshake Header (4) + ClientHello 版本等
     // 为了防止数组越界，我们用非常保守的截断。
-    if data.len() < 43 { return None; }
-    
+    // 需读到 data[43] (session_id_len), 故长度必须 ≥ 44 —— 用 < 43 会放行 len==43
+    // 使 data[43] 越界 panic (客户端可发恰好 43B 的 TLS 首段触发)。
+    if data.len() < 44 { return None; }
+
     // 检查 Handshake Type = 1 (ClientHello)
     if data[5] != 0x01 { return None; }
-    
+
     let session_id_len = data[43] as usize;
     let mut offset = 44 + session_id_len;
     
@@ -108,4 +110,56 @@ fn parse_http_host(data: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tls_sni;
+
+    #[test]
+    fn tls_sni_exactly_43_bytes_no_panic() {
+        // 回归 F4: len==43 曾使 data[43] 越界 panic。现应安全返回 None。
+        let data = vec![0x16u8; 43];
+        assert_eq!(parse_tls_sni(&data), None);
+    }
+
+    #[test]
+    fn tls_sni_short_inputs_no_panic() {
+        // 各种截断长度都不得 panic (只返回 None)。
+        for n in 0..64 {
+            let data = vec![0x16u8; n];
+            let _ = parse_tls_sni(&data);
+        }
+    }
+
+    #[test]
+    fn tls_sni_parses_real_hello() {
+        // 最小合法 ClientHello 骨架, SNI="ab.com"。
+        // record(5) + hs_type(1)+hs_len(3) + ver(2)+random(32)+sid_len(1)=44 起
+        let mut d = vec![0x16, 0x03, 0x01, 0x00, 0x00]; // record header (len 占位不校验)
+        d.push(0x01); // handshake type = ClientHello (data[5])
+        d.extend_from_slice(&[0x00, 0x00, 0x00]); // hs len
+        d.extend_from_slice(&[0x03, 0x03]); // version
+        d.extend_from_slice(&[0u8; 32]); // random
+        d.push(0); // session_id_len = 0 (data[43])
+        d.extend_from_slice(&[0x00, 0x02]); // cipher_suites_len = 2
+        d.extend_from_slice(&[0x13, 0x01]); // one cipher
+        d.push(1); // compression_methods_len = 1
+        d.push(0); // null compression
+        // extensions
+        let sni = b"ab.com";
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&[0x00, 0x00]); // ext type = SNI
+        let entry_len = 3 + sni.len(); // name_type(1)+name_len(2)+name
+        let list_len = entry_len;
+        exts.extend_from_slice(&((2 + list_len) as u16).to_be_bytes()); // ext_len = list_len_field(2)+list
+        exts.extend_from_slice(&(list_len as u16).to_be_bytes()); // server_name_list len
+        exts.push(0x00); // name_type = host_name
+        exts.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        exts.extend_from_slice(sni);
+        d.extend_from_slice(&(exts.len() as u16).to_be_bytes()); // ext_total_len
+        d.extend_from_slice(&exts);
+
+        assert_eq!(parse_tls_sni(&d).as_deref(), Some("ab.com"));
+    }
 }

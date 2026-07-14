@@ -22,6 +22,11 @@ fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
     let mut n: u64 = 0;
     let mut shift = 0;
     while *pos < data.len() {
+        // shift ≥ 64 时 `<< shift` 是溢出 (debug panic / release 掩码得垃圾值)。
+        // 合法 protobuf varint 最多 10 字节 (64/7), 超过即畸形, 返 Err 拒绝。
+        if shift >= 64 {
+            return Err(anyhow!("Varint too long (overflow)"));
+        }
         let b = data[*pos];
         *pos += 1;
         n |= ((b & 0x7f) as u64) << shift;
@@ -35,7 +40,10 @@ fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64> {
 
 fn read_len_delim<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let length = read_varint(data, pos)? as usize;
-    if *pos + length > data.len() {
+    // `*pos + length` 直接相加会在 length 接近 usize::MAX 时回绕, 使检查失效 →
+    // 后面 &data[*pos..*pos+length] start>end 而 panic。用减法比较避免溢出
+    // (*pos ≤ data.len() 由 read_varint 保证)。
+    if length > data.len().saturating_sub(*pos) {
         return Err(anyhow!("Truncated length delimited data"));
     }
     let res = &data[*pos..*pos + length];
@@ -281,6 +289,47 @@ pub fn load_singbox_json(path: &Path) -> Result<(Vec<GeoDomain>, Vec<IpNet>)> {
             }
         }
     }
-    
+
     Ok((domains, cidrs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_len_delim, read_varint};
+
+    #[test]
+    fn varint_roundtrip() {
+        let data = [0xAC, 0x02]; // 300
+        let mut pos = 0;
+        assert_eq!(read_varint(&data, &mut pos).unwrap(), 300);
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn varint_overlong_rejected_no_panic() {
+        // 回归 F7: 11+ 字节全 0x80 的 varint 曾使 shift≥64 溢出 panic。现应返 Err。
+        let data = [0x80u8; 16];
+        let mut pos = 0;
+        assert!(read_varint(&data, &mut pos).is_err());
+    }
+
+    #[test]
+    fn len_delim_huge_length_no_overflow_panic() {
+        // 回归 F7: length 近 usize::MAX 时 `*pos+length` 回绕曾使检查失效 →
+        // &data[..] start>end panic。构造一个声明超大长度的 varint。
+        // varint 0xFF*9,0x01 ≈ 巨大值; 后跟少量数据。应返 Err, 不 panic。
+        let mut data = vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        data.extend_from_slice(b"short");
+        let mut pos = 0;
+        assert!(read_len_delim(&data, &mut pos).is_err());
+    }
+
+    #[test]
+    fn len_delim_valid() {
+        let mut data = vec![0x03]; // length = 3
+        data.extend_from_slice(b"abc");
+        let mut pos = 0;
+        assert_eq!(read_len_delim(&data, &mut pos).unwrap(), b"abc");
+        assert_eq!(pos, 4);
+    }
 }

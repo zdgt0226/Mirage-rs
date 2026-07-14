@@ -636,43 +636,32 @@ impl WarmPool {
 
     pub async fn update_brutal_rate(&self, new_rate: u64) {
         self.brutal_state.current_rate.store(new_rate, std::sync::atomic::Ordering::Relaxed);
-        let mut fds: Vec<i32> = {
+
+        // ⚠️ 修 F2 (fd 复用竞态): 旧实现先把裸 fd 收集进 Vec、出锁后再 spawn_blocking
+        // setsockopt。快照与 syscall 之间, idle tunnel 可能被 get() 弹出并 Drop(关 fd)、
+        // 或 active tunnel 的 ActiveFdGuard Drop 移除 → fd 号被内核回收给**另一条**连接,
+        // setsockopt 把 brutal CC 误套到无关 socket 上。
+        //
+        // 修法: 持锁期间直接 setsockopt。①持 queue 锁时 idle tunnel 无法被 get() 弹出关闭;
+        // ②持 active_fds 锁时 ActiveFdGuard::drop (同锁 remove) 被阻塞 → handler 卡在
+        // drop(_guard) 无法继续 drop tunnel → fd 保持存活。setsockopt 是 µs 级非阻塞
+        // syscall, update_brutal_rate 仅 RTT 反馈循环 >5% 变化时触发 (秒级, 且 brutal
+        // 默认关), 持锁批量执行开销可忽略, 无跨 .await 持锁。
+        let mut total = 0usize;
+        {
             let q = self.queue.lock().await;
-            q.iter().map(|t| t.get_raw_fd()).collect()
-        }; // Queue lock released here
-        
-        if let Ok(actives) = self.brutal_state.active_fds.lock() {
-            fds.extend(actives.iter().copied());
-        }
-        
-        let total_updated = fds.len();
-        if fds.is_empty() {
-            return;
-        }
-        
-        tokio::task::spawn_blocking(move || {
-            for fd in fds {
-                // 常量 23301 (非 23, 23 = TCP_FASTOPEN), struct packed (12B 匹
-                // 配内核 __packed). 详见 src/proxy/brutal.rs apply_brutal 的长
-                // 注释 + 实测上游源码确认.
-                const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
-                #[repr(C, packed)]
-                struct BrutalParams { rate: u64, cwnd_gain: u32 }
-                // 与 brutal.rs 保持一致: 15 = 1.5× BDP (跟 Python POC 实测最优).
-                const CWND_GAIN_X10: u32 = 15;
-                let params = BrutalParams { rate: new_rate, cwnd_gain: CWND_GAIN_X10 };
-                unsafe {
-                    libc::setsockopt(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        TCP_BRUTAL_PARAMS,
-                        &params as *const _ as *const libc::c_void,
-                        std::mem::size_of::<BrutalParams>() as libc::socklen_t
-                    );
-                }
+            for t in q.iter() {
+                crate::proxy::brutal::set_brutal_rate(t.get_raw_fd(), new_rate);
+                total += 1;
             }
-        }).await.ok();
-        tracing::debug!("Updated Brutal rate to {} bps for {} tunnels (idle + active)", new_rate, total_updated);
+        }
+        if let Ok(actives) = self.brutal_state.active_fds.lock() {
+            for &fd in actives.iter() {
+                crate::proxy::brutal::set_brutal_rate(fd, new_rate);
+                total += 1;
+            }
+        }
+        tracing::debug!("Updated Brutal rate to {} bps for {} tunnels (idle + active)", new_rate, total);
     }
 
     pub fn active_fd_guard(&self, fd: i32) -> ActiveFdGuard {

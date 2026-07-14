@@ -60,23 +60,31 @@ const TOKEN_TS_TOLERANCE_SECS: u64 = 10;
 const REPLAY_BUCKET_SECS: u64 = 10;
 
 pub struct TokenReplayCache {
-    seen: Mutex<HashMap<u64, HashSet<Vec<u8>>>>,
+    /// (high-water-mark bucket, 各桶已见 token 集)。淘汰参考用**单调递增的 hwm**
+    /// 而非当前 token 桶 —— 否则重放一个旧 token 会把参考拉回、"复活"已淘汰的桶,
+    /// 使其 own 桶被当空桶重建 → 重放漏检 (F1)。hwm 只增不减, 保证淘汰单向前进。
+    seen: Mutex<(u64, HashMap<u64, HashSet<Vec<u8>>>)>,
 }
 
 impl TokenReplayCache {
     pub fn new() -> Self {
         Self {
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::new((0, HashMap::new())),
         }
     }
 
     pub fn check_and_insert(&self, ts: u64, token: &[u8]) -> bool {
         let current_bucket = ts / REPLAY_BUCKET_SECS;
-        let mut cache = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let (hwm, cache) = &mut *guard;
 
-        // 保留容忍窗口内的桶 (前后各 1 个 = 3 桶 × 10s = 30s 总窗口).
-        // 配合 v0.4 协议内嵌时间同步, 内存占用比旧 5×60s=300s 大幅下降.
-        cache.retain(|&k, _| (k as i64 - current_bucket as i64).abs() <= 1);
+        // hwm = 已见的最高桶 (单调)。ts 容忍窗口 ±10s + 桶量化 → 一个仍有效的 token
+        // 桶最低可到 hwm-2 (未来向 token 可把 hwm 推到 now_bucket+1)。保留 hwm-2..hwm
+        // 共 3 桶 (30s), 覆盖整个容忍窗口。参考用 hwm 而非 current_bucket, 旧 token 重放
+        // 不会把参考拉回复活已淘汰桶。
+        *hwm = (*hwm).max(current_bucket);
+        let hwm_val = *hwm;
+        cache.retain(|&k, _| hwm_val.saturating_sub(k) <= 2);
 
         let bucket = cache.entry(current_bucket).or_default();
         if bucket.len() > 100_000 {
@@ -129,6 +137,47 @@ pub fn verify_session_token(password: &str, token: &[u8; 32]) -> bool {
     if !cache.check_and_insert(ts, token) {
         return false; // Replay detected
     }
-    
+
     true
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::TokenReplayCache;
+
+    #[test]
+    fn first_seen_ok_replay_denied() {
+        let c = TokenReplayCache::new();
+        assert!(c.check_and_insert(1000, b"tok-a"), "首见应放行");
+        assert!(!c.check_and_insert(1000, b"tok-a"), "重放同 token 应拒绝");
+        // 不同 token 同桶各自独立
+        assert!(c.check_and_insert(1000, b"tok-b"));
+    }
+
+    #[test]
+    fn replay_survives_advancing_buckets_f1() {
+        // 回归 F1: token1(桶100) 存入后, 一个更高桶的 token 推进 hwm, 旧 token 重放
+        // 仍须被检出 (旧实现会因桶被淘汰而漏检)。
+        let c = TokenReplayCache::new();
+        assert!(c.check_and_insert(1009, b"old"), "token1 首见");
+        // ts=1020 → 桶 102, 把 hwm 推到 102 (旧代码此刻淘汰桶 100)
+        assert!(c.check_and_insert(1020, b"mid"));
+        // token1 重放: 现在必须仍被检出为重放
+        assert!(
+            !c.check_and_insert(1009, b"old"),
+            "F1: 桶推进后旧 token 重放必须仍被检出"
+        );
+    }
+
+    #[test]
+    fn far_past_bucket_evicted() {
+        // 超出 3 桶窗口的旧桶应被淘汰 (内存有界)。这类 token 早已被 ts 容忍窗口拒绝,
+        // 淘汰后即便"重放"也无所谓 (ts 校验在 check_and_insert 之前已挡下)。
+        let c = TokenReplayCache::new();
+        assert!(c.check_and_insert(1000, b"ancient")); // 桶 100
+        // hwm 推到 130 (桶 130), 桶 100 早已 < hwm-2 被淘汰
+        assert!(c.check_and_insert(1300, b"now"));
+        // 桶 100 已淘汰, 这里返回 true 只是证明桶确实被清 (内存有界); 真实场景 ts 校验已挡
+        assert!(c.check_and_insert(1000, b"ancient"));
+    }
 }

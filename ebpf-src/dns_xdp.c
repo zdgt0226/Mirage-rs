@@ -98,6 +98,11 @@ int mirage_xdp_dns(struct xdp_md *ctx) {
     // Only process standard queries (qdcount == 1, flags query)
     if (dns->qdcount != bpf_htons(1) || (dns->flags & bpf_htons(0x8000))) return XDP_PASS;
 
+    // 只处理【无附加/权威段】的裸查询。带 EDNS0 OPT (arcount≥1, 现代客户端近乎必带)
+    // 或权威段时, 本程序把 answer 追加在问题段之后会覆盖 OPT 记录、且不重排 arcount →
+    // 回畸形响应致客户端 SERVFAIL/重试。这类查询交用户态 DNS server 正确处理。
+    if (dns->ancount != 0 || dns->nscount != 0 || dns->arcount != 0) return XDP_PASS;
+
     int offset = sizeof(*eth) + sizeof(*iph) + sizeof(*udph) + sizeof(*dns);
     
     // Hash the QNAME
