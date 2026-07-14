@@ -155,17 +155,37 @@ fn make_fake_ip_response(query: &[u8], ip: std::net::Ipv4Addr) -> Option<Vec<u8>
 fn make_empty_response(query: &[u8]) -> Option<Vec<u8>> {
     let end = question_end(query);
     if end > query.len() || query.len() < 12 { return None; }
-    
+
     let mut header = query[..12].to_vec();
     header[2] |= 0x80; // QR=1
     header[3] &= 0x0F; // No error
-    
-    header[6] = 0; header[7] = 0;
-    header[8] = 0; header[9] = 0;
-    header[10] = 0; header[11] = 0;
-    
+
+    header[6] = 0; header[7] = 0;   // ANCOUNT=0
+    header[8] = 0; header[9] = 1;   // NSCOUNT=1 (authority 段带 SOA, 供负缓存)
+    header[10] = 0; header[11] = 0; // ARCOUNT=0
+
     let mut result = header;
     result.extend_from_slice(&query[12..end]);
+
+    // RFC 2308 负缓存: NODATA 空答复必须在 authority 段带一条 SOA, 否则 Windows 等
+    // stub resolver 不缓存该 (qname, qtype) → getaddrinfo 每次都重查 AAAA/type65
+    // → 自造查询风暴 + 偶发丢包致 11s 卡顿。合成一条最小 SOA, owner/MNAME/RNAME 均用
+    // 压缩指针 0xC00C 指向问题名 (RFC 1035 §4.1.4 允许 SOA RDATA 压缩)。负缓存 TTL
+    // = min(SOA.TTL, SOA.MINIMUM) = 300s, 与 fake-IP A 记录 TTL 对齐。
+    result.extend_from_slice(&[
+        0xC0, 0x0C,             // Name → ptr 问题名
+        0x00, 0x06,             // Type = SOA
+        0x00, 0x01,             // Class = IN
+        0x00, 0x00, 0x01, 0x2C, // TTL = 300
+        0x00, 0x18,             // RDLENGTH = 24 (MNAME 2 + RNAME 2 + 5×u32 20)
+        0xC0, 0x0C,             // MNAME → ptr 问题名
+        0xC0, 0x0C,             // RNAME → ptr 问题名
+        0x00, 0x00, 0x00, 0x01, // SERIAL  = 1
+        0x00, 0x00, 0x0E, 0x10, // REFRESH = 3600
+        0x00, 0x00, 0x02, 0x58, // RETRY   = 600
+        0x00, 0x01, 0x51, 0x80, // EXPIRE  = 86400
+        0x00, 0x00, 0x01, 0x2C, // MINIMUM = 300 (负缓存 TTL)
+    ]);
     Some(result)
 }
 
@@ -336,5 +356,47 @@ impl DnsForwarder {
         }
         
         Some(resp_buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 构造 "x.com" AAAA 查询: header(12) + name(3"x"..1"com"..0) + QTYPE(28) + QCLASS(1)
+    fn aaaa_query() -> Vec<u8> {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.push(1); q.push(b'x');
+        q.push(3); q.extend_from_slice(b"com");
+        q.push(0);
+        q.extend_from_slice(&[0x00, 0x1C]); // QTYPE = AAAA(28)
+        q.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+        q
+    }
+
+    #[test]
+    fn empty_response_carries_soa_for_negative_caching() {
+        let resp = make_empty_response(&aaaa_query()).unwrap();
+        // header: QR=1, RCODE=0, ANCOUNT=0, NSCOUNT=1, ARCOUNT=0
+        assert_eq!(resp[2] & 0x80, 0x80, "QR bit");
+        assert_eq!(resp[3] & 0x0F, 0, "RCODE=NOERROR (NODATA, 非 NXDOMAIN)");
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "ANCOUNT=0");
+        assert_eq!(u16::from_be_bytes([resp[8], resp[9]]), 1, "NSCOUNT=1 (SOA)");
+        assert_eq!(u16::from_be_bytes([resp[10], resp[11]]), 0, "ARCOUNT=0");
+
+        // authority 段: 紧跟问题之后。定位 SOA RR。
+        let soa = &resp[question_end(&aaaa_query())..];
+        assert_eq!([soa[0], soa[1]], [0xC0, 0x0C], "owner = ptr 问题名");
+        assert_eq!(u16::from_be_bytes([soa[2], soa[3]]), 6, "TYPE=SOA");
+        let ttl = u32::from_be_bytes([soa[6], soa[7], soa[8], soa[9]]);
+        assert_eq!(ttl, 300, "SOA TTL=300");
+        let rdlen = u16::from_be_bytes([soa[10], soa[11]]) as usize;
+        assert_eq!(rdlen, 24, "RDLENGTH=24");
+        // RDATA 末 4 字节 = MINIMUM (负缓存 TTL)
+        let rdata = &soa[12..12 + rdlen];
+        let minimum = u32::from_be_bytes([rdata[20], rdata[21], rdata[22], rdata[23]]);
+        assert_eq!(minimum, 300, "SOA MINIMUM=300 (负缓存 TTL)");
+        // 整包长度精确 = header + question + SOA RR
+        assert_eq!(resp.len(), question_end(&aaaa_query()) + 12 + rdlen, "无多余/截断字节");
     }
 }
