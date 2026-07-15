@@ -335,6 +335,28 @@ impl WarmPool {
             metrics: metrics.clone(),
         };
 
+        // 链路自愈: 启动 netlink 网络变更监听 (幂等, 仅首个 WarmPool 真正启动线程;
+        // 服务端无 WarmPool 自然不启动)。网络路径切换时下面的 flush task 被唤醒清空整池。
+        crate::net_monitor::spawn_monitor();
+        // 订阅网络变更 → 清空池, builder 会用新路径并发重建。旧隧道绑在旧源地址/路由上
+        // 已失效, 直接 clear 让 Drop 关 fd (不 close_notify, 网络已变多半发不出去)。
+        {
+            let flush_q = queue.clone();
+            let mut net_rx = crate::net_monitor::subscribe();
+            tokio::spawn(async move {
+                // changed() 只对订阅后的未来变更就绪, 启动瞬间不会误 flush。
+                while net_rx.changed().await.is_ok() {
+                    let mut q = flush_q.lock().await;
+                    let n = q.len();
+                    q.clear();
+                    drop(q);
+                    if n > 0 {
+                        info!("WarmPool: 检测到网络变更, 清空 {} 条旧隧道, builder 将用新路径重建", n);
+                    }
+                }
+            });
+        }
+
         // 初始 target = floor (跟 decide_new_target 的缩容底线一致), 保证客户端
         // 启动瞬间就能承接常见浏览器并发, 突发不用 wait build. floor 定义见
         // MIN_TARGET_FLOOR (=10). pool_size < floor 时降到 pool_size.

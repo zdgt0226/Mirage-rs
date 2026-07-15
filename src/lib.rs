@@ -7,6 +7,7 @@ pub mod time_sync;
 pub mod config_watcher;
 pub mod ebpf;
 pub mod monitor;
+pub mod net_monitor;
 pub mod api;
 
 use anyhow::Result;
