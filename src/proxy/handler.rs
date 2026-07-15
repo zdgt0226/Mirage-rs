@@ -162,30 +162,45 @@ pub async fn proxy_tcp_target(
     drop(current_state);
     match &*leaf {
         OutboundNode::Mirage { pool, .. } => {
-            let mut tunnel = match pool.get().await {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("Mirage outbound unavailable for {}: {}", target, e);
-                    return;
-                }
-            };
-
             let target_bytes = target.as_bytes();
             let mut target_header = Vec::with_capacity(2 + target_bytes.len());
             target_header.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
             target_header.extend_from_slice(target_bytes);
 
-            if let Err(e) = tunnel.writer.send_data(&target_header).await {
-                error!("Failed to send target address to upstream: {:?}", e);
-                return;
+            // 首次写失败重试: get() 的 stale 探测把死隧道挡在派发前, 但探测→派发→使用之间
+            // 仍有微秒级竞态 (隧道刚好在这窗口被 RST)。此刻还没开始双向 relay、没给客户端回
+            // 任何字节, 重发 target_header + initial_payload 到新隧道是幂等的 —— 首个写
+            // (目标头 / 首包) 失败就换一条隧道重试, 闭合 stale 探测留下的竞态窗口。
+            const MAX_TUNNEL_ATTEMPTS: usize = 2;
+            let mut tunnel = None;
+            for attempt in 0..MAX_TUNNEL_ATTEMPTS {
+                let mut t = match pool.get().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("Mirage outbound unavailable for {}: {}", target, e);
+                        return;
+                    }
+                };
+                if let Err(e) = t.writer.send_data(&target_header).await {
+                    debug!("[TUNNEL] {} 首写目标头失败 (第 {} 次尝试), 换隧道重试: {:?}", target, attempt + 1, e);
+                    continue; // 旧隧道 drop 关闭, 循环取新的
+                }
+                if !initial_payload.is_empty() {
+                    if let Err(e) = t.writer.send_data(&initial_payload).await {
+                        debug!("[TUNNEL] {} 首写首包失败 (第 {} 次尝试), 换隧道重试: {:?}", target, attempt + 1, e);
+                        continue;
+                    }
+                }
+                tunnel = Some(t);
+                break;
             }
-
-            if !initial_payload.is_empty() {
-                if let Err(e) = tunnel.writer.send_data(&initial_payload).await {
-                    error!("Failed to send initial payload: {:?}", e);
+            let tunnel = match tunnel {
+                Some(t) => t,
+                None => {
+                    error!("Mirage outbound: {} 尝试 {} 条隧道首写均失败, 放弃", target, MAX_TUNNEL_ATTEMPTS);
                     return;
                 }
-            }
+            };
 
             let active_fd = tunnel.get_raw_fd();
             let _guard = pool.active_fd_guard(active_fd);

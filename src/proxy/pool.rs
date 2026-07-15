@@ -612,6 +612,20 @@ impl WarmPool {
                         });
                         continue;
                     }
+                    // 死链主动剔除 (stale detection): 隧道在池里空闲期间可能被 RST/FIN
+                    // (GFW 主动断 / 路由跳变 / 服务端 reap), 此时 max_age 还没到但连接已死。
+                    // 派发前非阻塞探测一次, 脏则丢弃取下一条 —— 避免把死隧道交给下游导致
+                    // 首个请求报废。所有 pool.get() caller (handler / dns / udp_relay) 自动受益。
+                    // 注: 只缩窄竞态窗口 (探测→派发→使用之间仍可能死), handler 侧另有首次
+                    // 写失败重试兜底闭环。
+                    if tunnel.is_stale() {
+                        tracing::debug!("WarmPool: discarded stale tunnel (FIN/RST before dispatch)");
+                        tokio::spawn(async move {
+                            let mut t = tunnel;
+                            let _ = t.writer.send_close_notify().await;
+                        });
+                        continue;
+                    }
                     // 拿到可用 tunnel, 看是否经历过显著等待
                     if wait_start.elapsed() > Duration::from_millis(50) {
                         self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
