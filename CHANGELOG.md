@@ -1,5 +1,82 @@
 # Changelog - Mirage-rs
 
+## [v0.4.5] - DNS 抗风暴 + 全量审计 + 日志滚动 (2026-07-15)
+
+**0.4.5 收尾版** (final, 去 `-alpha` 标记版本完成)。汇总 alpha.21 → final 的改动。
+**后续开发从 `v0.5.0` 版本号开始。**
+
+### feat: 抗 DNS 查询风暴 (根治开网页时 ~11s 卡顿)
+
+真机定位: 两次 curl 间隔 <1s 快、>1s 就 11s。根因是 fake-IP 响应 TTL 过短 + 空答复
+无负缓存, 导致客户端 (Windows) 反复重查网关 DNS, 查询量被 grass.io/遥测放大数百倍 →
+网关 DNS 偶发丢包 → Windows 重传累积 ~11s。
+
+- **fake-IP A 记录 TTL 1s → 300s** (alpha.33): fake-IP 映射本就稳定 (一域名固定一 IP,
+  池 131071 淘汰极罕见), 1s 短 TTL 纯属自造风暴。提到 300s 查询频率降数百倍。
+- **AAAA / type65(HTTPS) 空答复带合成 SOA 负缓存** (alpha.34): 原空答复 NSCOUNT=0 无 SOA,
+  按 RFC 2308 客户端不做负缓存 → `getaddrinfo` 每次并发重查 AAAA/type65 (残留风暴源)。
+  现 authority 段带一条最小 SOA (owner/MNAME/RNAME 均压缩指针 0xC00C, TTL/MINIMUM=300),
+  客户端缓存 NODATA 5 分钟。dnspython 校验 wire 合法。
+
+### feat(dns): 国内域名上游解析加重传 + 多上游并行兜底 (alpha.35)
+
+国内/直连域名走真实上游 (`udp_query` → cn_dns)。旧实现**单上游单发不重传**: 上游 (114/223
+公共 DNS 高峰偶发丢包/限速) 丢一个 UDP 包就返 None → 网关不回 → 客户端自身重传累积 ~11s
+(国外走 fake-IP 不碰上游故不暴露)。
+
+- `udp_query` 重写为**多上游并行 + 重传**: 每轮向所有上游各发一份, 等 800ms, 无匹配则重传,
+  最多 3 轮 (总上限 2.4s ≪ 11s)。响应一到就返回 (健康时仍几十毫秒), 只有真丢包才重传/换上游。
+  校验 tx_id + QR + ≥12B 头, 丢串扰/迟到包。
+- `cached_cn_dns: Option<SocketAddr>` → `Vec<SocketAddr>`, 收集**全部** `tag=cn/direct` resolver。
+  尊重配置不掺公共 DNS (免污染内网视图); 一个都没配才默认双公共兜底 (114 + 223)。
+- `install.sh` 透明网关模式新增"备用直连 DNS"询问, 默认生成双 direct 上游。
+
+### feat(log): 文件日志按大小自动滚动 + gzip 压缩归档 (final)
+
+`config.log_file` 此前无限 append 单文件, 长跑网关会撑爆磁盘。
+
+- 单文件超 **10MB** 滚动: 归档号后移 (.1.gz→.2.gz …), 当前日志改名后重开新文件, 后台线程
+  gzip 临时文件为 .1.gz。保留最近 **10** 份压缩归档 (约 10:1 → 磁盘 ~10MB)。
+- 压缩在后台线程, 不阻塞日志写入热路径; best-effort, 任一步失败只 eprintln 不影响记日志。
+- 纯 Rust flate2 (miniz_oxide 后端, 无外部 gzip / C zlib 依赖)。
+
+### fix: 全量代码审计 5 修 (alpha.34)
+
+逐行审计 ~11K 行 Rust + 852 行 eBPF C, 修复:
+
+- **F4** `sniff.rs::parse_tls_sni` `<43` off-by-one → `data[43]` 越界 panic (裸 IP 发恰好
+  43B TLS 首段触发, tokio spawn 内被捕获但远程可刷 panic 日志)。改 `< 44`。
+- **F7** `geo.rs` varint 两处整数溢出: `read_varint` 无 shift 上限 (shift≥64 溢出),
+  `read_len_delim` 的 `*pos+length` 回绕使边界检查失效 → 切片 panic。畸形/损坏 geo.dat 可致
+  `RouterEngine::new` panic。加 shift 上限 + 减法比较。
+- **F8** `dns_xdp.c` 对带 EDNS0 (arcount≥1, 现代客户端近乎必带) 的 A 查询回畸形响应 (answer
+  覆盖 OPT 记录、arcount 未清)。加 `ancount/nscount/arcount==0` 守卫, 这类查询交用户态。
+- **F1** `hello_auth.rs` 重放缓存桶淘汰用"token 自身桶"作参考 → 重放旧 token 复活已淘汰桶
+  漏检。改用单调 hwm (只增不减)。
+- **F2** `pool.rs::update_brutal_rate` 收集裸 fd 后跨 await setsockopt → fd 关闭后复用竞态
+  (brutal CC 误套无关 socket)。改持锁期间直接 setsockopt。
+
+均带回归测试。死代码 (未清, 非 bug): `spawn_fallback_monitor` / `mss_clamp.elf` / `sockmap.c::extract_ip`。
+
+### fix: 真机部署踩坑修复 (alpha.27-31)
+
+- **透明 listener EINVAL 根治** (alpha.31): 真凶是 `nix::Backlog::new(1024)` —— nix 校验
+  val < SOMAXCONN, 该内核 SOMAXCONN=128, 1024 直接 EINVAL (与 IP_TRANSPARENT/sockmap 无关)。
+  改 `Backlog::MAXCONN`。此前三次误判一个 EINVAL 的教训: 逐 syscall 加 context 让日志说话。
+- **透明网关 fake-IP TCP/UDP 真机端到端首次跑通** (alpha.30/31): 满屏 `[TPROXY]` google/bing/github。
+- 本机流量走代理 (cgroup/connect4, alpha.19+, 默认关): connect4 改写 fake-IP 段目的 → 本地
+  listener, sockops 存 srcport→origdst 供反查。
+
+### 协议调整摘要 (v0.4 → v0.4.5)
+
+- **DNS 空答复带合成 SOA** (RFC 2308 负缓存); **fake-IP A 记录 TTL 固定 300s**。
+- 时间同步内嵌协议 (v0.4 起): 服务端 handshake 后经加密 channel 下发 `[0x01][ver][8B unix sec]`
+  帧, 客户端写全局 offset, 0 外部依赖 / 0 探测指纹。
+- ⚠️ 密码派生 info 常量 `pyrealiy-session` 是历史冻结值 (拼写错误), **切勿"修正"** —— 两端
+  必须完全一致, 改了新旧版本密钥不兼容、静默解密失败。
+
+---
+
 ## [v0.4.5-alpha.20] - UDP 透明代理 + Mirage-UDP 隧道腿 (2026-07-07)
 
 真机测试里程碑版。alpha.19 以来 16 个 commit, 补齐 UDP 透明代理整条线。

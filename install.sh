@@ -342,7 +342,7 @@ ETC_DIR="/etc/mirage-rs"
 STATE_DIR="/var/lib/mirage-rs"
 LOG_DIR="/var/log/mirage-rs"
 
-# 安装版本: 空 = 最新 release; 可用环境变量 MIRAGE_TAG=v0.4.5-alpha.10 预设 (跳过交互).
+# 安装版本: 空 = 最新 release; 可用环境变量 MIRAGE_TAG=v0.4.5 预设 (跳过交互).
 MIRAGE_TAG="${MIRAGE_TAG:-}"
 # init 系统: main 启动时 detect_init 填充 (systemd / openrc / none).
 INIT_SYS=""
@@ -360,7 +360,7 @@ select_version() {
     fi
     echo "" >&2
     info "安装版本 (留空 = 最新 release):"
-    echo "    可在 https://github.com/zdgt0226/Mirage-rs/releases 查看; 例: v0.4.5-alpha.10" >&2
+    echo "    可在 https://github.com/zdgt0226/Mirage-rs/releases 查看; 例: v0.4.5" >&2
     MIRAGE_TAG=$(ask "指定版本 tag (留空装最新)" "")
     if [[ -n "$MIRAGE_TAG" ]]; then
         info "将安装指定版本: $MIRAGE_TAG"
@@ -442,7 +442,7 @@ fetch_release_binary() {
 }
 
 # 本机已装二进制的版本 (CARGO_PKG_VERSION). 无/损坏返回非 0.
-# `mirage --version` 输出: "mirage-rs 0.4.5-alpha.19 (v0.4.5-alpha.19-...)"
+# `mirage --version` 输出: "mirage-rs 0.4.5 (v0.4.5-...)"
 local_version() {
     [[ -x "$BIN_PATH" ]] || return 1
     local out ver
@@ -1061,7 +1061,11 @@ config_client() {
         dns_listen=$(ask "DNS 服务监听地址" "0.0.0.0")
         dns_port=$(ask_port "DNS 监听端口 (LAN 设备 DNS 指这里; 标准 53)" "53" udp)
         fakeip_range=$(ask "Fake-IP 网段 (RFC2544 基准段, 一般不改)" "198.18.0.0/15")
-        direct_dns=$(ask "直连(国内)DNS" "223.5.5.5:53")
+        # v0.4.5: 国内域名走真实上游解析, 支持多上游并行 + 重传。配两个上游 (主+备)
+        # 后, DNS 服务会向两者并行发查询、取最快回的, 且丢包自动重传 —— 单上游偶发
+        # 丢一个 UDP 包不再放大成客户端 ~11s 卡顿。备用留空则只用主用 (仍有重传)。
+        direct_dns=$(ask "直连(国内)DNS 主用" "223.5.5.5:53")
+        direct_dns2=$(ask "直连(国内)DNS 备用 (多上游并行兜底, 留空=只用主用)" "114.114.114.114:53")
         remote_dns=$(ask "代理(境外)DNS, 经隧道查" "8.8.8.8")
         inbounds_json='{
             "type": "mixed",
@@ -1083,14 +1087,20 @@ config_client() {
             "listen": "'"$dns_listen"'",
             "port": '"$dns_port"'
         }'
+        # 组装 direct 上游 (主用 + 可选备用), 收集全部 tag=direct 供多上游并行解析
+        local direct_resolvers='            { "tag": "direct", "address": "'"$direct_dns"'" }'
+        if [[ -n "$direct_dns2" ]]; then
+            direct_resolvers="$direct_resolvers,"$'\n'"            { \"tag\": \"direct\", \"address\": \"$direct_dns2\" }"
+        fi
         advanced_dns_line='"advanced_dns": {
         "resolvers": [
-            { "tag": "direct", "address": "'"$direct_dns"'" },
+'"$direct_resolvers"',
             { "tag": "remote", "address": "'"$remote_dns"'", "via": "proxy" }
         ],
         "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'" }
     },'
-        info "透明网关模式: transparent(:$transparent_port, tc_divert@$lan_iface) + dns(:$dns_port) 入站 + fake-IP($fakeip_range)"
+        local dns_upstreams="$direct_dns"; [[ -n "$direct_dns2" ]] && dns_upstreams="$direct_dns + $direct_dns2"
+        info "透明网关模式: transparent(:$transparent_port, tc_divert@$lan_iface) + dns(:$dns_port, 国内上游=$dns_upstreams 并行+重传) 入站 + fake-IP($fakeip_range)"
     else
         inbounds_json='{
             "type": "mixed",

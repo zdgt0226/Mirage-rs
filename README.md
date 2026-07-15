@@ -1,15 +1,17 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.4.4--alpha-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.4.5-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 内核级 eBPF 加速 + 内置 Neon Dashboard。
 
 ## 核心特性
 
 - **无锁化异步架构**: 全异步数据搬运, 千兆网络 + 上万连接场景下内存低占用, CPU 接近理论极限
-- **eBPF sockmap / XDP / sk_lookup**: 内核级零拷贝转发 + DNS 解析 + 透明代理 (Linux ≥ 5.10)
+- **eBPF sk_lookup / tc_divert / XDP**: 内核级透明代理 (拦截 LAN 裸-IP 转发流量) + fake-IP DNS + 直连 splice(2) 零拷贝 (Linux ≥ 5.10)
 - **TCP Brutal 拥塞控制**: 单条 TCP 死磕设定速率, 跨洲专线 / 高丢包链路吊打 BBR (设计哲学见下方专章)
 - **零延迟认证与伪装**: 首包完成身份验证 + TLS 1.3 握手回放, 时序特征 100% 复刻真实站点
+- **抗风暴 DNS (v0.4.5)**: fake-IP 稳定 TTL + 空答复 SOA 负缓存 + 国内上游多路并行/重传, 根治开网页时的 DNS 查询风暴与偶发 ~11s 卡顿
+- **日志自动滚动压缩 (v0.4.5)**: 文件日志超 10MB 自动滚动 + gzip 归档, 长跑网关不再撑爆磁盘
 - **Neon Pulse Dashboard**: 内置网页大屏, Canvas 时序图展示 eBPF 命中率 / 吞吐量 / 连接动态
 
 ---
@@ -141,6 +143,7 @@ sha256sum -c mirage-rs-amd64-musl.sha256
 #### 关键字段说明
 
 - **`log_file`** (alpha.14+): 可选日志文件路径, 同时输出 stdout (journalctl) + 该文件. 不设保持老 stdout-only 行为
+  - **自动滚动压缩 (v0.4.5)**: 单文件超 **10MB** 自动滚动, 旧文件后台 gzip 压缩为 `server.log.1.gz` … `.10.gz` (保留最近 **10** 份, 约 10:1 压缩 → 磁盘 ~10MB 封顶)。压缩在后台线程跑, 不阻塞日志写入; 无需任何配置, 设了 `log_file` 即生效。滚动大小/份数目前硬编码 (`src/monitor.rs::LOG_ROTATE_BYTES / LOG_KEEP_ARCHIVES`)
 - **`inbounds[]`**: 标准结构化 (数组), `type: mixed` 同时支持 SOCKS5 + HTTP
 - **`outbounds[]`**: `type: mirage` 是代理节点 (旧名 `pyreality` 已弃用)
   - `pool_size`: WarmPool 上限 (默认 16). alpha.11+ 有自动 floor=10 保证突发无 wait build
@@ -197,6 +200,52 @@ sha256sum -c mirage-rs-amd64-musl.sha256
 mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>&brutal=<mbps>
 ```
 保存到 `/etc/mirage-rs/node-export.txt` (chmod 600). 客户端 `install.sh` 选"粘贴节点导入", 直接一步填充 host / port / password / SNI. 装了 `qrencode` 还能出 UTF8 二维码方便手机拍照。
+
+---
+
+## 🌐 透明网关 DNS 与 fake-IP (v0.4.5 重点)
+
+透明网关模式 (`install.sh` 部署模式选 2) 会起一个 DNS 服务 (`type: dns` 入站, 默认 `:53`), LAN 设备把 DNS 指向它。它按域名的分流去向分两条路处理:
+
+### 代理域名 → fake-IP (本地即时应答, 不出网)
+
+被代理规则命中的域名, DNS 直接返回一个 **fake-IP** (默认 `198.18.0.0/15` 段的地址), 客户端拿它建连, 网关的 `tc_divert` 按 fake-IP 段拦截并按域名走隧道。fake-IP 映射稳定 (一个域名固定一个 fake-IP)。
+
+**v0.4.5 抗 DNS 风暴的三处协议/行为调整** (根治开网页时几百倍 DNS 放大 + 偶发 ~11s 卡顿):
+
+| 调整 | 之前 | v0.4.5 | 原因 |
+|---|---|---|---|
+| fake-IP A 记录 **TTL** | 1s | **300s** | 1s 让客户端几乎每个请求都重查, grass.io/遥测把查询量放大数百倍 → DNS 偶发丢包 → Windows 重传累积 11s。映射本就稳定, 300s 无损 |
+| AAAA / type65(HTTPS) **空答复** | 纯 NODATA (无 SOA) | 带一条合成 **SOA** (TTL/MINIMUM=300) | 无 SOA 时 (RFC 2308) 客户端**不做负缓存**, `getaddrinfo` 每次并发重查 AAAA/type65 → 残留查询风暴。带 SOA 后客户端缓存 NODATA 5 分钟 |
+| type65 处理 | 逐个走隧道真解析 | 直接空答复 (免隧道) | 现代浏览器对每域名都发 type65, 逐个走隧道会瞬间打空 WarmPool |
+
+> ⚠️ **XDP DNS 加速 (`advanced_dns.xdp_interface`) 默认不开、也不建议开**: 该路径对带 EDNS0 (现代客户端近乎必带) 的查询处理不完整, 开了反而可能让缓存域名解析失败。fake-IP 由用户态 DNS 服务处理已足够快且稳。
+
+### 国内/直连域名 → 真实上游解析 (多上游并行 + 重传, v0.4.5)
+
+被"直连"规则命中的域名 (国内站点等) 走真实上游 DNS (配置里 `tag: direct` / `cn` 的 resolver)。
+
+**v0.4.5 前**: 单上游、单发、**不重传** —— 上游 (114/223 等公共 DNS 高峰期偶发丢包/限速) 丢一个 UDP 包就整体失败, 网关不回包 → 客户端靠自身重传累积 ~11s 才成功 (国外域名走 fake-IP 不碰上游, 故只有国内域名暴露)。
+
+**v0.4.5**: `udp_query` 重写为**多上游并行 + 重传**:
+- 每轮向**所有** `direct`/`cn` 上游各发一份查询, 等 800ms, 无匹配响应则重传, 最多 3 轮 (总上限 2.4s ≪ 客户端 11s)
+- 任一上游先回且 tx_id/QR 匹配即用 —— 上游健康时仍是**几十毫秒返回, 不增加延迟**, 只有真丢包才触发重传/换上游
+- 配置里配**多个** `tag: direct` resolver 即启用多上游; 一个都没配时默认双公共 DNS 兜底 (`114.114.114.114` + `223.5.5.5`)
+
+**配置示例** (`install.sh` 透明网关模式会问"主用/备用直连 DNS" 自动生成):
+
+```json
+"advanced_dns": {
+    "resolvers": [
+        { "tag": "direct", "address": "223.5.5.5:53" },
+        { "tag": "direct", "address": "114.114.114.114:53" },
+        { "tag": "remote", "address": "8.8.8.8", "via": "proxy" }
+    ],
+    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15" }
+}
+```
+
+> 尊重配置: 你配了 `direct` resolver 就**只用你配的那些** (不掺公共 DNS, 避免内网/split-horizon 域名被公共 DNS 解析错); 只有一个 `direct` 都没配时才回落到双公共兜底。`remote` (境外) DNS 走隧道查, 抗污染。
 
 ---
 
@@ -334,21 +383,25 @@ sudo bash install.sh
 
 ## 版本演进
 
-alpha.4 → 现在 (alpha.18) 的重要里程碑:
+alpha.4 → **v0.4.5 (final)** 的重要里程碑:
 
 | 版本 | 关键改动 |
 |---|---|
 | alpha.4-9 | Brutal 排错长征 (cwnd_gain / listener 时序 / autofallback / cwnd_gain 15) |
-| alpha.7 | eBPF SockMap 直连转发临时禁用 (待根治) |
+| alpha.7 | eBPF SockMap 直连转发弃用 → 改 splice(2)+pipe 零拷贝 |
 | alpha.10-11 | WarmPool 反馈算法修正 (cwnd_gain=15 对齐 POC, floor 提到 10) |
-| alpha.12-13 | 初始 target 修正, TIME_SYNC 降噪 |
-| alpha.14 | log_file 生效, geo 完整性校验, geo via proxy fallback |
-| alpha.15 | geo 30s timeout + 空 body 拒收覆盖 |
-| alpha.16 | reload log 显示纠正, ArcSwap guard 提前释放 |
-| alpha.17 | 4 处外部审计纰漏 (含 geo_updater 完整热更新架构 UpdaterHandle) |
-| alpha.18 | tuning=None 边界 + update_days 三层 clamp 防 tight loop |
+| alpha.12-18 | 初始 target 修正 / TIME_SYNC 降噪 / log_file / geo 完整性校验+via proxy fallback / 热更新架构 UpdaterHandle / update_days clamp |
+| alpha.19-26 | **透明网关成型**: tc_divert 纯 eBPF 抓 LAN 裸-IP 分流 (netns 实测) + 透明 UDP + cgroup/connect4 本机流量 + 异常链路修复 (握手缓存毒化/僵尸泄漏/pool 饿死) |
+| alpha.27-31 | 真机部署踩坑修复: 透明 listener `Backlog::MAXCONN` EINVAL 根治, fake-IP TCP/UDP 真机首次跑通 |
+| alpha.32-34 | **抗 DNS 风暴**: fake-IP TTL 1s→300s + 空答复 SOA 负缓存 (根治网页 ~11s 卡顿) + **全量代码审计** (逐行审 ~11K Rust + 852 eBPF C, 修 5 处: 越界 panic / varint 溢出 / XDP-EDNS0 畸形 / 重放窗口 / fd 复用) |
+| **alpha.35** | DNS 上游解析加**重传 + 多上游并行兜底** (根治国内域名偶发 11s) |
+| **v0.4.5 (final)** | 日志按大小滚动 + gzip 压缩归档收尾 |
+
+> **协议调整摘要 (v0.4 → v0.4.5)**: ①时间同步内嵌协议 (服务端 handshake 后经加密 channel 下发 `[0x01][ver][8B unix sec]` 帧, 客户端写全局 offset, 0 外部依赖/0 指纹); ②DNS 空答复带合成 SOA (RFC 2308 负缓存); ③fake-IP 稳定 TTL 300s。密码派生 info 常量 `pyrealiy-session` 为历史冻结值, **切勿修改** (两端必须一致)。
 
 完整清单见 [CHANGELOG.md](CHANGELOG.md)。
+
+**后续开发从 `v0.5.0` 版本号开始。**
 
 ---
 
