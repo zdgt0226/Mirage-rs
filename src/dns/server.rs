@@ -9,8 +9,12 @@ use crate::proxy::pool::WarmPool;
 use crate::proxy::outbound::OutboundNode;
 use crate::router::RoutingRequest;
 
-const UDP_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
+/// DNS 上游查询重传轮数。每轮向所有上游各发一份, 无匹配响应则重传。
+const DNS_QUERY_ROUNDS: u32 = 3;
+/// 每轮等待上限。上游正常时响应几十毫秒即返回, 这只是丢包后重传前的最大等待。
+/// 3 × 800ms = 2.4s 总上限, 远低于 Windows DNS 客户端 ~11s 重传超时。
+const DNS_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(800);
 
 fn extract_domain(data: &[u8]) -> Option<String> {
     if data.len() < 12 {
@@ -189,6 +193,43 @@ fn make_empty_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(result)
 }
 
+/// DNS 上游查询: 多上游并行 + 重传。
+///
+/// 旧实现单上游单发不重传: 上游丢一个 UDP 包(114 等公共 DNS 高峰期偶发/限速)就返回
+/// None → 网关不回包 → 客户端(Windows)靠自身重传累积 ~11s 才成功。这里每轮向**所有**
+/// 上游各发一份, 等 DNS_RETRANSMIT_INTERVAL, 无匹配响应则重传, 最多 DNS_QUERY_ROUNDS 轮。
+/// 任一上游先回且 tx_id 匹配即返回 —— 上游健康时几十毫秒返回(recv 一到就醒, 不等满
+/// interval), 只有真丢包才触发重传/换上游。
+async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    if upstreams.is_empty() || req.len() < 2 {
+        return None;
+    }
+    let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let mut buf = vec![0u8; 1500];
+
+    for _round in 0..DNS_QUERY_ROUNDS {
+        // 本轮向所有上游各发一份 (并行竞速 + 单上游丢包由其他上游兜底)
+        for up in upstreams {
+            let _ = sock.send_to(req, up).await;
+        }
+        // 本轮内循环收包, 丢弃 tx_id 不匹配的串扰/迟到响应, 直到匹配或本轮超时
+        let deadline = tokio::time::Instant::now() + DNS_RETRANSMIT_INTERVAL;
+        loop {
+            match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
+                // 合法 DNS 响应: ≥12B 头 + tx_id 与查询一致 + QR=1
+                Ok(Ok((size, _)))
+                    if size >= 12 && buf[0] == req[0] && buf[1] == req[1] && (buf[2] & 0x80) != 0 =>
+                {
+                    return Some(buf[..size].to_vec());
+                }
+                Ok(Ok(_)) => continue, // 不匹配/畸形, 本轮继续等
+                _ => break,            // 本轮超时或 socket 错 → 下一轮重传
+            }
+        }
+    }
+    None
+}
+
 pub struct DnsForwarder {
     socket: Arc<UdpSocket>,
     state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
@@ -251,14 +292,22 @@ impl DnsForwarder {
         let qtype = get_qtype(req).unwrap_or(0);
         let _req_port = 53; // DNS
         let st = self.state.load();
-        let mut cn_dns: SocketAddr = "114.114.114.114:53".parse().unwrap();
+        // 用户配了 cn/direct resolver 就用其全部 (尊重配置, 不掺公共 DNS 免污染内网视图);
+        // 没配则默认双公共 DNS 兜底 (114 电信/联通 + 223 阿里)。
+        let mut cn_dns: Vec<SocketAddr> = Vec::new();
         let mut remote_dns_host = "8.8.8.8".to_string();
         let mut remote_dns_port = 53;
-        
+
         if let Some(adv) = &st.advanced_dns {
-            if let Some(cached) = &adv.cached_cn_dns { cn_dns = *cached; }
+            if !adv.cached_cn_dns.is_empty() { cn_dns = adv.cached_cn_dns.clone(); }
             if let Some(cached) = &adv.cached_remote_host { remote_dns_host = cached.clone(); }
             if let Some(cached) = &adv.cached_remote_port { remote_dns_port = *cached; }
+        }
+        if cn_dns.is_empty() {
+            cn_dns = vec![
+                "114.114.114.114:53".parse().unwrap(),
+                "223.5.5.5:53".parse().unwrap(),
+            ];
         }
 
         let routing_req = RoutingRequest {
@@ -282,8 +331,8 @@ impl DnsForwarder {
                     Some(make_nxdomain(req))
                 }
                 OutboundNode::Direct { .. } => {
-                    debug!("[DNS] direct  [{}] → 真实解析 via {}", domain, cn_dns);
-                    self.udp_query(req, cn_dns).await
+                    debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
+                    udp_query(req, &cn_dns).await
                 }
                 OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
@@ -311,17 +360,6 @@ impl DnsForwarder {
             }
         } else {
             Some(make_nxdomain(req))
-        }
-    }
-
-    async fn udp_query(&self, req: &[u8], addr: SocketAddr) -> Option<Vec<u8>> {
-        let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-        sock.send_to(req, addr).await.ok()?;
-        
-        let mut buf = vec![0u8; 1500];
-        match timeout(UDP_TIMEOUT, sock.recv_from(&mut buf)).await {
-            Ok(Ok((size, _))) => Some(buf[..size].to_vec()),
-            _ => None,
         }
     }
 
@@ -398,5 +436,73 @@ mod tests {
         assert_eq!(minimum, 300, "SOA MINIMUM=300 (负缓存 TTL)");
         // 整包长度精确 = header + question + SOA RR
         assert_eq!(resp.len(), question_end(&aaaa_query()) + 12 + rdlen, "无多余/截断字节");
+    }
+
+    // 最小 A 查询 (tx_id=0x1234)
+    fn a_query() -> Vec<u8> {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.push(1); q.push(b'x');
+        q.push(3); q.extend_from_slice(b"com");
+        q.push(0);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // A IN
+        q
+    }
+
+    /// 起一个假上游: `respond_from` 之前的包全丢, 之后的回一个合法响应 (QR=1, tx_id 回显)。
+    /// 返回其地址。用于验证重传。
+    async fn fake_upstream(respond_from: usize) -> SocketAddr {
+        let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 1500];
+            let mut count = 0usize;
+            loop {
+                let (n, from) = match up.recv_from(&mut b).await { Ok(v) => v, Err(_) => break };
+                count += 1;
+                if count < respond_from { continue; } // 丢前 N 个
+                let mut resp = b[..n].to_vec();
+                resp[2] |= 0x80; // QR=1
+                let _ = up.send_to(&resp, from).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn udp_query_happy_path() {
+        let up = fake_upstream(1).await; // 第 1 个包就回
+        let resp = udp_query(&a_query(), &[up]).await.expect("应得到响应");
+        assert_eq!(&resp[0..2], &[0x12, 0x34], "tx_id 回显");
+        assert_eq!(resp[2] & 0x80, 0x80, "QR=1");
+    }
+
+    #[tokio::test]
+    async fn udp_query_retransmits_after_loss() {
+        // 上游丢掉第 1 个包, 第 2 个 (重传) 才回 → 单发不重传会失败, 重传应成功。
+        let up = fake_upstream(2).await;
+        let resp = udp_query(&a_query(), &[up]).await;
+        assert!(resp.is_some(), "丢首包后应靠重传拿到响应");
+    }
+
+    #[tokio::test]
+    async fn udp_query_second_upstream_failover() {
+        // 上游 A 永不回 (127.0.0.1:1 通常无监听/被拒), 上游 B 立即回 → 并行发应从 B 拿到。
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let alive = fake_upstream(1).await;
+        let resp = udp_query(&a_query(), &[dead, alive]).await;
+        assert!(resp.is_some(), "首上游死时应由第二上游兜底");
+    }
+
+    #[tokio::test]
+    async fn udp_query_all_dead_returns_none() {
+        // 所有上游都不回 → 3 轮重传后返回 None (不挂死)。
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let resp = udp_query(&a_query(), &[dead]).await;
+        assert!(resp.is_none(), "全上游无响应应返回 None");
+    }
+
+    #[tokio::test]
+    async fn udp_query_empty_upstreams_none() {
+        assert!(udp_query(&a_query(), &[]).await.is_none());
     }
 }

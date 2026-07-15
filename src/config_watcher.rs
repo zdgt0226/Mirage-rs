@@ -157,7 +157,7 @@ impl ConfigWatcher {
         
         let mut advanced_dns = config.advanced_dns;
         if let Some(adv) = &mut advanced_dns {
-            let mut cn_dns = None;
+            let mut cn_dns: Vec<std::net::SocketAddr> = Vec::new();
             let mut remote_host = None;
             let mut remote_port = None;
             for r in &adv.resolvers {
@@ -170,7 +170,10 @@ impl ConfigWatcher {
                         remote_host = Some(r.address.clone());
                     }
                 } else if r.tag == "direct" || r.tag == "cn" {
-                    if let Ok(addr) = r.address.parse() { cn_dns = Some(addr); }
+                    // 收集全部 cn/direct 上游 (支持配多个做多上游兜底), 去重。
+                    if let Ok(addr) = r.address.parse() {
+                        if !cn_dns.contains(&addr) { cn_dns.push(addr); }
+                    }
                 }
             }
             adv.cached_cn_dns = cn_dns;

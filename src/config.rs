@@ -169,8 +169,11 @@ pub struct RuleConfig {
 #[derive(Debug, Deserialize)]
 pub struct AdvancedDnsConfig {
 
+    /// 国内/直连域名的上游 DNS 列表 (tag=cn/direct 的 resolver 全部收集)。
+    /// udp_query 会向全部并行发 + 重传, 任一先回即用 —— 单上游单发丢一个 UDP 包
+    /// 就整体失败, 客户端重传累积 ~11s。空则用默认双公共 DNS 兜底。
     #[serde(skip)]
-    pub cached_cn_dns: Option<std::net::SocketAddr>,
+    pub cached_cn_dns: Vec<std::net::SocketAddr>,
     #[serde(skip)]
     pub cached_remote_host: Option<String>,
     #[serde(skip)]
