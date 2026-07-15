@@ -97,27 +97,36 @@ ask_port() {
 }
 
 # 询问 GUI 监听配置. 调用方:
-#   read gui_enabled gui_listen <<< "$(ask_gui 9090)"
-# 返回单行: "<enabled> <addr>:<port>", 其中 enabled = true|false.
+#   read gui_enabled gui_listen gui_token <<< "$(ask_gui 9090)"
+# 返回单行: "<enabled> <addr>:<port> <token>", enabled=true|false, token="-" 表示无鉴权。
 # 注意不能用全局变量传 enabled, 因为 $(ask_gui) 是子 shell, 出不来.
 # 用户拒绝时 listen 用 "127.0.0.1:9090" 占位 (enabled=false 时 mirage 忽略).
+# 暴露到 0.0.0.0 时自动生成随机 API token —— 否则任何可达者可读日志/配置+改路由规则。
 ask_gui() {
     local default_port=${1:-9090}
     if ! ask_yn "启用 Web GUI 管理面板 (Neon Dashboard)" y; then
-        echo "false 127.0.0.1:9090"
+        echo "false 127.0.0.1:9090 -"
         return
     fi
-    local scope listen_addr
+    local scope listen_addr token="-"
     scope=$(ask_choice "GUI 监听范围" \
         "仅本机 127.0.0.1 (推荐)" \
-        "全网开放 0.0.0.0 (LAN/远程访问, 自行加反代+鉴权)")
+        "全网开放 0.0.0.0 (LAN/远程访问)")
     case "$scope" in
         1) listen_addr="127.0.0.1" ;;
         2) listen_addr="0.0.0.0" ;;
     esac
     local port
     port=$(ask_port "GUI 端口" "$default_port" tcp)
-    echo "true ${listen_addr}:${port}"
+    if [[ "$listen_addr" == "0.0.0.0" ]]; then
+        # url-safe 32 位随机 token; /dev/urandom 不可用时退回时间戳哈希
+        token=$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 32)
+        [[ ${#token} -lt 16 ]] && token=$(date +%s%N | sha256sum | head -c 32)
+        info "GUI 开放到 0.0.0.0 —— 已自动生成 API token: ${token}"
+        info "  浏览器首次访问 http://<本机IP>:${port}/?token=${token} 即种 cookie, 之后免带"
+        info "  CLI: curl -H 'Authorization: Bearer ${token}' http://<本机IP>:${port}/api/overview"
+    fi
+    echo "true ${listen_addr}:${port} ${token}"
 }
 
 url_encode() {
@@ -867,8 +876,10 @@ EOM
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
-    local server_gui_enabled server_gui_listen
-    read server_gui_enabled server_gui_listen <<< "$(ask_gui 9090)"
+    local server_gui_enabled server_gui_listen server_gui_token server_gui_token_line=""
+    read server_gui_enabled server_gui_listen server_gui_token <<< "$(ask_gui 9090)"
+    [[ "$server_gui_token" != "-" && -n "$server_gui_token" ]] && server_gui_token_line=",
+        \"token\": \"${server_gui_token}\""
 
     cat > "${ETC_DIR}/config_server.json" <<EOF
 {
@@ -888,7 +899,7 @@ EOM
     "outbounds": [],
     "gui": {
         "enabled": ${server_gui_enabled},
-        "listen": "${server_gui_listen}"
+        "listen": "${server_gui_listen}"${server_gui_token_line}
     },
     "routing": {
         "default_outbound": "direct",
@@ -1182,8 +1193,10 @@ config_client() {
 
     # mode 3 同机部署时, 服务端可能已占 9090, ask_gui 内的 ask_port 会自动
     # 检测占用并提示改成 9091 等. 单独 client (mode 2) 直接 9090 即可.
-    local client_gui_enabled client_gui_listen
-    read client_gui_enabled client_gui_listen <<< "$(ask_gui 9090)"
+    local client_gui_enabled client_gui_listen client_gui_token client_gui_token_line=""
+    read client_gui_enabled client_gui_listen client_gui_token <<< "$(ask_gui 9090)"
+    [[ "$client_gui_token" != "-" && -n "$client_gui_token" ]] && client_gui_token_line=",
+        \"token\": \"${client_gui_token}\""
 
     cat > "${ETC_DIR}/config_client.json" <<EOF
 {
@@ -1214,7 +1227,7 @@ config_client() {
     ],
     "gui": {
         "enabled": ${client_gui_enabled},
-        "listen": "${client_gui_listen}"
+        "listen": "${client_gui_listen}"${client_gui_token_line}
     },
     ${routing_json},
     ${advanced_dns_line}

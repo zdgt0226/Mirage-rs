@@ -422,6 +422,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     let mut fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>> = None;
     let mut gui_enabled = false;
     let mut gui_listen = "127.0.0.1:9090".to_string();
+    let mut gui_token: Option<String> = None;
 
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
@@ -429,6 +430,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             if let Some(gui) = config.gui {
                 gui_enabled = gui.enabled;
                 gui_listen = gui.listen;
+                gui_token = gui.token;
             }
             if let Some(adv) = config.advanced_dns {
                 if let Some(iface) = &adv.xdp_interface {
@@ -461,8 +463,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         let xdp = xdp_engine.clone();
         let listen = gui_listen.clone();
         let cfg_path = config_path.to_string();
+        let token = gui_token.clone();
         tokio::spawn(async move {
-            crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path).await;
+            crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token).await;
         });
     }
 

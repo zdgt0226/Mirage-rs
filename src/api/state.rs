@@ -25,4 +25,6 @@ pub struct AppState {
     pub xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     pub config_path: String,
     pub history: Arc<std::sync::RwLock<HistoryData>>,
+    /// 可选 API 鉴权 token (gui.token)。None = 不鉴权。auth 中间件按它校验所有请求。
+    pub gui_token: Option<Arc<String>>,
 }

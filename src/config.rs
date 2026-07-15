@@ -6,6 +6,12 @@ pub struct GuiConfig {
     pub enabled: bool,
     #[serde(default = "default_gui_listen")]
     pub listen: String,
+    /// 可选 API 鉴权 token。设了则所有 /api/* 请求必须携带它 (Authorization: Bearer /
+    /// mirage_token cookie / ?token= 三选一)。不设 = 不鉴权 —— localhost 默认部署安全,
+    /// 但把 listen 改成 0.0.0.0 暴露到公网时**强烈建议**设一个随机 token, 否则任何人可读
+    /// 日志/配置、改路由规则。浏览器访问 http://host:9090/?token=XXX 一次即种 cookie。
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 fn default_gui_listen() -> String {

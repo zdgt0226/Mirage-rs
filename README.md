@@ -70,7 +70,7 @@ sha256sum -c mirage-rs-amd64-musl.sha256
    - **活体规则系统**：点击 "+ Add Rule" 可视化添加分流规则（GeoIP、域名后缀等），点击 "Save & Apply" **无感热重载生效**，不会断开正在看视频或下载的 TCP 连接。
    - **沉浸式终端日志**：不用再盯着黑白命令行，实时路由分发动作直接在面板彩色刷新。
 
-> **⚠️ 核心安全警告**：面板目前依靠内部接口进行局部防护，如果您要把它暴露到公网（比如通过 VPS 访问），**请一定在外面套一层 Nginx 并加上密码认证**，否则任何人都能随意修改您的路由规则。
+> **⚠️ 核心安全警告 (v0.5.0-alpha.1+)**：面板默认 `127.0.0.1` 只监听本机是安全的。若要暴露到 LAN/公网（`gui.listen: "0.0.0.0:..."`），**务必设 `gui.token`**——设了之后所有 `/api/*` 请求都要带它（`Authorization: Bearer <token>` / `mirage_token` cookie / `?token=`），否则任何可达者都能读日志/配置、改路由规则。`install.sh` 选「全网开放」时会**自动生成随机 token 并打印**。浏览器首次访问 `http://host:9090/?token=XXX` 即种 HttpOnly cookie，之后免带。不设 token 仍可用（向后兼容），但非本机暴露时会有 WARN 提醒。生产环境仍建议叠加 Nginx TLS。
 
 ---
 
@@ -149,6 +149,7 @@ sha256sum -c mirage-rs-amd64-musl.sha256
   - `pool_size`: WarmPool 上限 (默认 16). alpha.11+ 有自动 floor=10 保证突发无 wait build
   - `brutal_rate_mbps` (可选): 客户端出站 brutal 速率. 默认不开 (0 或不写字段)
 - **`gui.enabled`** + **`gui.listen`**: alpha.4+ 结构化 (老的 `gui_listen` 单字段弃用)
+- **`gui.token`** (v0.5.0-alpha.1+): 可选 API 鉴权 token。设了则所有 `/api/*` 要求携带 (Bearer header / `mirage_token` cookie / `?token=`)。不设=不鉴权 (localhost 默认安全)；`gui.listen` 改 `0.0.0.0` 暴露时**强烈建议**设，install.sh 会自动生成。常量时间校验防时序侧信道
 - **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` 等
 - **`tuning.ebpf_mode`**: `"auto"` / `"force"` / `"off"`. alpha.7 起 install.sh 客户端默认 `"off"` (BPF SockMap 直连转发有已知问题, 见 CHANGELOG alpha.7)
 - **`tuning.geo_sources[]`**: 多源 geo 数据下载 (v0.4.3+ 替代旧的 `geosite_url` / `geoip_url`)
