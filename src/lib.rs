@@ -47,10 +47,11 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
 
     // 打开 log_file (若配置了). 结果放 Option<FileLogger>, 它 Clone 廉价
     // (Arc<Mutex<File>>). subscriber 用 || file_logger.clone() 作 writer.
+    // FileLogger 自带按大小滚动 (10MB) + gzip 压缩归档 (保留 10 份)。
     let file_logger_opt: Option<crate::monitor::FileLogger> = match log_file_path.as_deref() {
         Some(path) if !path.is_empty() => {
-            match std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                Ok(file) => Some(crate::monitor::FileLogger::new(file)),
+            match crate::monitor::FileLogger::new(path) {
+                Ok(fl) => Some(fl),
                 Err(e) => {
                     eprintln!(
                         "[startup] cannot open log_file '{}': {}, falling back to stdout only",
