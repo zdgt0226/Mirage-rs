@@ -248,6 +248,17 @@ mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>&brutal=<mbps>
 
 > 尊重配置: 你配了 `direct` resolver 就**只用你配的那些** (不掺公共 DNS, 避免内网/split-horizon 域名被公共 DNS 解析错); 只有一个 `direct` 都没配时才回落到双公共兜底。`remote` (境外) DNS 走隧道查, 抗污染。
 
+### DNS 响应缓存 (v0.5.0-alpha.3+, honoring TTL)
+
+`advanced_dns.cache: { "enabled": true, "max_entries": 10000 }`（install.sh 网关模式默认开启）：按上游返回的**最小 TTL** 缓存直连 + 隧道-DNS 的响应，过期再查。
+
+- **直连域名**不再每查都打 114/223 上游；
+- **最实在的收益**：非 fake-IP 模式 / 罕见 qtype (MX/TXT/SRV) 的**隧道-DNS 不再每次消耗一条 WarmPool 隧道**——缓存命中直接免隧道。
+- 只缓存有答案的正响应（NODATA/NXDOMAIN 不缓存，客户端 SOA 负缓存已兜 AAAA）；命中时 patch tx_id + question 段兼容 0x20；TTL clamp `[1, 3600]`s。
+- fake-IP 路径本地即时应答，无需缓存。
+
+> **为什么不用 DoH/DoT**：墙内 DoT(853) 端口即封、DoH(443) 靠 SNI 阻断 + 封公共解析器 IP + 投毒，对公共解析器长期不可靠。Mirage 的抗审查 DNS 靠的是**远端解析**（被墙域名走 fake-IP，真解析推到墙外服务端）+ 本缓存 + TTL，而非加密到公共解析器。
+
 ---
 
 ## ⚡ 高级玩家指南：拥抱 Linux 极客内核

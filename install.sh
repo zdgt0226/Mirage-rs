@@ -1108,7 +1108,8 @@ config_client() {
 '"$direct_resolvers"',
             { "tag": "remote", "address": "'"$remote_dns"'", "via": "proxy" }
         ],
-        "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'" }
+        "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'" },
+        "cache": { "enabled": true, "max_entries": 10000 }
     },'
         local dns_upstreams="$direct_dns"; [[ -n "$direct_dns2" ]] && dns_upstreams="$direct_dns + $direct_dns2"
         info "透明网关模式: transparent(:$transparent_port, tc_divert@$lan_iface) + dns(:$dns_port, 国内上游=$dns_upstreams 并行+重传) 入站 + fake-IP($fakeip_range)"

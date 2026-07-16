@@ -230,11 +230,124 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
     None
 }
 
+// ── DNS 响应缓存 (honoring TTL) ──────────────────────────────────────────────
+// 接上 advanced_dns.cache (原为 stub 未实现)。缓存直连(udp_query)+ 隧道(tcp_over_tunnel)
+// 的上游响应, 按 answer 段最小 TTL 过期。价值: 直连域名不再每查打 114/223; **非 fake-IP /
+// 罕见 qtype 的隧道-DNS 不再每次消耗一条 WarmPool 隧道**。fake-IP 路径本地无需缓存。
+
+struct CacheEntry {
+    response: Vec<u8>,
+    expiry: std::time::Instant,
+}
+
+/// TTL-aware DNS 响应缓存。key=(小写域名, qtype), 只缓存有 answer 的正响应。
+struct DnsCache {
+    map: std::sync::Mutex<std::collections::HashMap<(String, u16), CacheEntry>>,
+    max_entries: usize,
+}
+
+impl DnsCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// 命中且未过期 → 返回按当前 query patch 好的响应 (tx_id + question 段, 兼容 0x20 大小写
+    /// 随机 + id; 保留响应头/flags/答案不变)。
+    fn get(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (domain.to_string(), qtype);
+        let e = m.get(&key)?;
+        if e.expiry <= std::time::Instant::now() {
+            m.remove(&key);
+            return None;
+        }
+        let mut resp = e.response.clone();
+        let q_end = question_end(query);
+        if q_end >= 12 && resp.len() >= q_end && query.len() >= q_end {
+            resp[0] = query[0];
+            resp[1] = query[1];
+            resp[12..q_end].copy_from_slice(&query[12..q_end]);
+        }
+        Some(resp)
+    }
+
+    /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
+    fn put(&self, domain: &str, qtype: u16, response: &[u8]) {
+        let ttl = match min_answer_ttl(response) {
+            Some(t) => t.clamp(1, 3600),
+            None => return,
+        };
+        let key = (domain.to_string(), qtype);
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if m.len() >= self.max_entries && !m.contains_key(&key) {
+            let now = std::time::Instant::now();
+            m.retain(|_, e| e.expiry > now); // 先清过期
+            if m.len() >= self.max_entries {
+                if let Some(k) = m.keys().next().cloned() {
+                    m.remove(&k); // 仍满则弹一个 (非严格 LRU, 缓存策略不影响正确性)
+                }
+            }
+        }
+        m.insert(
+            key,
+            CacheEntry {
+                response: response.to_vec(),
+                expiry: std::time::Instant::now() + Duration::from_secs(ttl as u64),
+            },
+        );
+    }
+}
+
+/// 跳过一个 DNS 域名 (处理压缩指针), 返回其后偏移。
+fn skip_name(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *data.get(pos)?;
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        if len & 0xC0 == 0xC0 {
+            return Some(pos + 2); // 压缩指针 (2B, name 到此为止)
+        }
+        if len & 0xC0 != 0 {
+            return None; // 非法长度字节
+        }
+        pos += 1 + len as usize;
+    }
+}
+
+/// 从响应 answer 段取最小 TTL (缓存过期用)。无 answer 返回 None (不缓存)。
+fn min_answer_ttl(resp: &[u8]) -> Option<u32> {
+    if resp.len() < 12 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+    if ancount == 0 {
+        return None;
+    }
+    let mut pos = question_end(resp);
+    let mut min: Option<u32> = None;
+    for _ in 0..ancount {
+        pos = skip_name(resp, pos)?;
+        if pos + 10 > resp.len() {
+            break;
+        }
+        let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
+        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+        min = Some(min.map_or(ttl, |m| m.min(ttl)));
+        pos += 10 + rdlen;
+    }
+    min
+}
+
 pub struct DnsForwarder {
     socket: Arc<UdpSocket>,
     state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
     xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
+    cache: Option<DnsCache>,
 }
 
 impl DnsForwarder {
@@ -245,9 +358,21 @@ impl DnsForwarder {
         xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     ) -> anyhow::Result<Arc<Self>> {
         let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
+
+        // 接上 advanced_dns.cache (enabled + max_entries)。启动时读初始配置; 缓存开关不热重载。
+        let cache = state
+            .load()
+            .advanced_dns
+            .as_ref()
+            .and_then(|adv| adv.cache.as_ref())
+            .filter(|c| c.enabled)
+            .map(|c| DnsCache::new(c.max_entries));
+
         info!(
-            "DNS Forwarder listening on {} (dynamic upstream, fake-ip: {})",
-            listen_addr, fake_ip_mapper.is_some()
+            "DNS Forwarder listening on {} (dynamic upstream, fake-ip: {}, cache: {})",
+            listen_addr,
+            fake_ip_mapper.is_some(),
+            if cache.is_some() { "on" } else { "off" }
         );
 
         let forwarder = Arc::new(Self {
@@ -255,6 +380,7 @@ impl DnsForwarder {
             state,
             fake_ip_mapper,
             xdp_engine,
+            cache,
         });
 
         // Start worker task
@@ -331,8 +457,19 @@ impl DnsForwarder {
                     Some(make_nxdomain(req))
                 }
                 OutboundNode::Direct { .. } => {
+                    let dk = domain.to_lowercase();
+                    if let Some(cache) = &self.cache {
+                        if let Some(hit) = cache.get(&dk, qtype, req) {
+                            debug!("[DNS] direct  [{}] → cache hit", domain);
+                            return Some(hit);
+                        }
+                    }
                     debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
-                    udp_query(req, &cn_dns).await
+                    let resp = udp_query(req, &cn_dns).await;
+                    if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+                        cache.put(&dk, qtype, r);
+                    }
+                    resp
                 }
                 OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
@@ -353,8 +490,20 @@ impl DnsForwarder {
                             return make_empty_response(req);
                         }
                     }
+                    // 隧道-DNS 是最贵的路径 (每查耗一条 WarmPool 隧道), 缓存收益最大。
+                    let dk = domain.to_lowercase();
+                    if let Some(cache) = &self.cache {
+                        if let Some(hit) = cache.get(&dk, qtype, req) {
+                            debug!("[DNS] proxy   [{}] → cache hit (免隧道)", domain);
+                            return Some(hit);
+                        }
+                    }
                     debug!("[DNS] proxy   [{}] → 隧道查 {}:{} via {}", domain, remote_dns_host, remote_dns_port, n.tag());
-                    self.tcp_over_tunnel(req, &pool, &remote_dns_host, remote_dns_port).await.unwrap_or_else(|| make_nxdomain(req)).into()
+                    let resp = self.tcp_over_tunnel(req, pool, &remote_dns_host, remote_dns_port).await;
+                    if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+                        cache.put(&dk, qtype, r);
+                    }
+                    Some(resp.unwrap_or_else(|| make_nxdomain(req)))
                 }
                 _ => Some(make_nxdomain(req)),
             }
@@ -504,5 +653,60 @@ mod tests {
     #[tokio::test]
     async fn udp_query_empty_upstreams_none() {
         assert!(udp_query(&a_query(), &[]).await.is_none());
+    }
+
+    // ── DNS 响应缓存测试 ──
+    // x.com A 响应: header(QR=1,an=1) + question + answer(ptr, A, IN, ttl, rdlen=4, ip)
+    fn cache_a_response(tx: [u8; 2], ttl: u32) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        r.push(1); r.push(b'x');
+        r.push(3); r.extend_from_slice(b"com");
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]); // A IN
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]); // ptr, A, IN
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&[0, 4, 1, 2, 3, 4]); // rdlen=4, 1.2.3.4
+        r
+    }
+    fn cache_a_query(tx: [u8; 2]) -> Vec<u8> {
+        let mut q = vec![tx[0], tx[1], 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.push(1); q.push(b'x');
+        q.push(3); q.extend_from_slice(b"com");
+        q.push(0);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        q
+    }
+
+    #[test]
+    fn min_ttl_reads_answer() {
+        assert_eq!(min_answer_ttl(&cache_a_response([0x12, 0x34], 120)), Some(120));
+        // ancount=0 → None
+        let mut r = cache_a_response([0, 0], 100);
+        r[6] = 0; r[7] = 0;
+        assert_eq!(min_answer_ttl(&r), None);
+    }
+
+    #[test]
+    fn cache_hit_patches_txid_and_question() {
+        let cache = DnsCache::new(10);
+        cache.put("x.com", 1, &cache_a_response([0xAA, 0xBB], 300));
+        let q = cache_a_query([0x99, 0x88]);
+        let hit = cache.get("x.com", 1, &q).expect("应命中");
+        assert_eq!(&hit[0..2], &[0x99, 0x88], "tx_id 应 patch 成 query 的");
+        assert_eq!(hit[2], 0x81, "响应 flags (QR=1) 保留");
+        // answer 段仍在 (响应比查询长)
+        assert!(hit.len() > q.len(), "命中响应应含 answer 段");
+        // 不同 qtype / 域名 → miss
+        assert!(cache.get("x.com", 28, &q).is_none(), "不同 qtype miss");
+        assert!(cache.get("y.com", 1, &q).is_none(), "不同域名 miss");
+    }
+
+    #[test]
+    fn cache_skips_no_answer_response() {
+        let cache = DnsCache::new(10);
+        let mut r = cache_a_response([0, 0], 100);
+        r[6] = 0; r[7] = 0; // ancount=0 (NODATA/NXDOMAIN)
+        cache.put("x.com", 1, &r);
+        assert!(cache.get("x.com", 1, &cache_a_query([1, 2])).is_none(), "无 answer 不缓存");
     }
 }
