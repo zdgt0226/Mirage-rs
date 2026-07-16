@@ -227,9 +227,15 @@ pub struct DnsCacheConfig {
     pub max_entries: usize,
 }
 
+/// ⚠️ **已废弃且从未生效** —— 历史遗留 stub: 本结构解析后**从不被任何代码使用**,
+/// `secret` **不提供任何鉴权**。设了它 = 什么都没设(安全 footgun)。
+/// **API 鉴权请用 `gui.token`**(见 api/mod.rs::auth_mw)。
+/// 字段保留仅为在启动时**检测并警告**设置过它的用户, 未来版本移除。
 #[derive(Debug, Deserialize)]
 pub struct ApiConfig {
+    #[serde(default)]
     pub listen: String,
+    #[serde(default)]
     pub secret: String,
 }
 

@@ -360,6 +360,50 @@ CLIENT_IS_GATEWAY=false
 # 网关本机自身流量是否走代理 (cgroup/connect4)。开启则 setup 时把本机 DNS 指向 mirage.
 CLIENT_PROXY_LOCAL=false
 RESOLV_BAK=/etc/resolv.conf.mirage-bak
+# resolv.conf 守卫脚本: 由 client service 的 ExecStartPost/ExecStopPost 调用, 把"本机 DNS 指向
+# mirage"这个改动**绑定到服务生命周期**。此前该改动只在【安装时】做、【卸载时】还原 —— 导致
+# systemctl stop / 崩溃 / 被杀 之后 resolv.conf 仍指着已死的 mirage, **整台机器彻底没 DNS**。
+# systemd 即便主进程被 SIGKILL 也会跑 ExecStopPost, 故绑到服务上能兜住所有非卸载的退出路径。
+RESOLV_GUARD=/usr/local/sbin/mirage-resolv-guard
+
+# 写出 resolv.conf 守卫脚本 (apply/restore 两个子命令, 逻辑集中在此一处)。
+write_resolv_guard() {
+    cat > "$RESOLV_GUARD" <<'GUARD'
+#!/bin/sh
+# mirage-resolv-guard —— 由 mirage-rs-client.service 的 ExecStartPost/ExecStopPost 调用。
+# apply:   备份原 resolv.conf (含 symlink 目标), 指向 mirage (127.0.0.1)
+# restore: 从备份还原 (服务停止/崩溃/被杀时, systemd 保证跑到这里 → 机器不会没 DNS)
+# 备份文件不在 restore 时删除 —— 反复 start/stop 都能正常工作; 只有卸载才清。
+RESOLV_BAK=/etc/resolv.conf.mirage-bak
+case "$1" in
+  apply)
+    if [ ! -e "$RESOLV_BAK" ]; then
+      if [ -L /etc/resolv.conf ]; then
+        readlink /etc/resolv.conf > "${RESOLV_BAK}.symlink" 2>/dev/null || true
+      fi
+      cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
+    fi
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf
+    printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+    ;;
+  restore)
+    [ -e "$RESOLV_BAK" ] || exit 0
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    rm -f /etc/resolv.conf
+    if [ -f "${RESOLV_BAK}.symlink" ]; then
+      ln -sf "$(cat "${RESOLV_BAK}.symlink")" /etc/resolv.conf 2>/dev/null \
+        || cp -a "$RESOLV_BAK" /etc/resolv.conf
+    else
+      cp -a "$RESOLV_BAK" /etc/resolv.conf
+    fi
+    ;;
+  *) echo "usage: $0 {apply|restore}" >&2; exit 1 ;;
+esac
+exit 0
+GUARD
+    chmod 755 "$RESOLV_GUARD"
+}
 
 # 让用户选择安装的 release tag (留空装 latest). 已通过环境变量指定则不交互.
 select_version() {
@@ -799,7 +843,16 @@ EOF
 setup_systemd() {
     local role=$1
     local service_path="/etc/systemd/system/mirage-rs-${role}.service"
-    
+
+    # proxy_local 客户端: 把 resolv.conf 的改动绑到服务生命周期。ExecStopPost 即便主进程被
+    # SIGKILL 也会执行 → 服务一停就还原, 不会留下"指着死 mirage 的 resolv.conf = 机器没 DNS"。
+    local resolv_lines=""
+    if [[ "$role" == "client" && "$CLIENT_PROXY_LOCAL" == true ]]; then
+        write_resolv_guard
+        resolv_lines="ExecStartPost=${RESOLV_GUARD} apply
+ExecStopPost=${RESOLV_GUARD} restore"
+    fi
+
     cat > "$service_path" <<EOF
 [Unit]
 Description=Mirage-rs High-Performance Proxy (${role})
@@ -810,6 +863,7 @@ Type=simple
 User=root
 WorkingDirectory=${STATE_DIR}
 ExecStart=${BIN_PATH} ${role} -c ${ETC_DIR}/config_${role}.json
+${resolv_lines}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
@@ -1379,15 +1433,11 @@ EOF
     # ④.5 本机出向走代理: 把网关自身 DNS 指向 mirage (127.0.0.1), 本机应用才能拿到
     # fake-IP、被 cgroup/connect4 重定向进代理。备份原 resolv.conf, 卸载时还原。
     if [[ "$CLIENT_PROXY_LOCAL" == true ]]; then
-        if [[ ! -e "$RESOLV_BAK" ]]; then
-            if [[ -L /etc/resolv.conf ]]; then
-                readlink /etc/resolv.conf > "${RESOLV_BAK}.symlink" 2>/dev/null || true
-            fi
-            cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
-        fi
-        rm -f /etc/resolv.conf
-        printf 'nameserver 127.0.0.1\n' > /etc/resolv.conf
+        # 逻辑集中在守卫脚本里 (service 的 ExecStartPost/ExecStopPost 用的是同一份)。
+        [[ -x "$RESOLV_GUARD" ]] || write_resolv_guard
+        "$RESOLV_GUARD" apply
         ok "本机 DNS 已指向 mirage (127.0.0.1); 原 resolv.conf 备份于 $RESOLV_BAK"
+        ok "  已绑定到服务生命周期: 服务停止/崩溃/被杀 → ExecStopPost 自动还原, 机器不会没 DNS"
         warn "若本机跑 NetworkManager/dhclient/systemd-resolved, 可能覆盖 /etc/resolv.conf;"
         warn "  被覆盖会导致本机拿不到 fake-IP。必要时 chattr +i /etc/resolv.conf 锁定。"
     fi
@@ -1410,19 +1460,24 @@ teardown_transparent_gateway() {
     # tc_divert 策略路由 (fwmark→local 路由表) 清理
     ip rule del fwmark 1 lookup 100 2>/dev/null || true
     ip route del local default dev lo table 100 2>/dev/null || true
-    # 还原本机 resolv.conf (proxy_local 开启时改过)
+    # 还原本机 resolv.conf (proxy_local 开启时改过)。优先用守卫脚本还原 (与 service 的
+    # ExecStopPost 同一份逻辑); 老版本装的没这脚本 → 内联兜底。卸载才删备份 + 守卫脚本。
     if [[ -e "$RESOLV_BAK" ]]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        rm -f /etc/resolv.conf
-        if [[ -e "${RESOLV_BAK}.symlink" ]]; then
-            ln -sf "$(cat "${RESOLV_BAK}.symlink")" /etc/resolv.conf 2>/dev/null || cp -a "$RESOLV_BAK" /etc/resolv.conf
-            rm -f "${RESOLV_BAK}.symlink"
+        if [[ -x "$RESOLV_GUARD" ]]; then
+            "$RESOLV_GUARD" restore
         else
-            cp -a "$RESOLV_BAK" /etc/resolv.conf
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            rm -f /etc/resolv.conf
+            if [[ -e "${RESOLV_BAK}.symlink" ]]; then
+                ln -sf "$(cat "${RESOLV_BAK}.symlink")" /etc/resolv.conf 2>/dev/null || cp -a "$RESOLV_BAK" /etc/resolv.conf
+            else
+                cp -a "$RESOLV_BAK" /etc/resolv.conf
+            fi
         fi
-        rm -f "$RESOLV_BAK"
+        rm -f "$RESOLV_BAK" "${RESOLV_BAK}.symlink"
         info "已还原本机 resolv.conf。"
     fi
+    rm -f "$RESOLV_GUARD"
     command -v nft >/dev/null 2>&1 && nft delete table inet "$GW_NFT_TABLE" 2>/dev/null || true
     # iptables: 从 POSTROUTING 摘掉跳转, flush + 删自定义链 (与 nft delete table 对齐, 100% 干净)
     if command -v iptables >/dev/null 2>&1; then
