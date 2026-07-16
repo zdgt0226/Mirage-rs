@@ -444,11 +444,18 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 }
                 if let Some(fakeip) = adv.fakeip {
                     if fakeip.enabled {
-                        if let Ok(mapper) = crate::dns::fake_ip::FakeIpMapper::new(&fakeip.inet4_range) {
-                            info!("Fake-IP Mapper initialized with range {}", fakeip.inet4_range);
-                            fake_ip_mapper = Some(Arc::new(mapper));
-                        } else {
-                            error!("Failed to initialize Fake-IP Mapper with range {}", fakeip.inet4_range);
+                        match crate::dns::fake_ip::FakeIpMapper::with_persist(&fakeip.inet4_range, fakeip.persist_path.clone()) {
+                            Ok(mapper) => {
+                                info!(
+                                    "Fake-IP Mapper initialized with range {} (persist: {})",
+                                    fakeip.inet4_range,
+                                    fakeip.persist_path.as_deref().unwrap_or("off")
+                                );
+                                let m = Arc::new(mapper);
+                                m.clone().spawn_flusher(); // 持久化启用时周期落盘
+                                fake_ip_mapper = Some(m);
+                            }
+                            Err(e) => error!("Failed to initialize Fake-IP Mapper with range {}: {}", fakeip.inet4_range, e),
                         }
                     }
                 }
@@ -632,6 +639,10 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         }
     }
     info!("Shutting down Mirage-rs...");
+    // 退出前最终落盘 fake-IP 映射 (周期 flush 之外, 保住最近 <60s 的新分配)。
+    if let Some(m) = &fake_ip_mapper {
+        m.flush();
+    }
     // 清理透明代理 fake-IP 本地路由 (若装过). best-effort, 失败无害.
     crate::proxy::transparent_net::cleanup().await;
     std::process::exit(0);

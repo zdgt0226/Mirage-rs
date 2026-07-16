@@ -212,6 +212,8 @@ mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>&brutal=<mbps>
 
 被代理规则命中的域名, DNS 直接返回一个 **fake-IP** (默认 `198.18.0.0/15` 段的地址), 客户端拿它建连, 网关的 `tc_divert` 按 fake-IP 段拦截并按域名走隧道。fake-IP 映射稳定 (一个域名固定一个 fake-IP)。
 
+**持久化 (v0.5.0-alpha.4+)**: `advanced_dns.fakeip.persist_path`(install.sh 网关模式默认 `/var/lib/mirage-rs/fakeip.cache`)。设了则启动加载 + 周期(60s)/退出落盘。**意义**: 网关重启后,客户端还揣着的旧 fake-IP(≤300s TTL)仍能反查到域名,避免重启后那段时间代理连接反查失败而断。映射无时间 TTL(稳定,由 round-robin 有界),换 fakeip 网段时旧缓存自动失效。不设 = 纯内存(向后兼容)。
+
 **v0.4.5 抗 DNS 风暴的三处协议/行为调整** (根治开网页时几百倍 DNS 放大 + 偶发 ~11s 卡顿):
 
 | 调整 | 之前 | v0.4.5 | 原因 |

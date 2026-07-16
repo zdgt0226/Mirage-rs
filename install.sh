@@ -1108,7 +1108,7 @@ config_client() {
 '"$direct_resolvers"',
             { "tag": "remote", "address": "'"$remote_dns"'", "via": "proxy" }
         ],
-        "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'" },
+        "fakeip": { "enabled": true, "inet4_range": "'"$fakeip_range"'", "persist_path": "/var/lib/mirage-rs/fakeip.cache" },
         "cache": { "enabled": true, "max_entries": 10000 }
     },'
         local dns_upstreams="$direct_dns"; [[ -n "$direct_dns2" ]] && dns_upstreams="$direct_dns + $direct_dns2"

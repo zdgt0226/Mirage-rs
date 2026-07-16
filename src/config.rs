@@ -213,6 +213,11 @@ pub struct DnsRule {
 pub struct FakeIpConfig {
     pub enabled: bool,
     pub inet4_range: String,
+    /// 可选: fake-IP 映射持久化文件路径。设了则启动加载 + 周期/退出落盘, 网关重启后
+    /// 客户端仍揣着的旧 fake-IP (≤300s TTL) 还能反查到域名, 避免重启后代理连接断一段。
+    /// 不设 = 纯内存 (向后兼容)。install.sh 网关模式默认填 /var/lib/mirage-rs/fakeip.cache。
+    #[serde(default)]
+    pub persist_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

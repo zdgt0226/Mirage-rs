@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub struct FakeIpMapper {
     network: u32,
@@ -9,10 +11,19 @@ pub struct FakeIpMapper {
     next_ip: RwLock<u32>,
     domain_to_ip: RwLock<HashMap<String, Ipv4Addr>>,
     ip_to_domain: RwLock<HashMap<Ipv4Addr, String>>,
+    /// 持久化文件路径 (None = 纯内存)。
+    persist_path: Option<PathBuf>,
+    /// 有新分配就置 true; flush 后清。避免无变化时空写盘。
+    dirty: AtomicBool,
 }
 
 impl FakeIpMapper {
     pub fn new(cidr: &str) -> anyhow::Result<Self> {
+        Self::with_persist(cidr, None)
+    }
+
+    /// 带持久化: persist_path 设了则启动尝试加载已有映射 (缺失/损坏则空启动)。
+    pub fn with_persist(cidr: &str, persist_path: Option<String>) -> anyhow::Result<Self> {
         // Simple CIDR parsing like "198.18.0.0/16"
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
@@ -20,22 +31,130 @@ impl FakeIpMapper {
         }
         let ip: Ipv4Addr = parts[0].parse()?;
         let prefix: u32 = parts[1].parse()?;
-        
+
         if prefix > 32 {
             return Err(anyhow::anyhow!("Invalid CIDR prefix"));
         }
-        
+
         let mask = if prefix == 0 { 0u32 } else { !0u32 << (32 - prefix) };
         let network = u32::from(ip) & mask;
-        
-        Ok(Self {
+
+        let mapper = Self {
             network,
             mask,
             prefix_len: prefix as u8,
             next_ip: RwLock::new(network + 2), // Start at .2
             domain_to_ip: RwLock::new(HashMap::new()),
             ip_to_domain: RwLock::new(HashMap::new()),
-        })
+            persist_path: persist_path.map(PathBuf::from),
+            dirty: AtomicBool::new(false),
+        };
+
+        if let Some(p) = &mapper.persist_path {
+            if p.exists() {
+                if let Err(e) = mapper.load(p) {
+                    tracing::warn!("[FAKEIP] 加载持久化缓存 {} 失败 ({}), 空启动", p.display(), e);
+                }
+            }
+        }
+        Ok(mapper)
+    }
+
+    /// 从持久化文件恢复映射 + next_ip。行格式: `next_ip=<u32>` 或 `<ip> <domain>`。
+    /// 只接受落在本 range 的 IP (换过 fakeip 网段的旧缓存自动丢弃)。best-effort 解析。
+    fn load(&self, path: &Path) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        let mut d2i = self.domain_to_ip.write().unwrap_or_else(|e| e.into_inner());
+        let mut i2d = self.ip_to_domain.write().unwrap_or_else(|e| e.into_inner());
+        let mut loaded_next: Option<u32> = None;
+        let mut count = 0usize;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("next_ip=") {
+                loaded_next = v.trim().parse().ok();
+                continue;
+            }
+            let mut it = line.splitn(2, ' ');
+            let (ip_s, dom) = match (it.next(), it.next()) {
+                (Some(a), Some(b)) if !b.is_empty() => (a, b),
+                _ => continue,
+            };
+            let ip: Ipv4Addr = match ip_s.parse() {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            if (u32::from(ip) & self.mask) != self.network {
+                continue; // 不在本 range, 丢弃 (换过网段)
+            }
+            let dom = dom.to_lowercase();
+            d2i.insert(dom.clone(), ip);
+            i2d.insert(ip, dom);
+            count += 1;
+        }
+        if let Some(n) = loaded_next {
+            // next_ip 必须落在 range 内且非广播, 否则保留默认 network+2
+            if (n & self.mask) == self.network && (n & !self.mask) != !self.mask {
+                *self.next_ip.write().unwrap_or_else(|e| e.into_inner()) = n;
+            }
+        }
+        tracing::info!("[FAKEIP] 从 {} 恢复 {} 条映射", path.display(), count);
+        Ok(())
+    }
+
+    /// 落盘 (仅 dirty 时)。先写 .tmp 再原子 rename。best-effort, 失败恢复 dirty 下轮重试。
+    pub fn flush(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        // 短暂持读锁快照 (域名, IP), 出锁再格式化 —— 不长时间阻塞新分配。
+        let snapshot: Vec<(String, Ipv4Addr)> = {
+            let d2i = self.domain_to_ip.read().unwrap_or_else(|e| e.into_inner());
+            d2i.iter().map(|(d, ip)| (d.clone(), *ip)).collect()
+        };
+        let next = *self.next_ip.read().unwrap_or_else(|e| e.into_inner());
+
+        let mut out = String::with_capacity(snapshot.len() * 32 + 64);
+        out.push_str("# mirage-rs fake-ip persist v1\n");
+        out.push_str(&format!("next_ip={}\n", next));
+        for (dom, ip) in &snapshot {
+            out.push_str(&format!("{} {}\n", ip, dom));
+        }
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent); // 目录不存在则建 (best-effort)
+        }
+        let tmp = path.with_extension("tmp");
+        if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
+            tracing::warn!("[FAKEIP] 写临时缓存 {} 失败: {}", tmp.display(), e);
+            self.dirty.store(true, Ordering::SeqCst); // 恢复 dirty
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::warn!("[FAKEIP] rename 缓存 {} 失败: {}", path.display(), e);
+            let _ = std::fs::remove_file(&tmp);
+            self.dirty.store(true, Ordering::SeqCst);
+            return;
+        }
+        tracing::debug!("[FAKEIP] 持久化 {} 条映射 → {}", snapshot.len(), path.display());
+    }
+
+    /// 启动周期落盘后台任务 (每 60s, 仅 dirty 才写)。持久化未启用则 no-op。
+    pub fn spawn_flusher(self: Arc<Self>) {
+        if self.persist_path.is_none() {
+            return;
+        }
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                self.flush();
+            }
+        });
     }
 
     pub fn network(&self) -> Ipv4Addr {
@@ -93,6 +212,7 @@ impl FakeIpMapper {
         }
         tracing::debug!("[FAKEIP] assign [{}] → {} (已用 {}/~{})", domain, ip, d2i.len() + 1, !self.mask);
         d2i.insert(domain, ip);
+        self.dirty.store(true, Ordering::Relaxed); // 新分配 → 待落盘
 
         ip
     }
@@ -143,5 +263,69 @@ mod bounded_tests {
         let a = m.lookup_or_assign("stable.com");
         let b = m.lookup_or_assign("stable.com");
         assert_eq!(a, b, "同域名多次查询返回同一 fake-IP");
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("mirage_fakeip_{}_{}", nanos, name))
+    }
+
+    #[test]
+    fn roundtrip_restores_mappings_and_next_ip() {
+        let path = tmp_path("rt");
+        let ps = path.to_str().unwrap().to_string();
+        let (ip_a, ip_b);
+        {
+            let m = FakeIpMapper::with_persist("198.18.0.0/16", Some(ps.clone())).unwrap();
+            ip_a = m.lookup_or_assign("a.com");
+            ip_b = m.lookup_or_assign("b.com");
+            assert_ne!(ip_a, ip_b);
+            m.flush();
+        }
+        // 新 mapper 从同路径恢复
+        let m2 = FakeIpMapper::with_persist("198.18.0.0/16", Some(ps)).unwrap();
+        assert_eq!(m2.lookup_or_assign("a.com"), ip_a, "恢复后 a.com 应同 IP");
+        assert_eq!(m2.lookup_domain(&ip_a).as_deref(), Some("a.com"), "反查恢复");
+        // next_ip 恢复 → 新域名不撞已恢复的 IP
+        let ip_c = m2.lookup_or_assign("c.com");
+        assert_ne!(ip_c, ip_a);
+        assert_ne!(ip_c, ip_b);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn out_of_range_entries_dropped_on_load() {
+        let path = tmp_path("range");
+        // 10.0.0.5 不在 198.18/16, 应丢弃; 198.18.0.9 保留
+        std::fs::write(&path, "# hdr\nnext_ip=999\n10.0.0.5 x.com\n198.18.0.9 y.com\n").unwrap();
+        let m = FakeIpMapper::with_persist("198.18.0.0/16", Some(path.to_str().unwrap().to_string())).unwrap();
+        assert_eq!(m.lookup_domain(&"198.18.0.9".parse().unwrap()).as_deref(), Some("y.com"), "range 内保留");
+        assert!(m.lookup_domain(&"10.0.0.5".parse().unwrap()).is_none(), "range 外丢弃");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn corrupt_file_does_not_panic() {
+        let path = tmp_path("corrupt");
+        std::fs::write(&path, b"not\xffutf8 garbage\nnext_ip=abc\n\n").unwrap();
+        // 损坏 (非法 UTF-8) → load Err → warn 但 with_persist 返回 Ok (空启动)
+        let m = FakeIpMapper::with_persist("198.18.0.0/16", Some(path.to_str().unwrap().to_string()));
+        assert!(m.is_ok(), "损坏文件不应致 panic/失败");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn no_persist_path_is_pure_memory() {
+        let m = FakeIpMapper::with_persist("198.18.0.0/16", None).unwrap();
+        m.lookup_or_assign("x.com");
+        m.flush(); // 无路径 → no-op, 不 panic
     }
 }
