@@ -375,13 +375,46 @@ write_resolv_guard() {
 # restore: 从备份还原 (服务停止/崩溃/被杀时, systemd 保证跑到这里 → 机器不会没 DNS)
 # 备份文件不在 restore 时删除 —— 反复 start/stop 都能正常工作; 只有卸载才清。
 RESOLV_BAK=/etc/resolv.conf.mirage-bak
+
+# 每次 apply 都刷新备份, 但**只在当前 resolv.conf 不是我们自己写的 stub 时**。
+#   为什么要刷新: 只备份第一次会让备份随时间腐坏 —— 换网络/新 DHCP 租约/重配
+#   systemd-resolved 之后, restore 会把几个月前的上游 DNS 写回去, 机器照样解析不了。
+#   为什么要门控: 若在自己的 stub 上再 apply 一次 (重启服务、ExecStartPost 重跑),
+#   无脑刷新会把 "nameserver 127.0.0.1" 存成备份, restore 就把机器指回已死的
+#   mirage —— 正是本守卫存在的意义所在。判据: 存在任一非 127.0.0.1 的 nameserver
+#   即视为真实配置 (systemd-resolved 的 127.0.0.53 也算, 它确实是真上游)。
+is_our_stub() {
+    [ -L /etc/resolv.conf ] && return 1
+    [ -f /etc/resolv.conf ] || return 1
+    grep -qE '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null || return 1
+    grep -E '^[[:space:]]*nameserver[[:space:]]+' /etc/resolv.conf 2>/dev/null \
+      | grep -qvE '^[[:space:]]*nameserver[[:space:]]+127\.0\.0\.1[[:space:]]*$' && return 1
+    return 0
+}
+
+backup_now() {
+    if [ -L /etc/resolv.conf ]; then
+        readlink /etc/resolv.conf > "${RESOLV_BAK}.symlink" 2>/dev/null || true
+    else
+        # 上次备份的是 symlink、这次是普通文件 → 必须清掉旁挂记录, 否则 restore 会
+        # 用陈旧的 symlink 目标覆盖掉本次的真实内容。
+        rm -f "${RESOLV_BAK}.symlink"
+    fi
+    # 先删再 cp -aL: ① -a 遇 symlink 源会**保留 symlink**, 备份文件自己就成了指向
+    # 上游文件的软链, 之后每次备份都写穿到目标去、restore 又把软链复制回来 —— 备份
+    # 存的必须是**内容** (symlink 目标另记在 .symlink 旁挂里), 故用 -L 解引用;
+    # ② 不先 rm, cp 会沿着已存在的旧软链写穿, -L 也救不回来。
+    rm -f "$RESOLV_BAK"
+    cp -aL /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
+}
+
 case "$1" in
   apply)
-    if [ ! -e "$RESOLV_BAK" ]; then
-      if [ -L /etc/resolv.conf ]; then
-        readlink /etc/resolv.conf > "${RESOLV_BAK}.symlink" 2>/dev/null || true
-      fi
-      cp -a /etc/resolv.conf "$RESOLV_BAK" 2>/dev/null || true
+    if is_our_stub; then
+      # 已经是我们的 stub: 保留既有备份 (它才是真实的上游配置), 什么都不备。
+      [ -e "$RESOLV_BAK" ] || echo "mirage-resolv-guard: resolv.conf 已是 mirage stub 且无备份, 无法保护原配置" >&2
+    else
+      backup_now
     fi
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf

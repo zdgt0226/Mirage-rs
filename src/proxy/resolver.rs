@@ -131,8 +131,17 @@ pub async fn connect_smart(target: &str) -> io::Result<TcpStream> {
     })?;
 
     // host 已是 IP → 直连, 不解析不缓存 (对应日志里 target=180.101.49.44:443, connect 6ms)
+    // 超时和域名路径一致: 少了这个就只能等内核的 TCP 重传超时 (~130s), 被墙/黑洞的
+    // 裸 IP 目的地会把这条连接吊死两分钟。
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return TcpStream::connect(SocketAddr::new(ip, port)).await;
+        let addr = SocketAddr::new(ip, port);
+        return match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(r) => r,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("connect {addr} timed out after {}s", PER_ATTEMPT_TIMEOUT.as_secs()),
+            )),
+        };
     }
 
     // 域名 → 缓存解析 + 候选逐一试

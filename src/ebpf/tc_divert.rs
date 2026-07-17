@@ -11,12 +11,13 @@ mod sys {
     use anyhow::{Context, Result};
     use aya::maps::lpm_trie::{Key, LpmTrie};
     use aya::maps::Array;
+    use aya::programs::tc::SchedClassifierLinkId;
     use aya::programs::{tc, SchedClassifier, TcAttachType};
     use aya::Ebpf;
     use ipnet::Ipv4Net;
     use std::collections::HashSet;
     use std::sync::Mutex;
-    use tracing::info;
+    use tracing::{info, warn};
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -30,6 +31,8 @@ mod sys {
         bpf: Mutex<Ebpf>,
         // 当前 direct_cidr map 里的 (网络序 u32, 前缀长度), 供热重载差量增删。
         loaded: Mutex<HashSet<(u32, u8)>>,
+        // attach 后的 tc 过滤器 link, 供退出时显式摘除 (见 detach)。
+        link: Mutex<Option<SchedClassifierLinkId>>,
     }
 
     impl TcDivertEngine {
@@ -46,6 +49,7 @@ mod sys {
             Ok(Self {
                 bpf: Mutex::new(bpf),
                 loaded: Mutex::new(HashSet::new()),
+                link: Mutex::new(None),
             })
         }
 
@@ -59,10 +63,33 @@ mod sys {
                 .context("tc_divert program missing")?
                 .try_into()?;
             prog.load()?;
-            prog.attach(iface, TcAttachType::Ingress)
+            let link_id = prog
+                .attach(iface, TcAttachType::Ingress)
                 .with_context(|| format!("tc_divert attach to {} ingress failed", iface))?;
+            *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(link_id);
             info!("eBPF tc_divert attached to {} ingress.", iface);
             Ok(())
+        }
+
+        /// 退出前显式摘掉 tc 过滤器。
+        ///
+        /// tc 过滤器自己持有 prog 引用, 不随进程 fd 关闭消失; 而本进程走
+        /// std::process::exit(0), 析构一个都不跑 → aya 的 Ebpf 永远不 Drop, 连优雅停止
+        /// 都会把过滤器留在网卡上。留下的过滤器配合 mirage-gw-nat 装的 fwmark→local
+        /// ip rule 会黑洞掉 LAN 的非直连 TCP。BPF 侧已有 sk_lookup 兜底 (listener 没了
+        /// 就不打 mark), 这里是第二道保险: 正常退出路径直接把过滤器摘干净。
+        pub fn detach(&self) {
+            let Some(link_id) = self.link.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                return;
+            };
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(prog) = bpf.program_mut("tc_divert") else { return };
+            let prog: Result<&mut SchedClassifier, _> = prog.try_into();
+            match prog.map(|p| p.detach(link_id)) {
+                Ok(Ok(())) => info!("eBPF tc_divert 已从网卡摘除。"),
+                Ok(Err(e)) => warn!("tc_divert detach 失败 (过滤器可能残留): {}", e),
+                Err(e) => warn!("tc_divert detach 取程序失败: {}", e),
+            }
         }
 
         /// 全量同步 direct_cidr map 到给定直连集 (增删差量, 支持热重载)。
@@ -111,6 +138,7 @@ mod sys {
         pub fn attach(&self, _iface: &str) -> Result<()> {
             Ok(())
         }
+        pub fn detach(&self) {}
         pub fn sync_direct_cidrs(&self, _cidrs: &[Ipv4Net]) -> Result<()> {
             Ok(())
         }

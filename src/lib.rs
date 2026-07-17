@@ -496,6 +496,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         warn!("No inbounds configured!");
     }
 
+    // 退出时要显式摘掉的 tc 过滤器 (见 TcDivertEngine::detach)。
+    let mut tc_divert_engine: Option<std::sync::Arc<crate::ebpf::TcDivertEngine>> = None;
+
     for inbound in inbounds {
         let state_clone = watcher.state.clone();
         let ebpf_clone = ebpf_engine.clone();
@@ -591,6 +594,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 match engine.attach(&iface) {
                                     Ok(()) => {
                                         info!("tc_divert 已接管 {} 上的裸-IP 转发流量 ({} 段直连快路径)", iface, cidrs.len());
+                                        tc_divert_engine = Some(engine.clone());
                                         // 热重载后按新规则刷新 direct_cidr map
                                         let eng = engine.clone();
                                         watcher.set_reload_hook(move |st| {
@@ -661,5 +665,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     }
     // 清理透明代理 fake-IP 本地路由 (若装过). best-effort, 失败无害.
     crate::proxy::transparent_net::cleanup().await;
+    // 摘掉 tc 过滤器: 下面是 process::exit(0), 析构不跑, 不显式摘就会留在网卡上。
+    if let Some(e) = &tc_divert_engine {
+        e.detach();
+    }
     std::process::exit(0);
 }

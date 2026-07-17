@@ -63,6 +63,11 @@ path = "examples/verify_tc_divert_tcp.rs"
 required-features = ["ebpf"]
 
 [[example]]
+name = "verify_tc_divert_orphan"
+path = "examples/verify_tc_divert_orphan.rs"
+required-features = ["ebpf"]
+
+[[example]]
 name = "verify_cgroup_connect"
 path = "examples/verify_cgroup_connect.rs"
 required-features = ["ebpf"]

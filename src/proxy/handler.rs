@@ -203,7 +203,6 @@ pub async fn proxy_tcp_target(
             };
 
             let active_fd = tunnel.get_raw_fd();
-            let _guard = pool.active_fd_guard(active_fd);
 
             debug!("[TUNNEL] {} 建立 (隧道就绪, 目标头已发)", target);
             let t_start = std::time::Instant::now();
@@ -211,6 +210,12 @@ pub async fn proxy_tcp_target(
             let (mut local_read, mut local_write) = local.into_split();
             let tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
+            // ★ guard 必须在持有 fd 的 reader/writer **之后**声明: drop 按声明逆序,
+            // 这样才能保证任何退出路径 (含 task 被 cancel/abort, 此时下面的显式 drop
+            // 根本不执行) 都是先把 fd 移出 active set、再关 fd。反过来则会露出一个
+            // "fd 已关但仍在 set 里"的窗口, fd 号被复用后 set 会误判活跃 —— 这正是
+            // active_fd_guard 本身要防的事。
+            let _guard = pool.active_fd_guard(active_fd);
 
             let upload = async {
                 let mut buf = [0u8; 16384];

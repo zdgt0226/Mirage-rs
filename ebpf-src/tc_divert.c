@@ -180,6 +180,18 @@ int tc_divert(struct __sk_buff *skb) {
             goto assign;
         }
         // 已建流: 仅打 mark, 交内核本地投递 + established 查找。
+        // 打 mark 前先探一下透明 listener 还在不在: 进程被 SIGKILL / 优雅停止后本
+        // 程序仍挂在网卡上 (tc 过滤器持有 prog 引用, 不随进程消失), 而 fwmark→local
+        // 路由表的 ip rule 由独立的 mirage-gw-nat.service 装、只在卸载时删。两者叠加
+        // 会把 LAN 的每个已建流包引到 local 表却无 socket 可收 → 整段非直连 TCP 黑洞。
+        // listener 不在就别打 mark, 让包走正常转发 —— 代理没了顶多不加速, 不该断网。
+        struct bpf_sock_tuple lt = {};
+        lt.ipv4.daddr = bpf_htonl(0x7f000001);
+        lt.ipv4.dport = lport;
+        sk = bpf_sk_lookup_tcp(skb, &lt, sizeof(lt.ipv4), BPF_F_CURRENT_NETNS, 0);
+        if (!sk)
+            return TC_ACT_OK;
+        bpf_sk_release(sk);
         skb->mark = MIRAGE_FWMARK;
         return TC_ACT_OK;
     } else if (ip->protocol == IPPROTO_UDP) {

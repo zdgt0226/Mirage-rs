@@ -52,6 +52,8 @@ jobs:
       run: sudo bash examples/verify_tc_divert.sh
     - name: tc_divert TCP — 透明 local_addr 分水岭 (IP_TRANSPARENT)
       run: sudo bash examples/verify_tc_divert_tcp.sh
+    - name: tc_divert 孤儿过滤器 — listener 没了不打 mark (停服不黑洞 LAN)
+      run: sudo bash examples/verify_tc_divert_orphan.sh
     - name: MSS clamp — TCP SYN MSS 钳制
       run: sudo bash examples/verify_mss_clamp.sh
     - name: cgroup/connect4 — 本机出向重定向 + origdst 还原
