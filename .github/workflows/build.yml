@@ -54,17 +54,13 @@ jobs:
       run: sudo bash examples/verify_tc_divert.sh
     - name: tc_divert TCP — 透明 local_addr 分水岭 (IP_TRANSPARENT)
       run: sudo bash examples/verify_tc_divert_tcp.sh
-    # ⚠️ 暂时摘掉 (2026-07-17): verify_tc_divert_orphan.sh 在本地内核 6.1 稳定绿, 但在
-    # 本 job 的 5.15 上红 —— ② (listener 活着 → 已建流应打 mark) 报 "到达=1 但 mark=0"。
-    # 病灶未定, 两种可能, 严重性天差地别:
-    #   a) 验证器自身在 5.15 上的问题 → 修测试;
-    #   b) 5.15 上 bpf_sk_lookup_tcp 在已建流路径查不到 listener → 那是**产品 bug**:
-    #      tc_divert.c 的 sk_lookup 门控会在 5.15 误伤正常路径 (listener 活着却不打
-    #      mark → 已建流投递不到代理 → 代理失效)。若坐实, 得换探活手段而非改测试。
-    # 在查清前不留在 CI 里: 长期红的必跑步骤会训练大家忽略红灯, 比没有它更糟。
-    # 脚本保留在 examples/ 下, 本地 (内核 ≥6.1) 仍可跑; 查清后接回来。
-    # - name: tc_divert 孤儿过滤器 — listener 没了不打 mark (停服不黑洞 LAN)
-    #   run: sudo bash examples/verify_tc_divert_orphan.sh
+    # 注 (2026-07-18): 该验证器曾用**合成裸 ACK**打已建流分支, 在本 job 的 5.15 上恒红
+    # (6.1 却绿)。查清=合成包无 conntrack 态/skb 布局不同, 早于 sk_lookup 的边界处理在
+    # 不同内核不一致 —— 病灶在测试的合成包, 非产品 (verify_tc_divert_tcp 用真实握手在
+    # 5.15 上跑通了同一段门控)。已重写为**真实连接驱动** (建真连→关 LISTEN socket→看
+    # 已建流包不再被 mark), 全程只用内核自然产生的包。
+    - name: tc_divert 孤儿过滤器 — listener 没了不打 mark (停服不黑洞 LAN)
+      run: sudo bash examples/verify_tc_divert_orphan.sh
     - name: MSS clamp — TCP SYN MSS 钳制
       run: sudo bash examples/verify_mss_clamp.sh
     - name: cgroup/connect4 — 本机出向重定向 + origdst 还原
