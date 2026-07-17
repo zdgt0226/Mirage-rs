@@ -123,12 +123,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ⚠️ 必须以退出码表达结论: 本验证器会在 CI 里跑, 只 println 的话失败也是绿灯 (假信心)。
     if got_proxied && !leaked_direct {
         println!("  ✅ PASS: {} 被 sk_assign 进代理; {} 走直连未进 socket (LPM 分流生效)", proxied, direct);
     } else if leaked_direct {
         println!("  ❌ FAIL: 直连段 {} 被错误劫持进代理 socket", direct);
+        std::process::exit(1);
     } else {
         println!("  ❌ FAIL: 代理目标 {} 未收到 (sk_assign 路径断)", proxied);
+        std::process::exit(1);
     }
     Ok(())
 }

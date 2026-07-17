@@ -71,7 +71,9 @@ fn main() -> anyhow::Result<()> {
     if mss > 0 && mss <= (MTU - 40) as i32 {
         println!("  ✅ PASS: MSS 被钳制到 {} ≤ {} (loopback 默认 ~65495)", mss, MTU - 40);
     } else {
+        // ⚠️ 退出码表达结论 (CI 里跑, 只 println 失败也绿灯)
         println!("  ❌ FAIL: MSS={} 未被钳制 (期望 ≤{})", mss, MTU - 40);
+        std::process::exit(1);
     }
     Ok(())
 }

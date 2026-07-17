@@ -90,7 +90,8 @@ fn load_and_attach() -> anyhow::Result<Ebpf> {
     Ok(bpf)
 }
 
-fn run_case(bpf: &mut Ebpf, transparent: bool, bind_port: u16, target: SocketAddrV4) -> anyhow::Result<()> {
+/// 返回本 case 是否达成预期 (origdst 正确报出 fake-IP)。调用方决定它是"必须通过"还是"对照观察"。
+fn run_case(bpf: &mut Ebpf, transparent: bool, bind_port: u16, target: SocketAddrV4) -> anyhow::Result<bool> {
     let label = if transparent { "IP_TRANSPARENT=on" } else { "IP_TRANSPARENT=off" };
     println!("\n=== case: {} → 目标 fake-IP {} ===", label, target);
 
@@ -108,33 +109,40 @@ fn run_case(bpf: &mut Ebpf, transparent: bool, bind_port: u16, target: SocketAdd
     println!("  [send] {} bytes → {}", payload.len(), target);
 
     let mut buf = [0u8; 2048];
-    match recv_origdst(sock.as_raw_fd(), &mut buf) {
+    let ok = match recv_origdst(sock.as_raw_fd(), &mut buf) {
         Ok((n, client, orig)) => {
             println!("  [recv] {} bytes, client={}, origdst={:?}", n, client, orig);
             let data_ok = &buf[..n] == payload;
             match orig {
                 Some(od) if od == target && data_ok => {
                     println!("  ✅ PASS: sk_assign 后 IP_ORIGDSTADDR 正确报出 fake-IP {}", od);
+                    true
                 }
                 Some(od) => {
                     println!("  ⚠️  origdst={} 与目标 {} 不一致 (data_ok={})", od, target, data_ok);
+                    false
                 }
                 None => {
                     println!("  ⚠️  收到包但 origdst cmsg 缺失 —— IP_RECVORIGDSTADDR 未生效?");
+                    false
                 }
             }
         }
         Err(nix::errno::Errno::EAGAIN) => {
             println!("  ❌ 2s 内未收到包 —— sk_lookup 未把 UDP 投给本 socket (transparent={})", transparent);
+            false
         }
-        Err(e) => println!("  ❌ recvmsg 错误: {}", e),
-    }
-    Ok(())
+        Err(e) => {
+            println!("  ❌ recvmsg 错误: {}", e);
+            false
+        }
+    };
+    Ok(ok)
 }
 
 /// ③ 回包源地址伪造: reply socket 用 IP_TRANSPARENT+IP_FREEBIND 绑到**非本地**
 /// 地址, send 时源地址应是该绑定地址 (client 会看到回包来自 fake-IP:port)。
-fn run_reply_spoof() -> anyhow::Result<()> {
+fn run_reply_spoof() -> anyhow::Result<bool> {
     println!("\n=== case: reply socket 源地址伪造 (IP_TRANSPARENT+IP_FREEBIND) ===");
     // 监听方 (模拟客户端)
     let listener = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -151,7 +159,7 @@ fn run_reply_spoof() -> anyhow::Result<()> {
         Ok(_) => println!("  [bind] IP_TRANSPARENT+FREEBIND 绑非本地 {} 成功", spoof_src),
         Err(e) => {
             println!("  ❌ 绑非本地 {} 失败: {} (FREEBIND 未生效?)", spoof_src, e);
-            return Ok(());
+            return Ok(false);
         }
     }
     let reply_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd.into_raw_fd()) };
@@ -160,33 +168,49 @@ fn run_reply_spoof() -> anyhow::Result<()> {
     println!("  [send] 从伪造源 {} → {}", spoof_src, listener_addr);
 
     let mut buf = [0u8; 128];
-    match listener.recv_from(&mut buf) {
+    let ok = match listener.recv_from(&mut buf) {
         Ok((n, src)) => {
             println!("  [recv] listener 收到 {} 字节, 源={}", n, src);
             if src == std::net::SocketAddr::V4(spoof_src) {
                 println!("  ✅ PASS: 回包源被伪造成 {} (客户端会认为回包来自 fake-IP:port)", spoof_src);
+                true
             } else {
                 println!("  ⚠️  源={} 不是伪造的 {} —— 源伪造未生效", src, spoof_src);
+                false
             }
         }
-        Err(e) => println!("  ❌ listener 2s 未收到 (源伪造包被丢?): {}", e),
-    }
-    Ok(())
+        Err(e) => {
+            println!("  ❌ listener 2s 未收到 (源伪造包被丢?): {}", e);
+            false
+        }
+    };
+    Ok(ok)
 }
 
 fn main() -> anyhow::Result<()> {
     println!("== sk_lookup UDP 透明代理内核行为验证 ==");
     let mut bpf = load_and_attach()?;
 
-    // ① 主验证: IP_TRANSPARENT 开, 看 origdst 是否报出 fake-IP
-    run_case(&mut bpf, true, 19999, SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 7), 12345))?;
+    // ① 主验证: IP_TRANSPARENT 开, 看 origdst 是否报出 fake-IP —— **必须通过**
+    let case1 = run_case(&mut bpf, true, 19999, SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 7), 12345))?;
 
-    // ② 对照: IP_TRANSPARENT 关, 看是否还能收到重定向包 (判断是否必须)
-    run_case(&mut bpf, false, 19998, SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 8), 12345))?;
+    // ② 对照实验: IP_TRANSPARENT 关, 看是否还能收到重定向包 (判断该选项是否必须)。
+    //    **两种结果都只是信息, 不参与成败判定** —— 收不到恰恰说明 IP_TRANSPARENT 是必需的。
+    let case2 = run_case(&mut bpf, false, 19998, SocketAddrV4::new(Ipv4Addr::new(198, 18, 0, 8), 12345))?;
 
-    // ③ 回包源伪造
-    run_reply_spoof()?;
+    // ③ 回包源伪造 (IP_TRANSPARENT+FREEBIND) —— **必须通过**
+    let case3 = run_reply_spoof()?;
 
-    println!("\n== 结论看上面各 case 的 PASS/⚠️/❌ ==");
+    println!("\n== 汇总 ==");
+    println!("  ① origdst 报出 fake-IP (必须通过): {}", if case1 { "✅ PASS" } else { "❌ FAIL" });
+    println!("  ② 对照 IP_TRANSPARENT=off 能否收到 (仅信息): {}", if case2 { "收到了" } else { "收不到 (即该选项必需)" });
+    println!("  ③ 回包源伪造 (必须通过): {}", if case3 { "✅ PASS" } else { "❌ FAIL" });
+
+    // ⚠️ 用退出码表达结论: 本验证器在 CI 里跑, 只 println 的话失败也是绿灯 (假信心)。
+    if !case1 || !case3 {
+        eprintln!("\n❌ 关键 case 未通过 → 退出码 1");
+        std::process::exit(1);
+    }
+    println!("\n✅ 全部关键 case 通过");
     Ok(())
 }

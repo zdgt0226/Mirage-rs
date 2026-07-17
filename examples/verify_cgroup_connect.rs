@@ -95,16 +95,24 @@ fn main() -> anyhow::Result<()> {
                 Ok(od) => {
                     let ip = Ipv4Addr::from(u32::from_be(od.ip));
                     println!("  [accept] peer={} → 查回 origdst {}:{}", peer, ip, od.port);
+                    // ⚠️ 退出码表达结论 (CI 里跑, 只 println 失败也绿灯)
                     if ip == expect_ip && od.port == FOREIGN_PORT as u32 {
                         println!("  ✅ PASS: connect4 改写 + sockops re-key 还原原始目的 {}:{}", ip, od.port);
                     } else {
                         println!("  ❌ FAIL: origdst {}:{} != {}:{}", ip, od.port, expect_ip, FOREIGN_PORT);
+                        std::process::exit(1);
                     }
                 }
-                Err(_) => println!("  ❌ FAIL: cc_port[{}] 无记录 (sockops re-key 没生效?)", sport),
+                Err(_) => {
+                    println!("  ❌ FAIL: cc_port[{}] 无记录 (sockops re-key 没生效?)", sport);
+                    std::process::exit(1);
+                }
             }
         }
-        Err(e) => println!("  ❌ FAIL: 5s 未 accept (connect4 改写没生效?): {}", e),
+        Err(e) => {
+            println!("  ❌ FAIL: 5s 未 accept (connect4 改写没生效?): {}", e);
+            std::process::exit(1);
+        }
     }
     Ok(())
 }

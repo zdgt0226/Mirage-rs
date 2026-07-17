@@ -71,12 +71,15 @@ fn main() -> anyhow::Result<()> {
                     println!("  ✅ PASS: local_addr()={} == 原始 foreign 目的, 透明 TCP 成立", l);
                 }
                 other => {
+                    // ⚠️ 退出码表达结论 (CI 里跑, 只 println 失败也绿灯)
                     println!("  ❌ FAIL: local_addr()={} != 原始目的 {} (IP_TRANSPARENT 未生效?)", other, expect);
+                    std::process::exit(1);
                 }
             }
         }
         Err(e) => {
             println!("  ❌ FAIL: 5s 未 accept 到连接: {} (sk_assign/握手断?)", e);
+            std::process::exit(1);
         }
     }
     Ok(())

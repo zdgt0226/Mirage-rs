@@ -19,3 +19,42 @@ jobs:
       run: cargo check --features ebpf --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  # 透明代理 eBPF 机制的 netns 集成验证。
+  #
+  # 为什么需要: 单测覆盖不到 tc_divert / sk_lookup / sk_assign / cgroup-connect4 这些**内核
+  # 行为** —— 它们只能在真 netns + 真 BPF 加载下验。此前这些验证器只能手动跑, 旗舰的透明代理
+  # 路径每次改动都在裸奔。
+  #
+  # ⚠️ 接入前提 (2026-07-17): 这些验证器原先**只 println PASS/FAIL、从不返回非零退出码** ——
+  # 直接进 CI 会永远绿灯 (假信心, 比没有 CI 更糟)。已先改成用退出码表达结论才接进来。
+  #
+  # 跑在 ubuntu-22.04 (内核 5.15) 是**故意的**: 贴近 README 声称的最低支持内核 (≥5.10), 让 CI
+  # 真正检验那个支持声明, 而不是只在最新内核上自我感觉良好。
+  ebpf-verify:
+    name: eBPF netns 验证器 (透明代理内核机制)
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic iproute2 python3
+    - name: 环境信息 (内核/BTF/cgroup — 失败时先看这里)
+      run: |
+        echo "kernel: $(uname -r)"
+        ls -l /sys/kernel/btf/vmlinux 2>/dev/null || echo "⚠️ 无 BTF (aya CO-RE 可能失败)"
+        echo "cgroup fs: $(stat -fc %T /sys/fs/cgroup 2>/dev/null || echo unknown)"
+    - name: Build eBPF examples
+      run: cargo build --features ebpf --examples --verbose
+    # 每个验证器单独一步: 失败时一眼看出是哪个内核机制断了
+    - name: tc_divert — 裸-IP UDP sk_assign + LPM 直连分流
+      run: sudo bash examples/verify_tc_divert.sh
+    - name: tc_divert TCP — 透明 local_addr 分水岭 (IP_TRANSPARENT)
+      run: sudo bash examples/verify_tc_divert_tcp.sh
+    - name: MSS clamp — TCP SYN MSS 钳制
+      run: sudo bash examples/verify_mss_clamp.sh
+    - name: cgroup/connect4 — 本机出向重定向 + origdst 还原
+      run: sudo bash examples/verify_cgroup_connect.sh
+    - name: sk_lookup UDP 透明 — origdst 报出 + 回包源伪造
+      run: sudo bash examples/verify_udp_transparent.sh
