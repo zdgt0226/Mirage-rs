@@ -14,6 +14,10 @@
 set -e
 BIN=./target/debug/examples/verify_tc_divert_orphan
 [ -x "$BIN" ] || { echo "先 build: cargo build --example verify_tc_divert_orphan --features ebpf"; exit 1; }
+# 前置检查: 缺依赖要报得一眼看懂 (本脚本是唯一用 nft 的验证器 —— CI 的 apt 清单里
+# 漏了 nftables 时, set -e 只会甩出一句 "nft: command not found" 就退, 很难查)。
+command -v nft >/dev/null || { echo "缺 nft (装 nftables 包): 本验证器用 nft 计数器数被打 mark 的包"; exit 1; }
+command -v python3 >/dev/null || { echo "缺 python3: 用来发裸 TCP ACK"; exit 1; }
 
 cleanup() { ip netns del ns_gw 2>/dev/null || true; ip netns del ns_cli 2>/dev/null || true; }
 trap cleanup EXIT

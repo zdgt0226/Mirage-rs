@@ -39,7 +39,8 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic iproute2 python3
+        # nftables: verify_tc_divert_orphan.sh 用 nft 计数器数"被打 mark 的包"
+        sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic iproute2 python3 nftables
     - name: 环境信息 (内核/BTF/cgroup — 失败时先看这里)
       run: |
         echo "kernel: $(uname -r)"
