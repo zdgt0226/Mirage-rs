@@ -77,6 +77,20 @@ count_of() {
 
 # 读增量, 不用 `nft reset counters` —— 它只重置**具名 counter 对象**, 重置不了规则里
 # 内联的 counter (会静默无效果, 计数一路累加 → case 之间互相污染出假通过)。
+# 轮询到端口真的进入 LISTEN 为止 (见 ② 处注释)
+LPORT=19999
+LISTEN_TIMEOUT=15
+wait_listener() {
+    local i
+    for i in $(seq 1 $((LISTEN_TIMEOUT * 10))); do
+        if ip netns exec ns_gw ss -H -ltn "sport = :$LPORT" 2>/dev/null | grep -q LISTEN; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
+}
+
 MARKED_BASE=0
 ARRIVED_BASE=0
 snapshot() { MARKED_BASE=$(count_of marked); ARRIVED_BASE=$(count_of arrived); }
@@ -106,7 +120,14 @@ fi
 # ── ② 对照组: listener 活着, mark 必须照打 ──────────────────────────────
 ip netns exec ns_gw "$BIN" listen &
 LP=$!
-sleep 1
+# 必须确认端口真在 LISTEN 再发包, 不能 sleep 一个固定值赌它起来了: CI 上跑 debug
+# 构建 + 冷页缓存 + 套一层 netns exec, 起得比本地慢得多。此处曾用 sleep 1, 在 CI
+# (run 29567205352) 上 listener 没绑上就发了包 → sk_lookup 查不到 → ② 假红。
+if ! wait_listener; then
+    echo "  [②] ❌ FAIL: listener ${LISTEN_TIMEOUT}s 内没进入 LISTEN (本 case 无效)"
+    kill -9 $LP 2>/dev/null || true
+    exit 1
+fi
 snapshot
 send_ack
 sleep 0.3
