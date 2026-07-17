@@ -93,6 +93,11 @@ fn do_listen() -> anyhow::Result<()> {
         }
         match l.accept() {
             Ok((mut s, _)) => {
+                // child 会继承 listener 的 200ms SO_RCVTIMEO (Linux 语义)。若不清掉,
+                // 客户端发包间隔一旦 >200ms, drain 的 read 就超时返 Err → 循环退出 →
+                // child 关闭 → RST 客户端, 流提前断。设 None (阻塞) 让 drain 只在真正
+                // EOF/错误时退出。
+                let _ = s.set_read_timeout(None);
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 1024];
                     while let Ok(n) = s.read(&mut buf) {

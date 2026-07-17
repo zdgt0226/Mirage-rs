@@ -96,13 +96,26 @@ CLI_PY=$(mktemp /tmp/orph_client.XXXXXX.py)
 cat > "$CLI_PY" <<'PY'
 import socket, sys, time
 flag = sys.argv[1]
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(5)
-try:
-    s.connect(("8.8.8.8", 9999))   # SYN→sk_assign→透明listener; 完成握手即证明 marking 正常
-    open(flag, "w").close()        # 通知 shell: 已建连
-except Exception as e:
-    print("  [cli] connect 失败:", e); sys.exit(1)
+# connect 重试: veth carrier/路由在 netns 起来后有个 settle 窗口 (5.15 上比 6.1 慢),
+# 期间 connect 会瞬时 ENETUNREACH。重试到 8s 兜住, 而非首次失败就放弃 (踩过一次)。
+deadline = time.time() + 8
+s = None
+last = None
+while time.time() < deadline:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(("8.8.8.8", 9999))  # SYN→sk_assign→透明listener; 握手完成即证明 marking 正常
+        break
+    except OSError as e:
+        last = e
+        try: s.close()
+        except Exception: pass
+        s = None
+        time.sleep(0.3)
+if s is None:
+    print("  [cli] connect 8s 内始终失败, 末次:", last); sys.exit(1)
+open(flag, "w").close()             # 通知 shell: 已建连
 s.settimeout(0.5)
 # 持续发 (杀 listener 后这些包 + 重传打已建流分支 → 用来验不被 mark)
 for _ in range(200):
