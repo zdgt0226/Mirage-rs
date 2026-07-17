@@ -63,6 +63,11 @@ pub enum InboundConfig {
         // Note: 服务端这一侧决定下载速度, 比客户端的 brutal 设置重要得多.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_rate_mbps: Option<u64>,
+        // 握手 token 的时间戳容忍窗口 (秒). 客户端时钟与本机相差超过它 → auth 失败.
+        // 默认 60 (见 hello_auth::DEFAULT_AUTH_TS_TOLERANCE_SECS)。别设太小: 首次握手
+        // 用未同步的裸系统时钟, TIME_SYNC 卡在这个窗口上无法 bootstrap → 偏差大的机器锁死。
+        #[serde(default = "default_auth_ts_tolerance")]
+        auth_ts_tolerance_secs: u64,
     },
     Mixed {
         tag: String,
@@ -331,6 +336,10 @@ fn default_log_level() -> String {
 
 fn default_pool_size() -> usize {
     16
+}
+
+fn default_auth_ts_tolerance() -> u64 {
+    crate::crypto::hello_auth::DEFAULT_AUTH_TS_TOLERANCE_SECS
 }
 
 impl Config {

@@ -48,6 +48,7 @@ pub(super) async fn handle_connection(
     password: String,
     camouflage_host: String,
     cam_pool: Arc<CamouflagePool>,
+    auth_ts_tolerance_secs: u64,
 ) {
     stream.set_nodelay(true).unwrap_or_default();
 
@@ -100,7 +101,7 @@ pub(super) async fn handle_connection(
             let session_id = &body[39..39 + sid_len];
             let mut sid_array = [0u8; 32];
             sid_array.copy_from_slice(session_id);
-            if crate::crypto::hello_auth::verify_session_token(&password, &sid_array) {
+            if crate::crypto::hello_auth::verify_session_token(&password, &sid_array, auth_ts_tolerance_secs) {
                 authenticated = true;
                 client_random.copy_from_slice(&body[6..38]);
             }

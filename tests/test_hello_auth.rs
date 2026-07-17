@@ -11,10 +11,10 @@ fn test_token_auth_roundtrip() {
     // Verify valid token
     let mut token_arr = [0u8; 32];
     token_arr.copy_from_slice(&token);
-    assert!(verify_session_token(password, &token_arr));
-    
+    assert!(verify_session_token(password, &token_arr, 60));
+
     // Replay should fail
-    assert!(!verify_session_token(password, &token_arr));
+    assert!(!verify_session_token(password, &token_arr, 60));
 }
 
 #[test]
@@ -35,10 +35,10 @@ fn test_time_sync_bypass_and_replay_cache() {
     let ts = now - 300;
 
     // The cache should accept it since we removed the duplicate SystemTime restriction in P0
-    let accepted = cache.check_and_insert(ts, &token);
+    let accepted = cache.check_and_insert(ts, &token, 14);
     assert!(accepted, "Cache should accept token regardless of raw SystemTime difference");
 
     // But repeating the exact same token should fail (replay attack detected)
-    let accepted_again = cache.check_and_insert(ts, &token);
+    let accepted_again = cache.check_and_insert(ts, &token, 14);
     assert!(!accepted_again, "Replay attack should be blocked");
 }

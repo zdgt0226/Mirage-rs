@@ -52,11 +52,16 @@ pub fn make_session_token(password: &str) -> [u8; 32] {
     token
 }
 
-/// Token 时间戳容忍窗口 (秒). v0.4 协议有内嵌时间同步, 不再需要 60s 的宽容窗口.
-/// ±10s 既能容忍 handshake 抖动 (RTT 几百毫秒), 又显著缩小重放攻击窗口.
-const TOKEN_TS_TOLERANCE_SECS: u64 = 10;
+/// Token 时间戳容忍窗口默认值 (秒). 服务端可经 config `auth_ts_tolerance_secs` 覆盖.
+///
+/// 为什么不能太小 (曾是 10s, 实测坑): 首次握手用的是客户端**未经 TIME_SYNC 校正**的裸
+/// 系统时钟 (TIME_OFFSET 初始 0), 而 TIME_SYNC 帧只在 auth 成功后才下发 —— auth 卡在这个
+/// 窗口上 → TIME_SYNC 永远 bootstrap 不了 → 时钟偏差 > 窗口的机器被永久锁死。auth 失败又
+/// 必须转发伪装站 (不能回时间提示, 否则破坏抗探测), 所以这个窗口是首次握手唯一的容错。
+/// 60s 容日常漂移; 更大的偏差应靠 NTP 压住 (且 NTP 不能走本代理, 否则死循环), 不靠拉宽窗口。
+pub const DEFAULT_AUTH_TS_TOLERANCE_SECS: u64 = 60;
 
-/// ReplayCache 桶大小 (秒). 配合 TOKEN_TS_TOLERANCE_SECS 设置.
+/// ReplayCache 桶大小 (秒). 保留桶数由容差自动推导 (见 verify_session_token), 二者始终一致.
 const REPLAY_BUCKET_SECS: u64 = 10;
 
 pub struct TokenReplayCache {
@@ -73,18 +78,20 @@ impl TokenReplayCache {
         }
     }
 
-    pub fn check_and_insert(&self, ts: u64, token: &[u8]) -> bool {
+    /// retain_buckets: 保留最近多少个桶 (由容差推导, 见 verify_session_token)。必须覆盖
+    /// 整个 ±容差窗口, 否则窗口内的旧 token 被过早淘汰 → 重放漏检。
+    pub fn check_and_insert(&self, ts: u64, token: &[u8], retain_buckets: u64) -> bool {
         let current_bucket = ts / REPLAY_BUCKET_SECS;
         let mut guard = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let (hwm, cache) = &mut *guard;
 
-        // hwm = 已见的最高桶 (单调)。ts 容忍窗口 ±10s + 桶量化 → 一个仍有效的 token
-        // 桶最低可到 hwm-2 (未来向 token 可把 hwm 推到 now_bucket+1)。保留 hwm-2..hwm
-        // 共 3 桶 (30s), 覆盖整个容忍窗口。参考用 hwm 而非 current_bucket, 旧 token 重放
-        // 不会把参考拉回复活已淘汰桶。
+        // hwm = 已见的最高桶 (单调)。ts 容忍窗口 ±tol + 桶量化 → 一个仍有效的 token 桶
+        // 最低可到 hwm - 2*tol/bucket (未来向 token 可把 hwm 推到 now_bucket + tol/bucket)。
+        // retain_buckets 已按此推导。参考用 hwm 而非 current_bucket, 旧 token 重放不会把
+        // 参考拉回复活已淘汰桶。
         *hwm = (*hwm).max(current_bucket);
         let hwm_val = *hwm;
-        cache.retain(|&k, _| hwm_val.saturating_sub(k) <= 2);
+        cache.retain(|&k, _| hwm_val.saturating_sub(k) <= retain_buckets);
 
         let bucket = cache.entry(current_bucket).or_default();
         if bucket.len() > 100_000 {
@@ -102,9 +109,14 @@ impl TokenReplayCache {
     }
 }
 
+/// token 时间戳是否落在 ±tolerance 窗口内 (双向对称: 客户端可能快也可能慢)。
+fn ts_within_tolerance(ts: u64, now: u64, tolerance_secs: u64) -> bool {
+    now <= ts + tolerance_secs && ts <= now + tolerance_secs
+}
+
 static REPLAY_CACHE: OnceLock<TokenReplayCache> = OnceLock::new();
 
-pub fn verify_session_token(password: &str, token: &[u8; 32]) -> bool {
+pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u64) -> bool {
     let mut random_prefix = [0u8; 8];
     random_prefix.copy_from_slice(&token[0..8]);
     
@@ -129,16 +141,41 @@ pub fn verify_session_token(password: &str, token: &[u8; 32]) -> bool {
     let ts = u64::from_be_bytes(ts_bytes);
     let now = crate::time_sync::now_sec();
 
-    if now > ts + TOKEN_TS_TOLERANCE_SECS || ts > now + TOKEN_TS_TOLERANCE_SECS {
+    if !ts_within_tolerance(ts, now, tolerance_secs) {
         return false;
     }
-    
+
+    // 保留桶数覆盖整个 ±容差窗口: 最旧有效 token 桶 = (now-tol)/bucket, hwm 最高可被未来
+    // 向 token 推到 (now+tol)/bucket → 需保留 2*tol/bucket 个桶, +2 余量抗桶边界量化。
+    let retain_buckets = 2 * tolerance_secs / REPLAY_BUCKET_SECS + 2;
     let cache = REPLAY_CACHE.get_or_init(TokenReplayCache::new);
-    if !cache.check_and_insert(ts, token) {
+    if !cache.check_and_insert(ts, token, retain_buckets) {
         return false; // Replay detected
     }
 
     true
+}
+
+#[cfg(test)]
+mod tolerance_tests {
+    use super::ts_within_tolerance;
+
+    #[test]
+    fn within_and_beyond_window_both_directions() {
+        let now = 1_000_000u64;
+        let tol = 60;
+        // 窗口内 (含边界)
+        assert!(ts_within_tolerance(now, now, tol), "ts==now");
+        assert!(ts_within_tolerance(now - 60, now, tol), "客户端慢 60s (边界)");
+        assert!(ts_within_tolerance(now + 60, now, tol), "客户端快 60s (边界)");
+        assert!(ts_within_tolerance(now - 59, now, tol));
+        // 窗口外, 两个方向都要拒
+        assert!(!ts_within_tolerance(now - 61, now, tol), "客户端慢 61s 应拒");
+        assert!(!ts_within_tolerance(now + 61, now, tol), "客户端快 61s 应拒");
+        // 更小的容差更严
+        assert!(!ts_within_tolerance(now - 11, now, 10), "±10s: 慢 11s 应拒");
+        assert!(ts_within_tolerance(now - 9, now, 10), "±10s: 慢 9s 应过");
+    }
 }
 
 #[cfg(test)]
@@ -148,10 +185,10 @@ mod replay_tests {
     #[test]
     fn first_seen_ok_replay_denied() {
         let c = TokenReplayCache::new();
-        assert!(c.check_and_insert(1000, b"tok-a"), "首见应放行");
-        assert!(!c.check_and_insert(1000, b"tok-a"), "重放同 token 应拒绝");
+        assert!(c.check_and_insert(1000, b"tok-a", 2), "首见应放行");
+        assert!(!c.check_and_insert(1000, b"tok-a", 2), "重放同 token 应拒绝");
         // 不同 token 同桶各自独立
-        assert!(c.check_and_insert(1000, b"tok-b"));
+        assert!(c.check_and_insert(1000, b"tok-b", 2));
     }
 
     #[test]
@@ -159,12 +196,12 @@ mod replay_tests {
         // 回归 F1: token1(桶100) 存入后, 一个更高桶的 token 推进 hwm, 旧 token 重放
         // 仍须被检出 (旧实现会因桶被淘汰而漏检)。
         let c = TokenReplayCache::new();
-        assert!(c.check_and_insert(1009, b"old"), "token1 首见");
+        assert!(c.check_and_insert(1009, b"old", 2), "token1 首见");
         // ts=1020 → 桶 102, 把 hwm 推到 102 (旧代码此刻淘汰桶 100)
-        assert!(c.check_and_insert(1020, b"mid"));
+        assert!(c.check_and_insert(1020, b"mid", 2));
         // token1 重放: 现在必须仍被检出为重放
         assert!(
-            !c.check_and_insert(1009, b"old"),
+            !c.check_and_insert(1009, b"old", 2),
             "F1: 桶推进后旧 token 重放必须仍被检出"
         );
     }
@@ -174,10 +211,10 @@ mod replay_tests {
         // 超出 3 桶窗口的旧桶应被淘汰 (内存有界)。这类 token 早已被 ts 容忍窗口拒绝,
         // 淘汰后即便"重放"也无所谓 (ts 校验在 check_and_insert 之前已挡下)。
         let c = TokenReplayCache::new();
-        assert!(c.check_and_insert(1000, b"ancient")); // 桶 100
+        assert!(c.check_and_insert(1000, b"ancient", 2)); // 桶 100
         // hwm 推到 130 (桶 130), 桶 100 早已 < hwm-2 被淘汰
-        assert!(c.check_and_insert(1300, b"now"));
+        assert!(c.check_and_insert(1300, b"now", 2));
         // 桶 100 已淘汰, 这里返回 true 只是证明桶确实被清 (内存有界); 真实场景 ts 校验已挡
-        assert!(c.check_and_insert(1000, b"ancient"));
+        assert!(c.check_and_insert(1000, b"ancient", 2));
     }
 }

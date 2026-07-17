@@ -57,6 +57,7 @@ pub async fn start_server(
     camouflage_host: &str,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     brutal_rate_bytes_per_sec: Option<u64>,
+    auth_ts_tolerance_secs: u64,
 ) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
@@ -65,7 +66,7 @@ pub async fn start_server(
             return;
         }
     };
-    info!("Mirage Server listening on {}", listen_addr);
+    info!("Mirage Server listening on {} (auth 时钟容差 ±{}s)", listen_addr, auth_ts_tolerance_secs);
 
     // Brutal CC 必须在 listener 上预设算法名, 让 accept 出来的子 socket 从
     // SYN-ACK 起就是 brutal. 在已 ESTABLISHED 的 accepted socket 上中途切换
@@ -120,7 +121,7 @@ pub async fn start_server(
                 let cam = camouflage_host.to_string();
                 let pool = cam_pool.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool).await;
+                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool, auth_ts_tolerance_secs).await;
                 });
             }
             Err(e) => {

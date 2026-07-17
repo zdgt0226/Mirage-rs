@@ -523,7 +523,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, .. } => {
+            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
                 let ebp = ebpf_clone.clone();
@@ -532,7 +532,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     .filter(|m| *m > 0)
                     .map(|m| m * 125_000);
                 tokio::spawn(async move {
-                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps).await;
+                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs).await;
                 });
             }
             crate::config::InboundConfig::Mixed { listen, port, .. } => {

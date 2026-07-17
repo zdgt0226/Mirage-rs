@@ -594,7 +594,20 @@ impl WarmPool {
                 );
             }
             Ok(Err(e)) => {
-                tracing::warn!("TIME_SYNC: recv failed: {:?}, proceeding without sync", e);
+                // 解密失败 = 服务端很可能拒了本次认证、把连接转发到了伪装站, 我们却在用
+                // 密码派生的会话密钥去解伪装站的 TLS 流量 → 解不开。这是"认证没过"的信号。
+                // 池子每次补货都会撞到, 故只详细提示一次 (避免刷屏)。两大常见原因见下。
+                static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !HINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "隧道认证疑似失败 (TIME_SYNC 解密失败: {:?})。排查: ①密码与服务端是否一致; \
+                         ②本机系统时钟与服务端相差是否超过服务端容差 (默认 ±60s) —— 两端各跑 `date -u` \
+                         对一下, 并确认 NTP 正常且**不走本代理** (否则隧道挂→NTP不同步→时钟更偏 死循环)。",
+                        e
+                    );
+                } else {
+                    tracing::debug!("TIME_SYNC: recv failed: {:?}, proceeding without sync", e);
+                }
             }
             Err(_) => {
                 tracing::info!("TIME_SYNC: timeout waiting for server time (3s), proceeding with local time. Old server?");
