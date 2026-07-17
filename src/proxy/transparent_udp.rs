@@ -37,6 +37,10 @@ use crate::proxy::outbound::OutboundNode;
 use crate::router::RoutingRequest;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// 首个下行到达前的短超时: 上游/VPS 过滤出向 UDP (如 QUIC) 时, 整段收不到下行, 用它
+// 快速拆流, 别死等 IDLE_TIMEOUT(60s) 白占一条隧道 (QUIC 站点每 flow 都占 = 大量浪费)。
+// 收到任一下行后转 IDLE_TIMEOUT —— 正常 UDP 会话可长期存活。8s 远宽于隧道往返首响。
+const FIRST_DOWNLINK_TIMEOUT: Duration = Duration::from_secs(8);
 const UDP_BUF: usize = 65536;
 /// 并发透明 UDP 流上限。每流 ≈ 1 出口 socket FD + 1 task + 64KB downlink buf
 /// (+ 共享 reply socket)。透明 UDP 仅跑在 64 位网关 (内核≥5.9+CAP_NET_ADMIN),
@@ -633,8 +637,11 @@ async fn setup_flow(
             let dl_ctr = down_ctr.clone();
             let downlink = async move {
                 let mut acc: Vec<u8> = Vec::new();
+                let mut got_downlink = false;
                 loop {
-                    let chunk = match tokio::time::timeout(IDLE_TIMEOUT, reader.recv_data()).await {
+                    // 首个下行前用短超时快速拆流 (见 FIRST_DOWNLINK_TIMEOUT); 收到后转常规 idle。
+                    let to = if got_downlink { IDLE_TIMEOUT } else { FIRST_DOWNLINK_TIMEOUT };
+                    let chunk = match tokio::time::timeout(to, reader.recv_data()).await {
                         Ok(Ok(c)) => c,
                         _ => break,
                     };
@@ -643,11 +650,25 @@ async fn setup_flow(
                         if !payload.is_empty() {
                             let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
                             dl_ctr.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            got_downlink = true;
                         }
                         acc.drain(0..consumed);
                     }
                     if acc.len() > UDP_BUF * 2 {
                         break; // 防异常累积
+                    }
+                }
+                // 整段没收到任何下行 = 上游/VPS 很可能过滤了出向 UDP (QUIC 典型)。刷屏没用,
+                // 一次性提示到点子上 (这次真机排障就卡在这)。
+                if !got_downlink {
+                    static HINTED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !HINTED.swap(true, Ordering::Relaxed) {
+                        warn!(
+                            "[TPROXY-UDP] UDP 流整段无下行后拆流 —— 服务端 VPS 很可能过滤出向 UDP \
+                             (QUIC/UDP:443 常见), 客户端会回落 TCP。若大量 QUIC 站点如此, 检查服务端 \
+                             VPS 的 UDP 出站策略 (廉价 VPS 防滥用常封 UDP)。"
+                        );
                     }
                 }
             };

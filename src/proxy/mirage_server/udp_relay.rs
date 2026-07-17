@@ -176,7 +176,18 @@ pub(super) async fn handle_udp_relay(
                 if let Ok(socket_addr) =
                     crate::proxy::resolver::resolve_first(&target_addr_str, port).await
                 {
-                    let _ = udp_socket.send_to(payload, socket_addr).await;
+                    // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
+                    // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
+                    if let Err(e) = udp_socket.send_to(payload, socket_addr).await {
+                        static WARNED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::warn!(
+                                "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
+                                socket_addr, e
+                            );
+                        }
+                    }
                 }
             }
         }
