@@ -15,7 +15,10 @@
 //! 验证: 生成的 ClientHello JA4 = t13d1516h2_8daaf6152771_806a8c22fdea, 跟真实
 //! Chromium 150 完全一致 (见 tests / dump_tls).
 //!
-//! TODO(v2): 增加 Android OkHttp profile (稳定指纹, SNI 灵活) 做多样性.
+//! v0.6.0: 加 Firefox 152 profile (从真实抓包字节精确复刻) + 加权轮换 (Chrome 70% /
+//! Firefox 30%), 稀释"单一出口指纹一模一样"这个行为特征。Firefox 与 Chrome 都提供
+//! MLKEM+X25519, ServerHello 模板对两者自洽 (模板 fetch 固定用 Chrome 保子集一致)。
+//! TODO: 增加 Android OkHttp profile (需 Android 真实抓包) 进一步多样化。
 
 use rand::RngExt;
 
@@ -285,12 +288,167 @@ pub fn build_chromium(sni_bytes: &[u8], session_id: &[u8], client_random: &[u8])
     assemble(session_id, client_random, &ciphers, &exts)
 }
 
-/// 生成 ClientHello + client_random. session_id 携带 Mirage 的 Poly1305 认证
-/// token (Chromium 也用 32B session_id, 完美契合).
+// ── Firefox 152 固定参数 (从真实抓包提取, 4 样本对齐) ───────────────────────
+// 与 Chromium 的关键差异: ①cipher 无 GREASE; ②扩展顺序固定不洗牌、无 GREASE 书挡;
+// ③有 record_size_limit(001c)/delegated_credentials(0022); ④真 ECH 281B; ⑤key_share
+// 三份 (MLKEM768+X25519+P256)。groups 含 11ec(MLKEM) → ServerHello 模板对 FF/Chrome 同样自洽。
+const FIREFOX_CIPHERS: [u16; 16] = [
+    0x1301, 0x1303, 0x1302, 0xc02b, 0xc02f, 0xcca9, 0xcca8, 0xc02c, 0xc030, 0xc00a, 0xc013, 0xc014,
+    0x009c, 0x009d, 0x002f, 0x0035,
+];
+const FIREFOX_GROUPS: [u16; 7] = [0x11ec, 0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101];
+/// signature_algorithms (0x000d) 内容 (含 2B 列表长度前缀), 11 个算法, 与 Chrome 略不同顺序.
+const FIREFOX_SIGALGS: &[u8] = &[
+    0x00, 0x16, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01,
+    0x05, 0x01, 0x06, 0x01, 0x02, 0x03, 0x02, 0x01,
+];
+/// delegated_credentials (0x0022) 内容: 内层 sigalgs 列表 [len=8][0403 0503 0603 0203].
+const FIREFOX_DELEG_CREDS: &[u8] = &[0x00, 0x08, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x02, 0x03];
+/// compress_certificate (0x001b): [len=6][zlib(0001) brotli(0002) zstd(0003)].
+const FIREFOX_CERT_COMPRESS: &[u8] = &[0x06, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03];
+
+/// supported_versions (0x002b) Firefox 版: [len=4][TLS1.3][TLS1.2] —— 无 GREASE.
+fn ff_supported_versions_ext() -> Vec<u8> {
+    ext(0x002b, &[0x04, 0x03, 0x04, 0x03, 0x03])
+}
+
+/// supported_groups (0x000a) Firefox 版: 7 曲线, 无 GREASE.
+fn ff_supported_groups_ext() -> Vec<u8> {
+    let mut g = Vec::new();
+    for &grp in &FIREFOX_GROUPS {
+        g.extend_from_slice(&grp.to_be_bytes());
+    }
+    let mut data = Vec::with_capacity(2 + g.len());
+    data.extend_from_slice(&(g.len() as u16).to_be_bytes());
+    data.extend_from_slice(&g);
+    ext(0x000a, &data)
+}
+
+/// key_share (0x0033) Firefox 版: 三份 X25519MLKEM768(1216)+X25519(32)+secp256r1(65), 无 GREASE.
+/// 公钥随机 (Mirage 不做真密钥派生); MLKEM ek 需 FIPS-203 合法 (对端会校验), 其余随机即可.
+fn ff_key_share_ext() -> Vec<u8> {
+    let mut list = Vec::with_capacity(HYBRID_KEYSHARE_LEN + 128);
+    // ① X25519MLKEM768: ek(1184 合法) || X25519(32 随机) = 1216
+    list.extend_from_slice(&0x11ECu16.to_be_bytes());
+    list.extend_from_slice(&(HYBRID_KEYSHARE_LEN as u16).to_be_bytes());
+    list.extend_from_slice(&mlkem768_valid_encap_key());
+    let mut xh = [0u8; 32];
+    rand::fill(&mut xh);
+    list.extend_from_slice(&xh);
+    // ② 纯 X25519 (32 随机)
+    let mut x = [0u8; 32];
+    rand::fill(&mut x);
+    list.extend_from_slice(&0x001Du16.to_be_bytes());
+    list.extend_from_slice(&32u16.to_be_bytes());
+    list.extend_from_slice(&x);
+    // ③ secp256r1 (65): 未压缩点 04||64 随机 (对端选 MLKEM, 不实际用它, 只需结构合法)
+    let mut p = [0u8; 65];
+    rand::fill(&mut p);
+    p[0] = 0x04;
+    list.extend_from_slice(&0x0017u16.to_be_bytes());
+    list.extend_from_slice(&65u16.to_be_bytes());
+    list.extend_from_slice(&p);
+
+    let mut data = Vec::with_capacity(2 + list.len());
+    data.extend_from_slice(&(list.len() as u16).to_be_bytes());
+    data.extend_from_slice(&list);
+    ext(0x0033, &data)
+}
+
+/// ECH (0xfe0d) Firefox 版: 281B (payload 239). kdf 固定 HKDF-SHA256, aead 随机(观测 0001/0003),
+/// config_id/enc/payload 每连接随机 —— GREASE ECH, 内容不可校验.
+fn ff_ech_ext() -> Vec<u8> {
+    let mut c = Vec::with_capacity(281);
+    c.push(0x00); // outer
+    c.extend_from_slice(&0x0001u16.to_be_bytes()); // kdf HKDF-SHA256
+    let aead = if rand::rng().random_bool(0.5) { 0x0001u16 } else { 0x0003u16 };
+    c.extend_from_slice(&aead.to_be_bytes());
+    let mut cid = [0u8; 1];
+    rand::fill(&mut cid);
+    c.push(cid[0]);
+    c.extend_from_slice(&32u16.to_be_bytes());
+    let mut enc = [0u8; 32];
+    rand::fill(&mut enc);
+    c.extend_from_slice(&enc);
+    const PAYLOAD_LEN: usize = 239;
+    c.extend_from_slice(&(PAYLOAD_LEN as u16).to_be_bytes());
+    let mut payload = [0u8; PAYLOAD_LEN];
+    rand::fill(&mut payload[..]);
+    c.extend_from_slice(&payload);
+    ext(0xfe0d, &c)
+}
+
+/// 构造 Firefox 152 ClientHello. 扩展顺序**固定不洗牌**、全程无 GREASE (Firefox 真实行为).
+pub fn build_firefox(sni_bytes: &[u8], session_id: &[u8], client_random: &[u8]) -> Vec<u8> {
+    let mut ciphers = Vec::with_capacity(32);
+    for &c in &FIREFOX_CIPHERS {
+        ciphers.extend_from_slice(&c.to_be_bytes());
+    }
+
+    // 17 个扩展, 固定顺序 (跨 4 样本一致)
+    let exts_list: Vec<Vec<u8>> = vec![
+        sni_ext(sni_bytes),
+        ext(0x0017, b""),                    // extended_master_secret
+        ext(0xff01, b"\x00"),                // renegotiation_info
+        ff_supported_groups_ext(),
+        ext(0x000b, EC_POINT_FORMATS),
+        ext(0x0023, b""),                    // session_ticket
+        ext(0x0010, ALPN),
+        ext(0x0005, STATUS_REQUEST),
+        ext(0x0022, FIREFOX_DELEG_CREDS),    // delegated_credentials
+        ext(0x0012, b""),                    // signed_certificate_timestamp
+        ff_key_share_ext(),
+        ff_supported_versions_ext(),
+        ext(0x000d, FIREFOX_SIGALGS),
+        ext(0x002d, PSK_MODES),              // psk_key_exchange_modes
+        ext(0x001c, b"\x40\x01"),            // record_size_limit
+        ext(0x001b, FIREFOX_CERT_COMPRESS),  // compress_certificate
+        ff_ech_ext(),
+    ];
+    let mut exts = Vec::new();
+    for e in &exts_list {
+        exts.extend_from_slice(e);
+    }
+
+    assemble(session_id, client_random, &ciphers, &exts)
+}
+
+/// 客户端指纹 profile. 轮换以稀释"单一出口指纹一模一样"这个行为特征.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    Chromium,
+    Firefox,
+}
+
+/// 加权随机选一个 profile (贴近真实桌面浏览器份额, 大头仍是 Chrome).
+fn pick_profile() -> Profile {
+    if rand::rng().random_bool(0.70) {
+        Profile::Chromium
+    } else {
+        Profile::Firefox
+    }
+}
+
+/// 生成 ClientHello + client_random. session_id 携带 Mirage 的 Poly1305 认证 token
+/// (Chromium/Firefox 都用 32B session_id, 完美契合)。profile 每次轮换。
 pub fn build_client_hello(server_name: &str, session_id: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
     let mut client_random = [0u8; 32];
     rand::fill(&mut client_random);
-    let record = build_chromium(server_name.as_bytes(), session_id, &client_random);
+    let record = match pick_profile() {
+        Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, &client_random),
+        Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, &client_random),
+    };
+    (record, client_random)
+}
+
+/// 指定 profile 构造 (供 dump/测试用, 不轮换)。
+pub fn build_with_profile(profile: Profile, server_name: &str, session_id: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
+    let mut client_random = [0u8; 32];
+    rand::fill(&mut client_random);
+    let record = match profile {
+        Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, &client_random),
+        Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, &client_random),
+    };
     (record, client_random)
 }
 

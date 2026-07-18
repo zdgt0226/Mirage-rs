@@ -1,16 +1,20 @@
+use mirage_rs::crypto::tls_raw::{self, Profile};
 use std::fs;
-use mirage_rs::crypto::tls_raw;
 
 fn main() {
     let session_id = [0u8; 32];
-    let client_random = [0u8; 32];
-    let sni = b"www.apple.com";
+    let sni = std::env::args().nth(1).unwrap_or_else(|| "www.apple.com".to_string());
 
-    // 生成 3 个 Chromium 150 ClientHello (扩展顺序每次随机洗牌, 验证洗牌 + JA4 稳定).
-    let s1 = tls_raw::build_chromium(sni, &session_id, &client_random);
-    let s2 = tls_raw::build_chromium(sni, &session_id, &client_random);
-    let s3 = tls_raw::build_chromium(sni, &session_id, &client_random);
-
-    let output = format!("{}\n{}\n{}", hex::encode(s1), hex::encode(s2), hex::encode(s3));
-    fs::write("/tmp/rust_tls.hex", output).unwrap();
+    // 每个 profile 生成 3 个样本 (Chrome 每次洗牌; Firefox 固定顺序)。把这些十六进制导入
+    // Wireshark / tlsfingerprint.io, 和真实浏览器抓包对 JA4 / 逐字节核对。
+    let mut out = String::new();
+    for (name, prof) in [("chromium", Profile::Chromium), ("firefox", Profile::Firefox)] {
+        for k in 1..=3 {
+            let (ch, _) = tls_raw::build_with_profile(prof, &sni, &session_id);
+            out.push_str(&format!("{}#{} {}\n", name, k, hex::encode(&ch)));
+        }
+    }
+    let path = "/tmp/rust_tls.hex";
+    fs::write(path, &out).unwrap();
+    println!("wrote {} ({} lines) sni={}", path, out.lines().count(), sni);
 }

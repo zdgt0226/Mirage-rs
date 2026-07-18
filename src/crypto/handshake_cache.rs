@@ -138,7 +138,13 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     let mut session_id = [0u8; 32];
     rand::fill(&mut session_id);
     let hostname = host.split(':').next().unwrap_or(host);
-    let (ch, _) = crate::crypto::tls_raw::build_client_hello(hostname, &session_id);
+    // 模板 fetch **固定用 Chromium**, 不用轮换的 build_client_hello: Chrome 的 supported_groups
+    // (11ec/1d/17/18) 是所有 profile 的子集 → camouflage 站据此协商出的曲线, 任何 profile
+    // 的客户端都提供过 → 回放的 ServerHello 恒自洽。若用 Firefox CH fetch, 万一协商到 FF 独有
+    // 的 P521/ffdhe, 回放给 Chrome 客户端就会"ServerHello 选了没提供的曲线"= 非法 TLS。
+    let mut client_random = [0u8; 32];
+    rand::fill(&mut client_random);
+    let ch = crate::crypto::tls_raw::build_chromium(hostname.as_bytes(), &session_id, &client_random);
 
     stream.write_all(&ch).await?;
 

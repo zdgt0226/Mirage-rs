@@ -132,6 +132,102 @@ fn chromium_mlkem_keyshare_valid() {
     assert!(found_mlkem, "必须含 X25519MLKEM768 后量子 key_share");
 }
 
+// ── Firefox 152 指纹回归 (从真实抓包锁定, 4 样本对齐) ────────────────────────
+
+#[test]
+fn firefox_cipher_and_ext_sets() {
+    let ch = tls_raw::build_firefox(b"www.cloudflare.com", &[0u8; 32], &[0u8; 32]);
+    let p = parse(&ch);
+
+    // 排序后 cipher 集合 = 真实 Firefox 152 (16 个, 无 GREASE; 含 c00a, 区别于 Chrome)
+    let mut cs = p.ciphers.clone();
+    cs.sort();
+    assert_eq!(
+        cs,
+        vec![
+            0x002f, 0x0035, 0x009c, 0x009d, 0x1301, 0x1302, 0x1303, 0xc00a, 0xc013, 0xc014,
+            0xc02b, 0xc02c, 0xc02f, 0xc030, 0xcca8, 0xcca9
+        ],
+        "cipher 集合必须与真实 Firefox 152 一致"
+    );
+    // Firefox cipher 无 GREASE (Chrome 才 GREASE)
+    assert!(!p.ciphers.iter().any(|c| is_grease(*c)), "Firefox cipher 不应含 GREASE");
+
+    // 排序后扩展集合 = 真实 Firefox 152 (17 个)
+    let mut es = p.exts.clone();
+    es.sort();
+    assert_eq!(
+        es,
+        vec![
+            0x0000, 0x0005, 0x000a, 0x000b, 0x000d, 0x0010, 0x0012, 0x0017, 0x001b, 0x001c,
+            0x0022, 0x0023, 0x002b, 0x002d, 0x0033, 0xfe0d, 0xff01
+        ],
+        "扩展集合必须与真实 Firefox 152 一致"
+    );
+    assert!(!p.exts.iter().any(|e| is_grease(*e)), "Firefox 扩展不应含 GREASE 书挡");
+}
+
+#[test]
+fn firefox_fixed_order_no_shuffle() {
+    // Firefox 扩展顺序固定 (不像 Chrome 洗牌); 跨多次生成必须完全一致 = 抓包顺序.
+    let expected = vec![
+        0x0000u16, 0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x0010, 0x0005, 0x0022, 0x0012, 0x0033,
+        0x002b, 0x000d, 0x002d, 0x001c, 0x001b, 0xfe0d,
+    ];
+    for _ in 0..50 {
+        let ch = tls_raw::build_firefox(b"example.com", &[0u8; 32], &[0u8; 32]);
+        let p = parse(&ch);
+        assert_eq!(p.exts, expected, "Firefox 扩展顺序必须固定 = 真实抓包顺序");
+    }
+}
+
+#[test]
+fn firefox_three_key_shares() {
+    // Firefox 152 key_share 三份: X25519MLKEM768(1216) + X25519(32) + secp256r1(65).
+    let ch = tls_raw::build_firefox(b"example.com", &[0u8; 32], &[0u8; 32]);
+    let p = parse(&ch);
+    let ks = &p.key_share;
+    let mut i = 2usize;
+    let mut groups = Vec::new();
+    while i + 4 <= ks.len() {
+        let group = u16b(ks, i);
+        let klen = u16b(ks, i + 2) as usize;
+        groups.push((group, klen));
+        i += 4 + klen;
+    }
+    assert_eq!(
+        groups,
+        vec![(0x11ec, 1216), (0x001d, 32), (0x0017, 65)],
+        "Firefox key_share = MLKEM768(1216)+X25519(32)+P256(65), 无 GREASE"
+    );
+}
+
+#[test]
+fn firefox_token_in_session_id() {
+    // Mirage 认证 token 塞在 legacy_session_id, 服务端按固定位置提取 —— 与 profile 无关.
+    let token: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let ch = tls_raw::build_firefox(b"a.com", &token, &[0u8; 32]);
+    // session_id 位置: record(5) + hs_hdr(4) + version(2) + random(32) + sid_len(1)
+    let off = 5 + 4 + 2 + 32;
+    assert_eq!(ch[off], 32, "session_id 长度 32");
+    assert_eq!(&ch[off + 1..off + 33], &token, "session_id 必须 == token");
+}
+
+#[test]
+fn firefox_mlkem_ek_valid() {
+    // 与 Chrome 同样: MLKEM ek 系数必须 < q=3329 (对端 FIPS-203 模数校验)。
+    let ch = tls_raw::build_firefox(b"example.com", &[0u8; 32], &[0u8; 32]);
+    let p = parse(&ch);
+    let ks = &p.key_share;
+    let ek = &ks[6..6 + 1184]; // list_len(2) + group(2) + klen(2) = 6, 然后 1184B ek
+    const Q: u16 = 3329;
+    for o in (0..1152).step_by(3) {
+        let c0 = ek[o] as u16 | (((ek[o + 1] & 0x0f) as u16) << 8);
+        let c1 = (ek[o + 1] >> 4) as u16 | ((ek[o + 2] as u16) << 4);
+        assert!(c0 < Q && c1 < Q, "Firefox ML-KEM 系数必须 < q=3329");
+    }
+}
+
 #[test]
 fn chromium_size_matches_real() {
     // 真实 Chromium 150 ~1786B (SNI=tls.peet.ws 11 字符). 我们的应在同量级
