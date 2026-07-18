@@ -31,30 +31,33 @@ struct dns_hdr {
  * 用于将 DNS 请求包中的域名动态解析并转化为 u64 哈希值。
  * 由于 eBPF 虚拟机不支持复杂的循环，这里使用了 `#pragma unroll` 对网络包的 Label 逐层拆解。
  */
-static inline __u64 hash_domain(void *data, void *data_end, int *offset) {
+// 三点必须一起, 否则加载被拒 (在内核 6.1 上逐一实测):
+//   ① __always_inline: 仅 `inline` 会被编成独立 BPF 子函数 (BPF-to-BPF call), 传包指针进
+//      子函数验证器跟不住边界 → "reg type unsupported for arg#0"。与 tc_divert.c 同款。
+//   ② __u32 off (无符号): 原 `int off` 经符号扩展后 `data+off` 可能被验证器判为负越界
+//      ("value -2147483648 makes pkt pointer out of bounds")。
+//   ③ 单层扁平循环: 原 10×63 嵌套 #pragma unroll 内联后状态爆炸 (>100 万指令 → E2BIG)。
+//      改成单循环 + "长度字节/字符字节"状态机, 哈希的字符与顺序同原实现 (同序 DJB2, 结果一致)。
+// DNS 名 wire 格式最长 255 字节, 循环上界取 256。
+static __always_inline __u64 hash_domain(void *data, void *data_end, __u32 *offset) {
     __u64 hash = 5381;
-    int off = *offset;
-    
+    __u32 off = *offset;
+    __u32 remaining = 0; // 当前 label 还剩几个字符待读; 0 表示下一字节是长度字节
+
     #pragma unroll
-    for (int i = 0; i < 10; i++) { // Max 10 labels
+    for (int i = 0; i < 256; i++) {
         if (data + off + 1 > data_end) break;
-        __u8 len = *((__u8 *)(data + off));
-        if (len == 0) {
-            off += 1;
-            break;
-        }
-        if (len > 63) break; // Invalid label length
-        
+        __u8 b = *((__u8 *)(data + off));
         off += 1;
-        #pragma unroll
-        for (int j = 0; j < 63; j++) {
-            if (j >= len) break;
-            if (data + off + 1 > data_end) break;
-            __u8 c = *((__u8 *)(data + off));
-            // to lowercase
-            if (c >= 'A' && c <= 'Z') c += 32;
-            hash = ((hash << 5) + hash) + c;
-            off += 1;
+        if (remaining == 0) {
+            if (b == 0) break;      // 根标签 → 域名结束
+            if (b > 63) break;      // 非法 label 长度
+            remaining = b;          // 进入该 label 的字符
+        } else {
+            __u8 c = b;
+            if (c >= 'A' && c <= 'Z') c += 32; // to lowercase
+            hash = ((hash << 5) + hash) + c;   // DJB2, 与用户态一致
+            remaining -= 1;
         }
     }
     *offset = off;
@@ -107,11 +110,11 @@ int mirage_xdp_dns(struct xdp_md *ctx) {
     // 回畸形响应致客户端 SERVFAIL/重试。这类查询交用户态 DNS server 正确处理。
     if (dns->ancount != 0 || dns->nscount != 0 || dns->arcount != 0) return XDP_PASS;
 
-    int offset = sizeof(*eth) + sizeof(*iph) + sizeof(*udph) + sizeof(*dns);
-    
+    __u32 offset = sizeof(*eth) + sizeof(*iph) + sizeof(*udph) + sizeof(*dns);
+
     // Hash the QNAME
     __u64 domain_hash = hash_domain(data, data_end, &offset);
-    
+
     // Check QTYPE and QCLASS
     if (data + offset + 4 > data_end) return XDP_PASS;
     __u16 qtype = bpf_ntohs(*((__u16 *)(data + offset)));
