@@ -15,6 +15,10 @@ pub struct FakeIpMapper {
     persist_path: Option<PathBuf>,
     /// 有新分配就置 true; flush 后清。避免无变化时空写盘。
     dirty: AtomicBool,
+    /// 串行化落盘: dirty.swap 只挡"无变化空写", 挡不住"周期 flush 写 .tmp 途中新分配置脏、
+    /// 关服 flush 又过了 dirty.swap"这种两个 flush 同写一个 .tmp 的窄竞态 → 文件交错损坏。
+    /// 落盘全程持此锁, 两个 flush 各自完整写+rename, 不交错。
+    flush_lock: std::sync::Mutex<()>,
 }
 
 impl FakeIpMapper {
@@ -48,6 +52,7 @@ impl FakeIpMapper {
             ip_to_domain: RwLock::new(HashMap::new()),
             persist_path: persist_path.map(PathBuf::from),
             dirty: AtomicBool::new(false),
+            flush_lock: std::sync::Mutex::new(()),
         };
 
         if let Some(p) = &mapper.persist_path {
@@ -89,6 +94,12 @@ impl FakeIpMapper {
             if (u32::from(ip) & self.mask) != self.network {
                 continue; // 不在本 range, 丢弃 (换过网段)
             }
+            // 排除网络号(.0)/.1/广播: 分配器本就从 network+2 起、跳过这三个 (见 lookup_or_assign),
+            // 合法缓存不会有; 被篡改的缓存若含它们, 拒之 (卫生, 免把保留地址映射给域名)。
+            let host = u32::from(ip) & !self.mask;
+            if host < 2 || host == (!self.mask) {
+                continue;
+            }
             let dom = dom.to_lowercase();
             d2i.insert(dom.clone(), ip);
             i2d.insert(ip, dom);
@@ -112,6 +123,8 @@ impl FakeIpMapper {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
         }
+        // 串行化真正的写盘 (见 flush_lock 注释)。持锁全程含 .tmp 写 + rename。
+        let _flush_guard = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         // 短暂持读锁快照 (域名, IP), 出锁再格式化 —— 不长时间阻塞新分配。
         let snapshot: Vec<(String, Ipv4Addr)> = {
             let d2i = self.domain_to_ip.read().unwrap_or_else(|e| e.into_inner());
@@ -309,6 +322,23 @@ mod persist_tests {
         let m = FakeIpMapper::with_persist("198.18.0.0/16", Some(path.to_str().unwrap().to_string())).unwrap();
         assert_eq!(m.lookup_domain(&"198.18.0.9".parse().unwrap()).as_deref(), Some("y.com"), "range 内保留");
         assert!(m.lookup_domain(&"10.0.0.5".parse().unwrap()).is_none(), "range 外丢弃");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_skips_network_gateway_broadcast() {
+        let path = tmp_path("reserved");
+        // .0(网络号) / .1(网关) / .255.255(广播) 应被拒; .2 正常保留。
+        std::fs::write(
+            &path,
+            "198.18.0.0 net.com\n198.18.0.1 gw.com\n198.18.255.255 bc.com\n198.18.0.2 ok.com\n",
+        )
+        .unwrap();
+        let m = FakeIpMapper::with_persist("198.18.0.0/16", Some(path.to_str().unwrap().to_string())).unwrap();
+        assert!(m.lookup_domain(&"198.18.0.0".parse().unwrap()).is_none(), ".0 网络号应拒");
+        assert!(m.lookup_domain(&"198.18.0.1".parse().unwrap()).is_none(), ".1 网关应拒");
+        assert!(m.lookup_domain(&"198.18.255.255".parse().unwrap()).is_none(), "广播应拒");
+        assert_eq!(m.lookup_domain(&"198.18.0.2".parse().unwrap()).as_deref(), Some("ok.com"), ".2 正常保留");
         std::fs::remove_file(&path).ok();
     }
 

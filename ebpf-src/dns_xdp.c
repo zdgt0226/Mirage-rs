@@ -84,6 +84,10 @@ int mirage_xdp_dns(struct xdp_md *ctx) {
     struct iphdr *iph = (void *)(eth + 1);
     if ((void *)(iph + 1) > data_end) return XDP_PASS;
 
+    // 有 IP options (ihl>5) 则 (iph+1) 与后面硬编码 offset=54 都假设的 20B IP 头不成立,
+    // udph 会错落进 options 区。这类包少见, 直接放行交内核 (与 tc_divert.c 同款守卫)。
+    if (iph->ihl != 5) return XDP_PASS;
+
     if (iph->protocol != IPPROTO_UDP) return XDP_PASS;
 
     struct udphdr *udph = (void *)(iph + 1);

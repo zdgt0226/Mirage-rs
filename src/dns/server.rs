@@ -127,8 +127,10 @@ fn get_qtype(data: &[u8]) -> Option<u16> {
 
 fn make_fake_ip_response(query: &[u8], ip: std::net::Ipv4Addr) -> Option<Vec<u8>> {
     let end = question_end(query);
-    if end > query.len() || query.len() < 12 { return None; }
-    
+    // end<=12 = 没有真实问题段: 此时 0xC00C 压缩指针会指向 answer 自身 (自引用环)。
+    // process_query 已在上游拦畸形查询, 这里是第二道防线 (也便于单测)。
+    if end <= 12 || end > query.len() || query.len() < 12 { return None; }
+
     let mut header = query[..12].to_vec();
     header[2] |= 0x80; // QR=1
     header[3] &= 0x0F; // No error
@@ -414,6 +416,16 @@ impl DnsForwarder {
     }
 
     async fn process_query(&self, req: &[u8]) -> Option<Vec<u8>> {
+        // 拒畸形查询: 必须有真实问题段。否则 question_end 停在 12, 而 extract_domain 只从
+        // offset 12 起读 (不看 QDCOUNT) 仍可能返回域名 → get_qtype 把报头的 NSCOUNT 错当 qtype、
+        // make_fake_ip_response 生成指向自身的 0xC00C 压缩指针 (自引用环, 畸形响应)。
+        // QDCOUNT>=1 且 question_end>12 才算有合法问题名。
+        if req.len() < 12
+            || u16::from_be_bytes([req[4], req[5]]) == 0
+            || question_end(req) <= 12
+        {
+            return None;
+        }
         let domain = extract_domain(req)?;
         let qtype = get_qtype(req).unwrap_or(0);
         let _req_port = 53; // DNS
@@ -559,6 +571,22 @@ mod tests {
         q.extend_from_slice(&[0x00, 0x1C]); // QTYPE = AAAA(28)
         q.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
         q
+    }
+
+    #[test]
+    fn fake_ip_rejects_malformed_no_question() {
+        let ip = "198.18.0.5".parse().unwrap();
+        // 纯 12B 报头, QDCOUNT=0 → 无问题段, question_end=12 → 必须拒 (否则 0xC00C 自引用)。
+        let hdr_only = vec![0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(make_fake_ip_response(&hdr_only, ip).is_none(), "纯报头应拒");
+        // 构造包: QDCOUNT=0 但 offset 12 塞 label 字节 (骗过 extract_domain), NSCOUNT=0x0001
+        // (让 get_qtype 误读成 qtype=1)。question_end 仍=12 (QDCOUNT=0) → 必须拒。
+        let mut crafted = vec![0x12, 0x34, 0x01, 0x00, 0, 0, 0, 0, 0, 1, 0, 0];
+        crafted.push(1); crafted.push(b'a'); // 伪 label
+        assert_eq!(question_end(&crafted), 12, "QDCOUNT=0 → question_end 停在 12");
+        assert!(make_fake_ip_response(&crafted, ip).is_none(), "构造的空问询包应拒, 不生成自引用 0xC00C");
+        // 正常查询仍应正常出响应。
+        assert!(make_fake_ip_response(&aaaa_query(), ip).is_some(), "合法查询正常");
     }
 
     #[test]
