@@ -70,3 +70,5 @@ jobs:
       run: sudo bash examples/verify_cgroup_connect.sh
     - name: sk_lookup UDP 透明 — origdst 报出 + 回包源伪造
       run: sudo bash examples/verify_udp_transparent.sh
+    - name: XDP 极速 DNS — 收发改包 + BPF/用户态哈希一致 (端到端)
+      run: sudo bash examples/verify_dns_xdp.sh

@@ -68,6 +68,11 @@ path = "examples/verify_tc_divert_orphan.rs"
 required-features = ["ebpf"]
 
 [[example]]
+name = "verify_dns_xdp"
+path = "examples/verify_dns_xdp.rs"
+required-features = ["ebpf"]
+
+[[example]]
 name = "verify_cgroup_connect"
 path = "examples/verify_cgroup_connect.rs"
 required-features = ["ebpf"]
