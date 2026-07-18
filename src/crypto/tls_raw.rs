@@ -15,10 +15,10 @@
 //! 验证: 生成的 ClientHello JA4 = t13d1516h2_8daaf6152771_806a8c22fdea, 跟真实
 //! Chromium 150 完全一致 (见 tests / dump_tls).
 //!
-//! v0.6.0: 加 Firefox 152 profile (从真实抓包字节精确复刻) + 加权轮换 (Chrome 70% /
-//! Firefox 30%), 稀释"单一出口指纹一模一样"这个行为特征。Firefox 与 Chrome 都提供
-//! MLKEM+X25519, ServerHello 模板对两者自洽 (模板 fetch 固定用 Chrome 保子集一致)。
-//! TODO: 增加 Android OkHttp profile (需 Android 真实抓包) 进一步多样化。
+//! v0.6.0: 加 Firefox 152 + OkHttp (Android Conscrypt) profile (均从真实抓包字节精确复刻) +
+//! 加权轮换 (Chrome 60% / Firefox 25% / OkHttp 15%), 稀释"单一出口指纹一模一样"这个行为特征。
+//! OkHttp 无 MLKEM (仅 X25519/P256/P384) —— 为让 ServerHello 模板对它也自洽, 模板 fetch 改用
+//! OkHttp CH (曲线 = 所有 profile 交集), 得 X25519 模板, 对 Chrome/FF/OkHttp 全部一致。
 
 use rand::RngExt;
 
@@ -413,19 +413,125 @@ pub fn build_firefox(sni_bytes: &[u8], session_id: &[u8], client_random: &[u8]) 
     assemble(session_id, client_random, &ciphers, &exts)
 }
 
+// ── OkHttp (Android Conscrypt/BoringSSL) 固定参数 (真实抓包, 2 样本对齐) ──────
+// 与 Chrome 差异: ①无 MLKEM (groups/key_share 仅 X25519/P256/P384); ②supported_versions
+// 含 TLS 1.1/1.0 (四版本); ③8 个 sigalgs; ④无 ECH/ALPS; ⑤padding 扩展补到 512B 定长;
+// ⑥固定扩展顺序 (不洗牌), 但保留 GREASE (cipher/书挡/groups/key_share/versions 各槽)。
+/// signature_algorithms 内容: [len=16] + 8 个算法.
+const OKHTTP_SIGALGS: &[u8] = &[
+    0x00, 0x10, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06,
+    0x06, 0x01,
+];
+/// OkHttp CH padding 目标: 补到 record payload = 512 字节 (BoringSSL 256~511B 补齐行为)。
+const OKHTTP_PAD_TARGET: usize = 512;
+
+/// supported_groups (0x000a) OkHttp: GREASE + X25519/P256/P384 (无 MLKEM)。
+fn ok_supported_groups_ext(grease: u16) -> Vec<u8> {
+    let mut g = Vec::new();
+    g.extend_from_slice(&grease.to_be_bytes());
+    for &grp in &[0x001du16, 0x0017, 0x0018] {
+        g.extend_from_slice(&grp.to_be_bytes());
+    }
+    let mut data = Vec::with_capacity(2 + g.len());
+    data.extend_from_slice(&(g.len() as u16).to_be_bytes());
+    data.extend_from_slice(&g);
+    ext(0x000a, &data)
+}
+
+/// supported_versions (0x002b) OkHttp: GREASE + TLS1.3/1.2/1.1/1.0。
+fn ok_supported_versions_ext(grease: u16) -> Vec<u8> {
+    let mut d = Vec::with_capacity(11);
+    d.push(10);
+    d.extend_from_slice(&grease.to_be_bytes());
+    for &v in &[0x0304u16, 0x0303, 0x0302, 0x0301] {
+        d.extend_from_slice(&v.to_be_bytes());
+    }
+    ext(0x002b, &d)
+}
+
+/// key_share (0x0033) OkHttp: GREASE(1B 占位) + X25519(32 随机)。无 MLKEM。
+fn ok_key_share_ext(grease: u16) -> Vec<u8> {
+    let mut list = Vec::new();
+    list.extend_from_slice(&grease.to_be_bytes());
+    list.extend_from_slice(&1u16.to_be_bytes());
+    list.push(0x00);
+    let mut x = [0u8; 32];
+    rand::fill(&mut x);
+    list.extend_from_slice(&0x001Du16.to_be_bytes());
+    list.extend_from_slice(&32u16.to_be_bytes());
+    list.extend_from_slice(&x);
+    let mut data = Vec::with_capacity(2 + list.len());
+    data.extend_from_slice(&(list.len() as u16).to_be_bytes());
+    data.extend_from_slice(&list);
+    ext(0x0033, &data)
+}
+
+/// 构造 OkHttp ClientHello. 固定扩展顺序; GREASE 各槽随机 (书挡两值互异); padding 补到 512B。
+pub fn build_okhttp(sni_bytes: &[u8], session_id: &[u8], client_random: &[u8]) -> Vec<u8> {
+    // ciphers: GREASE + Chrome 的 15 (OkHttp 用同一套 cipher 列表)
+    let mut ciphers = Vec::with_capacity(32);
+    ciphers.extend_from_slice(&get_grease().to_be_bytes());
+    for &c in &CHROMIUM_CIPHERS {
+        ciphers.extend_from_slice(&c.to_be_bytes());
+    }
+
+    // 书挡 GREASE 两值必须互异 (否则重复扩展类型被拒)
+    let g_first = get_grease();
+    let mut g_last = get_grease();
+    while g_last == g_first {
+        g_last = get_grease();
+    }
+
+    // 固定顺序 16 个扩展 (padding 之外)
+    let mut exts_bytes = Vec::new();
+    for e in [
+        ext(g_first, b""),
+        sni_ext(sni_bytes),
+        ext(0x0017, b""),
+        ext(0xff01, b"\x00"),
+        ok_supported_groups_ext(get_grease()),
+        ext(0x000b, EC_POINT_FORMATS),
+        ext(0x0023, b""),
+        ext(0x0010, ALPN),
+        ext(0x0005, STATUS_REQUEST),
+        ext(0x000d, OKHTTP_SIGALGS),
+        ext(0x0012, b""),
+        ok_key_share_ext(get_grease()),
+        ext(0x002d, PSK_MODES),
+        ok_supported_versions_ext(get_grease()),
+        ext(0x001b, CERT_COMPRESS),
+        ext(g_last, b"\x00"),
+    ] {
+        exts_bytes.extend_from_slice(&e);
+    }
+
+    // padding (0x0015): 补到 record payload = OKHTTP_PAD_TARGET(512)。先试拼一次量长度。
+    let trial = assemble(session_id, client_random, &ciphers, &exts_bytes);
+    let payload = trial.len() - 5; // record payload = handshake message
+    if payload + 4 < OKHTTP_PAD_TARGET {
+        let pad_len = OKHTTP_PAD_TARGET - payload - 4;
+        exts_bytes.extend_from_slice(&ext(0x0015, &vec![0u8; pad_len]));
+    }
+    assemble(session_id, client_random, &ciphers, &exts_bytes)
+}
+
 /// 客户端指纹 profile. 轮换以稀释"单一出口指纹一模一样"这个行为特征.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Profile {
     Chromium,
     Firefox,
+    OkHttp,
 }
 
 /// 加权随机选一个 profile (贴近真实桌面浏览器份额, 大头仍是 Chrome).
 fn pick_profile() -> Profile {
-    if rand::rng().random_bool(0.70) {
+    let r: f64 = rand::rng().random_range(0.0..1.0);
+    if r < 0.60 {
         Profile::Chromium
-    } else {
+    } else if r < 0.85 {
         Profile::Firefox
+    } else {
+        Profile::OkHttp
     }
 }
 
@@ -437,6 +543,7 @@ pub fn build_client_hello(server_name: &str, session_id: &[u8; 32]) -> (Vec<u8>,
     let record = match pick_profile() {
         Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, &client_random),
         Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, &client_random),
+        Profile::OkHttp => build_okhttp(server_name.as_bytes(), session_id, &client_random),
     };
     (record, client_random)
 }
@@ -448,6 +555,7 @@ pub fn build_with_profile(profile: Profile, server_name: &str, session_id: &[u8;
     let record = match profile {
         Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, &client_random),
         Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, &client_random),
+        Profile::OkHttp => build_okhttp(server_name.as_bytes(), session_id, &client_random),
     };
     (record, client_random)
 }

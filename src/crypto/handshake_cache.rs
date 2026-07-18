@@ -138,13 +138,15 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     let mut session_id = [0u8; 32];
     rand::fill(&mut session_id);
     let hostname = host.split(':').next().unwrap_or(host);
-    // 模板 fetch **固定用 Chromium**, 不用轮换的 build_client_hello: Chrome 的 supported_groups
-    // (11ec/1d/17/18) 是所有 profile 的子集 → camouflage 站据此协商出的曲线, 任何 profile
-    // 的客户端都提供过 → 回放的 ServerHello 恒自洽。若用 Firefox CH fetch, 万一协商到 FF 独有
-    // 的 P521/ffdhe, 回放给 Chrome 客户端就会"ServerHello 选了没提供的曲线"= 非法 TLS。
+    // 模板 fetch **固定用 OkHttp CH** (无 MLKEM, 只提供 X25519/P256/P384) —— 这三个曲线是
+    // 所有 profile (Chrome/FF/OkHttp) 的**交集**, camouflage 站据此协商出的曲线 (通常 X25519)
+    // 任何 profile 的客户端都提供过 → 回放的 ServerHello 恒自洽、不会"选了没提供的曲线"= 非法 TLS。
+    // 代价: Chrome/FF 客户端拿到的是 X25519 (而非 MLKEM) ServerHello —— 完全正常的协商 (大量
+    // 服务器不支持 MLKEM), 非可疑。换来对无 MLKEM 的 OkHttp profile 也自洽, 免去对变长 KEM
+    // 密文做 ServerHello 字节手术。
     let mut client_random = [0u8; 32];
     rand::fill(&mut client_random);
-    let ch = crate::crypto::tls_raw::build_chromium(hostname.as_bytes(), &session_id, &client_random);
+    let ch = crate::crypto::tls_raw::build_okhttp(hostname.as_bytes(), &session_id, &client_random);
 
     stream.write_all(&ch).await?;
 

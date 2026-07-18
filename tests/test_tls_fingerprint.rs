@@ -228,6 +228,58 @@ fn firefox_mlkem_ek_valid() {
     }
 }
 
+// ── OkHttp (Android Conscrypt) 指纹回归 (从真实抓包锁定, 2 样本对齐) ──────────
+
+#[test]
+fn okhttp_cipher_and_ext_sets() {
+    let ch = tls_raw::build_okhttp(b"api.example.com", &[0u8; 32], &[0u8; 32]);
+    let p = parse(&ch);
+    // cipher(去 GREASE) = Chrome 那 15 个
+    let mut cs: Vec<u16> = p.ciphers.iter().copied().filter(|c| !is_grease(*c)).collect();
+    cs.sort();
+    assert_eq!(
+        cs,
+        vec![
+            0x002f, 0x0035, 0x009c, 0x009d, 0x1301, 0x1302, 0x1303, 0xc013, 0xc014, 0xc02b,
+            0xc02c, 0xc02f, 0xc030, 0xcca8, 0xcca9
+        ]
+    );
+    // 扩展集合(去 GREASE): 含 padding(0015), 无 ECH(fe0d)/ALPS(44cd)
+    let mut es: Vec<u16> = p.exts.iter().copied().filter(|e| !is_grease(*e)).collect();
+    es.sort();
+    assert_eq!(
+        es,
+        vec![
+            0x0000, 0x0005, 0x000a, 0x000b, 0x000d, 0x0010, 0x0012, 0x0015, 0x0017, 0x001b,
+            0x0023, 0x002b, 0x002d, 0x0033, 0xff01
+        ]
+    );
+    assert!(!es.contains(&0xfe0d) && !es.contains(&0x44cd), "OkHttp 无 ECH/ALPS");
+}
+
+#[test]
+fn okhttp_no_mlkem() {
+    // OkHttp 不提供 MLKEM(11ec) —— 这是它区别于 Chrome/FF 的关键, 也是服务端要收敛 X25519 的原因.
+    let ch = tls_raw::build_okhttp(b"a.com", &[0u8; 32], &[0u8; 32]);
+    let p = parse(&ch);
+    assert!(!p.key_share.windows(2).any(|w| w == [0x11, 0xec]), "key_share 不应含 MLKEM");
+}
+
+#[test]
+fn okhttp_padded_to_512() {
+    // 短 SNI → padding 补到 record payload = 512 (BoringSSL 定长补齐).
+    let ch = tls_raw::build_okhttp(b"a.com", &[0u8; 32], &[0u8; 32]);
+    assert_eq!(ch.len() - 5, 512, "record payload 应补到 512");
+}
+
+#[test]
+fn okhttp_token_in_session_id() {
+    let token: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(3));
+    let ch = tls_raw::build_okhttp(b"a.com", &token, &[0u8; 32]);
+    let off = 5 + 4 + 2 + 32;
+    assert_eq!(&ch[off + 1..off + 33], &token);
+}
+
 #[test]
 fn chromium_size_matches_real() {
     // 真实 Chromium 150 ~1786B (SNI=tls.peet.ws 11 字符). 我们的应在同量级
