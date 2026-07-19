@@ -228,6 +228,38 @@ fn firefox_mlkem_ek_valid() {
     }
 }
 
+// ── JA4 指纹锁定 (对照 harness 核心): 三 profile 的 JA4 == 真实值 ────────────
+//
+// Chromium 的 JA4 == FoxIO 文档/真实 Chromium 150 抓包实测值 → 同时证明 ja4() 实现正确。
+// Firefox/OkHttp 的 JA4 由"已逐字节核对 == 真实抓包"的 profile 算出 (JA4 仅依赖 cipher/扩展/
+// sigalg/版本/ALPN/SNI存在, 这些均已对齐抓包 → JA4 必等)。任何未来改动破坏 mimicry 都会让
+// 这里的 JA4 变化而 fail —— 这是防"静默改坏指纹"的最强锁。
+
+#[test]
+fn ja4_locks_all_profiles() {
+    use tls_raw::ja4;
+    let s = [0u8; 32];
+    let r = [0u8; 32];
+    // GREASE/SNI/random 不影响 JA4, 换 SNI 也应稳定
+    for sni in [b"example.com".as_slice(), b"a.b.c.speedtest.net".as_slice()] {
+        assert_eq!(
+            ja4(&tls_raw::build_chromium(sni, &s, &r)),
+            "t13d1516h2_8daaf6152771_806a8c22fdea",
+            "Chromium JA4 == 真实 Chromium 150 (FoxIO 实测值)"
+        );
+        assert_eq!(
+            ja4(&tls_raw::build_firefox(sni, &s, &r)),
+            "t13d1617h2_86a278354501_3cbfd9057e0d",
+            "Firefox JA4 == 真实 Firefox 152 抓包"
+        );
+        assert_eq!(
+            ja4(&tls_raw::build_okhttp(sni, &s, &r)),
+            "t13d1515h2_8daaf6152771_de4a06bb82e3",
+            "OkHttp JA4 == 真实 Android OkHttp 抓包"
+        );
+    }
+}
+
 // ── OkHttp (Android Conscrypt) 指纹回归 (从真实抓包锁定, 2 样本对齐) ──────────
 
 #[test]

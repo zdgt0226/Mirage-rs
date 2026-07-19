@@ -560,6 +560,127 @@ pub fn build_with_profile(profile: Profile, server_name: &str, session_id: &[u8;
     (record, client_random)
 }
 
+fn is_grease_val(v: u16) -> bool {
+    (v & 0x0f0f) == 0x0a0a && (v >> 8) == (v & 0xff)
+}
+
+/// 计算 ClientHello 的 **JA4** 指纹 (FoxIO spec)。对照 harness / 自诊断用: 生成的 CH 与真实
+/// 抓包 JA4 一致, 才证明 mimicry 成立。GREASE 全程排除, 不受 SNI 内容/random/GREASE 值影响。
+/// 格式: {a}_{b}_{c} —— a=元数据(版本/SNI/cipher数/扩展数/ALPN), b=cipher 集合哈希, c=扩展+sigalg 哈希。
+pub fn ja4(ch: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let h12 = |s: &str| -> String { hex::encode(&Sha256::digest(s.as_bytes())[..6]) };
+
+    // 解析
+    let mut i = 5 + 4 + 2 + 32;
+    let sid = ch[i] as usize;
+    i += 1 + sid;
+    let cl = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
+    i += 2;
+    let ciphers: Vec<u16> = (0..cl)
+        .step_by(2)
+        .map(|j| u16::from_be_bytes([ch[i + j], ch[i + j + 1]]))
+        .filter(|c| !is_grease_val(*c))
+        .collect();
+    i += cl;
+    let cm = ch[i] as usize;
+    i += 1 + cm;
+    let el = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
+    i += 2;
+    let end = i + el;
+
+    let mut exts: Vec<u16> = Vec::new();
+    let mut sni = false;
+    let mut alpn: Option<String> = None;
+    let mut sigalgs: Vec<u16> = Vec::new();
+    let mut max_ver: u16 = 0x0303;
+    while i < end {
+        let et = u16::from_be_bytes([ch[i], ch[i + 1]]);
+        let le = u16::from_be_bytes([ch[i + 2], ch[i + 3]]) as usize;
+        let data = &ch[i + 4..i + 4 + le];
+        i += 4 + le;
+        if is_grease_val(et) {
+            continue;
+        }
+        exts.push(et);
+        match et {
+            0x0000 => sni = true,
+            0x0010 => {
+                if data.len() >= 3 {
+                    let pl = data[2] as usize;
+                    if data.len() >= 3 + pl {
+                        alpn = Some(String::from_utf8_lossy(&data[3..3 + pl]).to_string());
+                    }
+                }
+            }
+            0x002b => {
+                if !data.is_empty() {
+                    let vl = data[0] as usize;
+                    let mut k = 1;
+                    while k + 1 < 1 + vl && k + 1 < data.len() {
+                        let v = u16::from_be_bytes([data[k], data[k + 1]]);
+                        if !is_grease_val(v) && v > max_ver {
+                            max_ver = v;
+                        }
+                        k += 2;
+                    }
+                }
+            }
+            0x000d => {
+                if data.len() >= 2 {
+                    let sl = u16::from_be_bytes([data[0], data[1]]) as usize;
+                    let mut k = 2;
+                    while k + 1 < 2 + sl && k + 1 < data.len() {
+                        sigalgs.push(u16::from_be_bytes([data[k], data[k + 1]]));
+                        k += 2;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // JA4_a
+    let ver = match max_ver {
+        0x0304 => "13",
+        0x0303 => "12",
+        0x0302 => "11",
+        0x0301 => "10",
+        _ => "00",
+    };
+    let sni_c = if sni { "d" } else { "i" };
+    let alpn_c = match &alpn {
+        Some(a) if !a.is_empty() => {
+            let b = a.as_bytes();
+            format!("{}{}", b[0] as char, b[b.len() - 1] as char)
+        }
+        _ => "00".to_string(),
+    };
+    let a = format!(
+        "t{}{}{:02}{:02}{}",
+        ver,
+        sni_c,
+        ciphers.len().min(99),
+        exts.len().min(99),
+        alpn_c
+    );
+
+    // JA4_b: 排序 cipher (去 GREASE) 的哈希
+    let mut cs = ciphers.clone();
+    cs.sort();
+    let cs_str = cs.iter().map(|c| format!("{:04x}", c)).collect::<Vec<_>>().join(",");
+    let b = h12(&cs_str);
+
+    // JA4_c: 排序扩展 (去 GREASE/SNI(0000)/ALPN(0010)) + "_" + sigalgs (原序) 的哈希
+    let mut es: Vec<u16> = exts.iter().copied().filter(|e| *e != 0x0000 && *e != 0x0010).collect();
+    es.sort();
+    let es_str = es.iter().map(|e| format!("{:04x}", e)).collect::<Vec<_>>().join(",");
+    let sa_str = sigalgs.iter().map(|s| format!("{:04x}", s)).collect::<Vec<_>>().join(",");
+    let c = h12(&format!("{}_{}", es_str, sa_str));
+
+    format!("{}_{}_{}", a, b, c)
+}
+
 pub fn build_fake_client_tail() -> Vec<u8> {
     // 尾巴 body 53B 匹配真实 TLS 1.3 Client Finished (ChaCha20-Poly1305 + SHA-256
     // HMAC): 4B handshake header + 32B HMAC digest + 1B content_type + 16B AEAD tag.
