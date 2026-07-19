@@ -105,7 +105,10 @@ pub fn load_geosite_dat(path: &Path, target_code: &str) -> Result<Vec<GeoDomain>
             if fn_num == 1 {
                 let mut cpos = 0;
                 let mut code = String::new();
-                let mut domains = Vec::new();
+                // 先收集所有 entry(cfn==2)payload, 延后解析: protobuf 字段序**任意**
+                // (标准不保证 code 在 entries 前)。原代码只在 code 已知时才解析 entry,
+                // 若某 .dat 把 entries 排在 code 前, 整个国家的规则会被静默丢弃。
+                let mut entries: Vec<&[u8]> = Vec::new();
 
                 while cpos < content.len() {
                     let ctag = read_varint(content, &mut cpos)?;
@@ -117,11 +120,7 @@ pub fn load_geosite_dat(path: &Path, target_code: &str) -> Result<Vec<GeoDomain>
                         if cfn == 1 {
                             code = String::from_utf8_lossy(inner).to_uppercase();
                         } else if cfn == 2 {
-                            if code == target_upper {
-                                if let Ok(Some(d)) = parse_domain_msg(inner) {
-                                    domains.push(d);
-                                }
-                            }
+                            entries.push(inner);
                         }
                     } else if cwt == 0 {
                         read_varint(content, &mut cpos)?;
@@ -129,8 +128,15 @@ pub fn load_geosite_dat(path: &Path, target_code: &str) -> Result<Vec<GeoDomain>
                         break;
                     }
                 }
-                
+
+                // code 与 entries 收齐后再判定 (与字段序无关)
                 if code == target_upper {
+                    let mut domains = Vec::new();
+                    for inner in entries {
+                        if let Ok(Some(d)) = parse_domain_msg(inner) {
+                            domains.push(d);
+                        }
+                    }
                     return Ok(domains);
                 }
             }
@@ -197,7 +203,8 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
             if fn_num == 1 {
                 let mut cpos = 0;
                 let mut code = String::new();
-                let mut cidrs = Vec::new();
+                // 先收集 entry(cfn==2), 延后解析: protobuf 字段序任意 (见 load_geosite_dat 同款修复)。
+                let mut entries: Vec<&[u8]> = Vec::new();
 
                 while cpos < content.len() {
                     let ctag = read_varint(content, &mut cpos)?;
@@ -209,11 +216,7 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
                         if cfn == 1 {
                             code = String::from_utf8_lossy(inner).to_uppercase();
                         } else if cfn == 2 {
-                            if code == target_upper {
-                                if let Ok(Some(net)) = parse_cidr_msg(inner) {
-                                    cidrs.push(net);
-                                }
-                            }
+                            entries.push(inner);
                         }
                     } else if cwt == 0 {
                         read_varint(content, &mut cpos)?;
@@ -221,8 +224,14 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
                         break;
                     }
                 }
-                
+
                 if code == target_upper {
+                    let mut cidrs = Vec::new();
+                    for inner in entries {
+                        if let Ok(Some(net)) = parse_cidr_msg(inner) {
+                            cidrs.push(net);
+                        }
+                    }
                     return Ok(cidrs);
                 }
             }
@@ -331,5 +340,65 @@ mod tests {
         let mut pos = 0;
         assert_eq!(read_len_delim(&data, &mut pos).unwrap(), b"abc");
         assert_eq!(pos, 4);
+    }
+
+    // ── protobuf 编码 helper (仅测试用) ──
+    fn varint(mut v: u64) -> Vec<u8> {
+        let mut out = vec![];
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                out.push(b | 0x80);
+            } else {
+                out.push(b);
+                break;
+            }
+        }
+        out
+    }
+    fn ld(field: u64, data: &[u8]) -> Vec<u8> {
+        let mut out = varint((field << 3) | 2);
+        out.extend(varint(data.len() as u64));
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn geosite_field_order_independent() {
+        // 回归 #3: protobuf 字段序任意。构造 GeoSite 里 domain(field 2) **排在** code(field 1)
+        // **之前** 的 .dat —— 原代码会因"处理 domain 时 code 还空"把整个国家规则静默丢弃。
+        let domain_msg = ld(2, b"example.com"); // Domain{ value(field2)="example.com" } (type 默认 Plain)
+        // GeoSite: 反序 —— 先 domain(field 2), 再 code(field 1)="CN"
+        let mut geosite = Vec::new();
+        geosite.extend(ld(2, &domain_msg)); // domain 在前
+        geosite.extend(ld(1, b"CN")); // code 在后
+        let dat = ld(1, &geosite); // GeoSiteList: field 1 = GeoSite
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mirage_geo_test_{}.dat", std::process::id()));
+        std::fs::write(&path, &dat).unwrap();
+
+        let got = super::load_geosite_dat(&path, "CN").unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(got.len(), 1, "反序 .dat 也应解析出 1 条域名 (原 bug 会得 0)");
+        assert_eq!(got[0].value, "example.com");
+    }
+
+    #[test]
+    fn geosite_normal_order_and_miss() {
+        // 正序仍正常, 且非目标国不误匹配。
+        let domain_msg = ld(2, b"a.cn");
+        let mut geosite = Vec::new();
+        geosite.extend(ld(1, b"CN")); // 正序: code 先
+        geosite.extend(ld(2, &domain_msg));
+        let dat = ld(1, &geosite);
+
+        let path = std::env::temp_dir().join(format!("mirage_geo_test2_{}.dat", std::process::id()));
+        std::fs::write(&path, &dat).unwrap();
+        assert_eq!(super::load_geosite_dat(&path, "CN").unwrap().len(), 1, "正序命中");
+        assert_eq!(super::load_geosite_dat(&path, "US").unwrap().len(), 0, "非目标国不匹配");
+        std::fs::remove_file(&path).ok();
     }
 }
