@@ -123,7 +123,11 @@ pub fn load_geosite_dat(path: &Path, target_code: &str) -> Result<Vec<GeoDomain>
                             entries.push(inner);
                         }
                     } else if cwt == 0 {
-                        read_varint(content, &mut cpos)?;
+                        let _ = read_varint(content, &mut cpos)?;
+                    } else if cwt == 1 {
+                        cpos += 8;
+                    } else if cwt == 5 {
+                        cpos += 4;
                     } else {
                         break;
                     }
@@ -141,7 +145,11 @@ pub fn load_geosite_dat(path: &Path, target_code: &str) -> Result<Vec<GeoDomain>
                 }
             }
         } else if wt == 0 {
-            read_varint(&data, &mut pos)?;
+            let _ = read_varint(&data, &mut pos)?;
+        } else if wt == 1 {
+            pos += 8;
+        } else if wt == 5 {
+            pos += 4;
         } else {
             break;
         }
@@ -219,7 +227,11 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
                             entries.push(inner);
                         }
                     } else if cwt == 0 {
-                        read_varint(content, &mut cpos)?;
+                        let _ = read_varint(content, &mut cpos)?;
+                    } else if cwt == 1 {
+                        cpos += 8;
+                    } else if cwt == 5 {
+                        cpos += 4;
                     } else {
                         break;
                     }
@@ -236,7 +248,11 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
                 }
             }
         } else if wt == 0 {
-            read_varint(&data, &mut pos)?;
+            let _ = read_varint(&data, &mut pos)?;
+        } else if wt == 1 {
+            pos += 8;
+        } else if wt == 5 {
+            pos += 4;
         } else {
             break;
         }
@@ -363,6 +379,17 @@ mod tests {
         out.extend_from_slice(data);
         out
     }
+    // wire-type 1 (fixed64) / 5 (fixed32) 字段编码 (仅测试用)。
+    fn fixed64(field: u64, val: u64) -> Vec<u8> {
+        let mut out = varint((field << 3) | 1);
+        out.extend_from_slice(&val.to_le_bytes());
+        out
+    }
+    fn fixed32(field: u64, val: u32) -> Vec<u8> {
+        let mut out = varint((field << 3) | 5);
+        out.extend_from_slice(&val.to_le_bytes());
+        out
+    }
 
     #[test]
     fn geosite_field_order_independent() {
@@ -400,5 +427,27 @@ mod tests {
         assert_eq!(super::load_geosite_dat(&path, "CN").unwrap().len(), 1, "正序命中");
         assert_eq!(super::load_geosite_dat(&path, "US").unwrap().len(), 0, "非目标国不匹配");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn geosite_skips_fixed32_64_fields() {
+        // GeoSite 内混入未知的 fixed64(wt1)/fixed32(wt5) 字段 (未来 schema 扩展)。
+        // 原代码遇非 0/2 wire-type 直接 break → 截断内层循环, 丢掉其后的 domain。
+        // 修复后应跳 8/4 字节继续, 仍解析出域名。
+        let domain_msg = ld(2, b"example.com");
+        let mut geosite = Vec::new();
+        geosite.extend(ld(1, b"CN")); // code
+        geosite.extend(fixed64(3, 0xDEAD_BEEF)); // 假 fixed64 字段
+        geosite.extend(fixed32(4, 0x1234)); // 假 fixed32 字段
+        geosite.extend(ld(2, &domain_msg)); // domain 排在 fixed 字段之后
+        let dat = ld(1, &geosite);
+
+        let path = std::env::temp_dir().join(format!("mirage_geo_test3_{}.dat", std::process::id()));
+        std::fs::write(&path, &dat).unwrap();
+        let got = super::load_geosite_dat(&path, "CN").unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(got.len(), 1, "fixed 字段应被跳过, domain 仍解析 (原 break 会得 0)");
+        assert_eq!(got[0].value, "example.com");
     }
 }
