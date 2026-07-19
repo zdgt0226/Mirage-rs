@@ -8,10 +8,10 @@
 //! epoch (`tokio::watch`)。每个 WarmPool 订阅它, 变更即**清空整池**, builder 用新路径并发
 //! 重建 —— 毫秒级切换而非等超时。
 //!
-//! 设计取舍: 只要收到任何 LINK/ADDR/ROUTE 通知就触发 (不细分是不是默认路由/出口源地址),
-//! 靠 500ms 去抖把一次网络切换产生的十几条消息合并成一次 flush。flush = 重建连接池, 成本低
-//! (几百 ms 补货), 对目标部署 (客户端/家用网关, 网络变更本就罕见) 完全够用。未来可解析
-//! RTM_* 只对默认路由/出口源地址变化触发, 降低 route 频繁抖动机器上的误 flush。
+//! 设计取舍: 解析 RTM_* 消息类型, 对 LINK (载波 up/down)、ADDR (源地址增删/续租)、以及
+//! **默认路由**变化触发, 只滤掉忙机上的非默认路由抖动噪声 (BGP/具体 /32·/24 增删)。再靠
+//! 500ms 去抖把一次网络切换产生的十几条消息合并成一次 flush。flush = 重建连接池, 成本低
+//! (几百 ms 补货), 对目标部署 (客户端/家用网关) 完全够用。判据见 imp::should_bump。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -110,26 +110,66 @@ mod imp {
         Ok(owned)
     }
 
-    /// 阻塞收 netlink 通知的循环 (独立 OS 线程, 大部分时间阻塞在 recv)。收到一条变更就
-    /// 排空当前 burst + 去抖 + 再排空, 然后 bump 一次 epoch。
+    /// 扫一个 netlink 缓冲里的所有消息, 判断是否值得清空重建连接池。
+    /// 只滤掉一种高频噪声: 忙机上的**非默认路由**抖动 (BGP/具体 /32·/24 路由增删)。
+    /// 载波 up/down (LINK)、源地址增删续租 (ADDR)、默认路由变化 (ROUTE dst_len==0)
+    /// 都是真网络切换 → 触发。任一消息值得触发即返回 true。
+    fn should_bump(buf: &[u8]) -> bool {
+        let mut pos = 0;
+        while pos + 16 <= buf.len() {
+            let nlmsg_len = u32::from_ne_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let nlmsg_type = u16::from_ne_bytes(buf[pos + 4..pos + 6].try_into().unwrap());
+
+            if nlmsg_len < 16 || pos + nlmsg_len > buf.len() {
+                break;
+            }
+
+            match nlmsg_type {
+                // RTM_NEWLINK=16 / RTM_DELLINK=17 (载波 up/down),
+                // RTM_NEWADDR=20 / RTM_DELADDR=21 (源地址增删/DHCP 续租) —— 均为真变更。
+                16 | 17 | 20 | 21 => return true,
+                // RTM_NEWROUTE=24 / RTM_DELROUTE=25 —— 只认默认路由 (rtmsg.rtm_dst_len==0,
+                // 即 0.0.0.0/0 或 ::/0), 过滤具体路由抖动噪声。rtm_dst_len 在 rtmsg offset 1。
+                24 | 25 => {
+                    if pos + 16 + 2 <= buf.len() && buf[pos + 16 + 1] == 0 {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            pos = (pos + nlmsg_len + 3) & !3; // NLMSG_ALIGN
+        }
+        false
+    }
+
+    /// 阻塞收 netlink 通知的循环 (独立 OS 线程, 大部分时间阻塞在 recv)。收到一批变更就
+    /// 判定是否值得触发, 值得则排空当前 burst + 去抖 + 再排空, 然后 bump 一次 epoch。
     fn run(fd: OwnedFd) {
         let raw = fd.as_raw_fd();
         let mut buf = [0u8; 8192];
         loop {
             // 阻塞等下一条变更 (无变更时线程休眠, 不占 CPU)
             let n = unsafe { libc::recv(raw, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
-            if n < 0 {
+
+            let changed = if n < 0 {
                 let err = std::io::Error::last_os_error();
                 match err.raw_os_error() {
                     Some(libc::EINTR) => continue,
-                    // 缓冲溢出 = 短时间大量变更, 照样视为"网络变了"
-                    Some(libc::ENOBUFS) => {}
+                    // 缓冲溢出 = 短时间大量变更, 无法解析内容, 保守视为"网络变了"
+                    Some(libc::ENOBUFS) => true,
                     _ => {
                         warn!("链路自愈 netlink recv 错误 ({err}); 监听退出, 降级为 stale 探测/重试");
                         return;
                     }
                 }
+            } else {
+                should_bump(&buf[..n as usize])
+            };
+
+            if !changed {
+                continue;
             }
+
             // 合并一个 burst: 排空 → 去抖 500ms → 再排空, 只 bump 一次
             drain(raw, &mut buf);
             std::thread::sleep(DEBOUNCE);
@@ -152,7 +192,84 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        use super::should_bump;
         use std::os::fd::AsRawFd;
+
+        /// 造一条 netlink 消息: [len u32][type u16][flags u16][seq u32][pid u32][payload], 4B 对齐。
+        fn nlmsg(nlmsg_type: u16, payload: &[u8]) -> Vec<u8> {
+            let len = 16 + payload.len();
+            let mut m = Vec::new();
+            m.extend_from_slice(&(len as u32).to_ne_bytes());
+            m.extend_from_slice(&nlmsg_type.to_ne_bytes());
+            m.extend_from_slice(&0u16.to_ne_bytes()); // flags
+            m.extend_from_slice(&0u32.to_ne_bytes()); // seq
+            m.extend_from_slice(&0u32.to_ne_bytes()); // pid
+            m.extend_from_slice(payload);
+            while m.len() % 4 != 0 {
+                m.push(0); // NLMSG_ALIGN
+            }
+            m
+        }
+
+        /// rtmsg payload (12B): family, dst_len, src_len, tos, table, proto, scope, type, flags(4B)。
+        fn rtmsg(dst_len: u8) -> Vec<u8> {
+            let mut p = vec![0u8; 12];
+            p[1] = dst_len; // rtm_dst_len
+            p
+        }
+
+        #[test]
+        fn default_route_triggers() {
+            // RTM_NEWROUTE(24) dst_len=0 = 默认路由 → true
+            assert!(should_bump(&nlmsg(24, &rtmsg(0))));
+            // RTM_DELROUTE(25) dst_len=0 → true
+            assert!(should_bump(&nlmsg(25, &rtmsg(0))));
+        }
+
+        #[test]
+        fn specific_route_noise_ignored() {
+            // 具体路由 (dst_len=24/32) 抖动 = 噪声 → false
+            assert!(!should_bump(&nlmsg(24, &rtmsg(24))));
+            assert!(!should_bump(&nlmsg(25, &rtmsg(32))));
+            // 一堆非默认路由拼一起仍 false
+            let mut buf = nlmsg(24, &rtmsg(24));
+            buf.extend(nlmsg(25, &rtmsg(32)));
+            buf.extend(nlmsg(24, &rtmsg(16)));
+            assert!(!should_bump(&buf));
+        }
+
+        #[test]
+        fn link_and_addr_always_trigger() {
+            // 这些是本 WIP 早期漏掉的: 载波与源地址变化必须触发 (换源 IP 但网关不变的场景)
+            for t in [16u16, 17, 20, 21] {
+                // ADDR/LINK 消息带各自结构体, 内容无关紧要, 给 8B 占位
+                assert!(should_bump(&nlmsg(t, &[0u8; 8])), "nlmsg_type {t} 应触发");
+            }
+        }
+
+        #[test]
+        fn mixed_burst_default_route_wins() {
+            // 一次切换的 burst: 具体路由噪声 + 中间夹一条默认路由 → true
+            let mut buf = nlmsg(24, &rtmsg(24));
+            buf.extend(nlmsg(24, &rtmsg(0))); // 默认路由
+            buf.extend(nlmsg(25, &rtmsg(32)));
+            assert!(should_bump(&buf));
+        }
+
+        #[test]
+        fn garbage_and_truncation_no_panic() {
+            assert!(!should_bump(&[])); // 空
+            assert!(!should_bump(&[1, 2, 3])); // 不足一个头
+            // 声明 len=999 但 buf 不够 → 越界守卫 break, 不 panic, 返回 false
+            let mut m = 999u32.to_ne_bytes().to_vec();
+            m.extend_from_slice(&24u16.to_ne_bytes());
+            m.extend_from_slice(&[0u8; 10]);
+            assert!(!should_bump(&m));
+            // nlmsg_len < 16 (畸形) → break
+            let mut bad = 8u32.to_ne_bytes().to_vec();
+            bad.extend_from_slice(&[0u8; 12]);
+            assert!(!should_bump(&bad));
+        }
 
         #[test]
         fn netlink_socket_opens_and_binds() {
