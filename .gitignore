@@ -13,3 +13,6 @@ CLAUDE.md
 /test_poly.rs
 /simulate_bdp
 /*.log
+
+# Python 字节码缓存 (tools/*.py 运行产物)
+__pycache__/
