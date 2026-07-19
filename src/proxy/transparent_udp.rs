@@ -42,6 +42,11 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // 收到任一下行后转 IDLE_TIMEOUT —— 正常 UDP 会话可长期存活。8s 远宽于隧道往返首响。
 const FIRST_DOWNLINK_TIMEOUT: Duration = Duration::from_secs(8);
 const UDP_BUF: usize = 65536;
+// uplink 机会式合帧上限: 一次 send_data 前把此刻已排队的 UDP 数据报榨干打包, 直到累计
+// 超过此阈值。拉大/打散 TLS 记录尺寸 (对抗"UDP-over-TCP 记录众数卡在 ~MTU"的长度指纹),
+// 只合并本已在 channel 里的突发包 → 近乎零新增延迟。超阈值/超大帧交 send_data 自行切记录,
+// 服务端 udp_relay reassembler 本就支持一条记录内多帧、也支持帧跨记录, 无需协议/服务端改动。
+const UPLINK_COALESCE_CAP: usize = 16 * 1024;
 /// 并发透明 UDP 流上限。每流 ≈ 1 出口 socket FD + 1 task + 64KB downlink buf
 /// (+ 共享 reply socket)。透明 UDP 仅跑在 64 位网关 (内核≥5.9+CAP_NET_ADMIN),
 /// 内存充裕; 家用/小企业合法峰值数百~低千, 4096 留足余量, 同时给恶意 LAN
@@ -605,29 +610,44 @@ async fn setup_flow(
             let mut writer = tunnel.writer;
             let mut reader = tunnel.reader;
 
-            // uplink: channel → 封帧 (域名 ATYP=3 / 裸 IP ATYP=1) → 隧道
+            // uplink: channel → 封帧 (域名 ATYP=3 / 裸 IP ATYP=1) → 隧道。
+            // 机会式合帧: 每次 send_data 前用 try_recv 把此刻已排队的数据报一并打包成一条
+            // TLS 记录 (见 UPLINK_COALESCE_CAP), 拉大/打散记录尺寸抗长度指纹, 不等新包故近零延迟。
             let uplink = async move {
+                // 单个数据报封帧: 超大 (u16 帧长放不下, 真实 UDP 极少 >60KB) 则丢, 返回 None。
+                let mk_frame = |pkt: &[u8]| -> Option<Vec<u8>> {
+                    match &target {
+                        UdpTarget::Domain(d) => {
+                            (1 + 1 + d.len() + 2 + pkt.len() <= u16::MAX as usize)
+                                .then(|| frame_udp_domain(d, port, pkt))
+                        }
+                        UdpTarget::Ip(ip) => {
+                            (1 + 4 + 2 + pkt.len() <= u16::MAX as usize)
+                                .then(|| frame_udp_ipv4(ip, port, pkt))
+                        }
+                    }
+                };
                 loop {
                     let pkt = match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
                         Ok(Some(p)) => p,
                         _ => break, // idle / channel 关
                     };
-                    // 超大包无法用 u16 帧长表示, 丢 (真实 UDP 极少 >60KB)
-                    let frame = match &target {
-                        UdpTarget::Domain(d) => {
-                            if 1 + 1 + d.len() + 2 + pkt.len() > u16::MAX as usize {
-                                continue;
-                            }
-                            frame_udp_domain(d, port, &pkt)
-                        }
-                        UdpTarget::Ip(ip) => {
-                            if 1 + 4 + 2 + pkt.len() > u16::MAX as usize {
-                                continue;
-                            }
-                            frame_udp_ipv4(ip, port, &pkt)
-                        }
+                    let mut batch = match mk_frame(&pkt) {
+                        Some(f) => f,
+                        None => continue,
                     };
-                    if writer.send_data(&frame).await.is_err() {
+                    // 榨干此刻队列里已到的突发包, 合进同一次 send_data (不阻塞、不等新包)
+                    while batch.len() < UPLINK_COALESCE_CAP {
+                        match rx.try_recv() {
+                            Ok(p) => {
+                                if let Some(f) = mk_frame(&p) {
+                                    batch.extend_from_slice(&f);
+                                }
+                            }
+                            Err(_) => break, // 队列空 / 关 → 立即发
+                        }
+                    }
+                    if writer.send_data(&batch).await.is_err() {
                         break;
                     }
                 }
