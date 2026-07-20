@@ -18,6 +18,9 @@ find_camouflage —— 为 Mirage 自动寻找「SNI/IP 一致」的伪装站候
 
 能到什么程度 (务必看清):
   ✓ ASN/前缀级一致 —— 打掉绝大多数企业 NGFW 的一致性检查 (它们做 ASN/类目级)。
+  · 一致性分档: 精确IP > 同/24 > 同通告前缀 > 同ASN(不同前缀) > 跨ASN(淘汰)。
+    用 --prefix 扩大范围时, 判据是**ASN 归属**而非"是否落在通告前缀内" —— 否则扩出去的
+    候选会被全部误杀, 扩了等于没扩。跨 ASN 的候选会被标注并排到最后。
   ✗ 不是精确 IP 绑定 —— 若防火墙要求"连接必须去 SNI 解析出的确切 IP", 只能用你自有域名
     指向自己 VPS。本工具会把"恰好解析到你 VPS 确切 IP/同一 /24"的候选标为 BEST。
   · 候选站不是你的, 且可能搬离你 ASN → 定期复跑。
@@ -27,7 +30,10 @@ find_camouflage —— 为 Mirage 自动寻找「SNI/IP 一致」的伪装站候
    别无脑 --scan-asn 扫整个 ASN 的上千 IP (慢 + 可能被上游判定端口扫描)。
 
 用法:
-  python3 find_camouflage.py <你的VPS_IP> [--scan-asn] [--limit 256] [--workers 40]
+  python3 find_camouflage.py <你的VPS_IP> [--prefix N] [--scan-asn] [--limit 256] [--workers 40]
+
+  候选太少时按掩码扩大 (同机房常在相邻网段还有别的前缀, 仍属同一 ASN):
+  python3 find_camouflage.py <IP> --prefix 22 --limit 1024
 依赖: python3 stdlib + openssl CLI (几乎系统自带)。无 pip, 无 API key。
 """
 import argparse
@@ -126,10 +132,35 @@ def http_probe(host):
         return None, ""
 
 
+_ASN_CACHE = {}
+
+def asn_of(ip: str):
+    """查一个 IP 属于哪个 ASN。按 /24 缓存 —— 同段的 IP 几乎必属同一 ASN,
+    这样把请求数从"每候选一次"降到"每 /24 一次", 避免被 RIPEstat 限流。"""
+    try:
+        key = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+    except Exception:
+        return None
+    if key in _ASN_CACHE:
+        return _ASN_CACHE[key]
+    try:
+        d = ripe("network-info", ip)
+        asns = d.get("asns") or []
+        v = asns[0] if asns else None
+    except Exception:
+        v = None
+    _ASN_CACHE[key] = v
+    return v
+
+
 def main():
     ap = argparse.ArgumentParser(description="为 Mirage 找同 ASN 的伪装站候选 (零 API key)")
     ap.add_argument("vps_ip", help="你的 VPS 公网 IP")
     ap.add_argument("--scan-asn", action="store_true", help="扫整个 ASN 前缀 (慢, 默认只扫 VPS 覆盖前缀)")
+    ap.add_argument("--prefix", type=int, metavar="N",
+                    help="按子网掩码扩大搜索: 扫包含本机 IP 的 /N (如 22)。"
+                         "留空=只扫 RIPEstat 给出的通告前缀。"
+                         "注意: /N 里可能混有别家 ASN 的段, 故候选会逐个校验 ASN 归属")
     ap.add_argument("--limit", type=int, default=256, help="最多扫多少个 IP (默认 256)")
     ap.add_argument("--workers", type=int, default=40, help="并发数 (默认 40)")
     args = ap.parse_args()
@@ -145,6 +176,19 @@ def main():
 
     # 目标 IP 集
     nets = [vps_net]
+    if args.prefix is not None:
+        if not (8 <= args.prefix <= 32):
+            print(f"❌ --prefix 需在 8..32 之间 (给的是 {args.prefix})", file=sys.stderr)
+            sys.exit(1)
+        widened = ipaddress.ip_network(f"{vps_ip}/{args.prefix}", strict=False)
+        if args.prefix < vps_net.prefixlen:
+            print(f"[2/4] 按掩码扩大: {vps_net} → {widened} "
+                  f"({widened.num_addresses} 个地址, 受 --limit {args.limit} 约束)", file=sys.stderr)
+            print(f"      ⚠️  该范围已超出通告前缀, 其中可能含别家 ASN 的段 —— "
+                  f"候选会逐个校验 ASN 归属, 跨 ASN 的会被标注并降权。", file=sys.stderr)
+        else:
+            print(f"[2/4] 按掩码收窄: {vps_net} → {widened}", file=sys.stderr)
+        nets = [widened]
     if args.scan_asn:
         try:
             nets = [ipaddress.ip_network(p, strict=False) for p in asn_prefixes(asn)]
@@ -188,17 +232,21 @@ def main():
         ripa = ipaddress.ip_address(rip) if rip else None
         same_ip = ripa == vps_ip
         same_24 = ripa in vps_24 if ripa else False
-        same_prefix = ripa in vps_net if ripa else False  # 解析回的 IP 仍在本前缀 = 一致性判据
-        # 仅对"解析回本前缀"的候选做 TLS1.3/HTTP 深探 (无关的不浪费时间)
-        tls13 = supports_tls13(dom) if same_prefix else False
-        status, server = (http_probe(dom) if same_prefix else (None, ""))
+        same_prefix = ripa in vps_net if ripa else False
+        # 扩大搜索后, 候选可能落在通告前缀之外。此时"是否同 ASN"才是真正的一致性判据 ——
+        # 仅按前缀判会把同 ASN 的邻段全部误杀 (扩大范围就白做了)。
+        same_asn = same_prefix or (asn_of(rip) == asn if rip else False)
+        # 只对"同 ASN"的候选做 TLS1.3/HTTP 深探 (跨 ASN 的本就不可用, 不浪费时间)
+        tls13 = supports_tls13(dom) if same_asn else False
+        status, server = (http_probe(dom) if same_asn else (None, ""))
         score = 0
         if same_ip: score += 100
         elif same_24: score += 60
         elif same_prefix: score += 40
+        elif same_asn: score += 25   # 同 ASN 但不同前缀: 仍能通过 ASN 级一致性检查
         if tls13: score += 10
         if status and 200 <= status < 400: score += 5
-        return (score, dom, rip, same_ip, same_24, same_prefix, tls13, status, server,
+        return (score, dom, rip, same_ip, same_24, same_prefix, same_asn, tls13, status, server,
                 ip_issuer.get((dom, next(iter(ips))), "?"))
 
     with cf.ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -209,9 +257,10 @@ def main():
     print("-" * 100)
     best = None
     for r in rows[:30]:
-        score, dom, rip, same_ip, same_24, same_prefix, tls13, status, server, issuer = r
-        cons = "★精确IP" if same_ip else ("同/24" if same_24 else ("同前缀" if same_prefix else "跨段"))
-        if best is None and same_prefix and tls13 and status and 200 <= status < 400:
+        score, dom, rip, same_ip, same_24, same_prefix, same_asn, tls13, status, server, issuer = r
+        cons = ("★精确IP" if same_ip else "同/24" if same_24 else
+                "同前缀" if same_prefix else "同ASN" if same_asn else "跨ASN")
+        if best is None and same_asn and tls13 and status and 200 <= status < 400:
             best = dom
         print(f"{dom:<38} {str(rip):<16} {cons:<10} {'是' if tls13 else '否':<7} "
               f"{str(status):<6} {issuer[:24]}")
@@ -222,8 +271,9 @@ def main():
         print(f'   config 改法: "camouflage_host": "{best}"')
         print("   (它解析回你 VPS 的 ASN 前缀 + 供 TLS1.3 + HTTP 可达)")
     else:
-        print("⚠️ 没有'解析回本前缀 + TLS1.3 + HTTP 可达'的理想候选。")
-        print("   可看上面'同/24'或'同前缀'但 TLS1.3=否的, 或 --scan-asn 扩大搜索。")
+        print("⚠️ 没有'同 ASN + TLS1.3 + HTTP 可达'的理想候选。")
+        print("   可看上面 TLS1.3=否 的条目, 或用 --prefix 22 之类按掩码扩大搜索范围")
+        print("   (再不行才用 --scan-asn 扫整个 ASN —— 慢且可能被上游判定为端口扫描)。")
     print("\n务必记住:")
     print("  · 这是 ASN/前缀级一致 (打掉常见 NGFW 检查), 非精确 IP 绑定; 最强一致仍是自有域名指向自己 VPS。")
     print("  · 候选站非你所有、可能搬迁/下线 → 定期复跑复验。")

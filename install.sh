@@ -245,9 +245,30 @@ suggest_camouflage_host() {
         finder="$tmp_finder"
     fi
 
-    info "开始扫描 (约 1~3 分钟, 期间请勿中断)..."
+    # 搜索范围。默认只扫 RIPEstat 给出的通告前缀 (通常 /24); 候选太少时可按掩码扩大 ——
+    # 扩出去的段会逐个校验 ASN 归属, 同 ASN 的仍算合格 (跨 ASN 的会被降权标注)。
+    cat >&2 <<'EOM'
+
+  搜索范围: 默认只扫本机所在的通告前缀 (通常 /24, 约 256 个地址)。
+  若候选太少, 可按子网掩码扩大 —— 同一家机房常在相邻网段还有别的前缀,
+  它们仍属同一 ASN, 照样满足 SNI/IP 一致性。代价是耗时成倍增加。
+EOM
+    local range=$(ask_choice "搜索范围" \
+        "通告前缀 (最快, 约 256 地址)" \
+        "扩到 /22 (约 1024 地址, 慢约 3~4 倍)" \
+        "扩到 /20 (约 4096 地址, 慢约 10 倍以上)")
+    local scan_args=""
+    case "$range" in
+        2) scan_args="--prefix 22 --limit 1024" ;;
+        3) scan_args="--prefix 20 --limit 4096" ;;
+    esac
+
+    info "开始扫描 (期间请勿中断)..."
     # 工具的表格输出走 stdout, 这里整体重定向到 stderr 让用户看见但不污染返回值
-    timeout 300 python3 "$finder" "$ip" >&2 || \
+    # 扩大范围后耗时成倍增长, 超时也要跟着放宽, 否则总在快出结果时被砍掉。
+    local scan_timeout=300
+    [[ -n "$scan_args" ]] && scan_timeout=1200
+    timeout "$scan_timeout" python3 "$finder" "$ip" $scan_args >&2 || \
         warn "搜索未正常结束 (超时或出错), 可参考上面已输出的部分结果"
     [[ -n "$tmp_finder" ]] && rm -f "$tmp_finder"
 
