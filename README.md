@@ -53,6 +53,19 @@ sha256sum -c mirage-rs-amd64-musl.sha256
 ./mirage-rs-amd64-musl server -c /etc/mirage-rs/config_server.json
 ```
 
+配置校验与格式化 (不启动服务):
+```bash
+# 校验: 未知字段 (拼写错误) / 引用了不存在的 outbound / 明显无效值。
+# 有问题即非零退出, 适合当重启前的闸门:
+mirage-rs check -c /etc/mirage-rs/config_client.json && systemctl restart mirage-rs-client
+
+# 格式化输出到 stdout (不改动原文件, 保留原键序与全部字段):
+mirage-rs format -c config.json > config.pretty.json
+```
+
+> 服务**启动时**也会跑同一套校验, 但那里只打 WARN 不阻止启动 (配置多一个字段就让网关起不来
+> 代价太大)。`check` 反过来求"拦得住", 所以有问题就非零退出 —— 两者的严格度差异是刻意的。
+
 ⚠️ **内核必须 ≥ 5.10**, 详见下方 [系统兼容性](#系统兼容性)。
 
 ---

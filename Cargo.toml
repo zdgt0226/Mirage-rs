@@ -29,7 +29,7 @@ rand = "0.10.1"
 regex = "1.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["full", "net", "rt", "rt-multi-thread"] }
 tower-http = { version = "0.6.11", features = ["cors", "fs"] }
