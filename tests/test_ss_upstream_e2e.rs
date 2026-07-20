@@ -177,8 +177,8 @@ async fn wrong_password_cannot_decrypt_downlink() {
     let _ = w.write_all(b"x").await;
     // 密码不匹配 → 下行解密必须失败, 而不是返回垃圾数据
     let res = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_chunk()).await;
-    match res {
-        Ok(Ok(v)) => panic!("密码不匹配却解出了数据: {v:?}"),
-        _ => {} // 解密失败或超时都是可接受的拒绝方式
+    // 解密失败或超时都是可接受的拒绝方式; 唯独不能成功解出数据
+    if let Ok(Ok(v)) = res {
+        panic!("密码不匹配却解出了数据: {v:?}");
     }
 }

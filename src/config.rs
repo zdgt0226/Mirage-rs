@@ -528,9 +528,28 @@ impl Config {
             if port == 0 {
                 issues.push(format!("inbound `{tag}` 的 port 为 0"));
             }
-            if let InboundConfig::MirageServer { tag, password, .. } = ib {
+            if let InboundConfig::MirageServer { tag, password, upstream, .. } = ib {
                 if password.is_empty() {
                     issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
+                }
+                // 上游出口配错会让服务端**拒绝启动**, 必须在 check 阶段就拦住 ——
+                // 否则 `check && systemctl restart` 这个闸门对这条路径形同虚设。
+                if let Some(UpstreamConfig::Shadowsocks {
+                    server, server_port, password: ss_pw, method,
+                }) = upstream
+                {
+                    if let Err(e) = crate::proxy::shadowsocks::Method::parse(method) {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                    }
+                    if server.trim().is_empty() {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.server 为空"));
+                    }
+                    if *server_port == 0 {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.server_port 为 0"));
+                    }
+                    if ss_pw.is_empty() {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.password 为空"));
+                    }
                 }
             }
         }
@@ -716,6 +735,48 @@ mod validation_tests {
         let is = issues_of(&v);
         assert!(has(&is, "server 为空") && has(&is, "server_port 为 0") && has(&is, "password 为空"),
                 "实际: {is:?}");
+    }
+
+    #[test]
+    fn ss_upstream_bad_method_is_caught() {
+        // 回归: 加密方式写错会让服务端**拒绝启动**, check 必须拦住 ——
+        // 否则 `check && systemctl restart` 这个闸门形同虚设。
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "pw", "camouflage_host": "x.com",
+              "upstream": { "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+                            "password": "sspw", "method": "aes-256-cfb" } }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "aes-256-cfb"), "应指出不支持的加密方式, 实际: {is:?}");
+    }
+
+    #[test]
+    fn ss_upstream_empty_fields_are_caught() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "pw", "camouflage_host": "x.com",
+              "upstream": { "type": "shadowsocks", "server": "", "server_port": 0,
+                            "password": "", "method": "aes-256-gcm" } }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "upstream.server 为空"), "实际: {is:?}");
+        assert!(has(&is, "upstream.server_port 为 0"), "实际: {is:?}");
+        assert!(has(&is, "upstream.password 为空"), "实际: {is:?}");
+    }
+
+    #[test]
+    fn ss_upstream_valid_passes() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "pw", "camouflage_host": "x.com",
+              "upstream": { "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+                            "password": "sspw", "method": "chacha20-ietf-poly1305" } }
+        ]);
+        assert!(issues_of(&v).is_empty(), "合法上游配置不该报问题: {:?}", issues_of(&v));
     }
 
     #[test]
