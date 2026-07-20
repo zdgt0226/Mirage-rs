@@ -60,6 +60,7 @@
     // method 支持:
     //   SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
     //   SIP022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm
+    //           / 2022-blake3-chacha20-poly1305
     //   (legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)
     // ⚠️ SIP022 的 password 不是任意密码, 而是 base64 编码的密钥本身
     //    (128 要 16 字节 / 256 要 32 字节), 用 `openssl rand -base64 32` 生成。

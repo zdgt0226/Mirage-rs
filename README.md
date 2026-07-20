@@ -104,6 +104,7 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
     "password": "ss-password",
     "method": "aes-256-gcm",    // SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
                                 // SIP022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm
+                                //         / 2022-blake3-chacha20-poly1305
     "udp": "block"              // block(默认) | direct, 见下方说明
 }
 ```

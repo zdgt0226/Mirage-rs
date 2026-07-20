@@ -1026,12 +1026,14 @@ EOM
         "aes-256-gcm (SIP004, 兼容性最好)" \
         "chacha20-ietf-poly1305 (SIP004, 无 AES 硬件加速时更快)" \
         "aes-128-gcm (SIP004)" \
-        "2022-blake3-aes-256-gcm (SIP022, 安全性最好)")
+        "2022-blake3-aes-256-gcm (SIP022, 安全性最好)" \
+        "2022-blake3-chacha20-poly1305 (SIP022, 无 AES 硬件加速时更快)")
     case "$m" in
         1) ss_method="aes-256-gcm" ;;
         2) ss_method="chacha20-ietf-poly1305" ;;
         3) ss_method="aes-128-gcm" ;;
         4) ss_method="2022-blake3-aes-256-gcm" ;;
+        5) ss_method="2022-blake3-chacha20-poly1305" ;;
     esac
     if [[ "$ss_method" == 2022-* ]]; then
         cat >&2 <<'EOM'

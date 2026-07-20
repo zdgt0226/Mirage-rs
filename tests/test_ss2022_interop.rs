@@ -27,6 +27,7 @@ async fn rdn(s: &mut tokio::net::TcpStream, n: usize) -> std::io::Result<Vec<u8>
 async fn spawn_2022_server(
     psk: Vec<u8>,
     downlink: &'static [u8],
+    kind: CipherKind,
 ) -> (u16, tokio::sync::oneshot::Receiver<(Vec<u8>, Vec<u8>)>) {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = l.local_addr().unwrap().port();
@@ -34,7 +35,6 @@ async fn spawn_2022_server(
 
     tokio::spawn(async move {
         let (mut s, _) = l.accept().await.unwrap();
-        let kind = CipherKind::AEAD2022_BLAKE3_AES_256_GCM;
 
         // ── 收请求 ──
         let req_salt = rdn(&mut s, KLEN).await.unwrap();
@@ -101,42 +101,52 @@ fn psk_b64(psk: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(psk)
 }
 
+/// 对每种 SIP022 算法都跑一遍完整互通 —— 光"编译过"不能说明 chacha20 那条路对。
 #[tokio::test]
 async fn ss2022_crypto_interops_with_reference_cipher() {
     const DOWN: &[u8] = b"HTTP/1.1 200 OK\r\n\r\nfrom-2022-upstream";
+    for (name, kind) in [
+        ("2022-blake3-aes-256-gcm", CipherKind::AEAD2022_BLAKE3_AES_256_GCM),
+        ("2022-blake3-chacha20-poly1305", CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305),
+    ] {
+        one_interop_round(name, kind, DOWN).await;
+    }
+}
+
+async fn one_interop_round(name: &str, kind: CipherKind, DOWN: &'static [u8]) {
     let psk = vec![0x9Au8; KLEN];
-    let (port, rx) = spawn_2022_server(psk.clone(), DOWN).await;
+    let (port, rx) = spawn_2022_server(psk.clone(), DOWN, kind).await;
 
     let cfg = mirage_rs::proxy::shadowsocks::SsConfig {
         server: "127.0.0.1".into(),
         port,
         password: psk_b64(&psk),
-        method: mirage_rs::proxy::shadowsocks::Method::parse("2022-blake3-aes-256-gcm").unwrap(),
+        method: mirage_rs::proxy::shadowsocks::Method::parse(name).unwrap(),
         block_udp: true,
     };
 
     let (mut r, _w, _fd) = mirage_rs::proxy::shadowsocks::connect(&cfg, "example.com:443")
         .await
-        .expect("SS2022 连接失败");
+        .unwrap_or_else(|e| panic!("{name}: SS2022 连接失败: {e}"));
 
     // 服务端能解出正确的目标地址 → 说明密钥派生 + 定长/变长头都对
     let (addr, _initial) = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
-        .await.expect("等服务端超时").unwrap();
+        .await.unwrap_or_else(|_| panic!("{name}: 等服务端超时")).unwrap();
     let mut want = vec![0x03, 11];
     want.extend_from_slice(b"example.com");
     want.extend_from_slice(&443u16.to_be_bytes());
-    assert_eq!(addr, want, "目标地址必须正确送达上游");
+    assert_eq!(addr, want, "{name}: 目标地址必须正确送达上游");
 
     // 下行必须能被我方正确解密 (含响应头的 salt 回显校验)
     let got = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_chunk())
-        .await.expect("读下行超时").unwrap();
-    assert_eq!(got, DOWN, "下行数据必须正确解密");
+        .await.unwrap_or_else(|_| panic!("{name}: 读下行超时")).unwrap();
+    assert_eq!(got, DOWN, "{name}: 下行数据必须正确解密");
 }
 
 #[tokio::test]
 async fn ss2022_wrong_psk_fails() {
     const DOWN: &[u8] = b"secret";
-    let (port, _rx) = spawn_2022_server(vec![0x11u8; KLEN], DOWN).await;
+    let (port, _rx) = spawn_2022_server(vec![0x11u8; KLEN], DOWN, CipherKind::AEAD2022_BLAKE3_AES_256_GCM).await;
 
     let cfg = mirage_rs::proxy::shadowsocks::SsConfig {
         server: "127.0.0.1".into(),

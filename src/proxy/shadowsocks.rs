@@ -38,6 +38,7 @@ pub enum Method {
     // ── SIP022 (Shadowsocks 2022) ──
     Ss2022Aes128Gcm,
     Ss2022Aes256Gcm,
+    Ss2022Chacha20Poly1305,
 }
 
 impl Method {
@@ -49,10 +50,12 @@ impl Method {
             "chacha20-ietf-poly1305" | "chacha20-poly1305" => Ok(Self::Chacha20IetfPoly1305),
             "2022-blake3-aes-128-gcm" => Ok(Self::Ss2022Aes128Gcm),
             "2022-blake3-aes-256-gcm" => Ok(Self::Ss2022Aes256Gcm),
+            "2022-blake3-chacha20-poly1305" => Ok(Self::Ss2022Chacha20Poly1305),
             other => bail!(
                 "不支持的 Shadowsocks 加密方式 `{other}`。支持: \
                  aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305 (SIP004), \
-                 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm (SIP022)。\
+                 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm / \
+                 2022-blake3-chacha20-poly1305 (SIP022)。\
                  (legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)"
             ),
         }
@@ -60,14 +63,20 @@ impl Method {
 
     /// 是否为 Shadowsocks 2022 (SIP022)。两代在**密钥来源**与**帧结构**上都不同, 不可混用。
     pub fn is_2022(&self) -> bool {
-        matches!(self, Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm)
+        matches!(
+            self,
+            Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm | Self::Ss2022Chacha20Poly1305
+        )
     }
 
     /// 密钥长度。salt 长度与之相同 (两代皆然)。
     pub fn key_len(&self) -> usize {
         match self {
             Self::Aes128Gcm | Self::Ss2022Aes128Gcm => 16,
-            Self::Aes256Gcm | Self::Chacha20IetfPoly1305 | Self::Ss2022Aes256Gcm => 32,
+            Self::Aes256Gcm
+            | Self::Chacha20IetfPoly1305
+            | Self::Ss2022Aes256Gcm
+            | Self::Ss2022Chacha20Poly1305 => 32,
         }
     }
 
@@ -75,7 +84,9 @@ impl Method {
         match self {
             Self::Aes128Gcm | Self::Ss2022Aes128Gcm => &ring::aead::AES_128_GCM,
             Self::Aes256Gcm | Self::Ss2022Aes256Gcm => &ring::aead::AES_256_GCM,
-            Self::Chacha20IetfPoly1305 => &ring::aead::CHACHA20_POLY1305,
+            Self::Chacha20IetfPoly1305 | Self::Ss2022Chacha20Poly1305 => {
+                &ring::aead::CHACHA20_POLY1305
+            }
         }
     }
 }
@@ -812,7 +823,10 @@ mod ss2022_crypto_tests {
         assert_eq!(m.key_len(), 16);
         // SIP004 的不能被误判成 2022
         assert!(!Method::parse("aes-256-gcm").unwrap().is_2022());
-        // 未实现的 2022 变体要明确报错而非静默接受
-        assert!(Method::parse("2022-blake3-chacha20-poly1305").is_err());
+        let m = Method::parse("2022-blake3-chacha20-poly1305").unwrap();
+        assert!(m.is_2022());
+        assert_eq!(m.key_len(), 32);
+        // 仍未实现的变体要明确报错而非静默接受
+        assert!(Method::parse("2022-blake3-chacha8-poly1305").is_err());
     }
 }
