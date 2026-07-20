@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-20T15:12:21.814Z._
+_Auto-generated. Last updated 2026-07-20T16:16:04.945Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**

@@ -31,9 +31,13 @@ const TAG_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
+    // ── SIP004 AEAD (经典) ──
     Aes128Gcm,
     Aes256Gcm,
     Chacha20IetfPoly1305,
+    // ── SIP022 (Shadowsocks 2022) ──
+    Ss2022Aes128Gcm,
+    Ss2022Aes256Gcm,
 }
 
 impl Method {
@@ -43,28 +47,74 @@ impl Method {
             "aes-256-gcm" => Ok(Self::Aes256Gcm),
             // 两种写法在生态里都常见, 都认
             "chacha20-ietf-poly1305" | "chacha20-poly1305" => Ok(Self::Chacha20IetfPoly1305),
+            "2022-blake3-aes-128-gcm" => Ok(Self::Ss2022Aes128Gcm),
+            "2022-blake3-aes-256-gcm" => Ok(Self::Ss2022Aes256Gcm),
             other => bail!(
-                "不支持的 Shadowsocks 加密方式 `{other}`。支持: aes-128-gcm / aes-256-gcm / \
-                 chacha20-ietf-poly1305。(legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)"
+                "不支持的 Shadowsocks 加密方式 `{other}`。支持: \
+                 aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305 (SIP004), \
+                 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm (SIP022)。\
+                 (legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)"
             ),
         }
     }
 
-    /// 密钥长度。salt 长度与之相同 (SIP004)。
+    /// 是否为 Shadowsocks 2022 (SIP022)。两代在**密钥来源**与**帧结构**上都不同, 不可混用。
+    pub fn is_2022(&self) -> bool {
+        matches!(self, Self::Ss2022Aes128Gcm | Self::Ss2022Aes256Gcm)
+    }
+
+    /// 密钥长度。salt 长度与之相同 (两代皆然)。
     pub fn key_len(&self) -> usize {
         match self {
-            Self::Aes128Gcm => 16,
-            Self::Aes256Gcm | Self::Chacha20IetfPoly1305 => 32,
+            Self::Aes128Gcm | Self::Ss2022Aes128Gcm => 16,
+            Self::Aes256Gcm | Self::Chacha20IetfPoly1305 | Self::Ss2022Aes256Gcm => 32,
         }
     }
 
     fn algorithm(&self) -> &'static ring::aead::Algorithm {
         match self {
-            Self::Aes128Gcm => &ring::aead::AES_128_GCM,
-            Self::Aes256Gcm => &ring::aead::AES_256_GCM,
+            Self::Aes128Gcm | Self::Ss2022Aes128Gcm => &ring::aead::AES_128_GCM,
+            Self::Aes256Gcm | Self::Ss2022Aes256Gcm => &ring::aead::AES_256_GCM,
             Self::Chacha20IetfPoly1305 => &ring::aead::CHACHA20_POLY1305,
         }
     }
+}
+
+/// SIP022 的 BLAKE3 KDF context。**必须逐字一致**, 差一个字符就得出完全不同的密钥,
+/// 表现为"能连上但握手后对不上", 极难排查。
+const SS2022_KDF_CONTEXT: &str = "shadowsocks 2022 session subkey";
+
+/// SIP022 会话子密钥: `BLAKE3::derive_key(context, PSK || salt)`, 取 key_len 字节。
+///
+/// 注意 key_material 的顺序是 **PSK 在前、salt 在后**, 与 SIP004 的 HKDF(ikm=主密钥,
+/// salt=salt) 是完全不同的构造 —— 两者不能互相套用。
+fn ss2022_session_key(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new_derive_key(SS2022_KDF_CONTEXT);
+    hasher.update(psk);
+    hasher.update(salt);
+    let mut out = vec![0u8; key_len];
+    hasher.finalize_xof().fill(&mut out);
+    out
+}
+
+/// SIP022 的 PSK 在配置里是 **base64 编码**的, 且解码后长度必须等于 key_len。
+///
+/// 这与 SIP004 的"任意密码经 EVP_BytesToKey 派生"完全不同 —— 2022 不做密码拉伸,
+/// 配置里那串就是密钥本身。长度不对必须直接报错: 若容忍并截断/补齐, 会得到一个
+/// 双方不一致的密钥, 表现为连上后解密全失败, 而错误信息完全指不到根因。
+pub fn decode_ss2022_psk(b64: &str, key_len: usize) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let psk = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| anyhow!("SIP022 的 password 必须是 base64 编码的密钥: {e}"))?;
+    if psk.len() != key_len {
+        bail!(
+            "SIP022 密钥长度不对: base64 解码后 {} 字节, 该加密方式要求 {} 字节。\
+             (可用 `openssl rand -base64 {}` 生成)",
+            psk.len(), key_len, key_len
+        );
+    }
+    Ok(psk)
 }
 
 /// 上游 SS 服务器配置。
@@ -201,6 +251,97 @@ pub fn encode_socks_addr(target: &str) -> Result<Vec<u8>> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// SIP022 (Shadowsocks 2022) 帧结构
+// ────────────────────────────────────────────────────────────────────────────
+//
+// 与 SIP004 完全不同, 不能套用:
+//
+//   请求 (客户端→服务端):
+//     [salt: key_len]
+//     [AEAD(定长头): 11 + tag]      类型(1)=0 | 时间戳(8, u64 BE) | 变长头长度(2, u16 BE)
+//     [AEAD(变长头): 上述长度 + tag] 目标地址 | padding 长度(2) | padding | 首段载荷
+//     [后续 chunk: 与 SIP004 同构]
+//
+//   响应 (服务端→客户端):
+//     [salt: key_len]
+//     [AEAD(定长头): 1+8+key_len+2 + tag]  类型(1)=1 | 时间戳(8) | **请求 salt** | 载荷长度(2)
+//     [AEAD(载荷): 上述长度 + tag]
+//     [后续 chunk]
+//
+// 两个 SIP004 没有的安全要素:
+//   · **时间戳**: 双方校验 ±30s, 用于抗重放。这也意味着两端时钟偏差过大会直接连不上
+//     (与 Mirage 自己的握手容差是同类问题, 见 auth_ts_tolerance_secs)。
+//   · **请求 salt 回显**: 服务端必须在响应头里回显客户端的 salt, 把响应绑定到本次请求。
+//     不校验它, 攻击者就能把另一会话的响应重放给你。
+
+const SS2022_TYPE_CLIENT: u8 = 0;
+const SS2022_TYPE_SERVER: u8 = 1;
+/// 时间戳容差 (秒)。协议规定 30s。
+const SS2022_TS_TOLERANCE: u64 = 30;
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// 构造 SIP022 请求的定长头与变长头明文。
+///
+/// `initial_payload` 为空时塞一段随机 padding —— 协议如此规定, 目的是让"只建连不发数据"
+/// 的请求不至于呈现固定长度特征。有首段载荷时 padding 长度写 0。
+fn build_2022_request(target: &str, initial_payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let addr = encode_socks_addr(target)?;
+
+    let mut var = Vec::with_capacity(addr.len() + 2 + 64 + initial_payload.len());
+    var.extend_from_slice(&addr);
+    if initial_payload.is_empty() {
+        // 0..=64 的随机 padding (协议允许 0..=900, 取小段即可打散长度特征)
+        let pad_len = fastrand::usize(..65);
+        var.extend_from_slice(&(pad_len as u16).to_be_bytes());
+        var.extend(std::iter::repeat_n(0u8, pad_len).map(|_| fastrand::u8(..)));
+    } else {
+        var.extend_from_slice(&0u16.to_be_bytes());
+        var.extend_from_slice(initial_payload);
+    }
+
+    if var.len() > u16::MAX as usize {
+        bail!("SIP022 变长头过长: {} 字节", var.len());
+    }
+    let mut fixed = Vec::with_capacity(11);
+    fixed.push(SS2022_TYPE_CLIENT);
+    fixed.extend_from_slice(&now_unix().to_be_bytes());
+    fixed.extend_from_slice(&(var.len() as u16).to_be_bytes());
+
+    Ok((fixed, var))
+}
+
+/// 校验服务端响应的定长头。返回随后那段载荷的长度。
+///
+/// 三项都必须查: 类型 / 时间戳 / **请求 salt 回显**。少查任何一项都会留下重放面。
+fn parse_2022_response_header(plain: &[u8], our_salt: &[u8]) -> Result<usize> {
+    let klen = our_salt.len();
+    if plain.len() != 1 + 8 + klen + 2 {
+        bail!("SIP022 响应定长头长度异常: {}", plain.len());
+    }
+    if plain[0] != SS2022_TYPE_SERVER {
+        bail!("SIP022 响应头类型应为 {SS2022_TYPE_SERVER}, 实际 {}", plain[0]);
+    }
+    let ts = u64::from_be_bytes(plain[1..9].try_into().unwrap());
+    let now = now_unix();
+    if now.abs_diff(ts) > SS2022_TS_TOLERANCE {
+        bail!(
+            "SIP022 响应时间戳超出 ±{SS2022_TS_TOLERANCE}s (对端 {ts}, 本机 {now}) —— \
+             两端时钟不同步, 或是重放的旧响应"
+        );
+    }
+    if &plain[9..9 + klen] != our_salt {
+        bail!("SIP022 响应未回显本次请求的 salt —— 可能是重放的其它会话响应");
+    }
+    Ok(u16::from_be_bytes(plain[9 + klen..].try_into().unwrap()) as usize)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // 读写半边
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -232,6 +373,17 @@ impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
         }
         self.inner.flush().await
     }
+
+    /// 把整块明文密封后直接送出 —— **不套** chunk 的长度前缀。
+    /// SIP022 的定长头/变长头就是这样发的: 它们自身已带长度语义, 再套一层就错了。
+    async fn write_raw_sealed(&mut self, plain: &[u8]) -> std::io::Result<()> {
+        let mut b = plain.to_vec();
+        self.crypter
+            .seal(&mut b)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.inner.write_all(&b).await?;
+        self.inner.flush().await
+    }
 }
 
 /// 用给定 salt 构造一个写半边 —— 仅供测试与交叉验证 (需要可复现的 salt)。
@@ -251,7 +403,12 @@ pub struct SsReader<R> {
     inner: R,
     crypter: Option<Crypter>, // 首次读到 salt 后才建立
     method: Method,
+    /// SIP004: EVP_BytesToKey 出的主密钥; SIP022: base64 解码出的 PSK。
     master: Vec<u8>,
+    /// 本次请求用的上行 salt。SIP022 必须拿它校验服务端响应头里的回显, 防重放。
+    req_salt: Vec<u8>,
+    /// SIP022 首个 chunk 混在响应定长头之后, 与后续 chunk 结构不同, 需单独处理一次。
+    ss2022_first_done: bool,
 }
 
 impl<R: AsyncReadExt + Unpin> SsReader<R> {
@@ -259,15 +416,48 @@ impl<R: AsyncReadExt + Unpin> SsReader<R> {
     pub async fn read_chunk(&mut self) -> std::io::Result<Vec<u8>> {
         // 首个 chunk 之前先收下行 salt
         if self.crypter.is_none() {
-            let mut salt = vec![0u8; self.method.key_len()];
+            let klen = self.method.key_len();
+            let mut salt = vec![0u8; klen];
             match self.inner.read_exact(&mut salt).await {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
                 Err(e) => return Err(e),
             }
-            let subkey = hkdf_subkey(&self.master, &salt, self.method.key_len());
+            let subkey = if self.method.is_2022() {
+                ss2022_session_key(&self.master, &salt, klen)
+            } else {
+                hkdf_subkey(&self.master, &salt, klen)
+            };
             self.crypter = Some(Crypter::new(self.method, &subkey));
         }
+
+        // SIP022: salt 之后是定长响应头 (含请求 salt 回显), 其后那段载荷的长度由它给出。
+        // 这一步每条连接只做一次, 之后回到与 SIP004 同构的 chunk 循环。
+        if self.method.is_2022() && !self.ss2022_first_done {
+            self.ss2022_first_done = true;
+            let klen = self.method.key_len();
+            let hdr_len = 1 + 8 + klen + 2;
+            let mut hdr = vec![0u8; hdr_len + TAG_LEN];
+            match self.inner.read_exact(&mut hdr).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            }
+            let c = self.crypter.as_mut().unwrap();
+            let n = c.open(&mut hdr).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let plen = parse_2022_response_header(&hdr[..n], &self.req_salt)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if plen == 0 {
+                return Ok(Vec::new());
+            }
+            let mut body = vec![0u8; plen + TAG_LEN];
+            self.inner.read_exact(&mut body).await?;
+            let c = self.crypter.as_mut().unwrap();
+            let bl = c.open(&mut body).map_err(|e| std::io::Error::other(e.to_string()))?;
+            body.truncate(bl);
+            return Ok(body);
+        }
+
         let c = self.crypter.as_mut().unwrap();
 
         // [加密长度(2)+tag]
@@ -312,33 +502,61 @@ pub async fn connect(
 )> {
     use std::os::fd::AsRawFd;
 
+    let key_len = cfg.method.key_len();
+    // 两代的"密钥来源"完全不同: SIP004 把任意密码经 EVP_BytesToKey 拉伸;
+    // SIP022 不做拉伸, 配置里那串 base64 解码后**就是**密钥本身。
+    //
+    // 这一步刻意放在 **connect 之前**: PSK 格式/长度错是配置问题, 若先建连,
+    // 网络错误 (Connection refused / 超时) 会把真正的原因盖住, 用户对着
+    // "连接被拒" 根本查不到是密钥写错了。
+    let master = if cfg.method.is_2022() {
+        decode_ss2022_psk(&cfg.password, key_len)?
+    } else {
+        evp_bytes_to_key(&cfg.password, key_len)
+    };
+
     let stream = TcpStream::connect(cfg.addr()).await?;
     stream.set_nodelay(true).ok();
     let fd = stream.as_raw_fd();
     let (r, w) = stream.into_split();
 
-    let key_len = cfg.method.key_len();
-    let master = evp_bytes_to_key(&cfg.password, key_len);
-
     // 上行 salt: 每连接随机
     let mut salt = vec![0u8; key_len];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
         .map_err(|_| anyhow!("生成 salt 失败"))?;
-    let subkey = hkdf_subkey(&master, &salt, key_len);
+    let subkey = if cfg.method.is_2022() {
+        ss2022_session_key(&master, &salt, key_len)
+    } else {
+        hkdf_subkey(&master, &salt, key_len)
+    };
 
     let mut writer = SsWriter {
         inner: w,
         crypter: Crypter::new(cfg.method, &subkey),
         buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
     };
-    // salt 是明文前缀, 不经加密直接送出
+    // salt 是明文前缀, 不经加密直接送出 (两代皆然)
     writer.inner.write_all(&salt).await?;
 
-    // 首个载荷 = 目标地址
-    let addr = encode_socks_addr(target)?;
-    writer.write_all(&addr).await?;
+    if cfg.method.is_2022() {
+        // SIP022: 定长头 + 变长头 (目标地址在变长头里, 不是普通 chunk)
+        let (fixed, var) = build_2022_request(target, &[])?;
+        writer.write_raw_sealed(&fixed).await?;
+        writer.write_raw_sealed(&var).await?;
+    } else {
+        // SIP004: 首个 chunk 就是目标地址
+        let addr = encode_socks_addr(target)?;
+        writer.write_all(&addr).await?;
+    }
 
-    let reader = SsReader { inner: r, crypter: None, method: cfg.method, master };
+    let reader = SsReader {
+        inner: r,
+        crypter: None,
+        method: cfg.method,
+        master,
+        req_salt: salt,
+        ss2022_first_done: false,
+    };
     Ok((reader, writer, fd))
 }
 
@@ -471,6 +689,8 @@ mod tests {
             crypter: None,
             method,
             master: master.clone(),
+            req_salt: salt.clone(),
+            ss2022_first_done: false,
         };
         let mut got = Vec::new();
         loop {
@@ -508,7 +728,91 @@ mod tests {
             crypter: None,
             method,
             master: evp_bytes_to_key("wrong", method.key_len()),
+            req_salt: salt.clone(),
+            ss2022_first_done: false,
         };
         assert!(r.read_chunk().await.is_err(), "密码不匹配必须解密失败");
+    }
+}
+
+#[cfg(test)]
+mod ss2022_crypto_tests {
+    use super::*;
+
+    /// **对照验证**: 会话子密钥派生必须与成熟实现 `shadowsocks-crypto` 逐字节一致。
+    ///
+    /// 这是 SIP022 最容易搞错、错了又最难排查的一步 (context 字符串差一个字符、
+    /// key_material 拼接顺序反了, 都会得出完全不同的密钥, 表现为"连上但解不开")。
+    /// shadowsocks-crypto 是 dev-dependency, 不进发布二进制。
+    #[test]
+    fn session_key_matches_reference_impl() {
+        use shadowsocks_crypto::v2::BLAKE3_KEY_DERIVE_CONTEXT;
+        // 先确认双方用的是同一个 context 字符串
+        assert_eq!(SS2022_KDF_CONTEXT, BLAKE3_KEY_DERIVE_CONTEXT,
+                   "BLAKE3 KDF context 必须与参考实现完全一致");
+
+        for (klen, label) in [(16usize, "aes-128"), (32usize, "aes-256")] {
+            let psk = vec![0xABu8; klen];
+            let salt = vec![0x5Cu8; klen];
+
+            // 参考实现的派生方式 (照搬 shadowsocks-crypto TcpCipher::new 的算法)
+            let key_material = [&psk[..], &salt[..]].concat();
+            let mut h = blake3::Hasher::new_derive_key(BLAKE3_KEY_DERIVE_CONTEXT);
+            h.update(&key_material);
+            let mut expect = vec![0u8; klen];
+            h.finalize_xof().fill(&mut expect);
+
+            let got = ss2022_session_key(&psk, &salt, klen);
+            assert_eq!(got, expect, "{label} 的会话子密钥与参考实现不一致");
+        }
+    }
+
+    /// 我们用两次 update 喂 (psk, salt), 参考实现用一次 update 喂拼接结果。
+    /// BLAKE3 是流式哈希, 两者必须等价 —— 这条测试把这个假设钉死。
+    #[test]
+    fn streaming_update_equals_concat() {
+        let psk = b"0123456789abcdef";
+        let salt = b"fedcba9876543210";
+        let mut a = blake3::Hasher::new_derive_key(SS2022_KDF_CONTEXT);
+        a.update(psk);
+        a.update(salt);
+        let mut ka = [0u8; 32];
+        a.finalize_xof().fill(&mut ka);
+
+        let mut b = blake3::Hasher::new_derive_key(SS2022_KDF_CONTEXT);
+        b.update(&[&psk[..], &salt[..]].concat());
+        let mut kb = [0u8; 32];
+        b.finalize_xof().fill(&mut kb);
+
+        assert_eq!(ka, kb, "分次 update 必须等价于拼接后一次 update");
+    }
+
+    #[test]
+    fn psk_must_be_base64_of_exact_length() {
+        use base64::Engine;
+        let ok = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        assert_eq!(decode_ss2022_psk(&ok, 32).unwrap(), vec![7u8; 32]);
+
+        // 长度不匹配必须报错 (静默截断/补齐会造成两端密钥不一致)
+        let short = base64::engine::general_purpose::STANDARD.encode([7u8; 16]);
+        let e = decode_ss2022_psk(&short, 32).unwrap_err().to_string();
+        assert!(e.contains("16 字节") && e.contains("32 字节"), "实际: {e}");
+
+        // 非 base64 必须报错
+        assert!(decode_ss2022_psk("不是base64!!!", 32).is_err());
+    }
+
+    #[test]
+    fn method_parse_2022() {
+        let m = Method::parse("2022-blake3-aes-256-gcm").unwrap();
+        assert!(m.is_2022());
+        assert_eq!(m.key_len(), 32);
+        let m = Method::parse("2022-blake3-aes-128-gcm").unwrap();
+        assert!(m.is_2022());
+        assert_eq!(m.key_len(), 16);
+        // SIP004 的不能被误判成 2022
+        assert!(!Method::parse("aes-256-gcm").unwrap().is_2022());
+        // 未实现的 2022 变体要明确报错而非静默接受
+        assert!(Method::parse("2022-blake3-chacha20-poly1305").is_err());
     }
 }

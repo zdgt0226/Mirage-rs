@@ -1023,14 +1023,24 @@ EOM
     ss_port=$(ask "上游 SS 端口" "8388")
     ss_pwd=$(ask "上游 SS 密码" "")
     local m=$(ask_choice "上游 SS 加密方式" \
-        "aes-256-gcm (推荐)" \
-        "chacha20-ietf-poly1305 (无 AES 硬件加速时更快)" \
-        "aes-128-gcm")
+        "aes-256-gcm (SIP004, 兼容性最好)" \
+        "chacha20-ietf-poly1305 (SIP004, 无 AES 硬件加速时更快)" \
+        "aes-128-gcm (SIP004)" \
+        "2022-blake3-aes-256-gcm (SIP022, 安全性最好)")
     case "$m" in
         1) ss_method="aes-256-gcm" ;;
         2) ss_method="chacha20-ietf-poly1305" ;;
         3) ss_method="aes-128-gcm" ;;
+        4) ss_method="2022-blake3-aes-256-gcm" ;;
     esac
+    if [[ "$ss_method" == 2022-* ]]; then
+        cat >&2 <<'EOM'
+
+  ⚠️ SIP022 的密码不是任意字符串, 而是 **base64 编码的 32 字节密钥**
+     (与 SIP004 的"任意密码"完全不同, 填错会连不上)。
+     没有的话可以用: openssl rand -base64 32
+EOM
+    fi
     # legacy 流式加密 (aes-256-cfb 等) 不提供选项: 无完整性校验、已废弃、易被主动探测识别。
 
     cat >&2 <<'EOM'

@@ -49,6 +49,11 @@ pub(crate) fn build_ss_upstream(
         return Ok(None);
     };
     let m = crate::proxy::shadowsocks::Method::parse(method)?;
+    // SIP022: 密钥格式/长度错不会让服务起不来, 而是每条连接都静默失败 (服务看着健康却
+    // 代理不了任何东西)。在这里提前解一次, 让它变成"拒绝启动 + 明确报错"。
+    if m.is_2022() {
+        crate::proxy::shadowsocks::decode_ss2022_psk(password, m.key_len())?;
+    }
     info!(
         "上游出口: Shadowsocks {}:{} ({}) —— 本服务端作为中转站, TCP 流量将再经 SS 转发",
         server, server_port, method

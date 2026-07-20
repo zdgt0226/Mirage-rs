@@ -563,8 +563,19 @@ impl Config {
                     server, server_port, password: ss_pw, method, ..
                 }) = upstream
                 {
-                    if let Err(e) = crate::proxy::shadowsocks::Method::parse(method) {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                    match crate::proxy::shadowsocks::Method::parse(method) {
+                        Err(e) => issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}")),
+                        Ok(m) if m.is_2022() => {
+                            // SIP022 的 password 是 base64 密钥且长度固定。写错不会让服务端
+                            // 起不来, 而是**每条连接都静默失败** —— 服务看着健康却什么都代理
+                            // 不了, 比起不来更难查。必须在这里拦住。
+                            if let Err(e) =
+                                crate::proxy::shadowsocks::decode_ss2022_psk(ss_pw, m.key_len())
+                            {
+                                issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                            }
+                        }
+                        Ok(_) => {}
                     }
                     if server.trim().is_empty() {
                         issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.server 为空"));
@@ -775,6 +786,32 @@ mod validation_tests {
         ]);
         let is = issues_of(&v);
         assert!(has(&is, "aes-256-cfb"), "应指出不支持的加密方式, 实际: {is:?}");
+    }
+
+    #[test]
+    fn ss2022_psk_length_is_validated() {
+        // 回归: SIP022 密钥长度错**不会**让服务端起不来, 而是每条连接都静默失败 ——
+        // 服务看着健康却什么都代理不了。check 必须在重启前就拦住。
+        use base64::Engine;
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "pw", "camouflage_host": "x.com",
+              "upstream": { "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+                            "password": short, "method": "2022-blake3-aes-256-gcm" } }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "16 字节") && has(&is, "32 字节"), "实际: {is:?}");
+
+        // 长度正确则放行
+        let good = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        v["inbounds"][0]["upstream"]["password"] = serde_json::json!(good);
+        assert!(issues_of(&v).is_empty(), "合法 PSK 不该报问题: {:?}", issues_of(&v));
+
+        // 非 base64 也要拦
+        v["inbounds"][0]["upstream"]["password"] = serde_json::json!("不是base64!!!");
+        assert!(has(&issues_of(&v), "base64"), "非 base64 的 PSK 应被拦住");
     }
 
     #[test]

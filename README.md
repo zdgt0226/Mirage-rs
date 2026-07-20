@@ -102,7 +102,8 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
     "server": "1.2.3.4",
     "server_port": 8388,
     "password": "ss-password",
-    "method": "aes-256-gcm",    // 或 aes-128-gcm / chacha20-ietf-poly1305
+    "method": "aes-256-gcm",    // SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
+                                // SIP022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm
     "udp": "block"              // block(默认) | direct, 见下方说明
 }
 ```
@@ -117,8 +118,13 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 > 而非"发到别处去"**。代价: QUIC 回落 TCP(页面照常), 游戏/WebRTC 不可用。
 > 确需旧行为写 `"udp": "direct"`(启动会 WARN)。轻量客户端本就仅 TCP, 不受影响。
 >
-> 📌 支持 SIP004 AEAD; **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、
-> 已被 Shadowsocks 社区废弃, 且易被主动探测识别。
+> 📌 同时支持 **SIP004 AEAD** 与 **SIP022 (Shadowsocks 2022)**;
+> **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、已被社区废弃、易被主动探测识别。
+>
+> 📌 **SIP022 的 `password` 与 SIP004 语义完全不同**: 它不是任意密码, 而是 **base64 编码的密钥本身**
+> (2022-blake3-aes-128-gcm 要 16 字节, aes-256 要 32 字节), 不做密码拉伸。用
+> `openssl rand -base64 32` 生成。长度不对会被 `mirage-rs check` 直接拦下并说明应有长度 ——
+> 这类错**不会**让服务端起不来, 而是每条连接都静默失败, 所以必须提前拦住。
 
 ### 轻量模式 (只要"能翻墙"就够了)
 

@@ -38,6 +38,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 serde_ignored = "0.1.14"
 md-5 = "0.11.0"
+blake3 = "1.8.5"
+base64 = "0.22.1"
 
 [features]
 default = []
@@ -87,3 +89,7 @@ required-features = ["ebpf"]
 [[example]]
 name = "simulate_bdp"
 path = "examples/simulate_bdp.rs"
+
+[dev-dependencies]
+base64 = "0.22.1"
+shadowsocks-crypto = { version = "0.7.0", features = ["v2"] }
