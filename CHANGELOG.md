@@ -31,6 +31,42 @@
 缺头、`Authorization` 冒充、header 大小写、密码含冒号、base64 已知向量。
 "0x00 不能绕过"这条做过变异验证(放宽为也接受 0x00 → 该测试如实变红)。
 
+### feat(lite): 新增轻量模式 `lite-client` / `lite-server`
+
+给"只要能翻墙、不需要分流"的场景一条最短路径: 本机 SOCKS5 → 全部走隧道。
+
+```bash
+mirage-rs lite-server -c lite_server.json    # 墙外 VPS
+mirage-rs lite-client -c lite_client.json    # 本机
+```
+
+- **平铺极简配置**: `{listen, port, server, server_port, password, sni, auth?}`,
+  没有 inbounds/outbounds/routing 嵌套。客户端仅 `server`/`server_port`/`password` 必填。
+- **不加载**: 分流规则、DNS/fake-IP、透明代理、Web 看板、geo 数据下载、配置热重载。
+- **一个都没少**: 加密、TLS 指纹伪装、握手认证、认证失败转发真站。**协议与完整版完全一致,
+  轻量客户端可直连完整版服务端, 反之亦然。**
+- **仅 TCP**: SOCKS5 UDP ASSOCIATE 按规范回 `REP=0x07` 明确拒绝, 而非静默断开让客户端干等。
+  代价是 QUIC/HTTP3 走不了代理(浏览器会自动回落 TCP)。
+- 客户端同样带**开放代理告警**: 监听非回环且未配 `auth` 时启动 WARN。
+
+**实现上刻意不复制引擎**: 把平铺配置在内存里展开成内部 `CoreState`(单个 mirage 出站 +
+空规则 + default 指向它), 之后直接复用现成的 `proxy_tcp_target` / `mirage_server::start_server`
+—— 隧道池、换隧道重试、中继、伪装握手都只有一份实现, 不会与完整版分叉。
+「全部转发」因此是**结构性成立**的: 规则为空, 一切都落到唯一的 mirage 出站,
+不存在"漏配某条规则导致直连泄漏"的可能。
+
+> 📌 轻量模式是**运行时**精简, **不是**单独编译的小二进制 —— 体积与完整版相同(仍 ~15M)。
+> 真正减小体积需要 cargo feature 把 router/dns/api/ebpf 整块编译掉, 那是另一件事。
+>
+> 📌 `OutboundManager` 会无条件注入内置的 `direct`/`block` 节点, 轻量模式下它们**存在但不可达**
+> ——「全部转发」的保证来自路由(零规则 + default 指向 proxy), 不是来自"没有 direct 出站"。
+> 已有单测守这条线。
+
+验证: 6 个单测 (配置默认值/必填项/认证/路由全部指向隧道) + 2 个端到端集成测试 ——
+起真的 lite-server + lite-client, 经 SOCKS5 打通到本测试自建的 echo 服务并校验数据原样往返
+(不依赖外网, CI 可稳定跑), 以及 UDP ASSOCIATE 确实回 `0x07`。
+另在真机手工验过一条经隧道的真实 HTTPS 请求。
+
 ### feat(cli): 新增 `import` 子命令 —— 导入 mirage:// 节点
 
 ```bash

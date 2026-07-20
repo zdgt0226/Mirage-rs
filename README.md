@@ -75,6 +75,40 @@ mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
 
 ⚠️ **内核必须 ≥ 5.10**, 详见下方 [系统兼容性](#系统兼容性)。
 
+### 轻量模式 (只要"能翻墙"就够了)
+
+如果你不需要分流 / fake-IP / 透明网关 / 看板, 只想要「本机 SOCKS5 → 全部走隧道」,
+用轻量模式 —— **同一个二进制、同一套协议与伪装**, 与完整版可互通:
+
+```bash
+mirage-rs lite-server -c lite_server.json    # 墙外 VPS
+mirage-rs lite-client -c lite_client.json    # 本机
+```
+
+配置是平铺的极简格式:
+
+```jsonc
+// lite_client.json —— server/server_port/password 必填, 其余可省
+{
+  "listen": "127.0.0.1", "port": 1080,      // 默认值, 可省
+  "server": "1.2.3.4", "server_port": 443,
+  "password": "你的密码",
+  "sni": "www.apple.com",                    // 须与服务端一致
+  // 监听 0.0.0.0 时强烈建议设置, 否则是开放代理:
+  "auth": { "username": "u", "password": "p" }
+}
+
+// lite_server.json —— password 必填
+{ "listen": "0.0.0.0", "port": 443, "password": "你的密码", "sni": "www.apple.com" }
+```
+
+**与完整版的差别**: 无分流(**全部转发**)、无 DNS/fake-IP、无透明代理、无 Web 看板、
+无 geo 数据下载、无配置热重载、**SOCKS5 仅 TCP**(UDP ASSOCIATE 会按规范回 `0x07` 拒绝,
+所以 QUIC/HTTP3 走不了代理 —— 浏览器会自动回落 TCP)。
+加密、TLS 指纹伪装、握手认证、认证失败转发真站这些**一个都没少**。
+
+> 注: 轻量模式是**运行时**精简, 不是单独编译的小二进制 —— 体积与完整版相同。
+
 ---
 
 ## 🖥️ 科幻大屏：Neon Pulse Dashboard

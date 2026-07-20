@@ -9,6 +9,7 @@ pub mod ebpf;
 pub mod monitor;
 pub mod net_monitor;
 pub mod node_uri;
+pub mod lite;
 pub mod api;
 
 use anyhow::Result;

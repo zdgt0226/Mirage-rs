@@ -41,6 +41,23 @@ enum Mode {
         #[arg(short, long, default_value = "config.json")]
         config: String,
     },
+    /// 轻量客户端: 仅 SOCKS5 (TCP) 入站, 全部流量走隧道
+    ///
+    /// 无分流 / DNS / fake-IP / 透明代理 / 看板。协议与完整版一致, 可互通。
+    /// 配置是平铺的极简格式, 见 README。
+    LiteClient {
+        /// Path to lite configuration file
+        #[arg(short, long, default_value = "lite_client.json")]
+        config: String,
+    },
+    /// 轻量服务端: 全部转发, 无看板 / DNS / eBPF
+    ///
+    /// 加密、伪装握手、认证失败转发真站均与完整版完全一致。
+    LiteServer {
+        /// Path to lite configuration file
+        #[arg(short, long, default_value = "lite_server.json")]
+        config: String,
+    },
     /// 导入 mirage:// 节点 URI 为一个新的 mirage 出站 (会写回配置文件)
     ///
     /// 交互式询问出站 tag, 并保证不与现有出站 tag 冲突:
@@ -252,6 +269,14 @@ fn run_import(path: &str, uri: &str) -> i32 {
     0
 }
 
+/// 读并解析轻量配置。错误信息带上路径, 免得用户对着裸 serde 报错猜是哪个文件。
+fn load_lite<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+    use anyhow::Context;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("读不了轻量配置 {path}"))?;
+    serde_json::from_str(&content).with_context(|| format!("解析轻量配置 {path} 失败"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -264,10 +289,23 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
+    // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
+    match &args.mode {
+        Mode::LiteClient { config } => {
+            let cfg = load_lite(config)?;
+            return mirage_rs::lite::start_client(cfg).await;
+        }
+        Mode::LiteServer { config } => {
+            let cfg = load_lite(config)?;
+            return mirage_rs::lite::start_server(cfg).await;
+        }
+        _ => {}
+    }
+
     let (config_path, is_server) = match &args.mode {
         Mode::Client { config } => (config.as_str(), false),
         Mode::Server { config } => (config.as_str(), true),
-        _ => unreachable!("check/format 已在上面处理并退出"),
+        _ => unreachable!("check/format/import/lite-* 已在上面处理"),
     };
 
     mirage_rs::start_proxy(config_path, is_server).await
