@@ -39,6 +39,40 @@ pub struct Config {
     pub gui: Option<GuiConfig>,
 }
 
+/// SOCKS5 / HTTP 入站的认证凭据 (可选)。
+///
+/// **不配 = 不鉴权**(向后兼容既有配置)。但 socks/mixed 入站一旦监听非回环地址而又不配它,
+/// 就是一个**开放代理** —— 任何能连到该端口的人都能白嫖隧道, 流量从你的服务端出去,
+/// 出口 IP 会被滥用/拉黑。故 `lib.rs` 在这种组合下启动时 WARN。
+#[derive(Debug, Clone, Deserialize)]
+pub struct InboundAuth {
+    pub username: String,
+    pub password: String,
+}
+
+impl InboundAuth {
+    /// 常量时间校验用户名+密码。
+    ///
+    /// 用非短路的 `&` 且两侧都算完, 避免"用户名错就立刻返回"这类时序差把凭据前缀泄漏出去。
+    pub fn verify(&self, username: &[u8], password: &[u8]) -> bool {
+        let u = ct_eq(username, self.username.as_bytes());
+        let p = ct_eq(password, self.password.as_bytes());
+        u & p
+    }
+}
+
+/// 常量时间字节比较 (长度不同直接 false —— 长度本身不是秘密)。
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundConfig {
@@ -46,6 +80,9 @@ pub enum InboundConfig {
         tag: String,
         listen: String,
         port: u16,
+        /// 可选认证。不设 = 不鉴权 (见 InboundAuth 的开放代理告警)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<InboundAuth>,
     },
     Dns {
         tag: String,
@@ -73,6 +110,9 @@ pub enum InboundConfig {
         tag: String,
         listen: String,
         port: u16,
+        /// 可选认证, 同时作用于 SOCKS5 (RFC 1929) 与 HTTP (Proxy-Authorization: Basic)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<InboundAuth>,
     },
     Transparent {
         tag: String,

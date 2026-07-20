@@ -14,6 +14,25 @@ use anyhow::Result;
 use std::sync::Arc;
 use tracing::{info, warn, error, Level};
 
+/// 监听非回环地址却没配 auth = **开放代理**: 任何能连到该端口的人都能白嫖隧道,
+/// 流量从你的服务端出去, 出口 IP 会被滥用/拉黑 (对抗审查部署尤其致命 —— 招来注意力)。
+/// 不阻止启动 (向后兼容既有配置 + 可信内网仍是合法用法), 但必须让用户看见。
+fn warn_if_open_proxy(kind: &str, listen: &str, port: u16, has_auth: bool) {
+    if has_auth {
+        return;
+    }
+    let loopback = listen.starts_with("127.") || listen == "::1" || listen == "localhost";
+    if loopback {
+        return;
+    }
+    warn!(
+        "⚠️  {kind} 入站监听 {listen}:{port} 且**未配置认证** = 开放代理, \
+         任何能连到该端口的人都能使用你的隧道 (出口 IP 会被滥用/拉黑)。\
+         请在该入站加 \"auth\": {{\"username\": \"...\", \"password\": \"...\"}}, \
+         或把 listen 改回 127.0.0.1 仅本机使用。"
+    );
+}
+
 pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
@@ -505,8 +524,10 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         let fake_mapper_clone = fake_ip_mapper.clone();
 
         match inbound {
-            crate::config::InboundConfig::Socks { listen, port, .. } => {
+            crate::config::InboundConfig::Socks { listen, port, auth, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                warn_if_open_proxy("socks", &listen, port, auth.is_some());
+                let auth = auth.clone().map(std::sync::Arc::new);
                 tokio::spawn(async move {
                     if let Ok(listener) = tokio::net::TcpListener::bind(&listen_addr).await {
                         info!("SOCKS5 listening on {}", listen_addr);
@@ -514,8 +535,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                             let st = state_clone.clone();
                             let ebp = ebpf_clone.clone();
                             let fm = fake_mapper_clone.clone();
+                            let au = auth.clone();
                             tokio::spawn(async move {
-                                crate::proxy::handler::handle_client(stream, st, ebp, fm).await;
+                                crate::proxy::handler::handle_client(stream, st, ebp, fm, au).await;
                             });
                         }
                     } else {
@@ -535,8 +557,10 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs).await;
                 });
             }
-            crate::config::InboundConfig::Mixed { listen, port, .. } => {
+            crate::config::InboundConfig::Mixed { listen, port, auth, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                warn_if_open_proxy("mixed", &listen, port, auth.is_some());
+                let auth = auth.clone().map(std::sync::Arc::new);
                 tokio::spawn(async move {
                     if let Ok(listener) = tokio::net::TcpListener::bind(&listen_addr).await {
                         tracing::info!("Mixed inbound listening on {}", listen_addr);
@@ -544,8 +568,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                             let st = state_clone.clone();
                             let ebp = ebpf_clone.clone();
                             let fm = fake_mapper_clone.clone();
+                            let au = auth.clone();
                             tokio::spawn(async move {
-                                crate::proxy::mixed::handle_client(stream, st, ebp, fm).await;
+                                crate::proxy::mixed::handle_client(stream, st, ebp, fm, au).await;
                             });
                         }
                     } else {

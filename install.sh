@@ -1206,7 +1206,25 @@ config_client() {
     fi
 
     local inbound_port=$(ask_port "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080" tcp)
-    local inbound_listen=$(ask "本地代理监听地址 (LAN 共享用 0.0.0.0; 仅本机用 127.0.0.1)" "0.0.0.0")
+    # 默认回环: 监听 0.0.0.0 而不鉴权 = 开放代理, 任何能连到的人都能白嫖隧道,
+    # 出口 IP 会被滥用/拉黑 (对抗审查部署尤其致命)。要 LAN 共享就必须设凭据。
+    local inbound_listen=$(ask "本地代理监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0, 会要求设账号密码)" "127.0.0.1")
+    local inbound_auth_json=""
+    if [[ "$inbound_listen" != "127.0.0.1" && "$inbound_listen" != "::1" && "$inbound_listen" != "localhost" ]]; then
+        cat >&2 <<'EOM'
+
+  ⚠️  你选择了非回环监听地址 —— 该端口对本机之外可达。
+      不设认证 = 开放代理: 任何能连到它的人都能使用你的隧道, 流量从你的服务端出去,
+      出口 IP 会被滥用甚至拉黑。对抗审查部署来说, 招来注意力是最不能承受的。
+EOM
+        local ib_user ib_pass
+        ib_user=$(ask "代理用户名" "mirage")
+        ib_pass=$(ask "代理密码 (留空=自动生成)" "")
+        [[ -z "$ib_pass" ]] && { ib_pass=$(generate_password); info "已自动生成代理密码: $ib_pass"; }
+        inbound_auth_json=',
+            "auth": { "username": "'"$ib_user"'", "password": "'"$ib_pass"'" }'
+        ok "入站认证已启用 (SOCKS5 走 RFC 1929, HTTP 走 Proxy-Authorization: Basic)"
+    fi
 
     # ── 部署模式: 本地代理 vs 透明网关 ──
     # 本地代理 = 只 mixed 入站, 应用手动指向本机:1080。
@@ -1245,7 +1263,7 @@ config_client() {
             "type": "mixed",
             "tag": "mixed-in",
             "listen": "'"$inbound_listen"'",
-            "port": '"$inbound_port"'
+            "port": '"$inbound_port"''"$inbound_auth_json"'
         },
         {
             "type": "transparent",
@@ -1281,7 +1299,7 @@ config_client() {
             "type": "mixed",
             "tag": "mixed-in",
             "listen": "'"$inbound_listen"'",
-            "port": '"$inbound_port"'
+            "port": '"$inbound_port"''"$inbound_auth_json"'
         }'
     fi
 

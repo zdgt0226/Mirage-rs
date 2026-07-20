@@ -37,8 +37,9 @@ pub async fn handle_client(
     state: Arc<ArcSwap<CoreState>>,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
+    auth: Option<Arc<crate::config::InboundAuth>>,
 ) {
-    let command = match socks5::handshake(&mut local).await {
+    let command = match socks5::handshake(&mut local, auth.as_deref()).await {
         Ok(c) => c,
         Err(e) => {
             error!("SOCKS5 handshake failed: {}", e);
