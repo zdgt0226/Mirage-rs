@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [未发布] - Shadowsocks 2022 (SIP022) 支持 (2026-07-21)
+## [v0.6.0-alpha.4] - Shadowsocks 2022 + 服务名区分 + 搜索范围扩大 (2026-07-21)
 
 ### feat(install): 轻量版服务名与完整版区分 (`mirage-rs-lite-*`)
 
