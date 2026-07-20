@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [未发布] - 抗识别部署层 + 数据面/健壮性收尾 (2026-07-20)
+## [v0.6.0-alpha.2] - 轻量模式 + SS 中转 + CLI 工具 + 入站认证 (2026-07-20)
 
 ### 🔴 security(inbound): SOCKS5/HTTP 入站补认证 —— 修默认开放代理
 
