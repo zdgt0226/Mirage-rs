@@ -49,9 +49,13 @@
     // 典型用途: 本机放在离你近、线路好的位置 (如香港) 只做中转, 真正的出口落在
     // 另一台 SS 服务器上 (如落地解锁用的机器)。
     //
-    // ⚠️ 仅作用于 TCP —— SS 的 UDP 是另一套包格式, 尚未实现。配了上游后 UDP 中继
-    //    **仍走直连**, 意味着 UDP (QUIC/游戏) 的出口 IP 与 TCP 不同。启动时会 WARN。
-    //    介意的话请在客户端侧禁用 UDP (轻量客户端本就仅 TCP)。
+    // ⚠️ 仅作用于 TCP —— SS 的 UDP 是另一套包格式, 尚未实现。
+    //    因此 "udp" 默认是 "block": 直接拒绝 UDP 中继。这是刻意的 ——
+    //    若放行, UDP 会从**本机 IP** 直连出去而 TCP 从上游出去, 出口 IP 不一致;
+    //    对落地解锁场景这是功能性错误 (QUIC 会"成功"但用错 IP, 且不会像被封那样
+    //    回落 TCP, 表现为解锁时灵时不灵且极难排查)。
+    //    block 的代价: QUIC 回落 TCP (页面照常), 但游戏/WebRTC 不可用。
+    //    确需旧行为 (UDP 直连) 请显式写 "udp": "direct"。
     //
     // method 支持: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
     //   (legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)
@@ -60,7 +64,8 @@
     //     "server": "1.2.3.4",
     //     "server_port": 8388,
     //     "password": "ss-password",
-    //     "method": "aes-256-gcm"
+    //     "method": "aes-256-gcm",
+    //     "udp": "block"          // block(默认) | direct
     // },
 
     // 日志级别: trace / debug / info / warn / error

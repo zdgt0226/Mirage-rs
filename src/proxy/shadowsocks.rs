@@ -68,12 +68,17 @@ impl Method {
 }
 
 /// 上游 SS 服务器配置。
+///
+/// `block_udp` 严格说不属于"如何连 SS", 但它恰好在**存在上游时**才有意义, 且本结构
+/// 已被一路传到 control.rs 的分派点 —— 让它搭个便车比另开一条管线更简单也更不易漏。
 #[derive(Debug, Clone)]
 pub struct SsConfig {
     pub server: String,
     pub port: u16,
     pub password: String,
     pub method: Method,
+    /// true = 拒绝 UDP 中继 (默认)。见 config::UdpPolicy 的说明。
+    pub block_udp: bool,
 }
 
 impl SsConfig {

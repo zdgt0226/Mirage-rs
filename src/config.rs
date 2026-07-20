@@ -58,7 +58,32 @@ pub enum UpstreamConfig {
         /// aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。
         /// legacy 流式加密 (aes-256-cfb 等) 无完整性校验、已废弃, 不支持。
         method: String,
+        /// 配了上游时 UDP 怎么办。默认 `block`, 理由见 [`UdpPolicy`]。
+        #[serde(default)]
+        udp: UdpPolicy,
     },
+}
+
+/// 配置了上游出口时, 服务端对 UDP 的处理策略。
+///
+/// **默认 `Block`, 这是刻意的**: SS 的 UDP 尚未实现, 若放行则 UDP 会从 Mirage 服务端
+/// **自己的 IP** 直连出去, 而 TCP 从上游出口出去 —— 两者出口 IP 不同。
+///
+/// 这对中转最典型的用途(落地解锁)不是"不一致"而是**功能性错误**: 流媒体越来越多走
+/// QUIC, QUIC 走直连意味着目标看到的是错误的 IP → 区域判定错。而且它**不会**像"UDP 被封"
+/// 那样回落 TCP —— QUIC 成功了, 只是从错误的出口成功的, 结果是解锁时灵时不灵且极难排查。
+///
+/// 你配了中转, 意图就是流量从上游出去。**安全的失败方式是"不发", 而不是"发到别处去"。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdpPolicy {
+    /// 拒绝 UDP 中继 (默认)。客户端会立刻收到失败而非静默走错出口;
+    /// QUIC 会回落 TCP(页面照常), 但游戏/WebRTC 不可用。
+    #[default]
+    Block,
+    /// 保持旧行为: UDP 从本机直连出去。**出口 IP 与 TCP 不同**, 仅在你确认
+    /// 不介意(例如上游只为绕路而非隐藏出口)时才选。
+    Direct,
 }
 
 /// SOCKS5 / HTTP 入站的认证凭据 (可选)。
@@ -535,7 +560,7 @@ impl Config {
                 // 上游出口配错会让服务端**拒绝启动**, 必须在 check 阶段就拦住 ——
                 // 否则 `check && systemctl restart` 这个闸门对这条路径形同虚设。
                 if let Some(UpstreamConfig::Shadowsocks {
-                    server, server_port, password: ss_pw, method,
+                    server, server_port, password: ss_pw, method, ..
                 }) = upstream
                 {
                     if let Err(e) = crate::proxy::shadowsocks::Method::parse(method) {

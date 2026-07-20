@@ -43,7 +43,7 @@ pub(crate) fn build_ss_upstream(
     cfg: Option<&crate::config::UpstreamConfig>,
 ) -> Result<Option<Arc<crate::proxy::shadowsocks::SsConfig>>> {
     let Some(crate::config::UpstreamConfig::Shadowsocks {
-        server, server_port, password, method,
+        server, server_port, password, method, udp,
     }) = cfg
     else {
         return Ok(None);
@@ -53,16 +53,26 @@ pub(crate) fn build_ss_upstream(
         "上游出口: Shadowsocks {}:{} ({}) —— 本服务端作为中转站, TCP 流量将再经 SS 转发",
         server, server_port, method
     );
-    warn!(
-        "⚠️  SS 上游仅作用于 **TCP**: 服务端的 UDP 中继仍走直连, \
-         因此 UDP (QUIC/游戏) 的出口 IP 与 TCP 不同。若不希望暴露真实出口, \
-         请在客户端侧禁用 UDP, 或改用只走 TCP 的部署 (如轻量模式)。"
-    );
+    let block_udp = matches!(udp, crate::config::UdpPolicy::Block);
+    if block_udp {
+        info!(
+            "UDP 策略: block (默认) —— SS 的 UDP 尚未实现, 放行会让 UDP 从本机直连出去 \
+             (出口 IP 与 TCP 不同, 落地解锁场景会判错区域)。故直接拒绝 UDP 中继: \
+             QUIC 将回落 TCP, 游戏/WebRTC 不可用。要保留旧行为请显式设 \"udp\": \"direct\"。"
+        );
+    } else {
+        warn!(
+            "⚠️  UDP 策略: direct —— UDP 将从**本机 IP** 直连出去, 与 TCP 的上游出口**不同**。\
+             流媒体走 QUIC 时会被判成本机所在区域 (且不会回落 TCP, 故表现为解锁时灵时不灵)。\
+             除非你确认不介意, 否则建议改回默认的 \"udp\": \"block\"。"
+        );
+    }
     Ok(Some(Arc::new(crate::proxy::shadowsocks::SsConfig {
         server: server.clone(),
         port: *server_port,
         password: password.clone(),
         method: m,
+        block_udp,
     })))
 }
 

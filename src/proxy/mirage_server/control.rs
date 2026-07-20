@@ -81,7 +81,20 @@ pub(super) async fn dispatch_authenticated(
     info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
     if first_chunk.len() == 1 && first_chunk[0] == 0x00 {
-        // UDP Mode
+        // UDP Mode.
+        // 配了上游出口且策略为 block 时直接拒绝: SS 的 UDP 尚未实现, 放行意味着 UDP 会从
+        // 本机 IP 直连出去, 而 TCP 从上游出去 —— 出口 IP 不一致。对落地解锁场景这是功能性
+        // 错误 (QUIC 会"成功"但用错 IP, 不像被封那样回落 TCP)。这里直接断开, 让客户端立刻
+        // 知道 UDP 不可用, 而不是静默走错出口。
+        if upstream.as_ref().is_some_and(|u| u.block_udp) {
+            tracing::warn!(
+                "拒绝 UDP 中继: 已配置 SS 上游出口且 udp=block (默认)。\
+                 SS 的 UDP 未实现, 放行会让 UDP 从本机 IP 出去而与 TCP 出口不一致。\
+                 确需旧行为请在 upstream 里设 \"udp\": \"direct\"。"
+            );
+            let _ = writer.send_close_notify().await;
+            return;
+        }
         udp_relay::handle_udp_relay(reader, writer).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode

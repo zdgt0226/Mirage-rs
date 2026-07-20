@@ -131,6 +131,7 @@ async fn ss_client_interops_with_independent_server() {
         port,
         password: PW.into(),
         method: mirage_rs::proxy::shadowsocks::Method::parse("aes-256-gcm").unwrap(),
+        block_udp: true,
     };
 
     let (mut r, mut w, _fd) = mirage_rs::proxy::shadowsocks::connect(&cfg, "example.com:443")
@@ -170,6 +171,7 @@ async fn wrong_password_cannot_decrypt_downlink() {
         port,
         password: "client-pw-different".into(), // 故意不匹配
         method: mirage_rs::proxy::shadowsocks::Method::parse("aes-256-gcm").unwrap(),
+        block_udp: true,
     };
     let (mut r, mut w, _fd) = mirage_rs::proxy::shadowsocks::connect(&cfg, "example.com:443")
         .await
@@ -181,4 +183,69 @@ async fn wrong_password_cannot_decrypt_downlink() {
     if let Ok(Ok(v)) = res {
         panic!("密码不匹配却解出了数据: {v:?}");
     }
+}
+
+// ── UDP 策略 (方案 A: 配了上游默认阻断 UDP) ────────────────────────────────
+
+/// 起一个轻量服务端 + 轻量客户端, 返回 (客户端 SOCKS5 端口, 两个进程守卫)。
+/// `udp_field` 直接拼进 upstream, 用于切换策略。
+fn spawn_pair(sport: u16, cport: u16, udp_field: &str) -> (std::process::Child, std::process::Child) {
+    use std::process::{Command, Stdio};
+    let bin = {
+        let mut p = std::env::current_exe().unwrap();
+        p.pop(); p.pop(); p.push("mirage"); p
+    };
+    let dir = std::env::temp_dir();
+    let scfg = dir.join(format!("ss_udp_srv_{}_{}.json", std::process::id(), sport));
+    let ccfg = dir.join(format!("ss_udp_cli_{}_{}.json", std::process::id(), cport));
+    std::fs::write(&scfg, format!(
+        r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw","sni":"www.apple.com","log_level":"warn",
+            "upstream":{{"type":"shadowsocks","server":"127.0.0.1","server_port":19699,
+                         "password":"x","method":"aes-256-gcm"{udp_field}}}}}"#)).unwrap();
+    std::fs::write(&ccfg, format!(
+        r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},
+            "password":"pw","sni":"www.apple.com","pool_size":1,"log_level":"warn"}}"#)).unwrap();
+    let s = Command::new(&bin).args(["lite-server","-c",scfg.to_str().unwrap()])
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let c = Command::new(&bin).args(["lite-client","-c",ccfg.to_str().unwrap()])
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    (s, c)
+}
+
+/// 轻量客户端本就拒绝 UDP, 所以这里直接验证**服务端**的分派行为:
+/// 用 Mirage 协议连服务端不现实(需完整握手), 改为验证配置层面的策略解析 ——
+/// 真正的阻断行为由下面的"服务端仍能正常提供 TCP"间接佐证(阻断不应波及 TCP)。
+#[tokio::test]
+async fn udp_block_does_not_break_tcp() {
+    let (mut s, mut c) = spawn_pair(19611, 19612, "");
+    // 配了上游(指向一个不存在的 SS 端口)时 TCP 会连不通, 但服务端本身必须仍在监听 ——
+    // 即"阻断 UDP"这个改动不能把 TCP 路径也带崩。
+    let alive = std::net::TcpStream::connect(("127.0.0.1", 19611u16)).is_ok();
+    let _ = s.kill(); let _ = c.kill();
+    let _ = s.wait(); let _ = c.wait();
+    assert!(alive, "配 udp=block 后服务端仍应正常监听 TCP");
+}
+
+#[tokio::test]
+async fn udp_policy_parses_both_values() {
+    // 默认(不写 udp 字段)= block
+    let d: mirage_rs::config::UpstreamConfig = serde_json::from_str(
+        r#"{"type":"shadowsocks","server":"h","server_port":1,"password":"p","method":"aes-256-gcm"}"#
+    ).unwrap();
+    let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &d;
+    assert_eq!(*udp, mirage_rs::config::UdpPolicy::Block, "不写 udp 字段必须默认 block");
+
+    // 显式 direct
+    let e: mirage_rs::config::UpstreamConfig = serde_json::from_str(
+        r#"{"type":"shadowsocks","server":"h","server_port":1,"password":"p","method":"aes-256-gcm","udp":"direct"}"#
+    ).unwrap();
+    let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &e;
+    assert_eq!(*udp, mirage_rs::config::UdpPolicy::Direct);
+
+    // 拼错的值必须报错而不是静默回落成某个默认
+    assert!(serde_json::from_str::<mirage_rs::config::UpstreamConfig>(
+        r#"{"type":"shadowsocks","server":"h","server_port":1,"password":"p","method":"aes-256-gcm","udp":"blcok"}"#
+    ).is_err(), "拼错的 udp 值必须报错");
 }

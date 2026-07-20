@@ -92,16 +92,20 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
     "server": "1.2.3.4",
     "server_port": 8388,
     "password": "ss-password",
-    "method": "aes-256-gcm"     // 或 aes-128-gcm / chacha20-ietf-poly1305
+    "method": "aes-256-gcm",    // 或 aes-128-gcm / chacha20-ietf-poly1305
+    "udp": "block"              // block(默认) | direct, 见下方说明
 }
 ```
 
 不配 `upstream` = 直连目标(原行为)。加密方式写错会**直接报错拒绝启动**, 而不是悄悄降级
 成直连 —— 配了中转却走直连意味着出口 IP 与预期完全不同, 必须让人立刻知道。
 
-> ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 尚未实现: 配了上游后服务端的 UDP 中继
-> **仍走直连**, 因此 UDP (QUIC/游戏) 的出口 IP 与 TCP 不同, 启动时会 WARN。介意的话请在
-> 客户端侧禁用 UDP(轻量客户端本就仅 TCP)。
+> ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 尚未实现, 因此 `udp` **默认 `block`**
+> (直接拒绝 UDP 中继)。这是刻意的: 若放行, UDP 会从**本机 IP** 直连出去而 TCP 从上游出去,
+> 出口 IP 不一致 —— 对落地解锁场景这不是"不一致"而是**功能性错误**(流媒体走 QUIC 时会被判
+> 成错误区域, 且不会像被封那样回落 TCP, 表现为解锁时灵时不灵)。**安全的失败方式是"不发",
+> 而非"发到别处去"**。代价: QUIC 回落 TCP(页面照常), 游戏/WebRTC 不可用。
+> 确需旧行为写 `"udp": "direct"`(启动会 WARN)。轻量客户端本就仅 TCP, 不受影响。
 >
 > 📌 支持 SIP004 AEAD; **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、
 > 已被 Shadowsocks 社区废弃, 且易被主动探测识别。
