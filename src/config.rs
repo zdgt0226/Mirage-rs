@@ -389,6 +389,128 @@ impl Config {
         let config: Config = serde_json::from_str(&content)?;
         Ok(config)
     }
+
+    /// 解析配置并**同时**收集校验问题。
+    ///
+    /// 刻意**不把问题当致命错误**: 配置里多一个字段就让网关起不来, 代价远大于收益
+    /// (升级二进制时尤其危险)。校验的价值是"让你看见", 不是"拦住你" —— 与
+    /// `api.secret` 那次"保留字段 + WARN"的处理一致。调用方负责把返回的问题打成 WARN。
+    ///
+    /// 覆盖两类:
+    /// 1. **未知字段** —— 拼错的键此前被 serde 静默忽略, 用户永远不知道自己配了个寂寞;
+    /// 2. **语义问题** —— 语法合法但逻辑不成立 (引用了不存在的 outbound、tag 重复等)。
+    pub fn parse_with_diagnostics(content: &str) -> anyhow::Result<(Self, Vec<String>)> {
+        let mut issues = Vec::new();
+        let de = &mut serde_json::Deserializer::from_str(content);
+        let config: Config = serde_ignored::deserialize(de, |path| {
+            issues.push(format!("未知字段 `{}` (拼写错误? 已被忽略, 不会生效)", path));
+        })?;
+        issues.extend(config.semantic_issues());
+        Ok((config, issues))
+    }
+
+    /// 语义校验: 语法没问题但逻辑不成立的配置。
+    pub fn semantic_issues(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+
+        // 收集全部 outbound tag, 顺带查重
+        let mut tags: Vec<&str> = Vec::new();
+        for ob in &self.outbounds {
+            let tag = match ob {
+                OutboundConfig::Mirage { tag, .. }
+                | OutboundConfig::Direct { tag }
+                | OutboundConfig::Block { tag }
+                | OutboundConfig::Urltest { tag, .. }
+                | OutboundConfig::Fallback { tag, .. }
+                | OutboundConfig::Selector { tag, .. } => tag.as_str(),
+            };
+            if tags.contains(&tag) {
+                issues.push(format!("outbound tag `{tag}` 重复定义 (后者覆盖前者, 行为不确定)"));
+            }
+            tags.push(tag);
+        }
+        let known = |t: &str| tags.contains(&t);
+
+        // 路由默认出站必须存在 —— 不存在则所有未命中规则的流量无处可去
+        if !known(&self.routing.default_outbound) {
+            issues.push(format!(
+                "routing.default_outbound = `{}` 不存在于 outbounds (未命中任何规则的流量将无法路由)",
+                self.routing.default_outbound
+            ));
+        }
+
+        // 每条规则引用的出站必须存在 —— 否则该规则形同虚设, 且是静默的
+        for (i, rule) in self.routing.rules.iter().enumerate() {
+            if !known(&rule.outbound) {
+                issues.push(format!(
+                    "routing.rules[{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
+                    rule.outbound
+                ));
+            }
+        }
+
+        // 出站组的成员必须存在, 且组不能为空
+        for ob in &self.outbounds {
+            let (tag, children, kind) = match ob {
+                OutboundConfig::Urltest { tag, outbounds, .. } => (tag, outbounds, "urltest"),
+                OutboundConfig::Fallback { tag, outbounds, .. } => (tag, outbounds, "fallback"),
+                OutboundConfig::Selector { tag, outbounds, .. } => (tag, outbounds, "selector"),
+                _ => continue,
+            };
+            if children.is_empty() {
+                issues.push(format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用)"));
+            }
+            for child in children {
+                if !known(child) {
+                    issues.push(format!("{kind} `{tag}` 引用了不存在的成员 `{child}`"));
+                }
+            }
+            if children.iter().any(|c| c == tag) {
+                issues.push(format!("{kind} `{tag}` 把自己列为成员 (自引用)"));
+            }
+        }
+
+        // Mirage 出站的必填项非空
+        for ob in &self.outbounds {
+            if let OutboundConfig::Mirage { tag, server, server_port, password, .. } = ob {
+                if server.trim().is_empty() {
+                    issues.push(format!("mirage 出站 `{tag}` 的 server 为空"));
+                }
+                if *server_port == 0 {
+                    issues.push(format!("mirage 出站 `{tag}` 的 server_port 为 0"));
+                }
+                if password.is_empty() {
+                    issues.push(format!("mirage 出站 `{tag}` 的 password 为空 (服务端会认证失败)"));
+                }
+            }
+        }
+
+        // 入站 tag 查重 + 端口 0 + 服务端空密码
+        let mut in_tags: Vec<&str> = Vec::new();
+        for ib in &self.inbounds {
+            let (tag, port) = match ib {
+                InboundConfig::Socks { tag, port, .. }
+                | InboundConfig::Dns { tag, port, .. }
+                | InboundConfig::MirageServer { tag, port, .. }
+                | InboundConfig::Mixed { tag, port, .. }
+                | InboundConfig::Transparent { tag, port, .. } => (tag.as_str(), *port),
+            };
+            if in_tags.contains(&tag) {
+                issues.push(format!("inbound tag `{tag}` 重复定义"));
+            }
+            in_tags.push(tag);
+            if port == 0 {
+                issues.push(format!("inbound `{tag}` 的 port 为 0"));
+            }
+            if let InboundConfig::MirageServer { tag, password, .. } = ib {
+                if password.is_empty() {
+                    issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
+                }
+            }
+        }
+
+        issues
+    }
 }
 
 #[cfg(test)]
@@ -453,5 +575,142 @@ mod tests {
         assert_eq!(config.routing.default_outbound, "proxy");
         assert_eq!(config.routing.rules[0].geosite[0], "cn");
         assert!(config.routing.rules[0].domain_suffix.is_empty()); // default empty vec applied!
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::Config;
+
+    /// 一份最小可用配置; 各用例在其上做局部破坏。
+    fn base() -> serde_json::Value {
+        serde_json::json!({
+            "log_level": "info",
+            "inbounds": [
+                { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 1080 }
+            ],
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "block",  "tag": "block"  }
+            ],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        })
+    }
+
+    fn issues_of(v: &serde_json::Value) -> Vec<String> {
+        let (_, issues) = Config::parse_with_diagnostics(&v.to_string()).expect("应能解析");
+        issues
+    }
+
+    fn has(issues: &[String], needle: &str) -> bool {
+        issues.iter().any(|i| i.contains(needle))
+    }
+
+    #[test]
+    fn clean_config_has_no_issues() {
+        assert!(issues_of(&base()).is_empty(), "干净配置不该报问题");
+    }
+
+    #[test]
+    fn unknown_field_is_reported() {
+        let mut v = base();
+        // 拼错: log_levle
+        v["log_levle"] = serde_json::json!("debug");
+        let is = issues_of(&v);
+        assert!(has(&is, "log_levle"), "应指出未知字段, 实际: {is:?}");
+        assert!(has(&is, "未知字段"));
+    }
+
+    #[test]
+    fn unknown_nested_field_reports_path() {
+        let mut v = base();
+        v["routing"]["defalut_outbound"] = serde_json::json!("direct"); // 拼错
+        let is = issues_of(&v);
+        assert!(has(&is, "routing.defalut_outbound"), "应带嵌套路径, 实际: {is:?}");
+    }
+
+    #[test]
+    fn rule_referencing_missing_outbound() {
+        let mut v = base();
+        v["routing"]["rules"] = serde_json::json!([
+            { "outbound": "proxy", "domain_suffix": ["example.com"] }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "rules[0]") && has(&is, "proxy"), "实际: {is:?}");
+    }
+
+    #[test]
+    fn missing_default_outbound() {
+        let mut v = base();
+        v["routing"]["default_outbound"] = serde_json::json!("nope");
+        assert!(has(&issues_of(&v), "default_outbound"));
+    }
+
+    #[test]
+    fn duplicate_outbound_tag() {
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "dup" },
+            { "type": "block",  "tag": "dup" }
+        ]);
+        v["routing"]["default_outbound"] = serde_json::json!("dup");
+        assert!(has(&issues_of(&v), "重复定义"));
+    }
+
+    #[test]
+    fn group_member_and_self_reference() {
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "selector", "tag": "sel", "outbounds": ["ghost", "sel"] }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "ghost"), "应指出不存在的成员, 实际: {is:?}");
+        assert!(has(&is, "自引用"), "应指出自引用, 实际: {is:?}");
+    }
+
+    #[test]
+    fn empty_group_reported() {
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "urltest", "tag": "ut", "outbounds": [] }
+        ]);
+        assert!(has(&issues_of(&v), "为空"));
+    }
+
+    #[test]
+    fn mirage_outbound_required_fields() {
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "mirage", "tag": "m", "server": "", "server_port": 0,
+              "password": "", "camouflage_host": "x.com" }
+        ]);
+        v["routing"]["default_outbound"] = serde_json::json!("m");
+        let is = issues_of(&v);
+        assert!(has(&is, "server 为空") && has(&is, "server_port 为 0") && has(&is, "password 为空"),
+                "实际: {is:?}");
+    }
+
+    #[test]
+    fn server_inbound_empty_password() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0",
+              "port": 443, "password": "" }
+        ]);
+        assert!(has(&issues_of(&v), "任何人都能连"));
+    }
+
+    #[test]
+    fn duplicate_inbound_tag_and_zero_port() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 1080 },
+            { "type": "socks", "tag": "in", "listen": "127.0.0.1", "port": 0 }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "inbound tag `in` 重复定义"), "实际: {is:?}");
+        assert!(has(&is, "port 为 0"), "实际: {is:?}");
     }
 }

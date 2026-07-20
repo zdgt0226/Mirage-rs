@@ -132,6 +132,20 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     let mut geo_update_days: u32 = 7;
     let mut socks_proxy_url: Option<String> = None;
     if let Ok(content) = std::fs::read_to_string(config_path) {
+        // 配置校验: 拼错的键此前被 serde 静默忽略 (用户永远不知道自己配了个寂寞),
+        // 引用不存在的 outbound 也不会有任何提示。这里一次性把问题打出来。
+        // 刻意**不致命** —— 见 Config::parse_with_diagnostics 的说明。
+        match crate::config::Config::parse_with_diagnostics(&content) {
+            Ok((_, issues)) if !issues.is_empty() => {
+                warn!("配置校验发现 {} 个问题 (不影响启动, 但很可能不是你想要的):", issues.len());
+                for issue in &issues {
+                    warn!("  · {}", issue);
+                }
+            }
+            Ok(_) => info!("配置校验通过 (无未知字段, 引用完整)"),
+            Err(e) => warn!("配置校验跳过 (解析失败: {e})"),
+        }
+
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             if let Some(tuning) = config.tuning {
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }

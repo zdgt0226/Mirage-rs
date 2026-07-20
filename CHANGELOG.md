@@ -31,6 +31,31 @@
 缺头、`Authorization` 冒充、header 大小写、密码含冒号、base64 已知向量。
 "0x00 不能绕过"这条做过变异验证(放宽为也接受 0x00 → 该测试如实变红)。
 
+### feat(config): 启动时校验配置 —— 拼错的键不再静默失效
+
+配置此前**只做语法解析**: 键名拼错被 serde 静默忽略(用户永远不知道自己配了个寂寞),
+引用了不存在的 outbound 也毫无提示。`api.secret` 那个"设了却零作用"的 footgun 正是这类的产物。
+
+- **未知字段检测**: 借 `serde_ignored` 逐个报出被忽略的键并**带嵌套路径**
+  (如 `routing.defalut_outbound`)。不手维护字段名清单 —— 那种清单必然与结构体漂移,
+  比没有更糟。新增依赖仅 `serde_ignored`(传递依赖只有 `serde_core`)。
+- **语义校验**(语法合法但逻辑不成立):
+  - `routing.default_outbound` / 每条 `routing.rules[].outbound` 引用的出站必须存在;
+  - selector/urltest/fallback 的成员必须存在、组不能为空、不能自引用;
+  - outbound / inbound 的 tag 重复定义;
+  - mirage 出站的 `server`/`server_port`/`password` 非空; inbound `port` 非 0;
+  - `mirage_server` 入站空密码(任何人都能连)。
+- **刻意不致命**: 全部走 WARN, 不阻止启动。配置里多一个字段就让网关起不来, 代价远大于
+  收益(升级二进制时尤其危险)。校验的价值是"让你看见", 不是"拦住你" —— 与 `api.secret`
+  当初"保留字段 + WARN"的处理一致。无问题时打一行"配置校验通过"。
+
+验证: 11 个测试覆盖每一类问题(含嵌套路径未知字段、自引用、空组等)。
+另拿仓库内真实配置回归确认**零误报**(`config.json` / `sandbox_config.json` 均干净)。
+
+> 📌 顺带发现(**未修**, 非本次引入): 仓库里的 `transparent_config.json` 用的是旧 schema
+> (`outbounds` 写成带 `default` 的 map 而非扁平数组 + `routing.default_outbound`),
+> **原有解析器同样解析失败**, 且全仓库无人引用 —— 是个陈旧样例文件。
+
 ### feat(install): 服务端配置可自动搜索同 ASN 伪装域名 (`f48a78a`)
 
 `config_server` 问伪装 SNI 前新增**可选(默认否)**的自动搜索: 调 `tools/find_camouflage.py`
