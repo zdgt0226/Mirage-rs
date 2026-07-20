@@ -13,6 +13,12 @@
 - **抗风暴 DNS (v0.4.5)**: fake-IP 稳定 TTL + 空答复 SOA 负缓存 + 国内上游多路并行/重传, 根治开网页时的 DNS 查询风暴与偶发 ~11s 卡顿
 - **日志自动滚动压缩 (v0.4.5)**: 文件日志超 10MB 自动滚动 + gzip 归档, 长跑网关不再撑爆磁盘
 - **Neon Pulse Dashboard**: 内置网页大屏, Canvas 时序图展示 eBPF 命中率 / 吞吐量 / 连接动态
+- **轻量模式 (v0.6.0-alpha.2)**: `lite-client` / `lite-server` —— 只要「SOCKS5 进, 全部走隧道」时用它,
+  配置三五项填完就能用, 与完整版协议互通 (见 [轻量模式](#轻量模式-只要能翻墙就够了))
+- **中转站模式 (v0.6.0-alpha.2)**: 服务端可接 Shadowsocks 上游出口, 把 Mirage 当中转
+  (见 [中转站模式](#中转站模式-服务端接-shadowsocks-上游))
+- **配置工具链 (v0.6.0-alpha.2)**: `check` (重启前闸门, 有问题非零退出) / `format` / `import` (导入 mirage:// 节点)
+- **入站认证 (v0.6.0-alpha.2)**: SOCKS5 (RFC 1929) 与 HTTP (Basic) 均可设账号密码, 杜绝开放代理
 
 ---
 
@@ -22,11 +28,15 @@
 - 下载最新预编译二进制到 `/usr/local/bin/mirage-rs` (含 SHA256 双通道校验)
 - 探测公网 IP + 端口占用检测 + Brutal 内核模块
 - 生成服务端 / 客户端 config, 写 systemd unit `mirage-rs-{server,client}.service`
+- **选择部署形态**: 完整版 (分流/DNS/透明网关/看板) 或**轻量版** (只要能翻墙, 配置极简)
 - 交互配置 GUI 端口 / SNI 伪装 / brutal 速率 / geo 分流策略
+- **可选配置 Shadowsocks 上游出口** (把本机当中转站)
+- 非回环监听时**强制设入站账号密码**, 避免装出一个开放代理
 - 服务端配完可直接输出 `mirage://` 节点 URI (含二维码), 客户端安装时一步导入
 
 ```bash
-# 一键运行 (选 1=服务端 / 2=客户端 / 3=同机 / 4=卸载)
+# 一键运行 (1=服务端 / 2=客户端 / 3=同机 / 4=更新二进制 / 5=显示节点 / 6=卸载)
+# 选完 1/2/3 后会再问一次「部署形态」: 完整版 or 轻量版
 curl -fsSL https://raw.githubusercontent.com/zdgt0226/Mirage-rs/main/install.sh | sudo bash
 # 或先 clone 再看内容:
 git clone https://github.com/zdgt0226/Mirage-rs.git && cd Mirage-rs
@@ -188,6 +198,15 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 
 ### 客户端配置示例 (`/etc/mirage-rs/config_client.json`)
 
+> ⚠️ **入站监听地址与认证 (v0.6.0-alpha.2)**: 下面示例用 `127.0.0.1` = **仅本机可用**, 这是安全的默认。
+> 要给局域网共享需改成 `0.0.0.0`, 但**必须同时加 `auth`**, 否则任何能连到 1080 的人都能白嫖你的
+> 隧道 —— 流量从你的服务端出去, 出口 IP 会被滥用甚至拉黑:
+> ```jsonc
+> { "type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "port": 1080,
+>   "auth": { "username": "u", "password": "强密码" } }
+> ```
+> 不加 auth 而监听非回环地址时, 启动会 WARN 提醒。
+
 ```json
 {
   "schema_version": 1,
@@ -197,7 +216,7 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
     {
       "type": "mixed",
       "tag": "mixed-in",
-      "listen": "0.0.0.0",
+      "listen": "127.0.0.1",
       "port": 1080
     }
   ],

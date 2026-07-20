@@ -994,6 +994,66 @@ generate_password() {
     head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
 }
 
+# 询问是否配置 Shadowsocks 上游出口 (中转站模式)。
+# 输出: 配了则把 JSON 对象写到 stdout (供调用方拼进配置), 不配则输出空串。
+# 提示与告警走 stderr, 不污染返回值。
+ask_ss_upstream() {
+    cat >&2 <<'EOM'
+
+═══════════════════════════════════════════════════
+  上游出口 (可选) —— 把本机当作中转站
+═══════════════════════════════════════════════════
+  默认: 服务端直接连目标 (绝大多数人要的就是这个)。
+
+  配了上游后, 服务端不再直连, 而是把流量再经 Shadowsocks 发往上游:
+
+    客户端 ──(Mirage 隧道)──▶ 本机 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
+
+  典型用途: 本机放在离你近、线路好的位置 (如香港) 只做中转, 真正的出口
+  落在另一台 SS 服务器上 (如落地解锁机)。需要你已有一台可用的 SS 服务器。
+EOM
+    ask_yn "是否配置 Shadowsocks 上游出口?" n || { echo ""; return; }
+
+    local ss_server ss_port ss_pwd ss_method ss_udp
+    ss_server=$(ask "上游 SS 服务器地址 (域名或 IP)" "")
+    if [[ -z "$ss_server" ]]; then
+        warn "未填服务器地址, 跳过上游配置 (仍走直连)"
+        echo ""; return
+    fi
+    ss_port=$(ask "上游 SS 端口" "8388")
+    ss_pwd=$(ask "上游 SS 密码" "")
+    local m=$(ask_choice "上游 SS 加密方式" \
+        "aes-256-gcm (推荐)" \
+        "chacha20-ietf-poly1305 (无 AES 硬件加速时更快)" \
+        "aes-128-gcm")
+    case "$m" in
+        1) ss_method="aes-256-gcm" ;;
+        2) ss_method="chacha20-ietf-poly1305" ;;
+        3) ss_method="aes-128-gcm" ;;
+    esac
+    # legacy 流式加密 (aes-256-cfb 等) 不提供选项: 无完整性校验、已废弃、易被主动探测识别。
+
+    cat >&2 <<'EOM'
+
+  UDP 怎么办? SS 的 UDP 尚未实现。
+    · block (默认, 推荐): 直接拒绝 UDP。QUIC 会回落 TCP (页面照常),
+      游戏/WebRTC 不可用。
+    · direct: UDP 从**本机 IP** 直连出去 —— 与 TCP 的上游出口**不同**。
+      落地解锁场景下流媒体走 QUIC 会被判成本机所在区域, 且不会回落 TCP,
+      表现为解锁时灵时不灵且极难排查。
+EOM
+    if ask_yn "保留旧行为让 UDP 直连出去? (不推荐, 选 n 则阻断)" n; then
+        ss_udp="direct"
+        warn "UDP 将从本机 IP 出去, 与 TCP 出口不一致 —— 请确认你不介意"
+    else
+        ss_udp="block"
+    fi
+
+    ok "上游出口: ${ss_server}:${ss_port} (${ss_method}, udp=${ss_udp})"
+    printf '{ "type": "shadowsocks", "server": "%s", "server_port": %s, "password": "%s", "method": "%s", "udp": "%s" }' \
+        "$(json_escape "$ss_server")" "$ss_port" "$(json_escape "$ss_pwd")" "$ss_method" "$ss_udp"
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 轻量模式配置 (平铺格式, 无 inbounds/outbounds/routing)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1019,6 +1079,11 @@ EOM
     fi
     local sni=$(ask_camouflage_host "$sni_default")
 
+    local ss_up=$(ask_ss_upstream)
+    local upstream_line=""
+    [[ -n "$ss_up" ]] && upstream_line=",
+    \"upstream\": ${ss_up}"
+
     mkdir -p "$ETC_DIR"
     cat > "${ETC_DIR}/lite_server.json" <<EOF
 {
@@ -1027,7 +1092,7 @@ EOM
     "password": "$(json_escape "$pwd")",
     "sni": "$(json_escape "$sni")",
     "auth_ts_tolerance_secs": 60,
-    "log_level": "info"
+    "log_level": "info"${upstream_line}
 }
 EOF
     chmod 600 "${ETC_DIR}/lite_server.json"
@@ -1201,6 +1266,12 @@ EOM
         brutal_line=",\"brutal_rate_mbps\": ${brutal_rate_mbps}"
     fi
 
+    # 上游出口 (中转站模式), 不配则为空串
+    local ss_up_full=$(ask_ss_upstream)
+    local upstream_line=""
+    [[ -n "$ss_up_full" ]] && upstream_line=",
+            \"upstream\": ${ss_up_full}"
+
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
@@ -1222,7 +1293,7 @@ EOM
             "listen": "0.0.0.0",
             "port": ${port},
             "password": "$(json_escape "$pwd")",
-            "camouflage_host": "$(json_escape "$sni")"${brutal_line}
+            "camouflage_host": "$(json_escape "$sni")"${brutal_line}${upstream_line}
         }
     ],
     "outbounds": [],
