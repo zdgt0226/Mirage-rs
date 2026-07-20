@@ -35,6 +35,37 @@ fn warn_if_open_proxy(kind: &str, listen: &str, port: u16, has_auth: bool) {
     );
 }
 
+/// 把配置里的上游出口翻译成 SS 客户端配置。配了就说明本服务端要当**中转站**。
+///
+/// 加密方式不认识时返回 Err 而非静默降级为直连 —— 用户配了中转却悄悄走直连,
+/// 意味着出口 IP 与预期完全不同, 属于必须让人立刻知道的错配。
+pub(crate) fn build_ss_upstream(
+    cfg: Option<&crate::config::UpstreamConfig>,
+) -> Result<Option<Arc<crate::proxy::shadowsocks::SsConfig>>> {
+    let Some(crate::config::UpstreamConfig::Shadowsocks {
+        server, server_port, password, method,
+    }) = cfg
+    else {
+        return Ok(None);
+    };
+    let m = crate::proxy::shadowsocks::Method::parse(method)?;
+    info!(
+        "上游出口: Shadowsocks {}:{} ({}) —— 本服务端作为中转站, TCP 流量将再经 SS 转发",
+        server, server_port, method
+    );
+    warn!(
+        "⚠️  SS 上游仅作用于 **TCP**: 服务端的 UDP 中继仍走直连, \
+         因此 UDP (QUIC/游戏) 的出口 IP 与 TCP 不同。若不希望暴露真实出口, \
+         请在客户端侧禁用 UDP, 或改用只走 TCP 的部署 (如轻量模式)。"
+    );
+    Ok(Some(Arc::new(crate::proxy::shadowsocks::SsConfig {
+        server: server.clone(),
+        port: *server_port,
+        password: password.clone(),
+        method: m,
+    })))
+}
+
 pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
 
@@ -561,7 +592,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, .. } => {
+            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, .. } => {
                 let listen_addr = format!("{}:{}", listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
                 let ebp = ebpf_clone.clone();
@@ -569,8 +600,12 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 let brutal_bps = brutal_rate_mbps
                     .filter(|m| *m > 0)
                     .map(|m| m * 125_000);
+                let ss_upstream = match build_ss_upstream(upstream.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) => { error!("上游出口配置无效, 服务端未启动: {e}"); continue; }
+                };
                 tokio::spawn(async move {
-                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs).await;
+                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs, ss_upstream).await;
                 });
             }
             crate::config::InboundConfig::Mixed { listen, port, auth, .. } => {

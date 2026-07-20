@@ -58,6 +58,7 @@ pub async fn start_server(
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     brutal_rate_bytes_per_sec: Option<u64>,
     auth_ts_tolerance_secs: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::shadowsocks::SsConfig>>,
 ) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
@@ -120,8 +121,9 @@ pub async fn start_server(
                 let pwd = password.clone();
                 let cam = camouflage_host.to_string();
                 let pool = cam_pool.clone();
+                let up = upstream.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool, auth_ts_tolerance_secs).await;
+                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool, auth_ts_tolerance_secs, up).await;
                 });
             }
             Err(e) => {

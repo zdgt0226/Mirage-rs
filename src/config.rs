@@ -39,6 +39,28 @@ pub struct Config {
     pub gui: Option<GuiConfig>,
 }
 
+/// 服务端的**上游出口**配置 —— 配了它, Mirage 服务端就不再直连目标, 而是把流量
+/// 再经 Shadowsocks 发往上游 SS 服务器, 即把 Mirage 当作中转站:
+///
+/// ```text
+/// 客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
+/// ```
+///
+/// ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 当前未实现 —— 配了 SS 上游时
+/// 服务端的 UDP 中继**仍走直连**, 意味着 TCP 与 UDP 的出口 IP 不同。启动时会 WARN。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UpstreamConfig {
+    Shadowsocks {
+        server: String,
+        server_port: u16,
+        password: String,
+        /// aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。
+        /// legacy 流式加密 (aes-256-cfb 等) 无完整性校验、已废弃, 不支持。
+        method: String,
+    },
+}
+
 /// SOCKS5 / HTTP 入站的认证凭据 (可选)。
 ///
 /// **不配 = 不鉴权**(向后兼容既有配置)。但 socks/mixed 入站一旦监听非回环地址而又不配它,
@@ -105,6 +127,10 @@ pub enum InboundConfig {
         // 用未同步的裸系统时钟, TIME_SYNC 卡在这个窗口上无法 bootstrap → 偏差大的机器锁死。
         #[serde(default = "default_auth_ts_tolerance")]
         auth_ts_tolerance_secs: u64,
+        /// 可选上游出口: 配了则本服务端作为中转站, 流量再经 SS 发往上游 (仅 TCP)。
+        /// 不配 = 直连目标 (原行为)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upstream: Option<UpstreamConfig>,
     },
     Mixed {
         tag: String,

@@ -49,6 +49,7 @@ pub(super) async fn handle_connection(
     camouflage_host: String,
     cam_pool: Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::shadowsocks::SsConfig>>,
 ) {
     stream.set_nodelay(true).unwrap_or_default();
 
@@ -182,5 +183,5 @@ pub(super) async fn handle_connection(
     }
 
     // Hand off to control plane (crypto setup + TIME_SYNC + dispatch)
-    control::dispatch_authenticated(stream, password, client_random).await;
+    control::dispatch_authenticated(stream, password, client_random, upstream).await;
 }

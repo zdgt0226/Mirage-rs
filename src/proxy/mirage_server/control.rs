@@ -14,6 +14,7 @@ pub(super) async fn dispatch_authenticated(
     stream: TcpStream,
     password: String,
     client_random: [u8; 32],
+    upstream: Option<std::sync::Arc<crate::proxy::shadowsocks::SsConfig>>,
 ) {
     // 3. Setup Crypto Stream
     let (read_half, write_half) = stream.into_split();
@@ -105,7 +106,7 @@ pub(super) async fn dispatch_authenticated(
                 None
             };
 
-            tcp_relay::handle_tcp_relay(target, payload, reader, writer).await;
+            tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream).await;
         } else {
             tracing::error!("Mirage Server: first_chunk too short for target_len!");
         }

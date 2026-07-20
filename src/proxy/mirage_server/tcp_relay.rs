@@ -22,8 +22,14 @@ pub(super) async fn handle_tcp_relay(
     target: String,
     initial_payload: Option<Vec<u8>>,
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>
+    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    upstream_cfg: Option<Arc<crate::proxy::shadowsocks::SsConfig>>,
 ) {
+    // 配了 SS 上游 → 本服务端作中转站, 流量再经 SS 发往上游出口, 而非直连目标。
+    if let Some(ss) = upstream_cfg {
+        relay_via_shadowsocks(target, initial_payload, reader, writer, &ss).await;
+        return;
+    }
     debug!("Mirage Server: Connecting to TCP target {}", target);
     // connect_smart: 60s DNS 缓存 + IP 字面量零解析快车道 + **多候选 IP 逐一带超时** ——
     // 既有缓存(免每连接重解析), 又保证首个 IP 丢包时跳到下一个, 不会卡死内核 connect 超时。
@@ -125,6 +131,76 @@ pub(super) async fn handle_tcp_relay(
         // 上仍阻塞, 此处再无能为力 (1800s 兜底). 但 upload 若是正在写 upstream,
         // 我们这一刀让它立刻报错退出.
         shutdown_upstream(stop_fd_down);
+    };
+
+    tokio::join!(upload, download);
+}
+
+/// 经 Shadowsocks 上游中转的 TCP 转发。
+///
+/// 结构与直连路径一致(共享 fd + 任一方退出即 `shutdown(SHUT_RDWR)` 唤醒另一方),
+/// 差别只在: 上游是 SS 加密流, 因此下行按**整块解密**读取, 用不上直连路径那个
+/// 基于 `try_read` 的贪婪收割(SS 已按 ≤16KB 分块, 半块数据没有意义)。
+async fn relay_via_shadowsocks(
+    target: String,
+    initial_payload: Option<Vec<u8>>,
+    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
+    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    ss: &crate::proxy::shadowsocks::SsConfig,
+) {
+    debug!("Mirage Server: 经 SS 上游 {} 转发到 {}", ss.addr(), target);
+    let (mut up_read, mut up_write, up_fd) =
+        match crate::proxy::shadowsocks::connect(ss, &target).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Mirage Server: 连接 SS 上游 {} 失败 ({}): {}", ss.addr(), target, e);
+                return;
+            }
+        };
+
+    if let Some(payload) = initial_payload {
+        if !payload.is_empty() && up_write.write_all(&payload).await.is_err() {
+            return;
+        }
+    }
+
+    let stop_fd = Arc::new(AtomicI32::new(up_fd));
+    let (stop_up, stop_down) = (stop_fd.clone(), stop_fd.clone());
+    let shutdown_upstream = |stop: Arc<AtomicI32>| {
+        let fd = stop.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR); }
+        }
+    };
+
+    let upload = async move {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
+                Ok(Ok(data)) => {
+                    if up_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        shutdown_upstream(stop_up);
+    };
+
+    let download = async move {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(1800), up_read.read_chunk()).await {
+                Ok(Ok(chunk)) if chunk.is_empty() => break, // 上游 EOF
+                Ok(Ok(chunk)) => {
+                    if writer.send_data(&chunk).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let _ = writer.send_close_notify().await;
+        shutdown_upstream(stop_down);
     };
 
     tokio::join!(upload, download);

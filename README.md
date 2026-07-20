@@ -75,6 +75,37 @@ mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
 
 ⚠️ **内核必须 ≥ 5.10**, 详见下方 [系统兼容性](#系统兼容性)。
 
+### 中转站模式 (服务端接 Shadowsocks 上游)
+
+服务端可以**不直连目标**, 而是把流量再经 Shadowsocks 发往上游出口 —— 即把 Mirage 当中转站:
+
+```
+客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
+```
+
+典型用途: Mirage 服务端放在离你近、线路好的位置(如香港)只做中转, 真正的出口落在另一台
+SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻量服务端配置)加:
+
+```jsonc
+"upstream": {
+    "type": "shadowsocks",
+    "server": "1.2.3.4",
+    "server_port": 8388,
+    "password": "ss-password",
+    "method": "aes-256-gcm"     // 或 aes-128-gcm / chacha20-ietf-poly1305
+}
+```
+
+不配 `upstream` = 直连目标(原行为)。加密方式写错会**直接报错拒绝启动**, 而不是悄悄降级
+成直连 —— 配了中转却走直连意味着出口 IP 与预期完全不同, 必须让人立刻知道。
+
+> ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 尚未实现: 配了上游后服务端的 UDP 中继
+> **仍走直连**, 因此 UDP (QUIC/游戏) 的出口 IP 与 TCP 不同, 启动时会 WARN。介意的话请在
+> 客户端侧禁用 UDP(轻量客户端本就仅 TCP)。
+>
+> 📌 支持 SIP004 AEAD; **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、
+> 已被 Shadowsocks 社区废弃, 且易被主动探测识别。
+
 ### 轻量模式 (只要"能翻墙"就够了)
 
 如果你不需要分流 / fake-IP / 透明网关 / 看板, 只想要「本机 SOCKS5 → 全部走隧道」,

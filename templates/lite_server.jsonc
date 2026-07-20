@@ -41,6 +41,28 @@
     // 不设或 0 = 不启用, 走系统默认拥塞控制 (BBR/Cubic)。需内核已装 tcp-brutal 模块。
     "brutal_rate_mbps": 0,
 
+    // ── 上游出口 (可选): 把本服务端当作**中转站** ──────────────────────
+    // 配了它, 服务端就不再直连目标, 而是把流量再经 Shadowsocks 发往上游 SS 服务器:
+    //
+    //   客户端 ──(Mirage 隧道)──▶ 本服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
+    //
+    // 典型用途: 本机放在离你近、线路好的位置 (如香港) 只做中转, 真正的出口落在
+    // 另一台 SS 服务器上 (如落地解锁用的机器)。
+    //
+    // ⚠️ 仅作用于 TCP —— SS 的 UDP 是另一套包格式, 尚未实现。配了上游后 UDP 中继
+    //    **仍走直连**, 意味着 UDP (QUIC/游戏) 的出口 IP 与 TCP 不同。启动时会 WARN。
+    //    介意的话请在客户端侧禁用 UDP (轻量客户端本就仅 TCP)。
+    //
+    // method 支持: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
+    //   (legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)
+    // "upstream": {
+    //     "type": "shadowsocks",
+    //     "server": "1.2.3.4",
+    //     "server_port": 8388,
+    //     "password": "ss-password",
+    //     "method": "aes-256-gcm"
+    // },
+
     // 日志级别: trace / debug / info / warn / error
     "log_level": "info"
 }

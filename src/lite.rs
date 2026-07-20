@@ -73,6 +73,9 @@ pub struct LiteServerConfig {
     pub auth_ts_tolerance_secs: u64,
     #[serde(default)]
     pub brutal_rate_mbps: Option<u64>,
+    /// 可选上游出口: 配了则本服务端作为中转站, 流量再经 SS 发往上游 (仅 TCP)。
+    #[serde(default)]
+    pub upstream: Option<crate::config::UpstreamConfig>,
     #[serde(default = "d_log_level")]
     pub log_level: String,
 }
@@ -216,6 +219,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
         warn!("⚠️  password 为空 —— 任何人都能连上你的服务端, 请设置一个强密码。");
     }
     let brutal_bps = cfg.brutal_rate_mbps.filter(|m| *m > 0).map(|m| m * 125_000);
+    let ss_upstream = crate::build_ss_upstream(cfg.upstream.as_ref())?;
 
     crate::proxy::mirage_server::start_server(
         &addr,
@@ -224,6 +228,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
         None, // 无 eBPF
         brutal_bps,
         cfg.auth_ts_tolerance_secs,
+        ss_upstream,
     )
     .await;
     Ok(())
