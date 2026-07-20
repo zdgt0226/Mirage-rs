@@ -113,9 +113,9 @@ async fn ss2022_crypto_interops_with_reference_cipher() {
     }
 }
 
-async fn one_interop_round(name: &str, kind: CipherKind, DOWN: &'static [u8]) {
+async fn one_interop_round(name: &str, kind: CipherKind, down: &'static [u8]) {
     let psk = vec![0x9Au8; KLEN];
-    let (port, rx) = spawn_2022_server(psk.clone(), DOWN, kind).await;
+    let (port, rx) = spawn_2022_server(psk.clone(), down, kind).await;
 
     let cfg = mirage_rs::proxy::shadowsocks::SsConfig {
         server: "127.0.0.1".into(),
@@ -140,7 +140,7 @@ async fn one_interop_round(name: &str, kind: CipherKind, DOWN: &'static [u8]) {
     // 下行必须能被我方正确解密 (含响应头的 salt 回显校验)
     let got = tokio::time::timeout(std::time::Duration::from_secs(5), r.read_chunk())
         .await.unwrap_or_else(|_| panic!("{name}: 读下行超时")).unwrap();
-    assert_eq!(got, DOWN, "{name}: 下行数据必须正确解密");
+    assert_eq!(got, down, "{name}: 下行数据必须正确解密");
 }
 
 #[tokio::test]
@@ -151,19 +151,17 @@ async fn ss2022_wrong_psk_fails() {
     let cfg = mirage_rs::proxy::shadowsocks::SsConfig {
         server: "127.0.0.1".into(),
         port,
-        password: psk_b64(&vec![0x22u8; KLEN]), // 与服务端不同
+        password: psk_b64(&[0x22u8; KLEN]), // 与服务端不同
         method: mirage_rs::proxy::shadowsocks::Method::parse("2022-blake3-aes-256-gcm").unwrap(),
         block_udp: true,
     };
     // 连接本身能建立 (TCP 层), 但服务端解不开我们的头 → 我们也读不到有效下行
-    match mirage_rs::proxy::shadowsocks::connect(&cfg, "example.com:443").await {
-        Ok((mut r, _w, _fd)) => {
-            let res = tokio::time::timeout(std::time::Duration::from_secs(3), r.read_chunk()).await;
-            if let Ok(Ok(v)) = res {
-                assert!(v.is_empty(), "PSK 不匹配却解出了数据: {v:?}");
-            }
+    // 连接阶段就失败也是可接受的拒绝方式
+    if let Ok((mut r, _w, _fd)) = mirage_rs::proxy::shadowsocks::connect(&cfg, "example.com:443").await {
+        let res = tokio::time::timeout(std::time::Duration::from_secs(3), r.read_chunk()).await;
+        if let Ok(Ok(v)) = res {
+            assert!(v.is_empty(), "PSK 不匹配却解出了数据: {v:?}");
         }
-        Err(_) => {} // 连接阶段就失败也是可接受的拒绝方式
     }
 }
 
@@ -174,7 +172,7 @@ async fn ss2022_psk_length_is_enforced() {
     let cfg = mirage_rs::proxy::shadowsocks::SsConfig {
         server: "127.0.0.1".into(),
         port: 1,
-        password: psk_b64(&vec![0u8; 16]),
+        password: psk_b64(&[0u8; 16]),
         method: mirage_rs::proxy::shadowsocks::Method::parse("2022-blake3-aes-256-gcm").unwrap(),
         block_udp: true,
     };

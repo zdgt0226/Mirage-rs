@@ -385,15 +385,30 @@ impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
         self.inner.flush().await
     }
 
-    /// 把整块明文密封后直接送出 —— **不套** chunk 的长度前缀。
+    /// 把整块明文密封后**追加到 out**, 不写网络 —— **不套** chunk 的长度前缀。
     /// SIP022 的定长头/变长头就是这样发的: 它们自身已带长度语义, 再套一层就错了。
-    async fn write_raw_sealed(&mut self, plain: &[u8]) -> std::io::Result<()> {
+    ///
+    /// 之所以只密封不发送: 握手的几段必须**合并成一次 write** 送出。开着 TCP_NODELAY
+    /// 逐段 write+flush 会让 salt / 定长头 / 变长头 各成一个 TCP 段, 而真实 SS 客户端
+    /// 是一段 —— 那是个可被观察到的握手指纹。
+    fn seal_into(&mut self, plain: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
         let mut b = plain.to_vec();
         self.crypter
             .seal(&mut b)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        self.inner.write_all(&b).await?;
-        self.inner.flush().await
+        out.extend_from_slice(&b);
+        Ok(())
+    }
+
+    /// 把 chunk (带长度前缀) 密封进 out, 同样不写网络。供握手合并发送用。
+    fn seal_chunk_into(&mut self, chunk: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
+        let mut lenb = (chunk.len() as u16).to_be_bytes().to_vec();
+        self.crypter.seal(&mut lenb).map_err(|e| std::io::Error::other(e.to_string()))?;
+        out.extend_from_slice(&lenb);
+        let mut body = chunk.to_vec();
+        self.crypter.seal(&mut body).map_err(|e| std::io::Error::other(e.to_string()))?;
+        out.extend_from_slice(&body);
+        Ok(())
     }
 }
 
@@ -498,6 +513,35 @@ impl<R: AsyncReadExt + Unpin> SsReader<R> {
     }
 }
 
+/// 拼出完整的握手字节 (salt + 头部), 供**一次** write 送出。
+///
+/// 之所以拼成一整块而不是逐段发: 开着 TCP_NODELAY 逐段 write+flush 会让
+/// salt / 定长头 / 变长头 各成一个 TCP 段, 而真实 SS 客户端是一段 —— 那是个
+/// 可被观察到的握手指纹, 对一个以"不可区分"为目标的中转链路是实打实的缺陷。
+///
+/// 抽成独立函数是为了可测: 网络层测不出这个性质 (TCP 接收侧会把多段合并,
+/// 一次 read 照样拿全), 只能在拼装这一层验证。
+fn build_handshake<W: AsyncWriteExt + Unpin>(
+    writer: &mut SsWriter<W>,
+    method: Method,
+    salt: &[u8],
+    target: &str,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(salt.len() + 256);
+    out.extend_from_slice(salt); // salt 是明文前缀, 不加密 (两代皆然)
+    if method.is_2022() {
+        // SIP022: 定长头 + 变长头 (目标地址在变长头里, 不是普通 chunk)
+        let (fixed, var) = build_2022_request(target, &[])?;
+        writer.seal_into(&fixed, &mut out)?;
+        writer.seal_into(&var, &mut out)?;
+    } else {
+        // SIP004: 首个 chunk 就是目标地址
+        let addr = encode_socks_addr(target)?;
+        writer.seal_chunk_into(&addr, &mut out)?;
+    }
+    Ok(out)
+}
+
 /// 连接上游 SS 服务器并完成"首包送目标地址"。
 ///
 /// 返回 (读半边, 写半边, 底层 TCP 的裸 fd) —— fd 供调用方沿用既有的
@@ -546,19 +590,10 @@ pub async fn connect(
         crypter: Crypter::new(cfg.method, &subkey),
         buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
     };
-    // salt 是明文前缀, 不经加密直接送出 (两代皆然)
-    writer.inner.write_all(&salt).await?;
-
-    if cfg.method.is_2022() {
-        // SIP022: 定长头 + 变长头 (目标地址在变长头里, 不是普通 chunk)
-        let (fixed, var) = build_2022_request(target, &[])?;
-        writer.write_raw_sealed(&fixed).await?;
-        writer.write_raw_sealed(&var).await?;
-    } else {
-        // SIP004: 首个 chunk 就是目标地址
-        let addr = encode_socks_addr(target)?;
-        writer.write_all(&addr).await?;
-    }
+    // 整个握手 (salt + 头部) 拼成一个缓冲, **一次** write 送出。
+    let handshake = build_handshake(&mut writer, cfg.method, &salt, target)?;
+    writer.inner.write_all(&handshake).await?;
+    writer.inner.flush().await?;
 
     let reader = SsReader {
         inner: r,
@@ -828,5 +863,78 @@ mod ss2022_crypto_tests {
         assert_eq!(m.key_len(), 32);
         // 仍未实现的变体要明确报错而非静默接受
         assert!(Method::parse("2022-blake3-chacha8-poly1305").is_err());
+    }
+}
+
+#[cfg(test)]
+mod handshake_shape_tests {
+    use super::*;
+
+    /// 记录 write 次数的假 writer。
+    struct CountingWriter {
+        writes: usize,
+        buf: Vec<u8>,
+    }
+    impl tokio::io::AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            b: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.buf.extend_from_slice(b);
+            std::task::Poll::Ready(Ok(b.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    fn mk_writer(method: Method, key: &[u8]) -> SsWriter<CountingWriter> {
+        SsWriter {
+            inner: CountingWriter { writes: 0, buf: Vec::new() },
+            crypter: Crypter::new(method, key),
+            buf: Vec::new(),
+        }
+    }
+
+    /// 握手必须拼成**一整块**, 而不是分段。
+    ///
+    /// 注意: 这个性质**测不了网络层** —— TCP 接收侧会把多段合并, 服务端一次 read
+    /// 照样能拿全, 所以"服务端一次读到多少"根本区分不出客户端发了几次
+    /// (我最初就写了这样一个测试, 变异后仍然通过 = 假信心, 已删)。
+    /// 只能在拼装这一层验证: 断言 build_handshake 一次性产出完整字节。
+    #[tokio::test]
+    async fn handshake_is_one_contiguous_block() {
+        for (name, klen) in [
+            ("2022-blake3-aes-256-gcm", 32usize),
+            ("aes-256-gcm", 32),
+        ] {
+            let m = Method::parse(name).unwrap();
+            let mut w = mk_writer(m, &vec![0x5u8; klen]);
+            let salt = vec![0xAAu8; klen];
+
+            let hs = build_handshake(&mut w, m, &salt, "example.com:443").unwrap();
+
+            // 拼装阶段不应产生任何 write
+            assert_eq!(w.inner.writes, 0, "{name}: 拼装握手时不该写网络");
+            // salt 必须是明文前缀
+            assert_eq!(&hs[..klen], &salt[..], "{name}: salt 应为明文前缀");
+            // 且后面必须还有头部 —— 整块一起返回, 而非只有 salt
+            let min = if m.is_2022() { klen + (11 + TAG_LEN) + TAG_LEN } else { klen + 2 + TAG_LEN };
+            assert!(hs.len() > min,
+                    "{name}: 握手应含 salt + 头部共 {}+ 字节, 实际只有 {} —— \
+                     说明头部没被拼进来 (会导致分多次发送 = 可观察的握手指纹)",
+                    min, hs.len());
+        }
     }
 }

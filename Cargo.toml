@@ -91,5 +91,4 @@ name = "simulate_bdp"
 path = "examples/simulate_bdp.rs"
 
 [dev-dependencies]
-base64 = "0.22.1"
 shadowsocks-crypto = { version = "0.7.0", features = ["v2"] }
