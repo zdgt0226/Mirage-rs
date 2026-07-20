@@ -213,6 +213,52 @@ ask_camouflage_host() {
     done
 }
 
+# 自动搜索"与本机同 ASN"的伪装域名候选 (提升 SNI/IP 一致性, 削弱被动关联检测).
+# 复用 tools/find_camouflage.py: 本地仓库副本优先, 否则按 MIRAGE_TAG 从 GitHub 拉,
+# 不在本脚本里复制一份逻辑 (避免两处漂移).
+# 约定: 仅把最终选定的域名写 stdout; 工具表格/提示全部走 stderr, 供调用方 $(...) 捕获.
+# 失败/放弃/依赖缺失 → return 1, 调用方回落手动输入.
+suggest_camouflage_host() {
+    command -v python3 >/dev/null 2>&1 || { warn "未安装 python3, 跳过自动搜索"; return 1; }
+    command -v openssl >/dev/null 2>&1 || { warn "未安装 openssl, 跳过自动搜索"; return 1; }
+
+    local ip
+    ip=$(detect_public_ip || true)
+    ip=$(ask "本机公网 IP (用于确定所属 ASN)" "$ip")
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { warn "IP 无效, 跳过自动搜索"; return 1; }
+
+    # 定位搜索工具
+    local finder="" tmp_finder=""
+    local self_dir
+    self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
+    if [[ -n "$self_dir" && -f "$self_dir/tools/find_camouflage.py" ]]; then
+        finder="$self_dir/tools/find_camouflage.py"
+        info "使用本地搜索工具: $finder"
+    else
+        local ref="${MIRAGE_TAG:-main}"
+        local url="https://raw.githubusercontent.com/zdgt0226/Mirage-rs/${ref}/tools/find_camouflage.py"
+        tmp_finder=$(mktemp /tmp/mirage_find_camouflage.XXXXXX.py) || return 1
+        if ! curl -fsSL --max-time 20 "$url" -o "$tmp_finder"; then
+            warn "下载搜索工具失败 ($url), 跳过自动搜索"
+            rm -f "$tmp_finder"; return 1
+        fi
+        finder="$tmp_finder"
+    fi
+
+    info "开始扫描 (约 1~3 分钟, 期间请勿中断)..."
+    # 工具的表格输出走 stdout, 这里整体重定向到 stderr 让用户看见但不污染返回值
+    timeout 300 python3 "$finder" "$ip" >&2 || \
+        warn "搜索未正常结束 (超时或出错), 可参考上面已输出的部分结果"
+    [[ -n "$tmp_finder" ]] && rm -f "$tmp_finder"
+
+    # 刻意不自动采用推荐值: 廉价机房同段邻居很可能本身也是代理/空壳站,
+    # 必须人工过目 (工具输出末尾的告警说明了判据), 选错会连累自己.
+    local chosen
+    chosen=$(ask "从上面挑一个域名填入 (留空 = 放弃, 回落手动输入)" "")
+    [[ -n "$chosen" ]] || return 1
+    echo "$chosen"
+}
+
 brutal_loaded() {
     [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]] && \
         grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control
@@ -923,7 +969,37 @@ config_server() {
     local port=$(ask_port "监听端口 [1-65535]" "443" tcp)
     local rand_pwd=$(generate_password)
     local pwd=$(ask "认证密码" "$rand_pwd")
-    local sni=$(ask_camouflage_host "www.apple.com")
+
+    # 伪装 SNI: 可先自动搜索"与本机同 ASN"的候选, 搜到的作为默认值,
+    # 再走原有的 TLS1.3 探测 + 人工确认流程 (ask_camouflage_host).
+    local sni_default="www.apple.com"
+    cat >&2 <<'EOM'
+
+═══════════════════════════════════════════════════
+  伪装 SNI 域名 —— SNI/IP 一致性 (可选自动搜索)
+═══════════════════════════════════════════════════
+  伪装域名若与本机 IP 不在同一网络 (例如 SNI 填 speedtest.net
+  却打到某小机房 VPS), 企业防火墙的"SNI 归属 ASN vs 目的 IP
+  ASN 一致性"检查会盯上它 —— 这是被动关联暴露面。
+
+  自动搜索会扫描**本机所在 /24** 的 :443, 从证书 SAN 里找出
+  真实托管在同一 ASN 的域名, 让 SNI 与 IP 名实相符。
+  需要 python3 + openssl; 耗时约 1~3 分钟。
+
+  注意: 扫描的是你自己 VPS 的同段邻居; 廉价机房邻居很可能
+  本身也是代理/空壳站, 结果需人工过目后再选 (不会自动采用)。
+  不搜索也完全可用 —— 直接填一个支持 TLS1.3 的大站即可。
+EOM
+    if ask_yn "是否自动搜索同 ASN 的伪装域名候选?" n; then
+        local found
+        if found=$(suggest_camouflage_host) && [[ -n "$found" ]]; then
+            sni_default="$found"
+            ok "已选定候选: $found (下一步仍会做 TLS1.3 探测确认)"
+        else
+            warn "未采用自动搜索结果, 回落手动输入"
+        fi
+    fi
+    local sni=$(ask_camouflage_host "$sni_default")
     
     local brutal_rate_mbps=0
     if handle_brutal_optional; then
