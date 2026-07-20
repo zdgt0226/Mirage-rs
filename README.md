@@ -78,7 +78,14 @@ mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
 ### 轻量模式 (只要"能翻墙"就够了)
 
 如果你不需要分流 / fake-IP / 透明网关 / 看板, 只想要「本机 SOCKS5 → 全部走隧道」,
-用轻量模式 —— **同一个二进制、同一套协议与伪装**, 与完整版可互通:
+用轻量模式 —— **同一个二进制、同一套协议与伪装**, 与完整版可互通。
+
+**一键安装向导已支持**: 跑 `install.sh` 选完"部署服务端/客户端"后, 会再问一次
+**部署形态**, 选「轻量版」即可 —— 它会问端口/密码/SNI, 生成平铺配置并注册 systemd 服务
+(服务名仍是 `mirage-rs-{server,client}`, 与完整版共用, 不会两个 unit 抢端口)。
+客户端还支持直接粘贴服务端导出的 `mirage://` 串, 免得手抄密码出错。
+
+手动运行:
 
 ```bash
 mirage-rs lite-server -c lite_server.json    # 墙外 VPS

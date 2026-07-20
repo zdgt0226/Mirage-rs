@@ -31,6 +31,33 @@
 缺头、`Authorization` 冒充、header 大小写、密码含冒号、base64 已知向量。
 "0x00 不能绕过"这条做过变异验证(放宽为也接受 0x00 → 该测试如实变红)。
 
+### feat(install): install.sh 支持轻量模式部署
+
+此前轻量模式只能手写配置 + 手动跑二进制, `install.sh` 里零支持。现在选完
+"部署服务端/客户端"后会再问一次**部署形态**(完整版 / 轻量版):
+
+- **轻量服务端**: 问端口(**默认 443 但可自定义**)、密码、SNI(可选自动搜同 ASN 伪装域名),
+  生成平铺 `lite_server.json` 并注册服务; 同样导出 `mirage://` 节点串 + 二维码。
+- **轻量客户端**: 支持**直接粘贴服务端的 `mirage://` 串**导入(免手抄密码/SNI 出错),
+  或手动填; 问本地 SOCKS5 监听地址与端口; 非回环监听时**强制设 SOCKS5 认证**
+  (与完整版同一策略, 防开放代理)。生成 `lite_client.json` 并注册服务。
+- **服务名仍是 `mirage-rs-{server,client}`** —— 一个角色一个服务, 避免完整版与轻量版
+  两个 unit 抢同一个端口。systemd/OpenRC/SysV 三种 init 的 ExecStart 都会按形态
+  切换到 `lite-server`/`lite-client` 子命令与 `lite_*.json` 配置。
+- 轻量客户端不走透明网关那套(它本来就没有), 因此不会去动 NAT/ip rule/resolv.conf。
+
+**顺带修一个真 bug**: 新增 `json_escape()` —— 密码里含 `"` 或 `\` 时, 直接内插会生成
+**非法 JSON**, 服务起不来且报错难懂。实测密码 `p@ss"with\quote` 原先直接把配置写坏,
+转义后可正常握手连通。
+
+> ⚠️ **同样的问题在完整版的 `config_server` / `config_client` 里仍然存在**(本次只修了
+> 新增的轻量路径, 未动既有代码)。`generate_password` 生成的是十六进制所以默认安全,
+> 但用户手输带引号的密码仍会踩到。
+
+验证: `bash -n` 通过; 用 `json_escape` 生成含 `"` 与 `\` 的配置, 起真的 lite-server +
+lite-client **握手成功并跑通真实 HTTPS 请求**; 逐一核对两种形态下 systemd/OpenRC/SysV
+的 ExecStart 与配置路径推导正确。
+
 ### docs(lite): 补上轻量模式的配置模板 (含端口设置说明)
 
 轻量模式此前**没有任何模板** —— `templates/` 里只有完整版的 client/server, 用户想知道

@@ -618,6 +618,18 @@ service_active() { # role
 }
 
 # 从 config JSON 取字段 (先查 inbounds[0], 再查顶层). python3 优先, 否则 grep.
+# 把字符串转义成可安全嵌入 JSON 字符串字面量的形式。
+# 密码里出现 " 或 \ 时, 不转义会直接生成非法 JSON → 服务起不来且报错难懂。
+# 只处理 JSON 字符串必须转义的字符: 反斜杠、双引号、控制字符里最常见的制表/换行。
+json_escape() {
+    local s=$1
+    s=${s//\\/\\\\}   # 反斜杠必须先转, 否则会把后面转出来的再转一遍
+    s=${s//\"/\\\"}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\n'/\\n}
+    printf '%s' "$s"
+}
+
 json_get() { # file key
     local file=$1 key=$2
     if command -v python3 >/dev/null 2>&1; then
@@ -784,15 +796,31 @@ setup_fhs() {
 }
 
 # 按探测到的 init 系统分派服务注册. 未识别则打印手动启动命令.
+# 轻量模式开关 (main 里询问后置位)。轻量 = 只做 SOCKS5→隧道全部转发,
+# 不装分流/DNS/透明网关/看板。服务名仍是 mirage-rs-{server,client} —— 一个角色
+# 一个服务, 避免完整版与轻量版两个 unit 抢同一个端口。
+LITE_MODE=false
+
+# 轻量模式下走 lite-server/lite-client 子命令 + 平铺的 lite_*.json 配置。
+svc_subcmd() { [[ "$LITE_MODE" == true ]] && echo "lite-$1" || echo "$1"; }
+svc_cfg() {
+    if [[ "$LITE_MODE" == true ]]; then
+        echo "${ETC_DIR}/lite_$1.json"
+    else
+        echo "${ETC_DIR}/config_$1.json"
+    fi
+}
+
 setup_service() {
     local role=$1
+    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
     case "$INIT_SYS" in
         systemd)  setup_systemd "$role" ;;
         openrc)   setup_openrc  "$role" ;;
         sysvinit) setup_sysv    "$role" ;;
         *)
             warn "未识别的 init 系统 (非 systemd/OpenRC/SysV), 跳过服务注册。"
-            info "可手动前台运行: ${BIN_PATH} ${role} -c ${ETC_DIR}/config_${role}.json"
+            info "可手动前台运行: ${BIN_PATH} ${_subcmd} -c ${_cfgpath}"
             ;;
     esac
 }
@@ -802,6 +830,7 @@ setup_service() {
 # 注意: SysV 无 supervisor, 崩溃不自动重启 (systemd/OpenRC 才有). 可接受降级.
 setup_sysv() {
     local role=$1
+    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
     local svc="mirage-rs-${role}"
     local init_path="/etc/init.d/${svc}"
 
@@ -820,7 +849,7 @@ setup_sysv() {
 
 NAME="${svc}"
 BIN="${BIN_PATH}"
-ARGS="${role} -c ${ETC_DIR}/config_${role}.json"
+ARGS="${_subcmd} -c ${_cfgpath}"
 # /var/run 而非 /run: 老系统 (CentOS6) 只有 /var/run; 新系统 /var/run→/run symlink, 通吃.
 PIDFILE="/var/run/${svc}.pid"
 LOGFILE="${LOG_DIR}/${role}.log"
@@ -882,6 +911,7 @@ EOF
 # systemd Restart=on-failure). memlock unlimited 供 eBPF 用.
 setup_openrc() {
     local role=$1
+    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
     local svc="mirage-rs-${role}"
     local init_path="/etc/init.d/${svc}"
 
@@ -893,7 +923,7 @@ description="Mirage-rs High-Performance Proxy (${role})"
 
 supervisor=supervise-daemon
 command="${BIN_PATH}"
-command_args="${role} -c ${ETC_DIR}/config_${role}.json"
+command_args="${_subcmd} -c ${_cfgpath}"
 directory="${STATE_DIR}"
 pidfile="/run/${svc}.pid"
 respawn_delay=3
@@ -921,6 +951,7 @@ EOF
 
 setup_systemd() {
     local role=$1
+    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
     local service_path="/etc/systemd/system/mirage-rs-${role}.service"
 
     # proxy_local 客户端: 把 resolv.conf 的改动绑到服务生命周期。ExecStopPost 即便主进程被
@@ -941,7 +972,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=${STATE_DIR}
-ExecStart=${BIN_PATH} ${role} -c ${ETC_DIR}/config_${role}.json
+ExecStart=${BIN_PATH} ${_subcmd} -c ${_cfgpath}
 ${resolv_lines}
 Restart=on-failure
 RestartSec=3
@@ -961,6 +992,141 @@ EOF
 # ──────────────────────────────────────────────────────────────────────────────
 generate_password() {
     head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 轻量模式配置 (平铺格式, 无 inbounds/outbounds/routing)
+# ──────────────────────────────────────────────────────────────────────────────
+config_lite_server() {
+    title "配置 Mirage-rs 服务端 (轻量模式)"
+    cat >&2 <<'EOM'
+  轻量服务端: 只做「收隧道 → 全部转发」, 不带 Web 看板 / DNS / eBPF。
+  加密、TLS 伪装握手、认证失败转发真站与完整版完全一致, 协议互通 ——
+  轻量服务端可以直接给完整版客户端用。
+EOM
+    # 443 伪装效果最好, 但属特权端口; 这里跑在 root 下装 systemd 服务, 故无 bind 问题。
+    local port=$(ask_port "监听端口 [1-65535] (443 伪装最好, 也可自定义)" "443" tcp)
+    local rand_pwd=$(generate_password)
+    local pwd=$(ask "认证密码" "$rand_pwd")
+
+    local sni_default="www.apple.com"
+    if ask_yn "是否自动搜索同 ASN 的伪装域名候选? (提升 SNI/IP 一致性)" n; then
+        local found
+        if found=$(suggest_camouflage_host) && [[ -n "$found" ]]; then
+            sni_default="$found"
+            ok "已选定候选: $found"
+        fi
+    fi
+    local sni=$(ask_camouflage_host "$sni_default")
+
+    mkdir -p "$ETC_DIR"
+    cat > "${ETC_DIR}/lite_server.json" <<EOF
+{
+    "listen": "0.0.0.0",
+    "port": ${port},
+    "password": "$(json_escape "$pwd")",
+    "sni": "$(json_escape "$sni")",
+    "auth_ts_tolerance_secs": 60,
+    "log_level": "info"
+}
+EOF
+    chmod 600 "${ETC_DIR}/lite_server.json"
+    ok "轻量服务端配置已保存至: ${ETC_DIR}/lite_server.json"
+
+    setup_service "server"
+
+    # 节点导出 (与完整版同一格式, 客户端可直接导入)
+    local detected_ip pub_host
+    info "正在探测本机公网 IP..."
+    detected_ip=$(detect_public_ip || true)
+    pub_host=$(ask "公网地址 (域名/IP, 用于生成客户端导入串; 留空跳过)" "$detected_ip")
+    if [[ -n "$pub_host" ]]; then
+        local node_uri
+        node_uri=$(build_node_uri "$pwd" "$pub_host" "$port" "$sni")
+        echo "$node_uri" > "${ETC_DIR}/node-export.txt"
+        chmod 600 "${ETC_DIR}/node-export.txt"
+        echo >&2
+        title "客户端节点导入串"
+        echo "  $(_c 32 "$node_uri")" >&2
+        echo "  已保存到: ${ETC_DIR}/node-export.txt (chmod 600), 内含密码请妥善保管。" >&2
+        command -v qrencode >/dev/null 2>&1 && { echo >&2; qrencode -t UTF8 "$node_uri" >&2; }
+        echo >&2
+    fi
+    info "启动命令: $(svc_start_hint server)"
+}
+
+config_lite_client() {
+    title "配置 Mirage-rs 客户端 (轻量模式)"
+    cat >&2 <<'EOM'
+  轻量客户端: 本机开一个 SOCKS5 入站, **全部流量走隧道** —— 不分流、不查 DNS、
+  不做 fake-IP、无透明网关、无看板。浏览器/系统把代理指到下面填的地址即可。
+
+  ⚠️ 仅支持 TCP: SOCKS5 UDP ASSOCIATE 会被拒绝, QUIC/HTTP3 走不了代理
+     (浏览器会自动回落 TCP, 页面照常; 但依赖 UDP 的应用/游戏不可用)。
+     需要 UDP 请改用完整版客户端。
+EOM
+    # 支持粘贴服务端导出的 mirage:// 串, 免得手抄密码/SNI 出错
+    local server server_port pwd sni
+    if ask_yn "是否粘贴服务端的 mirage:// 节点串导入?" y; then
+        local uri
+        while :; do
+            uri=$(ask "粘贴 mirage:// 节点串" "")
+            if parse_node_uri "$uri"; then
+                server="$NODE_HOST"; server_port="$NODE_PORT"
+                pwd="$NODE_PWD";     sni="$NODE_SNI"
+                ok "已解析: ${server}:${server_port} (SNI ${sni})"
+                break
+            fi
+            warn "解析失败, 格式应为 mirage://<密码>@<host>:<port>?sni=<域名>"
+            ask_yn "重新输入?" y || { uri=""; break; }
+        done
+    fi
+    if [[ -z "${server:-}" ]]; then
+        server=$(ask "服务端地址 (域名或 IP)" "")
+        server_port=$(ask "服务端端口 (须与服务端配置一致)" "443")
+        pwd=$(ask "认证密码 (须与服务端一致)" "")
+        sni=$(ask_camouflage_host "www.apple.com")
+    fi
+
+    local listen=$(ask "本地 SOCKS5 监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0)" "127.0.0.1")
+    local lport=$(ask_port "本地 SOCKS5 监听端口" "1080" tcp)
+
+    # 与完整版同一策略: 非回环监听必须设认证, 否则是开放代理。
+    local auth_json=""
+    if [[ "$listen" != "127.0.0.1" && "$listen" != "::1" && "$listen" != "localhost" ]]; then
+        cat >&2 <<'EOM'
+
+  ⚠️  非回环监听 —— 不设认证 = 开放代理: 任何能连到它的人都能用你的隧道,
+      流量从你的服务端出去, 出口 IP 会被滥用甚至拉黑。
+EOM
+        local u p
+        u=$(ask "代理用户名" "mirage")
+        p=$(ask "代理密码 (留空=自动生成)" "")
+        [[ -z "$p" ]] && { p=$(generate_password); info "已自动生成代理密码: $p"; }
+        auth_json=",
+    \"auth\": { \"username\": \"$(json_escape "$u")\", \"password\": \"$(json_escape "$p")\" }"
+        ok "SOCKS5 认证已启用 (RFC 1929)"
+    fi
+
+    mkdir -p "$ETC_DIR"
+    cat > "${ETC_DIR}/lite_client.json" <<EOF
+{
+    "listen": "${listen}",
+    "port": ${lport},
+    "server": "$(json_escape "$server")",
+    "server_port": ${server_port},
+    "password": "$(json_escape "$pwd")",
+    "sni": "$(json_escape "$sni")",
+    "pool_size": 4,
+    "log_level": "info"${auth_json}
+}
+EOF
+    chmod 600 "${ETC_DIR}/lite_client.json"
+    ok "轻量客户端配置已保存至: ${ETC_DIR}/lite_client.json"
+
+    setup_service "client"
+    info "启动命令: $(svc_start_hint client)"
+    info "使用方式: 把浏览器/系统代理指向 SOCKS5 ${listen}:${lport}"
 }
 
 config_server() {
@@ -1752,7 +1918,28 @@ main() {
         6) uninstall; return ;;
     esac
 
-    # 部署路径 (1/2/3): 选择安装版本 (留空 = latest)
+    # 部署路径 (1/2/3): 先选形态 —— 完整版还是轻量版
+    cat >&2 <<'EOM'
+
+═══════════════════════════════════════════════════
+  部署形态
+═══════════════════════════════════════════════════
+  完整版: 分流 (国内直连/国外走代理) + fake-IP DNS + 可选透明网关 +
+          Web 看板 + UDP 支持。功能齐全, 配置项也多。
+
+  轻量版: 只有「本机 SOCKS5 → 全部走隧道」。无分流/DNS/透明网关/看板,
+          仅 TCP (QUIC 走不了代理, 浏览器会自动回落)。配置极简, 三五项填完就能用。
+          加密与 TLS 伪装与完整版**完全一致**, 两者协议互通。
+
+  拿不准就选完整版 —— 它能做轻量版的一切, 只是要多配几项。
+EOM
+    local form=$(ask_choice "选择部署形态" "完整版 (功能齐全)" "轻量版 (只要能翻墙)")
+    [[ "$form" == "2" ]] && LITE_MODE=true
+    if [[ "$LITE_MODE" == true ]]; then
+        ok "已选择轻量版: SOCKS5 全部转发, 仅 TCP"
+    fi
+
+    # 选择安装版本 (留空 = latest)
     select_version
 
     setup_fhs
@@ -1760,16 +1947,25 @@ main() {
 
     case $mode in
         1)
-            config_server
+            if [[ "$LITE_MODE" == true ]]; then config_lite_server; else config_server; fi
             ;;
         2)
-            config_client
-            [[ "$CLIENT_IS_GATEWAY" == true ]] && setup_transparent_gateway
+            if [[ "$LITE_MODE" == true ]]; then
+                config_lite_client   # 轻量版无透明网关, 不走 setup_transparent_gateway
+            else
+                config_client
+                [[ "$CLIENT_IS_GATEWAY" == true ]] && setup_transparent_gateway
+            fi
             ;;
         3)
-            config_server
-            config_client
-            [[ "$CLIENT_IS_GATEWAY" == true ]] && setup_transparent_gateway
+            if [[ "$LITE_MODE" == true ]]; then
+                config_lite_server
+                config_lite_client
+            else
+                config_server
+                config_client
+                [[ "$CLIENT_IS_GATEWAY" == true ]] && setup_transparent_gateway
+            fi
             ;;
     esac
 
