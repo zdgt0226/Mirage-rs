@@ -61,7 +61,14 @@ mirage-rs check -c /etc/mirage-rs/config_client.json && systemctl restart mirage
 
 # 格式化输出到 stdout (不改动原文件, 保留原键序与全部字段):
 mirage-rs format -c config.json > config.pretty.json
+
+# 导入 mirage:// 节点为新的 mirage 出站 (会写回配置, 自动备份为 config.json.bak):
+mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
 ```
+
+`import` 会交互式询问出站 tag 并**保证不与现有出站 tag 冲突**(撞名就重问, 绝不覆盖既有节点)。
+导入只添加出站、**不动路由** —— 要让流量走它, 需自行把 `routing.default_outbound` 或某条
+`rule` 的 `outbound` 改成新 tag, 再 `check` 一遍后重启。
 
 > 服务**启动时**也会跑同一套校验, 但那里只打 WARN 不阻止启动 (配置多一个字段就让网关起不来
 > 代价太大)。`check` 反过来求"拦得住", 所以有问题就非零退出 —— 两者的严格度差异是刻意的。
