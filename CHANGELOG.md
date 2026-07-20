@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [未发布] - 安装向导与文档补齐 SS 中转 (2026-07-20)
+## [v0.6.0-alpha.3] - 安装向导与文档补齐 SS 中转 (2026-07-20)
 
 ### feat(install): 安装向导补上 Shadowsocks 上游出口配置
 
