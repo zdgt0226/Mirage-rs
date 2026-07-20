@@ -437,7 +437,8 @@ RESOLV_GUARD=/usr/local/sbin/mirage-resolv-guard
 write_resolv_guard() {
     cat > "$RESOLV_GUARD" <<'GUARD'
 #!/bin/sh
-# mirage-resolv-guard —— 由 mirage-rs-client.service 的 ExecStartPost/ExecStopPost 调用。
+# mirage-resolv-guard —— 由**完整版**客户端服务 (mirage-rs-client.service) 的
+# ExecStartPost/ExecStopPost 调用。轻量模式无透明网关, 不会用到本脚本。
 # apply:   备份原 resolv.conf (含 symlink 目标), 指向 mirage (127.0.0.1)
 # restore: 从备份还原 (服务停止/崩溃/被杀时, systemd 保证跑到这里 → 机器不会没 DNS)
 # 备份文件不在 restore 时删除 —— 反复 start/stop 都能正常工作; 只有卸载才清。
@@ -540,22 +541,24 @@ detect_init() {
 
 # 输出 init-aware 的启动/日志命令提示 (供安装完成后打印).
 svc_start_hint() { # role
+    local n=$(svc_name "$1")
     case "$INIT_SYS" in
-        openrc)   echo "rc-service mirage-rs-$1 start" ;;
-        sysvinit) echo "service mirage-rs-$1 start" ;;
-        *)        echo "systemctl start mirage-rs-$1" ;;
+        openrc)   echo "rc-service $n start" ;;
+        sysvinit) echo "service $n start" ;;
+        *)        echo "systemctl start $n" ;;
     esac
 }
 svc_restart_hint() { # role
+    local n=$(svc_name "$1")
     case "$INIT_SYS" in
-        openrc)   echo "rc-service mirage-rs-$1 restart" ;;
-        sysvinit) echo "service mirage-rs-$1 restart" ;;
-        *)        echo "systemctl restart mirage-rs-$1" ;;
+        openrc)   echo "rc-service $n restart" ;;
+        sysvinit) echo "service $n restart" ;;
+        *)        echo "systemctl restart $n" ;;
     esac
 }
 svc_log_hint() { # role
     # 仅 systemd 有 journald; OpenRC/SysV 落到日志文件.
-    if [ "$INIT_SYS" = systemd ]; then echo "journalctl -u mirage-rs-$1 -f"; else echo "tail -f ${LOG_DIR}/$1.log"; fi
+    if [ "$INIT_SYS" = systemd ]; then echo "journalctl -u $(svc_name "$1") -f"; else echo "tail -f ${LOG_DIR}/$1.log"; fi
 }
 
 # uname -m → release 资产架构名. 32 位映射到 alpha.19 起发布的纯用户态产物.
@@ -620,7 +623,7 @@ remote_version() {
 
 # init-aware 服务控制 (start/stop/restart) 与运行状态查询. 未装服务时静默.
 svc_ctl() { # action role
-    local action=$1 svc="mirage-rs-$2"
+    local action=$1 svc=$(svc_name "$2")
     case "$INIT_SYS" in
         openrc)   rc-service "$svc" "$action" 2>/dev/null || true ;;
         sysvinit) service "$svc" "$action" 2>/dev/null || "/etc/init.d/$svc" "$action" 2>/dev/null || true ;;
@@ -629,7 +632,7 @@ svc_ctl() { # action role
     esac
 }
 service_active() { # role
-    local svc="mirage-rs-$1"
+    local svc=$(svc_name "$1")
     case "$INIT_SYS" in
         systemd)  systemctl is-active --quiet "$svc" 2>/dev/null ;;
         openrc)   rc-service "$svc" status >/dev/null 2>&1 ;;
@@ -822,7 +825,13 @@ setup_fhs() {
 # 一个服务, 避免完整版与轻量版两个 unit 抢同一个端口。
 LITE_MODE=false
 
-# 轻量模式下走 lite-server/lite-client 子命令 + 平铺的 lite_*.json 配置。
+# 轻量模式下走 lite-server/lite-client 子命令 + 平铺的 lite_*.json 配置,
+# 服务名也带 lite- 前缀以便与完整版区分 (systemctl status 一眼看出装的是哪个模式)。
+#
+# ⚠️ 两个模式的 unit 因此可以**并存**, 而它们默认监听同一端口 —— 装新模式前必须处理
+#    旧模式的残留, 否则后启动的那个会 bind 失败。见 stop_other_mode_service。
+svc_name() { [[ "$LITE_MODE" == true ]] && echo "mirage-rs-lite-$1" || echo "mirage-rs-$1"; }
+svc_other_name() { [[ "$LITE_MODE" == true ]] && echo "mirage-rs-$1" || echo "mirage-rs-lite-$1"; }
 svc_subcmd() { [[ "$LITE_MODE" == true ]] && echo "lite-$1" || echo "$1"; }
 svc_cfg() {
     if [[ "$LITE_MODE" == true ]]; then
@@ -832,8 +841,45 @@ svc_cfg() {
     fi
 }
 
+# 装某模式前, 处理另一模式遗留的同角色服务。
+#
+# 服务名区分后两个 unit 可以并存, 而它们默认监听**同一端口** —— 若旧模式的服务还开机
+# 自启, 重启后两个抢一个端口, 后启动的 bind 失败, 表现为"装完却时好时坏"。这里主动
+# 停掉并 disable 旧的 (不删配置, 用户想切回去只需重新跑安装)。
+stop_other_mode_service() {
+    local role=$1
+    local other=$(svc_other_name "$role")
+    local found=false
+    case "$INIT_SYS" in
+        systemd)  [[ -f "/etc/systemd/system/${other}.service" ]] && found=true ;;
+        openrc)   [[ -f "/etc/init.d/${other}" ]] && found=true ;;
+        sysvinit) [[ -f "/etc/init.d/${other}" ]] && found=true ;;
+    esac
+    [[ "$found" == true ]] || return 0
+
+    warn "检测到另一部署形态的同角色服务: ${other}"
+    warn "两者默认监听同一端口, 并存会互抢 —— 将停止并禁用它 (配置文件保留, 不删)。"
+    case "$INIT_SYS" in
+        systemd)
+            systemctl stop "$other" 2>/dev/null || true
+            systemctl disable "$other" 2>/dev/null || true
+            ;;
+        openrc)
+            rc-service "$other" stop 2>/dev/null || true
+            rc-update del "$other" default 2>/dev/null || true
+            ;;
+        sysvinit)
+            service "$other" stop 2>/dev/null || "/etc/init.d/$other" stop 2>/dev/null || true
+            command -v chkconfig >/dev/null 2>&1 && chkconfig "$other" off 2>/dev/null || true
+            command -v update-rc.d >/dev/null 2>&1 && update-rc.d -f "$other" remove 2>/dev/null || true
+            ;;
+    esac
+    ok "已停用 ${other} (如需切回, 重新运行安装并选择对应形态即可)"
+}
+
 setup_service() {
     local role=$1
+    stop_other_mode_service "$role"
     local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
     case "$INIT_SYS" in
         systemd)  setup_systemd "$role" ;;
@@ -852,7 +898,7 @@ setup_service() {
 setup_sysv() {
     local role=$1
     local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
-    local svc="mirage-rs-${role}"
+    local svc=$(svc_name "$role")
     local init_path="/etc/init.d/${svc}"
 
     cat > "$init_path" <<EOF
@@ -933,7 +979,7 @@ EOF
 setup_openrc() {
     local role=$1
     local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
-    local svc="mirage-rs-${role}"
+    local svc=$(svc_name "$role")
     local init_path="/etc/init.d/${svc}"
 
     cat > "$init_path" <<EOF
@@ -973,7 +1019,7 @@ EOF
 setup_systemd() {
     local role=$1
     local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
-    local service_path="/etc/systemd/system/mirage-rs-${role}.service"
+    local service_path="/etc/systemd/system/$(svc_name "$role").service"
 
     # proxy_local 客户端: 把 resolv.conf 的改动绑到服务生命周期。ExecStopPost 即便主进程被
     # SIGKILL 也会执行 → 服务一停就还原, 不会留下"指着死 mirage 的 resolv.conf = 机器没 DNS"。
@@ -1004,8 +1050,8 @@ LimitMEMLOCK=infinity
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable "mirage-rs-${role}.service" --now
-    ok "Systemd 服务已创建并启用: mirage-rs-${role}.service"
+    systemctl enable "$(svc_name "$role").service" --now
+    ok "Systemd 服务已创建并启用: $(svc_name "$role").service"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1892,7 +1938,13 @@ uninstall() {
     title "Mirage-rs 卸载"
 
     # 兼容两种命名: 新 (mirage-rs-*) + 旧 (mirage-*, alpha.8 之前的旧机器)
-    local services=(mirage-rs-server mirage-rs-client mirage-server mirage-client)
+    # 必须涵盖**所有历史与当前**的服务名: 完整版 / 轻量版 / 更早的 mirage-* 旧名。
+    # 漏掉任何一个都会留下开机自启的残留服务。
+    local services=(
+        mirage-rs-server      mirage-rs-client
+        mirage-rs-lite-server mirage-rs-lite-client
+        mirage-server         mirage-client
+    )
 
     # systemd 清理 (有 systemctl 才做)
     if command -v systemctl >/dev/null 2>&1; then

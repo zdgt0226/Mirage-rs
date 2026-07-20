@@ -27,7 +27,8 @@
 **alpha.4+ 起提供交互式安装向导 `install.sh`**, 会自动 (需 root):
 - 下载最新预编译二进制到 `/usr/local/bin/mirage-rs` (含 SHA256 双通道校验)
 - 探测公网 IP + 端口占用检测 + Brutal 内核模块
-- 生成服务端 / 客户端 config, 写 systemd unit `mirage-rs-{server,client}.service`
+- 生成服务端 / 客户端 config, 写 systemd unit —— 完整版 `mirage-rs-{server,client}.service`,
+  轻量版 `mirage-rs-lite-{server,client}.service`(名字区分, 一眼看出装的是哪个模式)
 - **选择部署形态**: 完整版 (分流/DNS/透明网关/看板) 或**轻量版** (只要能翻墙, 配置极简)
 - 交互配置 GUI 端口 / SNI 伪装 / brutal 速率 / geo 分流策略
 - **可选配置 Shadowsocks 上游出口** (把本机当中转站)
@@ -43,7 +44,8 @@ git clone https://github.com/zdgt0226/Mirage-rs.git && cd Mirage-rs
 sudo bash install.sh
 ```
 
-装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`.
+装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`
+(轻量版是 `mirage-rs-lite-{server,client}`)。
 
 ## 手动部署 (熟悉用户)
 
@@ -134,7 +136,11 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 
 **一键安装向导已支持**: 跑 `install.sh` 选完"部署服务端/客户端"后, 会再问一次
 **部署形态**, 选「轻量版」即可 —— 它会问端口/密码/SNI, 生成平铺配置并注册 systemd 服务
-(服务名仍是 `mirage-rs-{server,client}`, 与完整版共用, 不会两个 unit 抢端口)。
+(服务名为 `mirage-rs-lite-{server,client}`, 与完整版区分)。
+
+> 两种形态的 unit 可以并存, 但它们**默认监听同一端口**。安装向导会自动停用并禁用另一形态的
+> 同角色服务(配置文件保留), 避免两个服务抢一个端口导致"装完却时好时坏"。想切回去重新跑
+> 一次安装、选另一个形态即可。
 客户端还支持直接粘贴服务端导出的 `mirage://` 串, 免得手抄密码出错。
 
 手动运行:
@@ -521,7 +527,7 @@ zcat /proc/config.gz | grep -E 'CGROUP_BPF|BPF_SYSCALL|DEBUG_INFO_BTF|BPF_STREAM
 ## 卸载
 
 `install.sh` 主菜单第 4 项 "卸载 (Uninstall)":
-- 停止 + 禁用 `mirage-rs-server` / `mirage-rs-client` systemd 服务 (同时清老名字 `mirage-server` / `mirage-client` 兼容 alpha.8 之前的部署)
+- 停止 + 禁用 `mirage-rs-{server,client}` 与 `mirage-rs-lite-{server,client}` systemd 服务 (同时清老名字 `mirage-server` / `mirage-client` 兼容 alpha.8 之前的部署)
 - 删除 unit 文件 + 二进制 `/usr/local/bin/mirage-rs`
 - 交互询问是否删 `/var/log/mirage-rs` (默认 y) / `/etc/mirage-rs` config (默认 n, 重装可复用) / `/var/lib/mirage-rs` / `/etc/sysctl.d/99-mirage.conf`
 

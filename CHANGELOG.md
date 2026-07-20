@@ -2,6 +2,28 @@
 
 ## [未发布] - Shadowsocks 2022 (SIP022) 支持 (2026-07-21)
 
+### feat(install): 轻量版服务名与完整版区分 (`mirage-rs-lite-*`)
+
+此前两种形态共用 `mirage-rs-{server,client}` —— 当初这么设计是为了避免两个 unit 抢同一
+端口, 但代价是 `systemctl status` 看不出装的是哪个模式。现改为:
+
+| 形态 | 服务名 | 子命令 | 配置 |
+|---|---|---|---|
+| 完整版 | `mirage-rs-{server,client}` | `server`/`client` | `config_*.json` |
+| 轻量版 | `mirage-rs-lite-{server,client}` | `lite-server`/`lite-client` | `lite_*.json` |
+
+**区分服务名带来一个新风险, 已一并处理**: 两个 unit 现在可以并存, 而它们**默认监听同一
+端口** —— 旧模式的服务若还开机自启, 重启后两个抢一个端口, 后启动的 bind 失败, 表现为
+"装完却时好时坏"且极难联想到原因。故安装时会主动**停止并 disable 另一形态的同角色服务**
+(配置文件保留, 想切回去重跑安装选另一形态即可)。
+
+配套修正:
+- 服务名不再散落在各处硬编码, 统一走 `svc_name()`; systemd/OpenRC/SysV 三种 init 与
+  start/restart/log 提示、`svc_ctl`、`service_active` 全部跟随。
+- **卸载覆盖全部四个名字**(两形态 × 两角色)+ 两个历史旧名 —— 漏掉任何一个都会留下
+  开机自启的残留服务。
+- README 三处硬编码服务名同步。
+
 ### fix(shadowsocks): 握手合并为一次 write —— 消除可观察的握手指纹
 
 上线前自审发现: 开着 `TCP_NODELAY` 却逐段 `write+flush`, 使握手拆成**三个 TCP 段**
