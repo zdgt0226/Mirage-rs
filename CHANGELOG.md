@@ -50,9 +50,26 @@
 **非法 JSON**, 服务起不来且报错难懂。实测密码 `p@ss"with\quote` 原先直接把配置写坏,
 转义后可正常握手连通。
 
-> ⚠️ **同样的问题在完整版的 `config_server` / `config_client` 里仍然存在**(本次只修了
-> 新增的轻量路径, 未动既有代码)。`generate_password` 生成的是十六进制所以默认安全,
-> 但用户手输带引号的密码仍会踩到。
+### fix(install): 完整版配置生成同样做 JSON 转义 (密码含引号不再写坏配置)
+
+上一条只修了新增的轻量路径, 完整版仍留着同一个 bug。本次补齐所有**现实中真会含特殊
+字符**的字段:
+
+- `config_server`: `password` / `camouflage_host`
+- `config_client`: `server` / `password` / `camouflage_host`
+- mixed 入站的 `auth.username` / `auth.password`(开放代理修复时新加的, 同样有此问题)
+
+`generate_password` 产出十六进制故默认安全, 但用户**手输**带引号的密码会直接把
+`config.json` 写成非法 JSON —— 服务起不来, 且错误信息指向 JSON 解析而非密码, 极难排查。
+
+> 📌 **有意未处理**: 透明网关那段的网络参数(`inbound_listen` / `lan_iface` / `dns_listen` /
+> `direct_dns` / `remote_dns` / `fakeip_range`)仍是裸内插。它们同属一个 bug 类, 但
+> ①在网卡名或 IP 里打引号属荒诞 typo; ②那段配置生成**无法在开发机上端到端验证**(需真网关)。
+> 为防一个不现实的输入去改无法验证的代码, 风险大于收益。
+
+验证: 用 `p@ss"with\back\\slash<TAB>tab` 这种同时含引号、单/双反斜杠、制表符的密码, 走完
+完整版服务端 / 完整版客户端 / mixed 认证三条 JSON 生成路径, 均**合法且内容原样还原**;
+再用同一密码起真的两端, **握手成功并跑通真实 HTTPS 请求**。
 
 验证: `bash -n` 通过; 用 `json_escape` 生成含 `"` 与 `\` 的配置, 起真的 lite-server +
 lite-client **握手成功并跑通真实 HTTPS 请求**; 逐一核对两种形态下 systemd/OpenRC/SysV

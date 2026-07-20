@@ -1221,8 +1221,8 @@ EOM
             "tag": "mirage-in",
             "listen": "0.0.0.0",
             "port": ${port},
-            "password": "${pwd}",
-            "camouflage_host": "${sni}"${brutal_line}
+            "password": "$(json_escape "$pwd")",
+            "camouflage_host": "$(json_escape "$sni")"${brutal_line}
         }
     ],
     "outbounds": [],
@@ -1388,7 +1388,7 @@ EOM
         ib_pass=$(ask "代理密码 (留空=自动生成)" "")
         [[ -z "$ib_pass" ]] && { ib_pass=$(generate_password); info "已自动生成代理密码: $ib_pass"; }
         inbound_auth_json=',
-            "auth": { "username": "'"$ib_user"'", "password": "'"$ib_pass"'" }'
+            "auth": { "username": "'"$(json_escape "$ib_user")"'", "password": "'"$(json_escape "$ib_pass")"'" }'
         ok "入站认证已启用 (SOCKS5 走 RFC 1929, HTTP 走 Proxy-Authorization: Basic)"
     fi
 
@@ -1558,10 +1558,10 @@ EOM
         {
             "type": "mirage",
             "tag": "proxy",
-            "server": "${srv_host}",
+            "server": "$(json_escape "$srv_host")",
             "server_port": ${srv_port},
-            "password": "${pwd}",
-            "camouflage_host": "${sni}",
+            "password": "$(json_escape "$pwd")",
+            "camouflage_host": "$(json_escape "$sni")",
             "pool_size": ${pool_size}
         },
         {
