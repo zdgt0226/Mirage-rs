@@ -85,22 +85,34 @@ mirage-rs lite-server -c lite_server.json    # 墙外 VPS
 mirage-rs lite-client -c lite_client.json    # 本机
 ```
 
-配置是平铺的极简格式:
+配置是平铺的极简格式。**带完整注释的模板见 [`templates/lite_server.jsonc`](templates/lite_server.jsonc)
+与 [`templates/lite_client.jsonc`](templates/lite_client.jsonc)**(列全了每个字段的含义与取值建议;
+JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 
 ```jsonc
-// lite_client.json —— server/server_port/password 必填, 其余可省
+// lite_server.json —— 仅 password 必填, 其余都有默认值
 {
-  "listen": "127.0.0.1", "port": 1080,      // 默认值, 可省
-  "server": "1.2.3.4", "server_port": 443,
+  "listen": "0.0.0.0",
+  "port": 443,                    // 端口可自由自定义, 不限于 443
+  "password": "你的密码",
+  "sni": "www.apple.com"
+}
+
+// lite_client.json —— server / server_port / password 必填
+{
+  "listen": "127.0.0.1", "port": 1080,      // 本地 SOCKS5, 默认值可省
+  "server": "1.2.3.4", "server_port": 443,  // server_port 须与服务端 port 一致
   "password": "你的密码",
   "sni": "www.apple.com",                    // 须与服务端一致
   // 监听 0.0.0.0 时强烈建议设置, 否则是开放代理:
   "auth": { "username": "u", "password": "p" }
 }
-
-// lite_server.json —— password 必填
-{ "listen": "0.0.0.0", "port": 443, "password": "你的密码", "sni": "www.apple.com" }
 ```
+
+> 服务端端口选 443 伪装效果最好(与真实 HTTPS 同端口), 但它是特权端口(<1024), 非 root
+> 启动会 bind 失败 —— 用 systemd/root, 或给二进制加 `CAP_NET_BIND_SERVICE`, 或直接换个
+> `>1024` 的端口(如 8443/9443, 同样可用)。**两端的端口必须对上**: 客户端 `server_port`
+> = 服务端 `port`。
 
 **与完整版的差别**: 无分流(**全部转发**)、无 DNS/fake-IP、无透明代理、无 Web 看板、
 无 geo 数据下载、无配置热重载、**SOCKS5 仅 TCP**(UDP ASSOCIATE 会按规范回 `0x07` 拒绝,

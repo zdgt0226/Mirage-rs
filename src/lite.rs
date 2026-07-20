@@ -310,3 +310,61 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    /// 去掉 JSONC 的 `//` 注释。只在**引号之外**才认作注释起点, 否则会误伤
+    /// 值里的 `http://...` 之类。
+    fn strip_jsonc(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        for line in src.lines() {
+            let (mut in_str, mut esc) = (false, false);
+            let b = line.as_bytes();
+            let mut cut = line.len();
+            for i in 0..b.len() {
+                if esc { esc = false; continue; }
+                match b[i] {
+                    b'\\' if in_str => esc = true,
+                    b'"' => in_str = !in_str,
+                    b'/' if !in_str && i + 1 < b.len() && b[i + 1] == b'/' => { cut = i; break; }
+                    _ => {}
+                }
+            }
+            out.push_str(&line[..cut]);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 仓库里发布的模板必须能被当前代码解析。
+    ///
+    /// 这条是防**模板腐烂**的: 字段一旦在代码里改名/删除而模板没跟着改, 用户照着模板
+    /// 写出来的配置就会解析失败或字段被静默忽略。仓库里那个用旧 schema、连解析都过不了
+    /// 的 `transparent_config.json` 就是活例子。
+    #[test]
+    fn shipped_templates_still_parse() {
+        let s = strip_jsonc(&std::fs::read_to_string("templates/lite_server.jsonc").unwrap());
+        let srv: LiteServerConfig = serde_json::from_str(&s)
+            .expect("templates/lite_server.jsonc 应能解析为 LiteServerConfig");
+        assert_eq!(srv.port, 443, "模板应显式给出 port (端口可自定义)");
+        assert_eq!(srv.listen, "0.0.0.0");
+        assert!(!srv.password.is_empty());
+
+        let c = strip_jsonc(&std::fs::read_to_string("templates/lite_client.jsonc").unwrap());
+        let cli: LiteClientConfig = serde_json::from_str(&c)
+            .expect("templates/lite_client.jsonc 应能解析为 LiteClientConfig");
+        assert_eq!(cli.port, 1080, "模板应显式给出本地监听端口");
+        assert_eq!(cli.server_port, 443, "模板应显式给出 server_port");
+        assert_eq!(cli.listen, "127.0.0.1", "客户端模板默认应是回环, 不是 0.0.0.0");
+    }
+
+    #[test]
+    fn strip_jsonc_keeps_urls_in_strings() {
+        // 回归: 朴素地按 "//" 切会把 http:// 的值截断
+        let s = strip_jsonc(r#"{"u":"http://a.com/x"} // trailing"#);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["u"], "http://a.com/x");
+    }
+}

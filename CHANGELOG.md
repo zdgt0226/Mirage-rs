@@ -31,6 +31,25 @@
 缺头、`Authorization` 冒充、header 大小写、密码含冒号、base64 已知向量。
 "0x00 不能绕过"这条做过变异验证(放宽为也接受 0x00 → 该测试如实变红)。
 
+### docs(lite): 补上轻量模式的配置模板 (含端口设置说明)
+
+轻量模式此前**没有任何模板** —— `templates/` 里只有完整版的 client/server, 用户想知道
+"服务端端口怎么配"无处可查(功能一直支持, 只是没文档)。新增两份带完整注释的模板:
+
+- `templates/lite_server.jsonc` — 每个字段的含义与取值建议, 其中 `port` 明确说明:
+  **可自由自定义不限于 443**; 443 伪装最好但属特权端口(<1024), 非 root 会 bind 失败,
+  需 systemd/root 或 `CAP_NET_BIND_SERVICE` 或换 `>1024` 端口。
+- `templates/lite_client.jsonc` — 含 `server_port` 必须与服务端 `port` 一致的提示、
+  开放代理风险说明、以及"仅 TCP"的已知限制。
+
+同时新增**防模板腐烂**的测试: 断言仓库里发布的模板能被当前代码解析。字段一旦在代码里
+改名而模板没跟着改, 用户照着写就会踩坑 —— 仓库中那个用旧 schema、连解析都过不了的
+`transparent_config.json` 就是活例子。测试自带一个 JSONC 去注释器(只在引号外识别 `//`,
+避免误伤值里的 `http://`, 有专门回归用例)。
+
+验证: 从模板去注释生成真配置, 用**非 443 的自定义端口**(17777/17080)起真的
+lite-server + lite-client, 经隧道跑通一条真实 HTTPS 请求。
+
 ### feat(lite): 新增轻量模式 `lite-client` / `lite-server`
 
 给"只要能翻墙、不需要分流"的场景一条最短路径: 本机 SOCKS5 → 全部走隧道。
