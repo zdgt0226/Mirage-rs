@@ -4,7 +4,6 @@ sandbox_config.json
 output.log
 .geosite/
 .antigravity.md
-memory-bank/
 CLAUDE.md
 
 # Debug/scratch artifacts that occasionally end up in working tree

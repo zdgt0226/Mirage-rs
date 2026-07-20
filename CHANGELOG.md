@@ -1,5 +1,188 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 抗识别部署层 + 数据面/健壮性收尾 (2026-07-20)
+
+### feat(install): 服务端配置可自动搜索同 ASN 伪装域名 (`f48a78a`)
+
+`config_server` 问伪装 SNI 前新增**可选(默认否)**的自动搜索: 调 `tools/find_camouflage.py`
+扫本机 /24 的 :443, 从证书 SAN 找出真实托管在同 ASN 的域名, 让 SNI 与目的 IP 名实相符,
+削弱"SNI 归属 ASN vs 目的 IP ASN"一致性检查这个被动暴露面。搜到的域名作为**默认值**喂给
+原有 `ask_camouflage_host`, TLS1.3 探测 + 人工确认流程不变。
+
+- 不在 install.sh 内复制那 240 行逻辑: 本地仓库副本优先, 否则按 `MIRAGE_TAG` 从
+  raw.githubusercontent 拉 (适配 `curl | bash`), 避免两处漂移。
+- **刻意不自动采用推荐值**: 廉价机房同段邻居很可能本身也是代理/空壳站, 须人工过目。
+- 全路径优雅降级回落手动输入: 缺 python3/openssl、IP 无效、下载失败、扫描超时(300s)、用户留空。
+
+### feat(tools): `find_camouflage.py` —— 零 API key 找 SNI/IP 一致的伪装站 (`42b402d`)
+
+RIPEstat(keyless) 查 IP→ASN/前缀, 扫段抓 :443 证书读 SAN 得"域名↔所在 IP", 再校验解析回本前缀 +
+TLS1.3 + HTTP 可达并打分排序。**ASN/前缀级**一致(打掉常见 NGFW 检查), 非精确 IP 绑定。
+
+### feat(udp): 透明 UDP uplink 机会式合帧 (`4f5b299`)
+
+原来每个 UDP 数据报 1:1 封成一条 TLS 记录, QUIC 满 MTU 时记录众数卡在 ~1372B, 与真 bulk
+HTTPS-over-TCP 塞满 16KB 记录的尺寸签名不同 = 长度指纹。改为 `send_data` 前用 `try_recv`
+非阻塞榨干已排队的突发包合进同一条记录 (`UPLINK_COALESCE_CAP=16KB`)。只合并本已在 channel
+里的包 → **近零新增延迟**; 服务端 reassembler 本就支持一条记录内多帧, **无协议/服务端改动**。
+
+### feat(net-monitor): netlink 变更过滤, 收窄误 flush (`8dd0159`)
+
+链路自愈原来收到任何 LINK/ADDR/ROUTE 通知就清空重建连接池, 忙机 (BGP/大量具体路由增删) 上会被
+路由抖动频繁误 flush。新增 `should_bump` 解析 RTM_* 类型: LINK (载波 up/down)、ADDR (源地址
+增删/续租) 一律触发, ROUTE **只认默认路由** (`rtmsg.rtm_dst_len==0`)。ENOBUFS (溢出无法解析)
+保守仍触发。6 单测 + 变异验证。
+
+> 注: 收尾一份工作区遗留 WIP。该 WIP 只认默认路由、**漏掉 LINK/ADDR** → "换源 IP 但网关不变"
+> (DHCP 续租常见) 只发 `RTM_NEWADDR` 会被漏刷, 隧道绑旧源 IP。本次补回。
+
+### fix(geo): `.dat` 解析两处健壮性 (`a935567`, `ceba36e`)
+
+- **不再假设 protobuf 字段序**: 原代码只在 `code` 已知时才解析 entry, 若某 `.dat` 把 entries 排在
+  code 之前, **整个国家的规则会被静默丢弃**。改为先收集 entries、与 code 收齐后再判定。
+- **跳过 fixed32/fixed64 而非 break 截断**: wire-type 1/5 原落到 `else` 直接 break, 遇到 schema
+  扩展或非标 `.dat` 会截断解析、丢掉其后内容。改为正确跳 8/4 字节继续。
+- 两处均带回归测试并做过**变异验证**(退回旧逻辑测试如实变红)。
+
+### docs(brain): 引入 Open Project Brain (`eb1b73d`)
+
+落地 `BRAIN.md` + `brain/`(6 根页 + 15 个页面), 沉淀"代码里读不出来"的判断: eBPF 职责边界、
+splice(2) 弃 sockmap 的反转、fake-IP 远端解析的前提、只对首 SYN sk_assign 的不变式、
+auth 时间容差的 bootstrap 死锁、外部审计"真伪参半"的核实方法论(含**已证伪条目**防重复返工)。
+
+### chore
+
+- gitignore `__pycache__` (`6297a74`)。
+- 移除 `memory-bank/`(v0.2–v0.3 期的本地知识残留, 已被 `brain/` 取代; 原本就被 gitignore 未入库),
+  并清掉 `.gitignore` 中悬空的对应规则。
+
+---
+
+## [v0.6.0-alpha.1] - TLS 指纹多 profile 轮换 (2026-07-19)
+
+单一 ClientHello 指纹意味着该出口所有连接共享一个 JA3/JA4, 便于聚类。改为按权重轮换三套
+**字节级**仿真的真实客户端指纹, 稀释单一出口特征。各 profile 均取自真机抓包。
+
+- **Firefox 152** (`be4e8be`): 无 cipher GREASE、固定扩展定序(17 个)、3 个 key_share
+  (MLKEM768+X25519+P256)、`record_size_limit`、`delegated_credentials`。
+- **OkHttp / Android Conscrypt** (`579e6b1`): 有 GREASE 但**无 MLKEM**(X25519/P256/P384)、
+  TLS 1.3–1.0、8 个 sigalg、无 ECH/ALPS、padding 到 512。同时收敛服务端 ServerHello 曲线,
+  使模板对三套 profile 通用。
+- 加权选择 `pick_profile()`: Chromium ~60% / Firefox ~25% / OkHttp ~15%。
+- **JA4 对照 harness** (`1aa4dd5`): `dump_tls --ja4 <hexfile>` 可算抓包的 JA4;
+  `ja4_locks_all_profiles` 锁死三套指纹值防回归。
+
+> ⚠️ 服务端与客户端**都需升级**到 0.6.0-alpha.1 才完整生效。
+
+---
+
+## [v0.5.0-alpha.8] - 审计加固 + dns_xdp 现代内核复活 (2026-07-18)
+
+### harden: 外部审计中 4 处真实缺口 (`648579d`)
+
+逐条对 HEAD 核实一份 7 项审计后只修其中真实的 4 条(其余证伪不动):
+DNS `0xC00C` 自引用(构造包可让 `make_fake_ip_response` 生成自引用指针 → 加 `QDCOUNT>=1 &&
+question_end>12` 门控 + 二道防线)、`dns_xdp` 补 `ihl != 5` 守卫、fake-IP flush `.tmp` 窄竞态
+(加 `flush_lock`)、fake-IP 池未排除 `.0`/`.1`/广播。
+
+### fix(xdp): dns_xdp 在内核 ≥6.1 上加载被拒 —— 且一直如此 (`0e3f47e`)
+
+**即用户网关上 XDP 极速 DNS 从未生效**, 全靠用户态兜底。三个根因: ① `static inline` →
+`__always_inline`(否则编成 BPF-to-BPF call, 传包指针验证器跟不住); ② `int off` → `__u32`
+(符号扩展判负越界); ③ 10×63 嵌套 unroll → 单层扁平状态机(嵌套内联状态爆炸 E2BIG)。
+重写的 `hash_domain` 与用户态 `update_dns_cache` **逐字节一致**。补 `verify_dns_xdp`
+端到端 + 哈希一致性验证器 (`f2f7ffd`) 并接入 CI。
+
+> ⚠️ 该路径对带 EDNS0 的查询处理仍不完整, `advanced_dns.xdp_interface` **默认不开也不建议开**。
+
+---
+
+## [v0.5.0-alpha.7] - auth 时钟容差 + UDP 快速拆流 (2026-07-18)
+
+### fix(auth): 时钟偏差把客户端**永久锁死** (`3f0aa00`)
+
+真机 e2e 第一步即撞上: 两端时钟差 >10s → 握手令牌时间戳被拒。**这是设计缺陷非数值问题** ——
+首次握手用的是未经校正的裸系统时钟, 而 `TIME_SYNC` 帧**只在 auth 成功后**下发 → auth 卡在窗口上
+→ TIME_SYNC 永远 bootstrap 不了 → 偏差大的机器永久锁死。且 auth 失败必须走 camouflage 转发,
+不能回时间提示(否则破坏抗探测), 所以该窗口是首次握手唯一容错。
+
+- `TOKEN_TS_TOLERANCE_SECS` → 服务端 config **`auth_ts_tolerance_secs`(默认 60)**, 旧 config 兼容。
+- 重放缓存保留桶数从容差自动推导; 客户端"TIME_SYNC 解密失败"改一次性详细提示(查密码/时钟/NTP)。
+
+> 💡 同一病灶群: **NTP 若走代理** → 隧道挂则 NTP 同步不了 → 时钟更偏 → 隧道更挂 死循环。
+> 建议路由加 `{"outbound":"direct","port":[123]}`。
+
+### feat(udp): 上游过滤 UDP 时快速拆流 + 诊断 (`3080a49`)
+
+真机 e2e 暴露: 某些 VPS 过滤出向 UDP:443/QUIC 回包, 每条流白占一条隧道 60s。加
+`FIRST_DOWNLINK_TIMEOUT=8s` 快速拆流 + 零下行时一次性 WARN"上游可能滤 UDP";
+服务端 `udp_relay` 的 `send_to` 错误不再静默吞掉。
+
+---
+
+## [v0.5.0-alpha.6] - 孤儿 tc 过滤器黑洞 + 三个审计纰漏 (2026-07-17)
+
+### fix: 孤儿 tc 过滤器把 LAN 打成黑洞 (`3eb675b`)
+
+进程被 SIGKILL/停止后 tc 过滤器**仍挂在网卡上**(tc 持有 prog 引用), 而 `fwmark→local` 的
+`ip rule` 由独立 service 装、只在卸载时删。两者叠加把每个已建流的包引到 local 表却无 socket
+可收 → **整段非直连 TCP 黑洞**。修: 已建流打 mark **前**先 `bpf_sk_lookup_tcp` 探 listener,
+不在就走正常转发 —— **代理没了顶多不加速, 不该断网**。同时补退出时显式 detach。
+其余三条: guard 释放序、陈旧 resolv 备份、裸 IP 连接无超时。
+
+### ci: netns eBPF 验证器接入 CI (`607d175`)
+
+5 个验证器进 `ebpf-verify` job。**关键前提**: 它们原先只 println PASS/FAIL、从不返非零退出码
+(是诊断工具不是测试), 直接进 CI 会永远绿灯 = **假信心比没 CI 更糟** → 先全改成 `exit(1)` 才接入。
+故意跑在 ubuntu-22.04 / 内核 5.15 以检验 README 声称的"≥5.10 支持"。
+
+> ⚠️ 孤儿过滤器验证器经多轮尝试后**仍从 CI 摘掉**(`b96ac23`): 5.15 上红的是**测试脚手架**竞态
+> (`connect: Network is unreachable`, 根本没走到 sk_lookup), **产品已确认无恙**。脚本保留, 本地 ≥6.1 可跑。
+
+---
+
+## [v0.5.0-alpha.5] - 两个真实 footgun (2026-07-17)
+
+### fix: `proxy_local` 停服导致整机丢 DNS (`2ad65fa`)
+
+比预想更严重: `resolv.conf` 指向 127.0.0.1 是**安装时**做、只在**卸载时**还原, **完全没绑服务
+生命周期** → **`systemctl stop` 就让机器彻底没 DNS**(不只 SIGKILL)。修: 新增
+`/usr/local/sbin/mirage-resolv-guard {apply|restore}`, unit 加 `ExecStartPost`/`ExecStopPost` ——
+systemd 即便主进程被 SIGKILL 也保证跑 `ExecStopPost`。5 场景实测(含"重复 apply 不冲掉备份")。
+
+### fix: 废弃 stub 配置误导用户
+
+`api.secret` 被解析但**零使用**、不提供任何鉴权(alpha.2 加了真 `gui.token` 后更易混淆)。
+不静默删(设过的人永远不知被骗), 改为**保留字段检测 + 启动 WARN**; `advanced_dns.rules` 同样处理。
+
+---
+
+## [v0.5.0-alpha.4] - fake-IP 映射持久化 (2026-07-16)
+
+`973c8b2`: opt-in 写专用缓存文件, 重启后 fake-IP↔域名映射不丢, 免得客户端持有的旧 fake-IP
+失效导致代理连接断代。
+
+## [v0.5.0-alpha.3] - DNS 响应缓存 (2026-07-16)
+
+`a512689`: 接上原为 stub 的 `advanced_dns.cache`, 按 TTL 缓存上游响应。
+抗审查路线是**远端解析 + 缓存**, 而非墙内不可靠的 DoH/DoT。
+
+## [v0.5.0-alpha.2] - Web API bearer token 鉴权 (2026-07-16)
+
+`395488d`: 原 `api/` 全 endpoint **无鉴权**, 绑 0.0.0.0 即泄漏日志/配置。新增 config `gui.token`
+(可选, 不设=向后兼容), axum 中间件常量时间比较, token 三来源 (Bearer / cookie / `?token=`);
+根路由带合法 `?token` 即种 HttpOnly+SameSite=Strict cookie。非 localhost 暴露且未设 token 时启动 WARN。
+`install.sh` 选 0.0.0.0 自动生成 32 位 token。
+
+## [v0.5.0-alpha.1] - 连接健康 / 链路自愈 (2026-07-16)
+
+- **WarmPool 死链主动剔除** (`4c6848a`): `get()` 加 stale 探测, handler 首次写失败自动换隧道重试。
+- **链路自愈** (`48b800e`): netlink 订阅 LINK/ADDR/ROUTE 变更, 网络一变 (Wi-Fi↔蜂窝 / 宽带续租 /
+  载波变化) 就广播 epoch, WarmPool **清空整池**并用新路径并发重建 —— 毫秒级切换而非等超时。
+  500ms 去抖合并一次切换产生的十几条消息。
+
+---
+
 ## [v0.4.5] - DNS 抗风暴 + 全量审计 + 日志滚动 (2026-07-15)
 
 **0.4.5 收尾版** (final, 去 `-alpha` 标记版本完成)。汇总 alpha.21 → final 的改动。
