@@ -84,8 +84,15 @@ README 的 "≥5.10" 声明, 本地是 6.1; build.yml 里就记着实例(orphan 
 ②**干净环境** —— 本地有热 target/ 和装好的系统库, catch 不到漏声明的依赖。
 定位: 本地当快速反馈环, CI 当合并闸门。
 
+### 阶段3c-2: UDP 经隧道
+- `WgUdpSocket`: 隧道内绑端口, `send_to` 同步入队(不阻塞收包循环)、`recv_from` 走 waker。
+  drop 时摘除 socket, 否则每个 socket 泄漏 128KB 缓冲。
+- 接进透明代理 UDP 路由: 新增 `Route::Wireguard` 与 `FlowSink::Wireguard`,
+  建流/回包严格照 Direct 腿的 refs 与 guard 配平顺序写, 未自创流程。
+- 目标地址在**建流时**解析好 —— 隧道内没有 DNS(同 TCP 侧的已知限制)。
+
 ### 待完成
-- 阶段3c-2: UDP 经隧道; 3c-3: 接入 `mirage_server.upstream`。
+- 阶段3c-3: 接入 `mirage_server.upstream` (服务端中转经 WG 出去)。
 - 阶段4: 对着真实 WG peer 的 e2e 验证 (当前测试只覆盖到"握手包格式正确", **未证明与真实
   WG 服务器互通**)。
 

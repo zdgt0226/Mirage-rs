@@ -96,6 +96,8 @@ static NEXT_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 enum FlowSink {
     Direct(Arc<UdpSocket>),
     Mirage(tokio::sync::mpsc::Sender<Vec<u8>>),
+    /// WireGuard 隧道内的 UDP socket + 已解析的目标地址 (隧道内没 DNS, 地址在建流时定好)。
+    Wireguard(Arc<crate::proxy::wg::socket::WgUdpSocket>, SocketAddr),
 }
 
 /// 会话槽. Setting = setup_flow 正在建流 (占位, 防突发包重复 spawn);
@@ -397,6 +399,10 @@ pub async fn start_transparent_udp(
                 FlowSink::Mirage(tx) => {
                     let _ = tx.try_send(buf[..size].to_vec());
                 }
+                // send_to 是同步的 (数据进 smoltcp 缓冲), 不阻塞收包循环。
+                FlowSink::Wireguard(sock, dst) => {
+                    let _ = sock.send_to(&buf[..size], dst);
+                }
             }
         } else if do_setup {
             let payload = buf[..size].to_vec();
@@ -475,6 +481,7 @@ async fn setup_flow(
     enum Route {
         Direct,
         Mirage(Arc<crate::proxy::pool::WarmPool>),
+        Wireguard(Arc<OutboundNode>),
     }
     let route = match &*leaf {
         OutboundNode::Direct { .. } => Route::Direct,
@@ -483,6 +490,7 @@ async fn setup_flow(
             return;
         }
         OutboundNode::Mirage { pool, .. } => Route::Mirage(pool.clone()),
+        OutboundNode::Wireguard { .. } => Route::Wireguard(leaf.clone()),
         other => {
             warn!("[TPROXY-UDP] unsupported outbound leaf {:?}, dropping", other.tag());
             return;
@@ -545,6 +553,68 @@ async fn setup_flow(
             loop {
                 match tokio::time::timeout(IDLE_TIMEOUT, out.recv(&mut dbuf)).await {
                     Ok(Ok(n)) => {
+                        let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
+                        down_ctr.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // ── WireGuard 腿: 隧道内 UDP socket。地址在建流时解析好 —— 隧道内没有 DNS ──
+        Route::Wireguard(node) => {
+            let real: SocketAddr = match &target {
+                Some(UdpTarget::Domain(d)) => match crate::proxy::resolver::resolve_first(d, port).await {
+                    Ok(sa) => sa,
+                    Err(_) => {
+                        debug!("[TPROXY-UDP/WG] resolve {} failed", d);
+                        return;
+                    }
+                },
+                Some(UdpTarget::Ip(ip)) => SocketAddr::V4(SocketAddrV4::new(*ip, port)),
+                None => {
+                    warn!("[TPROXY-UDP/WG] 淘汰的 fake-ip {} 无域名可恢复, dropping", fake_ip);
+                    return;
+                }
+            };
+            if real.is_ipv6() {
+                warn!("[TPROXY-UDP/WG] IPv6 目标 {} 暂不支持, dropping", real);
+                return;
+            }
+            let tunnel = match node.wg_tunnel().await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("[TPROXY-UDP/WG] 建立隧道失败: {}", e);
+                    return;
+                }
+            };
+            let sock = match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    error!("[TPROXY-UDP/WG] 隧道内绑 UDP 失败: {}", e);
+                    return;
+                }
+            };
+
+            // reply refs++ 紧接 commit (中间无早退, 保证与 teardown 的 refs-- 配平)。
+            let reply = match acquire_reply(&replies, orig_dst) {
+                Some(r) => r,
+                None => return,
+            };
+            guard.reply_acquired = true;
+            lock_sessions(&sessions).insert(
+                key,
+                FlowSlot::Ready { id: flow_id, sink: FlowSink::Wireguard(sock.clone(), real) },
+            );
+            guard.committed_id = Some(flow_id);
+            debug!("[TPROXY-UDP/WG] new flow {} → {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
+
+            let _ = sock.send_to(&first_payload, real);
+            // buf 必须 ≥ 隧道 MTU: UDP 是逐数据报的, 缓冲不足会截断而不是分片。
+            let mut dbuf = vec![0u8; UDP_BUF];
+            loop {
+                match tokio::time::timeout(IDLE_TIMEOUT, sock.recv_from(&mut dbuf)).await {
+                    Ok(Ok((n, _from))) => {
                         let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
                         down_ctr.fetch_add(n as u64, Ordering::Relaxed);
                     }

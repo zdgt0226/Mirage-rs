@@ -191,6 +191,40 @@ mod tests {
     // encapsulate 一律返回 Done, 5s 内不会有任何包出去, 判据恒真。唤醒路径的测试
     // 见 tunnel.rs 的 wake_drains_tx_promptly (直接观察 tx 队列被排空)。
 
+    /// UDP socket drop 后同样必须摘除, 否则每个 socket 泄漏 128KB 缓冲。
+    #[tokio::test]
+    async fn dropping_udp_socket_removes_it() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = Arc::new(
+            super::WgTunnel::connect(&cfg(peer.local_addr().unwrap().to_string()))
+                .await
+                .unwrap(),
+        );
+        let s = WgUdpSocket::bind(t.clone()).expect("绑定应成功");
+        assert_eq!(lock_inner(&t.inner).sockets.iter().count(), 1);
+        drop(s);
+        assert_eq!(
+            lock_inner(&t.inner).sockets.iter().count(),
+            0,
+            "UDP socket drop 后未摘除 —— 每个 socket 泄漏 128KB 缓冲"
+        );
+    }
+
+    /// send_to 必须把数据报交给 smoltcp 并驱动出去(不报错即入队成功)。
+    /// 隧道未握手时 boringtun 会把它排队, 这里只锁住"调用路径通、不 panic"。
+    #[tokio::test]
+    async fn udp_send_enqueues_without_error() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = Arc::new(
+            super::WgTunnel::connect(&cfg(peer.local_addr().unwrap().to_string()))
+                .await
+                .unwrap(),
+        );
+        let s = WgUdpSocket::bind(t).unwrap();
+        s.send_to(b"hello", "10.0.0.1:53".parse().unwrap())
+            .expect("发送应入队成功");
+    }
+
     /// stream drop 后 socket 必须从 SocketSet 摘除, 否则每条连接泄漏 128KB 缓冲。
     #[tokio::test]
     async fn dropping_stream_removes_socket() {
@@ -215,5 +249,90 @@ mod tests {
         // 摘除后再取应 panic (smoltcp 对无效 handle 的行为), 用 iter 计数更稳妥
         let n = lock_inner(&t.inner).sockets.iter().count();
         assert_eq!(n, 0, "stream drop 后 socket 未从 SocketSet 摘除 —— 每条连接泄漏缓冲");
+    }
+}
+
+/// 经 WireGuard 隧道的一个 UDP socket。
+///
+/// 与 TCP 侧同样的桥接思路(waker + `poll_now`), 但语义差别要留神:
+/// UDP 是**逐数据报**的 —— `recv_from` 一次给一个完整数据报, 缓冲不足会截断,
+/// 所以调用方的 buf 必须 ≥ 隧道 MTU。
+pub struct WgUdpSocket {
+    tunnel: Arc<WgTunnel>,
+    handle: SocketHandle,
+}
+
+/// UDP 收发缓冲: 元数据槽数 + 载荷字节数。
+/// 32 个数据报 ≈ 突发容量; 64KB 载荷够放满 MTU 级别的包。
+const UDP_META_SLOTS: usize = 32;
+const UDP_PAYLOAD: usize = 64 * 1024;
+
+impl WgUdpSocket {
+    /// 在隧道内绑一个本地端口并返回 socket。
+    pub fn bind(tunnel: Arc<WgTunnel>) -> Result<Self> {
+        let handle = {
+            let mut g = lock_inner(&tunnel.inner);
+            let mut sock = smoltcp::socket::udp::Socket::new(
+                smoltcp::socket::udp::PacketBuffer::new(
+                    vec![smoltcp::socket::udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+                    vec![0u8; UDP_PAYLOAD],
+                ),
+                smoltcp::socket::udp::PacketBuffer::new(
+                    vec![smoltcp::socket::udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+                    vec![0u8; UDP_PAYLOAD],
+                ),
+            );
+            let local_port = 1024 + (fastrand::u16(..) % (u16::MAX - 1024));
+            sock.bind(local_port)
+                .map_err(|e| anyhow!("WireGuard: UDP 绑定本地端口失败: {e:?}"))?;
+            g.sockets.add(sock)
+        };
+        tunnel.poll_now();
+        Ok(Self { tunnel, handle })
+    }
+
+    /// 经隧道发一个数据报。
+    pub fn send_to(&self, data: &[u8], dst: std::net::SocketAddr) -> Result<()> {
+        {
+            let mut g = lock_inner(&self.tunnel.inner);
+            let sock = g
+                .sockets
+                .get_mut::<smoltcp::socket::udp::Socket>(self.handle);
+            sock.send_slice(data, smoltcp::wire::IpEndpoint::from(dst))
+                .map_err(|e| anyhow!("WireGuard: UDP 发送失败: {e:?}"))?;
+        }
+        // 同 TCP 侧: 进了发送缓冲不等于发出去了, 必须驱动 smoltcp + 叫醒 pump。
+        self.tunnel.poll_now();
+        Ok(())
+    }
+
+    /// 收一个数据报。`buf` 必须 ≥ 隧道 MTU, 否则数据报会被截断。
+    pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, std::net::SocketAddr)> {
+        std::future::poll_fn(|cx| {
+            let mut g = lock_inner(&self.tunnel.inner);
+            let sock = g
+                .sockets
+                .get_mut::<smoltcp::socket::udp::Socket>(self.handle);
+            if sock.can_recv() {
+                return Poll::Ready(
+                    sock.recv_slice(buf)
+                        .map(|(n, meta)| {
+                            let addr = std::net::SocketAddr::new(meta.endpoint.addr.into(), meta.endpoint.port);
+                            (n, addr)
+                        })
+                        .map_err(|e| anyhow!("WireGuard: UDP 接收失败: {e:?}")),
+                );
+            }
+            sock.register_recv_waker(cx.waker());
+            Poll::Pending
+        })
+        .await
+    }
+}
+
+impl Drop for WgUdpSocket {
+    fn drop(&mut self) {
+        // 同 TCP: 不摘除则每个 socket 在隧道里泄漏 128KB 缓冲。
+        lock_inner(&self.tunnel.inner).sockets.remove(self.handle);
     }
 }
