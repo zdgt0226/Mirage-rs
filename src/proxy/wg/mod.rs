@@ -28,9 +28,12 @@
 //!
 //! 实现分阶段 (见 feat/wireguard 分支):
 //!   - [x] 阶段1: 配置 + 密钥解码 + Tunn 构造 + 能产出合法 WG 握手包 (本文件 + 测试)
-//!   - [ ] 阶段2: WgDevice (smoltcp Device 桥接) + 异步 pump (udp↔tunn↔smoltcp + 定时器)
+//!   - [x] 阶段2a: WgDevice (smoltcp Device 桥接, 见 device.rs)
+//!   - [ ] 阶段2b: 异步 pump (udp↔tunn↔smoltcp + Tunn 定时器)
 //!   - [ ] 阶段3: connect_tcp / udp 通过 WG 隧道; 接入 outbound + mirage_server.upstream
 //!   - [ ] 阶段4: 真机 e2e 对着真实 WG peer 验证
+
+pub mod device;
 
 use anyhow::{anyhow, bail, Result};
 use boringtun::x25519::{PublicKey, StaticSecret};
