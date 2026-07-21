@@ -26,7 +26,8 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use std::sync::Mutex;
+use tokio::sync::Notify;
 
 /// 收包缓冲。取 UDP 载荷上限, 免得对端用大 MTU 时 `recv` 静默截断 —— 截断的包
 /// 认证必然失败, 表现为"隧道通但偶发丢包", 极难查。每隧道两块, 开销可忽略。
@@ -66,7 +67,11 @@ pub(crate) struct TunnelInner {
     pub(crate) device: WgDevice,
     pub(crate) iface: Interface,
     pub(crate) sockets: SocketSet<'static>,
-    pub(crate) udp: Arc<UdpSocket>,
+}
+
+/// 锁中毒即隧道已废 (某处 panic 过), 但没必要因此再 panic 一次级联炸掉调用方。
+pub(crate) fn lock_inner(m: &Mutex<TunnelInner>) -> std::sync::MutexGuard<'_, TunnelInner> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// smoltcp 需要一个单调时钟。用进程启动起点的相对毫秒。
@@ -117,7 +122,6 @@ impl WgTunnel {
             device,
             iface,
             sockets: SocketSet::new(Vec::new()),
-            udp: udp.clone(),
         }));
 
         let wake = Arc::new(Notify::new());
@@ -126,13 +130,14 @@ impl WgTunnel {
         Ok(Self { inner, local_addr: cfg.address, start, wake, pump })
     }
 
-    /// 驱动一次 smoltcp poll 并叫醒 pump 立刻发包。
+    /// 驱动一次 smoltcp poll 并叫醒 pump 立刻发包。**同步**, 以便从 `poll_read`/
+    /// `poll_write` 这类非 async 上下文调用。
     ///
-    /// 应用往 smoltcp socket 写完数据后**必须**调用: 否则出站包躺在队列里, 要等下一次
+    /// 应用往 smoltcp socket 写完数据后必须调用: 否则出站包躺在队列里, 要等下一次
     /// UDP 收包或 250ms tick 才发得出去 —— 每个往返白加最多 250ms 延迟。
-    pub(crate) async fn poll_now(&self) {
+    pub(crate) fn poll_now(&self) {
         {
-            let mut g = self.inner.lock().await;
+            let mut g = lock_inner(&self.inner);
             let g = &mut *g;
             g.iface.poll(smol_now(self.start), &mut g.device, &mut g.sockets);
         }
@@ -140,22 +145,33 @@ impl WgTunnel {
     }
 }
 
-/// 把 `TunnResult::WriteToNetwork` 的包发出去, 并反复用空 datagram 榨干后续待发包。
+/// 持锁期间**只做纯计算**, 把要发的加密数据报收集起来由调用方在锁外发送。
 ///
-/// **必须循环**: boringtun 一次 decapsulate 可能产生多个待发包 (握手应答 + 排队数据),
-/// 只发第一个会卡在握手中途。
-async fn flush_network(tunn: &mut Tunn, udp: &UdpSocket, first: Option<&[u8]>) {
-    if let Some(p) = first {
-        let _ = udp.send(p).await;
+/// 这是硬约束而非风格选择: `TunnelInner` 用同步 `Mutex` (`poll_read`/`poll_write` 是同步的,
+/// 锁不了 async mutex), 一旦持锁 `.await` 就会把整个 runtime worker 连同锁一起卡住。
+fn poll_and_collect(g: &mut TunnelInner, start: std::time::Instant) -> Vec<Vec<u8>> {
+    g.iface.poll(smol_now(start), &mut g.device, &mut g.sockets);
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; MAX_DATAGRAM];
+    while let Some(pkt) = g.device.pop_tx() {
+        match g.tunn.encapsulate(&pkt, &mut buf) {
+            TunnResult::WriteToNetwork(p) => out.push(p.to_vec()),
+            TunnResult::Err(e) => tracing::debug!("[WG] encapsulate: {e:?}"),
+            _ => {}
+        }
     }
+    out
+}
+
+/// 榨干 boringtun 内部排队的待发包。
+///
+/// **必须循环**: 一次 `decapsulate` 可能产生多个待发包 (握手应答 + 排队的数据),
+/// 只发第一个会卡在握手中途。
+fn drain_queued(g: &mut TunnelInner, out: &mut Vec<Vec<u8>>) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
-        match tunn.decapsulate(None, &[], &mut buf) {
-            TunnResult::WriteToNetwork(p) => {
-                if udp.send(p).await.is_err() {
-                    break;
-                }
-            }
+        match g.tunn.decapsulate(None, &[], &mut buf) {
+            TunnResult::WriteToNetwork(p) => out.push(p.to_vec()),
             _ => break,
         }
     }
@@ -174,7 +190,8 @@ async fn pump(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        tokio::select! {
+        // 每轮产出一批待发数据报, 统一在锁外发送。
+        let out: Vec<Vec<u8>> = tokio::select! {
             // ── 收: UDP → decapsulate → smoltcp rx ──
             r = udp.recv(&mut net_buf) => {
                 let n = match r {
@@ -184,13 +201,14 @@ async fn pump(
                         return;
                     }
                 };
-                let mut g = inner.lock().await;
+                let mut g = lock_inner(&inner);
                 let g = &mut *g;
+                let mut out = Vec::new();
                 match g.tunn.decapsulate(None, &net_buf[..n], &mut dec_buf) {
+                    // 握手应答/cookie: 发回网络。
                     TunnResult::WriteToNetwork(p) => {
-                        // 握手应答/cookie: 发回去, 并榨干后续包。
-                        let p = p.to_vec();
-                        flush_network(&mut g.tunn, &udp, Some(&p)).await;
+                        out.push(p.to_vec());
+                        drain_queued(g, &mut out);
                     }
                     TunnResult::WriteToTunnelV4(pkt, _) | TunnResult::WriteToTunnelV6(pkt, _) => {
                         g.device.push_rx(pkt.to_vec());
@@ -198,46 +216,34 @@ async fn pump(
                     TunnResult::Err(e) => tracing::debug!("[WG] decapsulate: {e:?}"),
                     TunnResult::Done => {}
                 }
-                g.iface.poll(smol_now(start), &mut g.device, &mut g.sockets);
-                drain_tx(g, &udp).await;
+                out.extend(poll_and_collect(g, start));
+                out
             }
 
             // ── 定时器: 握手重试 / 密钥轮换 / keepalive ──
             _ = tick.tick() => {
-                let mut g = inner.lock().await;
+                let mut g = lock_inner(&inner);
                 let g = &mut *g;
+                let mut out = Vec::new();
                 let mut tbuf = vec![0u8; MAX_DATAGRAM];
                 if let TunnResult::WriteToNetwork(p) = g.tunn.update_timers(&mut tbuf) {
-                    let _ = udp.send(p).await;
+                    out.push(p.to_vec());
                 }
-                // 定时 poll: smoltcp 的重传/超时也靠它推进。
-                g.iface.poll(smol_now(start), &mut g.device, &mut g.sockets);
-                drain_tx(g, &udp).await;
+                out.extend(poll_and_collect(g, start));
+                out
             }
 
             // ── 被叫醒: 应用刚写了数据, 立刻发, 别等 tick ──
             _ = wake.notified() => {
-                let mut g = inner.lock().await;
-                let g = &mut *g;
-                g.iface.poll(smol_now(start), &mut g.device, &mut g.sockets);
-                drain_tx(g, &udp).await;
+                let mut g = lock_inner(&inner);
+                poll_and_collect(&mut g, start)
             }
-        }
-    }
-}
+        };
 
-/// 把 smoltcp 产出的所有出站 IP 包加密发出。
-async fn drain_tx(g: &mut TunnelInner, udp: &UdpSocket) {
-    let mut buf = vec![0u8; MAX_DATAGRAM];
-    while let Some(pkt) = g.device.pop_tx() {
-        match g.tunn.encapsulate(&pkt, &mut buf) {
-            TunnResult::WriteToNetwork(p) => {
-                if udp.send(p).await.is_err() {
-                    return;
-                }
+        for p in out {
+            if udp.send(&p).await.is_err() {
+                break;
             }
-            TunnResult::Err(e) => tracing::debug!("[WG] encapsulate: {e:?}"),
-            _ => {}
         }
     }
 }
@@ -319,6 +325,44 @@ mod tests {
         assert!(e.contains("mtu 非法"), "实际: {e}");
         // 0 也不合法
         assert!(WgTunnel::connect(&cfg_to("127.0.0.1:1".into(), 0)).await.is_err());
+    }
+
+    /// `poll_now()` 必须**立刻**叫醒 pump 把出站队列排空, 而不是干等下一个 250ms tick。
+    ///
+    /// 判据用"tx 队列是否被排空"而非"对端是否收到包": 握手进行中 boringtun 对 encapsulate
+    /// 一律返回 Done (5s 内不发任何包), 用收包做判据恒真、证明不了唤醒路径。
+    ///
+    /// 用 10 次重复试验压掉 tick 的偶然干扰: 每次注入一个包后只给 3ms 窗口, 靠 tick
+    /// (250ms 一次) 排空的概率极低, 而唤醒路径正常时应次次排空。
+    #[tokio::test]
+    async fn wake_drains_tx_promptly() {
+        use smoltcp::phy::{Device, TxToken};
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = WgTunnel::connect(&cfg_to(peer.local_addr().unwrap().to_string(), 1420))
+            .await
+            .unwrap();
+        // 让起始握手先跑完, 免得和试验窗口重叠
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut drained = 0;
+        for _ in 0..10 {
+            {
+                let mut g = lock_inner(&t.inner);
+                let tx = g.device.transmit(smol_now(t.start)).unwrap();
+                tx.consume(4, |b| b.copy_from_slice(&[0x45, 0, 0, 4]));
+            }
+            t.poll_now();
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            if lock_inner(&t.inner).device.pop_tx().is_none() {
+                drained += 1;
+            }
+        }
+        assert!(
+            drained >= 8,
+            "10 次里只有 {drained} 次被及时排空 —— poll_now 的唤醒路径没生效, \
+             出站数据要等 250ms tick"
+        );
     }
 
     /// 隧道 drop 后 pump 任务必须停。pump 持有 inner 的 Arc 克隆, 光靠引用计数永远
