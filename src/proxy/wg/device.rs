@@ -56,10 +56,6 @@ impl WgDevice {
         self.tx.pop_front()
     }
 
-    /// 出站队列是否有货 (pump 用来决定要不要立刻 encapsulate)。
-    pub fn has_tx(&self) -> bool {
-        !self.tx.is_empty()
-    }
 }
 
 pub struct WgRxToken(Vec<u8>);
@@ -142,10 +138,8 @@ mod tests {
     #[test]
     fn tx_token_enqueues_for_pump() {
         let mut d = WgDevice::new(1420);
-        assert!(!d.has_tx());
         let t = d.transmit(Instant::from_millis(0)).unwrap();
         t.consume(4, |buf| buf.copy_from_slice(&[1, 2, 3, 4]));
-        assert!(d.has_tx());
         assert_eq!(d.pop_tx().unwrap(), vec![1, 2, 3, 4]);
         assert!(d.pop_tx().is_none());
     }
