@@ -64,8 +64,6 @@ jobs:
     # 脚本保留, 本地 (内核 ≥6.1) 可跑并含双向变异防护。要接回 CI 需先拿到 runner 日志访问。
     # - name: tc_divert 孤儿过滤器 — listener 没了不打 mark (停服不黑洞 LAN)
     #   run: sudo bash examples/verify_tc_divert_orphan.sh
-    - name: MSS clamp — TCP SYN MSS 钳制
-      run: sudo bash examples/verify_mss_clamp.sh
     - name: cgroup/connect4 — 本机出向重定向 + origdst 还原
       run: sudo bash examples/verify_cgroup_connect.sh
     - name: sk_lookup UDP 透明 — origdst 报出 + 回包源伪造

@@ -1,5 +1,27 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 清理 mss_clamp 死代码 (2026-07-21)
+
+### chore(ebpf): 移除独立的 mss_clamp 死代码 (含其 CI 验证器)
+
+MSS clamp 功能早已内联进 `tc_divert.c`(`clamp_tcp_mss`, 对转发 SYN 生效), 独立的
+`ebpf-src/mss_clamp.c/.elf` 从未在生产被加载 —— 只有 `build.rs` 编译它。
+
+**顺带发现一个"假信心"隐患**: CI 的 `verify_mss_clamp` 加载并验证的是那个**独立死 elf**,
+而非生产实际运行的内联版。它证明的是一份**不会被使用**的副本能工作 —— 覆盖是虚的,
+且两份实现已分叉。故成套删除:
+
+- `ebpf-src/mss_clamp.c` / `mss_clamp.elf`
+- `examples/verify_mss_clamp.rs` / `.sh` + Cargo.toml 的 example 声明 + CI 步骤
+- `build.rs` 里编译它的两行
+
+保留 `tc_divert.rs` 那句 `mss_clamp mtu={}` 日志 —— 它描述的是**内联版**的 mtu 配置, 是真的。
+
+> 📌 代价: MSS clamp 从此**没有专门的 CI 验证器**。但被删的验证器本就在验非生产的副本,
+> 删它不损失真实覆盖。若要给内联版补 CI 覆盖, 需让验证器改加载 `tc_divert.elf` 并配齐
+> 其 config map —— 那是独立的一件事, 非本次清理范围。
+
+
 ## [v0.6.0-alpha.5] - 路由标量字段 + 伪装域名确认 + 易用性 (2026-07-21)
 
 ### fix(install): 伪装域名搜索的确认逻辑 —— 回车即采用推荐值
