@@ -34,6 +34,7 @@
 //!   - [ ] 阶段4: 真机 e2e 对着真实 WG peer 验证
 
 pub mod device;
+pub mod tunnel;
 
 use anyhow::{anyhow, bail, Result};
 use boringtun::x25519::{PublicKey, StaticSecret};
