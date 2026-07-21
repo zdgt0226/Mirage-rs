@@ -44,9 +44,18 @@ pub async fn update_rules(State(app_state): State<AppState>, headers: HeaderMap,
             if let Some(routing) = v.get_mut("routing").and_then(|r| r.as_object_mut()) {
                 routing.insert("rules".to_string(), req.rules);
                 if let Ok(new_content) = serde_json::to_string_pretty(&v) {
-                    if tokio::fs::write(&app_state.config_path, new_content).await.is_ok() {
+                    // 原子写: 先写 .tmp 再 rename 替换。裸 fs::write 原地覆写不安全 ——
+                    // 中途崩溃/OOM/并发保存会把 config.json 截成半截 JSON 或空文件, 下次
+                    // 重启核心引擎解析失败直接变砖, 得人工 SSH 救。fake_ip 落盘早已用此范式,
+                    // 唯独这里的全局配置写漏了。rename 同目录同 FS, 原子。
+                    let tmp = format!("{}.tmp", app_state.config_path);
+                    if tokio::fs::write(&tmp, &new_content).await.is_ok()
+                        && tokio::fs::rename(&tmp, &app_state.config_path).await.is_ok()
+                    {
                         return Json(json!({"status": "success"}));
                     }
+                    // 写或 rename 失败: 清掉可能残留的半截 .tmp, 原 config.json 未被触碰。
+                    let _ = tokio::fs::remove_file(&tmp).await;
                 }
             }
         }

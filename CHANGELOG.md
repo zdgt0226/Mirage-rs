@@ -1,5 +1,34 @@
 # Changelog - Mirage-rs
 
+## [未发布] - API 写配置改原子 (2026-07-21)
+
+### fix(api): 路由规则 API 保存改为原子写 (tmp + rename), 防截断变砖
+
+外部审计四条, 逐条核实 —— **仅这条是真核, 其余三条前提错或严重性夸大 (详见 known_issues 存档)**。
+
+`api/handlers/rules.rs` 通过 UI 保存路由规则时用**裸 `tokio::fs::write` 原地覆写**。
+中途崩溃 / OOM 杀进程 / 两个管理员同时保存, 都可能把 `config.json` 截成半截 JSON 或空文件
+→ 下次重启核心引擎解析失败**直接变砖, 得人工 SSH 救**。讽刺的是 `fake_ip.rs` 落盘早已用
+tmp + rename 原子范式, 唯独这个全局配置写漏了。改为先写 `.tmp` 再 `rename` 替换 (同目录同 FS,
+rename 原子); 失败则清掉半截 tmp、原文件不动。
+
+> 注: 原子写解决的是**损坏/变砖**(核心风险)。"两管理员并发保存丢更新"是另一回事
+> (last-writer-wins, 非损坏), 需版本号/锁, 本次不做。
+
+**另三条核实结论 (证伪, 归档不改)**:
+- **IPv6 泄漏 (tc_divert.c:121)**: v4-only 属实但"致命 leak"夸大 —— DNS 层对被代理域名的
+  AAAA/HTTPS(type65) 返空答复 (server.rs:495), 强制走 v4 fake-IP。真缺口仅"IPv6 字面量不经
+  DNS 直连"(罕见)。见 roadmap「IPv6 全栈」。
+- **close_notify 排空卡 500ms (handler.rs)**: 正常关闭 FIN 紧随 close_notify → 排空立即 EOF
+  退出, 非每次 500ms; 且"卡满 Tokio 协程耗尽线程池"是把 async pending future 当 OS 线程的
+  误解 —— await 中的 task 不占 worker, runtime 可挂百万 pending。排空是有意的优雅关闭 (发 FIN
+  非 RST, 隐蔽特征), 500ms 仅对拖延 FIN 的对端的兜底。
+- **TCP_INFO ABI 未定义行为 (brutal.rs:237)**: "栈上随机垃圾"错 —— `TcpInfoExt::default()`
+  零初始化, 老内核短读后扩展字段是 0 非垃圾; 且 monitor 靠 MIN_SEGS≥500 门控 (老内核 segs_out=0
+  跳过评估, 不除零), retrans 用的 total_retrans 是 2.6.27 老字段必填; pacing_rate/bytes_acked
+  结构体外**零使用**。无 UB、无 panic。
+
+
 ## [v0.6.0-alpha.6] - 死代码清理 + guard 析构顺序 (2026-07-21)
 
 ### fix(handler): active_fd guard 在 cancel 路径也保证"先移出 set、再关 fd"
