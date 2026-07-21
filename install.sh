@@ -264,18 +264,32 @@ EOM
     esac
 
     info "开始扫描 (期间请勿中断)..."
-    # 工具的表格输出走 stdout, 这里整体重定向到 stderr 让用户看见但不污染返回值
+    # 工具表格既要展示给用户 (stderr), 又要捕获一份以便提取"推荐域名" —— 用 tee 复制。
     # 扩大范围后耗时成倍增长, 超时也要跟着放宽, 否则总在快出结果时被砍掉。
     local scan_timeout=300
     [[ -n "$scan_args" ]] && scan_timeout=1200
-    timeout "$scan_timeout" python3 "$finder" "$ip" $scan_args >&2 || \
+    local scan_out
+    scan_out=$(timeout "$scan_timeout" python3 "$finder" "$ip" $scan_args | tee /dev/stderr) || \
         warn "搜索未正常结束 (超时或出错), 可参考上面已输出的部分结果"
     [[ -n "$tmp_finder" ]] && rm -f "$tmp_finder"
 
-    # 刻意不自动采用推荐值: 廉价机房同段邻居很可能本身也是代理/空壳站,
-    # 必须人工过目 (工具输出末尾的告警说明了判据), 选错会连累自己.
+    # 工具在有理想候选时会打印 "✅ 推荐 camouflage_host: <域名>"; 提取它作默认值。
+    # 前缀带 "推荐 " 以避开紧随其后的 'config 改法: "camouflage_host": "..."' 提示行。
+    local recommended
+    recommended=$(printf '%s\n' "$scan_out" \
+        | grep -oE '推荐 camouflage_host: [^[:space:]]+' | head -1 \
+        | sed 's/^推荐 camouflage_host: //')
+
+    # ⚠️ 廉价机房同段邻居很可能本身也是代理/空壳站, 选错会连累自己 —— 采用推荐前请先
+    #    人工过目上面的表格 (工具输出末尾的告警说明了判据)。
     local chosen
-    chosen=$(ask "从上面挑一个域名填入 (留空 = 放弃, 回落手动输入)" "")
+    if [[ -n "$recommended" ]]; then
+        # 有推荐值: **回车直接采用推荐域名**, 手动输入则用输入的 (ask 的默认值语义)。
+        chosen=$(ask "确认伪装域名 (回车采用推荐值, 或手动输入其它)" "$recommended")
+    else
+        # 无理想推荐: 只能手动填 (或留空放弃)。
+        chosen=$(ask "从上面挑一个域名填入 (留空 = 放弃, 回落手动输入)" "")
+    fi
     [[ -n "$chosen" ]] || return 1
     echo "$chosen"
 }
