@@ -23,11 +23,18 @@ pub(super) async fn handle_tcp_relay(
     initial_payload: Option<Vec<u8>>,
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
     mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
-    upstream_cfg: Option<Arc<crate::proxy::shadowsocks::SsConfig>>,
+    upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) {
-    // 配了 SS 上游 → 本服务端作中转站, 流量再经 SS 发往上游出口, 而非直连目标。
-    if let Some(ss) = upstream_cfg {
-        relay_via_shadowsocks(target, initial_payload, reader, writer, &ss).await;
+    // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
+    if let Some(outlet) = upstream_cfg {
+        match &*outlet {
+            crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
+                relay_via_shadowsocks(target, initial_payload, reader, writer, ss).await;
+            }
+            crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => {
+                relay_via_wireguard(target, initial_payload, reader, writer, wg).await;
+            }
+        }
         return;
     }
     debug!("Mirage Server: Connecting to TCP target {}", target);
@@ -201,6 +208,100 @@ async fn relay_via_shadowsocks(
         }
         let _ = writer.send_close_notify().await;
         shutdown_upstream(stop_down);
+    };
+
+    tokio::join!(upload, download);
+}
+
+/// 经 WireGuard 上游中转。
+///
+/// 与 SS 上游的结构差异: SS 那边有真 fd, 靠 `libc::shutdown` 让对侧循环立刻退出;
+/// `WgTcpStream` **不是真 fd**(连接活在用户态 smoltcp 里), 没有 fd 可 shutdown。
+/// 改用 `tokio::io::split` + 任一方结束就 drop 整个 stream —— `WgTcpStream::Drop`
+/// 会 close() 并把 socket 摘出 SocketSet, 效果等价(对端收到 FIN, 另一半的读立刻结束)。
+async fn relay_via_wireguard(
+    target: String,
+    initial_payload: Option<Vec<u8>>,
+    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
+    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    wg: &crate::proxy::upstream::WgUpstream,
+) {
+    debug!("Mirage Server: 经 WireGuard 上游 {} 转发到 {}", wg.cfg.endpoint, target);
+
+    let tunnel = match wg.tunnel().await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Mirage Server: 建立 WireGuard 上游隧道失败: {}", e);
+            return;
+        }
+    };
+
+    // 隧道内没有 DNS —— 域名在本服务端解析后, 只把 IP 送进隧道。
+    let (host, port) = match target.rsplit_once(':').and_then(|(h, p)| {
+        p.parse::<u16>().ok().map(|p| (h.trim_matches(['[', ']']), p))
+    }) {
+        Some(hp) => hp,
+        None => {
+            warn!("Mirage Server: 目标 `{}` 不是合法 host:port", target);
+            return;
+        }
+    };
+    let addr = match crate::proxy::resolver::resolve_first(host, port).await {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("Mirage Server: 解析 {} 失败: {}", target, e);
+            return;
+        }
+    };
+
+    let stream = match crate::proxy::wg::socket::WgTcpStream::connect(tunnel, addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("Mirage Server: 经 WG 隧道连接 {} 失败: {}", target, e);
+            return;
+        }
+    };
+    let (mut up_read, mut up_write) = tokio::io::split(stream);
+
+    if let Some(payload) = initial_payload {
+        if !payload.is_empty() && up_write.write_all(&payload).await.is_err() {
+            return;
+        }
+    }
+
+    let upload = async move {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
+                Ok(Ok(data)) => {
+                    if up_write.write_all(&data).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        // drop up_write -> 半关闭链路, 对端收到 FIN
+    };
+
+    let download = async move {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1800),
+                up_read.read(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break, // 上游 EOF
+                Ok(Ok(n)) => {
+                    if writer.send_data(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let _ = writer.send_close_notify().await;
     };
 
     tokio::join!(upload, download);
