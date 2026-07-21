@@ -211,12 +211,6 @@ pub async fn proxy_tcp_target(
             let (mut local_read, mut local_write) = local.into_split();
             let tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
-            // ★ guard 必须在持有 fd 的 reader/writer **之后**声明: drop 按声明逆序,
-            // 这样才能保证任何退出路径 (含 task 被 cancel/abort, 此时下面的显式 drop
-            // 根本不执行) 都是先把 fd 移出 active set、再关 fd。反过来则会露出一个
-            // "fd 已关但仍在 set 里"的窗口, fd 号被复用后 set 会误判活跃 —— 这正是
-            // active_fd_guard 本身要防的事。
-            let _guard = pool.active_fd_guard(active_fd);
 
             let upload = async {
                 let mut buf = [0u8; 16384];
@@ -295,8 +289,22 @@ pub async fn proxy_tcp_target(
                 (tunnel_reader, down_bytes)
             };
 
+            // ★ guard 必须在 upload/download **之后**声明。这两个 async 块把
+            // tunnel_reader/writer **move** 了进去, 所以 fd 的实际关闭时机绑定在它们身上,
+            // 而不是上面那两行 let 的作用域。drop 按声明逆序: guard 声明在最后 → 任何退出
+            // 路径 (含在下面 join! 处被 cancel, 此时之后的显式 drop 根本不执行) 都是 guard
+            // 先析构 (把 fd 移出 active set)、再 drop 两个 future 关 fd。反过来会露出一个
+            // "fd 已关但仍在 set 里"的窗口, fd 号被复用后 set 误判活跃。
+            //
+            // 注: 当前 relay 外无 select!/timeout/abort 包裹, cancel 只发生在进程退出
+            // (active_fds 与所有连接一并销毁, 无 fd 复用之虞), 故这是防御性正确而非现存 bug;
+            // 但仍以正确顺序声明, 免得日后加了超时/竞速把这个窗口变成真 bug。
+            // (早前把 guard 声明在 upload/download 之前, 正常路径靠下面的显式 drop 兜住顺序,
+            //  唯独 cancel 路径会先关 fd 再移出 set —— 现已修正。)
+            let _guard = pool.active_fd_guard(active_fd);
+
             let ((tw, up_bytes), (tr, down_bytes)) = tokio::join!(upload, download);
-            drop(_guard);   // ← 先从 set 移除，防止微秒级死 FD 暴露
+            drop(_guard);   // 正常路径: 先从 set 移除，防止微秒级死 FD 暴露 (cancel 路径靠声明顺序)
             drop(tw);
             drop(tr);
             debug!(

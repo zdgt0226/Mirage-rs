@@ -1,5 +1,29 @@
 # Changelog - Mirage-rs
 
+## [未发布] - handler active_fd guard 析构顺序 (2026-07-21)
+
+### fix(handler): active_fd guard 在 cancel 路径也保证"先移出 set、再关 fd"
+
+外部审计指出 `handler.rs` 里 `_guard` (active_fds 成员管理) 的析构顺序在 task 被 cancel
+时不对。**核实: 观察属实, 注释本身写错了, 但严重性被大幅夸大。**
+
+- **真核**: `tunnel_reader/writer` 被 **move 进** upload/download 两个 async 块, 而它们声明在
+  `_guard` **之后**。原注释以为 fd 的关闭时机绑定在 `let tunnel_*` 那两行、故 guard 会先析构 ——
+  实则绑定在 upload/download 上, cancel 时按声明逆序是 `download→upload`(关 fd)`→_guard`(移出 set),
+  即先关 fd 后移出, 与注释承诺相反。**已把 `_guard` 声明挪到 upload/download 之后**, 逆序析构
+  变为 guard 最先 → 移出 set 再关 fd, cancel 路径也正确。
+
+- **严重性证伪**: 审计称"串位篡改 / 逻辑死锁"严重夸大。① relay 外**无 select!/timeout/abort**,
+  cancel 只发生在**进程退出**, 此时 active_fds 与所有连接一并销毁, **不存在 fd 被复用给合法新连接**;
+  ② active_fds 只驱动 Brutal CC 调速 + 指标汇总, 最坏后果是某连接 CC 速率误设/统计读到脏 socket
+  一个周期 —— **不碰数据(无"串位")、setsockopt 坏 fd 返 EBADF 直接忽略(无死锁)**;
+  ③ 消费侧竞态项目早已加固 (F2: update_brutal_rate 持 active_fds 锁期间 setsockopt, 阻塞 guard
+  的 remove、fd 保活)。
+
+故这是**防御性正确 + 修正误导性注释**, 而非现存 bug。之所以仍修: 注释承诺了一个 cancel 路径
+不成立的保证, 且日后若给 relay 加超时/竞速, 这个窗口会变成真 (虽仍轻微) 的 bug。140 测试全过。
+
+
 ## [未发布] - 清理 mss_clamp 死代码 (2026-07-21)
 
 ### chore(ebpf): 移除独立的 mss_clamp 死代码 (含其 CI 验证器)
