@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [未发布] - handler active_fd guard 析构顺序 (2026-07-21)
+## [v0.6.0-alpha.6] - 死代码清理 + guard 析构顺序 (2026-07-21)
 
 ### fix(handler): active_fd guard 在 cancel 路径也保证"先移出 set、再关 fd"
 
@@ -23,8 +23,6 @@
 故这是**防御性正确 + 修正误导性注释**, 而非现存 bug。之所以仍修: 注释承诺了一个 cancel 路径
 不成立的保证, 且日后若给 relay 加超时/竞速, 这个窗口会变成真 (虽仍轻微) 的 bug。140 测试全过。
 
-
-## [未发布] - 清理 mss_clamp 死代码 (2026-07-21)
 
 ### chore(ebpf): 移除独立的 mss_clamp 死代码 (含其 CI 验证器)
 
