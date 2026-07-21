@@ -223,6 +223,30 @@ pub enum OutboundConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_base_rtt_ms: Option<u64>,
     },
+    /// WireGuard 出站: 选中的流量经 WG 隧道发往 peer, 不走 Mirage 隧道。
+    ///
+    /// 密钥都是标准 WireGuard 的 **base64 32 字节 x25519 密钥** (与 `wg genkey`/`wg pubkey`
+    /// 一致), 不是任意密码 —— 填错长度会在启动时被拦下, 而不是留到每条连接静默失败。
+    Wireguard {
+        tag: String,
+        /// 本端私钥 (base64)。
+        private_key: String,
+        /// 对端公钥 (base64)。
+        peer_public_key: String,
+        /// 可选预共享密钥 (base64)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preshared_key: Option<String>,
+        /// peer 的 UDP endpoint, `host:port`。
+        endpoint: String,
+        /// 本端在隧道内的地址, 如 `10.0.0.2`。
+        address: String,
+        /// 隧道 MTU, 默认 1420。
+        #[serde(default = "default_wg_mtu")]
+        mtu: usize,
+        /// persistent-keepalive 秒数, 穿 NAT 用; 0 = 关。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persistent_keepalive: Option<u16>,
+    },
     Direct {
         tag: String,
     },
@@ -451,6 +475,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_wg_mtu() -> usize {
+    1420
+}
+
 fn default_pool_size() -> usize {
     16
 }
@@ -495,6 +523,7 @@ impl Config {
         for ob in &self.outbounds {
             let tag = match ob {
                 OutboundConfig::Mirage { tag, .. }
+                | OutboundConfig::Wireguard { tag, .. }
                 | OutboundConfig::Direct { tag }
                 | OutboundConfig::Block { tag }
                 | OutboundConfig::Urltest { tag, .. }
@@ -505,6 +534,48 @@ impl Config {
                 issues.push(format!("outbound tag `{tag}` 重复定义 (后者覆盖前者, 行为不确定)"));
             }
             tags.push(tag);
+        }
+
+        // WireGuard 出站: 密钥/地址/endpoint 在这里就验死。
+        //
+        // 这些错配的共同特征是**不会让进程起不来, 而是让每条连接静默失败** —— 服务看着健康,
+        // 却什么都代理不了, 错误信息也指不到根因。所以必须在 check/启动阶段变成明确报错。
+        for ob in &self.outbounds {
+            if let OutboundConfig::Wireguard {
+                tag, private_key, peer_public_key, preshared_key, endpoint, address, mtu, ..
+            } = ob
+            {
+                for (val, what) in [
+                    (private_key, "private_key"),
+                    (peer_public_key, "peer_public_key"),
+                ] {
+                    if let Err(e) = crate::proxy::wg::decode_wg_key(val, what) {
+                        issues.push(format!("outbound `{tag}`: {e}"));
+                    }
+                }
+                if let Some(psk) = preshared_key {
+                    if let Err(e) = crate::proxy::wg::decode_wg_key(psk, "preshared_key") {
+                        issues.push(format!("outbound `{tag}`: {e}"));
+                    }
+                }
+                if address.parse::<std::net::IpAddr>().is_err() {
+                    issues.push(format!(
+                        "outbound `{tag}`: address `{address}` 不是合法 IP \
+                         (应是隧道内本端地址, 如 10.0.0.2, 不带掩码)"
+                    ));
+                }
+                // endpoint 必须带端口 —— 少写端口是最常见的手抄错误
+                if !endpoint.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok()) {
+                    issues.push(format!(
+                        "outbound `{tag}`: endpoint `{endpoint}` 缺少端口 (应形如 host:51820)"
+                    ));
+                }
+                if *mtu == 0 || *mtu > 65503 {
+                    issues.push(format!(
+                        "outbound `{tag}`: mtu {mtu} 非法 (须 1..=65503, 常用 1420)"
+                    ));
+                }
+            }
         }
         let known = |t: &str| tags.contains(&t);
 

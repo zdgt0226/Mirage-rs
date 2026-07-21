@@ -391,6 +391,71 @@ pub async fn proxy_tcp_target(
                 }
             }
         }
+        OutboundNode::Wireguard { .. } => {
+            let t_start = std::time::Instant::now();
+
+            // 隧道懒建立 (首条路由到此出站的连接才真正握手)。
+            let tunnel = match leaf.wg_tunnel().await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("[WG] {} 建立隧道失败: {}", target, e);
+                    return;
+                }
+            };
+
+            // WG 隧道内没有 DNS —— smoltcp 只认 IP。域名先在本机解析, 再把 IP 送进隧道。
+            //
+            // ⚠️ 这意味着 **DNS 查询不经 WG 出去**, 目标 IP 由本机视角解析得出。对
+            // 「只想让某些流量换出口」的用途没问题; 但若指望 WG 出站同时隐藏 DNS 或拿到
+            // 对端地区的 CDN 解析结果, 当前实现做不到。隧道内 DNS 属未完成项。
+            // target 形如 "host:port"; 从右侧切, 兼容 IPv6 字面量里的冒号。
+            let (host, port) = match target.rsplit_once(':').and_then(|(h, p)| {
+                p.parse::<u16>().ok().map(|p| (h.trim_matches(['[', ']']), p))
+            }) {
+                Some(hp) => hp,
+                None => {
+                    error!("[WG] 目标 `{}` 不是合法的 host:port", target);
+                    return;
+                }
+            };
+            let addr = match crate::proxy::resolver::resolve_first(host, port).await {
+                Ok(a) => a,
+                Err(e) => {
+                    error!("[WG] {} 解析目标失败: {}", target, e);
+                    return;
+                }
+            };
+
+            let mut remote = match crate::proxy::wg::socket::WgTcpStream::connect(tunnel, addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("[WG] {} 经隧道连接失败: {}", target, e);
+                    return;
+                }
+            };
+            debug!("[WG] {} 已连通 ({}ms)", target, t_start.elapsed().as_millis());
+
+            // 首包 (SOCKS5 早期数据 / HTTP 请求头) 必须先送出去, 否则对端干等。
+            if !initial_payload.is_empty() {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = remote.write_all(&initial_payload).await {
+                    error!("[WG] {} 首包写入失败: {}", target, e);
+                    return;
+                }
+            }
+
+            // Direct 走 splice(2) 零拷贝, 但 WgTcpStream **不是真 fd** (数据在用户态 smoltcp
+            // 里), 无法 splice —— 只能用通用异步拷贝。
+            let mut local = local;
+            match tokio::io::copy_bidirectional(&mut local, &mut remote).await {
+                Ok((up, down)) => debug!(
+                    "[WG] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                    target, human_bytes(up), human_bytes(down),
+                    t_start.elapsed().as_secs_f64()
+                ),
+                Err(e) => debug!("[WG] {} 出错: {}", target, e),
+            }
+        }
         OutboundNode::Block { .. } => {
             debug!("Connection to {} blocked by routing rule", target);
             // Drop connection
