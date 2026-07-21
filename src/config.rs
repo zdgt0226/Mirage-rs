@@ -88,6 +88,24 @@ pub enum UpstreamConfig {
         #[serde(default)]
         udp: UdpPolicy,
     },
+    /// 上游走 WireGuard: 本服务端把流量再经 WG 隧道发往 peer。
+    ///
+    /// 与 SS 上游同样**目前仅作用于 TCP** —— 服务端的 UDP 中继尚未接到 WG 隧道上,
+    /// 故 `udp` 同样默认 `block` (放行会让 UDP 从本机 IP 直连出去, 与 TCP 出口 IP 不一致)。
+    Wireguard {
+        private_key: String,
+        peer_public_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preshared_key: Option<String>,
+        endpoint: String,
+        address: String,
+        #[serde(default = "default_wg_mtu")]
+        mtu: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persistent_keepalive: Option<u16>,
+        #[serde(default)]
+        udp: UdpPolicy,
+    },
 }
 
 /// 配置了上游出口时, 服务端对 UDP 的处理策略。
@@ -656,6 +674,37 @@ impl Config {
                 }
                 // 上游出口配错会让服务端**拒绝启动**, 必须在 check 阶段就拦住 ——
                 // 否则 `check && systemctl restart` 这个闸门对这条路径形同虚设。
+                if let Some(UpstreamConfig::Wireguard {
+                    private_key, peer_public_key, preshared_key, endpoint, address, mtu, ..
+                }) = upstream
+                {
+                    for (val, what) in [
+                        (private_key, "private_key"),
+                        (peer_public_key, "peer_public_key"),
+                    ] {
+                        if let Err(e) = crate::proxy::wg::decode_wg_key(val, what) {
+                            issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                        }
+                    }
+                    if let Some(psk) = preshared_key {
+                        if let Err(e) = crate::proxy::wg::decode_wg_key(psk, "preshared_key") {
+                            issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                        }
+                    }
+                    if address.parse::<std::net::IpAddr>().is_err() {
+                        issues.push(format!(
+                            "mirage_server 入站 `{tag}` 的 upstream.address `{address}` 不是合法 IP (不带掩码)"
+                        ));
+                    }
+                    if !endpoint.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok()) {
+                        issues.push(format!(
+                            "mirage_server 入站 `{tag}` 的 upstream.endpoint `{endpoint}` 缺少端口"
+                        ));
+                    }
+                    if *mtu == 0 || *mtu > 65503 {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.mtu {mtu} 非法"));
+                    }
+                }
                 if let Some(UpstreamConfig::Shadowsocks {
                     server, server_port, password: ss_pw, method, ..
                 }) = upstream
@@ -997,5 +1046,71 @@ mod validation_tests {
         let is = issues_of(&v);
         assert!(has(&is, "inbound tag `in` 重复定义"), "实际: {is:?}");
         assert!(has(&is, "port 为 0"), "实际: {is:?}");
+    }
+}
+
+#[cfg(test)]
+mod wg_upstream_tests {
+    use super::*;
+
+    const PRIV: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const PUB: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+
+    fn cfg_with_upstream(up: &str) -> Config {
+        let s = format!(r#"{{
+          "inbounds": [{{ "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0",
+                          "port": 443, "password": "pw", "upstream": {up} }}],
+          "outbounds": [{{ "type": "direct", "tag": "direct" }}],
+          "routing": {{ "default_outbound": "direct", "rules": [] }}
+        }}"#);
+        serde_json::from_str(&s).expect("配置应能解析")
+    }
+
+    /// 配了 WireGuard 上游必须真的建出 WG 出口。
+    ///
+    /// 这是回归测试: 加 WG 变体时 `build_ss_upstream` 原先的
+    /// `let Some(Shadowsocks{..}) = cfg else { return Ok(None) }` 会让 WG 上游**静默
+    /// 变成"没配上游"= 直连** —— 用户以为流量从落地机出去, 实际从本服务端 IP 裸奔出去,
+    /// 且毫无提示。必须锁死。
+    #[test]
+    fn wireguard_upstream_is_not_silently_ignored() {
+        let cfg = cfg_with_upstream(&format!(
+            r#"{{ "type": "wireguard", "private_key": "{PRIV}", "peer_public_key": "{PUB}",
+                  "endpoint": "1.2.3.4:51820", "address": "10.0.0.2" }}"#
+        ));
+        assert!(cfg.semantic_issues().is_empty(), "合法配置不该报错: {:?}", cfg.semantic_issues());
+
+        let InboundConfig::MirageServer { upstream, .. } = &cfg.inbounds[0] else {
+            panic!("应是 mirage_server 入站")
+        };
+        let outlet = crate::build_upstream(upstream.as_ref())
+            .expect("构建上游应成功")
+            .expect("配了 WG 上游却得到 None —— 会静默走直连, 流量从本机 IP 裸奔出去");
+        assert!(
+            matches!(&*outlet, crate::proxy::upstream::UpstreamOutlet::Wireguard(_)),
+            "应是 WireGuard 出口"
+        );
+        // UDP 默认必须 block (服务端 UDP 中继尚未接到 WG 隧道, 放行会出口 IP 不一致)
+        assert!(outlet.block_udp(), "WG 上游的 UDP 默认应为 block");
+    }
+
+    /// 上游 WG 配错必须在 check 阶段就拦下 (而非留到每条连接静默失败)。
+    #[test]
+    fn wireguard_upstream_bad_config_is_caught() {
+        let cases = [
+            (format!(r#"{{ "type": "wireguard", "private_key": "AAAA", "peer_public_key": "{PUB}",
+                "endpoint": "1.2.3.4:51820", "address": "10.0.0.2" }}"#), "private_key"),
+            (format!(r#"{{ "type": "wireguard", "private_key": "{PRIV}", "peer_public_key": "{PUB}",
+                "endpoint": "1.2.3.4", "address": "10.0.0.2" }}"#), "endpoint"),
+            (format!(r#"{{ "type": "wireguard", "private_key": "{PRIV}", "peer_public_key": "{PUB}",
+                "endpoint": "1.2.3.4:51820", "address": "not-an-ip" }}"#), "address"),
+        ];
+        for (up, want) in cases {
+            let issues = cfg_with_upstream(&up).semantic_issues();
+            assert!(
+                issues.iter().any(|i| i.contains(want)),
+                "含 {want} 错误却没被拦下: {issues:?}"
+            );
+        }
     }
 }

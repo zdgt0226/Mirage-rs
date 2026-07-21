@@ -14,7 +14,7 @@ pub(super) async fn dispatch_authenticated(
     stream: TcpStream,
     password: String,
     client_random: [u8; 32],
-    upstream: Option<std::sync::Arc<crate::proxy::shadowsocks::SsConfig>>,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) {
     // 3. Setup Crypto Stream
     let (read_half, write_half) = stream.into_split();
@@ -86,7 +86,7 @@ pub(super) async fn dispatch_authenticated(
         // 本机 IP 直连出去, 而 TCP 从上游出去 —— 出口 IP 不一致。对落地解锁场景这是功能性
         // 错误 (QUIC 会"成功"但用错 IP, 不像被封那样回落 TCP)。这里直接断开, 让客户端立刻
         // 知道 UDP 不可用, 而不是静默走错出口。
-        if upstream.as_ref().is_some_and(|u| u.block_udp) {
+        if upstream.as_ref().is_some_and(|u| u.block_udp()) {
             tracing::warn!(
                 "拒绝 UDP 中继: 已配置 SS 上游出口且 udp=block (默认)。\
                  SS 的 UDP 未实现, 放行会让 UDP 从本机 IP 出去而与 TCP 出口不一致。\

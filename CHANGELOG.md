@@ -91,8 +91,27 @@ README 的 "≥5.10" 声明, 本地是 6.1; build.yml 里就记着实例(orphan 
   建流/回包严格照 Direct 腿的 refs 与 guard 配平顺序写, 未自创流程。
 - 目标地址在**建流时**解析好 —— 隧道内没有 DNS(同 TCP 侧的已知限制)。
 
+### 阶段3c-3: 服务端 `upstream` 支持 WireGuard (Mirage 作中转站)
+新增 `UpstreamConfig::Wireguard`, 并把上游从"只能是 SS"泛化为 `UpstreamOutlet` 枚举。
+
+> **为什么必须做成枚举而不是加个可选字段**: 原 `build_ss_upstream` 写的是
+> `let Some(Shadowsocks{..}) = cfg else { return Ok(None) }` —— 加了 WG 变体后, 配了 WG
+> 上游会**静默变成"没配上游"= 直连**: 用户以为流量从落地机出去, 实际从本服务端 IP 裸奔
+> 出去且毫无提示。这类"悄悄发到别处"的失败必须在类型层面消灭。已加回归测试 +
+> 变异验证 (把 WG 分支改回 `Ok(None)` 后测试立刻红)。
+
+- 隧道懒初始化: 服务端启动不建, 第一条要中转的连接才建。
+- `relay_via_wireguard`: 与 SS 腿的结构差异在于 `WgTcpStream` **不是真 fd**, 没有 fd 可
+  `libc::shutdown`; 改用 `tokio::io::split` + drop 触发 `close()`, 效果等价。
+- UDP 同样默认 `block`: 服务端 UDP 中继尚未接到 WG 隧道, 放行会让 UDP 从本机 IP 出去而
+  TCP 从上游出去 —— 出口 IP 不一致, 对落地解锁是功能性错误。
+- `check` 校验覆盖上游 WG 的密钥/address/endpoint/mtu。
+
 ### 待完成
-- 阶段3c-3: 接入 `mirage_server.upstream` (服务端中转经 WG 出去)。
+- 阶段4: **对着真实 WG peer 的 e2e 互通验证** —— 当前所有测试只覆盖到握手包格式、pump
+  机制、socket 生命周期与配置契约, **没有任何一条证明能和真实 WireGuard 服务器互通**。
+- 服务端 UDP 中继接到 WG 隧道 (届时可把上游 udp 默认改为放行)。
+- 隧道内 DNS (当前域名在本机解析, DNS 不经 WG)。
 - 阶段4: 对着真实 WG peer 的 e2e 验证 (当前测试只覆盖到"握手包格式正确", **未证明与真实
   WG 服务器互通**)。
 

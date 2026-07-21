@@ -58,7 +58,7 @@ pub async fn start_server(
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     brutal_rate_bytes_per_sec: Option<u64>,
     auth_ts_tolerance_secs: u64,
-    upstream: Option<std::sync::Arc<crate::proxy::shadowsocks::SsConfig>>,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,

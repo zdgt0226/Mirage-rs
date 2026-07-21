@@ -49,7 +49,7 @@ pub(super) async fn handle_connection(
     camouflage_host: String,
     cam_pool: Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
-    upstream: Option<std::sync::Arc<crate::proxy::shadowsocks::SsConfig>>,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) {
     stream.set_nodelay(true).unwrap_or_default();
 

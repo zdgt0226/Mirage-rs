@@ -219,7 +219,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
         warn!("⚠️  password 为空 —— 任何人都能连上你的服务端, 请设置一个强密码。");
     }
     let brutal_bps = cfg.brutal_rate_mbps.filter(|m| *m > 0).map(|m| m * 125_000);
-    let ss_upstream = crate::build_ss_upstream(cfg.upstream.as_ref())?;
+    let ss_upstream = crate::build_upstream(cfg.upstream.as_ref())?;
 
     crate::proxy::mirage_server::start_server(
         &addr,

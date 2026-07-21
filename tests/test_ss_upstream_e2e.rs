@@ -234,14 +234,18 @@ async fn udp_policy_parses_both_values() {
     let d: mirage_rs::config::UpstreamConfig = serde_json::from_str(
         r#"{"type":"shadowsocks","server":"h","server_port":1,"password":"p","method":"aes-256-gcm"}"#
     ).unwrap();
-    let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &d;
+    let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &d else {
+        panic!("应解析为 shadowsocks 上游")
+    };
     assert_eq!(*udp, mirage_rs::config::UdpPolicy::Block, "不写 udp 字段必须默认 block");
 
     // 显式 direct
     let e: mirage_rs::config::UpstreamConfig = serde_json::from_str(
         r#"{"type":"shadowsocks","server":"h","server_port":1,"password":"p","method":"aes-256-gcm","udp":"direct"}"#
     ).unwrap();
-    let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &e;
+    let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &e else {
+        panic!("应解析为 shadowsocks 上游")
+    };
     assert_eq!(*udp, mirage_rs::config::UdpPolicy::Direct);
 
     // 拼错的值必须报错而不是静默回落成某个默认

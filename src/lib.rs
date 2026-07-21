@@ -35,50 +35,86 @@ fn warn_if_open_proxy(kind: &str, listen: &str, port: u16, has_auth: bool) {
     );
 }
 
-/// 把配置里的上游出口翻译成 SS 客户端配置。配了就说明本服务端要当**中转站**。
+/// 把配置里的上游出口翻译成运行期的 [`UpstreamOutlet`]。配了就说明本服务端当**中转站**。
 ///
-/// 加密方式不认识时返回 Err 而非静默降级为直连 —— 用户配了中转却悄悄走直连,
-/// 意味着出口 IP 与预期完全不同, 属于必须让人立刻知道的错配。
-pub(crate) fn build_ss_upstream(
+/// 任何错配都返回 Err 而非静默降级为直连 —— 用户配了中转却悄悄走直连, 意味着出口 IP
+/// 与预期完全不同(流量从本服务端 IP 裸奔出去), 属于必须让人立刻知道的错配。
+pub(crate) fn build_upstream(
     cfg: Option<&crate::config::UpstreamConfig>,
-) -> Result<Option<Arc<crate::proxy::shadowsocks::SsConfig>>> {
-    let Some(crate::config::UpstreamConfig::Shadowsocks {
-        server, server_port, password, method, udp,
-    }) = cfg
-    else {
-        return Ok(None);
+) -> Result<Option<Arc<crate::proxy::upstream::UpstreamOutlet>>> {
+    use crate::config::UpstreamConfig;
+    use crate::proxy::upstream::{UpstreamOutlet, WgUpstream};
+
+    let Some(cfg) = cfg else { return Ok(None) };
+
+    // UDP 策略的告警两种上游共用: 原因完全相同 —— UDP 未接到上游通道, 放行就会出口 IP 不一致。
+    let warn_udp = |block_udp: bool, why: &str| {
+        if block_udp {
+            info!(
+                "UDP 策略: block (默认) —— {why}, 放行会让 UDP 从本机直连出去 \
+                 (出口 IP 与 TCP 不同, 落地解锁场景会判错区域)。故直接拒绝 UDP 中继: \
+                 QUIC 将回落 TCP, 游戏/WebRTC 不可用。要保留旧行为请显式设 \"udp\": \"direct\"。"
+            );
+        } else {
+            warn!(
+                "⚠️  UDP 策略: direct —— UDP 将从**本机 IP** 直连出去, 与 TCP 的上游出口**不同**。\
+                 流媒体走 QUIC 时会被判成本机所在区域 (且不会回落 TCP, 故表现为解锁时灵时不灵)。\
+                 除非你确认不介意, 否则建议改回默认的 \"udp\": \"block\"。"
+            );
+        }
     };
-    let m = crate::proxy::shadowsocks::Method::parse(method)?;
-    // SIP022: 密钥格式/长度错不会让服务起不来, 而是每条连接都静默失败 (服务看着健康却
-    // 代理不了任何东西)。在这里提前解一次, 让它变成"拒绝启动 + 明确报错"。
-    if m.is_2022() {
-        crate::proxy::shadowsocks::decode_ss2022_psk(password, m.key_len())?;
+
+    match cfg {
+        UpstreamConfig::Shadowsocks { server, server_port, password, method, udp } => {
+            let m = crate::proxy::shadowsocks::Method::parse(method)?;
+            // SIP022: 密钥格式/长度错不会让服务起不来, 而是每条连接都静默失败 (服务看着健康却
+            // 代理不了任何东西)。在这里提前解一次, 让它变成"拒绝启动 + 明确报错"。
+            if m.is_2022() {
+                crate::proxy::shadowsocks::decode_ss2022_psk(password, m.key_len())?;
+            }
+            info!(
+                "上游出口: Shadowsocks {}:{} ({}) —— 本服务端作为中转站, TCP 流量将再经 SS 转发",
+                server, server_port, method
+            );
+            let block_udp = matches!(udp, crate::config::UdpPolicy::Block);
+            warn_udp(block_udp, "SS 的 UDP 尚未实现");
+            Ok(Some(Arc::new(UpstreamOutlet::Shadowsocks(Arc::new(
+                crate::proxy::shadowsocks::SsConfig {
+                    server: server.clone(),
+                    port: *server_port,
+                    password: password.clone(),
+                    method: m,
+                    block_udp,
+                },
+            )))))
+        }
+        UpstreamConfig::Wireguard {
+            private_key, peer_public_key, preshared_key, endpoint, address, mtu,
+            persistent_keepalive, udp,
+        } => {
+            let wg = crate::proxy::wg::WgConfig {
+                private_key: crate::proxy::wg::decode_wg_key(private_key, "private_key")?,
+                peer_public_key: crate::proxy::wg::decode_wg_key(peer_public_key, "peer_public_key")?,
+                preshared_key: preshared_key
+                    .as_deref()
+                    .map(|k| crate::proxy::wg::decode_wg_key(k, "preshared_key"))
+                    .transpose()?,
+                endpoint: endpoint.clone(),
+                address: address.parse().map_err(|_| {
+                    anyhow::anyhow!("上游 WireGuard: address `{address}` 不是合法 IP (不带掩码, 如 10.0.0.2)")
+                })?,
+                mtu: *mtu,
+                persistent_keepalive: *persistent_keepalive,
+            };
+            info!(
+                "上游出口: WireGuard {} (隧道内地址 {}) —— 本服务端作为中转站, TCP 流量将再经 WG 转发",
+                wg.endpoint, wg.address
+            );
+            let block_udp = matches!(udp, crate::config::UdpPolicy::Block);
+            warn_udp(block_udp, "服务端的 UDP 中继尚未接到 WG 隧道");
+            Ok(Some(Arc::new(UpstreamOutlet::Wireguard(WgUpstream::new(wg, block_udp)))))
+        }
     }
-    info!(
-        "上游出口: Shadowsocks {}:{} ({}) —— 本服务端作为中转站, TCP 流量将再经 SS 转发",
-        server, server_port, method
-    );
-    let block_udp = matches!(udp, crate::config::UdpPolicy::Block);
-    if block_udp {
-        info!(
-            "UDP 策略: block (默认) —— SS 的 UDP 尚未实现, 放行会让 UDP 从本机直连出去 \
-             (出口 IP 与 TCP 不同, 落地解锁场景会判错区域)。故直接拒绝 UDP 中继: \
-             QUIC 将回落 TCP, 游戏/WebRTC 不可用。要保留旧行为请显式设 \"udp\": \"direct\"。"
-        );
-    } else {
-        warn!(
-            "⚠️  UDP 策略: direct —— UDP 将从**本机 IP** 直连出去, 与 TCP 的上游出口**不同**。\
-             流媒体走 QUIC 时会被判成本机所在区域 (且不会回落 TCP, 故表现为解锁时灵时不灵)。\
-             除非你确认不介意, 否则建议改回默认的 \"udp\": \"block\"。"
-        );
-    }
-    Ok(Some(Arc::new(crate::proxy::shadowsocks::SsConfig {
-        server: server.clone(),
-        port: *server_port,
-        password: password.clone(),
-        method: m,
-        block_udp,
-    })))
 }
 
 pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
@@ -615,7 +651,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 let brutal_bps = brutal_rate_mbps
                     .filter(|m| *m > 0)
                     .map(|m| m * 125_000);
-                let ss_upstream = match build_ss_upstream(upstream.as_ref()) {
+                let ss_upstream = match build_upstream(upstream.as_ref()) {
                     Ok(v) => v,
                     Err(e) => { error!("上游出口配置无效, 服务端未启动: {e}"); continue; }
                 };

@@ -14,5 +14,6 @@ pub mod sniff;
 pub mod splice;
 pub mod resolver;
 pub mod shadowsocks;
+pub mod upstream;
 pub mod wg;
 pub mod transparent_net;
