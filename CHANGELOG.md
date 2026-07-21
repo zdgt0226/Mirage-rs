@@ -1,5 +1,47 @@
 # Changelog - Mirage-rs
 
+## [分支 feat/wireguard] - WireGuard 支持 (开发中, 未合并 main)
+
+WireGuard 与 Shadowsocks 不是一个层级: SS 是 L4 TCP 流可直接套字节流; WG 是 **L3 IP 包**协议
+(Noise IK 握手 + 密钥轮换), 隧道里跑 IP 包。把被代理的 TCP/UDP 送进 WG 绕不开**用户态 TCP/IP 栈**。
+选型: boringtun 0.7 (Cloudflare 用户态 WG) + smoltcp 0.13 (用户态 IP 栈), 不手搓 Noise。
+
+### 阶段1: 配置 + 密钥 + Tunn 地基
+- `WgConfig` 字段对齐 wg-quick / sing-box, 便于搬配置。
+- `decode_wg_key`: 强制 base64 32 字节, 长度不符直接报错 (同 SIP022 PSK 考量, 防"连上但握手永远失败")。
+- 验证: Tunn 能产出合法 WG 握手包 (type=1, 148 字节)。
+
+### 阶段2a: `WgDevice` (smoltcp phy::Device 桥接)
+- smoltcp 的 Device 是同步接口, UDP 收发与 Tunn 定时器是异步的 —— 用两个 IP 包队列解耦。
+- `Medium::Ip` (裸 IP 包, 无以太网头/ARP)。
+- 队列封顶 256 包、满则丢最老: 隧道拥塞时无限堆积会 OOM; IP 层本就尽力而为, TCP 重传兜底。
+
+### 阶段2b: 异步 pump (UDP ↔ Tunn ↔ smoltcp + 定时器)
+- `connect` 不等握手 —— 握手由首个数据或定时器触发。
+- 三个"做错就静默不通"的点已处理: `decapsulate` 返 `WriteToNetwork` 必须发回网络**且用空
+  datagram 反复调直到 Done** (一次报文可能解出多个待发包); `update_timers` 必须周期驱动
+  (否则握手不重试、密钥不轮换); `poll` 要在 rx 入队后、tx 出队前调。
+
+### 自审计修复 (4 个真问题)
+- **pump 任务泄漏**: pump 持 `inner` 的 Arc 克隆, 引用计数永远归不了零。`WgTunnel` 加 `Drop`
+  显式 `abort()` —— 否则每条废弃隧道留一个每 250ms 空转的任务。
+- **无唤醒机制致 +250ms 延迟**: 应用写数据后 pump 要干等下个 tick 才发包。加 `Notify`,
+  `poll_now()` 写完即叫醒 pump。
+- **MTU 超限 panic**: boringtun `format_packet_data` 是 `panic!("The destination buffer is
+  too small")` 而非返回错误, 且 pump 在 spawn 任务里 —— panic 只让隧道静默死掉。改为建隧道时
+  就校验 MTU 并给出可指向根因的错误。
+- **UDP recv 截断**: 收包缓冲 2048 改 65535。对端用大 MTU 时截断包认证必失败, 表现为
+  "隧道通但偶发丢包", 极难查。
+
+> 测试纪律: `dropping_tunnel_stops_pump` 初版是**假测试** —— 判据用"drop 后收不收得到包",
+> 但 boringtun 发完首个 init 后 REKEY_TIMEOUT(5s) 内一律返回 Done, 短窗口里死活都收不到包,
+> 测试恒过。已改为断言 `Arc::strong_count`, 并经变异验证 (去掉 `abort()` 后必 FAILED)。
+
+### 待完成
+- 阶段3: `connect_tcp` / UDP 经隧道; 接入 `OutboundConfig::Wireguard` + `mirage_server.upstream`。
+- 阶段4: 对着真实 WG peer 的 e2e 验证 (当前测试只覆盖到"握手包格式正确", **未证明与真实
+  WG 服务器互通**)。
+
 ## [未发布] - API 写配置改原子 (2026-07-21)
 
 ### fix(api): 路由规则 API 保存改为原子写 (tmp + rename), 防截断变砖
