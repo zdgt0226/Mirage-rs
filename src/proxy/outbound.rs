@@ -17,6 +17,13 @@ pub enum OutboundNode {
         total_retrans: Arc<std::sync::atomic::AtomicU64>,
         total_segs_out: Arc<std::sync::atomic::AtomicU64>,
     },
+    /// WireGuard 出站。隧道**懒初始化**: 没流量路由过来就不建, 免得白起一个
+    /// pump 任务反复发握手。
+    Wireguard {
+        tag: String,
+        cfg: Arc<crate::proxy::wg::WgConfig>,
+        tunnel: tokio::sync::OnceCell<Arc<crate::proxy::wg::tunnel::WgTunnel>>,
+    },
     Direct {
         tag: String,
     },
@@ -45,6 +52,7 @@ impl OutboundNode {
     pub fn tag(&self) -> &str {
         match self {
             Self::Mirage { tag, .. } => tag,
+            Self::Wireguard { tag, .. } => tag,
             Self::Direct { tag } => tag,
             Self::Block { tag } => tag,
             Self::Urltest { tag, .. } => tag,
@@ -53,10 +61,26 @@ impl OutboundNode {
         }
     }
 
+    /// 取(或首次建立)本出站的 WireGuard 隧道。
+    ///
+    /// 懒初始化: 第一条路由到此出站的连接才真正建隧道。失败**不缓存** ——
+    /// 网络暂时不可达时下一条连接应能重试, 而不是把一次失败钉死到进程结束。
+    pub async fn wg_tunnel(&self) -> anyhow::Result<Arc<crate::proxy::wg::tunnel::WgTunnel>> {
+        let Self::Wireguard { cfg, tunnel, .. } = self else {
+            anyhow::bail!("内部错误: 对非 WireGuard 出站请求隧道");
+        };
+        tunnel
+            .get_or_try_init(|| async {
+                crate::proxy::wg::tunnel::WgTunnel::connect(cfg).await.map(Arc::new)
+            })
+            .await
+            .cloned()
+    }
+
     pub fn is_healthy(self: &Arc<Self>) -> bool {
         match &**self {
             Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).is_healthy(),
-            Self::Direct { .. } | Self::Block { .. } => true,
+            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => true,
             Self::Urltest { children, .. } | Self::Fallback { children, .. } | Self::Selector { children, .. } => {
                 children.iter().any(|c| c.is_healthy())
             }
@@ -69,7 +93,7 @@ impl OutboundNode {
                 let rtt = rtt_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if rtt > 0 && rtt != u64::MAX { Some(rtt) } else { None }
             },
-            Self::Direct { .. } | Self::Block { .. } => None,
+            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } => {
                 let leaf = self.resolve_leaf();
                 if std::ptr::eq(&*leaf, &**self) { None } else { leaf.latency_rtt_ms() }
@@ -80,7 +104,7 @@ impl OutboundNode {
     pub fn latency_http_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
             Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).latency_ms(),
-            Self::Direct { .. } | Self::Block { .. } => None,
+            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } => {
                 let leaf = self.resolve_leaf();
                 if std::ptr::eq(&*leaf, &**self) { None } else { leaf.latency_http_ms() }
@@ -203,6 +227,50 @@ impl OutboundManager {
                         total_segs_out: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
                     }));
                 }
+                OutboundConfig::Wireguard {
+                    tag, private_key, peer_public_key, preshared_key, endpoint, address,
+                    mtu, persistent_keepalive,
+                } => {
+                    // 配置有问题时**降级为 Block, 而不是 Direct**。
+                    //
+                    // 这是刻意的: 用户配 WG 出站的意图就是流量从 WG 出去, 悄悄改走直连
+                    // 意味着本该走隧道的流量从本机 IP 裸奔出去 —— 与 SS 上游的 UDP block
+                    // 同一条理由: 安全的失败方式是"不发", 不是"发到别处去"。
+                    // (正常路径下 semantic_issues 已在 check/启动阶段拦下这些错配。)
+                    let built = (|| -> anyhow::Result<crate::proxy::wg::WgConfig> {
+                        Ok(crate::proxy::wg::WgConfig {
+                            private_key: crate::proxy::wg::decode_wg_key(private_key, "private_key")?,
+                            peer_public_key: crate::proxy::wg::decode_wg_key(peer_public_key, "peer_public_key")?,
+                            preshared_key: preshared_key
+                                .as_deref()
+                                .map(|k| crate::proxy::wg::decode_wg_key(k, "preshared_key"))
+                                .transpose()?,
+                            endpoint: endpoint.clone(),
+                            address: address.parse()?,
+                            mtu: *mtu,
+                            persistent_keepalive: *persistent_keepalive,
+                        })
+                    })();
+                    match built {
+                        Ok(wg) => {
+                            info!("出站 `{}`: WireGuard → {} (隧道内地址 {}, MTU {})",
+                                  tag, wg.endpoint, wg.address, wg.mtu);
+                            outbounds.insert(tag.clone(), Arc::new(OutboundNode::Wireguard {
+                                tag: tag.clone(),
+                                cfg: Arc::new(wg),
+                                tunnel: tokio::sync::OnceCell::new(),
+                            }));
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "出站 `{}` 的 WireGuard 配置有误, 已降级为 block (拒绝连接) \
+                                 而非直连 —— 避免本该走隧道的流量从本机 IP 裸奔出去。原因: {}",
+                                tag, e
+                            );
+                            outbounds.insert(tag.clone(), Arc::new(OutboundNode::Block { tag: tag.clone() }));
+                        }
+                    }
+                }
                 OutboundConfig::Direct { tag } => {
                     outbounds.insert(tag.clone(), Arc::new(OutboundNode::Direct { tag: tag.clone() }));
                 }
@@ -309,5 +377,84 @@ impl OutboundManager {
 
     pub fn get(&self, tag: &str) -> Option<Arc<OutboundNode>> {
         self.outbounds.get(tag).cloned()
+    }
+}
+
+#[cfg(test)]
+mod wg_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn cfg_with_wg(extra: &str) -> Config {
+        let s = format!(r#"{{
+          "inbounds": [],
+          "outbounds": [
+            {{ "type": "direct", "tag": "direct" }},
+            {{ "type": "wireguard", "tag": "wg", {extra} }}
+          ],
+          "routing": {{ "default_outbound": "direct", "rules": [] }}
+        }}"#);
+        serde_json::from_str(&s).expect("配置应能解析")
+    }
+
+    const GOOD_KEYS: &str = r#""private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        "endpoint": "1.2.3.4:51820", "address": "10.0.0.2""#;
+
+    /// 合法配置应建出 Wireguard 节点 (而非被降级)。
+    #[test]
+    fn valid_config_builds_wireguard_node() {
+        let cfg = cfg_with_wg(GOOD_KEYS);
+        assert!(cfg.semantic_issues().is_empty(), "合法配置不该有告警: {:?}", cfg.semantic_issues());
+        let m = OutboundManager::new(&cfg);
+        let node = m.outbounds.get("wg").expect("应有 wg 出站");
+        assert!(matches!(&**node, OutboundNode::Wireguard { .. }), "应是 Wireguard 节点");
+    }
+
+    /// 密钥错的 WG 出站必须降级为 **Block**, 绝不能变成 Direct。
+    ///
+    /// 这是安全契约: 用户配 WG 的意图是流量从 WG 出去; 悄悄改走直连 = 本该走隧道的流量
+    /// 从本机 IP 裸奔出去, 且用户毫无察觉。安全的失败方式是"不发"而不是"发到别处去"。
+    #[test]
+    fn bad_key_degrades_to_block_never_direct() {
+        // 16 字节密钥 (WG 要 32)
+        let cfg = cfg_with_wg(r#""private_key": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "endpoint": "1.2.3.4:51820", "address": "10.0.0.2""#);
+        // check 阶段就该报出来
+        let issues = cfg.semantic_issues();
+        assert!(issues.iter().any(|i| i.contains("private_key")), "应报密钥问题: {issues:?}");
+
+        let m = OutboundManager::new(&cfg);
+        match &**m.outbounds.get("wg").expect("wg 出站应存在") {
+            OutboundNode::Block { .. } => {}
+            OutboundNode::Direct { .. } => {
+                panic!("配错的 WG 出站降级成了 Direct —— 流量会从本机 IP 裸奔出去")
+            }
+            other => panic!("应降级为 Block, 实际 {:?}", other.tag()),
+        }
+    }
+
+    /// 校验必须拦下这些"不会让进程起不来、但会让每条连接静默失败"的错配。
+    #[test]
+    fn semantic_issues_catch_common_mistakes() {
+        let cases = [
+            (r#""private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+              "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+              "endpoint": "1.2.3.4", "address": "10.0.0.2""#, "endpoint"),
+            (r#""private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+              "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+              "endpoint": "1.2.3.4:51820", "address": "10.0.0.2/32""#, "address"),
+            (r#""private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+              "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+              "endpoint": "1.2.3.4:51820", "address": "10.0.0.2", "mtu": 99999"#, "mtu"),
+        ];
+        for (extra, want) in cases {
+            let issues = cfg_with_wg(extra).semantic_issues();
+            assert!(
+                issues.iter().any(|i| i.contains(want)),
+                "配置含 {want} 错误却没被拦下: {issues:?}"
+            );
+        }
     }
 }
