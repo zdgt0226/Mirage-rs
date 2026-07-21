@@ -1,5 +1,24 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 路由规则列表字段接受标量 (2026-07-21)
+
+### feat(config): 路由规则的列表字段可写单值, 不再强制数组
+
+用户反馈: `"port": 443` 会**解析失败**, 必须写 `"port": [443]` —— 而 sing-box/Clash 都允许
+单值省略 `[]`。现全部 10 个列表字段 (`domain_suffix` / `domain_keyword` / `domain_regex` /
+`geosite` / `ip_cidr` / `geoip` / `source_ip_cidr` / `source_mac` / `protocol` / `port`)
+都接受标量或数组两种写法:
+
+```jsonc
+{ "outbound": "direct", "port": 443 }            // ← 现在可以
+{ "outbound": "direct", "port": [80, 443] }      // ← 仍然可以
+{ "outbound": "direct", "domain_suffix": "cn" }  // 所有列表字段同理
+```
+
+纯易用性, 不改变任何匹配语义。单值被解成单元素数组 (`443` → `[443]`), 缺省仍是空。
+2 个单测锁定 (标量→单元素 / 数组原样 / 全 10 字段都支持)。
+
+
 ## [v0.6.0-alpha.4] - Shadowsocks 2022 + 服务名区分 + 搜索范围扩大 (2026-07-21)
 
 ### feat(install): 轻量版服务名与完整版区分 (`mirage-rs-lite-*`)

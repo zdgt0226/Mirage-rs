@@ -5,7 +5,7 @@ category: concept
 status: active
 tags: [routing, config]
 created: "2026-07-21T09:10:12"
-updated: "2026-07-21T09:11:50"
+updated: "2026-07-21T10:13:15"
 ---
 
 ## compiled_truth
@@ -69,4 +69,10 @@ sing-box 有按**进程名**分流, 这里**没有**。原因: 需要 eBPF/procf
   kind: decision
   summary: "从代码逐条核实路由匹配维度"
   source: src/router/mod.rs
+  affects: [routing-rules]
+
+- time: 2026-07-21T10:13:15
+  kind: decision
+  summary: "列表字段现支持标量或数组两种写法 (one_or_many), 单值不再强制 []"
+  source: config.rs one_or_many
   affects: [routing-rules]

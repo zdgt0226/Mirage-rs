@@ -1,5 +1,31 @@
 use serde::Deserialize;
 
+/// 允许路由规则的列表字段既写**单个标量**也写**数组** —— 与 sing-box/Clash 一致。
+///
+/// 三种形式都接受, 反序列化成 `Vec<T>`:
+/// - 缺省(字段不写)  → `[]`(由 `#[serde(default)]` 提供, 不经过本函数)
+/// - 单值 `"port": 443` / `"domain_suffix": "cn"` → `[443]` / `["cn"]`
+/// - 数组 `"port": [80, 443]` → 原样
+///
+/// 早前只接受数组, 写单值会**解析失败**(用户实测踩到)。这纯属易用性,
+/// 不改变任何匹配语义。
+fn one_or_many<'de, D, T>(de: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany<T> {
+        One(T),
+        Many(Vec<T>),
+    }
+    Ok(match OneOrMany::<T>::deserialize(de)? {
+        OneOrMany::One(v) => vec![v],
+        OneOrMany::Many(v) => v,
+    })
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct GuiConfig {
     #[serde(default)]
@@ -246,25 +272,25 @@ pub struct RuleConfig {
     #[serde(default)]
     pub mode: Option<String>,
     pub outbound: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub domain_suffix: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub domain_keyword: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub domain_regex: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub geosite: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub ip_cidr: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub geoip: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub source_ip_cidr: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub source_mac: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub protocol: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub port: Vec<u16>,
 }
 
@@ -661,7 +687,7 @@ mod tests {
 
 #[cfg(test)]
 mod validation_tests {
-    use super::Config;
+    use super::{Config, RuleConfig};
 
     /// 一份最小可用配置; 各用例在其上做局部破坏。
     fn base() -> serde_json::Value {
@@ -685,6 +711,45 @@ mod validation_tests {
 
     fn has(issues: &[String], needle: &str) -> bool {
         issues.iter().any(|i| i.contains(needle))
+    }
+
+    #[test]
+    fn rule_port_accepts_scalar_and_array() {
+        // 用户反馈: 单端口不该强制写数组 (sing-box/Clash 都允许标量)。
+        // 关键是"单值被解成 [值]"而非丢失 —— check 通过只说明能解析, 这里验语义。
+        let rule: RuleConfig = serde_json::from_str(
+            r#"{"outbound":"direct","port":443}"#).unwrap();
+        assert_eq!(rule.port, vec![443], "单端口标量应解成 [443]");
+
+        let rule: RuleConfig = serde_json::from_str(
+            r#"{"outbound":"direct","port":[80,443]}"#).unwrap();
+        assert_eq!(rule.port, vec![80, 443], "数组应原样");
+
+        // 缺省仍是空
+        let rule: RuleConfig = serde_json::from_str(r#"{"outbound":"direct"}"#).unwrap();
+        assert!(rule.port.is_empty());
+    }
+
+    #[test]
+    fn rule_all_list_fields_accept_scalar() {
+        // 全部 10 个列表字段都应支持标量, 不只是 port。
+        let rule: RuleConfig = serde_json::from_str(r#"{
+            "outbound":"direct",
+            "domain_suffix":"cn", "domain_keyword":"ads", "domain_regex":"^x$",
+            "geosite":"geosite.dat:cn", "ip_cidr":"10.0.0.0/8", "geoip":"geoip.dat:cn",
+            "source_ip_cidr":"192.168.1.0/24", "source_mac":"aa:bb:cc:dd:ee:ff",
+            "protocol":"tcp", "port":443
+        }"#).unwrap();
+        assert_eq!(rule.domain_suffix, vec!["cn"]);
+        assert_eq!(rule.domain_keyword, vec!["ads"]);
+        assert_eq!(rule.domain_regex, vec!["^x$"]);
+        assert_eq!(rule.geosite, vec!["geosite.dat:cn"]);
+        assert_eq!(rule.ip_cidr, vec!["10.0.0.0/8"]);
+        assert_eq!(rule.geoip, vec!["geoip.dat:cn"]);
+        assert_eq!(rule.source_ip_cidr, vec!["192.168.1.0/24"]);
+        assert_eq!(rule.source_mac, vec!["aa:bb:cc:dd:ee:ff"]);
+        assert_eq!(rule.protocol, vec!["tcp"]);
+        assert_eq!(rule.port, vec![443]);
     }
 
     #[test]
