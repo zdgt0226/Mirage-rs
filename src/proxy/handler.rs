@@ -126,6 +126,34 @@ pub async fn proxy_tcp_target(
         }
     }
 
+    // 目标仍是**裸 IP** (fake-IP 没还原出域名) 时, 嗅一下 TLS SNI / HTTP Host。
+    //
+    // 为什么需要: SOCKS5 客户端可以送域名也可以送 IP —— 不少 app 自己做完 DNS 再送 IP。
+    // 那种情况下 domain_suffix / geosite 这类规则**全部失效**, 用户看到的是"规则写了不生效"
+    // 却查不出原因。嗅到域名后既能正确分流, 也能把域名交给服务端在干净网络解析 (抗污染)。
+    //
+    // 只在裸 IP 上做: 浏览器等送域名的客户端完全不经过这里, 零成本。
+    // 超时取 300ms 而非 transparent 那边的 2s —— 客户端不先说话的协议 (SSH/SMTP 等
+    // server-first) 会干等到超时, 这段是白加的延迟, 泛用入站要给得紧。
+    // initial_payload 非空表示首包已被读走, peek 看不到, 直接跳过。
+    // ⚠️ 嗅到的域名**只用于路由判定, 不改连接目的地**。
+    //
+    // 客户端明确要连 1.2.3.4:443, 若把目的地换成域名, direct 出站会重新解析 —— 可能落到
+    // 另一个 IP (CDN/多 A 记录), 等于擅自改了客户端指定的目的地; 域名解析不出来时更是直接
+    // 连不上。sing-box 同样把两者分开 (override_destination 默认关)。
+    let mut sniffed_domain: Option<String> = None;
+    if initial_payload.is_empty() && final_host.parse::<IpAddr>().is_ok() {
+        if let Some(sniffed) = crate::proxy::sniff::sniff_with_timeout(
+            &local,
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        {
+            debug!("[SNIFF] 裸 IP {} 嗅到 SNI/Host [{}], 改按域名分流", final_host, sniffed);
+            sniffed_domain = Some(sniffed);
+        }
+    }
+
     info!("Proxying TCP request to {}", final_target);
     
     // Parse target for router
@@ -138,8 +166,13 @@ pub async fn proxy_tcp_target(
         source_mac: None,
     };
     
+    // 嗅到域名时**同时**带上域名与原始 IP: 域名让 domain_suffix/geosite 生效, IP 让
+    // ip_cidr/geoip 仍能匹配 —— 两类规则都不失效。
     if let Ok(ip) = final_host.parse::<IpAddr>() {
         routing_req.ip = Some(ip);
+        if let Some(d) = &sniffed_domain {
+            routing_req.domain = Some(d);
+        }
     } else if !final_host.is_empty() {
         routing_req.domain = Some(&final_host);
     }

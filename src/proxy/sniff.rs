@@ -7,12 +7,21 @@ use tracing::debug;
  * 注意，窥探必须使用 peek，不能消费（读走）数据，以免破坏代理后的握手流程。
  */
 pub async fn sniff_first_kb(stream: &TcpStream) -> Option<String> {
+    sniff_with_timeout(stream, std::time::Duration::from_secs(2)).await
+}
+
+/// 同上, 但可指定等待首包的超时。
+///
+/// 超时值是个**实打实的权衡**: 客户端不先说话的协议 (SSH / SMTP / MySQL 等 server-first)
+/// 会一直等到超时才继续 —— 这段时间是白加的延迟。TLS/HTTP 客户端则立刻发包, 几乎无成本。
+/// 所以调用方按场景选: 明确知道是网页流量可以给宽一点, 泛用入站应给紧一点。
+pub async fn sniff_with_timeout(stream: &TcpStream, timeout: std::time::Duration) -> Option<String> {
     // 4096: 后量子 TLS 1.3 (X25519MLKEM768/Kyber) 的 ClientHello 因 key_share 膨胀到
     // 1.2~1.8KB, 1024 装不下。SNI 扩展在前段, 但下面 parse 还需容忍截断 (见 ext_end clamp)。
     let mut buf = [0u8; 4096];
     
     // 使用 peek 查看数据，不从流中移除它，并加上 2 秒超时防止慢速 DoS 攻击
-    let n = match tokio::time::timeout(std::time::Duration::from_secs(2), stream.peek(&mut buf)).await {
+    let n = match tokio::time::timeout(timeout, stream.peek(&mut buf)).await {
         Ok(Ok(n)) if n > 0 => n,
         _ => return None,
     };
