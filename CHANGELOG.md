@@ -107,9 +107,30 @@ README 的 "≥5.10" 声明, 本地是 6.1; build.yml 里就记着实例(orphan 
   TCP 从上游出去 —— 出口 IP 不一致, 对落地解锁是功能性错误。
 - `check` 校验覆盖上游 WG 的密钥/address/endpoint/mtu。
 
+### 阶段4: 对着真实 WireGuard 服务端的互通验证 ✅ (TCP 路径)
+`examples/verify_wg_real_peer.rs` —— 分层诊断, 失败时一眼看出断在哪一层。
+
+对一台真实 WG 服务端 (OpenSSH 9.2p1 / Debian 12) 实测结果:
+
+| 层 | 内容 | 结果 |
+|---|---|---|
+| L1 | Noise IK 握手 (裸 boringtun) | ✅ 服务端回 type=2, 会话建立 |
+| L1.6 | ICMP echo → 服务端隧道地址 | ✅ 收到 echo reply |
+| L2 | **TCP 经 smoltcp 栈** | ✅ 连通并读到真实 SSH banner |
+| L1.5 | 裸 IP 包 → 公网目标 | ❌ 服务端未开出网转发 |
+| L3 | UDP 经隧道 | ⚠️ 未验 (无可达 UDP 服务) |
+
+**已证实**: 握手、密钥派生、报文格式与真实 WG 服务端互通; DATA 包 (type=4) 双向加解密
+正确; **smoltcp 产出的 TCP 包能被真实服务端路由、回包能被解密并交回 smoltcp** ——
+收到的 `SSH-2.0-OpenSSH_9.2p1` 走完了 smoltcp → WgDevice → boringtun → UDP → 真实服务端
+→ 原路返回的完整链路。另外开放端口连通、关闭端口 (53/443) 正确报 RST 拒绝, 说明
+TCP 状态机的区分能力正常。
+
+**仍未证实**: UDP 经隧道对真实 peer 的往返 —— 该服务端未开出网转发, 且隧道内网关无 UDP
+服务可打, 没有可用靶子。L1.5 的失败已定位为**服务端侧配置**(缺 ip_forward/MASQUERADE),
+非本项目代码: 同一个包绕开 smoltcp 直接灌进隧道同样不通, 而 ICMP 打网关却有回应。
+
 ### 待完成
-- 阶段4: **对着真实 WG peer 的 e2e 互通验证** —— 当前所有测试只覆盖到握手包格式、pump
-  机制、socket 生命周期与配置契约, **没有任何一条证明能和真实 WireGuard 服务器互通**。
 - 服务端 UDP 中继接到 WG 隧道 (届时可把上游 udp 默认改为放行)。
 - 隧道内 DNS (当前域名在本机解析, DNS 不经 WG)。
 - 阶段4: 对着真实 WG peer 的 e2e 验证 (当前测试只覆盖到"握手包格式正确", **未证明与真实
