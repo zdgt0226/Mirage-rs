@@ -327,8 +327,14 @@ async fn layer1_5_raw_ip(cfg: &mirage_rs::proxy::wg::WgConfig) -> Result<()> {
         _ => bail!("本测试只处理 IPv4 隧道地址"),
     };
     let id = 0x9abcu16;
-    let pkt = build_udp_ip_packet(src, "223.5.5.5".parse()?, 40000, 53, &dns_query(id));
-    eprintln!("  → 灌入手工 IPv4/UDP 包 ({} 字节) {} → 223.5.5.5:53", pkt.len(), src);
+    // 打与 L3 同一个目标: 这层的意义是"绕开 smoltcp 也能通吗", 靶子必须一致才可比。
+    let t: std::net::SocketAddr = udp_target().parse()?;
+    let dst = match t.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => bail!("只处理 IPv4 目标"),
+    };
+    let pkt = build_udp_ip_packet(src, dst, 40000, t.port(), &dns_query(id));
+    eprintln!("  → 灌入手工 IPv4/UDP 包 ({} 字节) {} → {}", pkt.len(), src, t);
 
     let mut ebuf = vec![0u8; 2048];
     match tunn.encapsulate(&pkt, &mut ebuf) {
@@ -344,9 +350,9 @@ async fn layer1_5_raw_ip(cfg: &mirage_rs::proxy::wg::WgConfig) -> Result<()> {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             bail!(
-                "12s 内没有任何隧道内回包 —— 服务端很可能没为本 peer 做出网转发 \
-                 (检查服务端该 peer 的 AllowedIPs 是否含 {src}/32, 以及是否开了 \
-                 ip_forward + MASQUERADE)"
+                "12s 内没有任何隧道内回包 —— 服务端没把流量转到 {t}。若目标是公网地址, \
+                 多半是服务端没开出网转发 (ip_forward + MASQUERADE); 若目标在隧道内, \
+                 检查该 peer 的 AllowedIPs 是否含 {src}/32"
             );
         }
         let n = match tokio::time::timeout(left, sock.recv(&mut rbuf)).await {
@@ -359,7 +365,7 @@ async fn layer1_5_raw_ip(cfg: &mirage_rs::proxy::wg::WgConfig) -> Result<()> {
                 let ip = ip.to_vec();
                 // IPv4 头 20 字节 + UDP 头 8 字节后是 DNS 响应
                 if ip.len() > 28 && ip[9] == 17 && dns_response_ok(&ip[28..], id) {
-                    eprintln!("  ✓ 收到隧道内 DNS 响应 —— 服务端确实为本 peer 转发出网");
+                    eprintln!("  ✓ 收到隧道内 DNS 响应 —— 服务端确实为本 peer 转发流量");
                     return Ok(());
                 }
                 eprintln!("  · 收到隧道内 IP 包 {} 字节 (proto={}), 继续等", ip.len(), ip[9]);
