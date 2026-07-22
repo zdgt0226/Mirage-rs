@@ -129,6 +129,57 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 > `openssl rand -base64 32` 生成。长度不对会被 `mirage-rs check` 直接拦下并说明应有长度 ——
 > 这类错**不会**让服务端起不来, 而是每条连接都静默失败, 所以必须提前拦住。
 
+### WireGuard 出站 / 上游 (v0.6.0-alpha.7+)
+
+WireGuard 可以用在**两个位置**:
+
+**① 客户端出站** —— 按路由规则把选中的流量走 WG,不经 Mirage 隧道:
+
+```jsonc
+{
+    "type": "wireguard",
+    "tag": "wg-out",
+    "private_key": "wg genkey 生成的 base64",
+    "peer_public_key": "对端公钥 base64",
+    "preshared_key": "可选, wg genpsk 生成",
+    "endpoint": "1.2.3.4:51820",
+    "address": "10.0.0.2",          // 隧道内分配给你的地址, 不带掩码
+    "mtu": 1420,                    // 可选, 默认 1420
+    "persistent_keepalive": 25      // 可选, 穿 NAT 用
+}
+```
+
+**② 服务端上游** —— 与 SS 中转同一个位置,把 Mirage 当中转站、出口落在 WG 对端:
+
+```
+客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(WireGuard)──▶ WG 对端 ──▶ 目标
+```
+
+给 `mirage_server` 入站加 `"upstream": { "type": "wireguard", ... }`,字段同上(外加
+`"udp": "block"`)。
+
+> 📌 **密钥是标准 WireGuard 的 base64 32 字节 x25519 密钥**(`wg genkey` / `wg pubkey` 的输出),
+> **不是任意密码**。长度不对会被 `mirage-rs check` 直接拦下 —— 这类错**不会**让进程起不来,
+> 而是让每条连接静默失败(服务看着健康却什么都代理不了),所以必须提前拦住。
+>
+> ⚠️ **配错时降级为 `block`(拒绝连接), 而不是 `direct`**。这是刻意的: 你配 WG 的意图就是
+> 流量从 WG 出去, 悄悄改走直连意味着本该走隧道的流量从**本机 IP 裸奔出去**且毫无察觉。
+> 与上面 SS 的 UDP 策略同一条原则 —— **安全的失败方式是"不发", 而非"发到别处去"**。
+>
+> ⚠️ **隧道内没有 DNS**: 域名在本机解析后才把 IP 送进隧道, 即 DNS 查询**不经** WG。
+> "只想让某些流量换出口"够用; 若指望同时隐藏 DNS 或拿到对端地区的 CDN 解析结果, 当前做不到。
+>
+> ⚠️ 服务端上游的 `udp` 同样**默认 `block`**: 服务端的 UDP 中继尚未接到 WG 隧道上。
+> (客户端出站的 TCP 与 UDP **都**已走隧道, 不受此限。)
+
+**实现说明**: WG 是 L3 IP 包协议, 隧道里跑的不是字节流。因此内部用
+[`boringtun`](https://github.com/cloudflare/boringtun)(Noise IK 握手/加解密)+
+[`smoltcp`](https://github.com/smoltcp-rs/smoltcp)(用户态 TCP/IP 栈)把被代理的 TCP/UDP
+连接转成 IP 包。**不需要**内核 WireGuard 模块、不需要 root、不创建网络接口。
+
+已对真实 WireGuard 服务端实测互通(握手 / 裸 IP 包 / TCP / UDP 四层全通),
+验证器见 `examples/verify_wg_real_peer.rs`。
+
 ### 轻量模式 (只要"能翻墙"就够了)
 
 如果你不需要分流 / fake-IP / 透明网关 / 看板, 只想要「本机 SOCKS5 → 全部走隧道」,

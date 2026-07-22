@@ -53,6 +53,8 @@ pub struct WgTunnel {
     pub(crate) start: std::time::Instant,
     /// 通知 pump "有出站数据待发", 别干等下个 tick。
     pub(crate) wake: Arc<Notify>,
+    /// 隧道内本端端口分配游标。见 [`WgTunnel::alloc_port`]。
+    next_port: std::sync::atomic::AtomicU32,
     pump: tokio::task::JoinHandle<()>,
 }
 
@@ -127,7 +129,26 @@ impl WgTunnel {
         let wake = Arc::new(Notify::new());
         let pump = tokio::spawn(pump(inner.clone(), udp, start, wake.clone()));
 
-        Ok(Self { inner, local_addr: cfg.address, start, wake, pump })
+        Ok(Self {
+            inner,
+            local_addr: cfg.address,
+            start,
+            wake,
+            // 起点随机: 不同隧道/不同进程不要都从 1024 开始复用同一批端口。
+            next_port: std::sync::atomic::AtomicU32::new(fastrand::u32(..)),
+            pump,
+        })
+    }
+
+    /// 分配一个隧道内本端端口。
+    ///
+    /// **顺序分配而非随机**: 端口空间只有约 64K, 随机取在 500 条并发时碰撞概率已达 86%
+    /// (生日问题)。而 smoltcp 按 (本地端口, 对端) 派发 —— 同端口**且**同目标的两个 socket
+    /// 会造成派发歧义, 数据被送进另一条连接。代理场景大量连接打同一个热门目标, 这不是
+    /// 理论风险。顺序分配把碰撞推迟到 6.4 万条**同时存活**的连接之后。
+    pub(crate) fn alloc_port(&self) -> u16 {
+        let n = self.next_port.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        1024 + (n % (65536 - 1024)) as u16
     }
 
     /// 驱动一次 smoltcp poll 并叫醒 pump 立刻发包。**同步**, 以便从 `poll_read`/
