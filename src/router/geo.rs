@@ -451,3 +451,71 @@ mod tests {
         assert_eq!(got[0].value, "example.com");
     }
 }
+
+/// 数一数 .dat 里有多少个顶层分类 (geosite 的国家/类别、geoip 的国家码)。
+///
+/// 用途是**下载落地前的校验**。为什么不能直接用 `load_geosite_dat` 判成败:
+/// 那两个 loader 是**宽容**的 —— 遇到不认识的 wire type 就跳过, 什么都没匹配上时
+/// 返回 `Ok(空表)`。于是一个 HTML 错误页/限流页也能"解析成功", 校验形同虚设,
+/// 结果就是好用的 .dat 被一张网页覆盖掉, 且要到下次加载才暴露。
+///
+/// 这里改判"结构里到底有没有东西": geosite/geoip 的顶层都是
+/// `repeated Entry { string code = 1; repeated ... = 2 }`, 数有 code 的 Entry 即可。
+/// 真实数据是几百个, 垃圾数据是 0。
+pub fn count_categories(path: &Path) -> Result<usize> {
+    let data = fs::read(path)?;
+    let mut pos = 0;
+    let mut n = 0;
+
+    while pos < data.len() {
+        let tag = read_varint(&data, &mut pos)?;
+        let fn_num = tag >> 3;
+        let wt = tag & 7;
+
+        match wt {
+            2 => {
+                let content = read_len_delim(&data, &mut pos)?;
+                if fn_num == 1 {
+                    // 顶层 Entry: 内部找 cfn==1 的非空 code
+                    let mut cpos = 0;
+                    let mut has_code = false;
+                    while cpos < content.len() {
+                        let ctag = match read_varint(content, &mut cpos) {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        };
+                        let cfn = ctag >> 3;
+                        match ctag & 7 {
+                            2 => match read_len_delim(content, &mut cpos) {
+                                Ok(inner) => {
+                                    if cfn == 1 && !inner.is_empty() {
+                                        has_code = true;
+                                    }
+                                }
+                                Err(_) => break,
+                            },
+                            0 => {
+                                if read_varint(content, &mut cpos).is_err() {
+                                    break;
+                                }
+                            }
+                            1 => cpos += 8,
+                            5 => cpos += 4,
+                            _ => break,
+                        }
+                    }
+                    if has_code {
+                        n += 1;
+                    }
+                }
+            }
+            0 => {
+                let _ = read_varint(&data, &mut pos)?;
+            }
+            1 => pos += 8,
+            5 => pos += 4,
+            _ => break,
+        }
+    }
+    Ok(n)
+}
