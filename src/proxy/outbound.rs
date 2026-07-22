@@ -229,7 +229,7 @@ impl OutboundManager {
                 }
                 OutboundConfig::Wireguard {
                     tag, private_key, peer_public_key, preshared_key, endpoint, address,
-                    mtu, persistent_keepalive,
+                    mtu, persistent_keepalive, dns,
                 } => {
                     // 配置有问题时**降级为 Block, 而不是 Direct**。
                     //
@@ -249,6 +249,7 @@ impl OutboundManager {
                             address: address.parse()?,
                             mtu: *mtu,
                             persistent_keepalive: *persistent_keepalive,
+                            dns: None,
                         })
                     })();
                     match built {

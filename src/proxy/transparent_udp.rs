@@ -563,14 +563,24 @@ async fn setup_flow(
 
         // ── WireGuard 腿: 隧道内 UDP socket。地址在建流时解析好 —— 隧道内没有 DNS ──
         Route::Wireguard(node) => {
+            // 先建隧道: 域名可能要经隧道解析 (配了 dns 时), 所以顺序不能反。
+            let tunnel = match node.wg_tunnel().await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("[TPROXY-UDP/WG] 建立隧道失败: {}", e);
+                    return;
+                }
+            };
             let real: SocketAddr = match &target {
-                Some(UdpTarget::Domain(d)) => match crate::proxy::resolver::resolve_first(d, port).await {
-                    Ok(sa) => sa,
-                    Err(_) => {
-                        debug!("[TPROXY-UDP/WG] resolve {} failed", d);
-                        return;
+                Some(UdpTarget::Domain(d)) => {
+                    match crate::proxy::wg::resolve_target(&tunnel, d, port).await {
+                        Ok(sa) => sa,
+                        Err(e) => {
+                            debug!("[TPROXY-UDP/WG] 解析 {} 失败: {}", d, e);
+                            return;
+                        }
                     }
-                },
+                }
                 Some(UdpTarget::Ip(ip)) => SocketAddr::V4(SocketAddrV4::new(*ip, port)),
                 None => {
                     warn!("[TPROXY-UDP/WG] 淘汰的 fake-ip {} 无域名可恢复, dropping", fake_ip);
@@ -581,13 +591,6 @@ async fn setup_flow(
                 warn!("[TPROXY-UDP/WG] IPv6 目标 {} 暂不支持, dropping", real);
                 return;
             }
-            let tunnel = match node.wg_tunnel().await {
-                Ok(t) => t,
-                Err(e) => {
-                    error!("[TPROXY-UDP/WG] 建立隧道失败: {}", e);
-                    return;
-                }
-            };
             let sock = match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {

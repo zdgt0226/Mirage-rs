@@ -90,7 +90,7 @@ pub(crate) fn build_upstream(
         }
         UpstreamConfig::Wireguard {
             private_key, peer_public_key, preshared_key, endpoint, address, mtu,
-            persistent_keepalive, udp,
+            persistent_keepalive, udp, dns,
         } => {
             let wg = crate::proxy::wg::WgConfig {
                 private_key: crate::proxy::wg::decode_wg_key(private_key, "private_key")?,
@@ -105,6 +105,7 @@ pub(crate) fn build_upstream(
                 })?,
                 mtu: *mtu,
                 persistent_keepalive: *persistent_keepalive,
+                dns: None,
             };
             info!(
                 "上游出口: WireGuard {} (隧道内地址 {}) —— 本服务端作为中转站, TCP 流量将再经 WG 转发",

@@ -418,7 +418,7 @@ pub async fn proxy_tcp_target(
                     return;
                 }
             };
-            let addr = match crate::proxy::resolver::resolve_first(host, port).await {
+            let addr = match crate::proxy::wg::resolve_target(&tunnel, host, port).await {
                 Ok(a) => a,
                 Err(e) => {
                     error!("[WG] {} 解析目标失败: {}", target, e);

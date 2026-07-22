@@ -80,6 +80,8 @@ fn load_config() -> Result<mirage_rs::proxy::wg::WgConfig> {
         address: env("WG_ADDRESS")?.parse().context("WG_ADDRESS 不是合法 IP")?,
         mtu: std::env::var("WG_MTU").ok().and_then(|s| s.parse().ok()).unwrap_or(1420),
         persistent_keepalive: Some(25),
+        // 配了就验隧道内 DNS (L4)
+        dns: std::env::var("WG_DNS").ok().and_then(|s| s.parse().ok()),
     })
 }
 
@@ -530,6 +532,27 @@ async fn main() {
     if let Err(e) = layer3_udp(tunnel.clone()).await {
         eprintln!("  ✗ L3 失败: {e:#}");
         failed = true;
+    }
+
+    // ── L4: 隧道内 DNS (配了 WG_DNS 才跑) ──
+    if cfg.dns.is_some() {
+        eprintln!("\n[L4] 隧道内 DNS 解析 (域名经隧道解析, 不在本机解析)");
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            mirage_rs::proxy::wg::resolve_target(&tunnel, "example.com", 443),
+        )
+        .await
+        {
+            Ok(Ok(sa)) => eprintln!("  ✓ example.com 经隧道解析为 {sa}"),
+            Ok(Err(e)) => {
+                eprintln!("  ✗ L4 失败: {e:#}");
+                failed = true;
+            }
+            Err(_) => {
+                eprintln!("  ✗ L4 失败: 15s 超时");
+                failed = true;
+            }
+        }
     }
 
     eprintln!();
