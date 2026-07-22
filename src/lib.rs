@@ -110,9 +110,22 @@ pub(crate) fn build_upstream(
                 "上游出口: WireGuard {} (隧道内地址 {}) —— 本服务端作为中转站, TCP 流量将再经 WG 转发",
                 wg.endpoint, wg.address
             );
-            let block_udp = matches!(udp, crate::config::UdpPolicy::Block);
-            warn_udp(block_udp, "服务端的 UDP 中继尚未接到 WG 隧道");
-            Ok(Some(Arc::new(UpstreamOutlet::Wireguard(WgUpstream::new(wg, block_udp)))))
+            match udp {
+                crate::config::UdpPolicy::Tunnel => info!(
+                    "UDP 策略: tunnel (默认) —— UDP 也走 WG 隧道, 与 TCP 同一个出口 IP。"
+                ),
+                crate::config::UdpPolicy::Block => info!(
+                    "UDP 策略: block —— 直接拒绝 UDP 中继。注意 WG 隧道本可承载 UDP \
+                     (默认即 tunnel), 除非你刻意要禁用, 否则 block 只会让 QUIC 回落 TCP、\
+                     游戏/WebRTC 不可用。"
+                ),
+                crate::config::UdpPolicy::Direct => warn!(
+                    "⚠️  UDP 策略: direct —— UDP 将从**本机 IP** 直连出去, 与 TCP 的 WG 出口\
+                     **不同**。WG 隧道本可承载 UDP (默认 tunnel), 除非你确知自己在做什么, \
+                     否则建议改回 \"udp\": \"tunnel\"。"
+                ),
+            }
+            Ok(Some(Arc::new(UpstreamOutlet::Wireguard(WgUpstream::new(wg, *udp)))))
         }
     }
 }
