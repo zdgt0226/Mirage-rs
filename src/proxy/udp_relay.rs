@@ -6,163 +6,258 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, error, info, warn};
 
-pub async fn handle_udp_associate(mut local_tcp: TcpStream, pool: Arc<WarmPool>) {
-    // 1. Bind local UDP socket on an ephemeral port
-    let udp_socket = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!("Failed to bind UDP socket for relay: {}", e);
-            return;
-        }
-    };
-    
-    let local_addr = match udp_socket.local_addr() {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-    
-    // 2. Send SOCKS5 reply with bound UDP port
-    let port = local_addr.port();
-    let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0];
-    reply.extend_from_slice(&port.to_be_bytes());
-    
-    if local_tcp.write_all(&reply).await.is_err() {
-        return;
-    }
-    
-    info!("UDP Relay started on port {}", port);
-
-    // 3. Acquire tunnel and send UDP Mode Sentinel (\x00)
-    let mut tunnel = match pool.get().await {
-        Ok(t) => t,
-        Err(e) => {
-            error!("UDP relay: pool unavailable ({}). Session aborted.", e);
-            return;
-        }
-    };
-    if tunnel.writer.send_data(&[0x00]).await.is_err() {
-        error!("Failed to send UDP sentinel");
-        return;
-    }
-    let mut tunnel_reader = tunnel.reader;
-    let tunnel_writer = std::sync::Arc::new(tokio::sync::Mutex::new(tunnel.writer));
-    
-    // 4. Run Relay Loops
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    
-    let udp_rx = udp_socket.clone();
-    let udp_tx = udp_socket;
-    
-    let tunnel_writer_clone = tunnel_writer.clone();
-    let uplink = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        let mut client_addr = None;
-        
-        loop {
-            match udp_rx.recv_from(&mut buf).await {
-                Ok((size, addr)) => {
-                    // Update client address on first packet
-                    if client_addr.is_none() {
-                        client_addr = Some(addr);
-                        let _ = tx.send(addr).await;
-                    }
-                    
-                    let data = &buf[..size];
-                    // Parse SOCKS5 UDP header
-                    // [2B RSV][1B FRAG][1B ATYP][ADDR][2B PORT][PAYLOAD]
-                    if data.len() < 4 || data[0] != 0 || data[1] != 0 {
-                        continue;
-                    }
-                    if data[2] != 0 {
-                        continue; // Fragmentation not supported
-                    }
-                    
-                    // Extract payload starting from ATYP
-                    let packed_and_payload = &data[3..];
-                    
-                    // Frame for tunnel: [2B len][packed_and_payload]
-                    let frame_len = packed_and_payload.len() as u16;
-                    let mut frame = Vec::with_capacity(2 + packed_and_payload.len());
-                    frame.extend_from_slice(&frame_len.to_be_bytes());
-                    frame.extend_from_slice(packed_and_payload);
-                    
-                    if tunnel_writer_clone.lock().await.send_data(&frame).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    
-    let downlink = tokio::spawn(async move {
-        // Wait for first uplink to know where to send replies
-        let client_addr = match rx.recv().await {
-            Some(a) => a,
-            None => return,
-        };
-        
-        let mut buffer = Vec::new();
-        loop {
-            match tunnel_reader.recv_data().await {
-                Ok(chunk) => {
-                    buffer.extend_from_slice(&chunk);
-                    
-                    // Parse frames
-                    while buffer.len() >= 2 {
-                        let frame_len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
-                        if buffer.len() < 2 + frame_len {
-                            break; // Incomplete frame
-                        }
-                        
-                        let frame = &buffer[2..2+frame_len];
-                        // Reconstruct SOCKS5 header: RSV(2) + FRAG(1) + ATYP...
-                        let mut sock_resp = vec![0, 0, 0];
-                        sock_resp.extend_from_slice(frame);
-                        
-                        let _ = udp_tx.send_to(&sock_resp, client_addr).await;
-                        
-                        buffer.drain(0..2+frame_len);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    
-    // Watch TCP connection, SOCKS5 standard dictates UDP relay stops when TCP closes
-    let tcp_watcher = tokio::spawn(async move {
-        let mut buf = [0u8; 1];
-        let _ = local_tcp.read(&mut buf).await;
-    });
-    
-    // abort_handle 只借用不消费, 可在 select 移动 handle 前取。
-    let ah_up = uplink.abort_handle();
-    let ah_down = downlink.abort_handle();
-    let ah_tcp = tcp_watcher.abort_handle();
-
-    // Terminate when any task ends
-    tokio::select! {
-        _ = uplink => {},
-        _ = downlink => {},
-        _ = tcp_watcher => {},
-    }
-
-    // ⚠️ select! 结束只 drop 另两个 JoinHandle —— drop JoinHandle **不 abort** task,
-    // uplink 会作为僵尸永久阻塞在 recv_from, 泄漏那个临时 UDP socket。必须显式
-    // abort 未完成的 (已完成的 abort 是 no-op)。(服务端 udp_relay 早有 downlink.abort())
-    ah_up.abort();
-    ah_down.abort();
-    ah_tcp.abort();
-
-    let _ = tunnel_writer.lock().await.send_close_notify().await;
-
-    debug!("UDP Relay gracefully closed for port {}", port);
-}
-
 // ── Direct 出口 UDP 转发 (SOCKS5 UDP ASSOCIATE, 不走隧道) ──
 // 复用 handle_udp_associate 的 SOCKS5-UDP 封装语义, 但把"隧道收发"换成
 // 直发 socket 收发. v1: outbound 绑 v4, IPv6 目标显式告警丢弃 (非静默).
+
+/// SOCKS5 UDP ASSOCIATE 的**逐数据报路由**转发。
+///
+/// ⚠️ 为什么必须逐包路由: ASSOCIATE 建立时**还没有任何数据报**, 目标是未知的 —— 目标写在
+/// 每个数据报自己的 SOCKS5 头里 (`[RSV][FRAG][ATYP][ADDR][PORT][PAYLOAD]`)。旧实现在
+/// ASSOCIATE 那一刻就用 `default_outbound` 定死出站, 于是**所有 UDP 完全绕过路由规则**:
+/// 默认直连时, 本该走隧道的域名从本机 IP 裸奔出去; 写了 `block` 的域名照发不误。
+///
+/// 会话按**出站 tag** 建, 不按目标建 —— 这是本实现比 transparent_udp 简单的原因:
+/// - Mirage 隧道本身就多路复用目标 (每帧自带地址, 服务端逐帧解析), 一条隧道够用;
+/// - 直连 socket 可以 `send_to` 任意目标, 一个 socket 够用。
+///
+/// 同一个关联里不同数据报**可以走不同出站** —— 这正是修复的意义所在。
+pub async fn handle_udp_associate_routed(
+    mut local_tcp: TcpStream,
+    state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
+    inbound_tag: Option<Arc<str>>,
+) {
+    let client_socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            error!("UDP relay: 绑客户端侧 socket 失败: {}", e);
+            return;
+        }
+    };
+    let port = match client_socket.local_addr() {
+        Ok(a) => a.port(),
+        Err(_) => return,
+    };
+
+    let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0];
+    reply.extend_from_slice(&port.to_be_bytes());
+    if local_tcp.write_all(&reply).await.is_err() {
+        return;
+    }
+    info!("UDP Relay (逐包路由) started on port {}", port);
+
+    // 每个出站 tag 一个 sink; 懒创建。
+    let mut sinks: HashMap<String, Sink> = HashMap::new();
+    // 各 sink 的下行任务, 关联结束时统一 abort (drop JoinHandle 不会 abort)。
+    let mut downlinks: Vec<tokio::task::AbortHandle> = Vec::new();
+    let mut dns_cache: HashMap<(String, u16), SocketAddr> = HashMap::new();
+
+    let uplink_sock = client_socket.clone();
+    let relay = async {
+        let mut buf = vec![0u8; 65536];
+        let mut client_addr: Option<SocketAddr> = None;
+
+        loop {
+            let (size, from) = match uplink_sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            // 只认第一个来源, 之后固定 —— 防别的主机往这个 relay 端口灌包。
+            let client = *client_addr.get_or_insert(from);
+            if from != client {
+                continue;
+            }
+
+            let data = &buf[..size];
+            // [2B RSV][1B FRAG][1B ATYP]...; FRAG != 0 不支持
+            if data.len() < 4 || data[0] != 0 || data[1] != 0 || data[2] != 0 {
+                continue;
+            }
+            let rest = &data[3..];
+            let (target, off) = match parse_socks_udp_addr(rest) {
+                Some(v) => v,
+                None => continue,
+            };
+            let payload = &rest[off..];
+
+            // ── 逐包路由 ──
+            let snap = state.load();
+            let (host_for_log, req_domain, req_ip, dport) = match &target {
+                UdpTarget::Domain(d, p) => (d.clone(), Some(d.clone()), None, *p),
+                UdpTarget::Ip(sa) => (sa.ip().to_string(), None, Some(sa.ip()), sa.port()),
+            };
+            let tag = snap.router.route(crate::router::RoutingRequest {
+                domain: req_domain.as_deref(),
+                ip: req_ip,
+                port: dport,
+                protocol: "udp",
+                source_ip: Some(client.ip()),
+                source_mac: None,
+                inbound: inbound_tag.as_deref(),
+            });
+
+            // ── 取或建该出站的 sink ──
+            if !sinks.contains_key(&tag) {
+                let node = match snap.outbounds.get(&tag) {
+                    Some(o) => o.resolve_leaf(),
+                    None => {
+                        warn!("[SOCKS-UDP] 出站 [{}] 不存在, 丢弃", tag);
+                        continue;
+                    }
+                };
+                drop(snap);
+                match build_sink(&node, client_socket.clone(), client).await {
+                    Some((sink, ah)) => {
+                        if let Some(ah) = ah {
+                            downlinks.push(ah);
+                        }
+                        debug!("[SOCKS-UDP] 为出站 [{}] 建立 sink", tag);
+                        sinks.insert(tag.clone(), sink);
+                    }
+                    None => {
+                        warn!("[SOCKS-UDP] 出站 [{}] 无法建立 sink, 丢弃", tag);
+                        continue;
+                    }
+                }
+            } else {
+                drop(snap);
+            }
+
+            match sinks.get(&tag) {
+                Some(Sink::Block) => {
+                    debug!("[SOCKS-UDP] {} 命中 block 规则, 丢弃", host_for_log);
+                }
+                Some(Sink::Direct { out }) => {
+                    let dst = match &target {
+                        UdpTarget::Ip(sa) => *sa,
+                        UdpTarget::Domain(d, p) => {
+                            match dns_cache.get(&(d.clone(), *p)) {
+                                Some(sa) => *sa,
+                                None => match crate::proxy::resolver::resolve_first(d, *p).await {
+                                    Ok(sa) => {
+                                        dns_cache.insert((d.clone(), *p), sa);
+                                        sa
+                                    }
+                                    Err(_) => continue,
+                                },
+                            }
+                        }
+                    };
+                    if dst.is_ipv6() {
+                        warn!("[SOCKS-UDP] IPv6 目标 {} 暂不支持, 丢弃", dst);
+                        continue;
+                    }
+                    let _ = out.send_to(payload, dst).await;
+                }
+                Some(Sink::Mirage { writer }) => {
+                    // 隧道帧: [2B len][ATYP..][PORT][PAYLOAD] —— 地址原样透传,
+                    // 由服务端逐帧解析目标, 所以一条隧道能服务所有目标。
+                    let body = &rest[..off + payload.len()];
+                    let mut frame = Vec::with_capacity(2 + body.len());
+                    frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
+                    frame.extend_from_slice(body);
+                    if writer.lock().await.send_data(&frame).await.is_err() {
+                        // 隧道断了: 摘掉这个 sink, 下个包会重建
+                        sinks.remove(&tag);
+                    }
+                }
+                None => {}
+            }
+        }
+    };
+
+    // SOCKS5 标准: 控制 TCP 关闭即结束 UDP 关联
+    let tcp_watcher = async move {
+        let mut b = [0u8; 1];
+        let _ = local_tcp.read(&mut b).await;
+    };
+
+    tokio::select! {
+        _ = relay => {},
+        _ = tcp_watcher => {},
+    }
+
+    // 各 sink 的下行是 spawn 出去的, 必须显式 abort —— drop JoinHandle 不会停任务,
+    // 否则每个关联都会留下永久阻塞在 recv 的僵尸 (连带泄漏 socket / 隧道)。
+    for ah in downlinks {
+        ah.abort();
+    }
+    debug!("UDP Relay closed for port {}", port);
+}
+
+/// 一个出站对应的 UDP 出口。
+enum Sink {
+    /// 直连: 一个出向 socket, `send_to` 任意目标。
+    Direct { out: Arc<UdpSocket> },
+    /// 经 Mirage 隧道: 一条隧道多路复用所有目标。
+    Mirage {
+        writer: Arc<tokio::sync::Mutex<crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>>>,
+    },
+    /// 命中 block 规则: 逐包丢弃 (而不是拒绝整个关联)。
+    Block,
+}
+
+/// 按出站类型建 sink, 并起对应的下行任务 (Block 无下行)。
+async fn build_sink(
+    node: &Arc<crate::proxy::outbound::OutboundNode>,
+    client_socket: Arc<UdpSocket>,
+    client: SocketAddr,
+) -> Option<(Sink, Option<tokio::task::AbortHandle>)> {
+    use crate::proxy::outbound::OutboundNode;
+    match &**node {
+        OutboundNode::Block { .. } => Some((Sink::Block, None)),
+        OutboundNode::Direct { .. } => {
+            let out = Arc::new(UdpSocket::bind("0.0.0.0:0").await.ok()?);
+            let dn_out = out.clone();
+            let h = tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let (n, src) = match dn_out.recv_from(&mut buf).await {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let mut resp = vec![0u8, 0, 0]; // RSV + FRAG
+                    resp.extend_from_slice(&encode_socks_udp_addr(src));
+                    resp.extend_from_slice(&buf[..n]);
+                    let _ = client_socket.send_to(&resp, client).await;
+                }
+            });
+            Some((Sink::Direct { out }, Some(h.abort_handle())))
+        }
+        OutboundNode::Mirage { pool, .. } => {
+            let mut tunnel = pool.get().await.ok()?;
+            // UDP 模式哨兵
+            tunnel.writer.send_data(&[0x00]).await.ok()?;
+            let mut reader = tunnel.reader;
+            let writer = Arc::new(tokio::sync::Mutex::new(tunnel.writer));
+            let h = tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                loop {
+                    let chunk = match reader.recv_data().await {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    buffer.extend_from_slice(&chunk);
+                    while buffer.len() >= 2 {
+                        let flen = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
+                        if buffer.len() < 2 + flen {
+                            break;
+                        }
+                        let mut resp = vec![0u8, 0, 0]; // RSV + FRAG
+                        resp.extend_from_slice(&buffer[2..2 + flen]);
+                        let _ = client_socket.send_to(&resp, client).await;
+                        buffer.drain(0..2 + flen);
+                    }
+                }
+            });
+            Some((Sink::Mirage { writer }, Some(h.abort_handle())))
+        }
+        other => {
+            warn!("[SOCKS-UDP] 不支持的出站类型 {:?}", other.tag());
+            None
+        }
+    }
+}
 
 /// SOCKS5 UDP 请求头里的目标地址.
 enum UdpTarget {
@@ -221,141 +316,6 @@ fn encode_socks_udp_addr(addr: SocketAddr) -> Vec<u8> {
     out
 }
 
-pub async fn handle_udp_associate_direct(mut local_tcp: TcpStream) {
-    // 1. Bind client-facing relay socket
-    let client_socket = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!("Direct UDP: bind relay socket failed: {}", e);
-            return;
-        }
-    };
-    let port = match client_socket.local_addr() {
-        Ok(a) => a.port(),
-        Err(_) => return,
-    };
-
-    // 2. SOCKS5 reply with bound UDP port
-    let mut reply = vec![0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0];
-    reply.extend_from_slice(&port.to_be_bytes());
-    if local_tcp.write_all(&reply).await.is_err() {
-        return;
-    }
-    info!("Direct UDP relay started on port {}", port);
-
-    // 3. Outbound socket (v1: IPv4). IPv6 目标在 uplink 里告警丢弃.
-    let outbound = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!("Direct UDP: bind outbound socket failed: {}", e);
-            return;
-        }
-    };
-
-    // client_addr 首包学到, 传给 downlink 决定回包目的地
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(1);
-
-    // uplink: client → target
-    let up_client = client_socket.clone();
-    let up_out = outbound.clone();
-    let uplink = async move {
-        let mut buf = vec![0u8; 65536];
-        let mut client_addr: Option<SocketAddr> = None;
-        let mut dns_cache: HashMap<(String, u16), SocketAddr> = HashMap::new();
-        loop {
-            let (size, addr) = match up_client.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            if client_addr.is_none() {
-                client_addr = Some(addr);
-                let _ = tx.send(addr).await;
-            } else if client_addr != Some(addr) {
-                continue; // 只服务已关联的客户端
-            }
-
-            let data = &buf[..size];
-            // [RSV(2)][FRAG(1)][ATYP...]
-            if data.len() < 4 || data[0] != 0 || data[1] != 0 {
-                continue;
-            }
-            if data[2] != 0 {
-                continue; // 不支持分片
-            }
-            let (target, off) = match parse_socks_udp_addr(&data[3..]) {
-                Some(v) => v,
-                None => continue,
-            };
-            let payload = &data[3 + off..];
-
-            let dst = match target {
-                UdpTarget::Ip(sa) => sa,
-                UdpTarget::Domain(host, p) => {
-                    let key = (host, p);
-                    if let Some(sa) = dns_cache.get(&key) {
-                        *sa
-                    } else {
-                        match crate::proxy::resolver::resolve_first(&key.0, key.1).await {
-                            Ok(sa) => {
-                                dns_cache.insert(key, sa);
-                                sa
-                            }
-                            Err(_) => {
-                                debug!("Direct UDP: resolve {} failed", key.0);
-                                continue;
-                            }
-                        }
-                    }
-                }
-            };
-
-            if dst.is_ipv6() {
-                warn!("Direct UDP: IPv6 target {} unsupported in v1, dropping", dst);
-                continue;
-            }
-            if up_out.send_to(payload, dst).await.is_err() {
-                break;
-            }
-        }
-    };
-
-    // downlink: target → client
-    let dn_client = client_socket.clone();
-    let dn_out = outbound.clone();
-    let downlink = async move {
-        let client_addr = match rx.recv().await {
-            Some(a) => a,
-            None => return,
-        };
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let (size, src) = match dn_out.recv_from(&mut buf).await {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            let mut resp = vec![0u8, 0, 0]; // RSV + FRAG
-            resp.extend_from_slice(&encode_socks_udp_addr(src));
-            resp.extend_from_slice(&buf[..size]);
-            let _ = dn_client.send_to(&resp, client_addr).await;
-        }
-    };
-
-    // SOCKS5 标准: 控制 TCP 关闭即结束 UDP 关联
-    let tcp_watcher = async move {
-        let mut b = [0u8; 1];
-        let _ = local_tcp.read(&mut b).await;
-    };
-
-    // 非 spawn: 任一分支结束, 其余 future 被 drop, socket 立即释放 (无后台泄漏)
-    tokio::select! {
-        _ = uplink => {},
-        _ = downlink => {},
-        _ = tcp_watcher => {},
-    }
-
-    debug!("Direct UDP relay closed for port {}", port);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +363,119 @@ mod tests {
         assert_eq!(enc, vec![0x01, 9, 8, 7, 6, 0x04, 0xD2]);
     }
 
+    /// 造一个只有 direct/block 出站的最小 CoreState。
+    /// `blocked_ports` 里的**目标端口**会被路由到 block 出站。
+    ///
+    /// 用端口而非 IP 段区分, 是为了让被 block 的目标也能是一个**真在监听**的 echo ——
+    /// 否则"收不到回程"在没有路由的情况下也成立, 判据恒真 (本测试初版就是这么错的)。
+    fn test_state(
+        blocked_ports: Vec<u16>,
+    ) -> Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>> {
+        let rules: Vec<crate::router::Rule> = blocked_ports
+            .iter()
+            .enumerate()
+            .map(|(i, p)| crate::router::Rule {
+                id: i,
+                mode: "or".into(),
+                outbound: "block".into(),
+                domain_suffix: vec![],
+                domain_keyword: vec![],
+                domain_regex: vec![],
+                geosite: vec![],
+                ip_cidr: vec![],
+                source_ip_cidr: vec![],
+                source_mac: vec![],
+                geoip: vec![],
+                port: vec![*p],
+                protocol: vec![],
+                inbound: vec![],
+            })
+            .collect();
+        let router = crate::router::RouterEngine::new(
+            rules,
+            "direct".into(),
+            ".",
+            &std::collections::HashMap::new(),
+        )
+        .expect("引擎应能构建");
+        let cfg: crate::config::Config = serde_json::from_str(
+            r#"{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}],"routing":{"default_outbound":"direct","rules":[]}}"#,
+        )
+        .unwrap();
+        Arc::new(arc_swap::ArcSwap::from_pointee(
+            crate::config_watcher::CoreState {
+                router: Arc::new(router),
+                outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg)),
+                advanced_dns: None,
+            },
+        ))
+    }
+
+    /// **逐数据报路由**的回归测试 —— 这是本次修复的核心契约。
+    ///
+    /// 旧实现在 ASSOCIATE 时就用 `default_outbound` 定死出站, 于是所有 UDP 完全绕过路由:
+    /// 写了 `block` 的目标照发不误。这里在**同一个 ASSOCIATE 里**往两个目标各发一包,
+    /// 一个命中 block 规则、一个不命中, 断言前者收不到回程、后者能。
+    #[tokio::test]
+    async fn per_datagram_routing_applies_block_rule() {
+        async fn spawn_echo() -> SocketAddr {
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let a = s.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 1500];
+                while let Ok((n, from)) = s.recv_from(&mut b).await {
+                    let _ = s.send_to(&b[..n], from).await;
+                }
+            });
+            a
+        }
+        fn pkt(dst: SocketAddr, body: &[u8]) -> Vec<u8> {
+            let mut p = vec![0u8, 0, 0, 0x01];
+            if let SocketAddr::V4(v4) = dst {
+                p.extend_from_slice(&v4.ip().octets());
+                p.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            p.extend_from_slice(body);
+            p
+        }
+
+        // ⚠️ 两个 echo **都真在监听** —— 被 block 的那个如果没人监听, "收不到回程"
+        // 在完全没有路由的情况下也成立, 判据就恒真了 (初版正是这么错的, 变异测试拆穿)。
+        let echo_ok = spawn_echo().await;
+        let echo_blocked = spawn_echo().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let laddr = listener.local_addr().unwrap();
+        let mut client_tcp = TcpStream::connect(laddr).await.unwrap();
+        let (server_tcp, _) = listener.accept().await.unwrap();
+        tokio::spawn(handle_udp_associate_routed(
+            server_tcp,
+            test_state(vec![echo_blocked.port()]),
+            None,
+        ));
+
+        let mut reply = [0u8; 10];
+        client_tcp.read_exact(&mut reply).await.unwrap();
+        let relay: SocketAddr =
+            ([127, 0, 0, 1], u16::from_be_bytes([reply[8], reply[9]])).into();
+
+        let cli = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut rbuf = vec![0u8; 1500];
+
+        // ① 未命中 block → 应有回程 (证明链路本身是通的)
+        cli.send_to(&pkt(echo_ok, b"ok"), relay).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), cli.recv_from(&mut rbuf)).await;
+        assert!(got.is_ok(), "未命中 block 的目标应能收到回程");
+
+        // ② 命中 block → 不该有回程。注意这个 echo **是在监听的**, 所以唯一能解释
+        //    "收不到"的原因就是路由把它拦了。
+        cli.send_to(&pkt(echo_blocked, b"nope"), relay).await.unwrap();
+        let after = tokio::time::timeout(Duration::from_millis(700), cli.recv_from(&mut rbuf)).await;
+        assert!(
+            after.is_err(),
+            "命中 block 规则的目标仍收到了回程 —— UDP 绕过了路由规则"
+        );
+    }
+
     // 端到端: 本地 echo UDP server + 走 Direct relay 打一发, 验证回程封装正确
     #[tokio::test]
     async fn direct_udp_echo_roundtrip() {
@@ -427,7 +500,8 @@ mod tests {
         let mut client_tcp = TcpStream::connect(laddr).await.unwrap();
         let (server_tcp, _) = listener.accept().await.unwrap();
 
-        tokio::spawn(handle_udp_associate_direct(server_tcp));
+        let state = test_state(vec![]);
+        tokio::spawn(handle_udp_associate_routed(server_tcp, state, None));
 
         // 读 SOCKS5 reply 拿 relay UDP 端口
         let mut reply = [0u8; 10];

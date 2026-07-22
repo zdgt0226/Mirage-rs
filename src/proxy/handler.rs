@@ -54,27 +54,11 @@ pub async fn handle_client(
     let target = match command {
         SocksCommand::TcpConnect(t) => t,
         SocksCommand::UdpAssociate => {
-            info!("Starting UDP relay for client");
-            let default_outbound_tag = &current_state.router.default_outbound;
-            if let Some(outbound) = current_state.outbounds.get(default_outbound_tag) {
-                let leaf = outbound.resolve_leaf();
-                drop(current_state);
-                match &*leaf {
-                    OutboundNode::Mirage { pool, .. } => {
-                        udp_relay::handle_udp_associate(local, pool.clone()).await;
-                    }
-                    OutboundNode::Direct { .. } => {
-                        udp_relay::handle_udp_associate_direct(local).await;
-                    }
-                    OutboundNode::Block { .. } => {
-                        return;
-                    }
-                    _ => {
-                        tracing::warn!("Unexpected leaf type {:?}, dropping", leaf.tag());
-                        return;
-                    }
-                }
-            }
+            // 逐数据报路由 —— 目标写在每个数据报自己的 SOCKS5 头里, ASSOCIATE 时还不知道
+            // 要连谁, 所以出站不能在这里定死 (旧实现用 default_outbound 定死, 导致所有
+            // UDP 完全绕过路由规则)。
+            drop(current_state);
+            udp_relay::handle_udp_associate_routed(local, state, inbound_tag).await;
             return;
         }
     };
