@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-07-23T03:13:04"
+updated: "2026-07-23T03:19:23"
 ---
 
 # Roadmap
@@ -25,6 +25,10 @@ updated: "2026-07-23T03:13:04"
 - **路由 `inbound` 维度**(2026-07-23): 规则可按入站 tag 限定, 支持"同一域名从不同入站走
   不同出口"。已穿透 socks / mixed / transparent(TCP+UDP)/ dns 全部入站。
   ⚠️ 固有语义: DNS 查询来自 dns 入站, 故 `{"inbound":"tproxy"}` 的规则不影响 fake-IP 决策
+- **SOCKS5 UDP 逐数据报路由**(2026-07-23, v0.6.0-alpha.7): 此前出站在 ASSOCIATE 时就用
+  `default_outbound` 定死 —— 那时还没有数据报、目标未知, 导致 UDP **完全绕过路由规则**
+  (默认直连时本该走隧道的 UDP 从本机 IP 裸奔; 写了 `block` 的目标照发)。会话按出站 tag 建
+  而非按目标建(Mirage 隧道自带多路复用, 直连 socket 可 send_to 任意目标)
 - **geo 更新器对齐 Python 前身**(2026-07-23): 重启不重下(meta.json 记 downloaded_at)、
   条件请求 ETag/304(真机证实 GitHub release assets 支持)、多镜像 fallback、
   落地前校验内容(数分类数而非看大小)、超时拆三段(实测同链路速度差一个数量级)
@@ -45,7 +49,6 @@ updated: "2026-07-23T03:13:04"
 | IPv6 全栈 | 结构性 | 见 [[ipv6-v4only-tradeoff]] |
 | SS 上游 UDP | 生态 | 需求驱动: 多数 SS 服务器默认不开 UDP 且无握手, 实现了不等于能用。见 [[ss-upstream-relay]]。**注: WG 上游的 UDP 已通**, 要 UDP 同出口可直接用 WG |
 | 订阅链接 | 生态 | 基础已有(node_uri + import), 但**订阅格式本身要先定义**才动手 |
-| SOCKS5 UDP ASSOCIATE 不走路由 | 路由维度 | 既有行为: 直接用 `default_outbound`, 完全绕过规则。审查时发现, 非本次回归 |
 | orphan 验证器接回 CI | 工程债 | 需先拿到 runner 日志访问权。见 [[orphan-filter-blackhole]] |
 
 ## 评估过但**不做**的(避免重复讨论)
