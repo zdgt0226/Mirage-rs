@@ -192,6 +192,17 @@ DNS 报文解析是漏洞温床, 明确防住的几点(都有测试):
 
 真机验证: 验证器加 L4 层, `example.com` 经真实 WG 隧道解析成功。
 
+### install.sh 支持 WireGuard 上游
+`ask_ss_upstream` 改名 `ask_upstream` 并先问上游类型 (Shadowsocks / WireGuard), 再分流。
+WG 分支引导私钥/公钥/endpoint/隧道内地址/PSK/MTU/隧道内 DNS, 并说明:
+- 密钥是 `wg genkey`/`wg pubkey` 的 base64 输出, **不是任意密码**;
+- `udp` 直接定为 `tunnel`(不问) —— WG 隧道能承载 UDP、出口与 TCP 一致, 没有 SS 那种
+  需要 block 兜底的理由;
+- 隧道内 DNS 留空的代价(拿到本机所在地区的解析结果, 对 CDN/流媒体等于白配出口)。
+
+已实测: 用桩函数跑通引导流程, 生成的配置能通过 `mirage check`(退出码 0)——
+免得装完才发现配置非法。
+
 ### 待完成
 - 服务端 UDP 中继接到 WG 隧道 (届时可把上游 udp 默认改为放行)。
 - 隧道内 DNS (当前域名在本机解析, DNS 不经 WG)。
