@@ -311,9 +311,28 @@ fn validate_dat(path: &Path, _kind: crate::config::GeoKind) -> Result<()> {
     Ok(())
 }
 
-// 每次 fetch 尝试的最大耗时. 覆盖 connect + TLS + body 全流程. proxy 抽风或
-// 服务端出网卡住时不至于挂死整个 updater 循环 (老版本 timeout=None 会永远等).
-const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// 三个超时**必须分开**, 不能只给一个总时长。
+//
+// 真机实测踩到过: 原来只设 `.timeout(30s)`, 而 reqwest 的 timeout 是**含 body 的整请求
+// 时长** —— geo 文件好几 MB, 慢链路上 30 秒根本下不完, 于是每次都 "read body: error
+// decoding response body", 更新**永远失败**且错误信息完全指不到"是超时太短"。
+//
+// 现在: 连接卡住快速失败, 传输中途静默才判死, 总预算兜底防无限挂。
+// (Python 版同样分三档: 握手 15s / 单次 recv 60s / 总预算 180s。)
+/// 建连 (含 TLS) 超时: 对端不可达时快速失败, 别耗掉整个预算。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// **两次读之间**的最大静默。只要还在持续收数据就不会触发, 所以对慢速大文件友好,
+/// 又能识别"连上了但卡死不发"的情况。
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 单次 fetch 总预算兜底。**给得宽是有实测依据的**:
+///
+/// 真机测同一个 geoip.dat (17.7 MB), 一次 559 KB/s 用了 31s, 紧接着一次只有 48 KB/s、
+/// 用了 360s —— 同一台机器同一个链路, 差了一个数量级。总预算给 300s 时后者直接失败。
+/// 主要的"卡死"防线是上面的 read-idle: 只要还在收数据就不打断。总预算只防
+/// "一直慢慢挤字节" 这种 slowloris 式的极端情况, 所以可以给得宽。
+///
+/// 代价可控: updater 跑在后台任务里, 单个源拖久了不阻塞任何其他流程。
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 // 下载后至少 N 字节才认为是合法响应. 200 但空 body 的 CDN 边缘缓存 miss 场景
 // 直接覆盖旧 .dat 会导致下次 load 失败, 规则集体失效. dlc.dat / geoip.dat
 // 正常都 > 1MB, 1 KB 阈值宽松防误伤.
@@ -324,7 +343,10 @@ fn build_client(
     proxy_url: Option<&str>,
     source_name: &str,
 ) -> Result<reqwest::Client> {
-    let base = reqwest::Client::builder().timeout(FETCH_TIMEOUT);
+    let base = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_IDLE_TIMEOUT)
+        .timeout(FETCH_TIMEOUT);
     match via {
         GeoVia::Direct => Ok(base.build()?),
         GeoVia::Proxy => match proxy_url {
@@ -597,6 +619,75 @@ mod tests {
         )
         .expect("数组应能解析");
         assert_eq!(many.url.len(), 2, "多镜像应全部保留");
+    }
+
+    /// 真机下载验证 (默认不跑, 需网络能到 GitHub):
+    ///   cargo test --lib geo_real_download -- --ignored --nocapture
+    ///
+    /// 单测只能证明"元数据能往返、校验判据对"; **证明不了上游到底认不认条件请求**。
+    /// 这条把三个阶段串起来真跑一遍:
+    ///   ① 冷下载 → 落地 + 记下 ETag
+    ///   ② 立刻再跑 → 新鲜度判据命中, 完全不发请求
+    ///   ③ 把 downloaded_at 拨老 → 发条件请求, 上游应回 304, 本地文件**不被重写**
+    #[tokio::test]
+    #[ignore = "需要网络; 用 --ignored 手动跑"]
+    async fn geo_real_download_and_304() {
+        use crate::config::{GeoKind, GeoVia};
+
+        let d = tmpdir("real");
+        let dir = d.to_str().unwrap();
+        let src = crate::config::GeoSource {
+            name: "ls-geoip".into(),
+            kind: GeoKind::Geoip,
+            url: vec![
+                "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat".into(),
+            ],
+            via: GeoVia::Direct,
+        };
+        let mut meta = MetaFile::default();
+        let dat = d.join("ls-geoip.dat");
+
+        // ── ① 冷下载 ──
+        update_one(dir, &src, None, 7, &mut meta).await.expect("冷下载应成功");
+        assert!(dat.exists(), "应落地 .dat");
+        let n = crate::router::geo::count_categories(&dat).unwrap();
+        assert!(n > 100, "真实 geoip 应有几百个分类, 实际 {n}");
+        let m0 = meta.sources.get("ls-geoip").expect("应记下元数据");
+        let has_validator = m0.validators.etag.is_some() || m0.validators.last_modified.is_some();
+        eprintln!(
+            "① 冷下载 OK: {} 分类, {} 字节, etag={:?}, last_modified={:?}",
+            n,
+            std::fs::metadata(&dat).unwrap().len(),
+            m0.validators.etag,
+            m0.validators.last_modified
+        );
+        assert!(m0.downloaded_at > 0, "应记下 downloaded_at");
+        let mtime1 = std::fs::metadata(&dat).unwrap().modified().unwrap();
+
+        // ── ② 立刻再跑: 新鲜度命中, 不该发请求也不该重写文件 ──
+        update_one(dir, &src, None, 7, &mut meta).await.expect("新鲜路径应成功");
+        let mtime2 = std::fs::metadata(&dat).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "新鲜期内文件被重写了 —— 新鲜度判据没生效");
+        eprintln!("② 新鲜跳过 OK (文件未被重写)");
+
+        // ── ③ 把 downloaded_at 拨老, 强制走条件请求 ──
+        if !has_validator {
+            eprintln!("⚠️ 上游未返回 ETag/Last-Modified, 跳过 304 验证 (条件请求无从谈起)");
+            return;
+        }
+        meta.sources.get_mut("ls-geoip").unwrap().downloaded_at = now_secs() - 100 * 86_400;
+        update_one(dir, &src, None, 7, &mut meta).await.expect("条件请求路径应成功");
+        let mtime3 = std::fs::metadata(&dat).unwrap().modified().unwrap();
+        if mtime3 == mtime2 {
+            eprintln!("③ 304 OK: 上游未变更, 本地文件未被重写 (省掉一次全量下载)");
+        } else {
+            // 不算失败 —— 上游可能刚好发了新版本。但要如实报出来, 免得当成 304 生效。
+            eprintln!("③ 上游返回了新内容 (文件被重写) —— 本次未覆盖到 304 路径");
+        }
+        assert!(
+            meta.sources.get("ls-geoip").unwrap().downloaded_at > now_secs() - 60,
+            "无论 304 还是重下, downloaded_at 都必须刷新, 否则每周期都会重复问"
+        );
     }
 
     /// 新鲜度判据: 刚落地的文件不该被重复下载。
