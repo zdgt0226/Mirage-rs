@@ -773,14 +773,16 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::Dns { listen, port, .. } => {
+            crate::config::InboundConfig::Dns { tag, listen, port } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                let dns_tag: std::sync::Arc<str> = tag.as_str().into();
                 let st_for_dns = state_clone.clone();
                 let fm_for_dns = fake_mapper_clone.clone();
                 let xdp_for_dns = xdp_engine.clone();
                 tokio::spawn(async move {
-                    if let Ok(addr) = listen_addr.parse() {
+                    if let Ok(addr) = listen_addr.parse::<std::net::SocketAddr>() {
                         let _ = crate::dns::server::DnsForwarder::start(
+                            dns_tag,
                             addr,
                             st_for_dns,
                             fm_for_dns,

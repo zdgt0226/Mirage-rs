@@ -227,6 +227,7 @@ pub async fn handle_client(
             ebpf_engine,
             fake_ip_mapper,
             inbound_tag,
+            false,
         ).await;
     }
 }

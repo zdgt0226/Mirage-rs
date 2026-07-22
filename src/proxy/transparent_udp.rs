@@ -319,6 +319,7 @@ fn parse_udp_frame_payload(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
 }
 
 pub async fn start_transparent_udp(
+    inbound_tag: Arc<str>,
     listen_addr: SocketAddrV4,
     state: Arc<ArcSwap<CoreState>>,
     fake_ip_mapper: Arc<FakeIpMapper>,
@@ -410,8 +411,9 @@ pub async fn start_transparent_udp(
             let fm = fake_ip_mapper.clone();
             let sessions = sessions.clone();
             let replies = replies.clone();
+            let tg = inbound_tag.clone();
             tokio::spawn(async move {
-                setup_flow(client, orig_dst, payload, st, fm, sessions, replies).await;
+                setup_flow(client, orig_dst, payload, st, fm, sessions, replies, tg).await;
             });
         }
     }
@@ -426,6 +428,9 @@ async fn setup_flow(
     fake_ip_mapper: Arc<FakeIpMapper>,
     sessions: Sessions,
     replies: Replies,
+    // 本流来自哪个入站。TCP 侧已经带上, UDP 侧不带的话同一个 transparent 入站会出现
+    // "TCP 认 inbound 规则、UDP 不认" —— 同一个站点两个出口 IP, 且完全无声。
+    inbound_tag: Arc<str>,
 ) {
     let key = (client, orig_dst);
     // RAII 清理: 早退清占位, commit 后清完整会话。始终保证执行 (含 panic)。
@@ -463,7 +468,7 @@ async fn setup_flow(
         protocol: "udp",
         source_ip: Some(IpAddr::V4(*client.ip())),
         source_mac: None,
-        inbound: None,
+        inbound: Some(&inbound_tag),
     };
     match &domain {
         Some(d) => req.domain = Some(d.as_str()),
