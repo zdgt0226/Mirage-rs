@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-07-23T01:32:15"
+updated: "2026-07-23T03:13:04"
 ---
 
 # Roadmap
@@ -39,6 +39,7 @@ updated: "2026-07-23T01:32:15"
 |---|---|---|
 | **rule-set 远程规则集 + 自动更新** | 路由生态 | 主流(sing-box `.srs` / mihomo rule-provider)有, 我们要手动放 geo 文件, 是维护成本大头。**但先想清安全模型**: 规则文件决定流量去哪, 被篡改 = 静默导向错误出口。须 HTTPS + 哈希/签名固定、**更新失败保留旧规则**(不可静默降级为无规则)、更新后先验证再原子切换 |
 | **process_name 分流** | 路由维度 | 客户端刚需("Telegram 走代理、微信直连")。已有 cgroup/connect4 的 eBPF 基础, 拿 pid→进程名比 procfs 扫描干净。见 [[routing-rules]] |
+| **指纹 profile 热下发** | 抗识别 | 服务端下发新 ClientHello profile, 免客户端发版。**数据侧可热更(我们 TLS 是假的, key_share 等填随机字节)**, 代码侧用预置编码器 + 数据选择。⚠️ 自动切最新 Chrome 反而更易识别 —— 要按装机份额且错开切换。详见 [[fingerprint-hot-update]] |
 | TLS resumption | 破坏性协议变更 | 零会话复用是真实统计指纹;工装已就绪, 两端需同时升级。见 [[tls-fingerprint-mimicry]] |
 | ICMP 处理 | 体验缺口 | ping/traceroute 被代理域名不通。**失败形态未在真机确认, 用户明确说等部署网关时再定** |
 | IPv6 全栈 | 结构性 | 见 [[ipv6-v4only-tradeoff]] |
