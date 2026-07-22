@@ -21,16 +21,16 @@ pub enum UpstreamOutlet {
 pub struct WgUpstream {
     pub cfg: Arc<crate::proxy::wg::WgConfig>,
     tunnel: tokio::sync::OnceCell<Arc<crate::proxy::wg::tunnel::WgTunnel>>,
-    /// UDP 是否拒绝中继。见 [`crate::config::UdpPolicy`]。
-    pub block_udp: bool,
+    /// UDP 策略。见 [`crate::config::UdpPolicy`]。
+    pub udp: crate::config::UdpPolicy,
 }
 
 impl WgUpstream {
-    pub fn new(cfg: crate::proxy::wg::WgConfig, block_udp: bool) -> Self {
+    pub fn new(cfg: crate::proxy::wg::WgConfig, udp: crate::config::UdpPolicy) -> Self {
         Self {
             cfg: Arc::new(cfg),
             tunnel: tokio::sync::OnceCell::new(),
-            block_udp,
+            udp,
         }
     }
 
@@ -48,15 +48,28 @@ impl WgUpstream {
 }
 
 impl UpstreamOutlet {
-    /// 配了上游时是否拒绝 UDP 中继。
+    /// 配了上游时的 UDP 策略。
     ///
-    /// 两种上游目前都默认拒绝, 理由相同: UDP 尚未接到上游通道上, 放行会让 UDP 从
-    /// **本机 IP** 直连出去而 TCP 从上游出去 —— 出口 IP 不一致, 对落地解锁是功能性错误。
-    pub fn block_udp(&self) -> bool {
+    /// - SS: UDP 未实现, 默认 `Block` —— 放行会让 UDP 从**本机 IP** 出去而 TCP 从上游出去,
+    ///   出口 IP 不一致, 对落地解锁是功能性错误。
+    /// - WireGuard: 默认 `Tunnel` —— WG 隧道能承载 UDP, 出口与 TCP 完全一致, 上面那个
+    ///   理由不成立, 所以没必要拒绝。
+    pub fn udp_policy(&self) -> crate::config::UdpPolicy {
         match self {
-            Self::Shadowsocks(ss) => ss.block_udp,
-            Self::Wireguard(wg) => wg.block_udp,
+            Self::Shadowsocks(ss) => {
+                if ss.block_udp {
+                    crate::config::UdpPolicy::Block
+                } else {
+                    crate::config::UdpPolicy::Direct
+                }
+            }
+            Self::Wireguard(wg) => wg.udp,
         }
+    }
+
+    /// 是否拒绝 UDP 中继。
+    pub fn block_udp(&self) -> bool {
+        matches!(self.udp_policy(), crate::config::UdpPolicy::Block)
     }
 
     /// 供日志用的简短描述。

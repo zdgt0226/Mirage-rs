@@ -82,20 +82,29 @@ pub(super) async fn dispatch_authenticated(
 
     if first_chunk.len() == 1 && first_chunk[0] == 0x00 {
         // UDP Mode.
-        // 配了上游出口且策略为 block 时直接拒绝: SS 的 UDP 尚未实现, 放行意味着 UDP 会从
-        // 本机 IP 直连出去, 而 TCP 从上游出去 —— 出口 IP 不一致。对落地解锁场景这是功能性
-        // 错误 (QUIC 会"成功"但用错 IP, 不像被封那样回落 TCP)。这里直接断开, 让客户端立刻
-        // 知道 UDP 不可用, 而不是静默走错出口。
+        // 策略为 block 时直接拒绝, 让客户端立刻知道 UDP 不可用, 而不是静默走错出口。
+        //
+        // SS 上游默认如此: SS 的 UDP 未实现, 放行会让 UDP 从本机 IP 出去而 TCP 从上游出去 ——
+        // 出口 IP 不一致, 对落地解锁是功能性错误 (QUIC 会"成功"但用错 IP, 不像被封那样回落 TCP)。
+        // WG 上游**默认不走这里**: 隧道能承载 UDP, 出口与 TCP 一致, 默认策略是 tunnel。
         if upstream.as_ref().is_some_and(|u| u.block_udp()) {
+            let up = upstream.as_ref().unwrap();
             tracing::warn!(
-                "拒绝 UDP 中继: 已配置 SS 上游出口且 udp=block (默认)。\
-                 SS 的 UDP 未实现, 放行会让 UDP 从本机 IP 出去而与 TCP 出口不一致。\
-                 确需旧行为请在 upstream 里设 \"udp\": \"direct\"。"
+                "拒绝 UDP 中继: 上游 {} 的 udp 策略为 block。{}",
+                up.describe(),
+                match &**up {
+                    crate::proxy::upstream::UpstreamOutlet::Shadowsocks(_) =>
+                        "SS 的 UDP 未实现; 放行会让 UDP 从本机 IP 出去而与 TCP 出口不一致。\
+                         确需旧行为请设 \"udp\": \"direct\"。",
+                    crate::proxy::upstream::UpstreamOutlet::Wireguard(_) =>
+                        "注意 WG 隧道本可承载 UDP (默认即 \"tunnel\", 与 TCP 同出口), \
+                         这里是你显式设了 block。",
+                }
             );
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         let target_len = u16::from_be_bytes([first_chunk[0], first_chunk[1]]) as usize;

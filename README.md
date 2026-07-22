@@ -169,8 +169,11 @@ WireGuard 可以用在**两个位置**:
 > ⚠️ **隧道内没有 DNS**: 域名在本机解析后才把 IP 送进隧道, 即 DNS 查询**不经** WG。
 > "只想让某些流量换出口"够用; 若指望同时隐藏 DNS 或拿到对端地区的 CDN 解析结果, 当前做不到。
 >
-> ⚠️ 服务端上游的 `udp` 同样**默认 `block`**: 服务端的 UDP 中继尚未接到 WG 隧道上。
-> (客户端出站的 TCP 与 UDP **都**已走隧道, 不受此限。)
+> 📌 服务端上游的 `udp` **默认 `tunnel`** —— UDP 也走 WG 隧道, **与 TCP 同一个出口 IP**。
+> 这与 SS 上游默认 `block` 不同, 因为 block 的理由(UDP 从本机 IP 出去、与 TCP 出口不一致)
+> 在 WG 上不成立: 隧道本就跑 IP 包, 天然能承载 UDP。
+> 想禁用写 `"udp": "block"`; 想让 UDP 绕过隧道走本机写 `"udp": "direct"`(会 WARN)。
+> 给 **SS** 上游写 `"udp": "tunnel"` 会被 `check` 拦下 —— SS 的 UDP 尚未实现。
 
 **实现说明**: WG 是 L3 IP 包协议, 隧道里跑的不是字节流。因此内部用
 [`boringtun`](https://github.com/cloudflare/boringtun)(Noise IK 握手/加解密)+

@@ -163,6 +163,19 @@ README 的 "≥5.10" 声明, 本地是 6.1; build.yml 里就记着实例(orphan 
 
 修复后本地 CI 全绿, 且**对真实 WG 服务端的四层验证重跑仍全部通过**。
 
+### 服务端 UDP 中继接入 WireGuard 上游
+此前服务端的 UDP 中继**硬绑本机 `UdpSocket`** —— 配了上游也照样从本机 IP 出去, 正因如此它
+一直被 `udp: block` 挡着。现在抽出 `UdpEgress` 出口层并接到 WG 隧道:
+
+- 新增 `UdpPolicy::Tunnel`, **WG 上游的 `udp` 默认改为 `tunnel`**。默认变更是有依据的:
+  block 的唯一理由是"UDP 从本机 IP 出去、与 TCP 出口不一致", 而 WG 隧道本就跑 IP 包、
+  天然承载 UDP, 这个理由不成立。SS 上游默认仍是 `block`(其 UDP 确实未实现)。
+- 给 SS 上游写 `"udp": "tunnel"` 会在 `check` 阶段报错, 不静默降级。
+- 拒绝 UDP 时的日志按上游类型分别说明 —— 原文案写死"SS 的 UDP 尚未实现", 对 WG 已不准确。
+
+真机验证 `examples/verify_wg_upstream_udp.rs`: 经真实 WG 上游发 DNS 查询并收到含回答记录的
+响应。**这条链路任何一环接错都会退化成"从本机 IP 出去"而不报错**, 单测覆盖不到, 故单独验。
+
 ### 待完成
 - 服务端 UDP 中继接到 WG 隧道 (届时可把上游 udp 默认改为放行)。
 - 隧道内 DNS (当前域名在本机解析, DNS 不经 WG)。

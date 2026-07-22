@@ -103,7 +103,8 @@ pub enum UpstreamConfig {
         mtu: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistent_keepalive: Option<u16>,
-        #[serde(default)]
+        /// 默认 `tunnel` (UDP 也走 WG 隧道, 与 TCP 同出口)。
+        #[serde(default = "default_wg_udp")]
         udp: UdpPolicy,
     },
 }
@@ -128,6 +129,19 @@ pub enum UdpPolicy {
     /// 保持旧行为: UDP 从本机直连出去。**出口 IP 与 TCP 不同**, 仅在你确认
     /// 不介意(例如上游只为绕路而非隐藏出口)时才选。
     Direct,
+    /// UDP 也走上游隧道, 与 TCP 同一个出口。
+    ///
+    /// 仅 WireGuard 上游支持 (WG 隧道本就跑 IP 包, UDP 天然可承载); SS 的 UDP 是另一套
+    /// 包格式、尚未实现, 给 SS 配这个会在 check 阶段报错而不是静默降级。
+    Tunnel,
+}
+
+/// WireGuard 上游的 UDP 默认策略 = 走隧道。
+///
+/// 与 SS 上游默认 `block` 不同, 因为 block 的理由 (UDP 从本机 IP 出去、与 TCP 出口不一致)
+/// 在 WG 上**不成立** —— WG 隧道能承载 UDP, 出口与 TCP 完全一致。
+fn default_wg_udp() -> UdpPolicy {
+    UdpPolicy::Tunnel
 }
 
 /// SOCKS5 / HTTP 入站的认证凭据 (可选)。
@@ -705,6 +719,14 @@ impl Config {
                         issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.mtu {mtu} 非法"));
                     }
                 }
+                if let Some(UpstreamConfig::Shadowsocks { udp, .. }) = upstream {
+                    if matches!(udp, UdpPolicy::Tunnel) {
+                        issues.push(format!(
+                            "mirage_server 入站 `{tag}` 的 upstream.udp 不能是 `tunnel`: \
+                             SS 的 UDP 是另一套包格式, 尚未实现。用 `block`(默认) 或 `direct`。"
+                        ));
+                    }
+                }
                 if let Some(UpstreamConfig::Shadowsocks {
                     server, server_port, password: ss_pw, method, ..
                 }) = upstream
@@ -1090,8 +1112,29 @@ mod wg_upstream_tests {
             matches!(&*outlet, crate::proxy::upstream::UpstreamOutlet::Wireguard(_)),
             "应是 WireGuard 出口"
         );
-        // UDP 默认必须 block (服务端 UDP 中继尚未接到 WG 隧道, 放行会出口 IP 不一致)
-        assert!(outlet.block_udp(), "WG 上游的 UDP 默认应为 block");
+        // WG 上游的 UDP 默认走隧道 —— 与 SS 上游默认 block 不同, 因为 block 的理由
+        // (UDP 从本机 IP 出去、与 TCP 出口不一致) 在 WG 上不成立: 隧道能承载 UDP。
+        assert_eq!(
+            outlet.udp_policy(),
+            UdpPolicy::Tunnel,
+            "WG 上游的 UDP 默认应为 tunnel (与 TCP 同出口)"
+        );
+        assert!(!outlet.block_udp(), "默认不该拒绝 UDP");
+    }
+
+    /// SS 上游不能配 `udp: "tunnel"` —— SS 的 UDP 是另一套包格式, 尚未实现。
+    /// 必须在 check 阶段报错, 而不是静默按某个默认行为跑。
+    #[test]
+    fn shadowsocks_upstream_rejects_tunnel_udp() {
+        let cfg = cfg_with_upstream(
+            r#"{ "type": "shadowsocks", "server": "h", "server_port": 8388,
+                 "password": "p", "method": "aes-256-gcm", "udp": "tunnel" }"#,
+        );
+        let issues = cfg.semantic_issues();
+        assert!(
+            issues.iter().any(|i| i.contains("tunnel")),
+            "SS 上游配 udp=tunnel 应被拦下: {issues:?}"
+        );
     }
 
     /// 上游 WG 配错必须在 check 阶段就拦下 (而非留到每条连接静默失败)。

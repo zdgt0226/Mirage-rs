@@ -14,20 +14,76 @@ use tracing::{debug, error};
 /// 流更短, 且客户端透明 UDP 自身 60s idle 即拆, 300s 只作服务端兜底不误杀活跃流)。
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// UDP 中继的出口。
+///
+/// `Direct` = 从本机 IP 发出去 (不配上游、或上游 udp=direct);
+/// `Wireguard` = 经 WG 隧道发出去, **与 TCP 同一个出口 IP** —— 这正是配中转的本意。
+enum UdpEgress {
+    Direct(Arc<UdpSocket>),
+    Wireguard(Arc<crate::proxy::wg::socket::WgUdpSocket>),
+}
+
+impl UdpEgress {
+    async fn send_to(&self, payload: &[u8], addr: std::net::SocketAddr) -> std::io::Result<()> {
+        match self {
+            Self::Direct(s) => s.send_to(payload, addr).await.map(|_| ()),
+            // 隧道侧是同步入队 (数据进 smoltcp 缓冲后由 pump 加密发出), 不阻塞。
+            Self::Wireguard(s) => s
+                .send_to(payload, addr)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        }
+    }
+
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+        match self {
+            Self::Direct(s) => s.recv_from(buf).await,
+            Self::Wireguard(s) => s
+                .recv_from(buf)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        }
+    }
+}
+
 pub(super) async fn handle_udp_relay(
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>
+    writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) {
     debug!("Mirage Server: Started UDP relay session");
 
-    // Bind an ephemeral UDP socket for sending/receiving
-    let udp_socket = match UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!("Failed to bind server UDP socket: {}", e);
-            return;
+    // 上游是 WG 且策略为 tunnel → UDP 也走隧道, 出口与 TCP 一致。否则从本机直发。
+    let egress = match upstream.as_deref() {
+        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(wg))
+            if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) =>
+        {
+            let tunnel = match wg.tunnel().await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!("UDP 中继: 建立 WG 上游隧道失败: {}", e);
+                    return;
+                }
+            };
+            match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
+                Ok(s) => UdpEgress::Wireguard(Arc::new(s)),
+                Err(e) => {
+                    error!("UDP 中继: 隧道内绑 UDP 失败: {}", e);
+                    return;
+                }
+            }
         }
+        _ => match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => UdpEgress::Direct(Arc::new(s)),
+            Err(e) => {
+                error!("Failed to bind server UDP socket: {}", e);
+                return;
+            }
+        },
     };
+    let udp_socket = Arc::new(egress);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let udp_clone = udp_socket.clone();
