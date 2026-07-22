@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-07-22T16:13:36"
+updated: "2026-07-23T01:32:15"
 ---
 
 # Roadmap
@@ -22,6 +22,12 @@ updated: "2026-07-22T16:13:36"
   为何不顺势做 Tailscale 见 [[tailscale-support-deferred]]
 - **裸 IP 目标按域名分流**(2026-07-22): SNI/Host 嗅探从 transparent 扩到全部入站,
   解决"app 自己解析完送 IP 导致 domain_suffix/geosite 规则全失效"。见 [[routing-rules]]
+- **路由 `inbound` 维度**(2026-07-23): 规则可按入站 tag 限定, 支持"同一域名从不同入站走
+  不同出口"。已穿透 socks / mixed / transparent(TCP+UDP)/ dns 全部入站。
+  ⚠️ 固有语义: DNS 查询来自 dns 入站, 故 `{"inbound":"tproxy"}` 的规则不影响 fake-IP 决策
+- **geo 更新器对齐 Python 前身**(2026-07-23): 重启不重下(meta.json 记 downloaded_at)、
+  条件请求 ETag/304(真机证实 GitHub release assets 支持)、多镜像 fallback、
+  落地前校验内容(数分类数而非看大小)、超时拆三段(实测同链路速度差一个数量级)
 - **配置工具链**: `check`(重启前闸门)/ `format` / `import`; 启动时配置校验(未知字段 + 引用完整性)
 - **入站认证**: SOCKS5(RFC 1929)/ HTTP(Basic), 修默认开放代理
 - **工程债已清**: 死代码 `mss_clamp.elf` 已删; 本地 CI 脚本 `scripts/ci-local.sh`(feature 分支不触发 workflow)
@@ -38,7 +44,7 @@ updated: "2026-07-22T16:13:36"
 | IPv6 全栈 | 结构性 | 见 [[ipv6-v4only-tradeoff]] |
 | SS 上游 UDP | 生态 | 需求驱动: 多数 SS 服务器默认不开 UDP 且无握手, 实现了不等于能用。见 [[ss-upstream-relay]]。**注: WG 上游的 UDP 已通**, 要 UDP 同出口可直接用 WG |
 | 订阅链接 | 生态 | 基础已有(node_uri + import), 但**订阅格式本身要先定义**才动手 |
-| inbound tag 匹配 | 路由维度 | 多入站部署才有意义, 看实际需求 |
+| SOCKS5 UDP ASSOCIATE 不走路由 | 路由维度 | 既有行为: 直接用 `default_outbound`, 完全绕过规则。审查时发现, 非本次回归 |
 | orphan 验证器接回 CI | 工程债 | 需先拿到 runner 日志访问权。见 [[orphan-filter-blackhole]] |
 
 ## 评估过但**不做**的(避免重复讨论)
