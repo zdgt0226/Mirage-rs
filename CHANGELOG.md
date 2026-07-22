@@ -130,6 +130,39 @@ README 的 "≥5.10" 声明, 本地是 6.1; build.yml 里就记着实例(orphan 
 > 同样不通、而 L1.6 打网关却有回应 —— 由此判定病灶在**服务端未开出网转发**而非本项目代码,
 > 换隧道内可达靶子后全绿。没有这层分诊断, 很容易误判成自己的 bug 并瞎改。
 
+### 转正式 PR 前的审查修复 (含 Sonnet 独立复核)
+自审 + 换用另一个模型独立复核, 修掉 6 个真问题。**其中 4 个只在真实负载/异常路径下暴露,
+现有测试与真机验证全绿也照样查不出来** —— 这正是换模型复核的价值。
+
+1. **`Drop` 从来没真的发出过 FIN** (`wg/socket.rs`)。smoltcp 的 `close()` 只改状态**不发包**,
+   FIN 是 `Interface::poll` 遍历**仍在 SocketSet 里**的 socket 时才生成的。旧实现在同一个
+   临界区里 `close()` 后立刻 `remove()`, 等 `poll_now()` 跑到时 socket 早没了 —— 对端只能
+   干等自己的超时。顺序改为 close → poll → remove。
+2. **服务端 WG 中转的"半关闭"是假的** (`mirage_server/tcp_relay.rs`)。`tokio::io::split` 把
+   stream 放进 `Arc<Mutex<_>>`, drop 掉一半只减引用计数, 底层 `Drop` 要**两半都 drop** 才跑。
+   于是上行结束后下行仍阻塞在读上, 一直挂到 1800s 超时, 每条连接钉住一个 task + 128KB 缓冲
+   —— 正是本文件头部注释里说的"僵尸泄漏"那一类, 而当初的提交信息还写着"效果等价"。
+   改用新增的 `WgStreamCloser`: smoltcp 在 `async` feature 下 `set_state` 会 wake rx/tx waker,
+   `abort()` 因此能叫醒另一个任务里阻塞的读 —— 这是 `libc::shutdown(SHUT_RDWR)` 的等价物。
+3. **建连没有超时**。smoltcp 没调 `set_timeout`, SynSent 会以退避 RTO 无限重传、状态机自己
+   永不退出; `wait_connected` 又只轮询状态。结果是连一个被丢包的目标就把调用任务和它那
+   128KB 缓冲**永久**钉死。加 15s 建连超时 (只管建连, 不设空闲超时 —— 否则代理里合法的
+   长空闲连接如 SSH 会被误杀)。
+4. **本地端口随机分配的碰撞**。端口空间约 64K, 随机取在 500 条并发时碰撞概率已达 **86%**;
+   smoltcp 按 (本地端口, 对端) 首个匹配派发, 同端口且同目标的两条连接会让数据串到另一条上,
+   输的那条被静默饿死。代理大量连接打同一个热门目标, 这不是理论风险。改为顺序分配。
+   (TCP/UDP 两处都有)
+5. **`poll_read` 排空缓冲后没驱动 smoltcp**: 窗口更新/ACK 只在 poll 时产出, 漏了这步对端要等
+   下一次 pump 事件 (收包或 250ms tick) 才知道窗口腾开, 持续下载时吞吐被钉在"每 tick 一个
+   窗口"的量级。
+6. README 补 WireGuard 章节 —— 此前 README/templates/install.sh **完全没提**这个功能, 用户
+   根本发现不了。
+
+复核未发现问题的方面 (已逐项确认): MTU/缓冲一致性、持锁跨 await、waker 注册完整性、
+`Drop` 的 panic/死锁、队列封顶、`poll_read` 的 Pending-vs-EOF 判定。
+
+修复后本地 CI 全绿, 且**对真实 WG 服务端的四层验证重跑仍全部通过**。
+
 ### 待完成
 - 服务端 UDP 中继接到 WG 隧道 (届时可把上游 udp 默认改为放行)。
 - 隧道内 DNS (当前域名在本机解析, DNS 不经 WG)。

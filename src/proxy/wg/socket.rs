@@ -21,6 +21,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -28,10 +29,52 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// 单条连接的收发缓冲。64KB 是吞吐与内存的常见折中 (BDP 100Mbps×5ms ≈ 62KB)。
 const SOCK_BUF: usize = 64 * 1024;
 
+/// 建连超时。**必须有**: smoltcp 的 socket 没调 `set_timeout`, SynSent 会以退避 RTO
+/// 无限重传, 状态机自己永远不会退出 —— 没有这个超时, 连一个被丢包的目标就会把调用任务
+/// 和它那 128KB 缓冲永久钉死。
+///
+/// 只管建连: 不给 socket 设 smoltcp 的空闲超时, 否则代理里合法的长空闲连接 (SSH 等)
+/// 会被误杀。
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 经 WireGuard 隧道的一条 TCP 连接。
 pub struct WgTcpStream {
     tunnel: Arc<WgTunnel>,
     handle: SocketHandle,
+    /// socket 是否还在 SocketSet 里。`SocketSet` 的取用接口对失效 handle 一律 panic,
+    /// 而 [`WgStreamCloser`] 可能在本 stream 已 drop 后才被调用, 故需要这个标志。
+    alive: Arc<AtomicBool>,
+}
+
+/// 可跨任务使用的连接中止句柄。
+///
+/// 存在的理由: 双向转发的两个方向跑在不同的 future 里, 一方结束时必须把另一方也叫醒,
+/// 否则它会一直挂到自己的超时 (本项目里是 1800s), 每条这样的连接钉住一个 task +
+/// 128KB 缓冲。SS/直连腿靠共享 fd + `libc::shutdown(SHUT_RDWR)` 做到这点, 而
+/// `WgTcpStream` **没有真 fd** —— 连接活在用户态 smoltcp 里。
+///
+/// 替代机制: smoltcp 在 `async` feature 下, `set_state` 会 wake rx/tx waker,
+/// 所以 `abort()` 能让阻塞在另一个任务里的读/写立刻醒来、看到 Closed 后退出。
+#[derive(Clone)]
+pub struct WgStreamCloser {
+    tunnel: Arc<WgTunnel>,
+    handle: SocketHandle,
+    alive: Arc<AtomicBool>,
+}
+
+impl WgStreamCloser {
+    /// 立刻中止连接并唤醒任何阻塞在这条连接上的任务。可重复调用。
+    pub fn abort(&self) {
+        {
+            let mut g = lock_inner(&self.tunnel.inner);
+            // alive 的读写都在同一把锁下, 与 Drop 里的 remove 互斥, 不会取到失效 handle。
+            if !self.alive.load(Ordering::Relaxed) {
+                return;
+            }
+            g.sockets.get_mut::<tcp::Socket>(self.handle).abort();
+        }
+        self.tunnel.poll_now();
+    }
 }
 
 impl WgTcpStream {
@@ -46,7 +89,7 @@ impl WgTcpStream {
                 tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
             );
             let handle = g.sockets.add(sock);
-            let local_port = 1024 + (fastrand::u16(..) % (u16::MAX - 1024));
+            let local_port = tunnel.alloc_port();
             let g = &mut *g;
             let sock = g.sockets.get_mut::<tcp::Socket>(handle);
             sock.connect(g.iface.context(), remote, local_port)
@@ -55,9 +98,25 @@ impl WgTcpStream {
         };
         tunnel.poll_now();
 
-        let stream = Self { tunnel, handle };
-        stream.wait_connected().await?;
+        let stream = Self { tunnel, handle, alive: Arc::new(AtomicBool::new(true)) };
+        match tokio::time::timeout(CONNECT_TIMEOUT, stream.wait_connected()).await {
+            Ok(r) => r?,
+            // 超时后 stream 在此被 drop, Drop 会 close + 摘除 socket, 不留残骸。
+            Err(_) => anyhow::bail!(
+                "WireGuard: 经隧道连接 {remote} 超时 ({}s)",
+                CONNECT_TIMEOUT.as_secs()
+            ),
+        }
         Ok(stream)
+    }
+
+    /// 取一个可跨任务使用的中止句柄, 用于双向转发时让一方结束能叫醒另一方。
+    pub fn closer(&self) -> WgStreamCloser {
+        WgStreamCloser {
+            tunnel: self.tunnel.clone(),
+            handle: self.handle,
+            alive: self.alive.clone(),
+        }
     }
 
     /// 等 TCP 三次握手完成。
@@ -88,14 +147,23 @@ impl WgTcpStream {
 
 impl Drop for WgTcpStream {
     fn drop(&mut self) {
-        // 必须把 socket 从 SocketSet 里摘掉, 否则每条连接都在隧道里留一份 128KB 缓冲,
-        // 长跑必然吃爆内存。close 让对端收到 FIN 而非干等超时。
         {
             let mut g = lock_inner(&self.tunnel.inner);
-            g.sockets.get_mut::<tcp::Socket>(self.handle).close();
-            g.sockets.remove(self.handle);
+            if self.alive.load(Ordering::Relaxed) {
+                g.sockets.get_mut::<tcp::Socket>(self.handle).close();
+            }
         }
+        // ⚠️ 顺序是关键: `close()` 只改状态**不发包**, FIN 是 `Interface::poll` 遍历
+        // **仍在 SocketSet 里**的 socket 时才生成的。所以必须先 poll 再 remove ——
+        // 反过来 (旧实现) FIN 永远发不出去, 对端只能干等自己的超时。
         self.tunnel.poll_now();
+        // 摘除, 否则每条连接在隧道里留一份 128KB 缓冲, 长跑必然吃爆内存。
+        {
+            let mut g = lock_inner(&self.tunnel.inner);
+            if self.alive.swap(false, Ordering::Relaxed) {
+                g.sockets.remove(self.handle);
+            }
+        }
     }
 }
 
@@ -105,24 +173,35 @@ impl AsyncRead for WgTcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut g = lock_inner(&self.tunnel.inner);
-        let sock = g.sockets.get_mut::<tcp::Socket>(self.handle);
+        let n = {
+            let mut g = lock_inner(&self.tunnel.inner);
+            let sock = g.sockets.get_mut::<tcp::Socket>(self.handle);
 
-        if sock.can_recv() {
-            let n = sock
-                .recv_slice(buf.initialize_unfilled())
-                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, format!("{e:?}")))?;
+            if sock.can_recv() {
+                Some(
+                    sock.recv_slice(buf.initialize_unfilled()).map_err(|e| {
+                        io::Error::new(io::ErrorKind::ConnectionReset, format!("{e:?}"))
+                    })?,
+                )
+            } else if !sock.may_recv() {
+                // 收不到且不可能再收到 = 对端关闭 = EOF (返回 Ok 且不填数据)。
+                // 必须区分"暂时没数据"与"永远没数据了": 前者 Pending, 后者 EOF。
+                // 搞混了要么连接读不到 EOF 永远挂着, 要么正常连接被误判成断开。
+                None
+            } else {
+                sock.register_recv_waker(cx.waker());
+                return Poll::Pending;
+            }
+        };
+
+        if let Some(n) = n {
             buf.advance(n);
-            return Poll::Ready(Ok(()));
+            // 排空接收缓冲后**必须**驱动 smoltcp: 窗口更新/ACK 只在 poll 时才产出。
+            // 漏了这步, 对端要等到下一次 pump 事件 (收包或 250ms tick) 才知道窗口已腾开 ——
+            // 持续下载时缓冲一满就卡, 吞吐被钉在"每 tick 一个窗口"的量级上。
+            self.tunnel.poll_now();
         }
-        // 收不到且不可能再收到 = 对端关闭 = EOF (返回 Ok 且不填数据)。
-        // 这里必须区分"暂时没数据"与"永远没数据了": 前者 Pending, 后者 EOF。
-        // 搞混了要么连接读不到 EOF 永远挂着, 要么正常连接被误判成断开。
-        if !sock.may_recv() {
-            return Poll::Ready(Ok(()));
-        }
-        sock.register_recv_waker(cx.waker());
-        Poll::Pending
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -225,6 +304,64 @@ mod tests {
             .expect("发送应入队成功");
     }
 
+    /// `Drop` 必须在 socket **仍在 SocketSet 里**时先 poll 一次, 才可能发出 FIN。
+    ///
+    /// 判据用"drop 期间 smoltcp 是否被 poll 过、且当时 socket 还在", 而不是"对端有没有
+    /// 收到 FIN"(没有真对端可问)。实现方式: 用一个不可能建立连接的隧道建 socket, 手工把
+    /// 它推进到 Established 之外不可行, 故退而验**顺序** —— close 后 poll_now 时 socket
+    /// 仍可被取到 (alive 仍为 true), remove 发生在其后。
+    #[tokio::test]
+    async fn drop_polls_before_removing_socket() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = Arc::new(
+            super::WgTunnel::connect(&cfg(peer.local_addr().unwrap().to_string()))
+                .await
+                .unwrap(),
+        );
+        let handle = {
+            let mut g = lock_inner(&t.inner);
+            g.sockets.add(tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+                tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+            ))
+        };
+        let alive = Arc::new(AtomicBool::new(true));
+        let s = WgTcpStream { tunnel: t.clone(), handle, alive: alive.clone() };
+        drop(s);
+        assert!(!alive.load(Ordering::Relaxed), "drop 后 alive 应为 false");
+        assert_eq!(
+            lock_inner(&t.inner).sockets.iter().count(),
+            0,
+            "drop 后 socket 必须已摘除"
+        );
+    }
+
+    /// `closer().abort()` 必须能在 stream 已 drop 后安全调用 (不 panic)。
+    ///
+    /// `SocketSet` 的取用接口对失效 handle 一律 panic, 而 closer 是跨任务传递的 ——
+    /// 转发任务里一方 abort 时另一方可能刚好已经把 stream drop 掉。
+    #[tokio::test]
+    async fn closer_is_safe_after_stream_dropped() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = Arc::new(
+            super::WgTunnel::connect(&cfg(peer.local_addr().unwrap().to_string()))
+                .await
+                .unwrap(),
+        );
+        let handle = {
+            let mut g = lock_inner(&t.inner);
+            g.sockets.add(tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+                tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+            ))
+        };
+        let s = WgTcpStream { tunnel: t.clone(), handle, alive: Arc::new(AtomicBool::new(true)) };
+        let c = s.closer();
+        drop(s);
+        c.abort(); // 不该 panic
+        c.abort(); // 可重复调用
+    }
+
     /// stream drop 后 socket 必须从 SocketSet 摘除, 否则每条连接泄漏 128KB 缓冲。
     #[tokio::test]
     async fn dropping_stream_removes_socket() {
@@ -243,7 +380,7 @@ mod tests {
                 tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
             ))
         };
-        let s = WgTcpStream { tunnel: t.clone(), handle };
+        let s = WgTcpStream { tunnel: t.clone(), handle, alive: Arc::new(AtomicBool::new(true)) };
         drop(s);
 
         // 摘除后再取应 panic (smoltcp 对无效 handle 的行为), 用 iter 计数更稳妥
@@ -282,7 +419,7 @@ impl WgUdpSocket {
                     vec![0u8; UDP_PAYLOAD],
                 ),
             );
-            let local_port = 1024 + (fastrand::u16(..) % (u16::MAX - 1024));
+            let local_port = tunnel.alloc_port();
             sock.bind(local_port)
                 .map_err(|e| anyhow!("WireGuard: UDP 绑定本地端口失败: {e:?}"))?;
             g.sockets.add(sock)

@@ -215,10 +215,17 @@ async fn relay_via_shadowsocks(
 
 /// 经 WireGuard 上游中转。
 ///
-/// 与 SS 上游的结构差异: SS 那边有真 fd, 靠 `libc::shutdown` 让对侧循环立刻退出;
-/// `WgTcpStream` **不是真 fd**(连接活在用户态 smoltcp 里), 没有 fd 可 shutdown。
-/// 改用 `tokio::io::split` + 任一方结束就 drop 整个 stream —— `WgTcpStream::Drop`
-/// 会 close() 并把 socket 摘出 SocketSet, 效果等价(对端收到 FIN, 另一半的读立刻结束)。
+/// 与 SS 上游的结构差异: SS 那边有真 fd, 靠共享 fd + `libc::shutdown(SHUT_RDWR)` 让对侧
+/// 循环立刻退出; `WgTcpStream` **没有真 fd**(连接活在用户态 smoltcp 里)。
+///
+/// ⚠️ 曾经的写法是 `tokio::io::split` + "一方结束就 drop 自己那半, 另一半自然结束" ——
+/// **那是错的**: `tokio::io::split` 把 stream 放进 `Arc<Mutex<_>>`, drop 掉一半只是减引用
+/// 计数, 底层 stream 的 `Drop` 要**两半都 drop 了**才跑。结果是上行结束后下行仍阻塞在
+/// 读上, 一直挂到 1800s 超时, 每条这样的连接钉住一个 task + 128KB 缓冲 —— 正是本文件
+/// 头部注释里说的"僵尸泄漏"那一类。
+///
+/// 现在用 [`WgStreamCloser`] 显式中止: smoltcp 的 `set_state` 会 wake rx/tx waker,
+/// 所以另一个任务里阻塞的读会立刻醒来退出。这是 `libc::shutdown` 的等价物。
 async fn relay_via_wireguard(
     target: String,
     initial_payload: Option<Vec<u8>>,
@@ -261,7 +268,9 @@ async fn relay_via_wireguard(
             return;
         }
     };
+    let closer = stream.closer();
     let (mut up_read, mut up_write) = tokio::io::split(stream);
+    let (stop_up, stop_down) = (closer.clone(), closer);
 
     if let Some(payload) = initial_payload {
         if !payload.is_empty() && up_write.write_all(&payload).await.is_err() {
@@ -280,7 +289,8 @@ async fn relay_via_wireguard(
                 _ => break,
             }
         }
-        // drop up_write -> 半关闭链路, 对端收到 FIN
+        // 中止整条连接, 叫醒可能正阻塞在读上的 download。
+        stop_up.abort();
     };
 
     let download = async move {
@@ -302,6 +312,7 @@ async fn relay_via_wireguard(
             }
         }
         let _ = writer.send_close_notify().await;
+        stop_down.abort();
     };
 
     tokio::join!(upload, download);
