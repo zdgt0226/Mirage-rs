@@ -99,15 +99,20 @@ pub async fn spawn_updater(handle: UpdaterHandle) {
             }
 
             info!("GeoUpdater: Starting periodic check for {} source(s).", snap.sources.len());
+            let mut meta = read_meta(&snap.geodata_dir);
             for source in &snap.sources {
                 let _ = update_one(
                     &snap.geodata_dir,
                     source,
                     snap.proxy_url.as_deref(),
                     snap.update_days,
+                    &mut meta,
                 )
                 .await;
             }
+            // 一轮结束统一落盘: 逐源写会放大 IO, 且中途崩溃时两种写法的损失一样
+            // (meta 丢了最多多下一次, 不影响正确性)。
+            write_meta(&snap.geodata_dir, &meta);
 
             // 用当前 update_days 决定 interval. drop snap 后再 sleep, 释放 Arc.
             // 防御性 clamp: 主 clamp 在 lib.rs 冷启动 + config_watcher::extract_updater_state
@@ -128,63 +133,139 @@ pub async fn spawn_updater(handle: UpdaterHandle) {
     });
 }
 
+/// 更新元数据: 每个源记下条件请求验证器与落地时间。
+///
+/// 存在的理由: ETag/Last-Modified 必须**跨进程重启**保留才有意义 —— 否则每次启动都是
+/// 无条件全量下载。`downloaded_at` 同理, 且比文件 mtime 更可靠 (304 时文件没被重写,
+/// mtime 不会变, 只有显式记一笔才能让新鲜度判据往前走)。
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct MetaFile {
+    #[serde(default)]
+    sources: std::collections::HashMap<String, SourceMeta>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct SourceMeta {
+    #[serde(default, flatten)]
+    validators: Validators,
+    /// Unix 秒。
+    #[serde(default)]
+    downloaded_at: u64,
+}
+
+fn meta_path(dir: &str) -> std::path::PathBuf {
+    Path::new(dir).join("meta.json")
+}
+
+/// 读元数据。任何问题 (不存在/损坏) 都退回空表 —— 元数据只是优化, 丢了最多多下一次。
+fn read_meta(dir: &str) -> MetaFile {
+    std::fs::read_to_string(meta_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// 原子写元数据 (tmp + rename), 写失败只记日志不影响主流程。
+fn write_meta(dir: &str, meta: &MetaFile) {
+    let path = meta_path(dir);
+    let tmp = path.with_extension("json.tmp");
+    match serde_json::to_vec_pretty(meta) {
+        Ok(bytes) => {
+            if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                return;
+            }
+            let _ = std::fs::remove_file(&tmp);
+            warn!("GeoUpdater: 写 meta.json 失败, 下次启动会退回无条件下载");
+        }
+        Err(e) => warn!("GeoUpdater: 序列化 meta.json 失败: {}", e),
+    }
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 async fn update_one(
     dir: &str,
     source: &GeoSource,
     proxy_url: Option<&str>,
     update_days: u32,
+    meta: &mut MetaFile,
 ) -> Result<()> {
     let filename = format!("{}.dat", source.name);
     let path = Path::new(dir).join(&filename);
     let tmp_path = Path::new(dir).join(format!("{}.tmp", filename));
+    let exists = path.exists();
 
-    // 已有文件且**足够新**就跳过 —— 用文件 mtime 当"上次下载时间"。
+    // ── 新鲜度: 够新就完全不发请求 ──
     //
-    // 少了这一步, 每次进程启动都会无条件重下全部源: 调配置反复重启、崩溃重启循环,
-    // 就是一次次几 MB 的重复下载; 弱网/走隧道时更慢, 还可能被 GitHub 限流。
-    // (Python 版用 meta.json 存 downloaded_at 解决同一问题; 这里用 mtime 免掉一个
-    //  额外的元数据文件 —— rename 后 mtime 就是落地时间, 语义等价。)
-    if let Some(age) = file_age(&path) {
-        let max_age = Duration::from_secs(update_days.max(1) as u64 * 86_400);
-        if age < max_age {
-            info!(
-                "GeoUpdater: {} 已是最新 (距上次下载 {:.1} 天 < {} 天), 跳过下载",
-                filename,
-                age.as_secs_f64() / 86_400.0,
-                update_days.max(1)
-            );
-            return Ok(());
+    // 少了这一步, 每次进程启动都会重下全部源 —— 调配置反复重启、崩溃重启循环, 就是一次次
+    // 几 MB 的重复下载; 弱网或走隧道时更慢, 还可能被上游 (GitHub) 限流。
+    // downloaded_at 优先取 meta (304 时文件没被重写, mtime 不动, 只有 meta 记得住);
+    // meta 丢了则退回文件 mtime。
+    let max_age = Duration::from_secs(update_days.max(1) as u64 * 86_400);
+    if exists {
+        let age = meta
+            .sources
+            .get(&source.name)
+            .filter(|m| m.downloaded_at > 0)
+            .map(|m| Duration::from_secs(now_secs().saturating_sub(m.downloaded_at)))
+            .or_else(|| file_age(&path));
+        if let Some(age) = age {
+            if age < max_age {
+                info!(
+                    "GeoUpdater: {} 已是最新 (距上次 {:.1} 天 < {} 天), 跳过",
+                    filename,
+                    age.as_secs_f64() / 86_400.0,
+                    update_days.max(1)
+                );
+                return Ok(());
+            }
         }
-        debug!(
-            "GeoUpdater: {} 距上次下载 {:.1} 天, 超过 {} 天, 重新下载",
-            filename, age.as_secs_f64() / 86_400.0, update_days.max(1)
-        );
     }
 
+    // ── 条件请求验证器: **仅当本地文件还在时**才带 ──
+    //
+    // 否则会出现"上游回 304 说你已是最新, 而本地 .dat 早被删了"的尴尬 —— 结果是永远
+    // 拿不到文件。(Python 版踩过同款, 明确注释了这点。)
+    let cond = if exists {
+        meta.sources.get(&source.name).map(|m| m.validators.clone())
+    } else {
+        None
+    };
+
     debug!(
-        "GeoUpdater: Downloading {} (kind={:?}, via={:?}) from {}",
-        source.name, source.kind, source.via, source.url
+        "GeoUpdater: 下载 {} (kind={:?}, via={:?}, {} 个镜像)",
+        source.name, source.kind, source.via, source.url.len()
     );
 
-    // Fetch with automatic fallback: via=proxy 失败时 (connect/HTTP error /
-    // body read error) 自动重试一次 direct. 大陆用户 config 默认 via=proxy
-    // 走 mirage 代理拿, 服务端出网了就能穿墙 GitHub; 代理不通时也仍能靠
-    // 直连拉回来 (至少偶尔 GitHub 直连能过).
-    let bytes = fetch_with_fallback(source, proxy_url).await?;
+    let (bytes, validators) = match fetch_with_fallback(source, proxy_url, cond.as_ref()).await? {
+        FetchOutcome::NotModified => {
+            // 上游没变: 不重下, 但要把"刚校验过"记一笔, 否则每个周期都会再问一次。
+            info!("GeoUpdater: {} 上游未变更 (304), 复用本地文件", filename);
+            let e = meta.sources.entry(source.name.clone()).or_default();
+            e.downloaded_at = now_secs();
+            return Ok(());
+        }
+        FetchOutcome::Body(b, v) => (b, v),
+    };
 
     // 写到 .tmp 再原子重命名, 避免下载中途文件损坏被读
     if !Path::new(dir).exists() {
         std::fs::create_dir_all(dir)?;
     }
     if let Err(e) = std::fs::write(&tmp_path, &bytes) {
-        error!("GeoUpdater: Failed to write tmp file for {}: {:?}", source.name, e);
+        error!("GeoUpdater: 写 {} 的临时文件失败: {:?}", source.name, e);
         return Err(anyhow!("Write tmp failed"));
     }
-    // ⚠️ **落地前先解析验证**: 能下下来 ≠ 是有效的 geo 数据。
+
+    // ⚠️ **落地前先校验**: 能下下来 ≠ 是有效的 geo 数据。
     //
-    // 只看大小挡不住"200 但返回 HTML 错误页 / 限流页"这类响应 —— 那种页面几 KB,
-    // 能过大小阈值, 却会直接覆盖掉本来好用的 .dat, 导致**规则集体失效**且只有下次
-    // 加载时才暴露。这里用真正的解析器过一遍, 解析不了就保留旧文件。
+    // 只看大小挡不住"200 但返回 HTML 错误页/限流页"这类响应 —— 那种页面几 KB, 能过大小
+    // 阈值, 却会直接覆盖掉本来好用的 .dat, 导致**规则集体失效**且只有下次加载时才暴露。
     if let Err(e) = validate_dat(&tmp_path, source.kind) {
         let _ = std::fs::remove_file(&tmp_path);
         error!(
@@ -195,12 +276,16 @@ async fn update_one(
     }
 
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
-        error!("GeoUpdater: Failed to rename tmp file for {}: {:?}", source.name, e);
+        error!("GeoUpdater: 重命名 {} 失败: {:?}", source.name, e);
         let _ = std::fs::remove_file(&tmp_path);
         return Err(anyhow!("Rename failed"));
     }
 
-    info!("GeoUpdater: Successfully updated {} ({} bytes)", filename, bytes.len());
+    let e = meta.sources.entry(source.name.clone()).or_default();
+    e.validators = validators;
+    e.downloaded_at = now_secs();
+
+    info!("GeoUpdater: {} 已更新 ({} 字节)", filename, bytes.len());
     Ok(())
 }
 
@@ -259,13 +344,56 @@ fn build_client(
     }
 }
 
-/// 单次 fetch: send → check status → read body → 校验 body 大小. 所有失败都返 Err.
-async fn do_fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    let resp = client.get(url).send().await
-        .map_err(|e| anyhow!("send: {}", e))?;
+/// 一次 fetch 的结果。
+pub(crate) enum FetchOutcome {
+    /// 拿到了新内容。
+    Body(Vec<u8>, Validators),
+    /// 上游回 304: 本地文件仍是最新的, 不用重下。
+    NotModified,
+}
+
+/// 条件请求用的缓存验证器。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub(crate) struct Validators {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+/// 单次 fetch: 带条件请求头 send → 304 直接返回 → 否则 check status → read body → 校验大小。
+async fn do_fetch(
+    client: &reqwest::Client,
+    url: &str,
+    cond: Option<&Validators>,
+) -> Result<FetchOutcome> {
+    let mut req = client.get(url);
+    // 条件请求: 上游没变就回 304, 省掉几 MB 的重复传输。
+    if let Some(v) = cond {
+        if let Some(e) = &v.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, e);
+        }
+        if let Some(lm) = &v.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+        }
+    }
+    let resp = req.send().await.map_err(|e| anyhow!("send: {}", e))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(FetchOutcome::NotModified);
+    }
     if !resp.status().is_success() {
         return Err(anyhow!("HTTP {}", resp.status()));
     }
+
+    let hdr = |n: reqwest::header::HeaderName| {
+        resp.headers().get(n).and_then(|v| v.to_str().ok()).map(String::from)
+    };
+    let validators = Validators {
+        etag: hdr(reqwest::header::ETAG),
+        last_modified: hdr(reqwest::header::LAST_MODIFIED),
+    };
+
     let bytes = resp.bytes().await
         .map(|b| b.to_vec())
         .map_err(|e| anyhow!("read body: {}", e))?;
@@ -275,44 +403,66 @@ async fn do_fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
             bytes.len(), MIN_VALID_BYTES
         ));
     }
-    Ok(bytes)
+    Ok(FetchOutcome::Body(bytes, validators))
 }
 
-/// 带 fallback 的 fetch: 主要按 source.via 走, 失败且原是 Proxy 时自动
-/// 重试一次 Direct. 便于配置默认 via=proxy 时不至于因为 mirage 出网抖动
-/// 而拉不到 geo. 两次都失败视为整体失败.
+/// 逐个镜像尝试, 每个镜像先按 `source.via` 走、失败且原是 Proxy 时再试一次 Direct。
+///
+/// 两层 fallback 的理由不同:
+/// - **镜像层**: GitHub 在部分网络下时通时不通, 多给一两个镜像能显著提高拿到规则的概率。
+/// - **通道层**: 配 `via=proxy` 时若自家代理出网抖动, 直连有时反而能过。
+///
+/// 全部失败才算整体失败 —— 调用方据此**保留旧文件**, 绝不覆盖。
 async fn fetch_with_fallback(
     source: &GeoSource,
     proxy_url: Option<&str>,
-) -> Result<Vec<u8>> {
-    let primary_client = build_client(source.via, proxy_url, &source.name)?;
-    match do_fetch(&primary_client, &source.url).await {
-        Ok(b) => Ok(b),
-        Err(e) if matches!(source.via, GeoVia::Proxy) => {
-            warn!(
-                "GeoUpdater: source '{}' via proxy failed ({}), retrying via direct",
-                source.name, e
-            );
-            let direct_client = build_client(GeoVia::Direct, None, &source.name)?;
-            match do_fetch(&direct_client, &source.url).await {
-                Ok(b) => {
-                    info!("GeoUpdater: direct fallback succeeded for '{}'", source.name);
-                    Ok(b)
+    cond: Option<&Validators>,
+) -> Result<FetchOutcome> {
+    let total = source.url.len();
+    let mut last_err = anyhow!("no url configured");
+
+    for (i, url) in source.url.iter().enumerate() {
+        let primary_client = build_client(source.via, proxy_url, &source.name)?;
+        match do_fetch(&primary_client, url, cond).await {
+            Ok(out) => {
+                if total > 1 {
+                    debug!("GeoUpdater: '{}' 镜像 {}/{} 成功: {}", source.name, i + 1, total, url);
                 }
-                Err(e2) => {
-                    error!(
-                        "GeoUpdater: source '{}' both proxy and direct failed. proxy err: {}, direct err: {}",
-                        source.name, e, e2
+                return Ok(out);
+            }
+            Err(e) => {
+                if matches!(source.via, GeoVia::Proxy) {
+                    warn!(
+                        "GeoUpdater: '{}' 镜像 {}/{} 经代理失败 ({}), 改试直连",
+                        source.name, i + 1, total, e
                     );
-                    Err(anyhow!("both proxy and direct fetch failed"))
+                    let direct_client = build_client(GeoVia::Direct, None, &source.name)?;
+                    match do_fetch(&direct_client, url, cond).await {
+                        Ok(out) => {
+                            info!("GeoUpdater: '{}' 镜像 {}/{} 直连回落成功", source.name, i + 1, total);
+                            return Ok(out);
+                        }
+                        Err(e2) => {
+                            warn!(
+                                "GeoUpdater: '{}' 镜像 {}/{} 代理与直连均失败 (proxy: {}, direct: {})",
+                                source.name, i + 1, total, e, e2
+                            );
+                            last_err = anyhow!("proxy: {}; direct: {}", e, e2);
+                        }
+                    }
+                } else {
+                    warn!("GeoUpdater: '{}' 镜像 {}/{} 失败: {}", source.name, i + 1, total, e);
+                    last_err = e;
                 }
             }
         }
-        Err(e) => {
-            error!("GeoUpdater: source '{}' fetch failed: {}", source.name, e);
-            Err(anyhow!("Fetch failed"))
-        }
     }
+
+    error!(
+        "GeoUpdater: '{}' 全部 {} 个镜像都失败, 保留现有 .dat 不覆盖。最后一次错误: {}",
+        source.name, total, last_err
+    );
+    Err(anyhow!("all {} mirror(s) failed: {}", total, last_err))
 }
 
 #[cfg(test)]
@@ -393,6 +543,60 @@ mod tests {
             validate_dat(&p, GeoKind::Geosite).is_ok(),
             "合法结构被校验拦下了 —— geo 将永远更新不了"
         );
+    }
+
+    /// meta.json 必须能跨"进程重启"往返 —— 这正是 ETag 有意义的前提。
+    /// 存不住就等于每次启动都无条件全量下载。
+    #[test]
+    fn meta_roundtrips_validators() {
+        let d = tmpdir("meta");
+        let dir = d.to_str().unwrap();
+
+        let mut m = MetaFile::default();
+        let e = m.sources.entry("ls".into()).or_default();
+        e.validators = Validators {
+            etag: Some("\"abc123\"".into()),
+            last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".into()),
+        };
+        e.downloaded_at = 1_700_000_000;
+        write_meta(dir, &m);
+
+        let back = read_meta(dir);
+        let got = back.sources.get("ls").expect("应能读回该源");
+        assert_eq!(got.validators.etag.as_deref(), Some("\"abc123\""));
+        assert_eq!(
+            got.validators.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        assert_eq!(got.downloaded_at, 1_700_000_000);
+    }
+
+    /// meta.json 损坏/不存在必须退回空表, **不能**让 updater 崩掉或卡住 ——
+    /// 元数据只是优化, 丢了最多多下一次。
+    #[test]
+    fn corrupt_meta_degrades_to_empty() {
+        let d = tmpdir("badmeta");
+        let dir = d.to_str().unwrap();
+        assert!(read_meta(dir).sources.is_empty(), "不存在应为空表");
+
+        std::fs::write(d.join("meta.json"), b"{ this is not json").unwrap();
+        assert!(read_meta(dir).sources.is_empty(), "损坏应退回空表而非 panic");
+    }
+
+    /// 单个 URL 与数组都要能解析成镜像列表 (配置易用性)。
+    #[test]
+    fn geo_source_url_accepts_string_or_array() {
+        let one: crate::config::GeoSource = serde_json::from_str(
+            r#"{ "name": "ls", "kind": "geosite", "url": "https://a/x.dat" }"#,
+        )
+        .expect("单值应能解析");
+        assert_eq!(one.url, vec!["https://a/x.dat"]);
+
+        let many: crate::config::GeoSource = serde_json::from_str(
+            r#"{ "name": "ls", "kind": "geosite", "url": ["https://a/x.dat", "https://b/x.dat"] }"#,
+        )
+        .expect("数组应能解析");
+        assert_eq!(many.url.len(), 2, "多镜像应全部保留");
     }
 
     /// 新鲜度判据: 刚落地的文件不该被重复下载。

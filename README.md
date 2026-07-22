@@ -358,6 +358,16 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
   - alpha.14+ 自动 fallback: via=proxy 失败会自动重试 direct
   - alpha.15+ 30s timeout + 空 body 拒收覆盖旧 .dat
   - alpha.17+ 支持热更新: 改 config 加/删 geo_sources 秒生效不必 restart
+  - **`url` 可写单个字符串, 也可写数组当镜像列表** —— 逐个试, 第一个成功即止。
+    GitHub 在部分网络下时通时不通, 多给一两个镜像能显著提高拿到规则的概率
+  - **重启不再重复下载**: 记住上次下载时间 (`meta.json` + 文件 mtime), 没到
+    `geo_update_days` 就完全不发请求。此前每次启动都无条件全量重下, 反复重启
+    容易被上游限流
+  - **条件请求 (ETag / Last-Modified)**: 到期后先问上游"变了没", 没变回 304
+    就复用本地文件, 省掉几 MB 传输
+  - **落地前校验内容**: 不只看大小 —— "HTTP 200 但返回 HTML 错误页/限流页"那种响应
+    有好几 KB, 光比大小拦不住, 会直接覆盖掉好用的 `.dat` 让规则**集体失效**。
+    现在会数里面有几个分类 (真实数据几百个, 垃圾 0 个), 为 0 则保留原文件
 - **`tuning.geo_update_days`**: 更新间隔天数, 默认 7. alpha.18 起硬 clamp min=1 防 tight loop 打死 CPU
 
 ### 服务端配置示例 (`/etc/mirage-rs/config_server.json`)

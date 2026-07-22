@@ -468,8 +468,12 @@ pub struct GeoSource {
     pub name: String,
     /// 数据类型: geosite (域名规则) 或 geoip (IP CIDR 规则).
     pub kind: GeoKind,
-    /// 下载 URL (通常是 GitHub release).
-    pub url: String,
+    /// 下载 URL (通常是 GitHub release)。
+    ///
+    /// 可以写**单个字符串**, 也可以写**数组**当镜像列表 —— 逐个试, 第一个成功即止。
+    /// GitHub 在部分网络下时通时不通, 多给一两个镜像能显著提高拿到规则的概率。
+    #[serde(deserialize_with = "one_or_many")]
+    pub url: Vec<String>,
     /// 下载通道: direct (默认, 直连) 或 proxy (走客户端本地 socks/mixed inbound).
     /// 国内服务器拉 GitHub 可设 proxy, 客户端通常 direct 即可 (除非 GitHub 被屏).
     #[serde(default)]
