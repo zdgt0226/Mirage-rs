@@ -1078,7 +1078,8 @@ generate_password() {
 # 询问是否配置 Shadowsocks 上游出口 (中转站模式)。
 # 输出: 配了则把 JSON 对象写到 stdout (供调用方拼进配置), 不配则输出空串。
 # 提示与告警走 stderr, 不污染返回值。
-ask_ss_upstream() {
+# 上游出口引导。返回一段 JSON (不配则返回空串)。
+ask_upstream() {
     cat >&2 <<'EOM'
 
 ═══════════════════════════════════════════════════
@@ -1086,14 +1087,22 @@ ask_ss_upstream() {
 ═══════════════════════════════════════════════════
   默认: 服务端直接连目标 (绝大多数人要的就是这个)。
 
-  配了上游后, 服务端不再直连, 而是把流量再经 Shadowsocks 发往上游:
+  配了上游后, 服务端不再直连, 而是把流量再发往上游出口:
 
-    客户端 ──(Mirage 隧道)──▶ 本机 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
+    客户端 ──(Mirage 隧道)──▶ 本机 ──(SS / WireGuard)──▶ 出口 ──▶ 目标
 
   典型用途: 本机放在离你近、线路好的位置 (如香港) 只做中转, 真正的出口
-  落在另一台 SS 服务器上 (如落地解锁机)。需要你已有一台可用的 SS 服务器。
+  落在另一台机器上 (如落地解锁机)。需要你已有一台可用的上游服务器。
 EOM
-    ask_yn "是否配置 Shadowsocks 上游出口?" n || { echo ""; return; }
+    ask_yn "是否配置上游出口?" n || { echo ""; return; }
+
+    local kind=$(ask_choice "上游类型" \
+        "Shadowsocks (仅 TCP; UDP 默认阻断)" \
+        "WireGuard (TCP + UDP 同出口; 还可让 DNS 也走隧道)")
+    if [[ "$kind" == "2" ]]; then
+        ask_wg_upstream
+        return
+    fi
 
     local ss_server ss_port ss_pwd ss_method ss_udp
     ss_server=$(ask "上游 SS 服务器地址 (域名或 IP)" "")
@@ -1147,6 +1156,54 @@ EOM
         "$(json_escape "$ss_server")" "$ss_port" "$(json_escape "$ss_pwd")" "$ss_method" "$ss_udp"
 }
 
+# WireGuard 上游引导。
+ask_wg_upstream() {
+    cat >&2 <<'EOM'
+
+  WireGuard 上游: TCP 与 UDP **同一个出口 IP** (SS 上游做不到这点)。
+  需要你已有一台 WG 服务端, 并在它的 peer 列表里登记本机的公钥。
+
+  密钥都是标准 WireGuard 的 base64 密钥 (wg genkey / wg pubkey 的输出),
+  **不是任意密码** —— 填错长度会在启动前被 check 直接拦下。
+EOM
+    local wg_priv wg_pub wg_ep wg_addr wg_dns wg_psk wg_udp mtu
+    wg_priv=$(ask "本机私钥 (wg genkey 生成的 base64)" "")
+    if [[ -z "$wg_priv" ]]; then
+        warn "未填私钥, 跳过上游配置 (仍走直连)"
+        echo ""; return
+    fi
+    wg_pub=$(ask "对端公钥 (base64)" "")
+    wg_ep=$(ask "对端 endpoint (host:port)" "")
+    wg_addr=$(ask "本机在隧道内的地址 (不带掩码, 如 10.0.0.2)" "")
+    if [[ -z "$wg_pub" || -z "$wg_ep" || -z "$wg_addr" ]]; then
+        warn "WireGuard 上游信息不完整, 跳过 (仍走直连)"
+        echo ""; return
+    fi
+    wg_psk=$(ask "预共享密钥 PSK (可选, 没有直接回车)" "")
+    mtu=$(ask "隧道 MTU" "1420")
+
+    cat >&2 <<'EOM'
+
+  隧道内 DNS (可选但强烈建议填):
+    填了 → 域名**经隧道解析**, 拿到的是**对端地区**的解析结果。
+           走 CDN/流媒体时这是必须的。
+    留空 → 在本机解析。流量确实从对端出去, 但目标 IP 是按**你本地位置**
+           挑的 —— 对 CDN/流媒体等于把这个出口白配了。
+EOM
+    wg_dns=$(ask "隧道内 DNS 服务器 IP (留空则本机解析)" "")
+
+    # WG 隧道能承载 UDP, 出口与 TCP 一致, 所以默认 tunnel —— 不像 SS 那样需要 block 兜底。
+    wg_udp="tunnel"
+
+    ok "上游出口: WireGuard ${wg_ep} (隧道内 ${wg_addr}, udp=${wg_udp})"
+    local extra=""
+    [[ -n "$wg_psk" ]] && extra="${extra}, \"preshared_key\": \"$(json_escape "$wg_psk")\""
+    [[ -n "$wg_dns" ]] && extra="${extra}, \"dns\": \"$(json_escape "$wg_dns")\""
+    printf '{ "type": "wireguard", "private_key": "%s", "peer_public_key": "%s", "endpoint": "%s", "address": "%s", "mtu": %s, "udp": "%s"%s }' \
+        "$(json_escape "$wg_priv")" "$(json_escape "$wg_pub")" "$(json_escape "$wg_ep")" \
+        "$(json_escape "$wg_addr")" "$mtu" "$wg_udp" "$extra"
+}
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 轻量模式配置 (平铺格式, 无 inbounds/outbounds/routing)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1172,7 +1229,7 @@ EOM
     fi
     local sni=$(ask_camouflage_host "$sni_default")
 
-    local ss_up=$(ask_ss_upstream)
+    local ss_up=$(ask_upstream)
     local upstream_line=""
     [[ -n "$ss_up" ]] && upstream_line=",
     \"upstream\": ${ss_up}"
@@ -1360,7 +1417,7 @@ EOM
     fi
 
     # 上游出口 (中转站模式), 不配则为空串
-    local ss_up_full=$(ask_ss_upstream)
+    local ss_up_full=$(ask_upstream)
     local upstream_line=""
     [[ -n "$ss_up_full" ]] && upstream_line=",
             \"upstream\": ${ss_up_full}"
