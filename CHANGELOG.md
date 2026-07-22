@@ -1,5 +1,33 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 裸 IP 目标也按域名分流 (SNI/Host 嗅探扩到全部入站)
+
+### feat(route): SOCKS5 等入站送裸 IP 时, 嗅 SNI/Host 参与路由判定
+
+此前嗅探**只在 transparent 入站**做。SOCKS5 客户端可以送域名也可以送 IP —— 不少 app 自己
+做完 DNS 再送 IP, 那种情况下 `domain_suffix` / `geosite` 这类规则**全部失效**, 用户看到的
+是"规则写了不生效"却查不出原因。
+
+实现放在 `proxy_tcp_target` 一处, socks / mixed / lite 全部入站受益, 不必每个入站各写一遍。
+
+三个刻意的设计取舍:
+
+1. **只对裸 IP 嗅**。fake-IP 已还原出域名、或客户端本来就送域名的, 完全不经过这条路径 ——
+   浏览器流量零成本。
+2. **超时 300ms**(transparent 那边是 2s)。客户端不先说话的协议 (SSH / SMTP / MySQL 等
+   server-first) 会一直等到超时才继续, 这段是**白加的延迟**。泛用入站要给得紧。
+3. **嗅到的域名只用于路由判定, 不改连接目的地** —— 这条是开发中被自己的测试抓出来的真
+   缺陷: 初版把 target 换成了域名, 于是 direct 出站去重新解析它。客户端明确要连
+   `1.2.3.4:443`, 重新解析可能落到**另一个 IP** (CDN / 多 A 记录), 等于擅自改了客户端指定
+   的目的地; 域名解析不出来时更是直接连不上。sing-box 同样把两者分开
+   (`override_destination` 默认关)。现在域名与原始 IP **同时**送进路由器, `domain_suffix`
+   与 `ip_cidr` 两类规则都不失效。
+
+测试: 端到端起真实进程, SOCKS5 用 ATYP=1 送裸 IP 再发带 SNI 的 ClientHello, 用
+"命中 block 规则 → 连接被丢弃 / 未命中 → echo 正常回显"这组**二选一的可观测差异**做判据
+(不靠日志), 并带对照组防恒真。另加一条超时边界测试, 防止有人把 300ms 调回 2s。
+均已变异验证。
+
 ## [分支 feat/wireguard] - WireGuard 支持 (开发中, 未合并 main)
 
 WireGuard 与 Shadowsocks 不是一个层级: SS 是 L4 TCP 流可直接套字节流; WG 是 **L3 IP 包**协议

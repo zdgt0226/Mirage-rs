@@ -405,6 +405,19 @@ mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>&brutal=<mbps>
 
 ---
 
+### 裸 IP 目标的域名分流 (SNI/Host 嗅探)
+
+有些 app 不把域名交给代理, 而是自己解析完直接送 IP。这种连接如果只按 IP 分流,
+`domain_suffix` / `geosite` 规则就全都用不上。
+
+Mirage 会在**目标是裸 IP** 时嗅一下 TLS SNI / HTTP Host, 拿到域名后参与路由判定:
+
+- 只对裸 IP 做 —— 浏览器等送域名的客户端零成本
+- 超时 300ms —— 客户端不先说话的协议 (SSH/SMTP 等) 最多多等这么久
+- **只影响路由判定, 不改连接目的地**: 仍连客户端指定的原始 IP。否则重新解析域名可能
+  落到另一个 IP(CDN/多 A 记录), 等于擅自改了目的地
+- 域名与原始 IP **同时**参与匹配, 所以 `domain_suffix` 和 `ip_cidr` 规则都有效
+
 ## 🌐 透明网关 DNS 与 fake-IP (v0.4.5 重点)
 
 透明网关模式 (`install.sh` 部署模式选 2) 会起一个 DNS 服务 (`type: dns` 入站, 默认 `:53`), LAN 设备把 DNS 指向它。它按域名的分流去向分两条路处理:
