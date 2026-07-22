@@ -189,7 +189,7 @@ async fn serve_client(
         Ok(SocksCommand::TcpConnect(target)) => {
             // 复用完整版的转发路径 (含换隧道重试/中继), 不另起一套实现。
             // 无 eBPF、无 fake-IP: 轻量模式不涉及这两者。
-            crate::proxy::handler::proxy_tcp_target(stream, target, Vec::new(), state, None, None)
+            crate::proxy::handler::proxy_tcp_target(stream, target, Vec::new(), state, None, None, None)
                 .await;
         }
         Ok(SocksCommand::UdpAssociate) => {
@@ -302,14 +302,14 @@ mod tests {
         for host in ["example.com", "baidu.cn", "qq.com"] {
             let req = crate::router::RoutingRequest {
                 domain: Some(host), ip: None, port: 443,
-                protocol: "tcp", source_ip: None, source_mac: None,
+                protocol: "tcp", source_ip: None, source_mac: None, inbound: None,
             };
             assert_eq!(st.router.route(req), "proxy", "{host} 也必须走隧道");
         }
         for ip in ["10.0.0.1", "1.1.1.1", "114.114.114.114"] {
             let req = crate::router::RoutingRequest {
                 domain: None, ip: Some(ip.parse().unwrap()), port: 443,
-                protocol: "tcp", source_ip: None, source_mac: None,
+                protocol: "tcp", source_ip: None, source_mac: None, inbound: None,
             };
             assert_eq!(st.router.route(req), "proxy", "{ip} 也必须走隧道");
         }

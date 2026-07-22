@@ -145,6 +145,7 @@ impl ConfigWatcher {
                 source_mac: r.source_mac,
                 protocol: r.protocol,
                 port: r.port,
+                inbound: r.inbound,
             });
         }
         

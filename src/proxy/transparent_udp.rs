@@ -463,6 +463,7 @@ async fn setup_flow(
         protocol: "udp",
         source_ip: Some(IpAddr::V4(*client.ip())),
         source_mac: None,
+        inbound: None,
     };
     match &domain {
         Some(d) => req.domain = Some(d.as_str()),

@@ -455,6 +455,7 @@ impl DnsForwarder {
             protocol: "udp",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         };
 
         let action = st.router.route(routing_req);
