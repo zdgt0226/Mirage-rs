@@ -38,6 +38,8 @@ pub async fn handle_client(
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
     auth: Option<Arc<crate::config::InboundAuth>>,
+    // 本连接来自哪个入站 (供 routing 的 `inbound` 条件用)。
+    inbound_tag: Option<Arc<str>>,
 ) {
     let command = match socks5::handshake(&mut local, auth.as_deref()).await {
         Ok(c) => c,
@@ -77,7 +79,7 @@ pub async fn handle_client(
         }
     };
 
-    proxy_tcp_target(local, target, Vec::new(), state, ebpf_engine, fake_ip_mapper).await;
+    proxy_tcp_target(local, target, Vec::new(), state, ebpf_engine, fake_ip_mapper, inbound_tag).await;
 }
 
 /**
@@ -95,6 +97,8 @@ pub async fn proxy_tcp_target(
     state: Arc<ArcSwap<CoreState>>,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
+    // 本连接来自哪个入站 (供 routing 的 `inbound` 条件用); None = 调用方未提供。
+    inbound_tag: Option<Arc<str>>,
 ) {
     let current_state = state.load();
     let mut final_target = target;
@@ -164,6 +168,7 @@ pub async fn proxy_tcp_target(
         protocol: "tcp",
         source_ip: None, // Can extract from local if needed
         source_mac: None,
+        inbound: inbound_tag.as_deref(),
     };
     
     // 嗅到域名时**同时**带上域名与原始 IP: 域名让 domain_suffix/geosite 生效, IP 让

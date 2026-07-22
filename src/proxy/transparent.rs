@@ -62,6 +62,7 @@ fn build_transparent_listener_inner(listen_addr: &str) -> anyhow::Result<TcpList
  * 这个服务会绑定到一个本地端口，并通过 eBPF sk_lookup 截获所有针对 fake_ip 的流量。
  */
 pub async fn start_transparent(
+    inbound_tag: Arc<str>,
     listen_addr: &str,
     state: Arc<ArcSwap<CoreState>>,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
@@ -130,6 +131,7 @@ pub async fn start_transparent(
                 let state_clone = state.clone();
                 let fake_ip_mapper_clone = fake_ip_mapper.clone();
                 let ebpf_clone = ebpf_engine.clone();
+                let tag_clone = inbound_tag.clone();
                 let cgroup_clone = cgroup_engine.clone();
 
                 tokio::spawn(async move {
@@ -172,6 +174,7 @@ pub async fn start_transparent(
                                 state_clone,
                                 ebpf_clone,
                                 Some(fake_ip_mapper_clone),
+                                Some(tag_clone),
                             ).await;
                         }
                     }

@@ -67,6 +67,7 @@ pub async fn handle_client(
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
     auth: Option<Arc<crate::config::InboundAuth>>,
+    inbound_tag: Option<Arc<str>>,
 ) {
     let mut buf = [0u8; 1];
     
@@ -86,7 +87,7 @@ pub async fn handle_client(
     if buf[0] == 0x05 {
         // SOCKS5 (鉴权在 socks5::handshake 里按 RFC 1929 做)
         debug!("Mixed inbound sniffed SOCKS5");
-        crate::proxy::handler::handle_client(stream, state, ebpf_engine, fake_ip_mapper, auth).await;
+        crate::proxy::handler::handle_client(stream, state, ebpf_engine, fake_ip_mapper, auth, inbound_tag).await;
     } else {
         // HTTP
         debug!("Mixed inbound sniffed HTTP (first byte: {})", buf[0]);
@@ -224,7 +225,8 @@ pub async fn handle_client(
             initial_payload.unwrap_or_default(),
             state,
             ebpf_engine,
-            fake_ip_mapper
+            fake_ip_mapper,
+            inbound_tag,
         ).await;
     }
 }

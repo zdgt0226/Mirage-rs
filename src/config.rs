@@ -356,6 +356,12 @@ pub struct RuleConfig {
     pub protocol: Vec<String>,
     #[serde(default, deserialize_with = "one_or_many")]
     pub port: Vec<u16>,
+    /// 按**入站 tag** 匹配 —— 只对从这些入站进来的连接生效。
+    ///
+    /// 多入站部署才有意义, 例如给家人开一个 socks 入站走固定落地、自己那个走另一条。
+    /// 不写 = 不限入站 (所有入站都可能命中), 与原行为一致。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub inbound: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,12 +638,32 @@ impl Config {
         }
 
         // 每条规则引用的出站必须存在 —— 否则该规则形同虚设, 且是静默的
+        let inbound_tags: Vec<&str> = self
+            .inbounds
+            .iter()
+            .map(|ib| match ib {
+                InboundConfig::Socks { tag, .. }
+                | InboundConfig::Dns { tag, .. }
+                | InboundConfig::MirageServer { tag, .. }
+                | InboundConfig::Mixed { tag, .. }
+                | InboundConfig::Transparent { tag, .. } => tag.as_str(),
+            })
+            .collect();
         for (i, rule) in self.routing.rules.iter().enumerate() {
             if !known(&rule.outbound) {
                 issues.push(format!(
                     "routing.rules[{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
                     rule.outbound
                 ));
+            }
+            // 同理: 引用了不存在的入站 tag, 该规则**永远不会命中**且毫无提示。
+            // 拼错入站名是很容易犯的错, 而症状是"规则写了不生效", 极难自查。
+            for t in &rule.inbound {
+                if !inbound_tags.contains(&t.as_str()) {
+                    issues.push(format!(
+                        "routing.rules[{i}].inbound = `{t}` 不存在于 inbounds (该规则永远不会命中)"
+                    ));
+                }
             }
         }
 
@@ -1167,5 +1193,38 @@ mod wg_upstream_tests {
                 "含 {want} 错误却没被拦下: {issues:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod inbound_rule_tests {
+    use super::*;
+
+    fn cfg(rule_inbound: &str) -> Config {
+        let s = format!(r#"{{
+          "inbounds": [{{ "type": "socks", "tag": "in-a", "listen": "127.0.0.1", "port": 1080 }}],
+          "outbounds": [{{ "type": "direct", "tag": "direct" }}],
+          "routing": {{ "default_outbound": "direct",
+            "rules": [{{ "domain_suffix": "x.com", "outbound": "direct", "inbound": {rule_inbound} }}] }}
+        }}"#);
+        serde_json::from_str(&s).expect("配置应能解析")
+    }
+
+    /// 引用了不存在的入站 tag 必须在 check 阶段拦下 —— 拼错入站名很常见,
+    /// 而症状是"规则写了不生效", 没有这条提示极难自查。
+    #[test]
+    fn unknown_inbound_tag_is_caught() {
+        let issues = cfg(r#""in-typo""#).semantic_issues();
+        assert!(
+            issues.iter().any(|i| i.contains("in-typo") && i.contains("inbound")),
+            "拼错的入站 tag 未被拦下: {issues:?}"
+        );
+    }
+
+    /// 存在的 tag 不该报错; 单值与数组都要能写。
+    #[test]
+    fn known_inbound_tag_passes_single_or_array() {
+        assert!(cfg(r#""in-a""#).semantic_issues().is_empty(), "单值应通过");
+        assert!(cfg(r#"["in-a"]"#).semantic_issues().is_empty(), "数组应通过");
     }
 }

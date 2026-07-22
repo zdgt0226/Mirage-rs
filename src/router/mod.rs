@@ -27,6 +27,8 @@ pub struct Rule {
     pub source_mac: Vec<String>,
     pub protocol: Vec<String>,
     pub port: Vec<u16>,
+    /// 入站 tag 白名单; 空 = 不限。
+    pub inbound: Vec<String>,
 }
 
 impl Rule {
@@ -61,6 +63,14 @@ impl Rule {
             let req_mac = req.source_mac.unwrap_or("");
             if !self.source_mac.contains(&req_mac.to_string()) {
                 return false;
+            }
+        }
+        if !self.inbound.is_empty() {
+            // 调用方没给入站 tag 时不匹配: 该条件本就是"限定来源", 信息缺失就当不满足,
+            // 而不是放宽成"任意入站都算命中" —— 后者会让本该只对某入站生效的规则外溢。
+            match req.inbound {
+                Some(tag) if self.inbound.iter().any(|t| t == tag) => {}
+                _ => return false,
             }
         }
         if !self.source_ip_cidr.is_empty() {
@@ -238,6 +248,9 @@ pub struct RoutingRequest<'a> {
     pub protocol: &'a str, // "tcp" or "udp"
     pub source_ip: Option<IpAddr>,
     pub source_mac: Option<&'a str>,
+    /// 本连接是从哪个入站进来的 (按 tag)。None = 调用方没提供, 此时带 `inbound`
+    /// 条件的规则**一律不匹配** —— 宁可不命中, 也不要在信息缺失时猜。
+    pub inbound: Option<&'a str>,
 }
 
 impl RouterEngine {
@@ -616,6 +629,7 @@ mod tests {
                 geoip: vec![],
                 port: vec![],
                 protocol: vec![],
+                inbound: vec![],
             },
             // Rule 1: direct cn
             Rule {
@@ -632,6 +646,7 @@ mod tests {
                 geoip: vec![],
                 port: vec![],
                 protocol: vec![],
+                inbound: vec![],
             },
             // Rule 2: proxy google
             Rule {
@@ -648,6 +663,7 @@ mod tests {
                 geoip: vec![],
                 port: vec![],
                 protocol: vec![],
+                inbound: vec![],
             },
             // Rule 3: proxy specific port
             Rule {
@@ -664,6 +680,7 @@ mod tests {
                 geoip: vec![],
                 port: vec![22], // SSH
                 protocol: vec![],
+                inbound: vec![],
             },
         ];
 
@@ -682,6 +699,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "block");
 
@@ -693,6 +711,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "block");
 
@@ -704,6 +723,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "direct");
 
@@ -715,6 +735,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "direct");
 
@@ -726,6 +747,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "default");
 
@@ -737,6 +759,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "proxy_port");
 
@@ -748,6 +771,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "block");
 
@@ -759,6 +783,7 @@ mod tests {
             protocol: "",
             source_ip: None,
             source_mac: None,
+            inbound: None,
         });
         assert_eq!(out, "block");
     }
@@ -778,6 +803,7 @@ mod tests {
             geoip: vec![],
             port: vec![],
             protocol: vec![],
+            inbound: vec![],
         }
     }
 
@@ -800,5 +826,92 @@ mod tests {
             "与 proxy 段重叠的直连段必须排除, 否则会绕过代理泄漏"
         );
         assert_eq!(direct.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod inbound_tests {
+    use super::*;
+
+    fn rule_for_inbound(id: RuleId, outbound: &str, inbound: Vec<&str>) -> Rule {
+        Rule {
+            id,
+            mode: "or".to_string(),
+            outbound: outbound.to_string(),
+            domain_suffix: vec!["example.com".to_string()],
+            domain_keyword: vec![],
+            domain_regex: vec![],
+            geosite: vec![],
+            ip_cidr: vec![],
+            source_ip_cidr: vec![],
+            source_mac: vec![],
+            geoip: vec![],
+            port: vec![],
+            protocol: vec![],
+            inbound: inbound.into_iter().map(String::from).collect(),
+        }
+    }
+
+    fn engine(rules: Vec<Rule>) -> RouterEngine {
+        RouterEngine::new(
+            rules,
+            "default".to_string(),
+            ".",
+            &std::collections::HashMap::new(),
+        )
+        .expect("测试规则应能构建引擎")
+    }
+
+    fn req<'a>(domain: &'a str, inbound: Option<&'a str>) -> RoutingRequest<'a> {
+        RoutingRequest {
+            domain: Some(domain),
+            ip: None,
+            port: 443,
+            protocol: "tcp",
+            source_ip: None,
+            source_mac: None,
+            inbound,
+        }
+    }
+
+    /// 同一个域名, 从不同入站进来要能走不同出口 —— 这就是本特性的全部意义。
+    #[test]
+    fn same_domain_routes_differently_per_inbound() {
+        let e = engine(vec![
+            rule_for_inbound(0, "via_a", vec!["in-a"]),
+            rule_for_inbound(1, "via_b", vec!["in-b"]),
+        ]);
+        assert_eq!(e.route(req("example.com", Some("in-a"))), "via_a");
+        assert_eq!(e.route(req("example.com", Some("in-b"))), "via_b");
+    }
+
+    /// 不带 `inbound` 条件的规则对所有入站生效 (向后兼容: 老配置行为不变)。
+    #[test]
+    fn rule_without_inbound_matches_any() {
+        let e = engine(vec![rule_for_inbound(0, "anywhere", vec![])]);
+        assert_eq!(e.route(req("example.com", Some("in-a"))), "anywhere");
+        assert_eq!(e.route(req("example.com", None)), "anywhere");
+    }
+
+    /// 入站 tag 对不上 → 不命中, 落到默认出口。
+    #[test]
+    fn non_matching_inbound_falls_through() {
+        let e = engine(vec![rule_for_inbound(0, "via_a", vec!["in-a"])]);
+        assert_eq!(e.route(req("example.com", Some("in-other"))), "default");
+    }
+
+    /// **信息缺失时不猜**: 调用方没提供入站 tag, 带 `inbound` 条件的规则一律不命中。
+    ///
+    /// 反过来 (缺失就放宽成"任意入站都算") 会让本该只对某入站生效的规则**外溢**到
+    /// 所有连接上 —— 例如"家人那条入站走固定落地"的规则会把自己的流量也带过去,
+    /// 而且完全无声。宁可不命中。
+    #[test]
+    fn missing_inbound_never_matches_inbound_scoped_rule() {
+        let e = engine(vec![rule_for_inbound(0, "family_exit", vec!["in-family"])]);
+        assert_eq!(
+            e.route(req("example.com", None)),
+            "default",
+            "入站信息缺失时命中了限定入站的规则 —— 该规则会外溢到所有连接"
+        );
     }
 }

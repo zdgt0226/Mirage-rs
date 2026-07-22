@@ -636,8 +636,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         let fake_mapper_clone = fake_ip_mapper.clone();
 
         match inbound {
-            crate::config::InboundConfig::Socks { listen, port, auth, .. } => {
+            crate::config::InboundConfig::Socks { tag, listen, port, auth } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 warn_if_open_proxy("socks", &listen, port, auth.is_some());
                 let auth = auth.clone().map(std::sync::Arc::new);
                 tokio::spawn(async move {
@@ -648,8 +649,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                             let ebp = ebpf_clone.clone();
                             let fm = fake_mapper_clone.clone();
                             let au = auth.clone();
+                            let tg = inbound_tag.clone();
                             tokio::spawn(async move {
-                                crate::proxy::handler::handle_client(stream, st, ebp, fm, au).await;
+                                crate::proxy::handler::handle_client(stream, st, ebp, fm, au, Some(tg)).await;
                             });
                         }
                     } else {
@@ -673,8 +675,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs, ss_upstream).await;
                 });
             }
-            crate::config::InboundConfig::Mixed { listen, port, auth, .. } => {
+            crate::config::InboundConfig::Mixed { tag, listen, port, auth } => {
                 let listen_addr = format!("{}:{}", listen, port);
+                let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 warn_if_open_proxy("mixed", &listen, port, auth.is_some());
                 let auth = auth.clone().map(std::sync::Arc::new);
                 tokio::spawn(async move {
@@ -685,8 +688,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                             let ebp = ebpf_clone.clone();
                             let fm = fake_mapper_clone.clone();
                             let au = auth.clone();
+                            let tg = inbound_tag.clone();
                             tokio::spawn(async move {
-                                crate::proxy::mixed::handle_client(stream, st, ebp, fm, au).await;
+                                crate::proxy::mixed::handle_client(stream, st, ebp, fm, au, Some(tg)).await;
                             });
                         }
                     } else {
@@ -694,7 +698,8 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::Transparent { listen, port, interface, proxy_local, .. } => {
+            crate::config::InboundConfig::Transparent { tag, listen, port, interface, proxy_local } => {
+                let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 let listen_addr = format!("{}:{}", listen, port);
                 // 本机出向重定向 (cgroup/connect4): 开启后网关本机自身 fake-IP 流量也走代理。
                 let cgroup_engine = if let (true, true, Some(fm)) = (proxy_local, enable_ebpf, &fake_ip_mapper) {
@@ -759,7 +764,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                         let net = fm.network();
                         let prefix = fm.prefix_len();
                         if let Err(e) = crate::proxy::transparent::start_transparent(
-                            &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix, cgroup_engine
+                            inbound_tag.clone(), &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix, cgroup_engine
                         ).await {
                             tracing::error!("Transparent proxy listener failed: {}", e);
                         }
