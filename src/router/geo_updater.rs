@@ -100,7 +100,13 @@ pub async fn spawn_updater(handle: UpdaterHandle) {
 
             info!("GeoUpdater: Starting periodic check for {} source(s).", snap.sources.len());
             for source in &snap.sources {
-                let _ = update_one(&snap.geodata_dir, source, snap.proxy_url.as_deref()).await;
+                let _ = update_one(
+                    &snap.geodata_dir,
+                    source,
+                    snap.proxy_url.as_deref(),
+                    snap.update_days,
+                )
+                .await;
             }
 
             // 用当前 update_days 决定 interval. drop snap 后再 sleep, 释放 Arc.
@@ -122,10 +128,38 @@ pub async fn spawn_updater(handle: UpdaterHandle) {
     });
 }
 
-async fn update_one(dir: &str, source: &GeoSource, proxy_url: Option<&str>) -> Result<()> {
+async fn update_one(
+    dir: &str,
+    source: &GeoSource,
+    proxy_url: Option<&str>,
+    update_days: u32,
+) -> Result<()> {
     let filename = format!("{}.dat", source.name);
     let path = Path::new(dir).join(&filename);
     let tmp_path = Path::new(dir).join(format!("{}.tmp", filename));
+
+    // 已有文件且**足够新**就跳过 —— 用文件 mtime 当"上次下载时间"。
+    //
+    // 少了这一步, 每次进程启动都会无条件重下全部源: 调配置反复重启、崩溃重启循环,
+    // 就是一次次几 MB 的重复下载; 弱网/走隧道时更慢, 还可能被 GitHub 限流。
+    // (Python 版用 meta.json 存 downloaded_at 解决同一问题; 这里用 mtime 免掉一个
+    //  额外的元数据文件 —— rename 后 mtime 就是落地时间, 语义等价。)
+    if let Some(age) = file_age(&path) {
+        let max_age = Duration::from_secs(update_days.max(1) as u64 * 86_400);
+        if age < max_age {
+            info!(
+                "GeoUpdater: {} 已是最新 (距上次下载 {:.1} 天 < {} 天), 跳过下载",
+                filename,
+                age.as_secs_f64() / 86_400.0,
+                update_days.max(1)
+            );
+            return Ok(());
+        }
+        debug!(
+            "GeoUpdater: {} 距上次下载 {:.1} 天, 超过 {} 天, 重新下载",
+            filename, age.as_secs_f64() / 86_400.0, update_days.max(1)
+        );
+    }
 
     debug!(
         "GeoUpdater: Downloading {} (kind={:?}, via={:?}) from {}",
@@ -146,6 +180,20 @@ async fn update_one(dir: &str, source: &GeoSource, proxy_url: Option<&str>) -> R
         error!("GeoUpdater: Failed to write tmp file for {}: {:?}", source.name, e);
         return Err(anyhow!("Write tmp failed"));
     }
+    // ⚠️ **落地前先解析验证**: 能下下来 ≠ 是有效的 geo 数据。
+    //
+    // 只看大小挡不住"200 但返回 HTML 错误页 / 限流页"这类响应 —— 那种页面几 KB,
+    // 能过大小阈值, 却会直接覆盖掉本来好用的 .dat, 导致**规则集体失效**且只有下次
+    // 加载时才暴露。这里用真正的解析器过一遍, 解析不了就保留旧文件。
+    if let Err(e) = validate_dat(&tmp_path, source.kind) {
+        let _ = std::fs::remove_file(&tmp_path);
+        error!(
+            "GeoUpdater: {} 下载内容不是有效的 {:?} 数据 ({}), 保留原文件不覆盖",
+            filename, source.kind, e
+        );
+        return Err(anyhow!("downloaded data failed validation"));
+    }
+
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
         error!("GeoUpdater: Failed to rename tmp file for {}: {:?}", source.name, e);
         let _ = std::fs::remove_file(&tmp_path);
@@ -153,6 +201,28 @@ async fn update_one(dir: &str, source: &GeoSource, proxy_url: Option<&str>) -> R
     }
 
     info!("GeoUpdater: Successfully updated {} ({} bytes)", filename, bytes.len());
+    Ok(())
+}
+
+/// 文件距今多久 (拿不到 mtime 或文件不存在返回 None)。
+fn file_age(path: &Path) -> Option<Duration> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    // 时钟回拨会让 elapsed() 报错; 那种情况按"很旧"处理, 重下一次总比永远不更新好。
+    mtime.elapsed().ok()
+}
+
+/// 验证下载内容确实是 geo 数据。
+///
+/// ⚠️ 不能只看"解析有没有报错": `load_geosite_dat`/`load_geoip_dat` 是**宽容**的 ——
+/// 不认识的字段直接跳过, 什么都没匹配上时返回 `Ok(空表)`。HTML 错误页/限流页因此也能
+/// "解析成功"。改判**里面到底有几个分类**: 真实数据几百个, 垃圾数据 0 个。
+fn validate_dat(path: &Path, _kind: crate::config::GeoKind) -> Result<()> {
+    let n = crate::router::geo::count_categories(path)?;
+    if n == 0 {
+        return Err(anyhow!(
+            "解析出 0 个分类 —— 多半是 HTML 错误页/限流页而非 geo 数据"
+        ));
+    }
     Ok(())
 }
 
@@ -242,5 +312,107 @@ async fn fetch_with_fallback(
             error!("GeoUpdater: source '{}' fetch failed: {}", source.name, e);
             Err(anyhow!("Fetch failed"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GeoKind;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("geoupd_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// HTML 错误页 / 限流页必须被拦下 —— 它能过大小阈值, 却会把好用的 .dat 覆盖掉,
+    /// 导致规则**集体失效**, 而且要到下次加载才暴露。
+    #[test]
+    fn html_error_page_fails_validation() {
+        let d = tmpdir("html");
+        let p = d.join("x.dat");
+        // 典型的 GitHub 限流/404 页, 几 KB, 远超 MIN_VALID_BYTES
+        let html = format!("<!DOCTYPE html><html><body>{}</body></html>", "rate limited ".repeat(200));
+        std::fs::write(&p, &html).unwrap();
+        assert!(html.len() > MIN_VALID_BYTES, "构造的样本要能过大小阈值才有意义");
+
+        assert!(
+            validate_dat(&p, GeoKind::Geosite).is_err(),
+            "HTML 错误页通过了校验 —— 会覆盖掉有效的 .dat"
+        );
+        assert!(validate_dat(&p, GeoKind::Geoip).is_err());
+    }
+
+    /// 截断的文件同样必须被拦下。
+    #[test]
+    fn truncated_data_fails_validation() {
+        let d = tmpdir("trunc");
+        let p = d.join("x.dat");
+        // 一个声称后面还有很长内容、实际戛然而止的 protobuf 片段
+        std::fs::write(&p, [0x0a, 0xff, 0xff, 0x03, 0x01, 0x02]).unwrap();
+        assert!(validate_dat(&p, GeoKind::Geosite).is_err(), "截断数据应校验失败");
+    }
+
+    /// 正向用例: 合法结构必须**通过**校验。
+    ///
+    /// 只测"拒绝垃圾"是不够的 —— 校验写太严会把真数据也拦掉, 表现为 geo 永远更新不了,
+    /// 而且日志只说"下载内容无效", 根因完全指不到校验本身。
+    #[test]
+    fn well_formed_dat_passes_validation() {
+        fn varint(mut v: u64) -> Vec<u8> {
+            let mut o = Vec::new();
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 { o.push(b); break; } else { o.push(b | 0x80); }
+            }
+            o
+        }
+        // 顶层 repeated Entry(fn=1,wt=2); Entry 内 code(fn=1,wt=2)
+        fn entry(code: &str) -> Vec<u8> {
+            let mut inner = varint(1 << 3 | 2);
+            inner.extend(varint(code.len() as u64));
+            inner.extend(code.as_bytes());
+            let mut out = varint(1 << 3 | 2);
+            out.extend(varint(inner.len() as u64));
+            out.extend(inner);
+            out
+        }
+        let d = tmpdir("ok");
+        let p = d.join("x.dat");
+        let mut buf = Vec::new();
+        for c in ["CN", "GOOGLE", "NETFLIX"] {
+            buf.extend(entry(c));
+        }
+        std::fs::write(&p, &buf).unwrap();
+
+        assert_eq!(crate::router::geo::count_categories(&p).unwrap(), 3);
+        assert!(
+            validate_dat(&p, GeoKind::Geosite).is_ok(),
+            "合法结构被校验拦下了 —— geo 将永远更新不了"
+        );
+    }
+
+    /// 新鲜度判据: 刚落地的文件不该被重复下载。
+    ///
+    /// 少了这条, 每次进程启动都会无条件重下全部源 —— 反复重启就是反复几 MB 下载,
+    /// 弱网/走隧道更慢, 还可能被上游限流。
+    #[test]
+    fn fresh_file_is_considered_up_to_date() {
+        let d = tmpdir("fresh");
+        let p = d.join("x.dat");
+        std::fs::write(&p, b"whatever").unwrap();
+
+        let age = file_age(&p).expect("刚写的文件应能取到 age");
+        let max_age = Duration::from_secs(7 * 86_400);
+        assert!(age < max_age, "刚写的文件 age={age:?} 应远小于 7 天");
+
+        // 不存在的文件必须返回 None (交给下载路径), 而不是被当成"很新"
+        assert!(
+            file_age(&d.join("nope.dat")).is_none(),
+            "文件不存在应返回 None, 否则会被误判成最新而永远不下载"
+        );
     }
 }

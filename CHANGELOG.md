@@ -1,5 +1,43 @@
 # Changelog - Mirage-rs
 
+## [未发布] - geo 更新器: 借鉴 Python 版的两条血泪教训
+
+对照 Python 前身 `core/geosite_cache.py` 逐条核对 Rust 版 `geo_updater.rs`。Rust 侧原本
+已有的(原子写 tmp+rename、大小阈值、via=proxy 失败回落直连、30s 超时、热重载感知)保持不动;
+补上它缺的两条:
+
+### fix(geo): 重启不再无条件重下全部源
+
+原实现**没有任何"上次何时下载"的持久化** —— 每次进程启动 30s 后一律重下所有源, 哪怕
+5 分钟前刚下过。调配置反复重启、崩溃重启循环, 就是一次次几 MB 的重复下载; 弱网或走隧道时
+更慢, 还可能被上游 (GitHub) 限流。
+
+改用**文件 mtime 当"上次下载时间"**: age < `update_days` 就跳过并打 INFO 说明还差多久。
+Python 版是用 `meta.json` 存 `downloaded_at` 解决同一问题; 这里用 mtime 省掉一个额外元数据
+文件 —— rename 落地时间与之语义等价。
+
+### fix(geo): 落地前的校验从"能否解析"改为"里面有几个分类"
+
+原来的大小阈值 (`MIN_VALID_BYTES = 1024`) 挡不住"HTTP 200 但返回 HTML 错误页/限流页" ——
+那种页面几 KB, 轻松过阈值, 然后**覆盖掉本来好用的 `.dat`**, 导致规则集体失效, 且要到下次
+加载才暴露。
+
+第一版改成"用 loader 解析一遍", **测试当场证明这个判据同样无效**: `load_geosite_dat` /
+`load_geoip_dat` 是**宽容**的 —— 遇到不认识的 wire type 直接跳过, 什么都没匹配上时返回
+`Ok(空表)`。HTML 页面因此照样"解析成功"。
+
+最终判据: 新增 `geo::count_categories()`, 数顶层有多少个带 code 的分类 —— 真实
+geosite/geoip 是几百个, 垃圾数据是 0 个。为 0 则保留原文件不覆盖。
+
+测试含**正向用例**(合法结构必须通过): 只测"拒绝垃圾"会让校验写太严也发现不了, 那种
+情况表现为 geo 永远更新不了, 而日志只说"下载内容无效", 根因指不到校验本身。
+两条契约均已变异验证。
+
+### 尚未借鉴的 (Python 版有, 记在 roadmap)
+- **ETag / Last-Modified 条件请求**: 命中 304 可完全跳过重下, 比 mtime 判据更省。
+  需持久化元数据 (Python 用 meta.json)。
+- **多镜像 fallback**: Python 的 `url` 可以是列表, 逐个试。
+
 ## [未发布] - 裸 IP 目标也按域名分流 (SNI/Host 嗅探扩到全部入站)
 
 ### feat(route): SOCKS5 等入站送裸 IP 时, 嗅 SNI/Host 参与路由判定
