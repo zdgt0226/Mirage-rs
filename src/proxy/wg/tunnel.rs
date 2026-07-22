@@ -55,6 +55,8 @@ pub struct WgTunnel {
     pub(crate) wake: Arc<Notify>,
     /// 隧道内本端端口分配游标。见 [`WgTunnel::alloc_port`]。
     next_port: std::sync::atomic::AtomicU32,
+    /// 隧道内 DNS 解析器 (配了 `dns` 才有)。每条隧道一份缓存。
+    pub(crate) dns: Option<super::dns::TunnelDns>,
     pump: tokio::task::JoinHandle<()>,
 }
 
@@ -136,6 +138,7 @@ impl WgTunnel {
             wake,
             // 起点随机: 不同隧道/不同进程不要都从 1024 开始复用同一批端口。
             next_port: std::sync::atomic::AtomicU32::new(fastrand::u32(..)),
+            dns: cfg.dns.map(super::dns::TunnelDns::new),
             pump,
         })
     }
@@ -286,6 +289,7 @@ mod tests {
             address: "10.0.0.2".parse().unwrap(),
             mtu: 1420,
             persistent_keepalive: None,
+            dns: None,
         };
         let t = tokio::time::timeout(Duration::from_secs(3), WgTunnel::connect(&cfg))
             .await
@@ -310,6 +314,7 @@ mod tests {
             mtu: 1420,
             // 开 keepalive, 让定时器有活干
             persistent_keepalive: Some(1),
+            dns: None,
         };
         let _t = WgTunnel::connect(&cfg).await.unwrap();
 
@@ -331,6 +336,7 @@ mod tests {
             address: "10.0.0.2".parse().unwrap(),
             mtu,
             persistent_keepalive: Some(1),
+            dns: None,
         }
     }
 

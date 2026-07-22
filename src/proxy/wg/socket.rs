@@ -263,6 +263,7 @@ mod tests {
             address: "10.0.0.2".parse().unwrap(),
             mtu: 1420,
             persistent_keepalive: None,
+            dns: None,
         }
     }
 

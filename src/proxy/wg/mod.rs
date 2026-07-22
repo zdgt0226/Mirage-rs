@@ -34,6 +34,7 @@
 //!   - [ ] 阶段4: 真机 e2e 对着真实 WG peer 验证
 
 pub mod device;
+pub mod dns;
 pub mod socket;
 pub mod tunnel;
 
@@ -60,6 +61,12 @@ pub struct WgConfig {
     pub mtu: usize,
     /// persistent-keepalive 秒数, 穿 NAT 用; 0/None = 关。
     pub persistent_keepalive: Option<u16>,
+    /// 隧道内 DNS 服务器 (对齐 wg-quick 的 `DNS =`)。
+    ///
+    /// 配了它, 走本隧道的域名就**经隧道解析** —— 否则在本机解析完再把 IP 送进去,
+    /// 意味着 ①查询本身不经隧道, ②拿到的是本机所在地区的解析结果 (CDN/流媒体会因此
+    /// 把 WG 出口白配)。不配 = 保持本机解析, 不强加一次额外往返。
+    pub dns: Option<std::net::IpAddr>,
 }
 
 /// 解码一个标准 WireGuard base64 密钥为 32 字节。
@@ -105,6 +112,21 @@ pub fn build_tunn(cfg: &WgConfig, index: u32) -> boringtun::noise::Tunn {
     )
 }
 
+/// 解析目标地址 —— **配了隧道内 DNS 就经隧道解析**, 否则回落到本机解析。
+///
+/// 回落是刻意的: 不配 `dns` 的用户不该被强加一次额外往返。但要清楚代价 —— 本机解析
+/// 意味着查询不经隧道, 且拿到的是本机所在地区的结果 (CDN/流媒体会因此把出口白配)。
+pub async fn resolve_target(
+    tunnel: &std::sync::Arc<tunnel::WgTunnel>,
+    host: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr> {
+    if let Some(dns) = &tunnel.dns {
+        return dns.resolve(tunnel.clone(), host, port).await;
+    }
+    Ok(crate::proxy::resolver::resolve_first(host, port).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +161,7 @@ mod tests {
             address: "10.0.0.2".parse().unwrap(),
             mtu: 1420,
             persistent_keepalive: None,
+            dns: None,
         };
         let expect = PublicKey::from(&StaticSecret::from(priv_bytes)).to_bytes();
         assert_eq!(cfg.public_key(), expect);
@@ -157,6 +180,7 @@ mod tests {
             address: "10.0.0.2".parse().unwrap(),
             mtu: 1420,
             persistent_keepalive: None,
+            dns: None,
         };
         let mut tunn = build_tunn(&cfg, 1);
 

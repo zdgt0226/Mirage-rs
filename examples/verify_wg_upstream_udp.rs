@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         address: env("WG_ADDRESS")?.parse()?,
         mtu: 1420,
         persistent_keepalive: Some(25),
+        dns: None,
     };
     let up = mirage_rs::proxy::upstream::WgUpstream::new(wg, mirage_rs::config::UdpPolicy::Tunnel);
 

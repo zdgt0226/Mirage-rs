@@ -253,7 +253,7 @@ async fn relay_via_wireguard(
             return;
         }
     };
-    let addr = match crate::proxy::resolver::resolve_first(host, port).await {
+    let addr = match crate::proxy::wg::resolve_target(&tunnel, host, port).await {
         Ok(a) => a,
         Err(e) => {
             warn!("Mirage Server: 解析 {} 失败: {}", target, e);

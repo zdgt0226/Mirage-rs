@@ -103,6 +103,10 @@ pub enum UpstreamConfig {
         mtu: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistent_keepalive: Option<u16>,
+        /// 隧道内 DNS 服务器 (如 `10.0.0.1`), 对齐 wg-quick 的 `DNS =`。
+        /// 配了则走本隧道的域名**经隧道解析**; 不配 = 本机解析 (原行为)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dns: Option<String>,
         /// 默认 `tunnel` (UDP 也走 WG 隧道, 与 TCP 同出口)。
         #[serde(default = "default_wg_udp")]
         udp: UdpPolicy,
@@ -278,6 +282,10 @@ pub enum OutboundConfig {
         /// persistent-keepalive 秒数, 穿 NAT 用; 0 = 关。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistent_keepalive: Option<u16>,
+        /// 隧道内 DNS 服务器 (如 `10.0.0.1`), 对齐 wg-quick 的 `DNS =`。
+        /// 配了则走本隧道的域名**经隧道解析**; 不配 = 本机解析 (原行为)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dns: Option<String>,
     },
     Direct {
         tag: String,
