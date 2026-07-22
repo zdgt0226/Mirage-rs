@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-22T04:26:44.606Z._
+_Auto-generated. Last updated 2026-07-22T04:52:56.571Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -19,4 +19,5 @@ _Auto-generated. Last updated 2026-07-22T04:26:44.606Z._
 - [splice-over-sockmap](pages/splice-over-sockmap.md) — category: decision | **决定**(v0.4.5-alpha.3, `a6535e1`):直连出站的零拷贝从 **sockmap `sk_skb`** 改为 **`splice(2)` + pipe**。
 - [ss-upstream-relay](pages/ss-upstream-relay.md) — category: decision | Mirage 服务端可配 `upstream` 把流量再经 Shadowsocks 发往上游, 即作中转站:
 - [syn-only-sk-assign](pages/syn-only-sk-assign.md) — category: decision | **决定**:`tc_divert` 对 TCP **只在首 SYN**(`th->syn && !th->ack`)做 `bpf_sk_assign`;
+- [tailscale-support-deferred](pages/tailscale-support-deferred.md) — category: decision | tags: [wireguard, tailscale, scope] | **决定**: 暂不为 Mirage 实现 Tailscale 原生支持。
 - [tls-fingerprint-mimicry](pages/tls-fingerprint-mimicry.md) — category: decision | **决定**:ClientHello **字节级**仿真真实客户端,并按权重轮换多个 profile 稀释单一出口指纹:
