@@ -189,7 +189,7 @@ async fn serve_client(
         Ok(SocksCommand::TcpConnect(target)) => {
             // 复用完整版的转发路径 (含换隧道重试/中继), 不另起一套实现。
             // 无 eBPF、无 fake-IP: 轻量模式不涉及这两者。
-            crate::proxy::handler::proxy_tcp_target(stream, target, Vec::new(), state, None, None, None)
+            crate::proxy::handler::proxy_tcp_target(stream, target, Vec::new(), state, None, None, None, false)
                 .await;
         }
         Ok(SocksCommand::UdpAssociate) => {

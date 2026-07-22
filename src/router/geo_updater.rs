@@ -151,6 +151,13 @@ struct SourceMeta {
     /// Unix 秒。
     #[serde(default)]
     downloaded_at: u64,
+    /// 上次实际下载用的 URL 列表。
+    ///
+    /// **必须记**: 否则用户把 `geo_sources[].url` 换成另一个规则源后, 本地 .dat 还"新鲜",
+    /// 新鲜度判据会直接跳过下载 —— 结果是继续用**旧源**的数据最长 `update_days` 天,
+    /// 而日志还说"已是最新", 完全误导。
+    #[serde(default)]
+    urls: Vec<String>,
 }
 
 fn meta_path(dir: &str) -> std::path::PathBuf {
@@ -207,7 +214,16 @@ async fn update_one(
     // downloaded_at 优先取 meta (304 时文件没被重写, mtime 不动, 只有 meta 记得住);
     // meta 丢了则退回文件 mtime。
     let max_age = Duration::from_secs(update_days.max(1) as u64 * 86_400);
-    if exists {
+    // 配置里的 URL 变了就必须重下, 不管本地多新 —— 换源的意图是立刻生效。
+    let url_changed = meta
+        .sources
+        .get(&source.name)
+        .map(|m| !m.urls.is_empty() && m.urls != source.url)
+        .unwrap_or(false);
+    if url_changed {
+        info!("GeoUpdater: {} 的 url 已变更, 忽略新鲜度直接重新下载", filename);
+    }
+    if exists && !url_changed {
         let age = meta
             .sources
             .get(&source.name)
@@ -231,7 +247,9 @@ async fn update_one(
     //
     // 否则会出现"上游回 304 说你已是最新, 而本地 .dat 早被删了"的尴尬 —— 结果是永远
     // 拿不到文件。(Python 版踩过同款, 明确注释了这点。)
-    let cond = if exists {
+    // 换源后**不能**带旧源的验证器: ETag 是源特定的, 拿去问新源没有意义, 万一撞上
+    // 还会误判成 304 而继续用旧内容。
+    let cond = if exists && !url_changed {
         meta.sources.get(&source.name).map(|m| m.validators.clone())
     } else {
         None
@@ -248,6 +266,7 @@ async fn update_one(
             info!("GeoUpdater: {} 上游未变更 (304), 复用本地文件", filename);
             let e = meta.sources.entry(source.name.clone()).or_default();
             e.downloaded_at = now_secs();
+            e.urls = source.url.clone();
             return Ok(());
         }
         FetchOutcome::Body(b, v) => (b, v),
@@ -284,6 +303,7 @@ async fn update_one(
     let e = meta.sources.entry(source.name.clone()).or_default();
     e.validators = validators;
     e.downloaded_at = now_secs();
+    e.urls = source.url.clone();
 
     info!("GeoUpdater: {} 已更新 ({} 字节)", filename, bytes.len());
     Ok(())
@@ -619,6 +639,48 @@ mod tests {
         )
         .expect("数组应能解析");
         assert_eq!(many.url.len(), 2, "多镜像应全部保留");
+    }
+
+    /// 换了源 URL 必须立刻重下, 不能被新鲜度判据挡住。
+    ///
+    /// 这是新鲜度优化引入的回归风险: 优化之前每次启动都重下, 改 URL 立刻生效;
+    /// 加了新鲜度跳过后, 若不比对 URL, 用户换源后会**继续用旧源的数据**最长
+    /// `update_days` 天, 而日志还说"已是最新", 完全误导。
+    #[test]
+    fn url_change_invalidates_freshness() {
+        let mut m = MetaFile::default();
+        let e = m.sources.entry("ls".into()).or_default();
+        e.urls = vec!["https://old/x.dat".into()];
+        e.downloaded_at = now_secs();
+
+        let changed = |cfg_urls: Vec<&str>| -> bool {
+            let want: Vec<String> = cfg_urls.into_iter().map(String::from).collect();
+            m.sources
+                .get("ls")
+                .map(|s| !s.urls.is_empty() && s.urls != want)
+                .unwrap_or(false)
+        };
+
+        assert!(changed(vec!["https://new/x.dat"]), "换了 URL 应判为变更");
+        assert!(!changed(vec!["https://old/x.dat"]), "URL 没变不该判为变更");
+        assert!(
+            changed(vec!["https://old/x.dat", "https://mirror/x.dat"]),
+            "加了镜像也算变更 (镜像顺序影响实际取哪个源)"
+        );
+    }
+
+    /// 老 meta (没有 urls 字段) 不能被误判成"URL 变了"而每次都重下。
+    #[test]
+    fn legacy_meta_without_urls_does_not_force_redownload() {
+        // 老版本写出的 meta 没有 urls 字段
+        let m: MetaFile =
+            serde_json::from_str(r#"{"sources":{"ls":{"downloaded_at":1700000000}}}"#)
+                .expect("老格式应能解析");
+        let s = m.sources.get("ls").expect("应有该源");
+        assert!(s.urls.is_empty(), "老 meta 无 urls 字段应为空");
+        // 空 urls 时判据必须返回 false, 否则每次都强制重下
+        let want = vec!["https://a/x.dat".to_string()];
+        assert!(!(!s.urls.is_empty() && s.urls != want), "空 urls 不该被判为变更");
     }
 
     /// 真机下载验证 (默认不跑, 需网络能到 GitHub):

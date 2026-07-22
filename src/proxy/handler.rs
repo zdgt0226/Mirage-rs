@@ -79,7 +79,7 @@ pub async fn handle_client(
         }
     };
 
-    proxy_tcp_target(local, target, Vec::new(), state, ebpf_engine, fake_ip_mapper, inbound_tag).await;
+    proxy_tcp_target(local, target, Vec::new(), state, ebpf_engine, fake_ip_mapper, inbound_tag, false).await;
 }
 
 /**
@@ -99,6 +99,10 @@ pub async fn proxy_tcp_target(
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
     // 本连接来自哪个入站 (供 routing 的 `inbound` 条件用); None = 调用方未提供。
     inbound_tag: Option<Arc<str>>,
+    // 调用方是否**已经嗅过**。transparent 入站自己会先嗅一轮 (它要把域名替换进 target
+    // 交服务端在干净网络解析, 抗 DNS 污染), 嗅不到才退回裸 IP —— 那种情况下这里再嗅
+    // 一次必然也嗅不到 (同一条流、仍然没数据), 白白再等一个超时。
+    already_sniffed: bool,
 ) {
     let current_state = state.load();
     let mut final_target = target;
@@ -146,7 +150,7 @@ pub async fn proxy_tcp_target(
     // 另一个 IP (CDN/多 A 记录), 等于擅自改了客户端指定的目的地; 域名解析不出来时更是直接
     // 连不上。sing-box 同样把两者分开 (override_destination 默认关)。
     let mut sniffed_domain: Option<String> = None;
-    if initial_payload.is_empty() && final_host.parse::<IpAddr>().is_ok() {
+    if !already_sniffed && initial_payload.is_empty() && final_host.parse::<IpAddr>().is_ok() {
         if let Some(sniffed) = crate::proxy::sniff::sniff_with_timeout(
             &local,
             std::time::Duration::from_millis(300),

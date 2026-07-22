@@ -112,9 +112,10 @@ pub async fn start_transparent(
         let st = state.clone();
         let fm = fake_ip_mapper.clone();
         let te = transparent_engine.clone();
+        let udp_tag = inbound_tag.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                crate::proxy::transparent_udp::start_transparent_udp(udp_bind, st, fm, te).await
+                crate::proxy::transparent_udp::start_transparent_udp(udp_tag, udp_bind, st, fm, te).await
             {
                 error!("Transparent UDP proxy failed: {}", e);
             }
@@ -175,6 +176,8 @@ pub async fn start_transparent(
                                 ebpf_clone,
                                 Some(fake_ip_mapper_clone),
                                 Some(tag_clone),
+                                // transparent 上面已经嗅过一轮, 别再重复等一个超时
+                                true,
                             ).await;
                         }
                     }

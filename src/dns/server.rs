@@ -350,10 +350,17 @@ pub struct DnsForwarder {
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
     xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     cache: Option<DnsCache>,
+    /// 本 DNS 入站的 tag, 供路由的 `inbound` 条件用。
+    ///
+    /// ⚠️ 语义要看清: DNS 查询是从 **dns 入站**进来的, 所以这里带的是 dns 的 tag。
+    /// 一条 `{"inbound": "tproxy", ...}` 的规则**不会**影响 DNS/fake-IP 决策 ——
+    /// 那条查询并非来自 tproxy。这不是遗漏, 是"决策发生在另一个入站上"的固有结果。
+    inbound_tag: Arc<str>,
 }
 
 impl DnsForwarder {
     pub async fn start(
+        inbound_tag: Arc<str>,
         listen_addr: SocketAddr,
         state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
         fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
@@ -383,6 +390,7 @@ impl DnsForwarder {
             fake_ip_mapper,
             xdp_engine,
             cache,
+            inbound_tag,
         });
 
         // Start worker task
@@ -455,7 +463,7 @@ impl DnsForwarder {
             protocol: "udp",
             source_ip: None,
             source_mac: None,
-            inbound: None,
+            inbound: Some(&self.inbound_tag),
         };
 
         let action = st.router.route(routing_req);

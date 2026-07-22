@@ -1,5 +1,30 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 自我审查修复 (含 Sonnet 独立复核)
+
+自审 + 换模型独立复核。两边**独立查出同样两条**(下面 1、2), 复核另外查出两条我漏掉的
+(3、4)。
+
+1. **`inbound` 规则对 UDP 不生效** (`transparent_udp.rs`): 路由请求里 `inbound` 写死 `None`。
+   同一个 transparent 入站, **TCP 认 `inbound` 规则、UDP 不认** —— 写
+   `{"inbound":"tproxy","domain_suffix":"netflix.com","outbound":"landing-jp"}` 后
+   TCP 走 landing-jp 而 QUIC/UDP 静默走默认出口, 同一站点两个出口 IP。已把 tag 穿透进
+   UDP 流。
+2. **换 geo 源 URL 不生效** (`geo_updater.rs`) —— **本次新鲜度优化引入的回归**。
+   优化前每次启动都重下, 改 URL 立刻生效; 加了新鲜度跳过后, 若不比对 URL, 换源会
+   **继续用旧源数据**最长 `update_days` 天, 日志还说"已是最新"。meta 现在记 URL 列表,
+   变了就无视新鲜度重下; 且**不带旧源的 ETag**(ETag 是源特定的, 拿去问新源没意义,
+   撞上还会误判 304 继续用旧内容)。含老 meta 兼容测试 (无 `urls` 字段不该被判成"变了")。
+3. **双重嗅探, 最坏叠加 ~2.3s** (复核发现): transparent 入站自己会先嗅一轮 (2s), 嗅不到
+   退回裸 IP; 而新加的集中式嗅探看到裸 IP 又嗅一次 (300ms)。同一条流、仍然没数据, 第二次
+   必然也嗅不到, 纯属白等。**没有直接删掉 transparent 那轮** —— 它替换 target 是刻意的
+   (把域名交服务端在干净网络解析, 抗 DNS 污染)。改为由调用方传 `already_sniffed` 跳过。
+4. **DNS 入站的 tag 被 `..` 丢弃** (复核发现): `InboundConfig::Dns` 解构时直接丢掉 `tag`,
+   DNS 路由固定传 `inbound: None` —— 连修的路径都没有。已补齐。
+   > 同时写清一条**固有语义**(不是 bug): DNS 查询来自 **dns 入站**, 所以
+   > `{"inbound":"tproxy"}` 的规则不会影响 fake-IP 决策。后果是该域名不分配 fake-IP,
+   > 透明模式下靠 SNI 嗅探仍能正确分流, 只是少了 fake-IP 这层。README 已注明。
+
 ## [未发布] - 路由新增 `inbound` 维度
 
 ### feat(route): 规则可按**入站 tag** 限定

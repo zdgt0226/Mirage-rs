@@ -359,6 +359,11 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
     ```
     不写 = 不限入站(与原行为一致)。写错入站名会被 `mirage-rs check` 拦下 ——
     否则症状是"规则写了不生效", 极难自查
+  - ⚠️ **与 fake-IP 的固有交互**: DNS 查询是从 **dns 入站**进来的, 所以一条
+    `{"inbound": "tproxy", ...}` 的规则**不会**影响 DNS/fake-IP 决策 —— 那条查询并非
+    来自 tproxy。后果是该域名不会被分配 fake-IP, 透明模式下只能靠 SNI 嗅探拿回域名
+    (通常仍能正确分流, 但少了 fake-IP 这一层)。这不是遗漏, 是"决策发生在另一个入站上"
+    的必然结果。要让 DNS 决策也受限, 规则里写 dns 入站自己的 tag
 - **`tuning.ebpf_mode`**: `"auto"` / `"force"` / `"off"`. alpha.7 起 install.sh 客户端默认 `"off"` (BPF SockMap 直连转发有已知问题, 见 CHANGELOG alpha.7)
 - **`tuning.geo_sources[]`**: 多源 geo 数据下载 (v0.4.3+ 替代旧的 `geosite_url` / `geoip_url`)
   - `via`: `"direct"` 或 `"proxy"`. **`"proxy"` 走客户端 mirage 出口拉 GitHub** — 大陆用户强烈推荐, `install.sh` 默认就是它
