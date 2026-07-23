@@ -19,6 +19,24 @@ use tracing::{info, warn, error, Level};
 /// 监听非回环地址却没配 auth = **开放代理**: 任何能连到该端口的人都能白嫖隧道,
 /// 流量从你的服务端出去, 出口 IP 会被滥用/拉黑 (对抗审查部署尤其致命 —— 招来注意力)。
 /// 不阻止启动 (向后兼容既有配置 + 可信内网仍是合法用法), 但必须让用户看见。
+/// 对 URL userinfo 段做百分号编码。
+///
+/// 必要性: 认证凭据要拼进 `socks5://user:pass@host` 时, 密码里的 `@ : / ?` 等字符会破坏
+/// URL 结构, reqwest::Proxy::all() 直接 InvalidUrl。只保留 RFC 3986 unreserved 字符,
+/// 其余全部 %XX —— userinfo 段这样最省心且绝不出错。
+fn urlencoding_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 fn warn_if_open_proxy(kind: &str, listen: &str, port: u16, has_auth: bool) {
     if has_auth {
         return;
@@ -137,16 +155,20 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     // 早读 config, 取 log_level + log_file 作 subscriber 初始化输入.
     // subscriber 只能 set_global_default 一次, 所以必须在 info!/error! 前.
     // 早失败 (config 读不到 / 解析错) 用 eprintln 输出到 stderr, 不依赖 tracing.
-    let (log_level_str, log_file_path) = {
+    let (log_level_str, log_file_path, log_rotate_mb, log_keep_archives) = {
         let mut level = "info".to_string();
         let mut file: Option<String> = None;
+        let mut rotate_mb: Option<u64> = None;
+        let mut keep: Option<usize> = None;
         if let Ok(content) = std::fs::read_to_string(config_path) {
             if let Ok(cfg) = serde_json::from_str::<crate::config::Config>(&content) {
                 level = cfg.log_level;
                 file = cfg.log_file;
+                rotate_mb = cfg.log_rotate_mb;
+                keep = cfg.log_keep_archives;
             }
         }
-        (level, file)
+        (level, file, rotate_mb, keep)
     };
     let max_level = match log_level_str.to_lowercase().as_str() {
         "trace" => Level::TRACE,
@@ -168,7 +190,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     // FileLogger 自带按大小滚动 (10MB) + gzip 压缩归档 (保留 10 份)。
     let file_logger_opt: Option<crate::monitor::FileLogger> = match log_file_path.as_deref() {
         Some(path) if !path.is_empty() => {
-            match crate::monitor::FileLogger::new(path) {
+            match crate::monitor::FileLogger::with_settings(path, log_rotate_mb, log_keep_archives) {
                 Ok(fl) => Some(fl),
                 Err(e) => {
                     eprintln!(
@@ -269,9 +291,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             // 探测本地 socks/mixed inbound 给 geo via=proxy 用. 0.0.0.0 自动改 127.0.0.1
             // (本地自连不能用通配地址).
             for ib in &config.inbounds {
-                let (listen, port) = match ib {
-                    crate::config::InboundConfig::Socks { listen, port, .. } => (listen, port),
-                    crate::config::InboundConfig::Mixed { listen, port, .. } => (listen, port),
+                let (listen, port, auth) = match ib {
+                    crate::config::InboundConfig::Socks { listen, port, auth, .. } => (listen, port, auth),
+                    crate::config::InboundConfig::Mixed { listen, port, auth, .. } => (listen, port, auth),
                     _ => continue,
                 };
                 // 0.0.0.0 / :: 通配符改回环 loopback (URL 里指自身). IPv6 主机 (含 ::1 /
@@ -288,7 +310,20 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 } else {
                     host_raw.to_string()
                 };
-                socks_proxy_url = Some(format!("socks5://{}:{}", host, port));
+                // ⚠️ 入站设了认证时, 凭据**必须**编进 proxy URL —— geo updater 用这个入站
+                // 当代理下载, 自己连自己的代理也要过认证。漏了会得到
+                // "client does not support username/password auth", geo 永远下不下来。
+                // reqwest::Proxy::all() 认 URL 里的 user:pass@host (RFC 1929 / Basic 都走它)。
+                socks_proxy_url = Some(match auth {
+                    Some(a) => format!(
+                        "socks5://{}:{}@{}:{}",
+                        urlencoding_encode(&a.username),
+                        urlencoding_encode(&a.password),
+                        host,
+                        port
+                    ),
+                    None => format!("socks5://{}:{}", host, port),
+                });
                 break;
             }
         }
@@ -818,4 +853,21 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         e.detach();
     }
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencoding_encode;
+
+    #[test]
+    fn userinfo_encoding_survives_special_chars() {
+        // unreserved 原样
+        assert_eq!(urlencoding_encode("mirage-1.0_x~"), "mirage-1.0_x~");
+        // 会破坏 URL 结构的字符必须被编码 —— 这正是 bug 的根因
+        assert_eq!(urlencoding_encode("p@ss:w/rd"), "p%40ss%3Aw%2Frd");
+        // openssl rand -base64 常见的 + / =
+        assert_eq!(urlencoding_encode("a+b/c="), "a%2Bb%2Fc%3D");
+        // 空字符串不炸
+        assert_eq!(urlencoding_encode(""), "");
+    }
 }

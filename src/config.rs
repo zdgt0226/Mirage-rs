@@ -55,6 +55,12 @@ pub struct Config {
     /// 常见值 "/var/log/mirage-rs/server.log" 或 client.log.
     #[serde(default)]
     pub log_file: Option<String>,
+    /// 单个日志文件滚动阈值 (MB)。不设 = 默认 10。仅在配了 log_file 时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_rotate_mb: Option<u64>,
+    /// 保留的 gzip 历史归档数。不设 = 默认 10。0 = 不保留归档 (滚动即删旧)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_keep_archives: Option<usize>,
     pub inbounds: Vec<InboundConfig>,
     pub outbounds: Vec<OutboundConfig>,
     pub routing: RoutingConfig,

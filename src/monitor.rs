@@ -101,6 +101,7 @@ struct RotatingFile {
     file: std::fs::File,
     written: u64,
     rotate_at: u64,
+    keep_archives: usize,
 }
 
 impl RotatingFile {
@@ -112,9 +113,9 @@ impl RotatingFile {
         let path = self.path.clone();
 
         // 1. 删最老归档
-        let _ = std::fs::remove_file(archive_name(&path, LOG_KEEP_ARCHIVES));
+        let _ = std::fs::remove_file(archive_name(&path, self.keep_archives));
         // 2. .i.gz → .(i+1).gz (从高到低, 避免覆盖)
-        for i in (1..LOG_KEEP_ARCHIVES).rev() {
+        for i in (1..self.keep_archives).rev() {
             let from = archive_name(&path, i);
             if from.exists() {
                 let _ = std::fs::rename(&from, archive_name(&path, i + 1));
@@ -171,6 +172,23 @@ impl FileLogger {
         Self::with_rotate_bytes(path, LOG_ROTATE_BYTES)
     }
 
+    /// 用显式滚动阈值 (MB) 与归档保留数构造。0/None 退回默认。
+    pub fn with_settings(
+        path: impl Into<std::path::PathBuf>,
+        rotate_mb: Option<u64>,
+        keep_archives: Option<usize>,
+    ) -> std::io::Result<Self> {
+        let rotate_at = match rotate_mb {
+            Some(mb) if mb > 0 => mb * 1024 * 1024,
+            _ => LOG_ROTATE_BYTES,
+        };
+        let fl = Self::with_rotate_bytes(path, rotate_at)?;
+        if let Some(keep) = keep_archives {
+            fl.0.lock().unwrap_or_else(|e| e.into_inner()).keep_archives = keep;
+        }
+        Ok(fl)
+    }
+
     fn with_rotate_bytes(path: impl Into<std::path::PathBuf>, rotate_at: u64) -> std::io::Result<Self> {
         let path = path.into();
         let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
@@ -180,6 +198,7 @@ impl FileLogger {
             file,
             written,
             rotate_at,
+            keep_archives: LOG_KEEP_ARCHIVES,
         }))))
     }
 }

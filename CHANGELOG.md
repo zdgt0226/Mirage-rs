@@ -1,5 +1,41 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 部署反馈修复 (真机反馈 4 条)
+
+### fix(geo): 入站设了认证时, geo 经代理下载因**丢失凭据**而永远失败
+
+真机日志: geo 走 `socks5://127.0.0.1:1080` 自连下载, 但该 mixed 入站设了认证, 握手回
+`client does not support username/password auth`。根因: 构造 proxy URL 时用 `..` 丢掉了
+入站的 `auth` 字段, reqwest 用无认证方式连自己的代理, 被拒。
+
+修复: 入站有认证时把凭据编进 URL (`socks5://user:pass@host`)。密码里的 `@ : / + =` 等字符
+会破坏 URL 结构, 故新增 `urlencoding_encode` 对 userinfo 段做百分号编码 (只保留 RFC 3986
+unreserved)。
+
+> 澄清: geo 走 `via: proxy` **本来就是"经隧道下载"的正确方式** —— socks 入站 → 路由 →
+> mirage 出站 → 隧道 → 服务端。它不是绕过隧道, 只是自连时漏带了认证。
+
+### feat(config): 日志滚动阈值与归档份数可配
+
+新增 `log_rotate_mb` / `log_keep_archives` 两个可选字段 (不设 = 默认 10MB / 10 份, 与原
+行为一致)。此前这两个值是硬编码常量, 无法调整。install.sh 客户端安装时可选引导。
+
+### feat(install): mixed 非回环监听的"知情不设认证"逃生阀
+
+此前非回环监听**强制**设认证。有些纯可信 LAN 场景确实不需要。改为: 仍默认引导设认证,
+但允许在**二次确认知悉风险后**不设 —— 警告写明"同一网络任何设备(含被入侵的 IoT/访客)
+都能白嫖隧道, 出口 IP 被滥用会连累整条链路"。安全的默认不变, 只多一个明确的出口。
+
+### feat(install): 客户端部署完成后打印汇总
+
+此前只有服务端有安装汇总, 客户端装完只提示两行。现补齐: 代理入站地址、Web 看板 URL
+(含 token)、配置文件路径、日志目录、日志/启动命令一屏列清。
+
+### ⚠️ 过程事故
+本次编辑中一个 heredoc 误把 lib.rs 的模块声明写进了 `monitor.rs`, 导致后者被整体覆盖。
+`cargo build` 立刻报 `file not found for module crypto` 暴露 —— `git checkout src/monitor.rs`
+恢复后重做。教训: 多文件连续脚本编辑时, 每步写完立刻验目标文件头部, 别攒着一起验。
+
 ## [v0.6.0-alpha.7] - WireGuard 支持 + 路由三项改进 (2026-07-23)
 
 自 alpha.6 以来最大的一版。三条主线: WireGuard 全套支持、路由三项改进、geo 更新器大修。

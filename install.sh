@@ -1604,13 +1604,31 @@ config_client() {
       不设认证 = 开放代理: 任何能连到它的人都能使用你的隧道, 流量从你的服务端出去,
       出口 IP 会被滥用甚至拉黑。对抗审查部署来说, 招来注意力是最不能承受的。
 EOM
-        local ib_user ib_pass
-        ib_user=$(ask "代理用户名" "mirage")
-        ib_pass=$(ask "代理密码 (留空=自动生成)" "")
-        [[ -z "$ib_pass" ]] && { ib_pass=$(generate_password); info "已自动生成代理密码: $ib_pass"; }
-        inbound_auth_json=',
+        if ask_yn "设置账号密码保护这个入站? (强烈建议 y)" y; then
+            local ib_user ib_pass
+            ib_user=$(ask "代理用户名" "mirage")
+            ib_pass=$(ask "代理密码 (留空=自动生成)" "")
+            [[ -z "$ib_pass" ]] && { ib_pass=$(generate_password); info "已自动生成代理密码: $ib_pass"; }
+            inbound_auth_json=',
             "auth": { "username": "'"$(json_escape "$ib_user")"'", "password": "'"$(json_escape "$ib_pass")"'" }'
-        ok "入站认证已启用 (SOCKS5 走 RFC 1929, HTTP 走 Proxy-Authorization: Basic)"
+            ok "入站认证已启用 (SOCKS5 走 RFC 1929, HTTP 走 Proxy-Authorization: Basic)"
+        else
+            # 逃生阀: 明确知情后允许开放代理 (例如纯可信 LAN)。二次确认防手滑。
+            warn "你选择了**不设认证的非回环监听** = 开放代理。"
+            warn "同一网络内任何设备 (含被入侵的 IoT / 访客) 都能白嫖你的隧道, 出口 IP"
+            warn "可能被滥用甚至拉黑 —— 抗审查部署里这可能让整条链路失效。"
+            if ask_yn "我明白风险, 确认不设认证?" n; then
+                ok "已按你的选择: 非回环开放代理 (无认证)"
+            else
+                local ib_user ib_pass
+                ib_user=$(ask "代理用户名" "mirage")
+                ib_pass=$(ask "代理密码 (留空=自动生成)" "")
+                [[ -z "$ib_pass" ]] && { ib_pass=$(generate_password); info "已自动生成代理密码: $ib_pass"; }
+                inbound_auth_json=',
+            "auth": { "username": "'"$(json_escape "$ib_user")"'", "password": "'"$(json_escape "$ib_pass")"'" }'
+                ok "入站认证已启用"
+            fi
+        fi
     fi
 
     # ── 部署模式: 本地代理 vs 透明网关 ──
@@ -1760,6 +1778,18 @@ EOM
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
+    # 日志滚动: 默认按 10MB 滚动 + gzip 保留 10 份 (磁盘约 10MB 封顶), 已足够绝大多数场景。
+    # 只在用户想调时才问, 不加噪。
+    local log_rotate_line=""
+    if ask_yn "自定义日志滚动设置? (默认 10MB/份, 保留 10 份 gzip)" n; then
+        local rmb rkeep
+        rmb=$(ask "单文件滚动阈值 (MB)" "10")
+        rkeep=$(ask "保留 gzip 归档份数 (0=滚动即删旧)" "10")
+        log_rotate_line='
+    "log_rotate_mb": '"${rmb}"',
+    "log_keep_archives": '"${rkeep}"','
+    fi
+
     # mode 3 同机部署时, 服务端可能已占 9090, ask_gui 内的 ask_port 会自动
     # 检测占用并提示改成 9091 等. 单独 client (mode 2) 直接 9090 即可.
     local client_gui_enabled client_gui_listen client_gui_token client_gui_token_line=""
@@ -1771,7 +1801,7 @@ EOM
 {
     "schema_version": 1,
     "log_level": "${log_str}",
-    "log_file": "${LOG_DIR}/client.log",
+    "log_file": "${LOG_DIR}/client.log",${log_rotate_line}
     "inbounds": [
         ${inbounds_json}
     ],
@@ -1824,7 +1854,22 @@ EOF
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
     setup_service "client"
 
-    info "你可以使用以下命令启动客户端: $(svc_start_hint client)"
+    # ── 部署汇总 ── 一屏看清关键信息, 免得用户回翻日志找端口/地址
+    local gui_url="(未启用)"
+    if [[ "$client_gui_enabled" == "true" ]]; then
+        local gui_host="${client_gui_listen%%:*}"
+        local gui_port="${client_gui_listen##*:}"
+        [[ "$gui_host" == "0.0.0.0" || "$gui_host" == "::" ]] && gui_host="<本机IP>"
+        gui_url="http://${gui_host}:${gui_port}"
+        [[ -n "$client_gui_token" && "$client_gui_token" != "-" ]] && gui_url="${gui_url}/?token=${client_gui_token}"
+    fi
+    title "客户端部署完成"
+    echo -e "  代理入站:   $(_c 36 "${inbound_listen}:${inbound_port}") (mixed: SOCKS5/HTTP)" >&2
+    echo -e "  Web 看板:   $(_c 36 "${gui_url}")" >&2
+    echo -e "  配置文件:   $(_c 36 "${ETC_DIR}/config_client.json")" >&2
+    echo -e "  日志目录:   $(_c 36 "${LOG_DIR}")" >&2
+    echo -e "  日志命令:   $(_c 36 "$(svc_log_hint client)")" >&2
+    echo -e "  启动命令:   $(_c 36 "$(svc_start_hint client)")" >&2
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
