@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-07-23T03:19:23"
+updated: "2026-07-23T10:13:02"
 ---
 
 # Roadmap
@@ -46,6 +46,7 @@ updated: "2026-07-23T03:19:23"
 | **指纹 profile 热下发** | 抗识别 | 服务端下发新 ClientHello profile, 免客户端发版。**数据侧可热更(我们 TLS 是假的, key_share 等填随机字节)**, 代码侧用预置编码器 + 数据选择。⚠️ 自动切最新 Chrome 反而更易识别 —— 要按装机份额且错开切换。详见 [[fingerprint-hot-update]] |
 | TLS resumption | 破坏性协议变更 | 零会话复用是真实统计指纹;工装已就绪, 两端需同时升级。见 [[tls-fingerprint-mimicry]] |
 | ICMP 处理 | 体验缺口 | ping/traceroute 被代理域名不通。**失败形态未在真机确认, 用户明确说等部署网关时再定** |
+| **统一出站流接口** | 结构性 | 抽 `OutboundNode::connect(target)->AsyncStream`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连 ("proxy URL 丢认证"bug 就是这个绕路的后果)。WgTcpStream 已证明抽象可行。有第二个隧道消费者时一并做。详见 [[unified-outbound-stream]] |
 | IPv6 全栈 | 结构性 | 见 [[ipv6-v4only-tradeoff]] |
 | SS 上游 UDP | 生态 | 需求驱动: 多数 SS 服务器默认不开 UDP 且无握手, 实现了不等于能用。见 [[ss-upstream-relay]]。**注: WG 上游的 UDP 已通**, 要 UDP 同出口可直接用 WG |
 | 订阅链接 | 生态 | 基础已有(node_uri + import), 但**订阅格式本身要先定义**才动手 |
