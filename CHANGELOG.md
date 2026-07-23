@@ -1,5 +1,27 @@
 # Changelog - Mirage-rs
 
+## [未发布] - LPM 同步先加后删 (外部审计 #3)
+
+### fix(tc_divert): direct_cidr 差量同步改"先加后删", 消除半更新漏判窗口
+
+热重载 GeoIP 直连表时逐条增删 LPM map, 非事务原子。旧顺序是**先删后加**: 一个既有段被
+remove 后、尚未 re-insert 前, 若 TCP SYN 首包撞上, 会把本该直连的流量误判成代理。
+
+审计建议 ARRAY_OF_MAPS 双缓冲原子切换 —— 核实 aya 0.13: 只把 ARRAY_OF_MAPS 当只读 info
+枚举, **无高层 API 操作 inner map**, 要做得换 map 类型 + 裸 syscall + 处理 inner 生命周期,
+对一个 P3 竞态性价比太低, 且引入新的加载/verifier 风险。
+
+改用**先加后删**, 几行改动、零新依赖:
+1. 先 insert 全部新增段 → 此刻 map = 旧 ∪ 新 (超集), **绝不漏判** (本该直连的段一定在)。
+2. 再 remove 过时段。
+
+唯一残留: 刚"不再直连"的段在 remove 前几微秒仍被当直连 —— 但它上一秒本就是直连, 方向
+无害 (顶多晚一个包切走)。审计真正担心的"直连被误代理"(漏判) 方向被彻底消除。
+
+容量: geoip cn 段实测约 1 万, 先加后删最坏"旧∪新"≈2 万, 距 max_entries 65536 有 3x 余量。
+
+tc_divert netns 验证器实测 LPM 分流仍正常。
+
 ## [未发布] - 修透明代理自连竞态 (外部审计 #2)
 
 ### fix(transparent): cgroup origdst 查询落空时丢弃, 不再 fallback 到监听端口 (防自连)

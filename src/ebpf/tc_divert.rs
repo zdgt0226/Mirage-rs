@@ -106,14 +106,25 @@ mod sys {
             )?;
             let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
 
-            for (net, plen) in loaded.iter() {
-                if !want.contains(&(*net, *plen)) {
-                    let _ = trie.remove(&Key::new(*plen as u32, *net));
-                }
-            }
+            // ⚠️ 外部审计 #3: LPM map 更新非事务原子, 差量增删期间若 SYN 首包撞上"半更新"
+            // 状态会走错分流。真原子切换 (ARRAY_OF_MAPS 双缓冲) 需换 map 类型 + 裸 syscall,
+            // 对一个 P3 竞态性价比太低。改用**先加后删**几乎消除风险:
+            //
+            //   1. 先 insert 全部新增段 —— 此刻 map = 旧 ∪ 新, 是超集, **绝不会漏判**
+            //      (本该直连的段一定在, 不会被误当代理)。
+            //   2. 再 remove 过时段。
+            //
+            // 唯一残留: 一个刚"不再直连"的段, 在 remove 前几微秒仍被当直连 —— 但它上一秒
+            // 本就是直连, 方向无害 (顶多晚一个包切走, 下个包正常; TCP 会重传)。审计真正担心
+            // 的"直连流量被误代理"那个方向 (漏判) 被彻底消除。
             for (net, plen) in want.iter() {
                 if !loaded.contains(&(*net, *plen)) {
                     trie.insert(&Key::new(*plen as u32, *net), 1u8, 0)?;
+                }
+            }
+            for (net, plen) in loaded.iter() {
+                if !want.contains(&(*net, *plen)) {
+                    let _ = trie.remove(&Key::new(*plen as u32, *net));
                 }
             }
             let n = want.len();
