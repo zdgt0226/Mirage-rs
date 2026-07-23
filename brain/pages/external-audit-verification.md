@@ -4,8 +4,10 @@ title: "外部审计逐条核实: 术语专业但真伪参半"
 category: concept
 status: active
 created: "2026-07-20T11:43:27"
-updated: "2026-07-20T12:20:56"
+updated: "2026-07-24T00:55:30"
 ---
+
+## compiled_truth
 
 ## compiled_truth
 
@@ -29,6 +31,27 @@ updated: "2026-07-20T12:20:56"
 3. 真修的记进 brain,证伪的**也记**(否则下轮审计会再来一遍);
 4. 别被 P0 标签带节奏。
 
+## 已核实的审计轮次实例
+
+### 2026-07-23 内核专家模型 (四条, 规律再次印证)
+
+| # | 审计声称 | 核实判定 | 处置 |
+|---|---|---|---|
+| 1 | DNS DJB2 忽略点分隔符 → 域名碰撞 | ✅ **真 P1** (foo.bar.com == foobar.com 哈希) | 已修: 长度字节入哈希 + 跨端护栏 + 消灭第三份哈希拷贝 |
+| 2 | cgroup 自连 "无限死循环 FD 耗尽" | ⚠️ 竞态真, **"无限循环"夸大** (实为一次注定失败的自连, 不递归; 仅 proxy_local) | 已修: origdst 落空即丢弃, 不 fallback 监听端口 |
+| 3 | LPM 非原子 "流量瞬断", 建议 ARRAY_OF_MAPS 双缓冲 | ⚠️ 技术对, **severity 夸大**; 建议**不可照搬** (aya 0.13 无 inner-map 高层 API) | 已修但**换方案**: 先加后删 (map=旧∪新超集, 消除漏判), 非双缓冲 |
+| 4 | IPv6 硬编码拦截逃逸 | ⚠️ 事实对, 是**已知 IPv4-only 取舍** (见 [[ipv6-v4only-tradeoff]]) | 归 IPv6 全栈 roadmap, 不单独修 |
+
+### 两条可复用教训 (本轮新增)
+
+1. **建议不能照搬 —— 先验依赖能力**: #3 的 ARRAY_OF_MAPS 双缓冲在 aya 0.13 上只有只读
+   info 枚举、无操作 API, 硬做要裸 syscall + 换 map 类型, 对 P3 性价比极差。审计给的方案
+   往往是"教科书正确"但不匹配本项目栈 —— 落地前先 `find ~/.cargo/registry` 验 API 是否存在。
+2. **修复可能暴露隐藏的重复代码**: #1 修哈希时端到端验证器 timeout, 根因是哈希逻辑有
+   **三份拷贝** (mod.rs / dns_xdp.c / verify_dns_xdp.rs), 第三份"为了独立而复制"没跟上。
+   教训: "复制以求独立"的代码恰恰在需要同步时不同步; 改共享逻辑后, 全量跑端到端验证器
+   (不只单测) 才能抓出漏改的拷贝。
+
 
 ## timeline
 
@@ -42,4 +65,16 @@ updated: "2026-07-20T12:20:56"
   kind: decision
   summary: "沉淀多轮外部审计的核实方法论"
   source: "多轮审计核实记录"
+  affects: [external-audit-verification]
+
+- time: 2026-07-24T00:52:42
+  kind: evidence
+  summary: "2026-07-23 内核专家模型审计四条: 1真P1(DNS哈希碰撞已修) + 3'技术对但夸大/已知'; 建议不能照搬(#3双缓冲在aya上不划算, 改先加后删)"
+  source: "2026-07-23 审计"
+  affects: [external-audit-verification]
+
+- time: 2026-07-24T00:55:30
+  kind: decision
+  summary: "补 2026-07-23 四条审计实例 + 两条可复用教训 (建议先验依赖能力/修复暴露重复代码)"
+  source: "2026-07-23 审计"
   affects: [external-audit-verification]
