@@ -1,5 +1,26 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 修透明代理自连竞态 (外部审计 #2)
+
+### fix(transparent): cgroup origdst 查询落空时丢弃, 不再 fallback 到监听端口 (防自连)
+
+cgroup/connect4 把本机 fake-IP 出向连接改写进透明 listener 后, 用户态按 peer 源端口从
+`cc_port` map 查回真实目标。但 `TCP_CONNECT_CB` 写 map 与用户态 `accept` 是**异步竞态** ——
+accept 抢在 map 写入前时 `lookup_origdst` 落空。旧逻辑此时 `dst` 保持 `127.0.0.1:lport`
+(监听端口), 若拿它当目标, 代理就**连回自己**。
+
+> 审计原文称"无限死循环 FD 耗尽"。核实: 实际是**一次注定失败的自连** (fallback 目标经
+> `proxy_tcp_target` 发起普通 connect, 不再触发 cgroup 重定向, 不递归)。表现是偶发卡顿/
+> 连不上, 非 FD 爆炸。且**仅影响 `proxy_local` 模式** (本机流量也走代理)。severity 被夸大,
+> 但"落空不该 fallback 到监听端口"这条健壮性改进确实该做。
+
+修复两道防线:
+1. `lookup_origdst` 落空 → **直接丢弃**该连接 (return)。客户端 TCP 会重传, 届时 map 多半
+   已同步 —— 比自旋等待简单且无副作用。
+2. 双保险: 无论走哪条路径, 目标若恰为本 listener 端口 (`127.0.0.1:lport`) 一律丢弃。
+
+cgroup netns 验证器实测: map 命中路径 (origdst 正常查回改写) 不受影响。
+
 ## [未发布] - 修 DNS 哈希碰撞 (外部审计 #1, 真 P1)
 
 ### fix(dns): DJB2 忽略点分隔符导致域名哈希碰撞 → 缓存串扰

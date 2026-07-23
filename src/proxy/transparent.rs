@@ -126,6 +126,9 @@ pub async fn start_transparent(
 
     info!("Transparent proxy pipeline fully initialized and attached.");
 
+    // 本 listener 的实际端口, 用于拦截"目标 == 自己监听端口"的自连 (见下面 spawn 内)。
+    let listen_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
@@ -134,6 +137,7 @@ pub async fn start_transparent(
                 let ebpf_clone = ebpf_engine.clone();
                 let tag_clone = inbound_tag.clone();
                 let cgroup_clone = cgroup_engine.clone();
+                let lport = listen_port;
 
                 tokio::spawn(async move {
                     // 原始目的: tc_divert 路径下 local_addr() 即 fake-IP; cgroup/connect4
@@ -141,11 +145,26 @@ pub async fn start_transparent(
                     let dst = stream.local_addr();
                     if let Ok(mut dst_addr) = dst {
                         if dst_addr.ip().is_loopback() {
-                            if let Some(eng) = &cgroup_clone {
-                                if let Some((ip, port)) = eng.lookup_origdst(peer_addr.port()) {
-                                    dst_addr = std::net::SocketAddr::from((ip, port));
+                            match cgroup_clone.as_ref().and_then(|eng| eng.lookup_origdst(peer_addr.port())) {
+                                Some((ip, port)) => dst_addr = std::net::SocketAddr::from((ip, port)),
+                                None => {
+                                    // ⚠️ 外部审计 #2: cgroup/connect4 是异步的 —— TCP_CONNECT_CB 写
+                                    // cc_port map 与用户态 accept 存在竞态, accept 抢在 map 写入前时
+                                    // lookup 落空。此刻 dst 仍是 127.0.0.1:lport, **绝不能拿它当目标**:
+                                    // 那会让代理连回自己 (至少是一次注定失败的自连, 表现为偶发卡顿)。
+                                    // 直接丢弃 —— 客户端 TCP 会重传, 届时 map 多半已同步。
+                                    debug!(
+                                        "[TPROXY] {} origdst 查询落空 (cgroup map 竞态), 丢弃以防自连 127.0.0.1:{}",
+                                        peer_addr, dst_addr.port()
+                                    );
+                                    return;
                                 }
                             }
+                        }
+                        // 双保险: 无论走哪条路径, 目标若恰是本 listener 端口 = 自连, 丢弃。
+                        if dst_addr.ip().is_loopback() && dst_addr.port() == lport {
+                            debug!("[TPROXY] {} 目标为自身监听端口 127.0.0.1:{}, 丢弃防死循环", peer_addr, lport);
+                            return;
                         }
                         if let std::net::IpAddr::V4(dst_v4) = dst_addr.ip() {
 
