@@ -1,3 +1,33 @@
+/// DNS 域名哈希 —— **必须与 `ebpf-src/dns_xdp.c::hash_domain` 逐字节一致**。
+///
+/// ⚠️ 修复 (2026-07-23): 旧实现只对字符字节做 DJB2, **点分隔符/长度字节不进哈希** ——
+/// 于是 `foo.bar.com` 与 `foobar.com` 哈希相同, DNS 缓存串扰把流量劫持到错 IP。
+///
+/// XDP 侧看到的是 DNS wire format 的 QNAME: `[3]foo[3]bar[3]com[0]` —— 每个 label 前有
+/// 一个长度字节, 它就是"点"的等价物。把长度字节也算进哈希, 碰撞即消除:
+///   `foo.bar.com` → 3,f,o,o,3,b,a,r,3,c,o,m
+///   `foobar.com`  → 6,f,o,o,b,a,r,3,c,o,m   (首字节 6≠3, 哈希不同)
+///
+/// 本函数在**字符串**上重建 wire format 的哈希序列: 逐 label, 先哈希其长度, 再哈希其字符
+/// (小写)。空 label (末尾的点 / 连续点) 跳过, 与 wire format 不产生 0 长度 label 对齐。
+pub fn hash_domain(domain: &str) -> u64 {
+    let mut hash: u64 = 5381;
+    for label in domain.split('.') {
+        if label.is_empty() {
+            continue; // 末尾点等: wire format 里不会出现 0 长度中间 label
+        }
+        // 长度字节 (label 的字节数, 与 wire format 的长度前缀一致)
+        let len = label.len() as u64;
+        hash = (hash << 5).wrapping_add(hash).wrapping_add(len);
+        for &c in label.as_bytes() {
+            let mut b = c;
+            if b.is_ascii_uppercase() { b += 32; }
+            hash = (hash << 5).wrapping_add(hash).wrapping_add(b as u64);
+        }
+    }
+    hash
+}
+
 /// Per-tunnel TCP 指标 + 远端 endpoint, 必须跟 ebpf-src/sockmap.c::tcp_state
 /// 字段顺序/大小严格一致 (size_of=36, 自然对齐 4). 改动时两边同步.
 ///
@@ -207,20 +237,10 @@ mod sys {
             let map = bpf.map_mut("mirage_dns_cache").unwrap();
             let mut lru = aya::maps::HashMap::<_, u64, u32>::try_from(map)?;
             
-            // DJB2 hash of the domain name.
-            // ★ 全部用 wrapping_* — Rust debug build 默认 overflow-checks=true,
-            // 任何 + 一旦 u64 溢出就 panic. C 端 (dns_xdp.c) 的 u64 + 天然 2's
-            // complement 截断, 必须显式 wrapping 对齐才能哈希一致. 之前只在
-            // 末尾 wrapping_add(b) 而 (hash << 5) + hash 的 + 没保护, 长域名
-            // 攻击会精准 panic 用户态. 见 commit:bug1 修复.
-            let mut hash: u64 = 5381;
-            for part in domain.split('.') {
-                for &c in part.as_bytes() {
-                    let mut b = c;
-                    if b >= b'A' && b <= b'Z' { b += 32; }
-                    hash = (hash << 5).wrapping_add(hash).wrapping_add(b as u64);
-                }
-            }
+            // wire-format 一致的哈希 (含长度字节, 防 foo.bar.com / foobar.com 碰撞)。
+            // 全 wrapping_*: debug build overflow-checks=true 下裸 + 溢出会 panic,
+            // 而 C 端 u64 + 天然 2's complement 截断, 必须对齐。见 super::hash_domain。
+            let hash = super::hash_domain(domain);
             
             let ip_u32 = u32::from(fake_ip).to_be(); // Net endian
             lru.insert(hash, ip_u32, 0)?;
@@ -310,3 +330,68 @@ pub use tc_divert::TcDivertEngine;
 
 pub mod cgroup_connect;
 pub use cgroup_connect::CgroupConnectEngine;
+
+#[cfg(test)]
+mod hash_tests {
+    use super::hash_domain;
+
+    /// C 侧 (dns_xdp.c) 的 hash_domain 参考实现: 在**真实 DNS wire format 字节**上跑,
+    /// 与 C 逐字节等价 —— 读长度字节 b (进哈希), 再读 b 个字符 (小写后进哈希)。
+    /// 这是"另一份独立实现", 用来钉死 Rust 字符串版与 C wire 版必须产出同一个 u64。
+    fn hash_wire(domain: &str) -> u64 {
+        // 构造 wire format QNAME: 每 label [len][bytes...], 末尾 [0]
+        let mut wire = Vec::new();
+        for label in domain.split('.') {
+            if label.is_empty() { continue; }
+            wire.push(label.len() as u8);
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+
+        // 逐字节跑 C 的状态机
+        let mut hash: u64 = 5381;
+        let mut remaining = 0u32;
+        for &b in &wire {
+            if remaining == 0 {
+                if b == 0 { break; }
+                if b > 63 { break; }
+                remaining = b as u32;
+                hash = (hash << 5).wrapping_add(hash).wrapping_add(b as u64); // 长度字节进哈希
+            } else {
+                let mut c = b;
+                if c.is_ascii_uppercase() { c += 32; }
+                hash = (hash << 5).wrapping_add(hash).wrapping_add(c as u64);
+                remaining -= 1;
+            }
+        }
+        hash
+    }
+
+    /// 核心 bug 回归: 点位置不同、字符相同的域名**必须**哈希不同。
+    #[test]
+    fn dot_position_changes_hash() {
+        assert_ne!(hash_domain("foo.bar.com"), hash_domain("foobar.com"),
+                   "foo.bar.com 与 foobar.com 哈希相同 —— 碰撞未消除, DNS 缓存会串扰");
+        assert_ne!(hash_domain("ex.ample.com"), hash_domain("example.com"));
+        assert_ne!(hash_domain("a.bc.d"), hash_domain("ab.c.d"));
+    }
+
+    /// 跨端一致性护栏: Rust 字符串版必须与 C wire-format 版逐字节产出同一哈希。
+    /// 任一端改了哈希逻辑, 这个测试会红 —— 防"改完两端对不上、缓存全 miss"。
+    #[test]
+    fn rust_matches_c_wire_format() {
+        for d in [
+            "foo.bar.com", "foobar.com", "example.com", "www.example.com",
+            "a.b.c.d.e", "xn--fiqs8s.cn", "UPPER.Case.COM", "single",
+        ] {
+            assert_eq!(hash_domain(d), hash_wire(d),
+                       "域名 {d}: Rust 字符串哈希 != C wire 哈希");
+        }
+    }
+
+    /// 大小写不敏感 (DNS 语义): 同域名不同大小写哈希一致。
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(hash_domain("Example.COM"), hash_domain("example.com"));
+    }
+}

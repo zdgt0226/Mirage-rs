@@ -18,21 +18,9 @@ const IFACE: &str = "veth1";
 const DOMAIN: &str = "test.mirage";
 const FAKE_IP: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 99);
 
-/// DJB2, 与用户态 src/ebpf/mod.rs::update_dns_cache 完全一致 (逐 label 字符/跳点/小写)。
-/// 复制而非调用, 是为了让本验证器独立于 XdpEngine, 直接操作 map。
-fn djb2_domain(domain: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for part in domain.split('.') {
-        for &c in part.as_bytes() {
-            let mut b = c;
-            if b.is_ascii_uppercase() {
-                b += 32;
-            }
-            hash = (hash << 5).wrapping_add(hash).wrapping_add(b as u64);
-        }
-    }
-    hash
-}
+// 哈希直接调 mirage_rs::ebpf::hash_domain —— **不再本地拷贝**。
+// 教训: 之前这里复制一份"为了独立", 结果修碰撞 bug 时漏掉这份, map 用旧哈希、C 用新哈希,
+// 端到端直接 timeout。单一真相源, 验证器才真在验"生产哈希与 C 一致"。
 
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
@@ -50,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     {
         let mut cache =
             AyaHashMap::<_, u64, u32>::try_from(bpf.map_mut("mirage_dns_cache").unwrap())?;
-        let key = djb2_domain(DOMAIN);
+        let key = mirage_rs::ebpf::hash_domain(DOMAIN);
         let val = u32::from(FAKE_IP).to_be();
         cache.insert(key, val, 0)?;
         println!("  [serve] map 灌入 hash({})={:#x} → {}", DOMAIN, key, FAKE_IP);

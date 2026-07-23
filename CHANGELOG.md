@@ -1,5 +1,44 @@
 # Changelog - Mirage-rs
 
+## [未发布] - 修 DNS 哈希碰撞 (外部审计 #1, 真 P1)
+
+### fix(dns): DJB2 忽略点分隔符导致域名哈希碰撞 → 缓存串扰
+
+XDP DNS 缓存的 key 是域名 DJB2 哈希。旧实现**只对字符字节哈希, 点分隔符/长度字节不进哈希**
+(C 侧读长度字节但只用作状态、不入哈希; 用户态 `split('.')` 把点吃掉)。后果:
+`foo.bar.com` 与 `foobar.com`、`ex.ample.com` 与 `example.com` 哈希**完全相同** —— 访问其一
+写入缓存, 再访问另一个直接命中前者, **流量被劫持到错 IP**, 且极难排查。二者都是合法可注册
+域名, 碰撞真实可触发。
+
+修复: 把长度字节 (DNS wire format 里"点"的等价物) 也算进哈希。`foo.bar.com` = `3,f,o,o,3,...`
+vs `foobar.com` = `6,f,o,o,...`, 首字节即不同。
+
+双端协议改动 (C + Rust 哈希必须逐字节一致, 否则缓存全 miss):
+- 用户态哈希抽成 `ebpf::hash_domain` 单一函数 (原内联在 update_dns_cache)。
+- `dns_xdp.c::hash_domain` 长度字节入哈希。
+- **消灭第三份拷贝**: `verify_dns_xdp.rs` 原本自带一份哈希"为了独立" —— 正是这份没跟上修复,
+  导致端到端验证器 timeout 才暴露。改为直接调 `hash_domain`, 单一真相源。
+
+测试: ①点位置不同必须哈希不同 (碰撞回归); ②Rust 字符串哈希 == C wire-format 哈希 (跨端
+护栏, 防两端跑偏); ③大小写不敏感。变异验证 (去掉长度字节) 令碰撞 + 一致性测试双双变红。
+端到端 XDP netns 验证器实测哈希一致、收发改包整条通。
+
+## [分支 feat/tls-resumption] - 抓包量化真实基线 (开发中)
+
+### tools(dump_tls): 加 `--session-ids` 模式量化 legacy_session_id 复用
+
+TLS resumption 仿真是破坏性协议变更, 动手前先量化**真实基线** —— 真 Chrome 到同一服务器
+反复连时, `legacy_session_id` 到底多常复用? 这决定后续方向:
+- 若真 Chrome 也几乎不复用 → 我们"每次全随机"其实不算统计异常, 该功能价值存疑
+- 若真 Chrome 高度复用 → "从不复用"确是可观测指纹, 值得补
+
+`dump_tls --session-ids <hexfile>` 读抓包 ClientHello (同 `--ja4` 格式), 抽每个的
+session_id、跨行标注复用、给出复用率汇总。抓法: 同一客户端反复连同一服务器, 每次抓
+ClientHello 存一行。
+
+自测: 对已知输入 (dump_tls 自身生成、固定 session_id) 正确报出 89% 复用 —— 证明解析
+能区分"全新"与"复用"。**下一步需真机抓包数据。**
+
 ## [未发布] - 部署反馈修复 (真机反馈 4 条)
 
 ### fix(geo): 入站设了认证时, geo 经代理下载因**丢失凭据**而永远失败

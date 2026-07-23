@@ -37,7 +37,8 @@ struct dns_hdr {
 //   ② __u32 off (无符号): 原 `int off` 经符号扩展后 `data+off` 可能被验证器判为负越界
 //      ("value -2147483648 makes pkt pointer out of bounds")。
 //   ③ 单层扁平循环: 原 10×63 嵌套 #pragma unroll 内联后状态爆炸 (>100 万指令 → E2BIG)。
-//      改成单循环 + "长度字节/字符字节"状态机, 哈希的字符与顺序同原实现 (同序 DJB2, 结果一致)。
+//      单循环 + "长度字节/字符字节"状态机。**长度字节也进哈希** (2026-07-23 修碰撞):
+//      它是点分隔符的等价物, 不算入则 foo.bar.com 与 foobar.com 哈希相同 → 缓存串扰。
 // DNS 名 wire 格式最长 255 字节, 循环上界取 256。
 static __always_inline __u64 hash_domain(void *data, void *data_end, __u32 *offset) {
     __u64 hash = 5381;
@@ -53,6 +54,10 @@ static __always_inline __u64 hash_domain(void *data, void *data_end, __u32 *offs
             if (b == 0) break;      // 根标签 → 域名结束
             if (b > 63) break;      // 非法 label 长度
             remaining = b;          // 进入该 label 的字符
+            // ⚠️ 长度字节**必须**进哈希 (它是"点"的等价物): 否则 foo.bar.com 与
+            //    foobar.com 字符序列相同 → 哈希碰撞 → DNS 缓存串扰。与用户态
+            //    src/ebpf/mod.rs::hash_domain 对齐: 先哈希长度, 再哈希字符。
+            hash = ((hash << 5) + hash) + b;
         } else {
             __u8 c = b;
             if (c >= 'A' && c <= 'Z') c += 32; // to lowercase
