@@ -158,6 +158,49 @@ fn make_fake_ip_response(query: &[u8], ip: std::net::Ipv4Addr) -> Option<Vec<u8>
     Some(result)
 }
 
+/// 单条 AAAA 记录响应 (静态解析的 IPv6)。结构同 make_fake_ip_response, 仅 Type=AAAA(28)
+/// + RDLENGTH=16 + 16B 地址。TTL=300s (静态映射稳定)。
+fn make_aaaa_response(query: &[u8], ip: std::net::Ipv6Addr) -> Option<Vec<u8>> {
+    let end = question_end(query);
+    if end <= 12 || end > query.len() || query.len() < 12 { return None; }
+    let mut header = query[..12].to_vec();
+    header[2] |= 0x80; // QR=1
+    header[3] &= 0x0F; // No error
+    header[6] = 0; header[7] = 1; // ANCOUNT=1
+    header[8] = 0; header[9] = 0; // NSCOUNT=0
+    header[10] = 0; header[11] = 0; // ARCOUNT=0
+    let mut result = header;
+    result.extend_from_slice(&query[12..end]);
+    // Name ptr(0xC00C) Type AAAA(28) Class IN(1) TTL(300) RDLength(16) RData(ip)
+    result.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2C, 0x00, 0x10]);
+    result.extend_from_slice(&ip.octets());
+    Some(result)
+}
+
+/// 静态解析域名匹配 (dnsmasq 语义): 精确相等, 或 dq 是 key 的子域 (dq 以 `.key` 结尾)。
+/// 两侧均应已小写。`test.local` 命中 `test.local` / `api.test.local`, 不命中 `xtest.local`。
+fn static_domain_matches(dq: &str, key: &str) -> bool {
+    dq == key
+        || (dq.len() > key.len() + 1
+            && dq.ends_with(key)
+            && dq.as_bytes()[dq.len() - key.len() - 1] == b'.')
+}
+
+/// 静态命中后按查询类型构造答复。A(1)/AAAA(28) 有对应家族 IP 则回该记录; 该域名被静态
+/// 接管, 无对应家族或其他类型一律回 NODATA (**不放行上游**, 防拿到真实记录泄漏)。
+fn static_answer(req: &[u8], qtype: u16, ips: &[std::net::IpAddr]) -> Option<Vec<u8>> {
+    let nodata = || make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+    match qtype {
+        1 => ips.iter().find_map(|ip| match ip { IpAddr::V4(v4) => Some(*v4), _ => None })
+            .and_then(|v4| make_fake_ip_response(req, v4))
+            .or_else(nodata),
+        28 => ips.iter().find_map(|ip| match ip { IpAddr::V6(v6) => Some(*v6), _ => None })
+            .and_then(|v6| make_aaaa_response(req, v6))
+            .or_else(nodata),
+        _ => nodata(),
+    }
+}
+
 fn make_empty_response(query: &[u8]) -> Option<Vec<u8>> {
     let end = question_end(query);
     if end > query.len() || query.len() < 12 { return None; }
@@ -473,6 +516,20 @@ impl DnsForwarder {
         let qtype = get_qtype(req).unwrap_or(0);
         let _req_port = 53; // DNS
         let st = self.state.load();
+
+        // 静态解析优先 (最高优先级): 命中即直接回 A/AAAA, 绕过 fake-IP / 路由 / 上游 ——
+        // 该域名完全由本地接管。最长键优先 (cached_static 已按域名长度降序)。命中但查询
+        // 类型无对应 IP 家族 (如只配 v4 却查 AAAA) → NODATA 空答复: 该域名既然被静态接管,
+        // 就**不**放行到上游, 否则会拿到真实 AAAA 泄漏。非 A/AAAA 查询同理回 NODATA。
+        if let Some(adv) = &st.advanced_dns {
+            if !adv.cached_static.is_empty() {
+                let dq = domain.to_lowercase();
+                if let Some((key, ips)) = adv.cached_static.iter().find(|(k, _)| static_domain_matches(&dq, k)) {
+                    debug!("[DNS] static  [{}] → 匹配 `{}` {:?} (qtype {})", domain, key, ips, qtype);
+                    return static_answer(req, qtype, ips);
+                }
+            }
+        }
         // 用户配了 cn/direct resolver 就用其全部 (尊重配置, 不掺公共 DNS 免污染内网视图);
         // 没配则默认双公共 DNS 兜底 (114 电信/联通 + 223 阿里)。
         let mut cn_dns: Vec<SocketAddr> = Vec::new();
@@ -631,6 +688,66 @@ mod tests {
         assert!(make_fake_ip_response(&crafted, ip).is_none(), "构造的空问询包应拒, 不生成自引用 0xC00C");
         // 正常查询仍应正常出响应。
         assert!(make_fake_ip_response(&aaaa_query(), ip).is_some(), "合法查询正常");
+    }
+
+    #[test]
+    fn static_domain_matching_semantics() {
+        // 精确
+        assert!(static_domain_matches("test.local", "test.local"));
+        // 子域 (任意深度)
+        assert!(static_domain_matches("api.test.local", "test.local"));
+        assert!(static_domain_matches("a.b.test.local", "test.local"));
+        // 不是子域: 前缀粘连 (xtest.local) 不该命中
+        assert!(!static_domain_matches("xtest.local", "test.local"));
+        // 不同域不命中
+        assert!(!static_domain_matches("test.example", "test.local"));
+        // key 比 dq 长不命中
+        assert!(!static_domain_matches("local", "test.local"));
+    }
+
+    #[test]
+    fn make_aaaa_response_structure() {
+        let ip: std::net::Ipv6Addr = "fd00::1".parse().unwrap();
+        let resp = make_aaaa_response(&aaaa_query(), ip).unwrap();
+        assert_eq!(resp[2] & 0x80, 0x80, "QR");
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "ANCOUNT=1");
+        let ans = &resp[question_end(&aaaa_query())..];
+        assert_eq!([ans[0], ans[1]], [0xC0, 0x0C], "name ptr");
+        assert_eq!(u16::from_be_bytes([ans[2], ans[3]]), 28, "TYPE=AAAA");
+        assert_eq!(u16::from_be_bytes([ans[10], ans[11]]), 16, "RDLENGTH=16");
+        assert_eq!(&ans[12..28], &ip.octets(), "RDATA=IPv6");
+    }
+
+    #[test]
+    fn static_answer_family_selection() {
+        let v4: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let v6: std::net::IpAddr = "fd00::1".parse().unwrap();
+
+        // A 查询 + 有 v4 → A 记录 (ANCOUNT=1, TYPE=A, 正确 IP)
+        let r = static_answer(&a_query(), 1, &[v4]).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "A: ANCOUNT=1");
+        let ans = &r[question_end(&a_query())..];
+        assert_eq!(u16::from_be_bytes([ans[2], ans[3]]), 1, "TYPE=A");
+        assert_eq!(&ans[12..16], &[10, 0, 0, 5]);
+
+        // A 查询但只配了 v6 → NODATA (ANCOUNT=0 + SOA), 绝不放行上游
+        let r = static_answer(&a_query(), 1, &[v6]).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "只 v6 时 A 查询应 NODATA");
+        assert_eq!(u16::from_be_bytes([r[8], r[9]]), 1, "NODATA 带 SOA");
+
+        // AAAA 查询 + 有 v6 → AAAA 记录
+        let r = static_answer(&aaaa_query(), 28, &[v6]).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "AAAA: ANCOUNT=1");
+        let ans = &r[question_end(&aaaa_query())..];
+        assert_eq!(u16::from_be_bytes([ans[2], ans[3]]), 28, "TYPE=AAAA");
+
+        // AAAA 查询但只配 v4 → NODATA
+        let r = static_answer(&aaaa_query(), 28, &[v4]).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "只 v4 时 AAAA 查询应 NODATA");
+
+        // 其他类型 (MX=15) → NODATA (静态只服务 A/AAAA, 但仍接管该域名)
+        let r = static_answer(&a_query(), 15, &[v4, v6]).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "非 A/AAAA 应 NODATA");
     }
 
     #[test]

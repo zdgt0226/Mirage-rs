@@ -180,6 +180,31 @@ impl ConfigWatcher {
             adv.cached_cn_dns = cn_dns;
             adv.cached_remote_host = remote_host;
             adv.cached_remote_port = remote_port;
+
+            // 静态解析: 域名小写化 + 解析每个 IP (跳过非法并告警), 按域名长度降序排 ——
+            // process_query 取首个匹配即"最长/最具体命中"(dnsmasq 语义)。
+            let mut cached_static: Vec<(String, Vec<std::net::IpAddr>)> = Vec::new();
+            for (domain, val) in &adv.static_hosts {
+                let ips: Vec<std::net::IpAddr> = val
+                    .as_slice()
+                    .iter()
+                    .filter_map(|s| match s.parse::<std::net::IpAddr>() {
+                        Ok(ip) => Some(ip),
+                        Err(_) => {
+                            tracing::warn!("advanced_dns.static: 域名 `{}` 的地址 `{}` 不是合法 IP, 已跳过", domain, s);
+                            None
+                        }
+                    })
+                    .collect();
+                if !ips.is_empty() {
+                    cached_static.push((domain.to_lowercase(), ips));
+                }
+            }
+            cached_static.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+            if !cached_static.is_empty() {
+                tracing::info!("advanced_dns.static: 已加载 {} 条静态解析 (最长域名优先匹配)", cached_static.len());
+            }
+            adv.cached_static = cached_static;
         }
 
         Ok(CoreState {
