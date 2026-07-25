@@ -1,6 +1,28 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - DNS 劫持 (可选, 默认关)
+## [Unreleased] - DNS 劫持 + 静态解析
+
+### feat(dns): 静态解析 (advanced_dns.static, 类 dnsmasq address=/domain/ip)
+
+自定义域名 → IP 解析, 命中即直接回 A/AAAA, **绕过 fake-IP / 路由 / 上游** —— 该域名完全
+由本地接管。本地测试环境把测试域名钉到本机/内网 IP 尤其有用。
+
+```json
+"advanced_dns": {
+  "static": {
+    "test.local": "192.168.1.100",
+    "dual.local": ["10.0.0.5", "fd00::1"]
+  }
+}
+```
+
+- **匹配语义**: 精确 + 子域 (`test.local` 同时命中 `api.test.local`、`a.b.test.local`),
+  **最长键优先** (dnsmasq 式)。
+- 值可写单个 IP 字符串或数组 (混 v4/v6): A 查询回 v4、AAAA 查询回 v6。
+- **接管即完全接管**: 命中域名但查询类型无对应家族 IP (如只配 v4 却查 AAAA), 或非 A/AAAA
+  查询 → 回 NODATA 空答复, **不放行上游** (防拿到真实记录泄漏)。
+- 非法 IP 字符串在配置加载时告警并跳过, 不影响其余条目。
+- 优先级最高, 在 fake-IP/路由之前; 对 DNS 劫持路径同样生效 (共用 process_query)。
 
 ### feat(dns): 劫持流经 LAN 的 53/UDP+TCP 查询 (可选, 默认关闭)
 

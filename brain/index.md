@@ -1,10 +1,11 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-25T14:56:30.667Z._
+_Auto-generated. Last updated 2026-07-25T15:25:24.700Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
 - [dns-hijack-lan](pages/dns-hijack-lan.md) — category: decision | tags: [dns, transparent, tc_divert, fakeip] | ## 决定
+- [dns-static-resolution](pages/dns-static-resolution.md) — category: decision | tags: [dns, static, testing, fakeip] | ## 决定
 - [ebpf-scope-narrowed](pages/ebpf-scope-narrowed.md) — category: decision | **决定**:eBPF 只承担三件事 —— ① `tc_divert` 拦截转发流量并 `sk_assign` 给透明 listener;
 - [external-audit-verification](pages/external-audit-verification.md) — category: concept | ## compiled_truth
 - [fakeip-remote-resolution](pages/fakeip-remote-resolution.md) — category: decision | **决定**:被代理域名的 DNS 查询返回**保留段 fake-IP**(198.18.0.0/15),真实域名随隧道送到**墙外服务端远程解析**。

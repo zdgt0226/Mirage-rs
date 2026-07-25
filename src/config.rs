@@ -397,6 +397,15 @@ pub struct AdvancedDnsConfig {
     pub cached_remote_host: Option<String>,
     #[serde(skip)]
     pub cached_remote_port: Option<u16>,
+    /// 静态 DNS 解析 (类 dnsmasq `address=/domain/ip`): 域名 → 一个或多个 IP。
+    /// 命中即直接回 A/AAAA, **绕过 fake-IP / 路由 / 上游** —— 该域名完全由本地接管。
+    /// 匹配语义: 精确 + 子域 (`test.local` 同时命中 `api.test.local`), 最长键优先。
+    /// 值可写单个 IP 字符串或数组 (混 v4/v6)。本地测试环境把测试域名钉到本机/内网 IP。
+    #[serde(default, rename = "static")]
+    pub static_hosts: std::collections::HashMap<String, StaticValue>,
+    /// static_hosts 预处理结果: (小写域名, IP 列表), 按域名长度降序 (最长/最具体优先)。
+    #[serde(skip)]
+    pub cached_static: Vec<(String, Vec<std::net::IpAddr>)>,
     pub default: Option<String>,
     #[serde(default)]
     pub resolvers: Vec<DnsResolver>,
@@ -405,6 +414,24 @@ pub struct AdvancedDnsConfig {
     pub fakeip: Option<FakeIpConfig>,
     pub cache: Option<DnsCacheConfig>,
     pub xdp_interface: Option<String>,
+}
+
+/// 静态解析值: 单个 IP 字符串或字符串数组 (与 rule 字段的 one_or_many 同理念, 但这里
+/// 是 HashMap 的值, 用 untagged enum 就地接受两种写法)。IP 合法性在 config_watcher 解析。
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum StaticValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StaticValue {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            StaticValue::One(s) => std::slice::from_ref(s),
+            StaticValue::Many(v) => v,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
