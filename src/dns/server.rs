@@ -186,10 +186,32 @@ fn static_domain_matches(dq: &str, key: &str) -> bool {
             && dq.as_bytes()[dq.len() - key.len() - 1] == b'.')
 }
 
-/// 静态命中后按查询类型构造答复。A(1)/AAAA(28) 有对应家族 IP 则回该记录; 该域名被静态
-/// 接管, 无对应家族或其他类型一律回 NODATA (**不放行上游**, 防拿到真实记录泄漏)。
-fn static_answer(req: &[u8], qtype: u16, ips: &[std::net::IpAddr]) -> Option<Vec<u8>> {
+/// IP 版本策略是否把该查询抑制成 NODATA。
+/// - `Ipv4Only`: 抑制 AAAA(28)。 `Ipv6Only`: 抑制 A(1)。 (硬模式, 与 has_* 无关)
+/// - `PreferIpv4`: 该名字**有 v4** 时抑制 AAAA (逼 v4)。 `PreferIpv6`: 有 v6 时抑制 A。
+/// direct/上游无法探测另一族存在与否 → 传 has_v4=has_v6=false, 使 prefer 恒不抑制 (=Dual);
+/// static 已知全部族 → 传真实值, prefer 完全生效。非 A/AAAA (其他 qtype) 一律不抑制。
+fn ip_strategy_suppresses(strategy: crate::config::IpStrategy, qtype: u16, has_v4: bool, has_v6: bool) -> bool {
+    use crate::config::IpStrategy::*;
+    match (strategy, qtype) {
+        (Ipv4Only, 28) => true,
+        (Ipv6Only, 1) => true,
+        (PreferIpv4, 28) => has_v4,
+        (PreferIpv6, 1) => has_v6,
+        _ => false,
+    }
+}
+
+/// 静态命中后按查询类型 + IP 策略构造答复。A(1)/AAAA(28) 未被策略抑制且有对应家族 IP
+/// 则回该记录; 该域名被静态接管, 被抑制 / 无对应家族 / 其他类型一律回 NODATA
+/// (**不放行上游**, 防拿到真实记录泄漏)。
+fn static_answer(req: &[u8], qtype: u16, ips: &[std::net::IpAddr], strategy: crate::config::IpStrategy) -> Option<Vec<u8>> {
     let nodata = || make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+    let has_v4 = ips.iter().any(|ip| ip.is_ipv4());
+    let has_v6 = ips.iter().any(|ip| ip.is_ipv6());
+    if ip_strategy_suppresses(strategy, qtype, has_v4, has_v6) {
+        return nodata();
+    }
     match qtype {
         1 => ips.iter().find_map(|ip| match ip { IpAddr::V4(v4) => Some(*v4), _ => None })
             .and_then(|v4| make_fake_ip_response(req, v4))
@@ -516,6 +538,8 @@ impl DnsForwarder {
         let qtype = get_qtype(req).unwrap_or(0);
         let _req_port = 53; // DNS
         let st = self.state.load();
+        // IP 版本策略 (Copy, 在 drop(st) 前取出供后续 direct 分支用)。缺省 Dual。
+        let ip_strategy = st.advanced_dns.as_ref().map(|a| a.ip_strategy).unwrap_or_default();
 
         // 静态解析优先 (最高优先级): 命中即直接回 A/AAAA, 绕过 fake-IP / 路由 / 上游 ——
         // 该域名完全由本地接管。最长键优先 (cached_static 已按域名长度降序)。命中但查询
@@ -525,8 +549,8 @@ impl DnsForwarder {
             if !adv.cached_static.is_empty() {
                 let dq = domain.to_lowercase();
                 if let Some((key, ips)) = adv.cached_static.iter().find(|(k, _)| static_domain_matches(&dq, k)) {
-                    debug!("[DNS] static  [{}] → 匹配 `{}` {:?} (qtype {})", domain, key, ips, qtype);
-                    return static_answer(req, qtype, ips);
+                    debug!("[DNS] static  [{}] → 匹配 `{}` {:?} (qtype {}, strategy {:?})", domain, key, ips, qtype, ip_strategy);
+                    return static_answer(req, qtype, ips, ip_strategy);
                 }
             }
         }
@@ -570,6 +594,12 @@ impl DnsForwarder {
                     Some(make_nxdomain(req))
                 }
                 OutboundNode::Direct { .. } => {
+                    // IP 策略 (direct 只做硬抑制: prefer 无法探测另一族, 降为 Dual)。
+                    // has_v4/has_v6 传 false → ip_strategy_suppresses 里 prefer 分支恒不抑制。
+                    if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
+                        debug!("[DNS] direct  [{}] → qtype {} 被 IP 策略 {:?} 抑制 (NODATA)", domain, qtype, ip_strategy);
+                        return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+                    }
                     let dk = domain.to_lowercase();
                     if let Some(cache) = &self.cache {
                         if let Some(hit) = cache.get(&dk, qtype, req) {
@@ -720,34 +750,83 @@ mod tests {
 
     #[test]
     fn static_answer_family_selection() {
+        use crate::config::IpStrategy::Dual;
         let v4: std::net::IpAddr = "10.0.0.5".parse().unwrap();
         let v6: std::net::IpAddr = "fd00::1".parse().unwrap();
 
         // A 查询 + 有 v4 → A 记录 (ANCOUNT=1, TYPE=A, 正确 IP)
-        let r = static_answer(&a_query(), 1, &[v4]).unwrap();
+        let r = static_answer(&a_query(), 1, &[v4], Dual).unwrap();
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "A: ANCOUNT=1");
         let ans = &r[question_end(&a_query())..];
         assert_eq!(u16::from_be_bytes([ans[2], ans[3]]), 1, "TYPE=A");
         assert_eq!(&ans[12..16], &[10, 0, 0, 5]);
 
         // A 查询但只配了 v6 → NODATA (ANCOUNT=0 + SOA), 绝不放行上游
-        let r = static_answer(&a_query(), 1, &[v6]).unwrap();
+        let r = static_answer(&a_query(), 1, &[v6], Dual).unwrap();
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "只 v6 时 A 查询应 NODATA");
         assert_eq!(u16::from_be_bytes([r[8], r[9]]), 1, "NODATA 带 SOA");
 
         // AAAA 查询 + 有 v6 → AAAA 记录
-        let r = static_answer(&aaaa_query(), 28, &[v6]).unwrap();
+        let r = static_answer(&aaaa_query(), 28, &[v6], Dual).unwrap();
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "AAAA: ANCOUNT=1");
         let ans = &r[question_end(&aaaa_query())..];
         assert_eq!(u16::from_be_bytes([ans[2], ans[3]]), 28, "TYPE=AAAA");
 
         // AAAA 查询但只配 v4 → NODATA
-        let r = static_answer(&aaaa_query(), 28, &[v4]).unwrap();
+        let r = static_answer(&aaaa_query(), 28, &[v4], Dual).unwrap();
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "只 v4 时 AAAA 查询应 NODATA");
 
         // 其他类型 (MX=15) → NODATA (静态只服务 A/AAAA, 但仍接管该域名)
-        let r = static_answer(&a_query(), 15, &[v4, v6]).unwrap();
+        let r = static_answer(&a_query(), 15, &[v4, v6], Dual).unwrap();
         assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "非 A/AAAA 应 NODATA");
+    }
+
+    #[test]
+    fn ip_strategy_suppression_matrix() {
+        use crate::config::IpStrategy::*;
+        // A=1, AAAA=28。has_v4/has_v6 只在 prefer 分支起作用。
+        // Dual: 都不抑制
+        assert!(!ip_strategy_suppresses(Dual, 1, true, true));
+        assert!(!ip_strategy_suppresses(Dual, 28, true, true));
+        // Ipv4Only: 抑制 AAAA, 不抑制 A (与 has_* 无关)
+        assert!(ip_strategy_suppresses(Ipv4Only, 28, false, false));
+        assert!(!ip_strategy_suppresses(Ipv4Only, 1, false, false));
+        // Ipv6Only: 抑制 A, 不抑制 AAAA
+        assert!(ip_strategy_suppresses(Ipv6Only, 1, false, false));
+        assert!(!ip_strategy_suppresses(Ipv6Only, 28, false, false));
+        // PreferIpv4: 有 v4 才抑制 AAAA; 无 v4 不抑制 (让 v6 通过)
+        assert!(ip_strategy_suppresses(PreferIpv4, 28, true, true));
+        assert!(!ip_strategy_suppresses(PreferIpv4, 28, false, true));
+        assert!(!ip_strategy_suppresses(PreferIpv4, 1, true, true), "prefer_ipv4 绝不抑制 A");
+        // PreferIpv6: 有 v6 才抑制 A
+        assert!(ip_strategy_suppresses(PreferIpv6, 1, true, true));
+        assert!(!ip_strategy_suppresses(PreferIpv6, 1, true, false));
+        assert!(!ip_strategy_suppresses(PreferIpv6, 28, true, true), "prefer_ipv6 绝不抑制 AAAA");
+        // direct 语义: has_v4=has_v6=false → prefer 恒不抑制 (降为 Dual), only 仍生效
+        assert!(!ip_strategy_suppresses(PreferIpv4, 28, false, false), "direct: prefer 降 Dual");
+        assert!(ip_strategy_suppresses(Ipv6Only, 1, false, false), "direct: only 仍生效");
+    }
+
+    #[test]
+    fn static_answer_honors_prefer_and_only() {
+        use crate::config::IpStrategy::*;
+        let v4: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let v6: std::net::IpAddr = "fd00::1".parse().unwrap();
+        let both = [v4, v6];
+
+        // prefer_ipv4 + 双族: A 查询正常回 v4, AAAA 查询被抑制 (NODATA)
+        let r = static_answer(&a_query(), 1, &both, PreferIpv4).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "prefer_ipv4: A 正常");
+        let r = static_answer(&aaaa_query(), 28, &both, PreferIpv4).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "prefer_ipv4: AAAA 抑制");
+
+        // prefer_ipv4 但条目只有 v6: AAAA 不抑制 (无 v4 可逼), 正常回 v6
+        let r = static_answer(&aaaa_query(), 28, &[v6], PreferIpv4).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 1, "prefer_ipv4 但只有 v6: AAAA 放行");
+
+        // ipv6_only + 双族: A 查询被硬抑制
+        let r = static_answer(&a_query(), 1, &both, Ipv6Only).unwrap();
+        assert_eq!(u16::from_be_bytes([r[6], r[7]]), 0, "ipv6_only: A 抑制");
     }
 
     #[test]
