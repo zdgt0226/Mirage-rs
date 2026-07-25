@@ -406,6 +406,9 @@ pub struct AdvancedDnsConfig {
     /// static_hosts 预处理结果: (小写域名, IP 列表), 按域名长度降序 (最长/最具体优先)。
     #[serde(skip)]
     pub cached_static: Vec<(String, Vec<std::net::IpAddr>)>,
+    /// DNS 应答 IP 版本策略 (见 IpStrategy)。默认 dual (A/AAAA 都应答)。
+    #[serde(default)]
+    pub ip_strategy: IpStrategy,
     pub default: Option<String>,
     #[serde(default)]
     pub resolvers: Vec<DnsResolver>,
@@ -414,6 +417,25 @@ pub struct AdvancedDnsConfig {
     pub fakeip: Option<FakeIpConfig>,
     pub cache: Option<DnsCacheConfig>,
     pub xdp_interface: Option<String>,
+}
+
+/// DNS 应答的 IP 版本策略。纯 DNS 服务器按记录类型分别应答, 无法在单查询里"优先",
+/// 服务端能做的只有**抑制某一族**(回 NODATA 逼客户端用另一族)。
+/// - `Dual` (默认): A/AAAA 都正常应答。
+/// - `Ipv4Only` / `Ipv6Only`: 硬抑制 AAAA / A (处处生效: static + direct)。
+/// - `PreferIpv4` / `PreferIpv6`: 软优先, **仅 static 完全生效** —— 该名字有首选族地址时
+///   抑制另一族; direct/上游无法探测另一族是否存在, 降级为 Dual (不抑制)。
+///
+/// 均不影响 proxied (Mirage/fake-IP) 路径 —— 那条按设计恒为 v4-fakeIP + AAAA 抑制。
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum IpStrategy {
+    #[default]
+    Dual,
+    Ipv4Only,
+    Ipv6Only,
+    PreferIpv4,
+    PreferIpv6,
 }
 
 /// 静态解析值: 单个 IP 字符串或字符串数组 (与 rule 字段的 one_or_many 同理念, 但这里

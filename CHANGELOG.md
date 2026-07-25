@@ -1,6 +1,32 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - DNS 劫持 + 静态解析
+## [Unreleased] - DNS 劫持 + 静态解析 + IP 版本策略
+
+### feat(dns): IP 版本策略 advanced_dns.ip_strategy (v4/v6 返回控制)
+
+控制 DNS 应答的 IP 版本。纯 DNS 服务器按记录类型分别应答, 无法在单查询里"优先" ——
+服务端能做的是**抑制某一族** (回 NODATA 逼客户端用另一族)。
+
+```json
+"advanced_dns": { "ip_strategy": "prefer_ipv4" }
+```
+
+5 档 (默认 `dual`):
+
+| 值 | 语义 |
+|---|---|
+| `dual` | A/AAAA 都正常应答 (默认, 现行为不变) |
+| `ipv4_only` | 硬抑制 AAAA (处处: static + direct) → 全网走 v4 |
+| `ipv6_only` | 硬抑制 A (处处) → 全网走 v6 |
+| `prefer_ipv4` | 软优先 v4: 名字有 v4 则抑制 AAAA。**仅 static 完全生效** |
+| `prefer_ipv6` | 软优先 v6: 名字有 v6 则抑制 A。**仅 static 完全生效** |
+
+- **作用范围**: static + direct 路径。`prefer_*` 在 direct 无法探测另一族是否存在, 降级为
+  `dual` (不抑制); 硬模式 (`*_only`) 在 direct 照常抑制。
+- **不影响 proxied (Mirage/fake-IP)**: 该路径按设计恒为 v4-fakeIP + AAAA 抑制。故 `ipv6_only`
+  下走代理的域名仍返回 v4 fake-IP (无 v6 fake-IP 可给) —— 与 v4-only 代理数据面绑定的已知限制,
+  不依赖 IPv6 数据面支持即可用 (static/direct 返回真实地址, 客户端原生连接)。
+- 对 DNS 劫持路径同样生效 (共用 process_query)。
 
 ### feat(dns): 静态解析 (advanced_dns.static, 类 dnsmasq address=/domain/ip)
 
