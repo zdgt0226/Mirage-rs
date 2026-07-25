@@ -456,6 +456,49 @@ impl StaticValue {
     }
 }
 
+/// 把原始 static_hosts (域名 → 字符串IP) 归一化成 (小写无尾点域名, IP 列表), 按域名长度
+/// 降序 (最长/最具体优先, 供 process_query 取首个匹配)。规则:
+/// - 域名剥尾点 + 小写 (查询域名从不带尾点/大写, 不归一则永不命中)。
+/// - 非法 IP 跳过并告警; 归一化后无合法 IP 的条目丢弃。
+/// - **确定性去重**: 先按原始 key 排序再插入, 归一化撞车 (仅大小写/尾点不同的重复键) 时
+///   首个原始 key 胜出, 不依赖 HashMap 随机迭代序 (否则胜者跨重启抖动)。
+pub fn normalize_static_hosts(
+    hosts: &std::collections::HashMap<String, StaticValue>,
+) -> Vec<(String, Vec<std::net::IpAddr>)> {
+    let mut raw: Vec<(&String, &StaticValue)> = hosts.iter().collect();
+    raw.sort_by(|a, b| a.0.cmp(b.0)); // 按原始 key 定序 → 去重确定性
+    let mut out: Vec<(String, Vec<std::net::IpAddr>)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (domain, val) in raw {
+        let norm = domain.trim_end_matches('.').to_lowercase();
+        if norm.is_empty() {
+            tracing::warn!("advanced_dns.static: 域名 `{}` 归一化后为空, 已跳过", domain);
+            continue;
+        }
+        let ips: Vec<std::net::IpAddr> = val
+            .as_slice()
+            .iter()
+            .filter_map(|s| match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    tracing::warn!("advanced_dns.static: 域名 `{}` 的地址 `{}` 不是合法 IP, 已跳过", domain, s);
+                    None
+                }
+            })
+            .collect();
+        if ips.is_empty() {
+            continue;
+        }
+        if !seen.insert(norm.clone()) {
+            tracing::warn!("advanced_dns.static: 域名 `{}` 与已有条目归一化后重复 (`{}`), 已忽略", domain, norm);
+            continue;
+        }
+        out.push((norm, ips));
+    }
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DnsResolver {
     pub tag: String,
@@ -873,6 +916,64 @@ impl Config {
         }
 
         issues
+    }
+}
+
+#[cfg(test)]
+mod static_hosts_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn hosts(pairs: &[(&str, &[&str])]) -> HashMap<String, StaticValue> {
+        pairs.iter().map(|(d, ips)| {
+            (d.to_string(), StaticValue::Many(ips.iter().map(|s| s.to_string()).collect()))
+        }).collect()
+    }
+
+    #[test]
+    fn normalizes_trailing_dot_and_case() {
+        // 尾点 + 大写都应归一化, 使查询域名 (无尾点/小写) 能命中
+        let out = normalize_static_hosts(&hosts(&[("Test.Local.", &["10.0.0.1"])]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "test.local", "剥尾点 + 小写");
+    }
+
+    #[test]
+    fn dedup_case_collision_is_deterministic() {
+        // Test.Local 与 test.local 归一化撞车: 按原始 key 排序, 首个 (大写 T < 小写 t,
+        // ASCII 'T'=84 < 't'=116) 胜出。多次运行结果必须一致 (不受 HashMap 随机序影响)。
+        for _ in 0..20 {
+            let out = normalize_static_hosts(&hosts(&[
+                ("test.local", &["10.0.0.2"]),
+                ("Test.Local", &["10.0.0.1"]),
+            ]));
+            assert_eq!(out.len(), 1, "撞车去重成一条");
+            assert_eq!(out[0].1, vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()],
+                "首个原始 key (Test.Local) 胜出, 确定");
+        }
+    }
+
+    #[test]
+    fn longest_key_first() {
+        let out = normalize_static_hosts(&hosts(&[
+            ("test.local", &["10.0.0.1"]),
+            ("api.test.local", &["10.0.0.2"]),
+        ]));
+        assert_eq!(out[0].0, "api.test.local", "最长域名排最前");
+        assert_eq!(out[1].0, "test.local");
+    }
+
+    #[test]
+    fn skips_invalid_ip_and_empty_entries() {
+        // 非法 IP 跳过; 全非法 → 条目丢弃; 纯尾点域名归一化为空 → 丢弃
+        let out = normalize_static_hosts(&hosts(&[
+            ("a.local", &["nonsense", "10.0.0.5"]), // 保留合法的
+            ("b.local", &["bad"]),                   // 全非法 → 丢
+            (".", &["10.0.0.9"]),                    // 归一化空 → 丢
+        ]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "a.local");
+        assert_eq!(out[0].1, vec!["10.0.0.5".parse::<std::net::IpAddr>().unwrap()]);
     }
 }
 
