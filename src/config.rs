@@ -188,6 +188,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// DNS 劫持路径的合成入站 tag。劫持的 DNS 查询本身不是一个声明的 inbound (它由
+/// transparent 入站的 dns_hijack 顺带产生), 但路由时仍需一个 `inbound` 维度值。
+/// 用这个稳定常量, 使用户可写 `"inbound":["dns-hijack"]` 规则专门路由劫持的 DNS
+/// 解析 —— 校验器在有 transparent 开启 dns_hijack 时会把它登记为已知 tag。
+pub const DNS_HIJACK_INBOUND_TAG: &str = "dns-hijack";
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundConfig {
@@ -245,6 +251,15 @@ pub enum InboundConfig {
         // 需本机 DNS 指向 mirage 才能拿到 fake-IP。默认 false (仅转发流量走代理)。
         #[serde(default)]
         proxy_local: bool,
+        // 劫持流经 LAN 的 DNS (53/UDP+TCP): 转发的 DNS 查询不再放行/转发到用户指定的
+        // 上游, 而是交给本机 DNS server 应答 (分配 fake-IP)。这样 LAN 设备**无需改 DNS**
+        // 就能享受 fake-IP 分流。默认 false (关闭 —— 保持转发, 需要用户自己把设备 DNS
+        // 指向本网关)。纯用户态实现 (tc_divert 的 sk_assign + 透明回包), 不改包、无 conntrack。
+        // 仅在配了 `interface` (tc_divert 生效) 时才有意义。
+        // 路由维度: 劫持的 DNS 解析走合成入站 tag `dns-hijack` (见 DNS_HIJACK_INBOUND_TAG),
+        // **不**继承 `dns` 入站的规则。要专门路由劫持查询, 写 `"inbound":["dns-hijack"]`。
+        #[serde(default)]
+        dns_hijack: bool,
     },
 }
 
@@ -644,7 +659,7 @@ impl Config {
         }
 
         // 每条规则引用的出站必须存在 —— 否则该规则形同虚设, 且是静默的
-        let inbound_tags: Vec<&str> = self
+        let mut inbound_tags: Vec<&str> = self
             .inbounds
             .iter()
             .map(|ib| match ib {
@@ -655,6 +670,12 @@ impl Config {
                 | InboundConfig::Transparent { tag, .. } => tag.as_str(),
             })
             .collect();
+        // DNS 劫持产生的解析走合成 tag `dns-hijack` (见 DNS_HIJACK_INBOUND_TAG):
+        // 有 transparent 开启 dns_hijack 时登记为已知入站, 否则 `inbound:["dns-hijack"]`
+        // 规则会被误判"永不命中"。
+        if self.inbounds.iter().any(|ib| matches!(ib, InboundConfig::Transparent { dns_hijack: true, .. })) {
+            inbound_tags.push(DNS_HIJACK_INBOUND_TAG);
+        }
         for (i, rule) in self.routing.rules.iter().enumerate() {
             if !known(&rule.outbound) {
                 issues.push(format!(
@@ -976,6 +997,31 @@ mod validation_tests {
         let mut v = base();
         v["routing"]["default_outbound"] = serde_json::json!("nope");
         assert!(has(&issues_of(&v), "default_outbound"));
+    }
+
+    #[test]
+    fn dns_hijack_synthetic_inbound_tag_gated_on_enable() {
+        // 规则引用合成 tag `dns-hijack`。仅当有 transparent 入站开启 dns_hijack 时
+        // 才算已知; 否则应报"永远不会命中"(防拼写误配)。
+        let rule = serde_json::json!([
+            { "outbound": "direct", "inbound": ["dns-hijack"], "domain_suffix": ["cn"] }
+        ]);
+        let transparent = |hijack: bool| serde_json::json!({
+            "type": "transparent", "tag": "tp", "listen": "0.0.0.0", "port": 12345,
+            "interface": "eth0", "proxy_local": false, "dns_hijack": hijack
+        });
+
+        // 关闭 (默认): dns-hijack 未登记 → 报未知入站
+        let mut off = base();
+        off["inbounds"] = serde_json::json!([transparent(false)]);
+        off["routing"]["rules"] = rule.clone();
+        assert!(has(&issues_of(&off), "dns-hijack"), "关闭时应报未知入站, 实际: {:?}", issues_of(&off));
+
+        // 开启: dns-hijack 登记为已知 → 该规则不再报未知入站
+        let mut on = base();
+        on["inbounds"] = serde_json::json!([transparent(true)]);
+        on["routing"]["rules"] = rule;
+        assert!(!has(&issues_of(&on), "dns-hijack"), "开启时不该报未知入站, 实际: {:?}", issues_of(&on));
     }
 
     #[test]

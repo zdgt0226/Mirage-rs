@@ -733,7 +733,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::Transparent { tag, listen, port, interface, proxy_local } => {
+            crate::config::InboundConfig::Transparent { tag, listen, port, interface, proxy_local, dns_hijack } => {
                 let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 let listen_addr = format!("{}:{}", listen, port);
                 // 本机出向重定向 (cgroup/connect4): 开启后网关本机自身 fake-IP 流量也走代理。
@@ -794,12 +794,25 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 }
                 let trans_eng = transparent_engine.clone();
+                // DNS 劫持: 开启时建一个"只处理查询、不 serve"的 forwarder, 与 dns 入站
+                // 共用同一个 fake_ip_mapper, 交给透明 UDP/TCP 路径应答 port-53 流量。
+                let hijack_state = state_clone.clone();
+                let hijack_fm = fake_mapper_clone.clone();
+                let hijack_xdp = xdp_engine.clone();
                 tokio::spawn(async move {
                     if let (Some(te), Some(fm)) = (trans_eng, fake_mapper_clone) {
+                        let dns_hijack_fwd = if dns_hijack {
+                            match crate::dns::server::DnsForwarder::for_hijack(
+                                hijack_state, hijack_fm, hijack_xdp,
+                            ).await {
+                                Ok(f) => { info!("DNS 劫持已启用: 流经 LAN 的 53 端口查询将由本机应答"); Some(f) }
+                                Err(e) => { error!("DNS 劫持 forwarder 构造失败, 劫持关闭: {}", e); None }
+                            }
+                        } else { None };
                         let net = fm.network();
                         let prefix = fm.prefix_len();
                         if let Err(e) = crate::proxy::transparent::start_transparent(
-                            inbound_tag.clone(), &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix, cgroup_engine
+                            inbound_tag.clone(), &listen_addr, state_clone, ebpf_clone, fm, te, net, prefix, cgroup_engine, dns_hijack_fwd
                         ).await {
                             tracing::error!("Transparent proxy listener failed: {}", e);
                         }

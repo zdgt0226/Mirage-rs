@@ -73,6 +73,9 @@ pub async fn start_transparent(
     // 本机出向重定向引擎: cgroup/connect4 把本机 fake-IP 连接改写进本 listener,
     // local_addr() 变成 127.0.0.1:lport, 需按 peer 端口查回原始 fake-IP。
     cgroup_engine: Option<Arc<crate::ebpf::CgroupConnectEngine>>,
+    // DNS 劫持 forwarder (Some=开启): tc_divert 已把流经 LAN 的 53/UDP+TCP 裸-IP
+    // 流量 sk_assign 进本 listener; 开启时这些 port-53 流量由本机直接应答, 不外发。
+    dns_hijack_fwd: Option<Arc<crate::dns::server::DnsForwarder>>,
 ) -> anyhow::Result<()> {
     // IP_TRANSPARENT listener: tc_divert 用 sk_assign 把外网-IP 的 TCP SYN 偷进来后,
     // listener 必须透明才能以非本地目的地址完成三次握手, accept 出的 socket 的
@@ -113,9 +116,10 @@ pub async fn start_transparent(
         let fm = fake_ip_mapper.clone();
         let te = transparent_engine.clone();
         let udp_tag = inbound_tag.clone();
+        let udp_hijack = dns_hijack_fwd.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                crate::proxy::transparent_udp::start_transparent_udp(udp_tag, udp_bind, st, fm, te).await
+                crate::proxy::transparent_udp::start_transparent_udp(udp_tag, udp_bind, st, fm, te, udp_hijack).await
             {
                 error!("Transparent UDP proxy failed: {}", e);
             }
@@ -137,6 +141,7 @@ pub async fn start_transparent(
                 let ebpf_clone = ebpf_engine.clone();
                 let tag_clone = inbound_tag.clone();
                 let cgroup_clone = cgroup_engine.clone();
+                let dns_hijack_fwd = dns_hijack_fwd.clone();
                 let lport = listen_port;
 
                 tokio::spawn(async move {
@@ -165,6 +170,15 @@ pub async fn start_transparent(
                         if dst_addr.ip().is_loopback() && dst_addr.port() == lport {
                             debug!("[TPROXY] {} 目标为自身监听端口 127.0.0.1:{}, 丢弃防死循环", peer_addr, lport);
                             return;
+                        }
+                        // DNS 劫持: 流经 LAN 的 53/TCP 查询由本机应答 (tc_divert 已把它
+                        // sk_assign 进来)。TCP DNS 是 [2B 长度][报文], 逐条读→本地解析→
+                        // 回写, 不外发。开启劫持才走此分支, 否则 53/TCP 照常路由。
+                        if dst_addr.port() == 53 {
+                            if let Some(fwd) = &dns_hijack_fwd {
+                                handle_tcp_dns(stream, fwd.clone()).await;
+                                return;
+                            }
                         }
                         if let std::net::IpAddr::V4(dst_v4) = dst_addr.ip() {
 
@@ -206,5 +220,74 @@ pub async fn start_transparent(
                 error!("Transparent proxy listener accept error: {}", e);
             }
         }
+    }
+}
+
+/// DNS-over-TCP 劫持: 逐条读 [2B 长度][DNS 报文], 本地解析, 回写 [2B 长度][响应]。
+/// 单连接可承载多条查询 (RFC 7766), 读到 EOF / 出错 / 解析失败即收工。
+/// 报文长度受 u16 天然封顶 (≤65535), 无需额外上限校验。
+///
+/// 空闲读超时是硬要求: 网关面向 LAN, 恶意/半开客户端 (连上不发、或发了 2B 长度不发
+/// body) 否则会让 read_exact 永久阻塞, 每条连接泄漏一个 task (slowloris)。DNS 客户端
+/// 都是即发即等, 8s 远宽于正常往返; 超时即当收工关连接。
+async fn handle_tcp_dns(mut stream: tokio::net::TcpStream, fwd: Arc<crate::dns::server::DnsForwarder>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const READ_IDLE: std::time::Duration = std::time::Duration::from_secs(8);
+    loop {
+        let mut len_buf = [0u8; 2];
+        // 读长度前缀带空闲超时: 超时/EOF/出错都收工 (这条包住"连上不发"的挂死)。
+        match tokio::time::timeout(READ_IDLE, stream.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return,
+        }
+        let qlen = u16::from_be_bytes(len_buf) as usize;
+        if qlen == 0 {
+            return;
+        }
+        let mut query = vec![0u8; qlen];
+        // body 也带超时 (包住"发了长度不发 body"的挂死)。
+        match tokio::time::timeout(READ_IDLE, stream.read_exact(&mut query)).await {
+            Ok(Ok(_)) => {}
+            _ => return,
+        }
+        let Some(resp) = fwd.resolve_query(&query).await else {
+            return; // 解析不出 = 丢弃并关连接
+        };
+        if stream.write_all(&frame_tcp_dns(&resp)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// DNS-over-TCP 帧: [2B 大端长度][DNS 报文]。resp 由 u16 长度天然封顶。
+fn frame_tcp_dns(resp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + resp.len());
+    out.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+    out.extend_from_slice(resp);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_tcp_dns;
+
+    #[test]
+    fn frame_prepends_be_length() {
+        // 3 字节响应 → [0x00, 0x03, b0, b1, b2]
+        assert_eq!(frame_tcp_dns(&[0xAA, 0xBB, 0xCC]), vec![0x00, 0x03, 0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn frame_length_is_big_endian() {
+        // 258 字节 → 长度前缀 0x01 0x02 (大端), 端序写反会变 0x02 0x01
+        let resp = vec![0u8; 258];
+        let framed = frame_tcp_dns(&resp);
+        assert_eq!(&framed[..2], &[0x01, 0x02]);
+        assert_eq!(framed.len(), 260);
+    }
+
+    #[test]
+    fn frame_empty() {
+        assert_eq!(frame_tcp_dns(&[]), vec![0x00, 0x00]);
     }
 }

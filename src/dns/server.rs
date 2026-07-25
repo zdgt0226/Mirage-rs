@@ -359,6 +359,41 @@ pub struct DnsForwarder {
 }
 
 impl DnsForwarder {
+    /// 构造一个**只处理查询、不 serve** 的实例, 供透明代理的 DNS 劫持复用。
+    ///
+    /// 与 `start` 的区别: 不绑监听 socket、不起收发 loop —— 劫持路径的收发由 transparent_udp
+    /// 的透明 socket 负责, 这里只借 `process_query` 的 fake-IP 分配 + 上游解析能力。
+    /// 共用同一个 `fake_ip_mapper`, 所以劫持路径分配的 fake-IP 与 dns 入站完全一致。
+    ///
+    /// socket 字段填一个未绑定的占位 (0.0.0.0:0), 因为 process_query 从不碰它 (只 serve loop 用)。
+    pub async fn for_hijack(
+        state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
+        fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
+        xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?); // 占位, 不用于收发
+        let cache = state
+            .load()
+            .advanced_dns
+            .as_ref()
+            .and_then(|adv| adv.cache.as_ref())
+            .filter(|c| c.enabled)
+            .map(|c| DnsCache::new(c.max_entries));
+        Ok(Arc::new(Self {
+            socket,
+            state,
+            fake_ip_mapper,
+            xdp_engine,
+            cache,
+            inbound_tag: crate::config::DNS_HIJACK_INBOUND_TAG.into(),
+        }))
+    }
+
+    /// 处理一个 DNS 查询字节, 返回应答字节 (供 DNS 劫持路径调用)。None = 无法应答, 应放行。
+    pub async fn resolve_query(&self, req: &[u8]) -> Option<Vec<u8>> {
+        self.process_query(req).await
+    }
+
     pub async fn start(
         inbound_tag: Arc<str>,
         listen_addr: SocketAddr,

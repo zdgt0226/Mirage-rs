@@ -324,6 +324,8 @@ pub async fn start_transparent_udp(
     state: Arc<ArcSwap<CoreState>>,
     fake_ip_mapper: Arc<FakeIpMapper>,
     transparent_engine: Arc<Mutex<TransparentEngine>>,
+    // DNS 劫持 forwarder (Some=开启): port-53 的 UDP 数据报由本机应答, 不建流。
+    dns_hijack_fwd: Option<Arc<crate::dns::server::DnsForwarder>>,
 ) -> anyhow::Result<()> {
     let main = Arc::new(build_main_socket(listen_addr)?);
     // sk_lookup UDP sockmap 注册非致命: tc_divert 用内核 bpf_sk_lookup_udp 直接找本
@@ -412,8 +414,9 @@ pub async fn start_transparent_udp(
             let sessions = sessions.clone();
             let replies = replies.clone();
             let tg = inbound_tag.clone();
+            let hj = dns_hijack_fwd.clone();
             tokio::spawn(async move {
-                setup_flow(client, orig_dst, payload, st, fm, sessions, replies, tg).await;
+                setup_flow(client, orig_dst, payload, st, fm, sessions, replies, tg, hj).await;
             });
         }
     }
@@ -431,6 +434,8 @@ async fn setup_flow(
     // 本流来自哪个入站。TCP 侧已经带上, UDP 侧不带的话同一个 transparent 入站会出现
     // "TCP 认 inbound 规则、UDP 不认" —— 同一个站点两个出口 IP, 且完全无声。
     inbound_tag: Arc<str>,
+    // DNS 劫持 forwarder (Some=开启): port-53 直接本地应答, 不建 flow。
+    dns_hijack_fwd: Option<Arc<crate::dns::server::DnsForwarder>>,
 ) {
     let key = (client, orig_dst);
     // RAII 清理: 早退清占位, commit 后清完整会话。始终保证执行 (含 panic)。
@@ -442,6 +447,21 @@ async fn setup_flow(
         committed_id: None,
         reply_acquired: false,
     };
+
+    // DNS 劫持: 流经 LAN 的 53/UDP 查询由本机应答, 不建流。每条查询用独立源端口
+    // = 独立 flow key, 一问一答后 guard 清占位。resolve_query 解不出即丢弃 (占端口
+    // 本就该我们答)。回包必须从 orig_dst 伪造源发回, 复用 reply socket 机制。
+    if orig_dst.port() == 53 {
+        if let Some(fwd) = &dns_hijack_fwd {
+            if let Some(resp) = fwd.resolve_query(&first_payload).await {
+                if let Some(reply) = acquire_reply(&replies, orig_dst) {
+                    guard.reply_acquired = true;
+                    let _ = reply.send_to(&resp, SocketAddr::V4(client)).await;
+                }
+            }
+            return;
+        }
+    }
     let fake_ip = *orig_dst.ip();
     let port = orig_dst.port();
     let domain = fake_ip_mapper.lookup_domain(&fake_ip);
