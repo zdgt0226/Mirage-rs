@@ -1644,7 +1644,7 @@ EOM
 
     if [[ "$deploy_mode" == "2" ]]; then
         CLIENT_IS_GATEWAY=true
-        local transparent_port lan_iface dns_listen dns_port fakeip_range direct_dns remote_dns proxy_local
+        local transparent_port lan_iface dns_listen dns_port fakeip_range direct_dns remote_dns proxy_local dns_hijack
         transparent_port=$(ask_port "透明代理监听端口 (sk_lookup 内部用, 随意)" "12345" tcp)
         lan_iface=$(ask "LAN 网卡名 (tc_divert 挂这张卡抓裸-IP 转发流量, 面向内网设备的那张)" "$(detect_wan_iface)")
         # 本机出向: 让网关这台机器自己的流量也走代理 (cgroup/connect4)。开启则需把
@@ -1655,6 +1655,14 @@ EOM
             proxy_local=false
         fi
         CLIENT_PROXY_LOCAL=$proxy_local
+        # DNS 劫持 (默认关): tc_divert 已抓 LAN 转发流量, 顺带把流经的 53/UDP+TCP 查询
+        # 交本机 DNS 服务应答 —— LAN 设备无需把 DNS 指向网关也能拿 fake-IP。纯用户态
+        # (sk_assign + 透明回包), 不改包无 conntrack。不劫持本机自身 DNS, 不碰 DoT/DoH。
+        if ask_yn "劫持流经 LAN 的 DNS 请求? (LAN 设备无需改 DNS 设置即被接管 53/UDP+TCP)" n; then
+            dns_hijack=true
+        else
+            dns_hijack=false
+        fi
         dns_listen=$(ask "DNS 服务监听地址" "0.0.0.0")
         dns_port=$(ask_port "DNS 监听端口 (LAN 设备 DNS 指这里; 标准 53)" "53" udp)
         fakeip_range=$(ask "Fake-IP 网段 (RFC2544 基准段, 一般不改)" "198.18.0.0/15")
@@ -1676,7 +1684,8 @@ EOM
             "listen": "0.0.0.0",
             "port": '"$transparent_port"',
             "interface": "'"$lan_iface"'",
-            "proxy_local": '"$proxy_local"'
+            "proxy_local": '"$proxy_local"',
+            "dns_hijack": '"$dns_hijack"'
         },
         {
             "type": "dns",
@@ -1699,6 +1708,7 @@ EOM
     },'
         local dns_upstreams="$direct_dns"; [[ -n "$direct_dns2" ]] && dns_upstreams="$direct_dns + $direct_dns2"
         info "透明网关模式: transparent(:$transparent_port, tc_divert@$lan_iface) + dns(:$dns_port, 国内上游=$dns_upstreams 并行+重传) 入站 + fake-IP($fakeip_range)"
+        [[ "$dns_hijack" == true ]] && info "DNS 劫持: 已开启 —— 流经 LAN 的 53/UDP+TCP 查询由本机应答, LAN 设备无需改 DNS 设置"
     else
         inbounds_json='{
             "type": "mixed",

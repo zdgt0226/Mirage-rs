@@ -1,5 +1,27 @@
 # Changelog - Mirage-rs
 
+## [Unreleased] - DNS 劫持 (可选, 默认关)
+
+### feat(dns): 劫持流经 LAN 的 53/UDP+TCP 查询 (可选, 默认关闭)
+
+透明网关新增可选 DNS 劫持: LAN 设备**无需把 DNS 指向网关**, 流经的 53 端口查询即被本机
+DNS 服务接管、返回 fake-IP, 后续到 fake-IP 的流量照常走透明分流。开关在 install.sh
+安装时询问 (默认否), 或配置 transparent 入站的 `"dns_hijack": true`。
+
+- **只劫持转发流量, 不碰本机自身 DNS**; 不处理 DoT/DoH (加密无从识别)。
+- **纯用户态、零新机制**: 复用 tc_divert 的 `sk_assign` (已抓 LAN 转发流量, 含 53 端口)
+  + 透明回包 (源伪造回 orig_dst:53), 不改包、无 conntrack、不加 iptables/nftables。
+- UDP: `setup_flow` 对 orig_dst 端口 53 直接本地应答, 不建 flow (一问一答)。
+- TCP: accept 后按 `[2B 长度][报文]` 逐条读→本地解析→回写 (RFC 7766, 单连接多查询)。
+- 关闭时 (默认) 53 端口流量照常按路由走, 行为不变。
+- **路由维度**: 劫持的 DNS 解析走合成入站 tag `dns-hijack` (不继承 `dns` 入站规则)。
+  开启后校验器登记该 tag, 用户可写 `"inbound":["dns-hijack"]` 规则专门路由; 未开启时
+  该 tag 仍按"未知入站"报错 (防拼写误配)。
+
+复用的内核机制均已由既有 netns verifier 覆盖 (verify_tc_divert 的 53/UDP sk_assign、
+verify_tc_divert_tcp 的透明 local_addr、verify_udp_transparent 的回包源伪造); 新增的
+TCP 长度分帧有单元测试 (`proxy::transparent::tests`)。
+
 ## [v0.6.0-alpha.8] - 外部审计修复 + 部署反馈 (2026-07-24)
 
 本版全部是**修复**, 无新功能。外部内核专家模型审计四条 + 真机部署反馈四条。
