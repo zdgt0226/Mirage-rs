@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [dns, static, testing, fakeip]
 created: "2026-07-25T23:13:49"
-updated: "2026-07-25T23:13:49"
+updated: "2026-07-26T02:09:29"
 ---
 
 ## compiled_truth
@@ -49,4 +49,10 @@ updated: "2026-07-25T23:13:49"
   kind: decision
   summary: "自定义域名→IP 静态解析: dnsmasq 式精确+子域最长匹配, 命中绕过 fake-IP/路由/上游, 无对应家族回 NODATA 不放行"
   source: brain update-truth
+  affects: [dns-static-resolution]
+
+- time: 2026-07-26T02:09:29
+  kind: note
+  summary: "Sonnet 审计: 键归一化剥尾点 + 确定性去重 (原按 HashMap 迭代序, 撞车胜者跨重启抖动); 提取纯函数 normalize_static_hosts 加单测"
+  source: 5f88e4a
   affects: [dns-static-resolution]
