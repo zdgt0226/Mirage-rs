@@ -68,6 +68,19 @@ enum Mode {
         config: String,
         /// mirage://... 节点 URI
         uri: String,
+        /// 导入前测一次节点可用性 (握手+认证)。默认失败仅告警仍导入 (见 --require-live)
+        #[arg(long)]
+        test: bool,
+        /// 只在节点测试通过时才导入 (隐含 --test); 不可用则中止不改配置
+        #[arg(long)]
+        require_live: bool,
+        /// 建/更新一个 urltest 出站组纳入全部 mirage 节点, 并把 routing.default_outbound
+        /// 指向它 = 按 RTT 自动选路。显式启用, 缺省不动路由。组名见 --group-name。
+        #[arg(long)]
+        group: bool,
+        /// urltest 组名 (仅 --group 时生效)
+        #[arg(long, default_value = "auto")]
+        group_name: String,
     },
     /// 测试配置里 mirage 出站节点的可用性 (完整握手 + 认证验证, 报 RTT)
     ///
@@ -199,8 +212,38 @@ fn prompt_unique_tag(default: &str, taken: &[String]) -> anyhow::Result<String> 
     }
 }
 
+/// 建/更新一个 urltest 出站组 `group_tag`, 纳入配置里全部 mirage 出站, 并把
+/// routing.default_outbound 指向它。返回 (纳入节点数, 旧 default_outbound)。
+/// group_tag 已被非 urltest 出站占用则 Err。显式 --group 才调用, 是唯一会改路由的路径。
+fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str) -> Result<(usize, Option<String>), String> {
+    let tags: Vec<String> = mirage_outbounds(root).into_iter().map(|(t, ..)| t).collect();
+    if tags.is_empty() {
+        return Err("配置里没有 mirage 出站可纳入组".into());
+    }
+    let arr = root["outbounds"].as_array_mut().ok_or("outbounds 不是数组")?;
+    // 已有同名出站: 是 urltest 则更新其成员, 否则拒绝 (别踩别的出站)。
+    if let Some(existing) = arr.iter_mut().find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(group_tag)) {
+        if existing.get("type").and_then(|t| t.as_str()) != Some("urltest") {
+            return Err(format!("tag `{group_tag}` 已被非 urltest 出站占用, 换个组名 (--group <名>)"));
+        }
+        existing["outbounds"] = serde_json::json!(tags);
+    } else {
+        arr.push(serde_json::json!({ "type": "urltest", "tag": group_tag, "outbounds": tags }));
+    }
+    // 把默认出站指向组 = 按 RTT 自动选路 (显式 --group 请求的核心动作)。
+    let old_default = root
+        .get("routing")
+        .and_then(|r| r.get("default_outbound"))
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string());
+    if let Some(routing) = root.get_mut("routing").filter(|r| r.is_object()) {
+        routing["default_outbound"] = serde_json::json!(group_tag);
+    }
+    Ok((mirage_outbounds(root).len(), old_default))
+}
+
 /// 导入 mirage:// 节点为新的 mirage 出站, 写回配置文件。
-fn run_import(path: &str, uri: &str) -> i32 {
+async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group: Option<&str>) -> i32 {
     let node = match mirage_rs::node_uri::NodeUri::parse(uri) {
         Ok(n) => n,
         Err(e) => {
@@ -231,6 +274,27 @@ fn run_import(path: &str, uri: &str) -> i32 {
     }
 
     println!("节点: {}:{}  (SNI 伪装: {})", node.host, node.port, node.sni);
+
+    // 可选: 导入前测节点可用性 (--test 告警, --require-live 硬拦)。
+    if test || require_live {
+        use mirage_rs::proxy::probe::{probe_mirage, ProbeOutcome};
+        print!("  测试节点 … ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        match probe_mirage(&node.host, node.port, &node.password, &node.sni, 8).await {
+            ProbeOutcome::Ok { handshake_ms, .. } => println!("✓ 可用 (握手+认证 {handshake_ms}ms)"),
+            ProbeOutcome::Unconfirmed { note, .. } => println!("⚠ 可达但未确认认证 —— {note}"),
+            ProbeOutcome::Fail(reason) => {
+                println!("✗ 不可用 —— {reason}");
+                if require_live {
+                    eprintln!("  --require-live: 节点不可用, 中止导入 (未改动配置)");
+                    return 1;
+                }
+                eprintln!("  警告: 节点测试未通过, 仍继续导入 (要拒绝请用 --require-live)");
+            }
+        }
+    }
+
     let taken = existing_outbound_tags(&root);
     if !taken.is_empty() {
         println!("现有出站 tag: {}", taken.join(", "));
@@ -253,6 +317,24 @@ fn run_import(path: &str, uri: &str) -> i32 {
         "camouflage_host": node.sni,
     });
     root["outbounds"].as_array_mut().unwrap().push(new_ob);
+
+    // --group: 建/更新 urltest 组并指向它 (唯一改路由的路径); 否则仅在代理数>1 时给建议。
+    let mut group_note: Option<String> = None;
+    if let Some(gname) = group {
+        match apply_urltest_group(&mut root, gname) {
+            Ok((n, old)) => {
+                group_note = Some(format!(
+                    "✓ 已建/更新 urltest 组 `{gname}` (纳入 {n} 个 mirage 节点), \
+                     routing.default_outbound: {} → `{gname}` (按 RTT 自动选路)",
+                    old.as_deref().unwrap_or("<未设>")
+                ));
+            }
+            Err(e) => {
+                eprintln!("✗ 建组失败: {e} (未改动配置)");
+                return 1;
+            }
+        }
+    }
 
     let rendered = match serde_json::to_string_pretty(&root) {
         Ok(s) => s + "\n",
@@ -280,9 +362,25 @@ fn run_import(path: &str, uri: &str) -> i32 {
     }
 
     println!("✓ 已导入为出站 `{tag}` → {path}  (原文件备份: {bak})");
-    println!("  提示: 出站已添加, 但还没有任何路由规则使用它。");
-    println!("        要让流量走它, 把 routing.default_outbound 或某条 rule 的 outbound 改为 `{tag}`,");
-    println!("        然后 `mirage-rs check -c {path}` 确认无误再重启。");
+    if let Some(note) = group_note {
+        // --group: 路由已自动指向组, 无需再手动接线。
+        println!("  {note}");
+        println!("  `mirage-rs check -c {path}` 确认无误再重启。");
+    } else {
+        println!("  提示: 出站已添加, 但还没有任何路由规则使用它。");
+        println!("        要让流量走它, 把 routing.default_outbound 或某条 rule 的 outbound 改为 `{tag}`,");
+        println!("        然后 `mirage-rs check -c {path}` 确认无误再重启。");
+        // 代理节点 >1: 建议 urltest 自动选路 (只建议, 不擅自改路由)。
+        let proxies = mirage_outbounds(&root);
+        if proxies.len() > 1 {
+            let tags: Vec<&str> = proxies.iter().map(|(t, ..)| t.as_str()).collect();
+            println!();
+            println!("  检测到 {} 个 mirage 节点。想按 RTT 自动选路 (故障自动切换), 两个办法:", proxies.len());
+            println!("    ① 重跑本命令时加 --group  (自动建 urltest 组并指向它)");
+            println!("    ② 手动在 outbounds 里加一条, 再把 default_outbound 改成 \"auto\":");
+            println!("         {{ \"type\": \"urltest\", \"tag\": \"auto\", \"outbounds\": {:?} }}", tags);
+        }
+    }
     0
 }
 
@@ -384,13 +482,16 @@ async fn main() -> anyhow::Result<()> {
     match &args.mode {
         Mode::Check { config } => std::process::exit(run_check(config)),
         Mode::Format { config } => std::process::exit(run_format(config)),
-        Mode::Import { config, uri } => std::process::exit(run_import(config, uri)),
         _ => {}
     }
 
-    // test: 需网络 + async, 放在 tokio 运行时里 (check/format/import 是纯本地不碰网络)。
+    // test / import: 可能需网络 (import --test / --require-live) + async, 放 tokio 运行时里。
     if let Mode::Test { config, tag, timeout } = &args.mode {
         std::process::exit(run_test(config, tag.as_deref(), *timeout).await);
+    }
+    if let Mode::Import { config, uri, test, require_live, group, group_name } = &args.mode {
+        let g = group.then_some(group_name.as_str());
+        std::process::exit(run_import(config, uri, *test, *require_live, g).await);
     }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
@@ -438,5 +539,52 @@ mod tests {
     #[test]
     fn no_outbounds_array_yields_empty() {
         assert!(mirage_outbounds(&serde_json::json!({})).is_empty());
+    }
+
+    use super::apply_urltest_group;
+
+    fn cfg_two_mirage() -> serde_json::Value {
+        serde_json::json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "m1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "direct", "tag": "direct" },
+                { "type": "mirage", "tag": "m2", "server": "h2", "server_port": 443, "password": "p", "camouflage_host": "s" }
+            ],
+            "routing": { "default_outbound": "m1", "rules": [] }
+        })
+    }
+
+    #[test]
+    fn group_creates_urltest_and_points_default() {
+        let mut root = cfg_two_mirage();
+        let (n, old) = apply_urltest_group(&mut root, "auto").unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(old.as_deref(), Some("m1"));
+        assert_eq!(root["routing"]["default_outbound"], "auto");
+        let g: Vec<_> = root["outbounds"].as_array().unwrap().iter()
+            .filter(|o| o["type"] == "urltest").collect();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0]["outbounds"], serde_json::json!(["m1", "m2"]));
+    }
+
+    #[test]
+    fn group_is_idempotent_updates_members() {
+        let mut root = cfg_two_mirage();
+        apply_urltest_group(&mut root, "auto").unwrap();
+        // 再加一个 mirage 后重跑: 组成员更新, 不新增第二个 urltest
+        root["outbounds"].as_array_mut().unwrap().push(serde_json::json!(
+            { "type": "mirage", "tag": "m3", "server": "h3", "server_port": 443, "password": "p", "camouflage_host": "s" }));
+        apply_urltest_group(&mut root, "auto").unwrap();
+        let g: Vec<_> = root["outbounds"].as_array().unwrap().iter()
+            .filter(|o| o["type"] == "urltest").collect();
+        assert_eq!(g.len(), 1, "不重复建组");
+        assert_eq!(g[0]["outbounds"], serde_json::json!(["m1", "m2", "m3"]));
+    }
+
+    #[test]
+    fn group_rejects_name_taken_by_non_urltest() {
+        let mut root = cfg_two_mirage();
+        // "direct" 已是非 urltest 出站 → 拒绝占用
+        assert!(apply_urltest_group(&mut root, "direct").is_err());
     }
 }

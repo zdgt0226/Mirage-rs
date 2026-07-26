@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-26T08:31:49.703Z._
+_Auto-generated. Last updated 2026-07-26T08:58:59.205Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -17,6 +17,7 @@ _Auto-generated. Last updated 2026-07-26T08:31:49.703Z._
 - [mss-clamp-merged-into-tc-divert](pages/mss-clamp-merged-into-tc-divert.md) — category: decision | **决定**(`66e0262`,方案A):把 MSS clamp **内联进 `tc_divert.c`**(`clamp_tcp_mss()`),
 - [no-clash-api](pages/no-clash-api.md) — category: decision | **决定**:**不做 Clash API 兼容**,走自有 API 路径。
 - [no-doh-dot](pages/no-doh-dot.md) — category: decision | **决定**:**不把 DoH/DoT 当作抗审查手段**。
+- [node-test-and-autogroup](pages/node-test-and-autogroup.md) — category: decision | tags: [cli, import, probe, urltest, routing] | ## 背景
 - [orphan-filter-blackhole](pages/orphan-filter-blackhole.md) — category: decision | **问题**:进程被 SIGKILL / 正常停止后,tc 过滤器**仍挂在网卡上**(tc 持有 prog 引用,不随进程消失),
 - [ring-for-aead](pages/ring-for-aead.md) — category: decision | **决定**:隧道载荷加密用 **`ring`** 的 ChaCha20-Poly1305(`LessSafeKey` + 显式 nonce 管理);
 - [routing-rules](pages/routing-rules.md) — category: concept | tags: [routing, config] | Mirage 的路由规则维度与 sing-box/Clash 基本对齐, **域名 4 种 + IP 2 种 + 连接属性 4 种 + and/or 组合**。
