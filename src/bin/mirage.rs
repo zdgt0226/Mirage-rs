@@ -90,7 +90,8 @@ enum Mode {
         /// urltest 组 HTTP 探测地址 (test_type≠rtt 时用; 默认 gstatic/generate_204)。仅 --group
         #[arg(long, requires = "group")]
         group_url: Option<String>,
-        /// urltest 组测试方式: rtt=内核 RTT / ping=HTTP 探测 (默认 ping)。仅 --group
+        /// urltest 组测试方式 (默认 ping)。ping==http: 穿隧道 HTTP 探测, 端到端含 VPS 出口
+        /// 质量。rtt: 内核 TCP RTT, 只量到 VPS 那一跳 (轻量/被动, 盲于出口)。仅 --group
         #[arg(long, requires = "group", value_parser = ["rtt", "ping", "http"])]
         group_test_type: Option<String>,
         /// --test/--require-live 探测的超时秒数 (握手阶段另有 15s 下限, 不受此值压低)

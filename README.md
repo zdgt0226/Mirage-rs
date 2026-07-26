@@ -103,14 +103,21 @@ mirage-rs import -c config.json --group "mirage://密码@host:443?sni=www.apple.
 mirage-rs import -c config.json --group \
   --group-interval 120 \      # 健康检查间隔秒 (默认 300; 0=关)
   --group-tolerance 30 \      # RTT 容差 ms, 现节点领先超过它才切换 (默认 50)
-  --group-test-type rtt \     # rtt=内核 RTT / ping=HTTP 探测 (默认 ping)
-  --group-url http://cp.cloudflare.com/generate_204 \  # HTTP 探测地址 (test_type≠rtt 时用)
+  --group-test-type ping \    # ping==http (穿隧道 HTTP 探测, 端到端) / rtt (内核 RTT, 轻量)
+  --group-url http://cp.cloudflare.com/generate_204 \  # HTTP 探测地址 (ping/http 模式用)
   "mirage://密码@host:443?sni=www.apple.com"
 
 # 测已配 mirage 节点可用性 (完整握手 + 认证验证, 报 RTT; 全通过退出 0):
 mirage-rs test -c config.json            # 测全部 mirage 出站
 mirage-rs test -c config.json --tag proxy # 只测某个 tag
 ```
+
+> **urltest 测试方式 `test_type` 说明**: `ping` 与 `http` **完全等价** —— 都是**穿隧道 HTTP
+> 探测** (周期性 GET `--group-url` 的 generate_204), 量**端到端**耗时, 含 VPS 到目标的**出口
+> 线路质量**, 最贴近真实浏览体验 (默认, 推荐)。`rtt` 是 eBPF 抓的**内核 TCP RTT**, 只量客户端
+> 到 VPS **那一跳**, 轻量/被动零探测流量, 但**盲于出口质量** —— 离你近却出口拥塞的节点会被
+> `rtt` 误判成最优。选"浏览最流畅"用 `ping`; 只在乎就近、想省探测流量用 `rtt` (节点无活连接时
+> `rtt` 自动回落 HTTP 探测)。
 
 `import` 会交互式询问出站 tag 并**保证不与现有出站 tag 冲突**(撞名就重问, 绝不覆盖既有节点)。
 默认只添加出站、**不动路由** —— 要让流量走它, 需自行把 `routing.default_outbound` 或某条
