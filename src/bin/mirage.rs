@@ -81,6 +81,9 @@ enum Mode {
         /// urltest 组名 (仅 --group 时生效)
         #[arg(long, default_value = "auto")]
         group_name: String,
+        /// --test/--require-live 探测的超时秒数 (握手阶段另有 15s 下限, 不受此值压低)
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
     },
     /// 测试配置里 mirage 出站节点的可用性 (完整握手 + 认证验证, 报 RTT)
     ///
@@ -236,14 +239,16 @@ fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str) -> Result<
         .and_then(|r| r.get("default_outbound"))
         .and_then(|d| d.as_str())
         .map(|s| s.to_string());
-    if let Some(routing) = root.get_mut("routing").filter(|r| r.is_object()) {
-        routing["default_outbound"] = serde_json::json!(group_tag);
+    match root.get_mut("routing").filter(|r| r.is_object()) {
+        Some(routing) => routing["default_outbound"] = serde_json::json!(group_tag),
+        // routing 缺失/非对象: 创建一个最小 routing 指向组, 否则会"报成功却没改路由"。
+        None => root["routing"] = serde_json::json!({ "default_outbound": group_tag, "rules": [] }),
     }
     Ok((mirage_outbounds(root).len(), old_default))
 }
 
 /// 导入 mirage:// 节点为新的 mirage 出站, 写回配置文件。
-async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group: Option<&str>) -> i32 {
+async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group: Option<&str>, timeout_secs: u64) -> i32 {
     let node = match mirage_rs::node_uri::NodeUri::parse(uri) {
         Ok(n) => n,
         Err(e) => {
@@ -281,7 +286,7 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         print!("  测试节点 … ");
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        match probe_mirage(&node.host, node.port, &node.password, &node.sni, 8).await {
+        match probe_mirage(&node.host, node.port, &node.password, &node.sni, timeout_secs).await {
             ProbeOutcome::Ok { handshake_ms, .. } => println!("✓ 可用 (握手+认证 {handshake_ms}ms)"),
             ProbeOutcome::Unconfirmed { note, .. } => println!("⚠ 可达但未确认认证 —— {note}"),
             ProbeOutcome::Fail(reason) => {
@@ -396,7 +401,7 @@ fn mirage_outbounds(root: &serde_json::Value) -> Vec<(String, String, u16, Strin
             Some((
                 o.get("tag")?.as_str()?.to_string(),
                 o.get("server")?.as_str()?.to_string(),
-                o.get("server_port")?.as_u64()? as u16,
+                u16::try_from(o.get("server_port")?.as_u64()?).ok()?, // 越界端口跳过, 不截断
                 o.get("password")?.as_str()?.to_string(),
                 o.get("camouflage_host")?.as_str()?.to_string(),
             ))
@@ -489,9 +494,9 @@ async fn main() -> anyhow::Result<()> {
     if let Mode::Test { config, tag, timeout } = &args.mode {
         std::process::exit(run_test(config, tag.as_deref(), *timeout).await);
     }
-    if let Mode::Import { config, uri, test, require_live, group, group_name } = &args.mode {
+    if let Mode::Import { config, uri, test, require_live, group, group_name, timeout } = &args.mode {
         let g = group.then_some(group_name.as_str());
-        std::process::exit(run_import(config, uri, *test, *require_live, g).await);
+        std::process::exit(run_import(config, uri, *test, *require_live, g, *timeout).await);
     }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
@@ -586,5 +591,19 @@ mod tests {
         let mut root = cfg_two_mirage();
         // "direct" 已是非 urltest 出站 → 拒绝占用
         assert!(apply_urltest_group(&mut root, "direct").is_err());
+    }
+
+    #[test]
+    fn group_creates_routing_when_absent() {
+        // routing 缺失时应创建并指向组, 不能报成功却没改路由
+        let mut root = serde_json::json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "m1", "server": "h", "server_port": 443, "password": "p", "camouflage_host": "s" }
+            ]
+        });
+        let (n, old) = apply_urltest_group(&mut root, "auto").unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(old, None, "原本无 default");
+        assert_eq!(root["routing"]["default_outbound"], "auto", "已创建 routing 并指向组");
     }
 }

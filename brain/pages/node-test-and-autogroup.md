@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [cli, import, probe, urltest, routing]
 created: "2026-07-26T16:50:20"
-updated: "2026-07-26T16:58:48"
+updated: "2026-07-26T18:48:00"
 ---
 
 ## compiled_truth
@@ -68,4 +68,10 @@ updated: "2026-07-26T16:58:48"
   kind: decision
   summary: "mirage test 走真握手+解密认证测活(裸TCP不算); import 建组是 opt-in(--group才改default_outbound), 默认只建议不静默改路由(护 region-unlock/per-inbound 意图)"
   source: brain update-truth
+  affects: [node-test-and-autogroup]
+
+- time: 2026-07-26T18:48:00
+  kind: note
+  summary: "Sonnet 审计修 4 条: probe 握手超时下限 15s(护慢链路, 修 HIGH 误判)、apply_urltest_group routing 缺失则创建、server_port try_from 防截断、解密失败措辞软化; import 加 --timeout"
+  source: feat/node-test-and-autogroup
   affects: [node-test-and-autogroup]
