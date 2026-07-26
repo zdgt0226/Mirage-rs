@@ -1,5 +1,17 @@
 # Changelog - Mirage-rs
 
+## [Unreleased] - DNS 直连上游: 默认端口 53 + TCP 协议选项
+
+### feat(dns): direct/cn 上游地址默认端口 53 + 可选 protocol: tcp
+
+- **地址默认端口 53**: 之前 `direct` 上游必须写 `223.5.5.5:53` (SocketAddr 解析要求端口),
+  而 `remote` 可省 —— 不一致。现 `direct` 上游不带端口默认 53 (`223.5.5.5` 即可), 与 remote
+  统一。裸 IPv6 (`2001:4860:4860::8888`) 直接写, 带端口用方括号。见 `parse_dns_upstream`。
+- **每上游 `protocol` (udp 默认 / tcp)**: UDP/53 被封或投毒的网络可给 `direct`/`cn` 上游加
+  `"protocol": "tcp"` 走 TCP 解析 (RFC 7766 长度分帧, 顺序 failover, 3s 超时)。UDP 上游仍走
+  并行竞速 + 重传; 混配则并发竞速取先回的。仅作用于 direct/cn —— remote 恒经隧道 TCP 查。
+- install.sh 网关模式 DNS 默认答案去掉 `:53`; README 示例同步 + 补 `protocol` 说明。
+
 ## [v0.6.1] - DNS 劫持 + 静态解析 + IP 版本策略 (2026-07-26)
 
 ### feat(dns): IP 版本策略 advanced_dns.ip_strategy (v4/v6 返回控制)
