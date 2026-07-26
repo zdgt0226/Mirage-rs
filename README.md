@@ -663,10 +663,11 @@ sudo bash install.sh
 - [x] geo 自动更新 (ETag/304 + 多镜像 + 落地前校验 + 重启不重下)
 - [x] 配置工具链 (`check` / `format` / `import`) + 启动时配置校验
 - [x] 入站认证 (SOCKS5 / HTTP), 修默认开放代理
+- [x] DNS: 可选劫持 (接管 LAN 53/UDP+TCP, 默认关) · 静态解析 (类 dnsmasq, 精确+子域) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回) (v0.6.1)
 
 **未完成 / 未完善**
 
-- [ ] **IPv6 全栈** —— 当前 WireGuard 与透明代理均 **IPv4-only**。这是最大的结构性缺口, IPv6 优先/仅 IPv6 网络 (尤其国内移动网) 下会漏流量或不可用
+- [ ] **IPv6 全栈** —— 当前 WireGuard 与透明代理数据面均 **IPv4-only** (DNS 层已可控 v4/v6 返回, 但数据面未通)。这是最大的结构性缺口, IPv6 优先/仅 IPv6 网络 (尤其国内移动网) 下会漏流量或不可用
 - [ ] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"); 已有 cgroup/connect4 的 eBPF 基础
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [ ] **订阅链接** —— `node_uri` + `import` 基础已有, 但订阅**格式本身要先定义**
@@ -685,7 +686,7 @@ sudo bash install.sh
 
 ## 版本演进
 
-近期 (v0.5.0 → v0.6.0-alpha.8):
+近期 (v0.5.0 → v0.6.1):
 
 | 版本 | 关键改动 |
 |---|---|
@@ -693,6 +694,7 @@ sudo bash install.sh
 | v0.6.0-alpha.1~6 | 轻量模式 · 中转站 (SS 上游) · 配置工具链 · 入站认证 · SS 2022 · 死代码清理 |
 | **v0.6.0-alpha.7** | **WireGuard 全套** (客户端出站 + 服务端上游, 真机五层验证) · 裸 IP 按域名分流 · 路由 `inbound` 维度 · SOCKS5 UDP 逐包路由 · geo 更新器大修 |
 | **v0.6.0-alpha.8** | 外部审计修复 (DNS 哈希碰撞 P1 / cgroup 自连竞态 / LPM 半更新) + 真机部署反馈 (geo 代理认证 / 日志滚动可配 / 部署汇总) |
+| **v0.6.1** | **DNS 三件套**: 可选劫持 (tc_divert sk_assign 复用, 纯用户态接管 LAN 53/UDP+TCP) · 静态解析 (`advanced_dns.static`, 类 dnsmasq 精确+子域最长匹配) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回)。自审 + Sonnet 独立复审 |
 
 <details>
 <summary>更早的里程碑 (alpha.4 → v0.4.5 final)</summary>
