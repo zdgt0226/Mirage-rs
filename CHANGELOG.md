@@ -26,6 +26,8 @@ mirage-rs test -c config.json --tag proxy # 只测某个 tag
   并把 `routing.default_outbound` 指向它 = 按 RTT 自动选路 (显式启用才改路由)。
 - 缺省行为不变 (只加出站不动路由); 但导入后代理节点 > 1 时**打印建议** (给现成 urltest
   配置片段), 让用户自己决定 —— 不静默重写路由 (避免破坏 region-unlock / per-inbound 意图)。
+- `--group` 可选自定义组参数: `--group-interval` (检查间隔秒) / `--group-tolerance` (RTT 容差 ms) /
+  `--group-test-type` (rtt / ping) / `--group-url` (HTTP 探测地址)。未给则建组走默认、更新时保留原值。
 
 ## [v0.6.2] - DNS 直连上游: 默认端口 53 + TCP 协议选项 (2026-07-26)
 

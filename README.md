@@ -99,6 +99,14 @@ mirage-rs import -c config.json --require-live "mirage://密码@host:443?sni=www
 # 导入并建 urltest 组按 RTT 自动选路 (建/更新 "auto" 组 + 指向它, --group-name 改名):
 mirage-rs import -c config.json --group "mirage://密码@host:443?sni=www.apple.com"
 
+# 建组时自定义 urltest 参数 (都可选; 未给的建组走默认/更新时保留原值):
+mirage-rs import -c config.json --group \
+  --group-interval 120 \      # 健康检查间隔秒 (默认 300; 0=关)
+  --group-tolerance 30 \      # RTT 容差 ms, 现节点领先超过它才切换 (默认 50)
+  --group-test-type rtt \     # rtt=内核 RTT / ping=HTTP 探测 (默认 ping)
+  --group-url http://cp.cloudflare.com/generate_204 \  # HTTP 探测地址 (test_type≠rtt 时用)
+  "mirage://密码@host:443?sni=www.apple.com"
+
 # 测已配 mirage 节点可用性 (完整握手 + 认证验证, 报 RTT; 全通过退出 0):
 mirage-rs test -c config.json            # 测全部 mirage 出站
 mirage-rs test -c config.json --tag proxy # 只测某个 tag
