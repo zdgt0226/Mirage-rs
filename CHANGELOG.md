@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - 节点测试子命令 + 导入建组建议
+## [v0.6.3] - 节点测试子命令 + 导入建组 (2026-07-26)
 
 ### feat(cli): `mirage-rs test` —— mirage 节点可用性测试 (完整握手 + 认证验证)
 
