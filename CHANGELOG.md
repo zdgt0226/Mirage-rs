@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - DNS 直连上游: 默认端口 53 + TCP 协议选项
+## [v0.6.2] - DNS 直连上游: 默认端口 53 + TCP 协议选项 (2026-07-26)
 
 ### feat(dns): direct/cn 上游地址默认端口 53 + 可选 protocol: tcp
 
