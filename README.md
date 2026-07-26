@@ -433,6 +433,102 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 
 密码 + `camouflage_host` 必须跟客户端完全一致。`brutal_rate_mbps` 是服务端到客户端方向 (下载) 的 brutal 目标速率, 见下方 Brutal 章节。
 
+### 透明网关完整配置模板 (v0.6.1)
+
+部署形态 2 (透明网关) 的一份**功能齐全**模板, 涵盖 transparent + dns 入站、fake-IP、DNS 缓存, 以及 v0.6.1 新增的 **DNS 劫持 / 静态解析 / IP 版本策略**。`install.sh` 网关模式会交互生成等价配置; 手改照此。
+
+> 下方是 **JSONC** (带注释便于阅读)。真正的 `config.json` **不能带注释** —— 去掉 `//` 行后即通过 `jq` 校验的严格 JSON (`jq empty config.json` 无报错)。install.sh 生成的就是无注释版。
+
+```jsonc
+{
+  "schema_version": 1,
+  "log_level": "info",
+  "log_file": "/var/log/mirage-rs/gateway.log", // 同时写文件 + stdout; 超 10MB 自动滚动 gzip
+
+  "inbounds": [
+    {
+      "type": "transparent",           // eBPF 透明网关入站 (tc_divert + sk_lookup)
+      "tag": "transparent-in",
+      "listen": "0.0.0.0",
+      "port": 12345,                   // sk_lookup 内部用, 随意选个空闲端口
+      "interface": "eth0",             // 面向 LAN 的网卡 —— tc_divert 挂这里抓裸-IP 转发流量
+      "proxy_local": false,            // true = 网关本机自身流量也走代理 (需本机 DNS 指向 mirage)
+      "dns_hijack": true               // v0.6.1: 接管流经 LAN 的 53/UDP+TCP 查询, LAN 设备无需改 DNS
+    },
+    {
+      "type": "dns",                   // DNS 服务入站: LAN 设备 (或被 dns_hijack 截获的) 查询由它应答
+      "tag": "dns-in",
+      "listen": "0.0.0.0",
+      "port": 53
+    }
+  ],
+
+  "outbounds": [
+    {
+      "type": "mirage",                // 代理节点 (旧名 pyreality 已弃用)
+      "tag": "proxy",
+      "server": "vps.example.com",
+      "server_port": 443,
+      "password": "your-strong-password",   // 必须与服务端一致
+      "camouflage_host": "www.cloudflare.com", // SNI 伪装, 必须与服务端一致
+      "pool_size": 50                  // WarmPool 预热连接数上限
+    },
+    { "tag": "direct", "type": "direct" },
+    { "tag": "block",  "type": "block"  }
+  ],
+
+  "routing": {
+    "default_outbound": "proxy",       // 未命中任何规则 → 走代理
+    "rules": [
+      { "outbound": "block",  "geosite": ["category-ads-all"] },                              // 广告域名直接 NXDOMAIN
+      { "outbound": "direct", "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] }, // 私网直连
+      { "outbound": "direct", "geosite": ["cn", "apple-cn", "google-cn"] },                   // 国内域名直连
+      { "outbound": "direct", "geoip": ["cn"] }                                               // 国内 IP 直连
+      // 可加 "inbound": ["dns-hijack"] 的规则专门路由被劫持的 DNS 解析 (仅 dns_hijack=true 时该 tag 有效)
+    ]
+  },
+
+  "advanced_dns": {
+    "resolvers": [
+      { "tag": "direct", "address": "223.5.5.5:53" },   // 直连(国内)上游, 配多个 = 并行竞速 + 重传
+      { "tag": "direct", "address": "114.114.114.114:53" },
+      { "tag": "remote", "address": "8.8.8.8", "via": "proxy" } // 境外上游, 经隧道查 (抗污染)
+    ],
+    "fakeip": {
+      "enabled": true,
+      "inet4_range": "198.18.0.0/15",                    // 代理域名返回此段 fake-IP, tc_divert 按段拦截
+      "persist_path": "/var/lib/mirage-rs/fakeip.cache"  // 重启后旧 fake-IP 仍可反查, 避免断流
+    },
+    "cache": { "enabled": true, "max_entries": 10000 },  // 按上游最小 TTL 缓存, 免每查打上游/耗隧道
+
+    "ip_strategy": "prefer_ipv4",                        // v0.6.1: dual(默认)/ipv4_only/ipv6_only/prefer_ipv4/prefer_ipv6
+                                                         //   纯抑制某族(NODATA); prefer 仅 static 完全生效, direct 降 dual; 不动 proxied
+    "static": {                                          // v0.6.1: 自定义解析 (类 dnsmasq), 精确+子域最长匹配, 绕过 fake-IP/路由/上游
+      "test.local": "192.168.1.100",                     //   命中 test.local 及所有子域 → 该 IPv4
+      "nas.lan": ["10.0.0.9", "fd00::9"]                 //   单值或数组; A 查询回 v4, AAAA 回 v6
+    }
+  },
+
+  "tuning": {
+    "ebpf_mode": "auto",               // 网关必须启用 eBPF (auto: 网关/客户端启用); 别设 "off"
+    "geodata_dir": "/etc/mirage-rs/geosite",
+    "geo_update_days": 7,
+    "geo_sources": [
+      { "name": "geosite", "kind": "geosite", "url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat", "via": "proxy" },
+      { "name": "geoip",   "kind": "geoip",   "url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",             "via": "proxy" }
+    ]
+  },
+
+  "gui": {
+    "enabled": true,
+    "listen": "127.0.0.1:9090",
+    "token": "生成的随机token"          // listen 改 0.0.0.0 暴露时强烈建议设; install.sh 自动生成
+  }
+}
+```
+
+> **透明网关额外要求 (非 config)**: tc_divert 的 sk_assign 依赖 `ip rule fwmark 1 lookup 100` + `ip route add local default dev lo table 100`, `install.sh` 网关模式会自动装并绑定到服务生命周期。手动部署需自行加。
+
 ### 节点 URI 导出/导入 (alpha.4+)
 
 服务端 `install.sh` 配完自动输出:
@@ -501,6 +597,30 @@ Mirage 会在**目标是裸 IP** 时嗅一下 TLS SNI / HTTP Host, 拿到域名�
 ```
 
 > 尊重配置: 你配了 `direct` resolver 就**只用你配的那些** (不掺公共 DNS, 避免内网/split-horizon 域名被公共 DNS 解析错); 只有一个 `direct` 都没配时才回落到双公共兜底。`remote` (境外) DNS 走隧道查, 抗污染。
+
+### DNS 劫持 (可选, v0.6.1)
+
+透明网关默认要求 LAN 设备把 DNS 指向网关 (`dns` 入站) 才能拿 fake-IP。开启 `transparent` 入站的 `"dns_hijack": true` 后, **流经 LAN 的 53 端口查询 (UDP+TCP) 被自动接管**, 设备无需改 DNS 设置。纯用户态 (复用 tc_divert 的 sk_assign + 透明回包), 不改包、不加 iptables。仅在配了 `interface` 时有意义; 不碰本机自身 DNS、不处理 DoT/DoH。路由维度走合成入站 tag `dns-hijack` (可写 `"inbound":["dns-hijack"]` 规则专门路由)。
+
+### 静态解析 (`advanced_dns.static`, v0.6.1)
+
+自定义域名 → IP (类 dnsmasq `address=/domain/ip`), 命中即直接回 A/AAAA, **绕过 fake-IP / 路由 / 上游** —— 本地测试环境把测试域名钉到内网 IP 尤其有用。匹配 = **精确 + 子域, 最长键优先** (`test.local` 命中 `api.test.local`)。值单 IP 或数组 (混 v4/v6)。命中但无对应族 / 非 A·AAAA → NODATA, 不放行上游 (防泄漏)。
+
+```json
+"static": { "test.local": "192.168.1.100", "nas.lan": ["10.0.0.9", "fd00::9"] }
+```
+
+### IP 版本策略 (`advanced_dns.ip_strategy`, v0.6.1)
+
+控制 v4/v6 应答。纯 DNS 服务器只能**抑制某一族** (回 NODATA 逼客户端用另一族), 真"优先"是客户端 Happy Eyeballs 挑的。5 档 (默认 `dual`):
+
+| 值 | 效果 |
+|---|---|
+| `dual` | A/AAAA 都应答 (默认) |
+| `ipv4_only` / `ipv6_only` | 硬抑制 AAAA / A (static + direct 处处) |
+| `prefer_ipv4` / `prefer_ipv6` | 有首选族则抑制另一族 (**仅 static 完全生效**; direct 无法探测降为 `dual`) |
+
+不影响 proxied (恒 v4-fakeIP)。与 IPv6 数据面**解耦**: static/direct 返回真实地址, 客户端原生连接。完整用法见上文 [透明网关完整配置模板](#透明网关完整配置模板-v061)。
 
 ### DNS 响应缓存 (v0.5.0-alpha.3+, honoring TTL)
 
