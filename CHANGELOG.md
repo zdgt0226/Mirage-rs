@@ -18,6 +18,14 @@ mirage-rs test -c config.json --tag proxy # 只测某个 tag
 - 复用客户端握手原语 (`proxy::probe::probe_mirage`), 端到端对真 lite-server 验证过
   (对密码=可用 / 错密码=认证失败 / 死端口=不可用 / 挂起=握手超时)。
 
+### feat(cli): `import` 增加节点测试 + urltest 自动建组 (opt-in, 不擅自改路由)
+
+- `import --test`: 导入前测一次节点 (仅告警, 仍导入); `--require-live`: 不可用则拒绝导入。
+- `import --group [--group-name auto]`: 建/更新一个 urltest 出站组纳入全部 mirage 节点,
+  并把 `routing.default_outbound` 指向它 = 按 RTT 自动选路 (显式启用才改路由)。
+- 缺省行为不变 (只加出站不动路由); 但导入后代理节点 > 1 时**打印建议** (给现成 urltest
+  配置片段), 让用户自己决定 —— 不静默重写路由 (避免破坏 region-unlock / per-inbound 意图)。
+
 ## [v0.6.2] - DNS 直连上游: 默认端口 53 + TCP 协议选项 (2026-07-26)
 
 ### feat(dns): direct/cn 上游地址默认端口 53 + 可选 protocol: tcp

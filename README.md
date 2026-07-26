@@ -31,7 +31,7 @@
 
 **易用性 / 运维**
 - **轻量模式**: `lite-client` / `lite-server` —— 「SOCKS5 进, 全部走隧道」, 三五项填完就能用, 与完整版协议互通
-- **配置工具链**: `check` (重启前闸门, 有问题非零退出) / `format` / `import` (导入 mirage:// 节点)
+- **配置工具链**: `check` (重启前闸门, 有问题非零退出) / `format` / `import` (导入 mirage:// 节点, 可选建 urltest 组) / `test` (节点可用性测试: 完整握手+认证)
 - **入站认证**: SOCKS5 (RFC 1929) 与 HTTP (Basic) 均可设账号密码, 杜绝开放代理
 - **Neon Pulse Dashboard**: 内置网页大屏, Canvas 时序图展示 eBPF 命中率 / 吞吐 / 连接动态
 - **日志自动滚动压缩**: 超阈值滚动 + gzip 归档 (阈值/份数可配), 长跑网关不撑爆磁盘
@@ -92,11 +92,26 @@ mirage-rs format -c config.json > config.pretty.json
 
 # 导入 mirage:// 节点为新的 mirage 出站 (会写回配置, 自动备份为 config.json.bak):
 mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
+
+# 导入前先测节点可用 (--test 仅告警; --require-live 不可用则拒绝导入):
+mirage-rs import -c config.json --require-live "mirage://密码@host:443?sni=www.apple.com"
+
+# 导入并建 urltest 组按 RTT 自动选路 (建/更新 "auto" 组 + 指向它, --group-name 改名):
+mirage-rs import -c config.json --group "mirage://密码@host:443?sni=www.apple.com"
+
+# 测已配 mirage 节点可用性 (完整握手 + 认证验证, 报 RTT; 全通过退出 0):
+mirage-rs test -c config.json            # 测全部 mirage 出站
+mirage-rs test -c config.json --tag proxy # 只测某个 tag
 ```
 
 `import` 会交互式询问出站 tag 并**保证不与现有出站 tag 冲突**(撞名就重问, 绝不覆盖既有节点)。
-导入只添加出站、**不动路由** —— 要让流量走它, 需自行把 `routing.default_outbound` 或某条
-`rule` 的 `outbound` 改成新 tag, 再 `check` 一遍后重启。
+默认只添加出站、**不动路由** —— 要让流量走它, 需自行把 `routing.default_outbound` 或某条
+`rule` 的 `outbound` 改成新 tag, 再 `check` 一遍后重启。导入后若代理节点 > 1, 会**建议**
+(不擅自改路由) 用 urltest 自动选路; 加 `--group` 才显式建组并把 `default_outbound` 指向它。
+
+**`mirage-rs test`**: 测节点是否真能用 —— 走**完整 Mirage 握手并解密服务端首帧确认认证**,
+裸 TCP 连通不算数 (伪装前置是真站点, `:443` 本来就通)。结果分 ✓可用 (报 RTT) / ⚠可达但未确认
+认证 (旧服务端?) / ✗不可用 (连接失败 / 握手超时 / 认证失败=密码不符或非 Mirage 服务端)。
 
 > 服务**启动时**也会跑同一套校验, 但那里只打 WARN 不阻止启动 (配置多一个字段就让网关起不来
 > 代价太大)。`check` 反过来求"拦得住", 所以有问题就非零退出 —— 两者的严格度差异是刻意的。
@@ -785,7 +800,7 @@ sudo bash install.sh
 - [x] WireGuard 出站 (客户端) + 上游 (服务端), TCP/UDP/隧道内 DNS, 真实 peer 五层验证
 - [x] 路由 `inbound` 维度 + 裸 IP 按域名分流 + SOCKS5 UDP 逐数据报路由
 - [x] geo 自动更新 (ETag/304 + 多镜像 + 落地前校验 + 重启不重下)
-- [x] 配置工具链 (`check` / `format` / `import`) + 启动时配置校验
+- [x] 配置工具链 (`check` / `format` / `import` + urltest 建组 / `test` 节点握手测活) + 启动时配置校验
 - [x] 入站认证 (SOCKS5 / HTTP), 修默认开放代理
 - [x] DNS: 可选劫持 (接管 LAN 53/UDP+TCP, 默认关) · 静态解析 (类 dnsmasq, 精确+子域) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回) (v0.6.1)
 
