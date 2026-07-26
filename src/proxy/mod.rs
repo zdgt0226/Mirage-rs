@@ -17,3 +17,4 @@ pub mod shadowsocks;
 pub mod upstream;
 pub mod wg;
 pub mod transparent_net;
+pub mod probe;
