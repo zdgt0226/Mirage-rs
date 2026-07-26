@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [dns, upstream, tcp, config]
 created: "2026-07-26T14:35:44"
-updated: "2026-07-26T14:35:45"
+updated: "2026-07-26T14:48:20"
 ---
 
 ## compiled_truth
@@ -53,4 +53,10 @@ direct_query 协议分派 (纯 TCP / 混配竞速 / 空)。install.sh 默认答�
   kind: decision
   summary: "direct/cn 上游地址无端口默认53(与remote统一); 每上游 protocol udp/tcp, tcp 走 RFC7766 顺序failover, 混配并发竞速; remote 恒隧道TCP不受影响"
   source: brain update-truth
+  affects: [dns-direct-upstream-tcp]
+
+- time: 2026-07-26T14:48:20
+  kind: note
+  summary: "Sonnet 审计: TCP 上游由顺序 failover 改并行竞速(JoinSet), 消除 3s×N 延迟堆叠, 整体 3s 封顶与上游数无关"
+  source: feat/dns-upstream-tcp
   affects: [dns-direct-upstream-tcp]
