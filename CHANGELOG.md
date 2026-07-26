@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - DNS 劫持 + 静态解析 + IP 版本策略
+## [v0.6.1] - DNS 劫持 + 静态解析 + IP 版本策略 (2026-07-26)
 
 ### feat(dns): IP 版本策略 advanced_dns.ip_strategy (v4/v6 返回控制)
 
