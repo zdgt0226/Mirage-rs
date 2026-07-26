@@ -600,6 +600,13 @@ pub struct TuningConfig {
 
     /// Geo 文件更新检查间隔 (天). 默认 7.
     pub geo_update_days: Option<u32>,
+
+    /// DNS-over-TCP 解析上游 (如 `1.1.1.1` 或 `1.1.1.1:53`)。设了则**本进程所有域名解析
+    /// 走它、经 TCP:53 查**, 不再用系统 getaddrinfo (glibc 默认 UDP)。
+    /// 用途: **出向 UDP 被封的 VPS 做服务端** —— 否则 getaddrinfo 用 UDP 查 DNS 会失败,
+    /// 代理目标域名解析不了。地址无端口默认 53 (见 parse_dns_upstream)。不设 = 系统解析器。
+    #[serde(default)]
+    pub dns_tcp_resolver: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]

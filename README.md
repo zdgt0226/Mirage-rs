@@ -476,6 +476,11 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 
 密码 + `camouflage_host` 必须跟客户端完全一致。`brutal_rate_mbps` 是服务端到客户端方向 (下载) 的 brutal 目标速率, 见下方 Brutal 章节。
 
+> **出向 UDP 被封的 VPS**: 系统 `getaddrinfo` (glibc) 默认用 **UDP:53** 查 DNS, 封了 UDP
+> 就解析不了代理目标域名 (代理域名全挂)。加 `"tuning": {"dns_tcp_resolver": "1.1.1.1"}` 让
+> **本进程所有域名解析改走 DNS-over-TCP** (地址无端口默认 53), 脱离系统解析器。不设 = 系统解析器。
+> (零改代码的替代: VPS 上 `echo "options use-vc" >> /etc/resolv.conf` 强制 glibc 走 TCP。)
+
 ### 透明网关完整配置模板 (v0.6.1)
 
 部署形态 2 (透明网关) 的一份**功能齐全**模板, 涵盖 transparent + dns 入站、fake-IP、DNS 缓存, 以及 v0.6.1 新增的 **DNS 劫持 / 静态解析 / IP 版本策略**。`install.sh` 网关模式会交互生成等价配置; 手改照此。
@@ -839,6 +844,7 @@ sudo bash install.sh
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [ ] **订阅链接** —— `node_uri` + `import` 基础已有, 但订阅**格式本身要先定义**
 - [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连
+- [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段
 - [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
 - [~] **SS 上游 UDP** —— 未实现; 需要 UDP 同出口可**直接用 WireGuard 上游** (已通)
 - [ ] orphan 验证器接回 CI (需 runner 日志访问权)
