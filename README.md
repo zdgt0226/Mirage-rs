@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.3-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.4-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 内核级 eBPF 加速 + 内置 Neon Dashboard。
 
@@ -853,7 +853,7 @@ sudo bash install.sh
 
 ## 版本演进
 
-近期 (v0.5.0 → v0.6.3):
+近期 (v0.5.0 → v0.6.4):
 
 | 版本 | 关键改动 |
 |---|---|
@@ -864,6 +864,7 @@ sudo bash install.sh
 | **v0.6.1** | **DNS 三件套**: 可选劫持 (tc_divert sk_assign 复用, 纯用户态接管 LAN 53/UDP+TCP) · 静态解析 (`advanced_dns.static`, 类 dnsmasq 精确+子域最长匹配) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回)。自审 + Sonnet 独立复审 |
 | **v0.6.2** | DNS 直连上游: 地址默认端口 53 (与 remote 统一) · 每上游可选 `protocol: "tcp"` (RFC 7766, 多 TCP 上游并行竞速)。自审 + Sonnet 独立复审 |
 | **v0.6.3** | `mirage-rs test` 节点测活 (完整握手+认证, 非裸 TCP) · `import` 加 `--test`/`--require-live` 测活 + `--group` urltest 自动建组 (可调 interval/tolerance/test_type/url)。自审 + 两轮 Sonnet 复审 |
+| **v0.6.4** | `mirage-rs test` 加穿隧道 HTTP 探测 (默认开): RTT+HTTP 协同判网络质量 (出口 ≈ HTTP−TCP), 补上单看 RTT 的出口盲区; 并发测活。自审 + Sonnet 复审 |
 
 <details>
 <summary>更早的里程碑 (alpha.4 → v0.4.5 final)</summary>

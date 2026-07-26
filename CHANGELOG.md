@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - 节点测试: RTT + HTTP 协同判断网络质量
+## [v0.6.4] - 节点测试: RTT + HTTP 协同判断网络质量 (2026-07-26)
 
 ### feat(cli): `mirage-rs test` 增加穿隧道 HTTP 探测 (默认开)
 
