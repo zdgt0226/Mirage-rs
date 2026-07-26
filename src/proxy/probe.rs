@@ -16,8 +16,9 @@ use tokio::time::timeout;
 
 /// 探测结果。RTT 单位毫秒。
 pub enum ProbeOutcome {
-    /// 握手 + 认证均通过。tcp_ms = TCP 建连往返; handshake_ms = 建连后到认证确认的往返。
-    Ok { tcp_ms: u64, handshake_ms: u64 },
+    /// 握手 + 认证均通过。tcp_ms = TCP 建连往返; handshake_ms = 建连后到认证确认的往返;
+    /// http_ms = 可选的穿隧道 HTTP 端到端往返 (含 VPS 出口), None = 未测或探测失败。
+    Ok { tcp_ms: u64, handshake_ms: u64, http_ms: Option<u64> },
     /// TCP + TLS 伪装握手可达, 但没收到可解密的首帧确认认证 (旧服务端不下发 TIME_SYNC?)。
     /// 可达但认证未确认 —— 不算失败, 也不能保证密码正确。
     Unconfirmed { tcp_ms: u64, note: String },
@@ -27,14 +28,19 @@ pub enum ProbeOutcome {
 
 /// 对一个 mirage 节点做一次探测。永不返回 Err —— 所有错误折叠进 `ProbeOutcome::Fail`,
 /// 便于调用方 (CLI / import --test) 直接按结果分支。
+///
+/// `http_probe`: Some(url) 则在认证确认后额外做一次**穿隧道 HTTP 探测** (拉 url, 计端到端
+/// 往返, 含 VPS 出口质量); None 则只做握手+认证 (不产生出口流量, import --test 用)。
+/// 探测本身失败不影响可用性判定 (节点仍 Ok, 只是 http_ms=None)。
 pub async fn probe_mirage(
     server: &str,
     port: u16,
     password: &str,
     camouflage_host: &str,
     timeout_secs: u64,
+    http_probe: Option<&str>,
 ) -> ProbeOutcome {
-    match probe_inner(server, port, password, camouflage_host, timeout_secs).await {
+    match probe_inner(server, port, password, camouflage_host, timeout_secs, http_probe).await {
         Ok(o) => o,
         Err(e) => ProbeOutcome::Fail(e.to_string()),
     }
@@ -46,6 +52,7 @@ async fn probe_inner(
     password: &str,
     camouflage_host: &str,
     timeout_secs: u64,
+    http_probe: Option<&str>,
 ) -> anyhow::Result<ProbeOutcome> {
     let dl = Duration::from_secs(timeout_secs);
     let addr = format!("{server}:{port}");
@@ -86,7 +93,7 @@ async fn probe_inner(
         .map_err(|e| anyhow!("TLS 伪装握手失败: {e}"))?;
 
     // 3. 派生会话密钥, 尝试解服务端首帧。解密成功 = 密钥正确 = 密码对且是真 Mirage 服务端。
-    let (mut reader, _writer) = crate::crypto::aead::create_crypto_pair(
+    let (mut reader, mut writer) = crate::crypto::aead::create_crypto_pair(
         read_half,
         write_half,
         password,
@@ -97,10 +104,15 @@ async fn probe_inner(
     let auth_wait = dl.min(Duration::from_secs(3));
     match timeout(auth_wait, reader.recv_data()).await {
         // 解密成功 (任意帧): 会话密钥正确 → 认证通过。
-        Ok(Ok(_data)) => Ok(ProbeOutcome::Ok {
-            tcp_ms,
-            handshake_ms: t1.elapsed().as_millis() as u64,
-        }),
+        Ok(Ok(_data)) => {
+            let handshake_ms = t1.elapsed().as_millis() as u64;
+            // 认证已确认。可选: 穿隧道 HTTP 探测端到端质量 (探测失败不影响可用判定)。
+            let http_ms = match http_probe {
+                Some(url) => fetch_via_tunnel(&mut reader, &mut writer, url, dl).await.ok(),
+                None => None,
+            };
+            Ok(ProbeOutcome::Ok { tcp_ms, handshake_ms, http_ms })
+        }
         // 首帧接收/解密失败: 最常见是服务端拒认证、把连接转给伪装站, 会话密钥解不开其真
         // TLS。也可能是服务端解密后提前关连接 (close_notify/空帧)。措辞不武断指向密码。
         Ok(Err(e)) => Ok(ProbeOutcome::Fail(format!(
@@ -112,5 +124,87 @@ async fn probe_inner(
             tcp_ms,
             note: "TLS 握手可达但未收到认证确认帧 (旧服务端?)".to_string(),
         }),
+    }
+}
+
+/// 解析明文 HTTP 探测 URL → (host, port, path)。只支持 `http://` (穿隧道到目标是裸 TCP,
+/// 拉 HTTP/80 免去对目标再套 TLS)。无端口默认 80, 无路径默认 `/`。
+fn parse_http_probe_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, path))
+}
+
+/// 认证确认后, 借已建好的隧道拉一次 HTTP, 计端到端往返 (ms)。协议: 先发目标头
+/// `[2B len][host:port]` (与 handler.rs 客户端一致), 再发 `GET`, 收首个响应即计时。
+/// 计时从发目标头到收到响应 —— 含 VPS 连目标 + 拉取 + 回程, 即出口质量。
+async fn fetch_via_tunnel<R, W>(
+    reader: &mut crate::crypto::aead::CryptoReader<R>,
+    writer: &mut crate::crypto::aead::CryptoWriter<W>,
+    url: &str,
+    dl: Duration,
+) -> anyhow::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (host, port, path) = parse_http_probe_url(url)
+        .ok_or_else(|| anyhow!("探测 URL 非法 (需 http://host[:port]/path): {url}"))?;
+    let target = format!("{host}:{port}");
+    let mut header = Vec::with_capacity(2 + target.len());
+    header.extend_from_slice(&(target.len() as u16).to_be_bytes());
+    header.extend_from_slice(target.as_bytes());
+    let req = format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: mirage-probe\r\nConnection: close\r\n\r\n"
+    );
+
+    let t = Instant::now();
+    writer.send_data(&header).await?;
+    writer.send_data(req.as_bytes()).await?;
+    let resp = timeout(dl, reader.recv_data())
+        .await
+        .map_err(|_| anyhow!("穿隧道 HTTP 探测超时"))??;
+    // 收到像样的 HTTP 响应即算出口通 (非 HTTP 头 = 出口异常/被劫持)。
+    if resp.starts_with(b"HTTP/") {
+        Ok(t.elapsed().as_millis() as u64)
+    } else {
+        Err(anyhow!("穿隧道响应非 HTTP (出口异常?)"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_http_probe_url;
+
+    #[test]
+    fn parse_probe_url_variants() {
+        assert_eq!(
+            parse_http_probe_url("http://www.gstatic.com/generate_204"),
+            Some(("www.gstatic.com".into(), 80, "/generate_204".into()))
+        );
+        // 带端口
+        assert_eq!(
+            parse_http_probe_url("http://example.com:8080/x"),
+            Some(("example.com".into(), 8080, "/x".into()))
+        );
+        // 无路径 → /
+        assert_eq!(
+            parse_http_probe_url("http://example.com"),
+            Some(("example.com".into(), 80, "/".into()))
+        );
+        // 非 http:// (https / 缺 scheme / 空) → None
+        assert!(parse_http_probe_url("https://example.com/").is_none());
+        assert!(parse_http_probe_url("example.com/x").is_none());
+        assert!(parse_http_probe_url("http:///path").is_none()); // 空 host
     }
 }

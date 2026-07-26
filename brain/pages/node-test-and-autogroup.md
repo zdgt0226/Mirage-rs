@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [cli, import, probe, urltest, routing]
 created: "2026-07-26T16:50:20"
-updated: "2026-07-26T19:08:31"
+updated: "2026-07-26T22:31:49"
 ---
 
 ## compiled_truth
@@ -80,4 +80,10 @@ updated: "2026-07-26T19:08:31"
   kind: note
   summary: "group 加可调 urltest 参数 flag (interval/tolerance/test-type/url), 未给建组默认更新保留"
   source: abf284a
+  affects: [node-test-and-autogroup]
+
+- time: 2026-07-26T22:31:49
+  kind: note
+  summary: "test 加穿隧道 HTTP 探测 (默认开, --no-http/--probe-url): 报 TCP+握手+HTTP 三指标, 出口约等HTTP减TCP; import 仍只握手"
+  source: feat/test-http-probe
   affects: [node-test-and-autogroup]

@@ -114,6 +114,12 @@ enum Mode {
         /// 每个节点的超时秒数
         #[arg(long, default_value_t = 8)]
         timeout: u64,
+        /// 关闭穿隧道 HTTP 探测 (默认开: 每节点穿隧道拉一次探测地址, 测端到端含出口质量)
+        #[arg(long)]
+        no_http: bool,
+        /// 穿隧道 HTTP 探测地址 (仅 http://; 默认 gstatic/generate_204)
+        #[arg(long, default_value = "http://www.gstatic.com/generate_204")]
+        probe_url: String,
     },
 }
 
@@ -316,7 +322,8 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         print!("  测试节点 … ");
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        match probe_mirage(&node.host, node.port, &node.password, &node.sni, timeout_secs).await {
+        // import 测活只做握手+认证 (http_probe=None), 不产生穿隧道出口流量。
+        match probe_mirage(&node.host, node.port, &node.password, &node.sni, timeout_secs, None).await {
             ProbeOutcome::Ok { handshake_ms, .. } => println!("✓ 可用 (握手+认证 {handshake_ms}ms)"),
             ProbeOutcome::Unconfirmed { note, .. } => println!("⚠ 可达但未确认认证 —— {note}"),
             ProbeOutcome::Fail(reason) => {
@@ -440,7 +447,7 @@ fn mirage_outbounds(root: &serde_json::Value) -> Vec<(String, String, u16, Strin
 }
 
 /// 测试 mirage 出站可用性。返回退出码: 0 = 全部通过 (含"未确认"), 1 = 有失败 / 读不了 / 无节点。
-async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64) -> i32 {
+async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64, http_probe: Option<&str>) -> i32 {
     use mirage_rs::proxy::probe::{probe_mirage, ProbeOutcome};
 
     let content = match std::fs::read_to_string(path) {
@@ -471,6 +478,11 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64) -> i32 
         return 1;
     }
 
+    if let Some(u) = http_probe {
+        if !u.starts_with("http://") {
+            eprintln!("⚠ --probe-url `{u}` 不是 http:// (穿隧道探测仅支持明文 HTTP), HTTP 探测会全部失败\n");
+        }
+    }
     println!("测试 {} 个 mirage 节点 (每个超时 {}s)…\n", nodes.len(), timeout_secs);
     let mut failed = 0;
     for (tag, server, port, password, sni) in &nodes {
@@ -478,9 +490,20 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64) -> i32 
         print!("  {tag:<16} {server}:{port}  … ");
         use std::io::Write;
         let _ = std::io::stdout().flush();
-        match probe_mirage(server, *port, password, sni, timeout_secs).await {
-            ProbeOutcome::Ok { tcp_ms, handshake_ms } => {
-                println!("✓ 可用  (TCP {tcp_ms}ms / 握手+认证 {handshake_ms}ms)");
+        match probe_mirage(server, *port, password, sni, timeout_secs, http_probe).await {
+            ProbeOutcome::Ok { tcp_ms, handshake_ms, http_ms } => {
+                match http_ms {
+                    // 协同判断: HTTP 端到端 − TCP ≈ 隧道+VPS 出口开销。差值大 = 出口是瓶颈。
+                    Some(h) => {
+                        let egress = h.saturating_sub(tcp_ms);
+                        let hint = if egress > 300 { ", 偏高" } else { "" };
+                        println!("✓ 可用  (TCP {tcp_ms}ms · 握手 {handshake_ms}ms · HTTP {h}ms; 出口 ≈ {egress}ms{hint})");
+                    }
+                    None if http_probe.is_some() => {
+                        println!("✓ 可用  (TCP {tcp_ms}ms · 握手 {handshake_ms}ms · HTTP 探测失败/超时, 出口可能不通)");
+                    }
+                    None => println!("✓ 可用  (TCP {tcp_ms}ms · 握手 {handshake_ms}ms)"),
+                }
             }
             ProbeOutcome::Unconfirmed { tcp_ms, note } => {
                 println!("⚠ 可达但未确认认证  (TCP {tcp_ms}ms) —— {note}");
@@ -521,8 +544,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // test / import: 可能需网络 (import --test / --require-live) + async, 放 tokio 运行时里。
-    if let Mode::Test { config, tag, timeout } = &args.mode {
-        std::process::exit(run_test(config, tag.as_deref(), *timeout).await);
+    if let Mode::Test { config, tag, timeout, no_http, probe_url } = &args.mode {
+        let http = (!no_http).then_some(probe_url.as_str());
+        std::process::exit(run_test(config, tag.as_deref(), *timeout, http).await);
     }
     if let Mode::Import {
         config, uri, test, require_live, group, group_name,
