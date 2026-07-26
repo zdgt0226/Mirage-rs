@@ -197,17 +197,24 @@ async fn resolve_via_tcp(host: &str, upstream: SocketAddr) -> io::Result<Vec<IpA
         query_one(host, 28, upstream),  // AAAA
     );
     let mut ips = Vec::new();
-    if let Ok(v) = ra {
-        ips.extend(v);
+    // 保留真实错误: 两族都失败时 (超时/连不上/域名非法) 把最后一个真错误抛出, 便于诊断
+    // 死/错配的 dns_tcp_resolver, 而非一律吞成通用 NotFound。
+    let mut last_err = None;
+    match ra {
+        Ok(v) => ips.extend(v),
+        Err(e) => last_err = Some(e),
     }
-    if let Ok(v) = raaaa {
-        ips.extend(v);
+    match raaaa {
+        Ok(v) => ips.extend(v),
+        Err(e) => last_err = Some(e),
     }
     if ips.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("DNS-over-TCP: {host} 无 A/AAAA 记录 (上游 {upstream})"),
-        ));
+        return Err(last_err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("DNS-over-TCP: {host} 无 A/AAAA 记录 (上游 {upstream})"),
+            )
+        }));
     }
     Ok(ips)
 }
@@ -252,6 +259,11 @@ fn build_dns_query(host: &str, qtype: u16) -> Option<Vec<u8>> {
     q.push(0); // root label
     q.extend_from_slice(&qtype.to_be_bytes());
     q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+    // TCP DNS 长度前缀是 u16: 报文超 65535 则前缀会截断、与实际字节错位。真实域名远不及此,
+    // 但畸形超长 host 得拦住, 否则帧错位。
+    if q.len() > u16::MAX as usize {
+        return None;
+    }
     Some(q)
 }
 
