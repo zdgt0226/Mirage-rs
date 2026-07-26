@@ -69,6 +69,23 @@ enum Mode {
         /// mirage://... 节点 URI
         uri: String,
     },
+    /// 测试配置里 mirage 出站节点的可用性 (完整握手 + 认证验证, 报 RTT)
+    ///
+    /// 走真 Mirage 握手并解密服务端首帧确认认证 —— 裸 TCP 连通不算数。
+    ///   mirage-rs test -c config.json            # 测全部 mirage 出站
+    ///   mirage-rs test -c config.json --tag proxy # 只测某个 tag
+    /// 全部通过退出 0; 有任一失败退出 1 (未确认认证不算失败)。
+    Test {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "config.json")]
+        config: String,
+        /// 只测这个出站 tag (缺省测全部 mirage 出站)
+        #[arg(short, long)]
+        tag: Option<String>,
+        /// 每个节点的超时秒数
+        #[arg(long, default_value_t = 8)]
+        timeout: u64,
+    },
 }
 
 /// 校验配置。返回进程退出码: 0 = 干净, 1 = 有问题 / 读不了 / 解析失败。
@@ -269,6 +286,88 @@ fn run_import(path: &str, uri: &str) -> i32 {
     0
 }
 
+/// 从配置 root 里抽出全部 mirage 出站的连接参数 (tag, host, port, password, sni)。
+/// 缺字段的条目跳过 (不是完整 mirage 出站)。供 test / import --test 复用。
+fn mirage_outbounds(root: &serde_json::Value) -> Vec<(String, String, u16, String, String)> {
+    let Some(arr) = root.get("outbounds").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("mirage"))
+        .filter_map(|o| {
+            Some((
+                o.get("tag")?.as_str()?.to_string(),
+                o.get("server")?.as_str()?.to_string(),
+                o.get("server_port")?.as_u64()? as u16,
+                o.get("password")?.as_str()?.to_string(),
+                o.get("camouflage_host")?.as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// 测试 mirage 出站可用性。返回退出码: 0 = 全部通过 (含"未确认"), 1 = 有失败 / 读不了 / 无节点。
+async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64) -> i32 {
+    use mirage_rs::proxy::probe::{probe_mirage, ProbeOutcome};
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ 读不了 {path}: {e}");
+            return 1;
+        }
+    };
+    let root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("✗ {path} 不是合法 JSON: {e}");
+            return 1;
+        }
+    };
+
+    let mut nodes = mirage_outbounds(&root);
+    if let Some(t) = only_tag {
+        nodes.retain(|(tag, ..)| tag == t);
+        if nodes.is_empty() {
+            eprintln!("✗ 配置里没有 tag=`{t}` 的 mirage 出站");
+            return 1;
+        }
+    }
+    if nodes.is_empty() {
+        eprintln!("✗ 配置里没有 mirage 出站可测");
+        return 1;
+    }
+
+    println!("测试 {} 个 mirage 节点 (每个超时 {}s)…\n", nodes.len(), timeout_secs);
+    let mut failed = 0;
+    for (tag, server, port, password, sni) in &nodes {
+        // 边测边打印: 先出 "节点 … " 不换行, 拿到结果补上, 长测时用户看得到进度。
+        print!("  {tag:<16} {server}:{port}  … ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        match probe_mirage(server, *port, password, sni, timeout_secs).await {
+            ProbeOutcome::Ok { tcp_ms, handshake_ms } => {
+                println!("✓ 可用  (TCP {tcp_ms}ms / 握手+认证 {handshake_ms}ms)");
+            }
+            ProbeOutcome::Unconfirmed { tcp_ms, note } => {
+                println!("⚠ 可达但未确认认证  (TCP {tcp_ms}ms) —— {note}");
+            }
+            ProbeOutcome::Fail(reason) => {
+                println!("✗ 不可用  —— {reason}");
+                failed += 1;
+            }
+        }
+    }
+    println!();
+    if failed == 0 {
+        println!("✓ 全部通过 ({} 个)", nodes.len());
+        0
+    } else {
+        eprintln!("✗ {failed}/{} 个节点不可用", nodes.len());
+        1
+    }
+}
+
 /// 读并解析轻量配置。错误信息带上路径, 免得用户对着裸 serde 报错猜是哪个文件。
 fn load_lite<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     use anyhow::Context;
@@ -289,6 +388,11 @@ async fn main() -> anyhow::Result<()> {
         _ => {}
     }
 
+    // test: 需网络 + async, 放在 tokio 运行时里 (check/format/import 是纯本地不碰网络)。
+    if let Mode::Test { config, tag, timeout } = &args.mode {
+        std::process::exit(run_test(config, tag.as_deref(), *timeout).await);
+    }
+
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
     match &args.mode {
         Mode::LiteClient { config } => {
@@ -305,8 +409,34 @@ async fn main() -> anyhow::Result<()> {
     let (config_path, is_server) = match &args.mode {
         Mode::Client { config } => (config.as_str(), false),
         Mode::Server { config } => (config.as_str(), true),
-        _ => unreachable!("check/format/import/lite-* 已在上面处理"),
+        _ => unreachable!("check/format/import/test/lite-* 已在上面处理"),
     };
 
     mirage_rs::start_proxy(config_path, is_server).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mirage_outbounds;
+
+    #[test]
+    fn extracts_only_complete_mirage_outbounds() {
+        let root = serde_json::json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "a", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s1" },
+                { "type": "direct", "tag": "direct" },                       // 非 mirage → 跳过
+                { "type": "mirage", "tag": "incomplete", "server": "h2" },   // 缺字段 → 跳过
+                { "type": "mirage", "tag": "b", "server": "h3", "server_port": 8443, "password": "q", "camouflage_host": "s2" }
+            ]
+        });
+        let got = mirage_outbounds(&root);
+        assert_eq!(got.len(), 2, "只抽完整的 mirage 出站");
+        assert_eq!(got[0], ("a".into(), "h1".into(), 443, "p".into(), "s1".into()));
+        assert_eq!(got[1], ("b".into(), "h3".into(), 8443, "q".into(), "s2".into()));
+    }
+
+    #[test]
+    fn no_outbounds_array_yields_empty() {
+        assert!(mirage_outbounds(&serde_json::json!({})).is_empty());
+    }
 }

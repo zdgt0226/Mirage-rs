@@ -1,5 +1,23 @@
 # Changelog - Mirage-rs
 
+## [Unreleased] - 节点测试子命令 + 导入建组建议
+
+### feat(cli): `mirage-rs test` —— mirage 节点可用性测试 (完整握手 + 认证验证)
+
+测配置里 mirage 出站是否真能用, **走真 Mirage 握手并解密服务端首帧确认认证** —— 裸 TCP
+连通不算数 (伪装前置是真站点, `:443` 本来就通)。认证没过时服务端转伪装站, 会话密钥解不开
+其真 TLS 流量 —— 正是"密码不符 / 非 Mirage 服务端 / 时钟偏差"的确定信号。
+
+```
+mirage-rs test -c config.json             # 测全部 mirage 出站
+mirage-rs test -c config.json --tag proxy # 只测某个 tag
+```
+
+- 报每个节点 TCP RTT + 握手+认证 RTT; 结果分 ✓可用 / ⚠可达但未确认认证 (旧服务端?) / ✗不可用。
+- 全部通过退出 0, 有失败退出 1 (可做脚本闸门)。
+- 复用客户端握手原语 (`proxy::probe::probe_mirage`), 端到端对真 lite-server 验证过
+  (对密码=可用 / 错密码=认证失败 / 死端口=不可用 / 挂起=握手超时)。
+
 ## [v0.6.2] - DNS 直连上游: 默认端口 53 + TCP 协议选项 (2026-07-26)
 
 ### feat(dns): direct/cn 上游地址默认端口 53 + 可选 protocol: tcp
