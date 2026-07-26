@@ -483,14 +483,33 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64, http_pr
             eprintln!("⚠ --probe-url `{u}` 不是 http:// (穿隧道探测仅支持明文 HTTP), HTTP 探测会全部失败\n");
         }
     }
-    println!("测试 {} 个 mirage 节点 (每个超时 {}s)…\n", nodes.len(), timeout_secs);
+    println!("测试 {} 个 mirage 节点 (并发, 每个超时 {}s)…\n", nodes.len(), timeout_secs);
+
+    // 并发探测: 每节点一个任务, 总耗时 = 最慢节点而非累加 (串行会把各节点最坏耗时叠起来)。
+    // 结果按原顺序收集后统一打印, 输出稳定。
+    let http_owned = http_probe.map(|s| s.to_string());
+    let mut set = tokio::task::JoinSet::new();
+    for (i, (_tag, server, port, password, sni)) in nodes.iter().enumerate() {
+        let (server, password, sni) = (server.clone(), password.clone(), sni.clone());
+        let port = *port;
+        let http = http_owned.clone();
+        set.spawn(async move {
+            (i, probe_mirage(&server, port, &password, &sni, timeout_secs, http.as_deref()).await)
+        });
+    }
+    let mut results: Vec<Option<ProbeOutcome>> =
+        std::iter::repeat_with(|| None).take(nodes.len()).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((i, outcome)) = joined {
+            results[i] = Some(outcome);
+        }
+    }
+
     let mut failed = 0;
-    for (tag, server, port, password, sni) in &nodes {
-        // 边测边打印: 先出 "节点 … " 不换行, 拿到结果补上, 长测时用户看得到进度。
+    for (i, (tag, server, port, ..)) in nodes.iter().enumerate() {
         print!("  {tag:<16} {server}:{port}  … ");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        match probe_mirage(server, *port, password, sni, timeout_secs, http_probe).await {
+        let outcome = results[i].take().unwrap_or_else(|| ProbeOutcome::Fail("内部错误: 探测任务未返回".into()));
+        match outcome {
             ProbeOutcome::Ok { tcp_ms, handshake_ms, http_ms } => {
                 match http_ms {
                     // 协同判断: HTTP 端到端 − TCP ≈ 隧道+VPS 出口开销。差值大 = 出口是瓶颈。
@@ -499,7 +518,7 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64, http_pr
                         let hint = if egress > 300 { ", 偏高" } else { "" };
                         println!("✓ 可用  (TCP {tcp_ms}ms · 握手 {handshake_ms}ms · HTTP {h}ms; 出口 ≈ {egress}ms{hint})");
                     }
-                    None if http_probe.is_some() => {
+                    None if http_owned.is_some() => {
                         println!("✓ 可用  (TCP {tcp_ms}ms · 握手 {handshake_ms}ms · HTTP 探测失败/超时, 出口可能不通)");
                     }
                     None => println!("✓ 可用  (TCP {tcp_ms}ms · 握手 {handshake_ms}ms)"),
