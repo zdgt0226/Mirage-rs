@@ -14,9 +14,11 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -29,6 +31,23 @@ const CACHE_MAX_ENTRIES: usize = 8192;
 /// 阻塞池饿死其他任务 (文件 IO / 其他 TCP 解析). 用信号量把并发解析封顶 128,
 /// 洪泛时新解析排队等待而非无限 spawn, 给阻塞池留 384 线程给别的活.
 const DNS_MAX_CONCURRENT: usize = 128;
+
+/// DNS-over-TCP 探测超时 (连接 + 收发)。
+const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 可选的 DNS-over-TCP 上游。设了 (服务端 `tuning.dns_tcp_resolver`) 则**所有域名解析走
+/// 它、经 TCP:53 查**, 不再用系统 getaddrinfo (glibc 默认 UDP)。用于 UDP 出向被封的 VPS ——
+/// 否则 getaddrinfo 用 UDP 查 DNS, 封 UDP 就解析不了代理目标域名。启动时 set 一次, 不热重载。
+static TCP_RESOLVER: OnceLock<SocketAddr> = OnceLock::new();
+
+/// 设置 DNS-over-TCP 上游 (启动时调用一次)。已设过则忽略 (返回 false)。
+pub fn set_tcp_resolver(addr: SocketAddr) -> bool {
+    TCP_RESOLVER.set(addr).is_ok()
+}
+
+fn tcp_resolver() -> Option<SocketAddr> {
+    TCP_RESOLVER.get().copied()
+}
 
 struct CacheEntry {
     ips: Vec<IpAddr>,
@@ -56,13 +75,16 @@ async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
         }
     }
 
-    // 2. miss / 过期 → getaddrinfo (tokio 阻塞池). 先拿信号量封顶并发, 防洪泛
-    //    打满阻塞池. permit 在解析完成即释放.
+    // 2. miss / 过期 → 解析. 先拿信号量封顶并发, 防洪泛打满阻塞池. permit 解析完即释放.
+    //    配了 dns_tcp_resolver 则走 DNS-over-TCP (UDP 被封的 VPS 用); 否则系统 getaddrinfo.
     let _permit = dns_semaphore().acquire().await.ok();
-    let mut ips: Vec<IpAddr> = tokio::net::lookup_host((host, port))
-        .await?
-        .map(|sa| sa.ip())
-        .collect();
+    let mut ips: Vec<IpAddr> = match tcp_resolver() {
+        Some(upstream) => resolve_via_tcp(host, upstream).await?,
+        None => tokio::net::lookup_host((host, port))
+            .await?
+            .map(|sa| sa.ip())
+            .collect(),
+    };
 
     if ips.is_empty() {
         return Err(io::Error::new(
@@ -163,4 +185,188 @@ pub async fn connect_smart(target: &str) -> io::Result<TcpStream> {
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::AddrNotAvailable, format!("all addresses failed for {host}"))
     }))
+}
+
+// ── DNS-over-TCP 解析 (tuning.dns_tcp_resolver, UDP 被封的 VPS 用) ─────────────
+
+/// 经 TCP 向 upstream 查 host 的 A + AAAA, 合并返回。与 getaddrinfo 双栈行为对齐
+/// (后续 resolve_cached 会 IPv4 优先排序)。两族并发查, 任一有结果即可用。
+async fn resolve_via_tcp(host: &str, upstream: SocketAddr) -> io::Result<Vec<IpAddr>> {
+    let (ra, raaaa) = tokio::join!(
+        query_one(host, 1, upstream),   // A
+        query_one(host, 28, upstream),  // AAAA
+    );
+    let mut ips = Vec::new();
+    if let Ok(v) = ra {
+        ips.extend(v);
+    }
+    if let Ok(v) = raaaa {
+        ips.extend(v);
+    }
+    if ips.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("DNS-over-TCP: {host} 无 A/AAAA 记录 (上游 {upstream})"),
+        ));
+    }
+    Ok(ips)
+}
+
+/// 一次 DNS-over-TCP 查询 (RFC 7766: 连接 → [2B 长度][报文] → 收 [2B 长度][响应])。
+async fn query_one(host: &str, qtype: u16, upstream: SocketAddr) -> io::Result<Vec<IpAddr>> {
+    let query = build_dns_query(host, qtype)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("非法域名: {host}")))?;
+    let fut = async {
+        let mut s = TcpStream::connect(upstream).await?;
+        let mut framed = (query.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&query);
+        s.write_all(&framed).await?;
+        let mut len_buf = [0u8; 2];
+        s.read_exact(&mut len_buf).await?;
+        let n = u16::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; n];
+        s.read_exact(&mut resp).await?;
+        Ok::<_, io::Error>(parse_answer_ips(&resp))
+    };
+    tokio::time::timeout(DNS_TCP_TIMEOUT, fut)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("DNS-over-TCP {upstream} 超时")))?
+}
+
+/// 构造一个标准 DNS 查询报文 (RD=1, QDCOUNT=1, 单问题)。域名 label 空或 >63 → None。
+fn build_dns_query(host: &str, qtype: u16) -> Option<Vec<u8>> {
+    static TXID: AtomicU16 = AtomicU16::new(1);
+    let tx = TXID.fetch_add(1, Ordering::Relaxed);
+    let mut q = Vec::with_capacity(host.len() + 18);
+    q.extend_from_slice(&tx.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00]); // flags: RD=1
+    q.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
+    q.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR=0
+    for label in host.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return None;
+        }
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0); // root label
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&[0x00, 0x01]); // QCLASS=IN
+    Some(q)
+}
+
+/// 从 DNS 响应的 answer 段抽出 A/AAAA 记录的 IP。畸形/截断即尽力而止 (返回已解出的)。
+/// 名字压缩指针只跳过不追 (取 rdata 不需要解名), 故不会有指针环。
+fn parse_answer_ips(resp: &[u8]) -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    if resp.len() < 12 {
+        return ips;
+    }
+    let qd = u16::from_be_bytes([resp[4], resp[5]]) as usize;
+    let an = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    let mut pos = 12;
+    for _ in 0..qd {
+        pos = skip_name(resp, pos);
+        pos += 4; // QTYPE + QCLASS
+    }
+    for _ in 0..an {
+        pos = skip_name(resp, pos);
+        if pos + 10 > resp.len() {
+            break;
+        }
+        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > resp.len() {
+            break;
+        }
+        match (rtype, rdlen) {
+            (1, 4) => ips.push(IpAddr::V4(Ipv4Addr::new(
+                resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3],
+            ))),
+            (28, 16) => {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&resp[pos..pos + 16]);
+                ips.push(IpAddr::V6(Ipv6Addr::from(o)));
+            }
+            _ => {}
+        }
+        pos += rdlen;
+    }
+    ips
+}
+
+/// 跳过一个 DNS 名字, 返回其后位置。压缩指针 (0xC0) = 2 字节即止, 不追 (只求跳过)。
+fn skip_name(buf: &[u8], mut pos: usize) -> usize {
+    while pos < buf.len() {
+        let len = buf[pos];
+        if len == 0 {
+            return pos + 1;
+        }
+        if len & 0xC0 == 0xC0 {
+            return pos + 2; // 指针占 2 字节, 名字到此结束
+        }
+        pos += 1 + len as usize;
+    }
+    pos
+}
+
+#[cfg(test)]
+mod dns_tcp_tests {
+    use super::*;
+
+    #[test]
+    fn build_query_shape() {
+        let q = build_dns_query("example.com", 1).unwrap();
+        // header 12B: flags RD=1, QDCOUNT=1
+        assert_eq!(&q[2..4], &[0x01, 0x00]);
+        assert_eq!(&q[4..6], &[0x00, 0x01]);
+        // question: 7"example" 3"com" 0 + QTYPE(A=1) + QCLASS(IN=1)
+        assert_eq!(q[12], 7);
+        assert_eq!(&q[13..20], b"example");
+        assert_eq!(q[20], 3);
+        assert_eq!(&q[21..24], b"com");
+        assert_eq!(q[24], 0);
+        assert_eq!(&q[25..29], &[0x00, 0x01, 0x00, 0x01]);
+        // 非法域名
+        assert!(build_dns_query("", 1).is_none());
+        assert!(build_dns_query(&"x".repeat(64), 1).is_none());
+    }
+
+    #[test]
+    fn parse_answers_a_and_aaaa() {
+        // header: tx=0x1234, QR=1, QD=1, AN=2
+        let mut r = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0];
+        // question: 1"a" 3"com" 0 A IN
+        r.push(1); r.push(b'a'); r.push(3); r.extend_from_slice(b"com"); r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]);
+        // answer 1: name ptr(0xC00C) A IN ttl rdlen=4 1.2.3.4
+        r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 1, 44, 0, 4, 1, 2, 3, 4]);
+        // answer 2: name ptr AAAA rdlen=16 ::1
+        r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x1C, 0x00, 0x01, 0, 0, 1, 44, 0, 16]);
+        r.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let ips = parse_answer_ips(&r);
+        assert_eq!(ips.len(), 2);
+        assert_eq!(ips[0], "1.2.3.4".parse::<IpAddr>().unwrap());
+        assert_eq!(ips[1], "::1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_ignores_cname_and_truncation() {
+        // AN=1 但 rdata 截断 → 尽力而止, 不 panic, 返回空
+        let mut r = vec![0, 0, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0];
+        r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 1, 44, 0, 4, 1, 2]); // rdlen=4 但只剩 2B
+        assert!(parse_answer_ips(&r).is_empty());
+    }
+
+    // 真实网络: DNS-over-TCP 对 1.1.1.1 解析已知域名。默认 ignore (CI 无出口时不挂),
+    // 手动跑: cargo test --lib resolver::dns_tcp_tests::real -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn real_resolve_via_tcp_1111() {
+        let up = "1.1.1.1:53".parse().unwrap();
+        let ips = resolve_via_tcp("example.com", up).await.expect("应解出 IP");
+        println!("example.com via TCP 1.1.1.1 → {ips:?}");
+        assert!(ips.iter().any(|ip| ip.is_ipv4()), "至少一个 A 记录");
+    }
 }

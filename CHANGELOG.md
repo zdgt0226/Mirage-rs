@@ -1,5 +1,22 @@
 # Changelog - Mirage-rs
 
+## [Unreleased] - 服务端可选 DNS-over-TCP 解析 (UDP 被封的 VPS)
+
+### feat(dns): `tuning.dns_tcp_resolver` —— 域名解析改走 TCP
+
+出向 **UDP 被封的 VPS** 做服务端时, 系统 `getaddrinfo` (glibc 默认 UDP) 查不了 DNS, 代理
+目标域名全解析失败。新增可选配置:
+
+```json
+"tuning": { "dns_tcp_resolver": "1.1.1.1" }
+```
+
+- 设了则**本进程所有域名解析走它、经 TCP:53 查** (RFC 7766), 不再用系统 getaddrinfo。
+- 地址无端口默认 53。并发查 A + AAAA 合并 (与双栈行为对齐), 复用现有 60s 解析缓存。
+- 不设 = 系统解析器 (原行为不变)。自实现轻量 DNS-over-TCP (查询构造 + answer 段 IP 提取),
+  无新依赖; 名字压缩指针只跳不追 (无指针环)。
+- 对真实 1.1.1.1 端到端验证; 单测覆盖查询构造 / A+AAAA 解析 / 截断容错。
+
 ## [v0.6.4] - 节点测试: RTT + HTTP 协同判断网络质量 (2026-07-26)
 
 ### feat(cli): `mirage-rs test` 增加穿隧道 HTTP 探测 (默认开)

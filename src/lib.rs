@@ -282,6 +282,16 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                         geo_update_days = d;
                     }
                 }
+                // DNS-over-TCP 解析上游: 设了则所有域名解析走 TCP (UDP 被封的 VPS 做服务端)。
+                if let Some(r) = &tuning.dns_tcp_resolver {
+                    match crate::config::parse_dns_upstream(r) {
+                        Some(addr) => {
+                            crate::proxy::resolver::set_tcp_resolver(addr);
+                            info!("DNS 解析改走 DNS-over-TCP 上游 {} (系统 getaddrinfo 停用; UDP 被封的 VPS 用)", addr);
+                        }
+                        None => error!("tuning.dns_tcp_resolver `{}` 非法 (需 ip 或 ip:port), 仍用系统解析器", r),
+                    }
+                }
             }
             // 仅当 routing.rules 真的引用 geosite / geoip 时才启动 updater
             needs_geo = config.routing.rules.iter().any(|r|

@@ -1,9 +1,10 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-26T15:56:18.102Z._
+_Auto-generated. Last updated 2026-07-26T17:32:11.821Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
+- [chain-proxy-roadmap](pages/chain-proxy-roadmap.md) — category: decision | status: draft | tags: [roadmap, chain-proxy, wireguard, shadowsocks, architecture] | ## 用户诉求 (2026-07-27)
 - [dns-direct-upstream-tcp](pages/dns-direct-upstream-tcp.md) — category: decision | tags: [dns, upstream, tcp, config] | ## 决定
 - [dns-hijack-lan](pages/dns-hijack-lan.md) — category: decision | tags: [dns, transparent, tc_divert, fakeip] | ## 决定
 - [dns-ip-strategy](pages/dns-ip-strategy.md) — category: decision | tags: [dns, ipv6, static, strategy] | ## 决定
@@ -22,6 +23,7 @@ _Auto-generated. Last updated 2026-07-26T15:56:18.102Z._
 - [ring-for-aead](pages/ring-for-aead.md) — category: decision | **决定**:隧道载荷加密用 **`ring`** 的 ChaCha20-Poly1305(`LessSafeKey` + 显式 nonce 管理);
 - [routing-rules](pages/routing-rules.md) — category: concept | tags: [routing, config] | Mirage 的路由规则维度与 sing-box/Clash 基本对齐, **域名 4 种 + IP 2 种 + 连接属性 4 种 + and/or 组合**。
 - [rust-rewrite-from-python-poc](pages/rust-rewrite-from-python-poc.md) — category: decision | **决定**(v0.2.x):从 Python + uvloop 的 POC 全量重写为 **Rust + Tokio** 全异步无锁流水线,
+- [server-dns-over-tcp](pages/server-dns-over-tcp.md) — category: decision | tags: [dns, resolver, tcp, vps, server] | ## 问题
 - [splice-over-sockmap](pages/splice-over-sockmap.md) — category: decision | **决定**(v0.4.5-alpha.3, `a6535e1`):直连出站的零拷贝从 **sockmap `sk_skb`** 改为 **`splice(2)` + pipe**。
 - [ss-upstream-relay](pages/ss-upstream-relay.md) — category: decision | Mirage 服务端可配 `upstream` 把流量再经 Shadowsocks 发往上游, 即作中转站:
 - [syn-only-sk-assign](pages/syn-only-sk-assign.md) — category: decision | **决定**:`tc_divert` 对 TCP **只在首 SYN**(`th->syn && !th->ack`)做 `bpf_sk_assign`;
