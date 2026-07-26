@@ -388,11 +388,11 @@ pub struct RuleConfig {
 #[derive(Debug, Deserialize)]
 pub struct AdvancedDnsConfig {
 
-    /// 国内/直连域名的上游 DNS 列表 (tag=cn/direct 的 resolver 全部收集)。
-    /// udp_query 会向全部并行发 + 重传, 任一先回即用 —— 单上游单发丢一个 UDP 包
-    /// 就整体失败, 客户端重传累积 ~11s。空则用默认双公共 DNS 兜底。
+    /// 国内/直连域名的上游 DNS 列表 (tag=cn/direct 的 resolver 全部收集), 带每个上游的
+    /// 传输协议。UDP 上游走 udp_query (并行发 + 重传, 任一先回即用); TCP 上游走 tcp_query。
+    /// 空则用默认双公共 DNS (UDP) 兜底。地址无端口时默认 53 (见 parse_dns_upstream)。
     #[serde(skip)]
-    pub cached_cn_dns: Vec<std::net::SocketAddr>,
+    pub cached_cn_dns: Vec<(std::net::SocketAddr, DnsProtocol)>,
     #[serde(skip)]
     pub cached_remote_host: Option<String>,
     #[serde(skip)]
@@ -499,11 +499,40 @@ pub fn normalize_static_hosts(
     out
 }
 
+/// DNS 上游的传输协议。默认 UDP (DNS 常规); TCP 用于 UDP/53 被封或投毒的网络,
+/// 或需要可靠传输 (大响应/EDNS) 的场景。仅作用于 direct/cn 上游 —— remote(境外) 上游
+/// 恒经隧道 TCP 查, 不受此字段影响。
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DnsProtocol {
+    #[default]
+    Udp,
+    Tcp,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DnsResolver {
     pub tag: String,
     pub address: String,
     pub via: Option<String>,
+    /// 该上游的传输协议 (udp 默认 / tcp)。仅对 direct/cn 上游有意义。
+    #[serde(default)]
+    pub protocol: DnsProtocol,
+}
+
+/// 解析 DNS 上游地址: `ip:port` 或 `ip` (无端口默认 53)。裸 IPv6 (无方括号) 也支持:
+/// `2001:4860:4860::8888` → :53; 带端口须用方括号 `[2001:...]:53`。非法返回 None。
+pub fn parse_dns_upstream(s: &str) -> Option<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr};
+    // 先试完整 socket 地址 (含 ip:port / [v6]:port)。
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Some(sa);
+    }
+    // 再试裸 IP (v4 或无方括号 v6), 默认端口 53。
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, 53));
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]

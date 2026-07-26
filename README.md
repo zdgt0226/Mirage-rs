@@ -490,8 +490,8 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 
   "advanced_dns": {
     "resolvers": [
-      { "tag": "direct", "address": "223.5.5.5:53" },   // 直连(国内)上游, 配多个 = 并行竞速 + 重传
-      { "tag": "direct", "address": "114.114.114.114:53" },
+      { "tag": "direct", "address": "223.5.5.5" },        // 直连(国内)上游, 不带端口默认 53; 配多个 = 并行竞速 + 重传
+      { "tag": "direct", "address": "114.114.114.114", "protocol": "tcp" }, // protocol:"tcp" = 走 TCP 解析 (默认 udp)
       { "tag": "remote", "address": "8.8.8.8", "via": "proxy" } // 境外上游, 经隧道查 (抗污染)
     ],
     "fakeip": {
@@ -588,8 +588,8 @@ Mirage 会在**目标是裸 IP** 时嗅一下 TLS SNI / HTTP Host, 拿到域名�
 ```json
 "advanced_dns": {
     "resolvers": [
-        { "tag": "direct", "address": "223.5.5.5:53" },
-        { "tag": "direct", "address": "114.114.114.114:53" },
+        { "tag": "direct", "address": "223.5.5.5" },
+        { "tag": "direct", "address": "114.114.114.114", "protocol": "tcp" },
         { "tag": "remote", "address": "8.8.8.8", "via": "proxy" }
     ],
     "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15" }
@@ -597,6 +597,10 @@ Mirage 会在**目标是裸 IP** 时嗅一下 TLS SNI / HTTP Host, 拿到域名�
 ```
 
 > 尊重配置: 你配了 `direct` resolver 就**只用你配的那些** (不掺公共 DNS, 避免内网/split-horizon 域名被公共 DNS 解析错); 只有一个 `direct` 都没配时才回落到双公共兜底。`remote` (境外) DNS 走隧道查, 抗污染。
+
+**`address` 端口**: 不带端口默认 **53** (`223.5.5.5` == `223.5.5.5:53`), 无需再写 `:53`。裸 IPv6 直接写 (`2001:4860:4860::8888`), 要带端口用方括号 (`[2001:4860:4860::8888]:5353`)。
+
+**`protocol`** (v0.6.1, 可选): 每个 `direct`/`cn` 上游的传输协议, `"udp"` (默认) 或 `"tcp"`。UDP/53 被封或投毒的网络可给上游加 `"protocol": "tcp"` 走 TCP 解析 (RFC 7766 长度分帧, 顺序 failover)。UDP 上游仍走并行竞速+重传; 两类混配则并发竞速取先回的。仅作用于 `direct`/`cn` 上游 —— `remote` (境外) 恒经隧道 TCP 查, 不受此字段影响。
 
 ### DNS 劫持 (可选, v0.6.1)
 

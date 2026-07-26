@@ -15,6 +15,9 @@ const DNS_QUERY_ROUNDS: u32 = 3;
 /// 每轮等待上限。上游正常时响应几十毫秒即返回, 这只是丢包后重传前的最大等待。
 /// 3 × 800ms = 2.4s 总上限, 远低于 Windows DNS 客户端 ~11s 重传超时。
 const DNS_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(800);
+/// TCP 上游单次查询 (连接+收发) 超时。TCP 无 UDP 的丢包问题, 故按上游顺序 failover 而非
+/// 并行重传; 3s 宽于正常 TCP DNS 往返, 又能在上游 SYN 被丢时较快切下一个。
+const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn extract_domain(data: &[u8]) -> Option<String> {
     if data.len() < 12 {
@@ -297,6 +300,68 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
     None
 }
 
+/// 直连上游解析: 按每个上游的传输协议分派。UDP 上游走 udp_query (并行 + 重传), TCP 上游
+/// 走 tcp_query (顺序 failover)。两者都配则并发跑、取先返回的正响应 (混配少见但支持)。
+async fn direct_query(req: &[u8], upstreams: &[(SocketAddr, crate::config::DnsProtocol)]) -> Option<Vec<u8>> {
+    use crate::config::DnsProtocol::{Tcp, Udp};
+    let udp: Vec<SocketAddr> = upstreams.iter().filter(|(_, p)| *p == Udp).map(|(a, _)| *a).collect();
+    let tcp: Vec<SocketAddr> = upstreams.iter().filter(|(_, p)| *p == Tcp).map(|(a, _)| *a).collect();
+    match (udp.is_empty(), tcp.is_empty()) {
+        (false, true) => udp_query(req, &udp).await,
+        (true, false) => tcp_query(req, &tcp).await,
+        (true, true) => None,
+        (false, false) => {
+            // 并发竞速: 先返回 Some 者胜; 若先完成的是 None 则 await 另一个 (pin 复用, 不重跑)。
+            let u = udp_query(req, &udp);
+            let t = tcp_query(req, &tcp);
+            tokio::pin!(u);
+            tokio::pin!(t);
+            tokio::select! {
+                r = &mut u => if r.is_some() { r } else { t.await },
+                r = &mut t => if r.is_some() { r } else { u.await },
+            }
+        }
+    }
+}
+
+/// TCP 上游解析: 按顺序试各上游, 首个成功即返回。TCP 无丢包问题, 故 failover 而非并行重传。
+async fn tcp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
+    for up in upstreams {
+        if let Some(r) = tcp_query_one(req, *up).await {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// 单个 TCP 上游一次查询: 连接 → 写 [2B 长度][报文] → 读 [2B 长度][响应] (RFC 7766),
+/// 校验 tx_id + QR。整体 DNS_TCP_TIMEOUT 超时。任何一步失败/超时 → None (交上层 failover)。
+async fn tcp_query_one(req: &[u8], up: SocketAddr) -> Option<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let attempt = async {
+        let mut s = tokio::net::TcpStream::connect(up).await.ok()?;
+        let mut framed = Vec::with_capacity(2 + req.len());
+        framed.extend_from_slice(&(req.len() as u16).to_be_bytes());
+        framed.extend_from_slice(req);
+        s.write_all(&framed).await.ok()?;
+        let mut len_buf = [0u8; 2];
+        s.read_exact(&mut len_buf).await.ok()?;
+        let n = u16::from_be_bytes(len_buf) as usize;
+        if n < 12 {
+            return None;
+        }
+        let mut buf = vec![0u8; n];
+        s.read_exact(&mut buf).await.ok()?;
+        // 合法响应: tx_id 与查询一致 + QR=1 (req 已在 process_query 上游保证 ≥12B)。
+        if buf[0] == req[0] && buf[1] == req[1] && (buf[2] & 0x80) != 0 {
+            Some(buf)
+        } else {
+            None
+        }
+    };
+    tokio::time::timeout(DNS_TCP_TIMEOUT, attempt).await.ok().flatten()
+}
+
 // ── DNS 响应缓存 (honoring TTL) ──────────────────────────────────────────────
 // 接上 advanced_dns.cache (原为 stub 未实现)。缓存直连(udp_query)+ 隧道(tcp_over_tunnel)
 // 的上游响应, 按 answer 段最小 TTL 过期。价值: 直连域名不再每查打 114/223; **非 fake-IP /
@@ -556,7 +621,7 @@ impl DnsForwarder {
         }
         // 用户配了 cn/direct resolver 就用其全部 (尊重配置, 不掺公共 DNS 免污染内网视图);
         // 没配则默认双公共 DNS 兜底 (114 电信/联通 + 223 阿里)。
-        let mut cn_dns: Vec<SocketAddr> = Vec::new();
+        let mut cn_dns: Vec<(SocketAddr, crate::config::DnsProtocol)> = Vec::new();
         let mut remote_dns_host = "8.8.8.8".to_string();
         let mut remote_dns_port = 53;
 
@@ -566,9 +631,10 @@ impl DnsForwarder {
             if let Some(cached) = &adv.cached_remote_port { remote_dns_port = *cached; }
         }
         if cn_dns.is_empty() {
+            use crate::config::DnsProtocol::Udp;
             cn_dns = vec![
-                "114.114.114.114:53".parse().unwrap(),
-                "223.5.5.5:53".parse().unwrap(),
+                ("114.114.114.114:53".parse().unwrap(), Udp),
+                ("223.5.5.5:53".parse().unwrap(), Udp),
             ];
         }
 
@@ -608,7 +674,7 @@ impl DnsForwarder {
                         }
                     }
                     debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
-                    let resp = udp_query(req, &cn_dns).await;
+                    let resp = direct_query(req, &cn_dns).await;
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, r);
                     }
@@ -921,6 +987,76 @@ mod tests {
     #[tokio::test]
     async fn udp_query_empty_upstreams_none() {
         assert!(udp_query(&a_query(), &[]).await.is_none());
+    }
+
+    #[test]
+    fn parse_dns_upstream_defaults_port_53() {
+        use crate::config::parse_dns_upstream as p;
+        // 裸 IPv4 → :53
+        assert_eq!(p("223.5.5.5").unwrap(), "223.5.5.5:53".parse().unwrap());
+        // 显式端口保留
+        assert_eq!(p("223.5.5.5:5353").unwrap(), "223.5.5.5:5353".parse().unwrap());
+        // 裸 IPv6 → :53
+        assert_eq!(p("2001:4860:4860::8888").unwrap(),
+                   "[2001:4860:4860::8888]:53".parse().unwrap());
+        // 带方括号+端口的 IPv6
+        assert_eq!(p("[2001:4860:4860::8888]:53").unwrap(),
+                   "[2001:4860:4860::8888]:53".parse().unwrap());
+        // 非法
+        assert!(p("not-an-ip").is_none());
+        assert!(p("").is_none());
+    }
+
+    /// 假 TCP DNS 上游: accept 一条, 读 [2B 长度][查询], 回 [2B 长度][查询+QR置位]。
+    async fn fake_tcp_upstream() -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = l.accept().await {
+                let mut lb = [0u8; 2];
+                if s.read_exact(&mut lb).await.is_err() { return; }
+                let n = u16::from_be_bytes(lb) as usize;
+                let mut q = vec![0u8; n];
+                if s.read_exact(&mut q).await.is_err() { return; }
+                q[2] |= 0x80; // QR=1
+                let mut out = (q.len() as u16).to_be_bytes().to_vec();
+                out.extend_from_slice(&q);
+                let _ = s.write_all(&out).await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn tcp_query_one_happy_path() {
+        let up = fake_tcp_upstream().await;
+        let resp = tcp_query_one(&a_query(), up).await.expect("TCP 上游应返回响应");
+        assert_eq!([resp[0], resp[1]], [a_query()[0], a_query()[1]], "tx_id 回显");
+        assert_eq!(resp[2] & 0x80, 0x80, "QR=1");
+    }
+
+    #[tokio::test]
+    async fn tcp_query_failover_to_second() {
+        // 首个上游是死端口 (connect 立刻 ECONNREFUSED) → failover 到活的
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let good = fake_tcp_upstream().await;
+        let resp = tcp_query(&a_query(), &[dead, good]).await;
+        assert!(resp.is_some(), "首个死上游应 failover 到第二个");
+    }
+
+    #[tokio::test]
+    async fn direct_query_dispatches_by_protocol() {
+        use crate::config::DnsProtocol::{Tcp, Udp};
+        // 只配 TCP 上游 → 走 tcp 路径
+        let tcp_up = fake_tcp_upstream().await;
+        assert!(direct_query(&a_query(), &[(tcp_up, Tcp)]).await.is_some(), "纯 TCP 上游");
+        // 混配: 死 UDP + 活 TCP → 竞速取活的 (UDP 3 轮 2.4s 内 TCP 先回)
+        let dead_udp: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let tcp_up2 = fake_tcp_upstream().await;
+        assert!(direct_query(&a_query(), &[(dead_udp, Udp), (tcp_up2, Tcp)]).await.is_some(), "混配竞速");
+        // 空 → None
+        assert!(direct_query(&a_query(), &[]).await.is_none());
     }
 
     // ── DNS 响应缓存测试 ──
