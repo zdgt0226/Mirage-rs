@@ -15,8 +15,8 @@ const DNS_QUERY_ROUNDS: u32 = 3;
 /// 每轮等待上限。上游正常时响应几十毫秒即返回, 这只是丢包后重传前的最大等待。
 /// 3 × 800ms = 2.4s 总上限, 远低于 Windows DNS 客户端 ~11s 重传超时。
 const DNS_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(800);
-/// TCP 上游单次查询 (连接+收发) 超时。TCP 无 UDP 的丢包问题, 故按上游顺序 failover 而非
-/// 并行重传; 3s 宽于正常 TCP DNS 往返, 又能在上游 SYN 被丢时较快切下一个。
+/// TCP 上游查询超时: 既是单个 tcp_query_one 的上限, 也是 tcp_query 并行竞速的整体上限。
+/// 3s 宽于正常 TCP DNS 往返; 并行竞速故总延迟与上游数无关 (不像顺序 failover 会堆叠)。
 const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn extract_domain(data: &[u8]) -> Option<String> {
@@ -324,14 +324,29 @@ async fn direct_query(req: &[u8], upstreams: &[(SocketAddr, crate::config::DnsPr
     }
 }
 
-/// TCP 上游解析: 按顺序试各上游, 首个成功即返回。TCP 无丢包问题, 故 failover 而非并行重传。
+/// TCP 上游解析: **并行竞速**所有上游, 首个成功即返回。整体 DNS_TCP_TIMEOUT 封顶。
+/// 不用顺序 failover: 一个 SYN 被黑洞 (非 RST) 的上游会占满自身 3s 超时, 顺序试 N 个
+/// 就堆到 3s×N, 远超 UDP 路径固定 2.4s。并行则总延迟 = min(最快成功, 3s), 与上游数无关。
 async fn tcp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
-    for up in upstreams {
-        if let Some(r) = tcp_query_one(req, *up).await {
-            return Some(r);
-        }
+    if upstreams.is_empty() {
+        return None;
     }
-    None
+    let mut set = tokio::task::JoinSet::new();
+    for up in upstreams {
+        let up = *up;
+        let req = req.to_vec(); // 'static: 每个任务拿一份查询字节
+        set.spawn(async move { tcp_query_one(&req, up).await });
+    }
+    // 首个 Some 即返回 (JoinSet drop 时中止其余任务, 关掉悬挂连接)。
+    let race = async {
+        while let Some(res) = set.join_next().await {
+            if let Ok(Some(resp)) = res {
+                return Some(resp);
+            }
+        }
+        None
+    };
+    tokio::time::timeout(DNS_TCP_TIMEOUT, race).await.ok().flatten()
 }
 
 /// 单个 TCP 上游一次查询: 连接 → 写 [2B 长度][报文] → 读 [2B 长度][响应] (RFC 7766),
@@ -1037,12 +1052,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_query_failover_to_second() {
-        // 首个上游是死端口 (connect 立刻 ECONNREFUSED) → failover 到活的
+    async fn tcp_query_races_dead_and_live() {
+        // 并行竞速: 死端口任务返回 None, 活上游返回 Some → 整体 Some (不被死上游拖住)
         let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let good = fake_tcp_upstream().await;
         let resp = tcp_query(&a_query(), &[dead, good]).await;
-        assert!(resp.is_some(), "首个死上游应 failover 到第二个");
+        assert!(resp.is_some(), "死+活上游并行竞速应取活的");
     }
 
     #[tokio::test]
