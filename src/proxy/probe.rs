@@ -128,16 +128,33 @@ async fn probe_inner(
 }
 
 /// 解析明文 HTTP 探测 URL → (host, port, path)。只支持 `http://` (穿隧道到目标是裸 TCP,
-/// 拉 HTTP/80 免去对目标再套 TLS)。无端口默认 80, 无路径默认 `/`。
+/// 拉 HTTP/80 免去对目标再套 TLS)。无端口默认 80, 无路径默认 `/`。方括号 IPv6 字面量
+/// (`http://[::1]:80/x` 或 `http://[::1]/x`) 也支持 —— host 保留方括号供 host:port 目标头。
 fn parse_http_probe_url(url: &str) -> Option<(String, u16, String)> {
     let rest = url.strip_prefix("http://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().ok()?),
-        None => (authority.to_string(), 80),
+    let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+        // 方括号 IPv6: [addr] 可选 :port。不能用 rsplit_once(':') —— 地址内部全是冒号。
+        let close = inner.find(']')?;
+        let addr = &inner[..close];
+        if addr.is_empty() {
+            return None;
+        }
+        let after = &inner[close + 1..];
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if after.is_empty() => 80,
+            None => return None, // ']' 后有杂字符
+        };
+        (format!("[{addr}]"), port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (authority.to_string(), 80),
+        }
     };
     if host.is_empty() {
         return None;
@@ -169,9 +186,14 @@ where
     );
 
     let t = Instant::now();
-    writer.send_data(&header).await?;
-    writer.send_data(req.as_bytes()).await?;
-    let resp = timeout(dl, reader.recv_data())
+    // 全部 IO (两次写 + 一次读) 包一个 dl 超时: 写侧 stall (server 不读/发缓冲满) 也不会
+    // 永久挂死, 否则单个坏节点会卡住整个 test。
+    let io = async {
+        writer.send_data(&header).await?;
+        writer.send_data(req.as_bytes()).await?;
+        reader.recv_data().await
+    };
+    let resp = timeout(dl, io)
         .await
         .map_err(|_| anyhow!("穿隧道 HTTP 探测超时"))??;
     // 收到像样的 HTTP 响应即算出口通 (非 HTTP 头 = 出口异常/被劫持)。
@@ -206,5 +228,15 @@ mod tests {
         assert!(parse_http_probe_url("https://example.com/").is_none());
         assert!(parse_http_probe_url("example.com/x").is_none());
         assert!(parse_http_probe_url("http:///path").is_none()); // 空 host
+        // 方括号 IPv6: 带端口 / 无端口(默认80) / 空地址
+        assert_eq!(
+            parse_http_probe_url("http://[::1]:8080/x"),
+            Some(("[::1]".into(), 8080, "/x".into()))
+        );
+        assert_eq!(
+            parse_http_probe_url("http://[2001:db8::1]/"),
+            Some(("[2001:db8::1]".into(), 80, "/".into()))
+        );
+        assert!(parse_http_probe_url("http://[]/x").is_none()); // 空 IPv6
     }
 }
