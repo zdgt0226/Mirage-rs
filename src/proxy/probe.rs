@@ -76,9 +76,13 @@ async fn probe_inner(
         write_half.flush().await?;
         Ok::<_, anyhow::Error>(client_random)
     };
-    let client_random = timeout(dl, hs)
+    // 握手阶段超时**下限 15s**: read_server_handshake 本身对真实慢链路容忍到 ~10-14s
+    // (CCS 前), 若用外层 8s 总超时去卡它, 慢但可用的服务端会被误判 Fail (--require-live
+    // 就会拒掉一个其实能用的节点)。故握手取 max(用户超时, 15s), 不低于协议自身容忍。
+    let hs_dl = dl.max(Duration::from_secs(15));
+    let client_random = timeout(hs_dl, hs)
         .await
-        .map_err(|_| anyhow!("TLS 伪装握手超时 ({timeout_secs}s)"))?
+        .map_err(|_| anyhow!("TLS 伪装握手超时 ({}s)", hs_dl.as_secs()))?
         .map_err(|e| anyhow!("TLS 伪装握手失败: {e}"))?;
 
     // 3. 派生会话密钥, 尝试解服务端首帧。解密成功 = 密钥正确 = 密码对且是真 Mirage 服务端。
@@ -97,9 +101,11 @@ async fn probe_inner(
             tcp_ms,
             handshake_ms: t1.elapsed().as_millis() as u64,
         }),
-        // 解密失败: 服务端很可能拒了认证、把连接转给伪装站, 我们解不开它的真 TLS。
+        // 首帧接收/解密失败: 最常见是服务端拒认证、把连接转给伪装站, 会话密钥解不开其真
+        // TLS。也可能是服务端解密后提前关连接 (close_notify/空帧)。措辞不武断指向密码。
         Ok(Err(e)) => Ok(ProbeOutcome::Fail(format!(
-            "认证失败: 会话数据解密错 (密码不符 / 非 Mirage 服务端 / 时钟偏差超服务端容差): {e}"
+            "认证/首帧失败: 会话数据接收或解密错 (多为密码不符 / 非 Mirage 服务端 / 时钟偏差; \
+             也可能服务端提前关连接): {e}"
         ))),
         // 超时未收到首帧: TLS 握手过了但没确认认证 (旧服务端不下发 TIME_SYNC?)。
         Err(_) => Ok(ProbeOutcome::Unconfirmed {
