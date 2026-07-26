@@ -1,5 +1,23 @@
 # Changelog - Mirage-rs
 
+## [Unreleased] - 节点测试: RTT + HTTP 协同判断网络质量
+
+### feat(cli): `mirage-rs test` 增加穿隧道 HTTP 探测 (默认开)
+
+认证确认后再**穿隧道拉一次**探测地址 (默认 `http://www.gstatic.com/generate_204`), 报三指标
+协同判断:
+
+```
+proxy  1.2.3.4:443  ✓ 可用  (TCP 42ms · 握手 88ms · HTTP 210ms; 出口 ≈ 168ms, 偏高)
+```
+
+- **TCP** = 客户端↔VPS 网络往返; **HTTP** = 穿隧道端到端 (含 VPS 出口); `出口 ≈ HTTP − TCP`。
+  低 TCP 高 HTTP = 离你近但出口线路烂 —— 补上单看 RTT "近但出口烂被误判成好"的盲区。
+- `--no-http` 关探测 (只握手, 零出口流量); `--probe-url` 换目标 (仅 http://)。
+- HTTP 探测失败不影响可用判定 (节点仍 ✓可用, 标"出口可能不通")。
+- 复用客户端隧道原语 (目标头 `[2B len][host:port]` + GET, 与 handler.rs 一致)。
+  `import --test` 仍只做握手 (不加出口流量)。
+
 ## [v0.6.3] - 节点测试子命令 + 导入建组 (2026-07-26)
 
 ### feat(cli): `mirage-rs test` —— mirage 节点可用性测试 (完整握手 + 认证验证)
