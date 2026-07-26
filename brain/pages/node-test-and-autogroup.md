@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [cli, import, probe, urltest, routing]
 created: "2026-07-26T16:50:20"
-updated: "2026-07-26T18:48:00"
+updated: "2026-07-26T19:08:31"
 ---
 
 ## compiled_truth
@@ -74,4 +74,10 @@ updated: "2026-07-26T18:48:00"
   kind: note
   summary: "Sonnet 审计修 4 条: probe 握手超时下限 15s(护慢链路, 修 HIGH 误判)、apply_urltest_group routing 缺失则创建、server_port try_from 防截断、解密失败措辞软化; import 加 --timeout"
   source: feat/node-test-and-autogroup
+  affects: [node-test-and-autogroup]
+
+- time: 2026-07-26T19:08:31
+  kind: note
+  summary: "group 加可调 urltest 参数 flag (interval/tolerance/test-type/url), 未给建组默认更新保留"
+  source: abf284a
   affects: [node-test-and-autogroup]
