@@ -81,6 +81,18 @@ enum Mode {
         /// urltest 组名 (仅 --group 时生效)
         #[arg(long, default_value = "auto")]
         group_name: String,
+        /// urltest 组健康检查间隔秒 (默认 300; 0=关)。仅 --group
+        #[arg(long, requires = "group")]
+        group_interval: Option<u64>,
+        /// urltest 组 RTT 容差 ms, 现节点领先超过它才切换 (默认 50)。仅 --group
+        #[arg(long, requires = "group")]
+        group_tolerance: Option<u64>,
+        /// urltest 组 HTTP 探测地址 (test_type≠rtt 时用; 默认 gstatic/generate_204)。仅 --group
+        #[arg(long, requires = "group")]
+        group_url: Option<String>,
+        /// urltest 组测试方式: rtt=内核 RTT / ping=HTTP 探测 (默认 ping)。仅 --group
+        #[arg(long, requires = "group", value_parser = ["rtt", "ping", "http"])]
+        group_test_type: Option<String>,
         /// --test/--require-live 探测的超时秒数 (握手阶段另有 15s 下限, 不受此值压低)
         #[arg(long, default_value_t = 8)]
         timeout: u64,
@@ -215,24 +227,41 @@ fn prompt_unique_tag(default: &str, taken: &[String]) -> anyhow::Result<String> 
     }
 }
 
+/// urltest 组的可调参数覆盖 (仅 --group 时可设)。None = 建组时省略走 serde 默认 /
+/// 更新既有组时保留原值。
+#[derive(Default)]
+struct GroupOpts {
+    interval: Option<u64>,   // 健康检查间隔秒 (默认 300; 0 = 关)
+    tolerance: Option<u64>,  // RTT 容差 ms, 现节点领先超过它才切换 (默认 50)
+    url: Option<String>,     // HTTP 探测地址 (test_type != rtt 时用; 默认 gstatic/generate_204)
+    test_type: Option<String>, // "rtt"=内核 RTT / 否则 HTTP 探测 (默认 ping)
+}
+
 /// 建/更新一个 urltest 出站组 `group_tag`, 纳入配置里全部 mirage 出站, 并把
 /// routing.default_outbound 指向它。返回 (纳入节点数, 旧 default_outbound)。
 /// group_tag 已被非 urltest 出站占用则 Err。显式 --group 才调用, 是唯一会改路由的路径。
-fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str) -> Result<(usize, Option<String>), String> {
+fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str, opts: &GroupOpts) -> Result<(usize, Option<String>), String> {
     let tags: Vec<String> = mirage_outbounds(root).into_iter().map(|(t, ..)| t).collect();
     if tags.is_empty() {
         return Err("配置里没有 mirage 出站可纳入组".into());
     }
     let arr = root["outbounds"].as_array_mut().ok_or("outbounds 不是数组")?;
     // 已有同名出站: 是 urltest 则更新其成员, 否则拒绝 (别踩别的出站)。
-    if let Some(existing) = arr.iter_mut().find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(group_tag)) {
+    let group = if let Some(existing) = arr.iter_mut().find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(group_tag)) {
         if existing.get("type").and_then(|t| t.as_str()) != Some("urltest") {
-            return Err(format!("tag `{group_tag}` 已被非 urltest 出站占用, 换个组名 (--group <名>)"));
+            return Err(format!("tag `{group_tag}` 已被非 urltest 出站占用, 换个组名 (--group-name <名>)"));
         }
         existing["outbounds"] = serde_json::json!(tags);
+        existing
     } else {
         arr.push(serde_json::json!({ "type": "urltest", "tag": group_tag, "outbounds": tags }));
-    }
+        arr.last_mut().unwrap()
+    };
+    // 覆盖项: 只写用户显式传的 (未传则建组省略走默认 / 更新保留原值)。
+    if let Some(v) = opts.interval { group["interval"] = serde_json::json!(v); }
+    if let Some(v) = opts.tolerance { group["tolerance"] = serde_json::json!(v); }
+    if let Some(v) = &opts.url { group["url"] = serde_json::json!(v); }
+    if let Some(v) = &opts.test_type { group["test_type"] = serde_json::json!(v); }
     // 把默认出站指向组 = 按 RTT 自动选路 (显式 --group 请求的核心动作)。
     let old_default = root
         .get("routing")
@@ -248,7 +277,7 @@ fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str) -> Result<
 }
 
 /// 导入 mirage:// 节点为新的 mirage 出站, 写回配置文件。
-async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group: Option<&str>, timeout_secs: u64) -> i32 {
+async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group: Option<&str>, group_opts: &GroupOpts, timeout_secs: u64) -> i32 {
     let node = match mirage_rs::node_uri::NodeUri::parse(uri) {
         Ok(n) => n,
         Err(e) => {
@@ -326,7 +355,7 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
     // --group: 建/更新 urltest 组并指向它 (唯一改路由的路径); 否则仅在代理数>1 时给建议。
     let mut group_note: Option<String> = None;
     if let Some(gname) = group {
-        match apply_urltest_group(&mut root, gname) {
+        match apply_urltest_group(&mut root, gname, group_opts) {
             Ok((n, old)) => {
                 group_note = Some(format!(
                     "✓ 已建/更新 urltest 组 `{gname}` (纳入 {n} 个 mirage 节点), \
@@ -494,9 +523,19 @@ async fn main() -> anyhow::Result<()> {
     if let Mode::Test { config, tag, timeout } = &args.mode {
         std::process::exit(run_test(config, tag.as_deref(), *timeout).await);
     }
-    if let Mode::Import { config, uri, test, require_live, group, group_name, timeout } = &args.mode {
+    if let Mode::Import {
+        config, uri, test, require_live, group, group_name,
+        group_interval, group_tolerance, group_url, group_test_type, timeout,
+    } = &args.mode
+    {
         let g = group.then_some(group_name.as_str());
-        std::process::exit(run_import(config, uri, *test, *require_live, g, *timeout).await);
+        let opts = GroupOpts {
+            interval: *group_interval,
+            tolerance: *group_tolerance,
+            url: group_url.clone(),
+            test_type: group_test_type.clone(),
+        };
+        std::process::exit(run_import(config, uri, *test, *require_live, g, &opts, *timeout).await);
     }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
@@ -546,7 +585,7 @@ mod tests {
         assert!(mirage_outbounds(&serde_json::json!({})).is_empty());
     }
 
-    use super::apply_urltest_group;
+    use super::{apply_urltest_group, GroupOpts};
 
     fn cfg_two_mirage() -> serde_json::Value {
         serde_json::json!({
@@ -562,7 +601,7 @@ mod tests {
     #[test]
     fn group_creates_urltest_and_points_default() {
         let mut root = cfg_two_mirage();
-        let (n, old) = apply_urltest_group(&mut root, "auto").unwrap();
+        let (n, old) = apply_urltest_group(&mut root, "auto", &GroupOpts::default()).unwrap();
         assert_eq!(n, 2);
         assert_eq!(old.as_deref(), Some("m1"));
         assert_eq!(root["routing"]["default_outbound"], "auto");
@@ -575,11 +614,11 @@ mod tests {
     #[test]
     fn group_is_idempotent_updates_members() {
         let mut root = cfg_two_mirage();
-        apply_urltest_group(&mut root, "auto").unwrap();
+        apply_urltest_group(&mut root, "auto", &GroupOpts::default()).unwrap();
         // 再加一个 mirage 后重跑: 组成员更新, 不新增第二个 urltest
         root["outbounds"].as_array_mut().unwrap().push(serde_json::json!(
             { "type": "mirage", "tag": "m3", "server": "h3", "server_port": 443, "password": "p", "camouflage_host": "s" }));
-        apply_urltest_group(&mut root, "auto").unwrap();
+        apply_urltest_group(&mut root, "auto", &GroupOpts::default()).unwrap();
         let g: Vec<_> = root["outbounds"].as_array().unwrap().iter()
             .filter(|o| o["type"] == "urltest").collect();
         assert_eq!(g.len(), 1, "不重复建组");
@@ -590,7 +629,29 @@ mod tests {
     fn group_rejects_name_taken_by_non_urltest() {
         let mut root = cfg_two_mirage();
         // "direct" 已是非 urltest 出站 → 拒绝占用
-        assert!(apply_urltest_group(&mut root, "direct").is_err());
+        assert!(apply_urltest_group(&mut root, "direct", &GroupOpts::default()).is_err());
+    }
+
+    #[test]
+    fn group_applies_and_preserves_params() {
+        let mut root = cfg_two_mirage();
+        // 建组时设 interval + tolerance
+        apply_urltest_group(&mut root, "auto", &GroupOpts {
+            interval: Some(120), tolerance: Some(30), ..Default::default()
+        }).unwrap();
+        let g = |r: &serde_json::Value| r["outbounds"].as_array().unwrap().iter()
+            .find(|o| o["type"] == "urltest").unwrap().clone();
+        let gv = g(&root);
+        assert_eq!(gv["interval"], 120);
+        assert_eq!(gv["tolerance"], 30);
+        // 再跑只改 url: interval/tolerance 应保留 (未传不动)
+        apply_urltest_group(&mut root, "auto", &GroupOpts {
+            url: Some("http://example.com/gen204".into()), ..Default::default()
+        }).unwrap();
+        let gv = g(&root);
+        assert_eq!(gv["interval"], 120, "未传 interval → 保留");
+        assert_eq!(gv["tolerance"], 30, "未传 tolerance → 保留");
+        assert_eq!(gv["url"], "http://example.com/gen204");
     }
 
     #[test]
@@ -601,7 +662,7 @@ mod tests {
                 { "type": "mirage", "tag": "m1", "server": "h", "server_port": 443, "password": "p", "camouflage_host": "s" }
             ]
         });
-        let (n, old) = apply_urltest_group(&mut root, "auto").unwrap();
+        let (n, old) = apply_urltest_group(&mut root, "auto", &GroupOpts::default()).unwrap();
         assert_eq!(n, 1);
         assert_eq!(old, None, "原本无 default");
         assert_eq!(root["routing"]["default_outbound"], "auto", "已创建 routing 并指向组");
