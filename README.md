@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.6-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.7-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 内核级 eBPF 加速 + 内置 Neon Dashboard。
 
@@ -899,7 +899,7 @@ sudo bash install.sh
 
 ## 版本演进
 
-近期 (v0.5.0 → v0.6.6):
+近期 (v0.5.0 → v0.6.7):
 
 | 版本 | 关键改动 |
 |---|---|
@@ -913,6 +913,7 @@ sudo bash install.sh
 | **v0.6.4** | `mirage-rs test` 加穿隧道 HTTP 探测 (默认开): RTT+HTTP 协同判网络质量 (出口 ≈ HTTP−TCP), 补上单看 RTT 的出口盲区; 并发测活。自审 + Sonnet 复审 |
 | **v0.6.5** | 服务端可选 `tuning.dns_tcp_resolver`: 出向 UDP 被封的 VPS 域名解析改走 DNS-over-TCP (自实现无依赖), 解决 getaddrinfo 走 UDP 解析不了代理目标域名。自审 + Sonnet 复审 |
 | **v0.6.6** | `process_name` 分流 (本机 loopback 入站经 /proc 反查可执行名, "Telegram 走代理、微信直连") + dump_tls session_id 分析工具。自审 + Sonnet 复审 |
+| **v0.6.7** | **负载均衡出站组** `load_balance` (round-robin 分摊健康成员) · `subscribe <url>` **订阅链接批量导入** (多字母表 base64 · server:port 去重 · --group 建组) · **节点区域判定** GeoIP (`test` 显 `[国家码]` · `--group` 混区域告警)。自审 + 各 Sonnet 独立复审 |
 
 <details>
 <summary>更早的里程碑 (alpha.4 → v0.4.5 final)</summary>
