@@ -121,6 +121,39 @@ enum Mode {
         #[arg(long, default_value = "http://www.gstatic.com/generate_204")]
         probe_url: String,
     },
+    /// 从订阅 URL 批量导入 mirage 节点为出站 (会写回配置文件)
+    ///
+    /// 订阅格式: 每行一个 mirage:// URI (整段是 base64 则先解码, 兼容经典订阅)。
+    /// 按 server:port 去重, 自动生成 tag。可选 --group 建 urltest 组按 RTT 自动选路。
+    ///   mirage-rs subscribe -c config.json https://example.com/sub
+    Subscribe {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "config.json")]
+        config: String,
+        /// 订阅 URL (http/https, 返回 mirage:// 列表或其 base64)
+        url: String,
+        /// 建/更新 urltest 组纳入全部 mirage 节点 + 指向它 = 按 RTT 自动选路
+        #[arg(long)]
+        group: bool,
+        /// urltest 组名 (仅 --group 时生效)
+        #[arg(long, default_value = "auto")]
+        group_name: String,
+        /// urltest 组检查间隔秒 (仅 --group)
+        #[arg(long, requires = "group")]
+        group_interval: Option<u64>,
+        /// urltest 组 RTT 容差 ms (仅 --group)
+        #[arg(long, requires = "group")]
+        group_tolerance: Option<u64>,
+        /// urltest 组 HTTP 探测地址 (仅 --group)
+        #[arg(long, requires = "group")]
+        group_url: Option<String>,
+        /// urltest 组测试方式 rtt/ping (仅 --group)
+        #[arg(long, requires = "group", value_parser = ["rtt", "ping", "http"])]
+        group_test_type: Option<String>,
+        /// 拉取订阅的超时秒数
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
 }
 
 /// 校验配置。返回进程退出码: 0 = 干净, 1 = 有问题 / 读不了 / 解析失败。
@@ -283,6 +316,48 @@ fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str, opts: &Gro
     Ok((mirage_outbounds(root).len(), old_default))
 }
 
+/// 由 NodeUri 构造一个 mirage 出站 JSON。import / subscribe 共用。
+fn mirage_outbound_json(tag: &str, node: &mirage_rs::node_uri::NodeUri) -> serde_json::Value {
+    serde_json::json!({
+        "type": "mirage",
+        "tag": tag,
+        "server": node.host,
+        "server_port": node.port,
+        "password": node.password,
+        "camouflage_host": node.sni,
+    })
+}
+
+/// 原子写回配置: 先备份 `<path>.bak`, 再写 `<path>.tmp` + rename (中途失败不留半截)。
+fn atomic_write_config(path: &str, original: &str, rendered: &str) -> Result<(), String> {
+    let bak = format!("{path}.bak");
+    std::fs::write(&bak, original).map_err(|e| format!("备份到 {bak} 失败: {e} (未改动原文件)"))?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, rendered).map_err(|e| format!("写临时文件 {tmp} 失败: {e} (未改动原文件)"))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("替换 {path} 失败: {e}")
+    })
+}
+
+/// 生成一个不与 `taken` 冲突的 tag (base 撞名则 base-2 / base-3 …)。批量非交互用。
+/// 生成后即把它加进 `taken`, 供同批后续去重。
+fn unique_auto_tag(base: &str, taken: &mut Vec<String>) -> String {
+    let base = if base.is_empty() { "node" } else { base };
+    if !taken.iter().any(|t| t == base) {
+        taken.push(base.to_string());
+        return base.to_string();
+    }
+    for n in 2.. {
+        let cand = format!("{base}-{n}");
+        if !taken.iter().any(|t| t == &cand) {
+            taken.push(cand.clone());
+            return cand;
+        }
+    }
+    unreachable!()
+}
+
 /// 导入 mirage:// 节点为新的 mirage 出站, 写回配置文件。
 async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group: Option<&str>, group_opts: &GroupOpts, timeout_secs: u64) -> i32 {
     let node = match mirage_rs::node_uri::NodeUri::parse(uri) {
@@ -350,15 +425,7 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         }
     };
 
-    let new_ob = serde_json::json!({
-        "type": "mirage",
-        "tag": tag,
-        "server": node.host,
-        "server_port": node.port,
-        "password": node.password,
-        "camouflage_host": node.sni,
-    });
-    root["outbounds"].as_array_mut().unwrap().push(new_ob);
+    root["outbounds"].as_array_mut().unwrap().push(mirage_outbound_json(&tag, &node));
 
     // --group: 建/更新 urltest 组并指向它 (唯一改路由的路径); 否则仅在代理数>1 时给建议。
     let mut group_note: Option<String> = None;
@@ -386,24 +453,12 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         }
     };
 
-    // 写回是破坏性的: 先备份, 再写临时文件 + rename 原子替换 (中途失败不会留下半截配置)。
-    let bak = format!("{path}.bak");
-    if let Err(e) = std::fs::write(&bak, &content) {
-        eprintln!("✗ 备份到 {bak} 失败: {e} (未改动原文件)");
-        return 1;
-    }
-    let tmp = format!("{path}.tmp");
-    if let Err(e) = std::fs::write(&tmp, &rendered) {
-        eprintln!("✗ 写临时文件 {tmp} 失败: {e} (未改动原文件)");
-        return 1;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        eprintln!("✗ 替换 {path} 失败: {e}");
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = atomic_write_config(path, &content, &rendered) {
+        eprintln!("✗ {e}");
         return 1;
     }
 
-    println!("✓ 已导入为出站 `{tag}` → {path}  (原文件备份: {bak})");
+    println!("✓ 已导入为出站 `{tag}` → {path}  (原文件备份: {path}.bak)");
     if let Some(note) = group_note {
         // --group: 路由已自动指向组, 无需再手动接线。
         println!("  {note}");
@@ -422,6 +477,117 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
             println!("    ② 手动在 outbounds 里加一条, 再把 default_outbound 改成 \"auto\":");
             println!("         {{ \"type\": \"urltest\", \"tag\": \"auto\", \"outbounds\": {:?} }}", tags);
         }
+    }
+    0
+}
+
+/// 订阅解码: 整段是 base64 (经典订阅格式, 无空白) 则先解码, 否则原样当明文。
+/// 再逐行取 `mirage://` (跳过空行 / `#` 注释), 解析成节点。
+fn parse_subscription(body: &str) -> Vec<mirage_rs::node_uri::NodeUri> {
+    use base64::Engine;
+    let trimmed: String = body.split_whitespace().collect(); // 判 base64 用: 去所有空白
+    let text = if !trimmed.is_empty()
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+    {
+        base64::engine::general_purpose::STANDARD
+            .decode(&trimmed)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_else(|| body.to_string())
+    } else {
+        body.to_string()
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && l.starts_with("mirage://"))
+        .filter_map(|l| mirage_rs::node_uri::NodeUri::parse(l).ok())
+        .collect()
+}
+
+/// 从订阅 URL 拉取节点列表, 批量导入为 mirage 出站 (按 server:port 去重), 可选建 urltest 组。
+async fn run_subscribe(path: &str, url: &str, group: Option<&str>, group_opts: &GroupOpts, timeout_secs: u64) -> i32 {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("✗ 读不了 {path}: {e}"); return 1; }
+    };
+    let mut root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("✗ {path} 不是合法 JSON: {e}"); return 1; }
+    };
+    if !root.get("outbounds").map(|v| v.is_array()).unwrap_or(false) {
+        eprintln!("✗ {path} 里没有 outbounds 数组, 不像是 Mirage 配置");
+        return 1;
+    }
+
+    print!("拉取订阅 {url} … ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => { eprintln!("✗ 构造 HTTP 客户端失败: {e}"); return 1; }
+    };
+    let body = match client.get(url).send().await.and_then(|r| r.error_for_status()) {
+        Ok(resp) => match resp.text().await {
+            Ok(t) => t,
+            Err(e) => { eprintln!("✗ 读订阅响应失败: {e}"); return 1; }
+        },
+        Err(e) => { eprintln!("✗ 拉订阅失败: {e}"); return 1; }
+    };
+    let nodes = parse_subscription(&body);
+    println!("解析到 {} 个 mirage 节点", nodes.len());
+    if nodes.is_empty() {
+        eprintln!("✗ 订阅里没有可解析的 mirage:// 节点 (格式: 每行一个 mirage:// URI, 或整段 base64)");
+        return 1;
+    }
+
+    let mut taken = existing_outbound_tags(&root);
+    let mut seen: std::collections::HashSet<(String, u16)> = root["outbounds"].as_array().unwrap().iter()
+        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("mirage"))
+        .filter_map(|o| Some((o.get("server")?.as_str()?.to_string(), o.get("server_port")?.as_u64()? as u16)))
+        .collect();
+    let (mut added, mut skipped) = (0u32, 0u32);
+    for node in &nodes {
+        if !seen.insert((node.host.clone(), node.port)) {
+            skipped += 1;
+            continue;
+        }
+        let tag = unique_auto_tag(&node.host, &mut taken);
+        root["outbounds"].as_array_mut().unwrap().push(mirage_outbound_json(&tag, node));
+        added += 1;
+    }
+    println!("  新增 {added} 个, 跳过 {skipped} 个 (server:port 已存在)");
+    // 0 新增且不建组 = 无改动早退; 带 --group 则仍对已有节点建组 (重订阅刷新组的常见用法)。
+    if added == 0 && group.is_none() {
+        println!("✓ 无新增节点, 配置未改动");
+        return 0;
+    }
+
+    let mut group_note = None;
+    if let Some(gname) = group {
+        match apply_urltest_group(&mut root, gname, group_opts) {
+            Ok((n, old)) => group_note = Some(format!(
+                "✓ 已建/更新 urltest 组 `{gname}` (纳入 {n} 个 mirage 节点), default_outbound: {} → `{gname}`",
+                old.as_deref().unwrap_or("<未设>")
+            )),
+            Err(e) => { eprintln!("✗ 建组失败: {e} (未改动配置)"); return 1; }
+        }
+    }
+
+    let rendered = match serde_json::to_string_pretty(&root) {
+        Ok(s) => s + "\n",
+        Err(e) => { eprintln!("✗ 序列化失败: {e}"); return 1; }
+    };
+    if let Err(e) = atomic_write_config(path, &content, &rendered) {
+        eprintln!("✗ {e}");
+        return 1;
+    }
+    println!("✓ 已写回 {path} (原文件备份: {path}.bak)");
+    match group_note {
+        Some(note) => println!("  {note}\n  `mirage-rs check -c {path}` 确认后重启。"),
+        None => println!("  提示: 出站已加但未接路由。要按 RTT 自动选路, 重跑时加 --group。"),
     }
     0
 }
@@ -581,6 +747,20 @@ async fn main() -> anyhow::Result<()> {
         };
         std::process::exit(run_import(config, uri, *test, *require_live, g, &opts, *timeout).await);
     }
+    if let Mode::Subscribe {
+        config, url, group, group_name,
+        group_interval, group_tolerance, group_url, group_test_type, timeout,
+    } = &args.mode
+    {
+        let g = group.then_some(group_name.as_str());
+        let opts = GroupOpts {
+            interval: *group_interval,
+            tolerance: *group_tolerance,
+            url: group_url.clone(),
+            test_type: group_test_type.clone(),
+        };
+        std::process::exit(run_subscribe(config, url, g, &opts, *timeout).await);
+    }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
     match &args.mode {
@@ -606,7 +786,35 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::mirage_outbounds;
+    use super::{mirage_outbounds, parse_subscription, unique_auto_tag};
+
+    #[test]
+    fn parse_subscription_plaintext_and_filters() {
+        let body = "# 注释\n\nmirage://p1@a.com:443?sni=www.apple.com\nnot-a-node\nmirage://p2@b.com:8443?sni=www.bing.com\n";
+        let nodes = parse_subscription(body);
+        assert_eq!(nodes.len(), 2, "跳过注释/空行/非 mirage 行");
+        assert_eq!(nodes[0].host, "a.com");
+        assert_eq!(nodes[1].port, 8443);
+    }
+
+    #[test]
+    fn parse_subscription_base64() {
+        use base64::Engine;
+        let plain = "mirage://p@h.com:443?sni=www.apple.com";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(plain);
+        let nodes = parse_subscription(&b64);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].host, "h.com");
+    }
+
+    #[test]
+    fn unique_auto_tag_dedups() {
+        let mut taken = vec!["a".to_string()];
+        assert_eq!(unique_auto_tag("a", &mut taken), "a-2");
+        assert_eq!(unique_auto_tag("a", &mut taken), "a-3");
+        assert_eq!(unique_auto_tag("b", &mut taken), "b");
+        assert_eq!(unique_auto_tag("", &mut taken), "node");
+    }
 
     #[test]
     fn extracts_only_complete_mirage_outbounds() {
