@@ -884,13 +884,19 @@ fn merge_fragment(root: &mut serde_json::Value, frag: &serde_json::Value, includ
     }
 
     let mut taken = existing_outbound_tags(root);
-    // 现有 mirage 节点的 (host,port) → tag, 供 dup 重映射
+    // 现有 mirage 节点的 (host,port) → tag, 供 dup 重映射; 现有 tag → type, 供 direct/block 同类判断
     let mut host_port: std::collections::HashMap<(String, u16), String> = std::collections::HashMap::new();
+    let mut existing_type: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for o in root["outbounds"].as_array().unwrap() {
-        if o.get("type").and_then(|t| t.as_str()) == Some("mirage") {
+        let tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        let ty = o.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        if !tag.is_empty() {
+            existing_type.insert(tag.clone(), ty.clone());
+        }
+        if ty == "mirage" {
             if let (Some(h), Some(p)) = (o.get("server").and_then(|s| s.as_str()), o.get("server_port").and_then(|p| p.as_u64())) {
                 if let Ok(p) = u16::try_from(p) {
-                    host_port.insert((h.to_string(), p), o.get("tag").and_then(|t| t.as_str()).unwrap_or_default().to_string());
+                    host_port.insert((h.to_string(), p), tag);
                 }
             }
         }
@@ -950,7 +956,8 @@ fn merge_fragment(root: &mut serde_json::Value, frag: &serde_json::Value, includ
         remap.insert(orig, newtag.clone());
         group_newtags.push((i, newtag));
     }
-    // 2b. direct/block: 同名已存在则跳过, 否则加 (remap 恒等)
+    // 2b. direct/block: **同 tag 同 type** 已存在才 dedup 跳过 (remap 恒等); 撞到异类出站则改名
+    // 重映射 (否则片段的 block 会静默指到配置里同名的 direct/节点, 引用错类型)。
     for g in frag_out {
         let t = type_of(g);
         if t != "direct" && t != "block" {
@@ -960,29 +967,64 @@ fn merge_fragment(root: &mut serde_json::Value, frag: &serde_json::Value, includ
         if tag.is_empty() {
             continue;
         }
-        remap.entry(tag.clone()).or_insert_with(|| tag.clone());
-        if !taken.contains(&tag) {
+        if existing_type.get(&tag).map(|et| et == &t).unwrap_or(false) {
+            remap.entry(tag.clone()).or_insert(tag); // 真·同类重复, 恒等
+            continue;
+        }
+        if taken.contains(&tag) {
+            // tag 被异类出站占用 → 改名
+            let newtag = unique_auto_tag(&tag, &mut taken);
+            rep.renamed.push((tag.clone(), newtag.clone()));
+            remap.insert(tag, newtag.clone());
+            let mut gc = g.clone();
+            gc["tag"] = Value::String(newtag);
+            root["outbounds"].as_array_mut().unwrap().push(gc);
+        } else {
+            remap.entry(tag.clone()).or_insert_with(|| tag.clone());
             root["outbounds"].as_array_mut().unwrap().push(g.clone());
             taken.push(tag);
         }
     }
 
-    // 最终出站集合 (含组 newtag / 节点 / direct/block), 用于判断成员/规则是否悬空
-    let taken_set: std::collections::HashSet<String> = taken.iter().cloned().collect();
-
-    // 2c. 组成员重映射 + 落地 (剔空跳过)
+    // 2c. 组落地 (present fixpoint, 学 export): present = 真实存在的出站 (节点 + direct/block +
+    // 原有配置), 组只有"至少一个成员可达 present"才算 present。避免"空组 tag 仍占位 → 父组悬空"。
+    let mut present: std::collections::HashSet<String> = taken.iter().cloned().collect();
+    for (_, newtag) in &group_newtags {
+        present.remove(newtag); // 组先移出, 下面 fixpoint 逐个加回
+    }
+    let member_present = |g: &Value, present: &std::collections::HashSet<String>| -> bool {
+        g.get("outbounds").and_then(|m| m.as_array()).map(|ms| ms.iter().any(|m| {
+            m.as_str().map(|s| present.contains(remap.get(s).map(String::as_str).unwrap_or(s))).unwrap_or(false)
+        })).unwrap_or(false)
+    };
+    loop {
+        let mut added = false;
+        for (i, newtag) in &group_newtags {
+            if present.contains(newtag) {
+                continue;
+            }
+            if member_present(&frag_out[*i], &present) {
+                present.insert(newtag.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    // 按配置顺序落地 present 组, 成员过滤到 present (保证无悬空)
     for (i, newtag) in &group_newtags {
+        if !present.contains(newtag) {
+            rep.skipped_groups.push(newtag.clone());
+            continue;
+        }
         let g = &frag_out[*i];
         let members = g.get("outbounds").and_then(|m| m.as_array()).cloned().unwrap_or_default();
         let mapped: Vec<Value> = members.iter().filter_map(|m| {
             let s = m.as_str()?;
             let resolved = remap.get(s).cloned().unwrap_or_else(|| s.to_string());
-            taken_set.contains(&resolved).then_some(Value::String(resolved))
+            present.contains(&resolved).then_some(Value::String(resolved))
         }).collect();
-        if mapped.is_empty() {
-            rep.skipped_groups.push(newtag.clone());
-            continue;
-        }
         let mut gc = g.clone();
         gc["tag"] = Value::String(newtag.clone());
         gc["outbounds"] = Value::Array(mapped);
@@ -1002,8 +1044,8 @@ fn merge_fragment(root: &mut serde_json::Value, frag: &serde_json::Value, includ
             for r in rules {
                 let ob = r.get("outbound").and_then(|o| o.as_str()).unwrap_or("");
                 let resolved = remap.get(ob).cloned().unwrap_or_else(|| ob.to_string());
-                if !taken_set.contains(&resolved) {
-                    rep.dropped_rules += 1;
+                if !present.contains(&resolved) {
+                    rep.dropped_rules += 1; // 指向不存在/被跳过的出站 → 丢弃
                     continue;
                 }
                 let mut rc = r.clone();
@@ -1729,6 +1771,46 @@ mod tests {
         let rules = r2["routing"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["outbound"], "n1");
+    }
+
+    #[test]
+    fn merge_skipped_group_does_not_leave_dangling_parent() {
+        // grpX 引用 grpY, grpY 全成员悬空 → grpY 跳过; grpX 只引 grpY → 也应跳过 (无悬空)
+        let mut root = serde_json::json!({ "outbounds": [] });
+        let frag = serde_json::json!({
+            "nodes": [],
+            "outbounds": [
+                { "type": "fallback", "tag": "grpX", "outbounds": ["grpY"] },
+                { "type": "urltest",  "tag": "grpY", "outbounds": ["ghost"] }
+            ]
+        });
+        let rep = merge_fragment(&mut root, &frag, false);
+        assert_eq!(rep.added_groups, 0, "两组都无可达成员 → 全跳过");
+        let tags: Vec<&str> = root["outbounds"].as_array().unwrap().iter()
+            .filter_map(|o| o["tag"].as_str()).collect();
+        assert!(!tags.contains(&"grpX") && !tags.contains(&"grpY"), "不落地任何悬空组");
+    }
+
+    #[test]
+    fn merge_directblock_type_mismatch_renames() {
+        // 配置有 direct tag d1; 片段有 block tag d1 → 改名 d1-2, 组引用指向改名后的 block
+        let mut root = serde_json::json!({ "outbounds": [ { "type": "direct", "tag": "d1" } ] });
+        let frag = serde_json::json!({
+            "nodes": [ { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" } ],
+            "outbounds": [
+                { "type": "block", "tag": "d1" },
+                { "type": "urltest", "tag": "grp", "outbounds": ["d1", "n1"] }
+            ]
+        });
+        let rep = merge_fragment(&mut root, &frag, false);
+        assert!(rep.renamed.contains(&("d1".to_string(), "d1-2".to_string())), "异类同名改名");
+        let obs = root["outbounds"].as_array().unwrap();
+        let blk = obs.iter().find(|o| o["type"] == "block").unwrap();
+        assert_eq!(blk["tag"], "d1-2");
+        let grp = obs.iter().find(|o| o["tag"] == "grp").unwrap();
+        assert_eq!(grp["outbounds"], serde_json::json!(["d1-2", "n1"]), "组引用指向改名后的 block");
+        // 原 direct d1 未被动
+        assert!(obs.iter().any(|o| o["type"] == "direct" && o["tag"] == "d1"));
     }
 
     #[test]

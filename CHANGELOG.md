@@ -41,6 +41,11 @@ mirage-rs subscribe -c config.json https://host/share.json # 也能远程拉片�
 - 核心 `merge_fragment` 纯函数; 单测: 加节点/组/geo · 撞名改名+组重映射 · server:port dup 重映射到
   已有 · 路由开关+悬空规则丢弃。e2e: `export` 子集 → `subscribe` 合并 round-trip。
 
+**审计修复 (Sonnet)**: ① 空组悬空 —— 组的落地改 present fixpoint (学 export): 先求真实可达出站集合,
+被跳过的空组 tag 不占位, 父组引用空组也随之跳过, 保证合并结果**无悬空引用** (规则同样按 present 判)。
+② `direct`/`block` 仅"同 tag 同 type"才 dedup 跳过; 撞到异类同名出站则改名重映射 (否则片段的
+`block` 会静默指到配置里同名的 `direct`/节点)。加两条回归测试。
+
 ## [v0.6.7] - 负载均衡组 + 订阅导入 + 节点区域判定 (2026-07-28)
 
 ### feat(outbound): 负载均衡出站组 `load_balance` (round-robin)
