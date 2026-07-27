@@ -1,5 +1,51 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(cli): `mirage-rs export` —— 交互式导出配置片段 (subscribe 的反向)
+
+从本地配置挑节点导出为可分享 JSON 片段 (下一版做 JSON 导入侧闭环):
+
+```
+mirage-rs export -c config.json -o share.json
+mirage-rs export -c config.json > share.json   # 无 -o 写 stdout (提示走 stderr, 不污染)
+```
+
+- 交互问三样: 导出哪些 mirage 节点 (回车/`all`=全部, 或 `1,3,5-7` 选部分) · 是否带路由规则 ·
+  是否带 geo 下载地址 (`geo_sources`/`geodata_dir`)。
+- **组自动按所选节点匹配**: 组内未选成员剔除, 剔空则跳过 (嵌套组 fixpoint 收敛); 引用到未导出
+  出站的规则丢弃, `default_outbound` 悬空则不带。被组/规则引用的 `direct`/`block` 一并带上。
+- 输出格式 `{ nodes:[mirage], outbounds:[组+direct/block], routing?:{rules,default_outbound}, geo_sources?, geodata_dir? }`。
+- 核心 `build_export` 抽为纯函数; 单测: 组过滤/悬空规则丢弃/direct 携带/序号选择解析 (区间+去重+越界)。
+
+**审计修复 (Sonnet)**: 组 fixpoint 原单阶段有序 bug —— 组A 引用组B 且排在 B 前时, A 成员被冻结成
+缺 B 后不再重算, 永久缺 B。改两阶段 (先求可达出站集合, 收敛后再按最终集合过滤成员), 加嵌套回归
+测试。另加护栏: `-o` 指向源配置同一文件时**拒绝** (导出是片段, 避免误覆盖源配置)。
+
+### feat(cli): `subscribe` 支持 JSON 片段 + 本地文件 —— 闭合 export/import 环
+
+`subscribe` 现在既能吃 mirage:// 列表, 也能吃 `export` 产出的 **JSON 片段**; 来源既能是 URL 也能是
+**本地文件**。payload 以 `{` 开头即走片段合并:
+
+```
+mirage-rs subscribe -c config.json share.json              # 合并本地片段
+mirage-rs subscribe -c config.json --routing share.json    # 连路由规则一起并 (侵入, 默认不并)
+mirage-rs subscribe -c config.json https://host/share.json # 也能远程拉片段
+```
+
+- 节点按 `server:port` 去重: dup 不重复加, 但把片段里它的 tag **重映射到配置已有同址节点**,
+  引用它的组/规则不悬空。tag 撞现有出站则自动改名并全程重映射到组成员/规则 outbound。
+- 组成员 / 规则 outbound 重映射后仍悬空 → 丢弃 (组剔空跳过)。`direct`/`block` 同名已存在则跳过。
+- `--routing` 才并 `routing.rules` (侵入); `default_outbound` **一律不动**。`geo_sources` 按 name
+  去重, `geodata_dir` 缺则设。
+- 核心 `merge_fragment` 纯函数; 单测: 加节点/组/geo · 撞名改名+组重映射 · server:port dup 重映射到
+  已有 · 路由开关+悬空规则丢弃。e2e: `export` 子集 → `subscribe` 合并 round-trip。
+
+**审计修复 (Sonnet)**: ① 空组悬空 —— 组的落地改 present fixpoint (学 export): 先求真实可达出站集合,
+被跳过的空组 tag 不占位, 父组引用空组也随之跳过, 保证合并结果**无悬空引用** (规则同样按 present 判)。
+② `direct`/`block` 仅"同 tag 同 type"才 dedup 跳过; 撞到异类同名出站则改名重映射 (否则片段的
+`block` 会静默指到配置里同名的 `direct`/节点)。加两条回归测试。
+
 ## [v0.6.7] - 负载均衡组 + 订阅导入 + 节点区域判定 (2026-07-28)
 
 ### feat(outbound): 负载均衡出站组 `load_balance` (round-robin)
