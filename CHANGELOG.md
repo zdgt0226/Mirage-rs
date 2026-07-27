@@ -32,6 +32,21 @@ mirage-rs subscribe -c config.json --group https://example.com/sub   # 顺带建
 - 重构: 抽 `mirage_outbound_json` / `atomic_write_config` 供 import + subscribe 共用。
 - **周期自动刷新暂未做** (手动重跑; 加 --group 会重建组)。
 
+### feat(cli): 节点区域判定 (GeoIP) —— test 区域列 + 建组混区域告警
+
+用已下载的 `geoip.dat` 离线判节点区域 (`server` IP 所在国), 辅助负载均衡/选路"同区域分组":
+
+- `mirage-rs test` 每节点显示 `[国家码]` (如 `[US]`/`[CN]`)。
+- `import --group` 建组时组内节点跨多区域 → 告警 (出口国不一致影响落地解锁/延迟)。
+- 新增 `router::geo::load_all_geoip` (解析全部国家) + `country_for_ip` (IP→国家反查)。
+  CLI 从 `tuning.geodata_dir` 定位 geoip.dat; 无 geoip / 未知 IP 静默降级 (不报区域)。
+- 离线免费, 对**直连出口**节点准 (VPS IP 国=出口国); 节点自身再经上游中转时不准 (已知限制,
+  主动出口探测后续加)。单测: 合成 dat 的 load_all_geoip/country_for_ip; e2e 对真 geoip.dat。
+
+**审计修复 (Sonnet)**: `region_for_host` 域名解析原用 `std::net::ToSocketAddrs` (阻塞、无超时) 在
+async 运行时里跑, 慢 resolver 会卡死 worker 线程。改 `tokio::net::lookup_host` + 3s `timeout`
+(不阻塞、有界); `mixed_region_warning`/test 区域列同步改 async。
+
 ## [v0.6.6] - process_name 分流 + dump_tls 工具 (2026-07-27)
 
 ### feat(route): process_name 分流 —— 按发起程序名路由 (本机 loopback 入站)

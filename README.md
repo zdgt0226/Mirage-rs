@@ -145,6 +145,11 @@ mirage-rs subscribe -c config.json --group https://example.com/sub
 { "type": "load_balance", "tag": "lb", "outbounds": ["n1","n2","n3"], "strategy": "round-robin" }
 ```
 
+**节点区域** (GeoIP): `mirage-rs test` 每节点显示 `[国家码]` (如 `[US]`/`[JP]`) —— 用已下载的
+`geoip.dat` 查 `server` IP 所在国 (离线, 免费; 直连出口的节点即出口国)。`import --group` 建组时,
+若组内节点**跨多个区域**会告警 —— 负载均衡/自动选路混区域会让出口国不一致 (落地解锁/延迟受影响),
+建议同区域各自分组。(节点自身再经上游中转时 server IP ≠ 真出口, 属已知限制。)
+
 **`mirage-rs test`**: 测节点是否真能用 —— 走**完整 Mirage 握手并解密服务端首帧确认认证**,
 裸 TCP 连通不算数 (伪装前置是真站点, `:443` 本来就通)。结果分 ✓可用 (报 RTT) / ⚠可达但未确认
 认证 (旧服务端?) / ✗不可用 (连接失败 / 握手超时 / 认证失败=密码不符或非 Mirage 服务端)。
