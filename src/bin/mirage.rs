@@ -371,8 +371,10 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
                     old.as_deref().unwrap_or("<未设>")
                 ));
                 // 混区域告警: 组内节点跨国时提示 (出口不一致)。
-                if let Some(w) = load_node_geoip(&root).as_ref().and_then(|db| mixed_region_warning(&root, db)) {
-                    eprintln!("  {w}");
+                if let Some(db) = load_node_geoip(&root) {
+                    if let Some(w) = mixed_region_warning(&root, &db).await {
+                        eprintln!("  {w}");
+                    }
                 }
             }
             Err(e) => {
@@ -446,24 +448,33 @@ fn load_node_geoip(root: &serde_json::Value) -> Option<GeoIpDb> {
     mirage_rs::router::geo::load_all_geoip(&path).ok()
 }
 
-/// 查某 host (IP 字面量或域名) 所在国家码。域名走系统解析取首个 IP。查不到 None。
-fn region_for_host(geoip: &GeoIpDb, host: &str) -> Option<String> {
-    use std::net::{IpAddr, ToSocketAddrs};
+/// 查某 host (IP 字面量或域名) 所在国家码。域名走**带超时的异步解析** (tokio, 不阻塞
+/// worker; 慢 resolver 3s 即放弃) 取首个 IP。查不到 None。
+async fn region_for_host(geoip: &GeoIpDb, host: &str) -> Option<String> {
+    use std::net::IpAddr;
     let ip: IpAddr = if let Ok(ip) = host.parse::<IpAddr>() {
         ip
     } else {
-        (host, 0u16).to_socket_addrs().ok()?.next()?.ip()
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::net::lookup_host((host, 0u16)),
+        )
+        .await
+        .ok()?
+        .ok()?
+        .next()?
+        .ip()
     };
     mirage_rs::router::geo::country_for_ip(geoip, ip)
 }
 
 /// 配置里 mirage 节点若跨多个区域, 返回告警串 (供 --group 建组时提示混区域)。
 /// 无 geoip / 全同区 / <2 区域 → None。少量节点顺序解析。
-fn mixed_region_warning(root: &serde_json::Value, geoip: &GeoIpDb) -> Option<String> {
+async fn mixed_region_warning(root: &serde_json::Value, geoip: &GeoIpDb) -> Option<String> {
     let mut by_region: std::collections::BTreeMap<String, usize> = Default::default();
     let mut unknown = 0usize;
     for (_tag, server, ..) in mirage_outbounds(root) {
-        match region_for_host(geoip, &server) {
+        match region_for_host(geoip, &server).await {
             Some(c) => *by_region.entry(c).or_default() += 1,
             None => unknown += 1,
         }
@@ -559,14 +570,16 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64, http_pr
         }
     }
 
-    // 节点区域 (GeoIP 查 server IP; 无 geoip.dat 则空)。少量节点, 顺序解析即可。
+    // 节点区域 (GeoIP 查 server IP; 无 geoip.dat 则空)。解析带超时, 少量节点顺序即可。
     let geoip = load_node_geoip(&root);
-    let regions: Vec<String> = nodes.iter().map(|(_, server, ..)| {
-        geoip.as_ref()
-            .and_then(|db| region_for_host(db, server))
-            .map(|c| format!("[{c}]"))
-            .unwrap_or_default()
-    }).collect();
+    let mut regions: Vec<String> = Vec::with_capacity(nodes.len());
+    for (_, server, ..) in &nodes {
+        let r = match &geoip {
+            Some(db) => region_for_host(db, server).await.map(|c| format!("[{c}]")).unwrap_or_default(),
+            None => String::new(),
+        };
+        regions.push(r);
+    }
 
     let mut failed = 0;
     for (i, (tag, server, port, ..)) in nodes.iter().enumerate() {
