@@ -489,6 +489,7 @@ async fn setup_flow(
         source_ip: Some(IpAddr::V4(*client.ip())),
         source_mac: None,
         inbound: Some(&inbound_tag),
+        process_name: None, // 透明 UDP: LAN 转发, 无本机进程
     };
     match &domain {
         Some(d) => req.domain = Some(d.as_str()),

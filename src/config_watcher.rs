@@ -146,6 +146,7 @@ impl ConfigWatcher {
                 protocol: r.protocol,
                 port: r.port,
                 inbound: r.inbound,
+                process_name: r.process_name,
             });
         }
         

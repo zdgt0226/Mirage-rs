@@ -302,14 +302,14 @@ mod tests {
         for host in ["example.com", "baidu.cn", "qq.com"] {
             let req = crate::router::RoutingRequest {
                 domain: Some(host), ip: None, port: 443,
-                protocol: "tcp", source_ip: None, source_mac: None, inbound: None,
+                protocol: "tcp", source_ip: None, source_mac: None, inbound: None, process_name: None,
             };
             assert_eq!(st.router.route(req), "proxy", "{host} 也必须走隧道");
         }
         for ip in ["10.0.0.1", "1.1.1.1", "114.114.114.114"] {
             let req = crate::router::RoutingRequest {
                 domain: None, ip: Some(ip.parse().unwrap()), port: 443,
-                protocol: "tcp", source_ip: None, source_mac: None, inbound: None,
+                protocol: "tcp", source_ip: None, source_mac: None, inbound: None, process_name: None,
             };
             assert_eq!(st.router.route(req), "proxy", "{ip} 也必须走隧道");
         }

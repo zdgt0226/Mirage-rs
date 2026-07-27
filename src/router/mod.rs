@@ -29,6 +29,9 @@ pub struct Rule {
     pub port: Vec<u16>,
     /// 入站 tag 白名单; 空 = 不限。
     pub inbound: Vec<String>,
+    /// 进程名白名单 (comm, 精确匹配); 空 = 不限。仅对本机 (loopback) socks/mixed 入站
+    /// 连接可判定 —— 透明/LAN 转发的连接进程在别的机器上, 无从取, 此维度不命中。
+    pub process_name: Vec<String>,
 }
 
 impl Rule {
@@ -80,6 +83,13 @@ impl Rule {
                 }
             } else {
                 return false;
+            }
+        }
+        if !self.process_name.is_empty() {
+            // 同 inbound: 进程名未知 (非本机连接 / 查不到) 就不匹配, 不放宽。
+            match req.process_name {
+                Some(name) if self.process_name.iter().any(|n| n == name) => {}
+                _ => return false,
             }
         }
         true
@@ -251,6 +261,9 @@ pub struct RoutingRequest<'a> {
     /// 本连接是从哪个入站进来的 (按 tag)。None = 调用方没提供, 此时带 `inbound`
     /// 条件的规则**一律不匹配** —— 宁可不命中, 也不要在信息缺失时猜。
     pub inbound: Option<&'a str>,
+    /// 发起连接的本机进程名 (comm)。仅本机 loopback 连接可查到; None = 未知,
+    /// 带 `process_name` 条件的规则一律不匹配 (同 inbound 语义)。
+    pub process_name: Option<&'a str>,
 }
 
 impl RouterEngine {
@@ -511,6 +524,12 @@ impl RouterEngine {
         direct
     }
 
+    /// 是否有任何规则带 `process_name` 条件。调用方 (handler) 据此决定是否值得为本机连接
+    /// 扫 /proc 查进程名 —— 没人用这维度就完全跳过, 避免每连接的 /proc 开销。
+    pub fn uses_process_name(&self) -> bool {
+        self.rule_table.iter().any(|r| !r.process_name.is_empty())
+    }
+
     pub fn route(&self, req: RoutingRequest) -> OutboundTag {
         let mut candidate_counts: std::collections::HashMap<RuleId, usize> = std::collections::HashMap::new();
 
@@ -630,6 +649,7 @@ mod tests {
                 port: vec![],
                 protocol: vec![],
                 inbound: vec![],
+                process_name: vec![],
             },
             // Rule 1: direct cn
             Rule {
@@ -647,6 +667,7 @@ mod tests {
                 port: vec![],
                 protocol: vec![],
                 inbound: vec![],
+                process_name: vec![],
             },
             // Rule 2: proxy google
             Rule {
@@ -664,6 +685,7 @@ mod tests {
                 port: vec![],
                 protocol: vec![],
                 inbound: vec![],
+                process_name: vec![],
             },
             // Rule 3: proxy specific port
             Rule {
@@ -681,6 +703,7 @@ mod tests {
                 port: vec![22], // SSH
                 protocol: vec![],
                 inbound: vec![],
+                process_name: vec![],
             },
         ];
 
@@ -700,6 +723,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "block");
 
@@ -712,6 +736,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "block");
 
@@ -724,6 +749,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "direct");
 
@@ -736,6 +762,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "direct");
 
@@ -748,6 +775,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "default");
 
@@ -760,6 +788,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "proxy_port");
 
@@ -772,6 +801,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "block");
 
@@ -784,6 +814,7 @@ mod tests {
             source_ip: None,
             source_mac: None,
             inbound: None,
+            process_name: None,
         });
         assert_eq!(out, "block");
     }
@@ -804,6 +835,7 @@ mod tests {
             port: vec![],
             protocol: vec![],
             inbound: vec![],
+            process_name: vec![],
         }
     }
 
@@ -849,6 +881,7 @@ mod inbound_tests {
             port: vec![],
             protocol: vec![],
             inbound: inbound.into_iter().map(String::from).collect(),
+            process_name: vec![],
         }
     }
 
@@ -871,6 +904,7 @@ mod inbound_tests {
             source_ip: None,
             source_mac: None,
             inbound,
+            process_name: None,
         }
     }
 
@@ -913,5 +947,38 @@ mod inbound_tests {
             "default",
             "入站信息缺失时命中了限定入站的规则 —— 该规则会外溢到所有连接"
         );
+    }
+
+    fn rule_for_proc(id: RuleId, outbound: &str, procs: Vec<&str>) -> Rule {
+        let mut r = rule_for_inbound(id, outbound, vec![]);
+        r.process_name = procs.into_iter().map(String::from).collect();
+        r
+    }
+    fn req_proc<'a>(domain: &'a str, proc_name: Option<&'a str>) -> RoutingRequest<'a> {
+        let mut q = req(domain, None);
+        q.process_name = proc_name;
+        q
+    }
+
+    /// 按进程名分流: Telegram 走代理, 其余落默认。
+    #[test]
+    fn routes_by_process_name() {
+        let e = engine(vec![rule_for_proc(0, "proxy", vec!["telegram", "Telegram"])]);
+        assert_eq!(e.route(req_proc("example.com", Some("telegram"))), "proxy");
+        assert_eq!(e.route(req_proc("example.com", Some("wechat"))), "default", "其它进程不命中");
+    }
+
+    /// 信息缺失不猜: 进程名未知 (非本机连接/查不到), 带 process_name 的规则不命中。
+    #[test]
+    fn missing_process_name_never_matches() {
+        let e = engine(vec![rule_for_proc(0, "proxy", vec!["telegram"])]);
+        assert_eq!(e.route(req_proc("example.com", None)), "default");
+    }
+
+    /// uses_process_name: 有 process_name 规则才返回 true (handler 据此决定是否扫 /proc)。
+    #[test]
+    fn uses_process_name_flag() {
+        assert!(engine(vec![rule_for_proc(0, "proxy", vec!["x"])]).uses_process_name());
+        assert!(!engine(vec![rule_for_inbound(0, "proxy", vec![])]).uses_process_name());
     }
 }

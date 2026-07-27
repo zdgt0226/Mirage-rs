@@ -147,7 +147,23 @@ pub async fn proxy_tcp_target(
     }
 
     info!("Proxying TCP request to {}", final_target);
-    
+
+    // process_name 分流: 仅当有规则用到该维度、且连接来自本机 (loopback) 才查进程名。
+    // /proc 扫描是阻塞 IO, 放 spawn_blocking, 不占 tokio worker。非本机/查不到 → None。
+    let process_name: Option<String> = if current_state.router.uses_process_name() {
+        match local.peer_addr() {
+            Ok(peer) if peer.ip().is_loopback() => {
+                tokio::task::spawn_blocking(move || crate::proxy::proc_lookup::process_name_for_peer(peer))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     // Parse target for router
     let mut routing_req = RoutingRequest {
         domain: None,
@@ -157,6 +173,7 @@ pub async fn proxy_tcp_target(
         source_ip: None, // Can extract from local if needed
         source_mac: None,
         inbound: inbound_tag.as_deref(),
+        process_name: process_name.as_deref(),
     };
     
     // 嗅到域名时**同时**带上域名与原始 IP: 域名让 domain_suffix/geosite 生效, IP 让
