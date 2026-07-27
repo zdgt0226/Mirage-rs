@@ -1,5 +1,21 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(outbound): 负载均衡出站组 `load_balance` (round-robin)
+
+新增出站组类型, 把连接**分摊**到多个健康成员 (现有 urltest/fallback/selector 都是"选一个")：
+
+```json
+{ "type": "load_balance", "tag": "lb", "outbounds": ["n1","n2","n3"], "strategy": "round-robin" }
+```
+
+- v1 策略 `round-robin` (每连接原子游标轮流, 只在健康成员里分摊); 其它 strategy 在 check/启动
+  报错不静默降级 (留 consistent-hash 等作显式扩展)。`url`+`interval` 同 urltest 做健康检查。
+- `type` 认 `load_balance` 与 `load-balance` (alias)。⚠️ round-robin 下同会话多连接可能落不同
+  节点, 查 IP 一致性的站点受影响 (会话粘滞的 consistent-hash 后续加)。
+- 单测: round-robin 轮流 / 无健康成员退路 / 构建+check / 未支持策略被拦。
+
 ## [v0.6.6] - process_name 分流 + dump_tls 工具 (2026-07-27)
 
 ### feat(route): process_name 分流 —— 按发起程序名路由 (本机 loopback 入站)

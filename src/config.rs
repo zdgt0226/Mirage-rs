@@ -338,10 +338,32 @@ pub enum OutboundConfig {
         tag: String,
         outbounds: Vec<String>,
     },
+    /// 负载均衡组: 把连接**分摊**到多个健康成员 (与 urltest 选最优不同)。
+    /// v1 仅 `round-robin` (每连接轮流)。健康检查同 urltest (url + interval)。
+    /// type = `load_balance` (也接受 `load-balance` 连字符写法)。
+    #[serde(alias = "load-balance")]
+    LoadBalance {
+        tag: String,
+        outbounds: Vec<String>,
+        /// 分摊策略。v1 只支持 `round-robin`; 其它值在 check/启动时报错 (留给后续
+        /// consistent-hash 等作显式扩展, 不静默降级)。
+        #[serde(default = "default_lb_strategy")]
+        strategy: String,
+        /// 健康检查探测地址 (同 urltest)。
+        #[serde(default = "default_probe_url")]
+        url: String,
+        /// 健康检查间隔秒 (同 urltest; 0=关)。
+        #[serde(default = "default_urltest_interval")]
+        interval: u64,
+    },
 }
 
 fn default_probe_url() -> String {
     "http://www.gstatic.com/generate_204".to_string()
+}
+
+fn default_lb_strategy() -> String {
+    "round-robin".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -733,7 +755,8 @@ impl Config {
                 | OutboundConfig::Block { tag }
                 | OutboundConfig::Urltest { tag, .. }
                 | OutboundConfig::Fallback { tag, .. }
-                | OutboundConfig::Selector { tag, .. } => tag.as_str(),
+                | OutboundConfig::Selector { tag, .. }
+                | OutboundConfig::LoadBalance { tag, .. } => tag.as_str(),
             };
             if tags.contains(&tag) {
                 issues.push(format!("outbound tag `{tag}` 重复定义 (后者覆盖前者, 行为不确定)"));
@@ -834,6 +857,15 @@ impl Config {
                 OutboundConfig::Urltest { tag, outbounds, .. } => (tag, outbounds, "urltest"),
                 OutboundConfig::Fallback { tag, outbounds, .. } => (tag, outbounds, "fallback"),
                 OutboundConfig::Selector { tag, outbounds, .. } => (tag, outbounds, "selector"),
+                OutboundConfig::LoadBalance { tag, outbounds, strategy, .. } => {
+                    // v1 只支持 round-robin, 别的策略明确报错 (不静默降级)。
+                    if strategy != "round-robin" {
+                        issues.push(format!(
+                            "load-balance `{tag}` 的 strategy `{strategy}` 暂不支持 (v1 仅 round-robin)"
+                        ));
+                    }
+                    (tag, outbounds, "load-balance")
+                }
                 _ => continue,
             };
             if children.is_empty() {
