@@ -261,6 +261,77 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
     Ok(Vec::new())
 }
 
+/// 解析 geoip.dat 里**全部国家**的 CIDR (泛化 load_geoip_dat: 不过滤 target_code)。
+/// 返回 (国家码大写, 该国 CIDR 列表)。供 IP→国家 反查用 (节点区域判定)。
+pub fn load_all_geoip(path: &Path) -> Result<Vec<(String, Vec<IpNet>)>> {
+    let data = fs::read(path)?;
+    let mut pos = 0;
+    let mut out: Vec<(String, Vec<IpNet>)> = Vec::new();
+
+    while pos < data.len() {
+        let tag = read_varint(&data, &mut pos)?;
+        let fn_num = tag >> 3;
+        let wt = tag & 7;
+
+        if wt == 2 {
+            let content = read_len_delim(&data, &mut pos)?;
+            if fn_num == 1 {
+                let mut cpos = 0;
+                let mut code = String::new();
+                let mut entries: Vec<&[u8]> = Vec::new();
+                while cpos < content.len() {
+                    let ctag = read_varint(content, &mut cpos)?;
+                    let cfn = ctag >> 3;
+                    let cwt = ctag & 7;
+                    if cwt == 2 {
+                        let inner = read_len_delim(content, &mut cpos)?;
+                        if cfn == 1 {
+                            code = String::from_utf8_lossy(inner).to_uppercase();
+                        } else if cfn == 2 {
+                            entries.push(inner);
+                        }
+                    } else if cwt == 0 {
+                        let _ = read_varint(content, &mut cpos)?;
+                    } else if cwt == 1 {
+                        cpos += 8;
+                    } else if cwt == 5 {
+                        cpos += 4;
+                    } else {
+                        break;
+                    }
+                }
+                if !code.is_empty() {
+                    let cidrs: Vec<IpNet> = entries.iter()
+                        .filter_map(|inner| parse_cidr_msg(inner).ok().flatten())
+                        .collect();
+                    if !cidrs.is_empty() {
+                        out.push((code, cidrs));
+                    }
+                }
+            }
+        } else if wt == 0 {
+            let _ = read_varint(&data, &mut pos)?;
+        } else if wt == 1 {
+            pos += 8;
+        } else if wt == 5 {
+            pos += 4;
+        } else {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// 在 load_all_geoip 结果里查某 IP 属于哪个国家码 (首个包含它的国家)。无匹配 None。
+pub fn country_for_ip(all: &[(String, Vec<IpNet>)], ip: std::net::IpAddr) -> Option<String> {
+    for (code, cidrs) in all {
+        if cidrs.iter().any(|net| net.contains(&ip)) {
+            return Some(code.clone());
+        }
+    }
+    None
+}
+
 // ==========================================
 // Sing-box SRS / JSON compatibility layer
 // ==========================================
@@ -389,6 +460,39 @@ mod tests {
         let mut out = varint((field << 3) | 5);
         out.extend_from_slice(&val.to_le_bytes());
         out
+    }
+
+    // 合成 geoip.dat: 国家 = { code(field1), cidr(field2)×N }; cidr = { ip(field1 ld), prefix(field2 varint) }。
+    fn cidr_msg(ip: [u8; 4], prefix: u8) -> Vec<u8> {
+        let mut m = ld(1, &ip);
+        m.extend(varint((2 << 3) | 0)); // field 2, wire 0
+        m.extend(varint(prefix as u64));
+        m
+    }
+    fn country_msg(code: &str, cidrs: &[Vec<u8>]) -> Vec<u8> {
+        let mut m = ld(1, code.as_bytes());
+        for c in cidrs {
+            m.extend(ld(2, c));
+        }
+        m
+    }
+
+    #[test]
+    fn load_all_geoip_and_country_for_ip() {
+        use super::{country_for_ip, load_all_geoip};
+        // US: 1.2.3.0/24; CN: 5.6.7.0/24
+        let mut dat = Vec::new();
+        dat.extend(ld(1, &country_msg("US", &[cidr_msg([1, 2, 3, 0], 24)])));
+        dat.extend(ld(1, &country_msg("CN", &[cidr_msg([5, 6, 7, 0], 24)])));
+        let path = std::env::temp_dir().join(format!("mirage_geoip_test_{}.dat", std::process::id()));
+        std::fs::write(&path, &dat).unwrap();
+
+        let all = load_all_geoip(&path).unwrap();
+        assert_eq!(all.len(), 2, "两个国家");
+        assert_eq!(country_for_ip(&all, "1.2.3.9".parse().unwrap()).as_deref(), Some("US"));
+        assert_eq!(country_for_ip(&all, "5.6.7.200".parse().unwrap()).as_deref(), Some("CN"));
+        assert_eq!(country_for_ip(&all, "9.9.9.9".parse().unwrap()), None, "不在任何段");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

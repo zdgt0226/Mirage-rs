@@ -370,6 +370,10 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
                      routing.default_outbound: {} → `{gname}` (按 RTT 自动选路)",
                     old.as_deref().unwrap_or("<未设>")
                 ));
+                // 混区域告警: 组内节点跨国时提示 (出口不一致)。
+                if let Some(w) = load_node_geoip(&root).as_ref().and_then(|db| mixed_region_warning(&root, db)) {
+                    eprintln!("  {w}");
+                }
             }
             Err(e) => {
                 eprintln!("✗ 建组失败: {e} (未改动配置)");
@@ -424,6 +428,56 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         }
     }
     0
+}
+
+type GeoIpDb = Vec<(String, Vec<ipnet::IpNet>)>;
+
+/// 从配置的 tuning 找到 geoip.dat 并解析成 (国家码, CIDRs) 全表, 供节点区域判定。
+/// 找不到 geodata_dir / geoip 文件 / 解析失败 → None (区域功能静默降级)。
+fn load_node_geoip(root: &serde_json::Value) -> Option<GeoIpDb> {
+    let tuning = root.get("tuning")?;
+    let dir = tuning.get("geodata_dir").and_then(|d| d.as_str())?;
+    // geo_sources 里 kind=geoip 的 name → <dir>/<name>.dat; 否则默认 <dir>/geoip.dat
+    let name = tuning.get("geo_sources").and_then(|s| s.as_array())
+        .and_then(|arr| arr.iter().find(|s| s.get("kind").and_then(|k| k.as_str()) == Some("geoip")))
+        .and_then(|s| s.get("name").and_then(|n| n.as_str()))
+        .unwrap_or("geoip");
+    let path = std::path::Path::new(dir).join(format!("{name}.dat"));
+    mirage_rs::router::geo::load_all_geoip(&path).ok()
+}
+
+/// 查某 host (IP 字面量或域名) 所在国家码。域名走系统解析取首个 IP。查不到 None。
+fn region_for_host(geoip: &GeoIpDb, host: &str) -> Option<String> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    let ip: IpAddr = if let Ok(ip) = host.parse::<IpAddr>() {
+        ip
+    } else {
+        (host, 0u16).to_socket_addrs().ok()?.next()?.ip()
+    };
+    mirage_rs::router::geo::country_for_ip(geoip, ip)
+}
+
+/// 配置里 mirage 节点若跨多个区域, 返回告警串 (供 --group 建组时提示混区域)。
+/// 无 geoip / 全同区 / <2 区域 → None。少量节点顺序解析。
+fn mixed_region_warning(root: &serde_json::Value, geoip: &GeoIpDb) -> Option<String> {
+    let mut by_region: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut unknown = 0usize;
+    for (_tag, server, ..) in mirage_outbounds(root) {
+        match region_for_host(geoip, &server) {
+            Some(c) => *by_region.entry(c).or_default() += 1,
+            None => unknown += 1,
+        }
+    }
+    if by_region.len() <= 1 {
+        return None;
+    }
+    let summary: Vec<String> = by_region.iter().map(|(c, n)| format!("{c}×{n}")).collect();
+    Some(format!(
+        "⚠ 组内节点跨 {} 个区域 ({}{}) —— 负载均衡/自动选路会让出口国不一致 (落地解锁/延迟受影响)。建议同区域各自分组。",
+        by_region.len(),
+        summary.join(" "),
+        if unknown > 0 { format!(", {unknown} 个未知") } else { String::new() }
+    ))
 }
 
 /// 从配置 root 里抽出全部 mirage 出站的连接参数 (tag, host, port, password, sni)。
@@ -505,9 +559,18 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64, http_pr
         }
     }
 
+    // 节点区域 (GeoIP 查 server IP; 无 geoip.dat 则空)。少量节点, 顺序解析即可。
+    let geoip = load_node_geoip(&root);
+    let regions: Vec<String> = nodes.iter().map(|(_, server, ..)| {
+        geoip.as_ref()
+            .and_then(|db| region_for_host(db, server))
+            .map(|c| format!("[{c}]"))
+            .unwrap_or_default()
+    }).collect();
+
     let mut failed = 0;
     for (i, (tag, server, port, ..)) in nodes.iter().enumerate() {
-        print!("  {tag:<16} {server}:{port}  … ");
+        print!("  {tag:<16} {server}:{port} {:<5} … ", regions[i]);
         let outcome = results[i].take().unwrap_or_else(|| ProbeOutcome::Fail("内部错误: 探测任务未返回".into()));
         match outcome {
             ProbeOutcome::Ok { tcp_ms, handshake_ms, http_ms } => {
