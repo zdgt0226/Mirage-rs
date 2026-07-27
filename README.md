@@ -851,7 +851,7 @@ sudo bash install.sh
 
 **性能 (计划 v0.7.0, 需先 profile 定位瓶颈再动手)**
 
-- [ ] **加密吞吐** —— AEAD 热路径 (ring) 是隧道大流量主耗, 看批处理 / 对齐硬件 AES-NI
+- [ ] **加密吞吐 (首选, 已 profile)** —— 隧道硬编码 ChaCha20-Poly1305, 不吃 AES-NI。实测本机 AES-256-GCM 比 ChaCha20 快 **2.1x** (release), 回环隧道 154 MB/s 加密占大头。方向: **cipher agility** (有 AES-NI 用 AES-GCM, 否则 ChaCha20, 即 TLS 做法; 需两端协商 cipher, 注意向后兼容)
 - [ ] **隧道 relay 缓冲/合帧再调** —— 当前 BufWriter 64KB, 高 BDP 链路可能有余量
 - [ ] **io_uring 替代 relay 的 read/write 循环** —— 大工程, 高并发小包收益明显
 - [ ] **MSS clamp / 网络层** —— 见 landscape 参考 P1

@@ -5,7 +5,7 @@ category: decision
 status: draft
 tags: [roadmap, performance]
 created: "2026-07-27T08:58:17"
-updated: "2026-07-27T09:00:38"
+updated: "2026-07-27T09:31:43"
 ---
 
 ## compiled_truth
@@ -49,4 +49,10 @@ v0.7.0 起挑, 先 profile。关联 [[unified-outbound-stream]] (架构地基, �
   kind: decision
   summary: "v0.7.0 起做性能 4 候选(加密吞吐/relay合帧/io_uring/MSS), 先 profile; 统一出站接口重构本身不提速(持平)"
   source: brain update-truth
+  affects: [perf-roadmap-v070]
+
+- time: 2026-07-27T09:31:43
+  kind: evidence
+  summary: "Profiling: 隧道硬编码 ChaCha20(不吃 AES-NI); 本 CPU AES-256-GCM=2.10x ChaCha20(release); 回环隧道 154MB/s 加密占大头. 结论: 候选#1 加密(cipher agility 有AES-NI用AES-GCM)证据最硬风险最低, 首选"
+  source: "cipher_bench + 回环吞吐实测"
   affects: [perf-roadmap-v070]

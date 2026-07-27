@@ -265,3 +265,36 @@ pub fn create_crypto_pair<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         CryptoWriter::new(writer, &master, is_initiator),
     )
 }
+
+#[cfg(test)]
+mod cipher_bench {
+    use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+    use std::time::Instant;
+
+    fn bench(alg: &'static aead::Algorithm, name: &str) -> f64 {
+        let key = LessSafeKey::new(UnboundKey::new(alg, &[0x42u8; 32]).unwrap());
+        let mut buf = vec![0u8; 16384 + 16]; // 16KB record + tag 空间
+        let iters = 200_000u64; // 200k × 16KB ≈ 3.1 GB
+        let t = Instant::now();
+        for i in 0..iters {
+            let mut nb = [0u8; 12];
+            nb[4..12].copy_from_slice(&i.to_be_bytes());
+            buf.truncate(16384);
+            key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nb), Aad::empty(), &mut buf).unwrap();
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let gb = (iters * 16384) as f64 / 1e9;
+        let gbps = gb / secs;
+        println!("  {name:22} {gbps:6.2} GB/s  ({gb:.1} GB in {secs:.2}s)");
+        gbps
+    }
+
+    #[test]
+    #[ignore]
+    fn compare_chacha_vs_aesgcm() {
+        println!("\n== AEAD seal 吞吐 (16KB record, 本 CPU) ==");
+        let cc = bench(&aead::CHACHA20_POLY1305, "ChaCha20-Poly1305");
+        let aes = bench(&aead::AES_256_GCM, "AES-256-GCM");
+        println!("  → AES-256-GCM / ChaCha20 = {:.2}x", aes / cc);
+    }
+}
