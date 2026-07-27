@@ -1,5 +1,23 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(cli): `mirage-rs export` —— 交互式导出配置片段 (subscribe 的反向)
+
+从本地配置挑节点导出为可分享 JSON 片段 (下一版做 JSON 导入侧闭环):
+
+```
+mirage-rs export -c config.json -o share.json
+mirage-rs export -c config.json > share.json   # 无 -o 写 stdout (提示走 stderr, 不污染)
+```
+
+- 交互问三样: 导出哪些 mirage 节点 (回车/`all`=全部, 或 `1,3,5-7` 选部分) · 是否带路由规则 ·
+  是否带 geo 下载地址 (`geo_sources`/`geodata_dir`)。
+- **组自动按所选节点匹配**: 组内未选成员剔除, 剔空则跳过 (嵌套组 fixpoint 收敛); 引用到未导出
+  出站的规则丢弃, `default_outbound` 悬空则不带。被组/规则引用的 `direct`/`block` 一并带上。
+- 输出格式 `{ nodes:[mirage], outbounds:[组+direct/block], routing?:{rules,default_outbound}, geo_sources?, geodata_dir? }`。
+- 核心 `build_export` 抽为纯函数; 单测: 组过滤/悬空规则丢弃/direct 携带/序号选择解析 (区间+去重+越界)。
+
 ## [v0.6.7] - 负载均衡组 + 订阅导入 + 节点区域判定 (2026-07-28)
 
 ### feat(outbound): 负载均衡出站组 `load_balance` (round-robin)

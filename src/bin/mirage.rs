@@ -154,6 +154,20 @@ enum Mode {
         #[arg(long, default_value_t = 15)]
         timeout: u64,
     },
+    /// 交互式导出配置片段 (选节点 + 匹配的组/路由/geo) 为可分享 JSON
+    ///
+    /// 询问导出哪些 mirage 节点 (全部/部分)、是否带路由规则、是否带 geo 下载地址。
+    /// 组自动按所选节点过滤成员 (剔除未选的, 剔空则跳过); 引用到未导出出站的规则丢弃。
+    ///   mirage-rs export -c config.json -o share.json
+    ///   mirage-rs export -c config.json > share.json   # 无 -o 则写 stdout
+    Export {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "config.json")]
+        config: String,
+        /// 输出文件 (缺省写 stdout; 交互提示走 stderr, 不污染)
+        #[arg(short, long)]
+        out: Option<String>,
+    },
 }
 
 /// 校验配置。返回进程退出码: 0 = 干净, 1 = 有问题 / 读不了 / 解析失败。
@@ -821,6 +835,252 @@ fn load_lite<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     serde_json::from_str(&content).with_context(|| format!("解析轻量配置 {path} 失败"))
 }
 
+/// 从整份配置构造导出片段 (纯函数, 便于单测)。
+///
+/// `picked` = 要导出的 mirage 节点 tag。组自动纳入 —— 成员过滤到已导出集合 (所选节点 +
+/// direct/block + 已纳入组), 剔空则跳过, 嵌套组靠 fixpoint 收敛。规则/geo 按开关带上;
+/// 规则只留 `outbound` 指向已导出出站的; 被引用的 direct/block 对象一并带出。
+fn build_export(
+    root: &serde_json::Value,
+    picked: &std::collections::HashSet<String>,
+    include_rules: bool,
+    include_geo: bool,
+) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let empty = Vec::new();
+    let outbounds = root.get("outbounds").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let type_of = |o: &Value| o.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let tag_of = |o: &Value| o.get("tag").and_then(|t| t.as_str()).unwrap_or("").to_string();
+
+    // 导出的 mirage 节点对象
+    let nodes: Vec<Value> = outbounds.iter()
+        .filter(|o| type_of(o) == "mirage" && picked.contains(&tag_of(o)))
+        .cloned().collect();
+
+    // 已导出出站集合 (供组/规则引用解析): 所选节点 + 全部 direct/block (内建叶子)
+    let mut exported: std::collections::HashSet<String> = picked.clone();
+    for o in outbounds {
+        let t = type_of(o);
+        if t == "direct" || t == "block" {
+            exported.insert(tag_of(o));
+        }
+    }
+
+    // 组 fixpoint: 反复纳入"过滤后成员非空"的组, 成员过滤到 exported
+    let group_types = ["urltest", "fallback", "selector", "load_balance"];
+    let all_groups: Vec<&Value> = outbounds.iter()
+        .filter(|o| group_types.contains(&type_of(o).as_str()))
+        .collect();
+    let mut kept_groups: Vec<Value> = Vec::new();
+    loop {
+        let mut added = false;
+        for g in &all_groups {
+            let tag = tag_of(g);
+            if tag.is_empty() || exported.contains(&tag) {
+                continue; // 无 tag 或已纳入
+            }
+            let Some(members) = g.get("outbounds").and_then(|m| m.as_array()) else { continue };
+            let kept: Vec<Value> = members.iter()
+                .filter(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false))
+                .cloned().collect();
+            if kept.is_empty() {
+                continue; // 成员全未选; 可能下轮某被引用组被纳入后再够, 留给后续 pass
+            }
+            let mut gc = (*g).clone();
+            gc["outbounds"] = Value::Array(kept);
+            kept_groups.push(gc);
+            exported.insert(tag);
+            added = true;
+        }
+        if !added {
+            break;
+        }
+    }
+
+    // 收集被引用 tag (组成员 + 后面规则的 outbound), 决定带哪些 direct/block
+    let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for g in &kept_groups {
+        if let Some(ms) = g.get("outbounds").and_then(|m| m.as_array()) {
+            for m in ms {
+                if let Some(s) = m.as_str() {
+                    referenced.insert(s.to_string());
+                }
+            }
+        }
+    }
+
+    // 路由 (可选): 只留 outbound ∈ exported 的规则; default_outbound 同理
+    let routing = root.get("routing");
+    let mut out_routing = serde_json::Map::new();
+    if include_rules {
+        if let Some(rules) = routing.and_then(|r| r.get("rules")).and_then(|r| r.as_array()) {
+            let kept_rules: Vec<Value> = rules.iter()
+                .filter(|r| r.get("outbound").and_then(|o| o.as_str())
+                    .map(|o| exported.contains(o)).unwrap_or(false))
+                .cloned().collect();
+            for r in &kept_rules {
+                if let Some(o) = r.get("outbound").and_then(|o| o.as_str()) {
+                    referenced.insert(o.to_string());
+                }
+            }
+            out_routing.insert("rules".into(), Value::Array(kept_rules));
+        }
+        if let Some(d) = routing.and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()) {
+            if exported.contains(d) {
+                out_routing.insert("default_outbound".into(), json!(d));
+                referenced.insert(d.to_string());
+            }
+        }
+    }
+
+    // 被引用的 direct/block 对象带上 (和组一起放 outbounds)
+    let mut out_outbounds = kept_groups;
+    for o in outbounds {
+        let t = type_of(o);
+        if (t == "direct" || t == "block") && referenced.contains(&tag_of(o)) {
+            out_outbounds.push((*o).clone());
+        }
+    }
+
+    let mut export = serde_json::Map::new();
+    export.insert("nodes".into(), Value::Array(nodes));
+    export.insert("outbounds".into(), Value::Array(out_outbounds));
+    if !out_routing.is_empty() {
+        export.insert("routing".into(), Value::Object(out_routing));
+    }
+    if include_geo {
+        if let Some(tuning) = root.get("tuning") {
+            if let Some(gs) = tuning.get("geo_sources") {
+                export.insert("geo_sources".into(), gs.clone());
+            }
+            if let Some(dir) = tuning.get("geodata_dir") {
+                export.insert("geodata_dir".into(), dir.clone());
+            }
+        }
+    }
+    Value::Object(export)
+}
+
+/// 解析 "1,3,5-7" 形式的 1-based 序号选择为 0-based 去重升序索引。越界/非法 → Err。
+fn parse_index_selection(sel: &str, n: usize) -> Result<Vec<usize>, String> {
+    let mut set = std::collections::BTreeSet::new();
+    for part in sel.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some((a, b)) = part.split_once('-') {
+            let a: usize = a.trim().parse().map_err(|_| format!("非法区间 `{part}`"))?;
+            let b: usize = b.trim().parse().map_err(|_| format!("非法区间 `{part}`"))?;
+            if a == 0 || a > b || b > n {
+                return Err(format!("区间 `{part}` 越界 (有效 1..={n})"));
+            }
+            for i in a..=b {
+                set.insert(i - 1);
+            }
+        } else {
+            let i: usize = part.parse().map_err(|_| format!("非法序号 `{part}`"))?;
+            if i == 0 || i > n {
+                return Err(format!("序号 `{i}` 越界 (有效 1..={n})"));
+            }
+            set.insert(i - 1);
+        }
+    }
+    if set.is_empty() {
+        return Err("空选择".into());
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// 读一行 stdin (trim)。EOF / 管道关闭 → 空串。提示走 stderr (不污染 stdout 的 JSON)。
+fn prompt_line(prompt: &str) -> String {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt} ");
+    let _ = std::io::stderr().flush();
+    let mut s = String::new();
+    match std::io::stdin().lock().read_line(&mut s) {
+        Ok(0) | Err(_) => String::new(),
+        Ok(_) => s.trim().to_string(),
+    }
+}
+
+/// y/n 提示。空 / EOF → default。
+fn prompt_yes_no(prompt: &str, default: bool) -> bool {
+    let d = if default { "Y/n" } else { "y/N" };
+    let ans = prompt_line(&format!("{prompt} [{d}]:"));
+    match ans.chars().next() {
+        Some('y' | 'Y') => true,
+        Some('n' | 'N') => false,
+        _ => default,
+    }
+}
+
+/// 交互式导出配置片段。列 mirage 节点让用户选, 问是否带规则/geo, 构造后写 out 或 stdout。
+fn run_export(path: &str, out: Option<&str>) -> i32 {
+    use std::io::Write;
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("✗ 读不了 {path}: {e}"); return 1; }
+    };
+    let root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("✗ {path} 不是合法 JSON: {e}"); return 1; }
+    };
+    let empty = Vec::new();
+    let nodes: Vec<&serde_json::Value> = root.get("outbounds").and_then(|v| v.as_array()).unwrap_or(&empty)
+        .iter().filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("mirage")).collect();
+    if nodes.is_empty() {
+        eprintln!("✗ {path} 里没有 mirage 节点可导出");
+        return 1;
+    }
+    eprintln!("mirage 节点 ({} 个):", nodes.len());
+    for (i, n) in nodes.iter().enumerate() {
+        let tag = n.get("tag").and_then(|t| t.as_str()).unwrap_or("?");
+        let server = n.get("server").and_then(|t| t.as_str()).unwrap_or("?");
+        let port = n.get("server_port").and_then(|p| p.as_u64()).unwrap_or(0);
+        eprintln!("  [{}] {tag}  {server}:{port}", i + 1);
+    }
+    let sel = prompt_line("选导出哪些 (回车/all=全部, 或 1,3,5-7):");
+    let picked: std::collections::HashSet<String> = if sel.is_empty() || sel == "all" {
+        nodes.iter().filter_map(|n| n.get("tag").and_then(|t| t.as_str()).map(str::to_string)).collect()
+    } else {
+        match parse_index_selection(&sel, nodes.len()) {
+            Ok(idxs) => idxs.iter()
+                .filter_map(|&i| nodes[i].get("tag").and_then(|t| t.as_str()).map(str::to_string)).collect(),
+            Err(e) => { eprintln!("✗ 选择无效: {e}"); return 1; }
+        }
+    };
+    if picked.is_empty() {
+        eprintln!("✗ 没选中任何节点");
+        return 1;
+    }
+    let include_rules = prompt_yes_no("导出路由规则? (只带指向已选出站的)", true);
+    let include_geo = prompt_yes_no("导出 geo 下载地址 (geo_sources/geodata_dir)?", true);
+
+    let export = build_export(&root, &picked, include_rules, include_geo);
+    let ng = export.get("outbounds").and_then(|o| o.as_array()).map(|a| a.len()).unwrap_or(0);
+    eprintln!(
+        "导出 {} 个节点, {ng} 个出站(组/direct/block){}{}。",
+        picked.len(),
+        if include_rules { ", 带路由规则" } else { "" },
+        if include_geo { ", 带 geo" } else { "" },
+    );
+
+    let rendered = match serde_json::to_string_pretty(&export) {
+        Ok(s) => s + "\n",
+        Err(e) => { eprintln!("✗ 序列化失败: {e}"); return 1; }
+    };
+    match out {
+        Some(p) => {
+            if let Err(e) = std::fs::write(p, &rendered) {
+                eprintln!("✗ 写 {p} 失败: {e}");
+                return 1;
+            }
+            eprintln!("✓ 已写 {p}");
+        }
+        None => {
+            let _ = std::io::stdout().write_all(rendered.as_bytes());
+        }
+    }
+    0
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -829,6 +1089,7 @@ async fn main() -> anyhow::Result<()> {
     match &args.mode {
         Mode::Check { config } => std::process::exit(run_check(config)),
         Mode::Format { config } => std::process::exit(run_format(config)),
+        Mode::Export { config, out } => std::process::exit(run_export(config, out.as_deref())),
         _ => {}
     }
 
@@ -890,7 +1151,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mirage_outbounds, parse_subscription, unique_auto_tag};
+    use super::{build_export, mirage_outbounds, parse_index_selection, parse_subscription, unique_auto_tag};
 
     #[test]
     fn parse_subscription_plaintext_and_filters() {
@@ -1030,5 +1291,81 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(old, None, "原本无 default");
         assert_eq!(root["routing"]["default_outbound"], "auto", "已创建 routing 并指向组");
+    }
+
+    #[test]
+    fn index_selection_parses_ranges_and_dedups() {
+        assert_eq!(parse_index_selection("1,3,5-7", 7).unwrap(), vec![0, 2, 4, 5, 6]);
+        assert_eq!(parse_index_selection("2, 2 , 1", 3).unwrap(), vec![0, 1], "去重+排序");
+        assert!(parse_index_selection("5", 3).is_err(), "越上界");
+        assert!(parse_index_selection("0", 3).is_err(), "0 非法 (1-based)");
+        assert!(parse_index_selection("3-1", 3).is_err(), "逆区间");
+        assert!(parse_index_selection("x", 3).is_err(), "非数字");
+        assert!(parse_index_selection("", 3).is_err(), "空选择");
+    }
+
+    fn cfg_for_export() -> serde_json::Value {
+        serde_json::json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "mirage", "tag": "n2", "server": "h2", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "mirage", "tag": "n3", "server": "h3", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "direct", "tag": "direct" },
+                { "type": "load_balance", "tag": "grpA", "outbounds": ["n1", "n2", "direct"] },
+                { "type": "urltest",      "tag": "grpB", "outbounds": ["n2", "n3"] },
+                { "type": "urltest",      "tag": "grpC", "outbounds": ["n3"] }
+            ],
+            "routing": { "default_outbound": "grpB", "rules": [
+                { "outbound": "grpA", "domain_suffix": "a.com" },
+                { "outbound": "n3",   "domain_suffix": "b.com" }
+            ] },
+            "tuning": { "geodata_dir": "/etc/mirage/geo", "geo_sources": [ { "kind": "geoip", "name": "geoip", "url": "http://x/geoip.dat" } ] }
+        })
+    }
+
+    #[test]
+    fn export_filters_groups_rules_and_carries_referenced_direct() {
+        let root = cfg_for_export();
+        let picked: std::collections::HashSet<String> = ["n1", "n2"].iter().map(|s| s.to_string()).collect();
+        let e = build_export(&root, &picked, true, true);
+
+        // 节点: 只 n1,n2
+        let nodes = e["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+
+        // 组: grpA 全在 (n1,n2,direct) 保留; grpB 剔除 n3 → [n2]; grpC 全未选 → 跳过
+        let groups: std::collections::HashMap<&str, &serde_json::Value> = e["outbounds"].as_array().unwrap()
+            .iter().filter(|o| o["type"] == "load_balance" || o["type"] == "urltest")
+            .map(|o| (o["tag"].as_str().unwrap(), o)).collect();
+        assert!(groups.contains_key("grpA"));
+        assert_eq!(groups["grpA"]["outbounds"], serde_json::json!(["n1", "n2", "direct"]));
+        assert_eq!(groups["grpB"]["outbounds"], serde_json::json!(["n2"]), "剔除未选 n3");
+        assert!(!groups.contains_key("grpC"), "全未选 → 跳过");
+
+        // direct 被 grpA 引用 → 带上
+        assert!(e["outbounds"].as_array().unwrap().iter().any(|o| o["tag"] == "direct"));
+
+        // 规则: grpA 规则留, n3 规则丢; default_outbound=grpB 保留 (grpB 已导出)
+        let rules = e["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["outbound"], "grpA");
+        assert_eq!(e["routing"]["default_outbound"], "grpB");
+
+        // geo 带上
+        assert_eq!(e["geodata_dir"], "/etc/mirage/geo");
+        assert!(e["geo_sources"].is_array());
+    }
+
+    #[test]
+    fn export_can_drop_rules_and_geo() {
+        let root = cfg_for_export();
+        let picked: std::collections::HashSet<String> = ["n1", "n2", "n3"].iter().map(|s| s.to_string()).collect();
+        let e = build_export(&root, &picked, false, false);
+        assert!(e.get("routing").is_none(), "不带规则时无 routing");
+        assert!(e.get("geo_sources").is_none(), "不带 geo");
+        // 全选 → grpB 完整保留, grpC 保留
+        let tags: Vec<&str> = e["outbounds"].as_array().unwrap().iter()
+            .filter_map(|o| o["tag"].as_str()).collect();
+        assert!(tags.contains(&"grpB") && tags.contains(&"grpC"));
     }
 }

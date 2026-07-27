@@ -1,10 +1,11 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-27T16:50:07.582Z._
+_Auto-generated. Last updated 2026-07-27T17:21:36.286Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
 - [chain-proxy-roadmap](pages/chain-proxy-roadmap.md) — category: decision | status: draft | tags: [roadmap, chain-proxy, wireguard, shadowsocks, architecture] | ## 用户诉求 (2026-07-27)
+- [config-export-fragment](pages/config-export-fragment.md) — category: decision | tags: [cli, export, subscription, config, share] | `mirage-rs export` = subscribe 的反向。
 - [dns-direct-upstream-tcp](pages/dns-direct-upstream-tcp.md) — category: decision | tags: [dns, upstream, tcp, config] | ## 决定
 - [dns-hijack-lan](pages/dns-hijack-lan.md) — category: decision | tags: [dns, transparent, tc_divert, fakeip] | ## 决定
 - [dns-ip-strategy](pages/dns-ip-strategy.md) — category: decision | tags: [dns, ipv6, static, strategy] | ## 决定
