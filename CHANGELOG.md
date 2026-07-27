@@ -18,6 +18,10 @@ mirage-rs export -c config.json > share.json   # 无 -o 写 stdout (提示走 st
 - 输出格式 `{ nodes:[mirage], outbounds:[组+direct/block], routing?:{rules,default_outbound}, geo_sources?, geodata_dir? }`。
 - 核心 `build_export` 抽为纯函数; 单测: 组过滤/悬空规则丢弃/direct 携带/序号选择解析 (区间+去重+越界)。
 
+**审计修复 (Sonnet)**: 组 fixpoint 原单阶段有序 bug —— 组A 引用组B 且排在 B 前时, A 成员被冻结成
+缺 B 后不再重算, 永久缺 B。改两阶段 (先求可达出站集合, 收敛后再按最终集合过滤成员), 加嵌套回归
+测试。另加护栏: `-o` 指向源配置同一文件时**拒绝** (导出是片段, 避免误覆盖源配置)。
+
 ## [v0.6.7] - 负载均衡组 + 订阅导入 + 节点区域判定 (2026-07-28)
 
 ### feat(outbound): 负载均衡出站组 `load_balance` (round-robin)

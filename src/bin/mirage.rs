@@ -866,12 +866,13 @@ fn build_export(
         }
     }
 
-    // 组 fixpoint: 反复纳入"过滤后成员非空"的组, 成员过滤到 exported
+    // 组 fixpoint (两阶段): 先纯求可达出站集合 exported (哪些组能被纳入), 收敛后再按**最终**
+    // 集合过滤每组成员。单阶段会有序 bug: 组A 引用组B 且先于 B 处理时, A 成员冻结成缺 B, 之后
+    // A 已在 exported 不再重算 → 永久缺 B。分开"求集合"与"过滤成员"即可避免。
     let group_types = ["urltest", "fallback", "selector", "load_balance"];
     let all_groups: Vec<&Value> = outbounds.iter()
         .filter(|o| group_types.contains(&type_of(o).as_str()))
         .collect();
-    let mut kept_groups: Vec<Value> = Vec::new();
     loop {
         let mut added = false;
         for g in &all_groups {
@@ -880,22 +881,31 @@ fn build_export(
                 continue; // 无 tag 或已纳入
             }
             let Some(members) = g.get("outbounds").and_then(|m| m.as_array()) else { continue };
-            let kept: Vec<Value> = members.iter()
-                .filter(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false))
-                .cloned().collect();
-            if kept.is_empty() {
-                continue; // 成员全未选; 可能下轮某被引用组被纳入后再够, 留给后续 pass
+            let has_member = members.iter()
+                .any(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false));
+            if has_member {
+                exported.insert(tag); // 至少一个成员可达 → 组可纳入
+                added = true;
             }
-            let mut gc = (*g).clone();
-            gc["outbounds"] = Value::Array(kept);
-            kept_groups.push(gc);
-            exported.insert(tag);
-            added = true;
         }
         if !added {
             break;
         }
     }
+    // exported 已收敛; 按最终集合过滤每个被纳入组的成员 (保持配置顺序)
+    let kept_groups: Vec<Value> = all_groups.iter().filter_map(|g| {
+        let tag = tag_of(g);
+        if tag.is_empty() || !exported.contains(&tag) {
+            return None;
+        }
+        let members = g.get("outbounds").and_then(|m| m.as_array())?;
+        let kept: Vec<Value> = members.iter()
+            .filter(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false))
+            .cloned().collect();
+        let mut gc = (*g).clone();
+        gc["outbounds"] = Value::Array(kept);
+        Some(gc)
+    }).collect();
 
     // 收集被引用 tag (组成员 + 后面规则的 outbound), 决定带哪些 direct/block
     let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1011,9 +1021,24 @@ fn prompt_yes_no(prompt: &str, default: bool) -> bool {
     }
 }
 
+/// 两路径是否指向同一文件 (都存在则比 canonicalize, 否则退化为字符串相等)。
+fn same_file(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 /// 交互式导出配置片段。列 mirage 节点让用户选, 问是否带规则/geo, 构造后写 out 或 stdout。
 fn run_export(path: &str, out: Option<&str>) -> i32 {
     use std::io::Write;
+    // 防误覆盖源配置: 导出的是**片段**不是完整配置, 写回 config 会毁掉它
+    if let Some(p) = out {
+        if same_file(p, path) {
+            eprintln!("✗ 拒绝: 输出 `{p}` 与源配置 `{path}` 是同一文件 (导出是片段, 会覆盖源配置)");
+            return 1;
+        }
+    }
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => { eprintln!("✗ 读不了 {path}: {e}"); return 1; }
@@ -1354,6 +1379,25 @@ mod tests {
         // geo 带上
         assert_eq!(e["geodata_dir"], "/etc/mirage/geo");
         assert!(e["geo_sources"].is_array());
+    }
+
+    #[test]
+    fn export_nested_group_before_dependency_keeps_member() {
+        // 组A 引用组B 且在配置里排在 B 前面 —— 修复前 (单阶段 fixpoint) A 会永久缺 B
+        let root = serde_json::json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "mirage", "tag": "n2", "server": "h2", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "fallback", "tag": "grpA", "outbounds": ["grpB", "n1"] },
+                { "type": "urltest",  "tag": "grpB", "outbounds": ["n2"] }
+            ]
+        });
+        let picked: std::collections::HashSet<String> = ["n1", "n2"].iter().map(|s| s.to_string()).collect();
+        let e = build_export(&root, &picked, false, false);
+        let ga = e["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grpA").unwrap();
+        assert_eq!(ga["outbounds"], serde_json::json!(["grpB", "n1"]), "嵌套组顺序无关, grpA 必须保留 grpB");
+        let gb = e["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grpB").unwrap();
+        assert_eq!(gb["outbounds"], serde_json::json!(["n2"]));
     }
 
     #[test]
