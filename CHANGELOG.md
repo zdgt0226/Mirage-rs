@@ -16,6 +16,22 @@
   节点, 查 IP 一致性的站点受影响 (会话粘滞的 consistent-hash 后续加)。
 - 单测: round-robin 轮流 / 无健康成员退路 / 构建+check / 未支持策略被拦。
 
+### feat(cli): `mirage-rs subscribe <url>` —— 订阅链接批量导入节点
+
+从订阅 URL 拉取并批量导入 mirage 节点为出站:
+
+```
+mirage-rs subscribe -c config.json https://example.com/sub
+mirage-rs subscribe -c config.json --group https://example.com/sub   # 顺带建 urltest 组
+```
+
+- **格式**: URL 返回每行一个 `mirage://` URI (整段是 base64 则先解码, 兼容经典订阅); 跳过
+  空行 / `#` 注释。复用 `node_uri` 解析 + `import` 的出站构造 + `--group` urltest 建组。
+- 按 `server:port` **去重** (重订阅只加新节点); tag 自动生成 (撞名加 `-2`/`-3`)。
+- 原子写回 (备份 + tmp + rename); `--group` 支持 interval/tolerance/test-type/url 调参。
+- 重构: 抽 `mirage_outbound_json` / `atomic_write_config` 供 import + subscribe 共用。
+- **周期自动刷新暂未做** (手动重跑; 加 --group 会重建组)。
+
 ## [v0.6.6] - process_name 分流 + dump_tls 工具 (2026-07-27)
 
 ### feat(route): process_name 分流 —— 按发起程序名路由 (本机 loopback 入站)

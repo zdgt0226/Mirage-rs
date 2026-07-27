@@ -110,7 +110,15 @@ mirage-rs import -c config.json --group \
 # 测已配 mirage 节点可用性 (完整握手 + 认证验证, 报 RTT; 全通过退出 0):
 mirage-rs test -c config.json            # 测全部 mirage 出站
 mirage-rs test -c config.json --tag proxy # 只测某个 tag
+
+# 从订阅 URL 批量导入节点 (按 server:port 去重, 自动 tag; --group 建 urltest 组按 RTT 选路):
+mirage-rs subscribe -c config.json https://example.com/sub
+mirage-rs subscribe -c config.json --group https://example.com/sub
 ```
+
+> **订阅格式**: URL 返回**每行一个 `mirage://` URI** (整段是 base64 则先解码, 兼容经典订阅格式);
+> 跳过空行 / `#` 注释。按 `server:port` 去重 (重订阅只加新节点); tag 自动生成 (撞名加 `-2`/`-3`)。
+> 周期自动刷新暂未做 —— 手动重跑即可 (加 `--group` 会对全部节点重建组)。
 
 > **urltest 测试方式 `test_type` 说明**: `ping` 与 `http` **完全等价** —— 都是**穿隧道 HTTP
 > 探测** (周期性 GET `--group-url` 的 generate_204), 量**端到端**耗时, 含 VPS 到目标的**出口
@@ -862,7 +870,7 @@ sudo bash install.sh
 - [ ] **IPv6 全栈** —— 当前 WireGuard 与透明代理数据面均 **IPv4-only** (DNS 层已可控 v4/v6 返回, 但数据面未通)。这是最大的结构性缺口, IPv6 优先/仅 IPv6 网络 (尤其国内移动网) 下会漏流量或不可用
 - [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
-- [ ] **订阅链接** —— `node_uri` + `import` 基础已有, 但订阅**格式本身要先定义**
+- [~] **订阅链接** —— `mirage-rs subscribe <url>` 批量导入 (格式=每行 `mirage://` 或整段 base64, server:port 去重, 可选 --group)。**周期自动刷新**待做
 - [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连
 - [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段
 - [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
