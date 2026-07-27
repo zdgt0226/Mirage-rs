@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [cli, export, subscription, config, share]
 created: "2026-07-28T01:20:41"
-updated: "2026-07-28T01:20:42"
+updated: "2026-07-28T02:00:04"
 ---
 
 ## compiled_truth
@@ -42,3 +42,8 @@ updated: "2026-07-28T01:20:42"
   summary: "mirage-rs export 导出可分享 JSON 片段; 也是 subscription-with-config 的落定格式"
   source: brain update-truth
   affects: [config-export-fragment]
+
+- time: 2026-07-28T02:00:04
+  kind: decision
+  summary: "闭环: subscribe 支持 JSON 片段+本地文件导入 (merge_fragment), 与 export 配对"
+  affects: [src/bin/mirage.rs]

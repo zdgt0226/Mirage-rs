@@ -121,18 +121,22 @@ enum Mode {
         #[arg(long, default_value = "http://www.gstatic.com/generate_204")]
         probe_url: String,
     },
-    /// 从订阅 URL 批量导入 mirage 节点为出站 (会写回配置文件)
+    /// 从来源 (URL 或本地文件) 导入节点 —— mirage:// 列表, 或 export 产出的 JSON 片段
     ///
-    /// 订阅格式: 每行一个 mirage:// URI (整段是 base64 则先解码, 兼容经典订阅)。
-    /// 按 server:port 去重, 自动生成 tag。可选 --group 建 urltest 组按 RTT 自动选路。
-    ///   mirage-rs subscribe -c config.json https://example.com/sub
+    /// 来源 payload 自动辨: 以 `{` 开头 = JSON 片段 (合并节点+组+可选路由/geo, 见 --routing);
+    /// 否则每行一个 mirage:// URI (整段 base64 则先解码)。按 server:port 去重, 自动 tag。
+    ///   mirage-rs subscribe -c config.json https://example.com/sub   # 远程列表
+    ///   mirage-rs subscribe -c config.json share.json                # 本地片段 (export 产出)
     Subscribe {
         /// Path to configuration file
         #[arg(short, long, default_value = "config.json")]
         config: String,
-        /// 订阅 URL (http/https, 返回 mirage:// 列表或其 base64)
-        url: String,
-        /// 建/更新 urltest 组纳入全部 mirage 节点 + 指向它 = 按 RTT 自动选路
+        /// 来源: URL (http/https) 或本地文件路径; 内容为 mirage:// 列表或 JSON 片段
+        source: String,
+        /// 合并 JSON 片段时**连同路由规则一起并入** (侵入性, 默认不并; 只对片段生效)
+        #[arg(long)]
+        routing: bool,
+        /// 建/更新 urltest 组纳入全部 mirage 节点 + 指向它 = 按 RTT 自动选路 (仅列表模式)
         #[arg(long)]
         group: bool,
         /// urltest 组名 (仅 --group 时生效)
@@ -535,8 +539,9 @@ fn parse_subscription(body: &str) -> Vec<mirage_rs::node_uri::NodeUri> {
         .collect()
 }
 
-/// 从订阅 URL 拉取节点列表, 批量导入为 mirage 出站 (按 server:port 去重), 可选建 urltest 组。
-async fn run_subscribe(path: &str, url: &str, group: Option<&str>, group_opts: &GroupOpts, timeout_secs: u64) -> i32 {
+/// 从来源 (URL 或本地文件) 导入节点。payload 以 `{` 开头 = export 的 JSON 片段 (合并
+/// 节点/组/可选路由/geo), 否则按 mirage:// 列表批量导入 (按 server:port 去重, 可选建组)。
+async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts: &GroupOpts, include_routing: bool, timeout_secs: u64) -> i32 {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => { eprintln!("✗ 读不了 {path}: {e}"); return 1; }
@@ -550,32 +555,46 @@ async fn run_subscribe(path: &str, url: &str, group: Option<&str>, group_opts: &
         return 1;
     }
 
-    print!("拉取订阅 {url} … ");
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => { eprintln!("✗ 构造 HTTP 客户端失败: {e}"); return 1; }
-    };
-    const MAX_SUB_BYTES: u64 = 8 * 1024 * 1024; // 订阅正常 KB 级; 8MB 上限防恶意大 body OOM
-    let body = match client.get(url).send().await.and_then(|r| r.error_for_status()) {
-        Ok(resp) => {
-            if let Some(len) = resp.content_length() {
-                if len > MAX_SUB_BYTES {
-                    eprintln!("✗ 订阅体过大 ({len} 字节 > {MAX_SUB_BYTES} 上限), 拒绝");
-                    return 1;
+    // 取 body: 本地文件优先, 否则当 URL 拉
+    let body = if std::path::Path::new(source).is_file() {
+        match std::fs::read_to_string(source) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("✗ 读不了 {source}: {e}"); return 1; }
+        }
+    } else {
+        print!("拉取订阅 {source} … ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => { eprintln!("✗ 构造 HTTP 客户端失败: {e}"); return 1; }
+        };
+        const MAX_SUB_BYTES: u64 = 8 * 1024 * 1024; // 订阅正常 KB 级; 8MB 上限防恶意大 body OOM
+        match client.get(source).send().await.and_then(|r| r.error_for_status()) {
+            Ok(resp) => {
+                if let Some(len) = resp.content_length() {
+                    if len > MAX_SUB_BYTES {
+                        eprintln!("✗ 订阅体过大 ({len} 字节 > {MAX_SUB_BYTES} 上限), 拒绝");
+                        return 1;
+                    }
+                }
+                match resp.text().await {
+                    Ok(t) => t,
+                    Err(e) => { eprintln!("✗ 读订阅响应失败: {e}"); return 1; }
                 }
             }
-            match resp.text().await {
-                Ok(t) => t,
-                Err(e) => { eprintln!("✗ 读订阅响应失败: {e}"); return 1; }
-            }
+            Err(e) => { eprintln!("✗ 拉订阅失败: {e}"); return 1; }
         }
-        Err(e) => { eprintln!("✗ 拉订阅失败: {e}"); return 1; }
     };
+
+    // JSON 片段 (export 产出) 走合并路径; 否则按 mirage:// 列表
+    if body.trim_start().starts_with('{') {
+        return apply_fragment(path, &content, root, &body, include_routing);
+    }
+
     let nodes = parse_subscription(&body);
     println!("解析到 {} 个 mirage 节点", nodes.len());
     if nodes.is_empty() {
@@ -833,6 +852,240 @@ fn load_lite<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读不了轻量配置 {path}"))?;
     serde_json::from_str(&content).with_context(|| format!("解析轻量配置 {path} 失败"))
+}
+
+/// 合并 JSON 片段的结果统计。
+#[derive(Default)]
+struct MergeReport {
+    added_nodes: u32,
+    dup_nodes: u32,
+    added_groups: u32,
+    added_geo: u32,
+    added_rules: u32,
+    dropped_rules: u32,
+    renamed: Vec<(String, String)>, // 片段原 tag → 改名后 (撞现有 tag)
+    skipped_groups: Vec<String>,    // 成员合并后为空而跳过的组 (改名后的 tag)
+}
+
+/// 把 export 产出的 JSON 片段合并进配置 root (纯函数, 便于单测)。
+///
+/// - 节点按 `server:port` 去重: dup 不重复加, 但把片段里它的 tag **重映射到配置里已有同址节点**,
+///   使引用它的组/规则不悬空。
+/// - tag 撞现有出站则自动改名 (`unique_auto_tag`), 并全程重映射到组成员 / 规则 outbound。
+/// - 组成员 / 规则 outbound 经重映射后仍不在最终出站集合里 → 丢弃 (组剔空则跳过整组)。
+/// - `direct`/`block` 同名已存在则跳过 (不重复内建叶子)。
+/// - `geo_sources` 按 `name` 去重合并; `geodata_dir` 仅在配置缺失时设。
+/// - `include_routing` 为真才并入 `routing.rules` (侵入性)。`default_outbound` **一律不动**。
+fn merge_fragment(root: &mut serde_json::Value, frag: &serde_json::Value, include_routing: bool) -> MergeReport {
+    use serde_json::Value;
+    let mut rep = MergeReport::default();
+    if !root.get("outbounds").map(|v| v.is_array()).unwrap_or(false) {
+        root["outbounds"] = Value::Array(Vec::new());
+    }
+
+    let mut taken = existing_outbound_tags(root);
+    // 现有 mirage 节点的 (host,port) → tag, 供 dup 重映射
+    let mut host_port: std::collections::HashMap<(String, u16), String> = std::collections::HashMap::new();
+    for o in root["outbounds"].as_array().unwrap() {
+        if o.get("type").and_then(|t| t.as_str()) == Some("mirage") {
+            if let (Some(h), Some(p)) = (o.get("server").and_then(|s| s.as_str()), o.get("server_port").and_then(|p| p.as_u64())) {
+                if let Ok(p) = u16::try_from(p) {
+                    host_port.insert((h.to_string(), p), o.get("tag").and_then(|t| t.as_str()).unwrap_or_default().to_string());
+                }
+            }
+        }
+    }
+
+    let empty = Vec::new();
+    let tag_of = |o: &Value| o.get("tag").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let type_of = |o: &Value| o.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let mut remap: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+    // 1. 节点
+    for n in frag.get("nodes").and_then(|n| n.as_array()).unwrap_or(&empty) {
+        let orig = tag_of(n);
+        let host = n.get("server").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let Some(port) = n.get("server_port").and_then(|p| p.as_u64()).and_then(|p| u16::try_from(p).ok()) else {
+            continue; // 无效端口, 跳过
+        };
+        let key = (host.clone(), port);
+        if let Some(existing) = host_port.get(&key) {
+            if !orig.is_empty() {
+                remap.insert(orig, existing.clone()); // dup → 指向已有节点
+            }
+            rep.dup_nodes += 1;
+            continue;
+        }
+        let base = if orig.is_empty() { host.as_str() } else { orig.as_str() };
+        let newtag = unique_auto_tag(base, &mut taken);
+        if !orig.is_empty() {
+            if newtag != orig {
+                rep.renamed.push((orig.clone(), newtag.clone()));
+            }
+            remap.insert(orig, newtag.clone());
+        }
+        let mut nc = n.clone();
+        nc["tag"] = Value::String(newtag.clone());
+        root["outbounds"].as_array_mut().unwrap().push(nc);
+        host_port.insert(key, newtag);
+        rep.added_nodes += 1;
+    }
+
+    // 2a. 组: 先给所有组分配最终 tag (登记 remap, 供成员前向引用)
+    let group_types = ["urltest", "fallback", "selector", "load_balance"];
+    let frag_out = frag.get("outbounds").and_then(|o| o.as_array()).unwrap_or(&empty);
+    let mut group_newtags: Vec<(usize, String)> = Vec::new();
+    for (i, g) in frag_out.iter().enumerate() {
+        if !group_types.contains(&type_of(g).as_str()) {
+            continue;
+        }
+        let orig = tag_of(g);
+        if orig.is_empty() {
+            continue;
+        }
+        let newtag = unique_auto_tag(&orig, &mut taken);
+        if newtag != orig {
+            rep.renamed.push((orig.clone(), newtag.clone()));
+        }
+        remap.insert(orig, newtag.clone());
+        group_newtags.push((i, newtag));
+    }
+    // 2b. direct/block: 同名已存在则跳过, 否则加 (remap 恒等)
+    for g in frag_out {
+        let t = type_of(g);
+        if t != "direct" && t != "block" {
+            continue;
+        }
+        let tag = tag_of(g);
+        if tag.is_empty() {
+            continue;
+        }
+        remap.entry(tag.clone()).or_insert_with(|| tag.clone());
+        if !taken.contains(&tag) {
+            root["outbounds"].as_array_mut().unwrap().push(g.clone());
+            taken.push(tag);
+        }
+    }
+
+    // 最终出站集合 (含组 newtag / 节点 / direct/block), 用于判断成员/规则是否悬空
+    let taken_set: std::collections::HashSet<String> = taken.iter().cloned().collect();
+
+    // 2c. 组成员重映射 + 落地 (剔空跳过)
+    for (i, newtag) in &group_newtags {
+        let g = &frag_out[*i];
+        let members = g.get("outbounds").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+        let mapped: Vec<Value> = members.iter().filter_map(|m| {
+            let s = m.as_str()?;
+            let resolved = remap.get(s).cloned().unwrap_or_else(|| s.to_string());
+            taken_set.contains(&resolved).then_some(Value::String(resolved))
+        }).collect();
+        if mapped.is_empty() {
+            rep.skipped_groups.push(newtag.clone());
+            continue;
+        }
+        let mut gc = g.clone();
+        gc["tag"] = Value::String(newtag.clone());
+        gc["outbounds"] = Value::Array(mapped);
+        root["outbounds"].as_array_mut().unwrap().push(gc);
+        rep.added_groups += 1;
+    }
+
+    // 3. 路由规则 (可选): outbound 重映射, 悬空丢弃; default_outbound 不动
+    if include_routing {
+        if let Some(rules) = frag.get("routing").and_then(|r| r.get("rules")).and_then(|r| r.as_array()) {
+            if !root.get("routing").map(|r| r.is_object()).unwrap_or(false) {
+                root["routing"] = serde_json::json!({});
+            }
+            if !root["routing"].get("rules").map(|r| r.is_array()).unwrap_or(false) {
+                root["routing"]["rules"] = Value::Array(Vec::new());
+            }
+            for r in rules {
+                let ob = r.get("outbound").and_then(|o| o.as_str()).unwrap_or("");
+                let resolved = remap.get(ob).cloned().unwrap_or_else(|| ob.to_string());
+                if !taken_set.contains(&resolved) {
+                    rep.dropped_rules += 1;
+                    continue;
+                }
+                let mut rc = r.clone();
+                rc["outbound"] = Value::String(resolved);
+                root["routing"]["rules"].as_array_mut().unwrap().push(rc);
+                rep.added_rules += 1;
+            }
+        }
+    }
+
+    // 4. geo_sources (按 name 去重) + geodata_dir (缺则设)
+    if let Some(gs) = frag.get("geo_sources").and_then(|g| g.as_array()) {
+        if !root.get("tuning").map(|t| t.is_object()).unwrap_or(false) {
+            root["tuning"] = serde_json::json!({});
+        }
+        if !root["tuning"].get("geo_sources").map(|g| g.is_array()).unwrap_or(false) {
+            root["tuning"]["geo_sources"] = Value::Array(Vec::new());
+        }
+        let have: std::collections::HashSet<String> = root["tuning"]["geo_sources"].as_array().unwrap().iter()
+            .filter_map(|s| s.get("name").and_then(|n| n.as_str()).map(str::to_string)).collect();
+        for s in gs {
+            let name = s.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.is_empty() || have.contains(name) {
+                continue;
+            }
+            root["tuning"]["geo_sources"].as_array_mut().unwrap().push(s.clone());
+            rep.added_geo += 1;
+        }
+    }
+    if let Some(dir) = frag.get("geodata_dir") {
+        if root.get("tuning").and_then(|t| t.get("geodata_dir")).is_none() {
+            if !root.get("tuning").map(|t| t.is_object()).unwrap_or(false) {
+                root["tuning"] = serde_json::json!({});
+            }
+            root["tuning"]["geodata_dir"] = dir.clone();
+        }
+    }
+
+    rep
+}
+
+/// 合并 JSON 片段并写回配置。校验片段含 nodes, 合并后原子写回, 打印统计。
+fn apply_fragment(path: &str, content: &str, mut root: serde_json::Value, body: &str, include_routing: bool) -> i32 {
+    let frag: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("✗ 片段不是合法 JSON: {e}"); return 1; }
+    };
+    if !frag.get("nodes").map(|n| n.is_array()).unwrap_or(false) {
+        eprintln!("✗ 片段缺 nodes 数组, 不像 export 产出的配置片段");
+        return 1;
+    }
+    let rep = merge_fragment(&mut root, &frag, include_routing);
+    if rep.added_nodes == 0 && rep.added_groups == 0 && rep.added_geo == 0 && rep.added_rules == 0 {
+        println!("✓ 片段无新增 (节点/组/geo/规则都已存在), 配置未改动");
+        return 0;
+    }
+    let rendered = match serde_json::to_string_pretty(&root) {
+        Ok(s) => s + "\n",
+        Err(e) => { eprintln!("✗ 序列化失败: {e}"); return 1; }
+    };
+    if let Err(e) = atomic_write_config(path, content, &rendered) {
+        eprintln!("✗ {e}");
+        return 1;
+    }
+    println!("✓ 已合并片段并写回 {path} (原文件备份: {path}.bak)");
+    println!(
+        "  节点 +{} (dup 跳过 {}), 组 +{}, geo +{}, {}",
+        rep.added_nodes, rep.dup_nodes, rep.added_groups, rep.added_geo,
+        if include_routing {
+            format!("规则 +{} (悬空丢弃 {})", rep.added_rules, rep.dropped_rules)
+        } else {
+            "未并路由 (加 --routing 才并规则)".to_string()
+        },
+    );
+    for (o, n) in &rep.renamed {
+        println!("  改名: `{o}` → `{n}` (撞现有 tag; 引用它的组/规则已同步)");
+    }
+    for g in &rep.skipped_groups {
+        println!("  跳过组 `{g}` (成员合并后为空)");
+    }
+    println!("  `mirage-rs check -c {path}` 确认后重启。");
+    0
 }
 
 /// 从整份配置构造导出片段 (纯函数, 便于单测)。
@@ -1138,7 +1391,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(run_import(config, uri, *test, *require_live, g, &opts, *timeout).await);
     }
     if let Mode::Subscribe {
-        config, url, group, group_name,
+        config, source, routing, group, group_name,
         group_interval, group_tolerance, group_url, group_test_type, timeout,
     } = &args.mode
     {
@@ -1149,7 +1402,7 @@ async fn main() -> anyhow::Result<()> {
             url: group_url.clone(),
             test_type: group_test_type.clone(),
         };
-        std::process::exit(run_subscribe(config, url, g, &opts, *timeout).await);
+        std::process::exit(run_subscribe(config, source, g, &opts, *routing, *timeout).await);
     }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
@@ -1176,7 +1429,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_export, mirage_outbounds, parse_index_selection, parse_subscription, unique_auto_tag};
+    use super::{build_export, merge_fragment, mirage_outbounds, parse_index_selection, parse_subscription, unique_auto_tag};
 
     #[test]
     fn parse_subscription_plaintext_and_filters() {
@@ -1398,6 +1651,84 @@ mod tests {
         assert_eq!(ga["outbounds"], serde_json::json!(["grpB", "n1"]), "嵌套组顺序无关, grpA 必须保留 grpB");
         let gb = e["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grpB").unwrap();
         assert_eq!(gb["outbounds"], serde_json::json!(["n2"]));
+    }
+
+    #[test]
+    fn merge_adds_nodes_group_geo() {
+        let mut root = serde_json::json!({ "outbounds": [ { "type": "direct", "tag": "direct" } ] });
+        let frag = serde_json::json!({
+            "nodes": [
+                { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" },
+                { "type": "mirage", "tag": "n2", "server": "h2", "server_port": 443, "password": "p", "camouflage_host": "s" }
+            ],
+            "outbounds": [ { "type": "load_balance", "tag": "lb", "outbounds": ["n1", "n2"] } ],
+            "geo_sources": [ { "kind": "geoip", "name": "geoip", "url": "http://x/geoip.dat" } ],
+            "geodata_dir": "/geo"
+        });
+        let rep = merge_fragment(&mut root, &frag, false);
+        assert_eq!((rep.added_nodes, rep.added_groups, rep.added_geo), (2, 1, 1));
+        let obs = root["outbounds"].as_array().unwrap();
+        let lb = obs.iter().find(|o| o["tag"] == "lb").unwrap();
+        assert_eq!(lb["outbounds"], serde_json::json!(["n1", "n2"]));
+        assert_eq!(root["tuning"]["geodata_dir"], "/geo");
+        assert_eq!(root["tuning"]["geo_sources"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_renames_colliding_tag_and_remaps_group() {
+        // 配置已有 tag n1 (不同 server) → 片段 n1 改名 n1-2, 组成员同步
+        let mut root = serde_json::json!({ "outbounds": [
+            { "type": "mirage", "tag": "n1", "server": "OTHER", "server_port": 443, "password": "p", "camouflage_host": "s" }
+        ]});
+        let frag = serde_json::json!({
+            "nodes": [ { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" } ],
+            "outbounds": [ { "type": "urltest", "tag": "grp", "outbounds": ["n1"] } ]
+        });
+        let rep = merge_fragment(&mut root, &frag, false);
+        assert_eq!(rep.added_nodes, 1);
+        assert_eq!(rep.renamed, vec![("n1".to_string(), "n1-2".to_string())]);
+        let grp = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grp").unwrap();
+        assert_eq!(grp["outbounds"], serde_json::json!(["n1-2"]), "组成员重映射到改名后");
+    }
+
+    #[test]
+    fn merge_dedups_by_hostport_remaps_to_existing() {
+        // 配置已有同址节点 (tag existing) → 片段 n1 dup, 组引用指向 existing
+        let mut root = serde_json::json!({ "outbounds": [
+            { "type": "mirage", "tag": "existing", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" }
+        ]});
+        let frag = serde_json::json!({
+            "nodes": [ { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" } ],
+            "outbounds": [ { "type": "urltest", "tag": "grp", "outbounds": ["n1"] } ]
+        });
+        let rep = merge_fragment(&mut root, &frag, false);
+        assert_eq!((rep.added_nodes, rep.dup_nodes), (0, 1));
+        let grp = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grp").unwrap();
+        assert_eq!(grp["outbounds"], serde_json::json!(["existing"]), "dup 节点的组引用指向已有 tag");
+    }
+
+    #[test]
+    fn merge_routing_gated_and_drops_dangling() {
+        let frag = serde_json::json!({
+            "nodes": [ { "type": "mirage", "tag": "n1", "server": "h1", "server_port": 443, "password": "p", "camouflage_host": "s" } ],
+            "outbounds": [],
+            "routing": { "rules": [
+                { "outbound": "n1", "domain_suffix": "a.com" },
+                { "outbound": "ghost", "domain_suffix": "b.com" }
+            ] }
+        });
+        // 不带 routing → 规则不并
+        let mut r1 = serde_json::json!({ "outbounds": [] });
+        let rep1 = merge_fragment(&mut r1, &frag, false);
+        assert_eq!(rep1.added_rules, 0);
+        assert!(r1.get("routing").is_none(), "未 --routing 不建 routing");
+        // 带 routing → n1 规则留, ghost 悬空丢
+        let mut r2 = serde_json::json!({ "outbounds": [] });
+        let rep2 = merge_fragment(&mut r2, &frag, true);
+        assert_eq!((rep2.added_rules, rep2.dropped_rules), (1, 1));
+        let rules = r2["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["outbound"], "n1");
     }
 
     #[test]

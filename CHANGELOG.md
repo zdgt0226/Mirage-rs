@@ -22,6 +22,25 @@ mirage-rs export -c config.json > share.json   # 无 -o 写 stdout (提示走 st
 缺 B 后不再重算, 永久缺 B。改两阶段 (先求可达出站集合, 收敛后再按最终集合过滤成员), 加嵌套回归
 测试。另加护栏: `-o` 指向源配置同一文件时**拒绝** (导出是片段, 避免误覆盖源配置)。
 
+### feat(cli): `subscribe` 支持 JSON 片段 + 本地文件 —— 闭合 export/import 环
+
+`subscribe` 现在既能吃 mirage:// 列表, 也能吃 `export` 产出的 **JSON 片段**; 来源既能是 URL 也能是
+**本地文件**。payload 以 `{` 开头即走片段合并:
+
+```
+mirage-rs subscribe -c config.json share.json              # 合并本地片段
+mirage-rs subscribe -c config.json --routing share.json    # 连路由规则一起并 (侵入, 默认不并)
+mirage-rs subscribe -c config.json https://host/share.json # 也能远程拉片段
+```
+
+- 节点按 `server:port` 去重: dup 不重复加, 但把片段里它的 tag **重映射到配置已有同址节点**,
+  引用它的组/规则不悬空。tag 撞现有出站则自动改名并全程重映射到组成员/规则 outbound。
+- 组成员 / 规则 outbound 重映射后仍悬空 → 丢弃 (组剔空跳过)。`direct`/`block` 同名已存在则跳过。
+- `--routing` 才并 `routing.rules` (侵入); `default_outbound` **一律不动**。`geo_sources` 按 name
+  去重, `geodata_dir` 缺则设。
+- 核心 `merge_fragment` 纯函数; 单测: 加节点/组/geo · 撞名改名+组重映射 · server:port dup 重映射到
+  已有 · 路由开关+悬空规则丢弃。e2e: `export` 子集 → `subscribe` 合并 round-trip。
+
 ## [v0.6.7] - 负载均衡组 + 订阅导入 + 节点区域判定 (2026-07-28)
 
 ### feat(outbound): 负载均衡出站组 `load_balance` (round-robin)

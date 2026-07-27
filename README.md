@@ -111,9 +111,11 @@ mirage-rs import -c config.json --group \
 mirage-rs test -c config.json            # 测全部 mirage 出站
 mirage-rs test -c config.json --tag proxy # 只测某个 tag
 
-# 从订阅 URL 批量导入节点 (按 server:port 去重, 自动 tag; --group 建 urltest 组按 RTT 选路):
-mirage-rs subscribe -c config.json https://example.com/sub
-mirage-rs subscribe -c config.json --group https://example.com/sub
+# 批量导入节点: 来源可为 URL 或本地文件; 内容可为 mirage:// 列表 或 export 的 JSON 片段:
+mirage-rs subscribe -c config.json https://example.com/sub   # 远程 mirage:// 列表 (经典订阅)
+mirage-rs subscribe -c config.json --group https://example.com/sub  # 顺带建 urltest 组
+mirage-rs subscribe -c config.json share.json                # 合并本地 JSON 片段 (export 产出)
+mirage-rs subscribe -c config.json --routing share.json      # 连路由规则一起并 (侵入, 默认不并)
 
 # 反向: 交互式导出配置片段 (选节点 + 匹配的组/路由/geo) 为可分享 JSON:
 mirage-rs export -c config.json -o share.json
@@ -123,11 +125,12 @@ mirage-rs export -c config.json > share.json   # 无 -o 则写 stdout (提示走
 > **导出 `export`**: 交互问导出哪些 mirage 节点 (回车=全部, 或 `1,3,5-7` 选部分)、是否带
 > 路由规则、是否带 geo 下载地址。**组自动按所选节点匹配** —— 组内未选成员剔除, 剔空则跳过;
 > 引用到未导出出站的规则丢弃。被组/规则引用的 `direct`/`block` 一并带上。输出 JSON 片段
-> (`nodes` + `outbounds` + 可选 `routing`/`geo_sources`)。对应的 JSON 导入侧待下一版。
+> (`nodes` + `outbounds` + 可选 `routing`/`geo_sources`)。用 `subscribe <片段>` 导回, 闭环。
 
-> **订阅格式**: URL 返回**每行一个 `mirage://` URI** (整段是 base64 则先解码, 兼容经典订阅格式);
-> 跳过空行 / `#` 注释。按 `server:port` 去重 (重订阅只加新节点); tag 自动生成 (撞名加 `-2`/`-3`)。
-> 周期自动刷新暂未做 —— 手动重跑即可 (加 `--group` 会对全部节点重建组)。
+> **导入格式**: `subscribe` 自动辨来源内容 —— 以 `{` 开头当 **JSON 片段**合并 (节点+组+可选路由/geo),
+> 否则当**每行一个 `mirage://` URI** (整段 base64 则先解码, 兼容经典订阅; 跳过空行 / `#` 注释)。
+> 均按 `server:port` 去重 (重导只加新); tag 撞名自动改名 (`-2`/`-3`) 并**同步重映射**片段里组/规则的
+> 引用。合并片段时 `--routing` 才并路由规则 (侵入); `default_outbound` 不动。周期自动刷新暂未做。
 
 > **urltest 测试方式 `test_type` 说明**: `ping` 与 `http` **完全等价** —— 都是**穿隧道 HTTP
 > 探测** (周期性 GET `--group-url` 的 generate_204), 量**端到端**耗时, 含 VPS 到目标的**出口
