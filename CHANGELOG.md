@@ -1,5 +1,13 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### tools(dump_tls): session_id 复用量化 + 多维对照 (论证 session_id 非指纹)
+
+`dump_tls` 分析工具加 `--session-ids` (量化 `legacy_session_id` 复用率) + `--session-cmp`
+(多维统计对照)。实测证明真 Chrome 的 `legacy_session_id` 也每次全新随机, 与我方不可区分 ——
+这是"决定不做 TLS resumption 仿真"的证据基础。从搁置的实验分支提取工具本身 (功能不做, 工具留用)。
+
 ## [v0.6.5] - 服务端可选 DNS-over-TCP 解析 (UDP 被封的 VPS) (2026-07-27)
 
 ### feat(dns): `tuning.dns_tcp_resolver` —— 域名解析改走 TCP
