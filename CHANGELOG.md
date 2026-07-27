@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(route): process_name 分流 —— 按发起程序名路由 (本机 loopback 入站)
+
+路由规则新增 `process_name` 维度 (comm 精确匹配), 实现"Telegram 走代理、微信直连":
+
+```json
+{ "process_name": ["telegram", "Telegram"], "outbound": "proxy" }
+```
+
+- **仅本机 loopback socks/mixed 入站可判定**: 经 `/proc/net/tcp` 找 socket inode → 扫
+  `/proc/*/fd` 找 PID → 读 `/proc/PID/comm`。透明/LAN 转发的连接进程在别的机器上, 无从取,
+  带此条件的规则对它们不命中 (同 `inbound` 的"信息缺失不猜")。
+- **零开销 opt-in**: 仅当配了 `process_name` 规则时才查 `/proc` (router.uses_process_name 门控);
+  `/proc` 扫描走 spawn_blocking 不占 tokio worker。
+- 纯用户态, 不依赖 eBPF。proc_lookup 支持 v4/v6 loopback。单测含真实 /proc 自反查。
+
 ### tools(dump_tls): session_id 复用量化 + 多维对照 (论证 session_id 非指纹)
 
 `dump_tls` 分析工具加 `--session-ids` (量化 `legacy_session_id` 复用率) + `--session-cmp`

@@ -410,7 +410,14 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 - **`gui.enabled`** + **`gui.listen`**: alpha.4+ 结构化 (老的 `gui_listen` 单字段弃用)
 - **`gui.token`** (v0.5.0-alpha.1+): 可选 API 鉴权 token。设了则所有 `/api/*` 要求携带 (Bearer header / `mirage_token` cookie / `?token=`)。不设=不鉴权 (localhost 默认安全)；`gui.listen` 改 `0.0.0.0` 暴露时**强烈建议**设，install.sh 会自动生成。常量时间校验防时序侧信道
   - ⚠️ **`api.secret` 是废弃 stub，不提供任何鉴权**（历史遗留，解析后从不被使用）。老配置里若有它，**它什么都没做** —— API 鉴权只认 `gui.token`。启动时会 WARN 提醒，未来版本移除。同理 `advanced_dns.rules` 也尚未实现、当前被忽略（DNS 分流由 `routing.rules` 决定）
-- **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` / `inbound` 等
+- **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` / `inbound` / `process_name` 等
+  - **`process_name`**: 按**发起程序名** (comm) 精确匹配, 实现"Telegram 走代理、微信直连":
+    ```jsonc
+    { "process_name": ["telegram", "Telegram"], "outbound": "proxy" }
+    ```
+    **仅对本机 loopback socks/mixed 入站可判定** —— 通过 `/proc` 反查发起连接的程序。
+    透明/LAN 转发的连接进程在**别的机器**上, 无从取, 带 `process_name` 的规则对它们不命中
+    (同 `inbound` 的"信息缺失不猜")。仅当配了 `process_name` 规则时才查 `/proc` (零开销 opt-in)。
   - **`inbound`**: 按**入站 tag** 限定规则只对某些入站生效。多入站部署才有意义 ——
     例如给家人开一个 socks 入站走固定落地、自己那个走另一条:
     ```jsonc
@@ -840,7 +847,7 @@ sudo bash install.sh
 **未完成 / 未完善**
 
 - [ ] **IPv6 全栈** —— 当前 WireGuard 与透明代理数据面均 **IPv4-only** (DNS 层已可控 v4/v6 返回, 但数据面未通)。这是最大的结构性缺口, IPv6 优先/仅 IPv6 网络 (尤其国内移动网) 下会漏流量或不可用
-- [ ] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"); 已有 cgroup/connect4 的 eBPF 基础
+- [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [ ] **订阅链接** —— `node_uri` + `import` 基础已有, 但订阅**格式本身要先定义**
 - [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连

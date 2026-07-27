@@ -661,6 +661,7 @@ impl DnsForwarder {
             source_ip: None,
             source_mac: None,
             inbound: Some(&self.inbound_tag),
+            process_name: None, // DNS 查询: 无本机进程名维度
         };
 
         let action = st.router.route(routing_req);
