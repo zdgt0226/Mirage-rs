@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [refactor, outbound, geo, architecture]
 created: "2026-07-23T10:08:11"
-updated: "2026-07-23T10:08:47"
+updated: "2026-07-27T08:58:17"
 ---
 
 ## compiled_truth
@@ -67,4 +67,10 @@ mirage 出站 → 隧道。**这是"经隧道下载"的正确语义**, 不是绕
   kind: decision
   summary: "记录候选重构: 抽 OutboundNode::connect(target)->AsyncStream, 让 geo 直连隧道而非绕 SOCKS 自连; WgTcpStream 已证明该抽象可行"
   source: "2026-07-23 讨论"
+  affects: [unified-outbound-stream]
+
+- time: 2026-07-27T08:58:17
+  kind: decision
+  summary: "接口设计定为 OutboundStream 枚举(Raw/Async/Framed)保住 Direct splice + Mirage 合帧(性能持平); 重估: 无干净低风险 stage-1 消费者(geo 借 SOCKS 本就是正确语义), 真收益在 chain-proxy, 建议与之同期做"
+  source: "2026-07-27 规划"
   affects: [unified-outbound-stream]

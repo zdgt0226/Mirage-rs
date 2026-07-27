@@ -849,6 +849,13 @@ sudo bash install.sh
 - [~] **SS 上游 UDP** —— 未实现; 需要 UDP 同出口可**直接用 WireGuard 上游** (已通)
 - [ ] orphan 验证器接回 CI (需 runner 日志访问权)
 
+**性能 (计划 v0.7.0, 需先 profile 定位瓶颈再动手)**
+
+- [ ] **加密吞吐** —— AEAD 热路径 (ring) 是隧道大流量主耗, 看批处理 / 对齐硬件 AES-NI
+- [ ] **隧道 relay 缓冲/合帧再调** —— 当前 BufWriter 64KB, 高 BDP 链路可能有余量
+- [ ] **io_uring 替代 relay 的 read/write 循环** —— 大工程, 高并发小包收益明显
+- [ ] **MSS clamp / 网络层** —— 见 landscape 参考 P1
+
 **评估后决定不做** (避免重复提)
 
 - **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
