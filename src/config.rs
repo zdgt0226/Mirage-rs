@@ -383,10 +383,10 @@ pub struct RuleConfig {
     /// 不写 = 不限入站 (所有入站都可能命中), 与原行为一致。
     #[serde(default, deserialize_with = "one_or_many")]
     pub inbound: Vec<String>,
-    /// 按**进程名** (comm) 精确匹配 —— 只对本机指定程序发起的连接生效
-    /// (如 "Telegram 走代理、微信直连")。**仅本机 loopback socks/mixed 入站可判定**:
-    /// 透明/LAN 转发的连接进程在别的机器上, 无从取, 带此条件的规则对它们不命中。
-    /// 不写 = 不限进程。
+    /// 按**进程名**精确匹配 —— 只对本机指定程序发起的连接生效 (如 "Telegram 走代理、微信直连")。
+    /// 名字 = 可执行文件 basename (`/proc/PID/exe`, 与 clash/sing-box 一致; 取不到回落 comm)。
+    /// **仅本机 loopback socks/mixed 入站可判定**: 透明/LAN 转发的连接进程在别的机器上,
+    /// 无从取, 带此条件的规则对它们不命中。不写 = 不限进程。
     #[serde(default, deserialize_with = "one_or_many")]
     pub process_name: Vec<String>,
 }

@@ -152,7 +152,9 @@ pub async fn proxy_tcp_target(
     // /proc 扫描是阻塞 IO, 放 spawn_blocking, 不占 tokio worker。非本机/查不到 → None。
     let process_name: Option<String> = if current_state.router.uses_process_name() {
         match local.peer_addr() {
-            Ok(peer) if peer.ip().is_loopback() => {
+            // is_local_peer: 含双栈 v4-mapped loopback (::ffff:127.0.0.1)。LAN/透明的
+            // 远端 peer 不本机 → 不 spawn, 免每连接白跑一次 blocking 任务。
+            Ok(peer) if crate::proxy::proc_lookup::is_local_peer(peer.ip()) => {
                 tokio::task::spawn_blocking(move || crate::proxy::proc_lookup::process_name_for_peer(peer))
                     .await
                     .ok()

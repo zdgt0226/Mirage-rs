@@ -411,7 +411,7 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 - **`gui.token`** (v0.5.0-alpha.1+): 可选 API 鉴权 token。设了则所有 `/api/*` 要求携带 (Bearer header / `mirage_token` cookie / `?token=`)。不设=不鉴权 (localhost 默认安全)；`gui.listen` 改 `0.0.0.0` 暴露时**强烈建议**设，install.sh 会自动生成。常量时间校验防时序侧信道
   - ⚠️ **`api.secret` 是废弃 stub，不提供任何鉴权**（历史遗留，解析后从不被使用）。老配置里若有它，**它什么都没做** —— API 鉴权只认 `gui.token`。启动时会 WARN 提醒，未来版本移除。同理 `advanced_dns.rules` 也尚未实现、当前被忽略（DNS 分流由 `routing.rules` 决定）
 - **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` / `inbound` / `process_name` 等
-  - **`process_name`**: 按**发起程序名** (comm) 精确匹配, 实现"Telegram 走代理、微信直连":
+  - **`process_name`**: 按**发起程序名**精确匹配 (可执行文件 basename, 如 clash/sing-box), 实现"Telegram 走代理、微信直连":
     ```jsonc
     { "process_name": ["telegram", "Telegram"], "outbound": "proxy" }
     ```
