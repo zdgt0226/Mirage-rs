@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.6.6] - process_name 分流 + dump_tls 工具 (2026-07-27)
 
 ### feat(route): process_name 分流 —— 按发起程序名路由 (本机 loopback 入站)
 
