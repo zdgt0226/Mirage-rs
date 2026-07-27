@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased] - 服务端可选 DNS-over-TCP 解析 (UDP 被封的 VPS)
+## [v0.6.5] - 服务端可选 DNS-over-TCP 解析 (UDP 被封的 VPS) (2026-07-27)
 
 ### feat(dns): `tuning.dns_tcp_resolver` —— 域名解析改走 TCP
 

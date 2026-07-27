@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "mirage-rs"
-version = "0.6.4"
+version = "0.6.5"
 dependencies = [
  "aho-corasick",
  "anyhow",
