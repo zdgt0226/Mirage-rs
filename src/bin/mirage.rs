@@ -615,6 +615,14 @@ async fn run_subscribe(path: &str, url: &str, group: Option<&str>, group_opts: &
         Some(note) => println!("  {note}\n  `mirage-rs check -c {path}` 确认后重启。"),
         None => println!("  提示: 出站已加但未接路由。要按 RTT 自动选路, 重跑时加 --group。"),
     }
+    // 建组时若节点跨区域给出告警 (与 import --group 一致)
+    if group.is_some() {
+        if let Some(db) = load_node_geoip(&root) {
+            if let Some(w) = mixed_region_warning(&root, &db).await {
+                eprintln!("  {w}");
+            }
+        }
+    }
     0
 }
 

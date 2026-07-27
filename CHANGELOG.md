@@ -31,6 +31,7 @@ mirage-rs subscribe -c config.json --group https://example.com/sub   # 顺带建
 - 原子写回 (备份 + tmp + rename); `--group` 支持 interval/tolerance/test-type/url 调参。
 - 重构: 抽 `mirage_outbound_json` / `atomic_write_config` 供 import + subscribe 共用。
 - **周期自动刷新暂未做** (手动重跑; 加 --group 会重建组)。
+- `subscribe --group` 建组后同 `import --group` 给**混区域告警** (节点跨国时提示)。
 
 ### feat(cli): 节点区域判定 (GeoIP) —— test 区域列 + 建组混区域告警
 
