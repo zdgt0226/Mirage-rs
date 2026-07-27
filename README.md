@@ -854,7 +854,7 @@ sudo bash install.sh
 - [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段
 - [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
 - [~] **SS 上游 UDP** —— 未实现; 需要 UDP 同出口可**直接用 WireGuard 上游** (已通)
-- [ ] orphan 验证器接回 CI (需 runner 日志访问权)
+- [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
 
 **性能 (计划 v0.7.0, 需先 profile 定位瓶颈再动手)**
 
