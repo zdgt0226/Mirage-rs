@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.6.8] - 配置片段 export/import 闭环 (2026-07-28)
 
 ### feat(cli): `mirage-rs export` —— 交互式导出配置片段 (subscribe 的反向)
 
