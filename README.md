@@ -124,6 +124,19 @@ mirage-rs test -c config.json --tag proxy # 只测某个 tag
 `rule` 的 `outbound` 改成新 tag, 再 `check` 一遍后重启。导入后若代理节点 > 1, 会**建议**
 (不擅自改路由) 用 urltest 自动选路; 加 `--group` 才显式建组并把 `default_outbound` 指向它。
 
+**出站组类型** (rule / default_outbound 可指向组, 组成员是其它出站):
+
+| type | 行为 |
+|---|---|
+| `urltest` | 选**延迟最低**的健康成员 (自动测速, `test_type` rtt/ping, `tolerance` 容差) |
+| `fallback` | 选**第一个健康**成员 (主备切换) |
+| `selector` | 手动指定当前成员 |
+| `load_balance` | 把连接**分摊**到多个健康成员 (负载均衡)。v1 `strategy: "round-robin"` (每连接轮流); `url`+`interval` 同 urltest 做健康检查。⚠️ round-robin 下同一会话的多条连接可能落到不同节点, 查 IP 一致性的站点会受影响 (会话粘滞的 consistent-hash 后续加) |
+
+```json
+{ "type": "load_balance", "tag": "lb", "outbounds": ["n1","n2","n3"], "strategy": "round-robin" }
+```
+
 **`mirage-rs test`**: 测节点是否真能用 —— 走**完整 Mirage 握手并解密服务端首帧确认认证**,
 裸 TCP 连通不算数 (伪装前置是真站点, `:443` 本来就通)。结果分 ✓可用 (报 RTT) / ⚠可达但未确认
 认证 (旧服务端?) / ✗不可用 (连接失败 / 握手超时 / 认证失败=密码不符或非 Mirage 服务端)。

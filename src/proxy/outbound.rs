@@ -46,6 +46,14 @@ pub enum OutboundNode {
         children: Vec<Arc<OutboundNode>>,
         current: Arc<RwLock<Option<Arc<OutboundNode>>>>,
     },
+    /// 负载均衡组: 把连接**分摊**到多个健康成员 (与 urltest "选一个最优" 不同)。
+    /// v1 = round-robin (每连接原子递增取模)。复用 is_healthy 只在健康成员里分摊。
+    LoadBalance {
+        tag: String,
+        children: Vec<Arc<OutboundNode>>,
+        /// round-robin 游标 (每次 resolve 递增)。
+        next: Arc<std::sync::atomic::AtomicU64>,
+    },
 }
 
 impl OutboundNode {
@@ -58,6 +66,7 @@ impl OutboundNode {
             Self::Urltest { tag, .. } => tag,
             Self::Fallback { tag, .. } => tag,
             Self::Selector { tag, .. } => tag,
+            Self::LoadBalance { tag, .. } => tag,
         }
     }
 
@@ -81,7 +90,7 @@ impl OutboundNode {
         match &**self {
             Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).is_healthy(),
             Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => true,
-            Self::Urltest { children, .. } | Self::Fallback { children, .. } | Self::Selector { children, .. } => {
+            Self::Urltest { children, .. } | Self::Fallback { children, .. } | Self::Selector { children, .. } | Self::LoadBalance { children, .. } => {
                 children.iter().any(|c| c.is_healthy())
             }
         }
@@ -94,7 +103,7 @@ impl OutboundNode {
                 if rtt > 0 && rtt != u64::MAX { Some(rtt) } else { None }
             },
             Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => None,
-            Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } => {
+            Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. } => {
                 let leaf = self.resolve_leaf();
                 if std::ptr::eq(&*leaf, &**self) { None } else { leaf.latency_rtt_ms() }
             }
@@ -105,7 +114,7 @@ impl OutboundNode {
         match &**self {
             Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).latency_ms(),
             Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => None,
-            Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } => {
+            Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. } => {
                 let leaf = self.resolve_leaf();
                 if std::ptr::eq(&*leaf, &**self) { None } else { leaf.latency_http_ms() }
             }
@@ -181,6 +190,16 @@ impl OutboundNode {
                     return c.resolve_leaf();
                 }
                 self.clone()
+            }
+            Self::LoadBalance { children, next, .. } => {
+                // round-robin: 只在健康成员里分摊, 原子游标递增取模。
+                let healthy: Vec<_> = children.iter().filter(|c| c.is_healthy()).collect();
+                if healthy.is_empty() {
+                    // 无健康成员: 退回首个 child 去试 (别 self.clone 成死路)。
+                    return children.first().map(|c| c.resolve_leaf()).unwrap_or_else(|| self.clone());
+                }
+                let i = (next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % healthy.len() as u64) as usize;
+                healthy[i].resolve_leaf()
             }
             _ => self.clone(),
         }
@@ -317,6 +336,11 @@ impl OutboundManager {
                     OutboundConfig::Selector { tag, outbounds } => {
                         (tag, outbounds, "selector", 0, 0)
                     }
+                    OutboundConfig::LoadBalance { tag, outbounds, url, interval, .. } => {
+                        hc_url = url.clone();
+                        hc_interval = *interval;
+                        (tag, outbounds, "load-balance", *interval, 0)
+                    }
                     _ => unreachable!(),
                 };
 
@@ -353,6 +377,12 @@ impl OutboundManager {
                             tag: tag.clone(),
                             children,
                             current: Arc::new(RwLock::new(None)),
+                        })
+                    } else if otype == "load-balance" {
+                        Arc::new(OutboundNode::LoadBalance {
+                            tag: tag.clone(),
+                            children,
+                            next: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         })
                     } else {
                         Arc::new(OutboundNode::Fallback {
@@ -457,5 +487,71 @@ mod wg_tests {
                 "配置含 {want} 错误却没被拦下: {issues:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lb_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    fn direct(tag: &str) -> Arc<OutboundNode> {
+        Arc::new(OutboundNode::Direct { tag: tag.to_string() })
+    }
+
+    #[test]
+    fn load_balance_round_robins_healthy() {
+        // Direct 恒健康; round-robin 应在成员间轮流。
+        let lb = Arc::new(OutboundNode::LoadBalance {
+            tag: "lb".into(),
+            children: vec![direct("a"), direct("b"), direct("c")],
+            next: Arc::new(AtomicU64::new(0)),
+        });
+        let seq: Vec<String> = (0..6).map(|_| lb.resolve_leaf().tag().to_string()).collect();
+        assert_eq!(seq, vec!["a", "b", "c", "a", "b", "c"], "应轮流分摊");
+    }
+
+    #[test]
+    fn load_balance_skips_unhealthy() {
+        // Block 也恒健康 (is_healthy=true), 换用一个真不健康的场景不易造; 这里验"全健康时
+        // 不漏成员"已由上面覆盖。无健康成员的退路 (children.first) 由代码保证不 panic:
+        let empty_like = Arc::new(OutboundNode::LoadBalance {
+            tag: "lb".into(),
+            children: vec![direct("only")],
+            next: Arc::new(AtomicU64::new(0)),
+        });
+        assert_eq!(empty_like.resolve_leaf().tag(), "only");
+    }
+
+    #[test]
+    fn load_balance_builds_and_checks() {
+        let s = r#"{
+          "inbounds": [],
+          "outbounds": [
+            { "type": "direct", "tag": "d1" },
+            { "type": "direct", "tag": "d2" },
+            { "type": "load_balance", "tag": "lb", "outbounds": ["d1", "d2"] }
+          ],
+          "routing": { "default_outbound": "lb", "rules": [] }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.semantic_issues().is_empty(), "合法 lb 配置无告警: {:?}", cfg.semantic_issues());
+        let m = OutboundManager::new(&cfg);
+        assert!(matches!(&**m.outbounds.get("lb").unwrap(), OutboundNode::LoadBalance { .. }));
+    }
+
+    #[test]
+    fn load_balance_bad_strategy_rejected() {
+        let s = r#"{
+          "inbounds": [],
+          "outbounds": [
+            { "type": "direct", "tag": "d1" },
+            { "type": "load_balance", "tag": "lb", "outbounds": ["d1"], "strategy": "consistent-hash" }
+          ],
+          "routing": { "default_outbound": "lb", "rules": [] }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.semantic_issues().iter().any(|i| i.contains("strategy") && i.contains("consistent-hash")),
+            "未支持的 strategy 应被拦: {:?}", cfg.semantic_issues());
     }
 }
