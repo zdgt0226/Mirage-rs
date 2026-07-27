@@ -481,19 +481,30 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
     0
 }
 
+/// 依次试 4 种 base64 字母表 (standard / url-safe × 有无填充) 解码成 UTF-8。都不成 → None。
+/// 订阅提供方用哪种都有, 只试 STANDARD 会把 url-safe/无填充的订阅解成乱码。
+fn try_base64_decode(s: &str) -> Option<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    for eng in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = eng.decode(s) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
 /// 订阅解码: 整段是 base64 (经典订阅格式, 无空白) 则先解码, 否则原样当明文。
 /// 再逐行取 `mirage://` (跳过空行 / `#` 注释), 解析成节点。
 fn parse_subscription(body: &str) -> Vec<mirage_rs::node_uri::NodeUri> {
-    use base64::Engine;
     let trimmed: String = body.split_whitespace().collect(); // 判 base64 用: 去所有空白
-    let text = if !trimmed.is_empty()
-        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
-    {
-        base64::engine::general_purpose::STANDARD
-            .decode(&trimmed)
-            .ok()
-            .and_then(|b| String::from_utf8(b).ok())
-            .unwrap_or_else(|| body.to_string())
+    let looks_base64 = !trimmed.is_empty()
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'));
+    // 像 base64 就试 4 种字母表解; 解不出 (其实是纯 base64 字符集的明文) 回落原文。
+    let text = if looks_base64 {
+        try_base64_decode(&trimmed).unwrap_or_else(|| body.to_string())
     } else {
         body.to_string()
     };
@@ -529,11 +540,20 @@ async fn run_subscribe(path: &str, url: &str, group: Option<&str>, group_opts: &
         Ok(c) => c,
         Err(e) => { eprintln!("✗ 构造 HTTP 客户端失败: {e}"); return 1; }
     };
+    const MAX_SUB_BYTES: u64 = 8 * 1024 * 1024; // 订阅正常 KB 级; 8MB 上限防恶意大 body OOM
     let body = match client.get(url).send().await.and_then(|r| r.error_for_status()) {
-        Ok(resp) => match resp.text().await {
-            Ok(t) => t,
-            Err(e) => { eprintln!("✗ 读订阅响应失败: {e}"); return 1; }
-        },
+        Ok(resp) => {
+            if let Some(len) = resp.content_length() {
+                if len > MAX_SUB_BYTES {
+                    eprintln!("✗ 订阅体过大 ({len} 字节 > {MAX_SUB_BYTES} 上限), 拒绝");
+                    return 1;
+                }
+            }
+            match resp.text().await {
+                Ok(t) => t,
+                Err(e) => { eprintln!("✗ 读订阅响应失败: {e}"); return 1; }
+            }
+        }
         Err(e) => { eprintln!("✗ 拉订阅失败: {e}"); return 1; }
     };
     let nodes = parse_subscription(&body);
@@ -546,7 +566,7 @@ async fn run_subscribe(path: &str, url: &str, group: Option<&str>, group_opts: &
     let mut taken = existing_outbound_tags(&root);
     let mut seen: std::collections::HashSet<(String, u16)> = root["outbounds"].as_array().unwrap().iter()
         .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("mirage"))
-        .filter_map(|o| Some((o.get("server")?.as_str()?.to_string(), o.get("server_port")?.as_u64()? as u16)))
+        .filter_map(|o| Some((o.get("server")?.as_str()?.to_string(), u16::try_from(o.get("server_port")?.as_u64()?).ok()?)))
         .collect();
     let (mut added, mut skipped) = (0u32, 0u32);
     for node in &nodes {
@@ -798,13 +818,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_subscription_base64() {
+    fn parse_subscription_base64_all_alphabets() {
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
         use base64::Engine;
-        let plain = "mirage://p@h.com:443?sni=www.apple.com";
-        let b64 = base64::engine::general_purpose::STANDARD.encode(plain);
-        let nodes = parse_subscription(&b64);
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].host, "h.com");
+        // 两个节点, 保证编码里出现需 url-safe 的字符差异; 逐个字母表都应解出。
+        let plain = "mirage://p1@a.example.com:443?sni=www.apple.com\nmirage://p2@b.example.com:8443?sni=www.bing.com";
+        for b64 in [
+            STANDARD.encode(plain),
+            STANDARD_NO_PAD.encode(plain),
+            URL_SAFE.encode(plain),
+            URL_SAFE_NO_PAD.encode(plain),
+        ] {
+            let nodes = parse_subscription(&b64);
+            assert_eq!(nodes.len(), 2, "base64 变体应都解出: {b64}");
+            assert_eq!(nodes[0].host, "a.example.com");
+        }
     }
 
     #[test]
