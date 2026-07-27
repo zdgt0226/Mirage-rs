@@ -4,18 +4,36 @@
 //! 入站时, 我们能通过 `/proc` 反查是哪个程序。透明/LAN 转发的连接进程在别的机器上, 无从取。
 //!
 //! 路径: peer(app 的 local 端) → `/proc/net/tcp{,6}` 找 socket inode → 扫 `/proc/*/fd` 找持有
-//! 该 inode 的 PID → 读 `/proc/PID/comm`。查不到 (无权限/竞态/非本机) 一律返回 None。
+//! 该 inode 的 PID → 读进程名。查不到 (无权限/竞态/非本机) 一律返回 None。
+//!
+//! **成本**: 每次查要扫 `/proc/*/fd` (随系统总 fd 数, 非本连接)。每条新连接的 socket inode
+//! 都不同, 无法跨连接缓存 —— 故不缓存。调用方 (handler) 已用 `router.uses_process_name()` +
+//! loopback + `spawn_blocking` 三重门控: 没配 process_name 规则完全不触发, 触发也不占 reactor。
+//!
+//! **进程名 = 可执行文件 basename** (`/proc/PID/exe`), 与 clash/sing-box 一致; 取不到 (无权限/
+//! 内核线程) 回落 `/proc/PID/comm` (注意 comm 被内核截断到 15 字符)。
 
 use std::net::{IpAddr, SocketAddr};
 
-/// 查发起连接的本机进程名 (comm)。非 loopback / 查不到 → None (调用方据此不填 process_name)。
+/// peer 是否本机 (含双栈下的 v4-mapped loopback `::ffff:127.0.0.1`)。
+/// `Ipv6Addr::is_loopback` 只认 `::1`, 不认 v4-mapped, 故单独判。供 handler 预门控复用。
+pub fn is_local_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// 查发起连接的本机进程名。非本机 / 查不到 → None (调用方据此不填 process_name)。
 pub fn process_name_for_peer(peer: SocketAddr) -> Option<String> {
-    if !peer.ip().is_loopback() {
+    if !is_local_peer(peer.ip()) {
         return None;
     }
     let inode = socket_inode_for_local(peer)?;
     let pid = pid_for_socket_inode(inode)?;
-    comm_for_pid(pid)
+    name_for_pid(pid)
 }
 
 /// 把 peer 格式化成 `/proc/net/tcp{,6}` 里 local_address 那列的 hex 串 (大写)。
@@ -83,8 +101,16 @@ fn pid_for_socket_inode(inode: u64) -> Option<u32> {
     None
 }
 
-/// 读 `/proc/PID/comm` (内核给的进程名, ≤15 字符)。
-fn comm_for_pid(pid: u32) -> Option<String> {
+/// 进程名 = `/proc/PID/exe` 的 basename (完整可执行名, 与 clash/sing-box 一致);
+/// 取不到 (无权限/内核线程/竞态) 回落 `/proc/PID/comm` (内核截断到 15 字符)。
+fn name_for_pid(pid: u32) -> Option<String> {
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+        if let Some(base) = exe.file_name().and_then(|s| s.to_str()) {
+            if !base.is_empty() {
+                return Some(base.to_string());
+            }
+        }
+    }
     let s = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     let name = s.trim_end_matches('\n').to_string();
     if name.is_empty() {
@@ -120,15 +146,25 @@ mod tests {
     }
 
     #[test]
+    fn v4_mapped_loopback_recognized() {
+        // 双栈 [::]:port 下, v4 客户端显示为 ::ffff:127.0.0.1 —— 要认作本机。
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(is_local_peer(ip), "v4-mapped loopback 应判本机");
+        assert!(!is_local_peer("::ffff:8.8.8.8".parse().unwrap()), "v4-mapped 公网非本机");
+        // hex 格式 = 内核 /proc/net/tcp6 的 v4-mapped 形式
+        let p: SocketAddr = "[::ffff:127.0.0.1]:8080".parse().unwrap();
+        assert_eq!(proc_hex_local(p), "0000000000000000FFFF00000100007F:1F90");
+    }
+
+    #[test]
     fn resolves_own_process() {
         // 起一个真 TCP 连接, 用它的本地端 (loopback) 反查, 应查到本测试进程名。
-        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = std::net::TcpStream::connect(addr).unwrap();
         let (_srv, _peer) = listener.accept().unwrap();
-        // client 的 local 端 = 本进程持有的 socket, 反查应得本进程 comm。
-        let mine = comm_for_pid(std::process::id()).unwrap();
+        // client 的 local 端 = 本进程持有的 socket, 反查应得本进程名 (exe basename)。
+        let mine = name_for_pid(std::process::id()).unwrap();
         let looked = process_name_for_peer(client.local_addr().unwrap());
         // CI 无权限扫 /proc 时可能 None, 有结果则必须等于自己。
         if let Some(name) = looked {
