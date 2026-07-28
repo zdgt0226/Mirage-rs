@@ -15,3 +15,6 @@ CLAUDE.md
 
 # Python 字节码缓存 (tools/*.py 运行产物)
 __pycache__/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
