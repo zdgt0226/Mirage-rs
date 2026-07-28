@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-28T01:15:13.911Z._
+_Auto-generated. Last updated 2026-07-28T02:01:49.300Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -26,6 +26,7 @@ _Auto-generated. Last updated 2026-07-28T01:15:13.911Z._
 - [orphan-filter-blackhole](pages/orphan-filter-blackhole.md) — category: decision | **问题**:进程被 SIGKILL / 正常停止后,tc 过滤器**仍挂在网卡上**(tc 持有 prog 引用,不随进程消失),
 - [orphan-verifier-ci-blocked](pages/orphan-verifier-ci-blocked.md) — category: reference | tags: [ci, ebpf, netns, verifier] | ## 结论 (2026-07-27, PR #9 实测后)
 - [perf-roadmap-v070](pages/perf-roadmap-v070.md) — category: decision | status: draft | tags: [roadmap, performance] | ## 背景
+- [poc-vs-rust-feature-diff](pages/poc-vs-rust-feature-diff.md) — category: reference | tags: [poc, comparison, architecture, ebpf, tradeoff] | POC 源: `/opt/claude/mirage/` (~15k 行 Python; `pyrealiy-*` 是同源旧名副本)。
 - [process-name-routing](pages/process-name-routing.md) — category: decision | tags: [routing, process-name, proc, loopback] | ## 决定
 - [ring-for-aead](pages/ring-for-aead.md) — category: decision | **决定**:隧道载荷加密用 **`ring`** 的 ChaCha20-Poly1305(`LessSafeKey` + 显式 nonce 管理);
 - [routing-rules](pages/routing-rules.md) — category: concept | tags: [routing, config] | Mirage 的路由规则维度与 sing-box/Clash 基本对齐, **域名 4 种 + IP 2 种 + 连接属性 4 种 + and/or 组合**。
