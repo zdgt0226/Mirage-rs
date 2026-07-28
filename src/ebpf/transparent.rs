@@ -40,10 +40,15 @@ mod sys {
         }
 
         pub fn attach_to_netns(&mut self, fakeip_net: std::net::Ipv4Addr, prefix_len: u8) -> Result<()> {
+            if prefix_len > 32 {
+                anyhow::bail!("fake-ip prefix_len /{prefix_len} 非法 (须 <= 32)"); // 防 32-prefix 移位下溢
+            }
             let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
 
             // 1. Write the fake-ip range to the BPF map
-            let mut fakeip_map = Array::<_, FakeIpCfg>::try_from(bpf.map_mut("mirage_fakeip_cfg").unwrap())?;
+            let mut fakeip_map = Array::<_, FakeIpCfg>::try_from(
+                bpf.map_mut("mirage_fakeip_cfg").context("mirage_fakeip_cfg map missing")?,
+            )?;
             
             let net_u32 = u32::from(fakeip_net).to_be(); // network byte order
             let mask_u32 = if prefix_len == 0 { 0 } else { (!0u32 << (32 - prefix_len)).to_be() };
@@ -78,7 +83,9 @@ mod sys {
             let cookie = get_socket_cookie(fd)?;
 
             // Write actual listener socket into sockmap
-            let mut sk_map = SockMap::<_>::try_from(bpf.map_mut("mirage_listener_sk").unwrap())?;
+            let mut sk_map = SockMap::<_>::try_from(
+                bpf.map_mut("mirage_listener_sk").context("mirage_listener_sk map missing")?,
+            )?;
             // SockMap key is 0, value is the file descriptor
             sk_map.set(0, listener, 0).context("Failed to insert listener socket fd")?;
 
@@ -91,7 +98,9 @@ mod sys {
             let fd = socket.as_raw_fd();
             let cookie = get_socket_cookie(fd)?;
 
-            let mut sk_map = SockMap::<_>::try_from(bpf.map_mut("mirage_udp_sk").unwrap())?;
+            let mut sk_map = SockMap::<_>::try_from(
+                bpf.map_mut("mirage_udp_sk").context("mirage_udp_sk map missing")?,
+            )?;
             sk_map.set(0, socket, 0).context("Failed to insert UDP socket fd")?;
 
             info!("eBPF Transparent Engine: UDP socket registered (cookie: {}, fd: {})", cookie, fd);

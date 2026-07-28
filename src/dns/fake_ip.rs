@@ -36,8 +36,12 @@ impl FakeIpMapper {
         let ip: Ipv4Addr = parts[0].parse()?;
         let prefix: u32 = parts[1].parse()?;
 
-        if prefix > 32 {
-            return Err(anyhow::anyhow!("Invalid CIDR prefix"));
+        // fake-ip 段需至少 3 个主机位 (跳过 .0/.1/broadcast 后仍有可分配空间); /30-/32
+        // 会发出范围外 IP。上界 32 之外再设下界: prefix <= 29。
+        if prefix > 29 {
+            return Err(anyhow::anyhow!(
+                "fake-ip CIDR 前缀 /{prefix} 太小 (需 <= /29, 至少 3 个主机位)"
+            ));
         }
 
         let mask = if prefix == 0 { 0u32 } else { !0u32 << (32 - prefix) };
@@ -243,6 +247,16 @@ impl FakeIpMapper {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    #[test]
+    fn rejects_too_small_prefix() {
+        // /30-/32 主机位不足 (会发出范围外 IP) → 构造即拒; /29 是最小可用
+        for p in [30u8, 31, 32] {
+            assert!(FakeIpMapper::new(&format!("10.0.0.0/{p}")).is_err(), "/{p} 应被拒");
+        }
+        assert!(FakeIpMapper::new("10.0.0.0/29").is_ok(), "/29 应可用");
+        assert!(FakeIpMapper::new("198.18.0.0/16").is_ok());
+    }
 
     #[test]
     fn round_robin_bounds_both_maps_and_evicts_oldest() {

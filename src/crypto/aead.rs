@@ -118,6 +118,11 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             self.buffer.extend_from_slice(chunk);
             self.buffer.push(0x17); // inner content type = application_data
 
+            // nonce 用尽即断: (key,nonce) 复用会毁掉 AEAD 安全。2^64 帧物理不可达,
+            // 但显式拦住比依赖"到不了"稳妥 (溢出在 debug 会 panic, release 会回绕)。
+            if self.nonce == u64::MAX {
+                return Err(anyhow!("AEAD nonce 耗尽, 拒绝复用"));
+            }
             let nonce_bytes = format_nonce(self.nonce);
             self.nonce += 1;
 
@@ -213,6 +218,9 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         let mut buffer = vec![0u8; len];
         self.reader.read_exact(&mut buffer).await?;
 
+        if self.nonce == u64::MAX {
+            return Err(anyhow!("AEAD nonce 耗尽, 拒绝复用"));
+        }
         let nonce_bytes = format_nonce(self.nonce);
         self.nonce += 1;
 
