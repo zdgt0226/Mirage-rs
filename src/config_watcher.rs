@@ -14,6 +14,8 @@ pub struct CoreState {
     pub router: Arc<RouterEngine>,
     pub outbounds: Arc<OutboundManager>,
     pub advanced_dns: Option<crate::config::AdvancedDnsConfig>,
+    /// 未分类域名自适应分类 (auto_classify)。None = 关闭 / geoip 缺失。热重载会重建 (学习缓存重置)。
+    pub auto_classify: Option<Arc<crate::dns::server::AutoClassify>>,
 }
 
 impl CoreState {
@@ -194,10 +196,17 @@ impl ConfigWatcher {
             adv.cached_static = cached_static;
         }
 
+        let auto_classify = crate::dns::server::AutoClassify::from_config(
+            advanced_dns.as_ref(),
+            config.tuning.as_ref(),
+            geodata_dir,
+        );
+
         Ok(CoreState {
             router: Arc::new(router),
             outbounds,
             advanced_dns,
+            auto_classify,
         })
     }
 

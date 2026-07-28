@@ -131,6 +131,7 @@ fn build_core_state(cfg: &LiteClientConfig) -> Result<crate::config_watcher::Cor
         router: Arc::new(router),
         outbounds,
         advanced_dns: None,
+        auto_classify: None,
     })
 }
 

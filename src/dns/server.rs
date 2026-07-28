@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::proxy::pool::WarmPool;
 use crate::proxy::outbound::OutboundNode;
@@ -76,6 +76,141 @@ fn question_end(data: &[u8]) -> usize {
         }
     }
     pos
+}
+
+/// 从 DNS 响应里取**首个 A 记录**的 IPv4 (供 auto_classify 判归属)。无 A / 越界 → None。
+fn first_a_record(resp: &[u8]) -> Option<std::net::Ipv4Addr> {
+    if resp.len() < 12 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    let mut pos = question_end(resp);
+    for _ in 0..ancount {
+        // 跳过 answer 的 name (0xC0 压缩指针 2 字节, 或 label 序列到 0x00)
+        while pos < resp.len() {
+            let n = resp[pos] as usize;
+            if n == 0 {
+                pos += 1;
+                break;
+            }
+            if n & 0xC0 == 0xC0 {
+                pos += 2;
+                break;
+            }
+            pos += 1 + n;
+        }
+        if pos + 10 > resp.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+        let rdata = pos + 10;
+        if rdata + rdlen > resp.len() {
+            return None;
+        }
+        if rtype == 1 && rdlen == 4 {
+            return Some(std::net::Ipv4Addr::new(
+                resp[rdata], resp[rdata + 1], resp[rdata + 2], resp[rdata + 3],
+            ));
+        }
+        pos = rdata + rdlen;
+    }
+    None
+}
+
+/// 未分类域名的自适应分类状态: CN 段集 (判 IP 归属) + 学习到的"海外"域名 TTL 缓存。
+/// 见 config::AutoClassifyConfig。构造经 `from_config` (geoip cn 段为空则返 None = 禁用)。
+pub struct AutoClassify {
+    ttl: std::time::Duration,
+    cn_cidrs: Vec<ipnet::IpNet>,
+    foreign: std::sync::Mutex<ForeignCache>,
+    /// 国内判 CN 时后台隧道交叉校验 (非阻塞, 污染则标记海外供下次)。
+    verify_async: bool,
+}
+
+struct ForeignCache {
+    map: std::collections::HashMap<String, std::time::Instant>, // domain(小写) → 过期时刻
+    cap: usize,
+}
+
+impl AutoClassify {
+    /// 从配置构造。auto_classify.enabled 且 geoip.dat 的 cn 段非空才返 Some; 否则 None (禁用)。
+    pub(crate) fn from_config(
+        advanced_dns: Option<&crate::config::AdvancedDnsConfig>,
+        tuning: Option<&crate::config::TuningConfig>,
+        geodata_dir: &str,
+    ) -> Option<std::sync::Arc<Self>> {
+        let ac = advanced_dns?.auto_classify.as_ref()?;
+        if !ac.enabled {
+            return None;
+        }
+        // geoip.dat 路径: geodata_dir + geo_sources 里 kind=geoip 的 name (默认 geoip)
+        let name = tuning
+            .and_then(|t| t.geo_sources.iter().find(|s| s.kind == crate::config::GeoKind::Geoip))
+            .map(|s| s.name.as_str())
+            .unwrap_or("geoip");
+        let path = std::path::Path::new(geodata_dir).join(format!("{name}.dat"));
+        match crate::router::geo::load_geoip_dat(&path, "cn") {
+            Ok(cn) if !cn.is_empty() => {
+                info!(
+                    "auto_classify 启用: 载入 CN 段 {} 条 (ttl {}s, cap {})",
+                    cn.len(),
+                    ac.ttl,
+                    ac.max_entries
+                );
+                Some(std::sync::Arc::new(Self {
+                    ttl: std::time::Duration::from_secs(ac.ttl),
+                    cn_cidrs: cn,
+                    foreign: std::sync::Mutex::new(ForeignCache {
+                        map: std::collections::HashMap::new(),
+                        cap: ac.max_entries.max(1),
+                    }),
+                    verify_async: ac.verify_cn == crate::config::VerifyCn::Async,
+                }))
+            }
+            Ok(_) => {
+                warn!("auto_classify 开启但 geoip.dat 的 cn 段为空 ({}) — 已禁用", path.display());
+                None
+            }
+            Err(e) => {
+                warn!("auto_classify 开启但读 geoip cn 段失败 ({}): {} — 已禁用", path.display(), e);
+                None
+            }
+        }
+    }
+
+    /// IP 是否属 CN (在 geoip cn 段内)。cn_cidrs 恒非空 (构造保证)。
+    fn is_cn(&self, ip: std::net::IpAddr) -> bool {
+        self.cn_cidrs.iter().any(|c| c.contains(&ip))
+    }
+
+    /// 域名是否已学习为海外且未过 TTL (过期条目顺手清掉)。
+    fn is_foreign_cached(&self, domain: &str) -> bool {
+        let mut g = self.foreign.lock().unwrap_or_else(|e| e.into_inner());
+        match g.map.get(domain) {
+            Some(&exp) if exp > std::time::Instant::now() => true,
+            Some(_) => {
+                g.map.remove(domain);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 学习标记域名为海外 (带 TTL)。超容量先清过期, 仍满则移除任意一条 (软上限)。
+    fn mark_foreign(&self, domain: &str) {
+        let now = std::time::Instant::now();
+        let mut g = self.foreign.lock().unwrap_or_else(|e| e.into_inner());
+        if g.map.len() >= g.cap {
+            g.map.retain(|_, exp| *exp > now);
+            if g.map.len() >= g.cap {
+                if let Some(k) = g.map.keys().next().cloned() {
+                    g.map.remove(&k);
+                }
+            }
+        }
+        g.map.insert(domain.to_string(), now + self.ttl);
+    }
 }
 
 fn make_nxdomain(query: &[u8]) -> Vec<u8> {
@@ -539,6 +674,48 @@ impl DnsForwarder {
         self.process_query(req).await
     }
 
+    /// 返回 fakeip 应答 (auto_classify 判为海外时用): A → fake-IP, AAAA/HTTPS → 空答复。
+    /// 未配 fakeip mapper 则退空答复 (auto_classify 无法代理, 但也不泄露真实 IP)。
+    fn answer_fakeip(&self, req: &[u8], domain: &str, qtype: u16) -> Option<Vec<u8>> {
+        if let Some(mapper) = &self.fake_ip_mapper {
+            if qtype == 1 {
+                let fake_ip = mapper.lookup_or_assign(domain);
+                if let Some(engine) = &self.xdp_engine {
+                    let _ = engine.update_dns_cache(domain, fake_ip);
+                }
+                return make_fake_ip_response(req, fake_ip);
+            }
+            if qtype == 28 || qtype == 65 {
+                return make_empty_response(req);
+            }
+        }
+        make_empty_response(req).or_else(|| Some(make_nxdomain(req)))
+    }
+
+    /// 后台 (非阻塞) 交叉校验: 经隧道可信解析 `query` 的域名; 若首个 A 判为**海外** (即国内那次
+    /// 判 CN 是污染) → `mark_foreign`, 下次该域名走 fakeip。leaf 非 Mirage / 隧道失败 → 静默不动。
+    fn spawn_cn_verify(
+        leaf: Arc<crate::proxy::outbound::OutboundNode>,
+        ac: Arc<AutoClassify>,
+        domain: String,
+        query: Vec<u8>,
+        host: String,
+        port: u16,
+    ) {
+        tokio::spawn(async move {
+            if let crate::proxy::outbound::OutboundNode::Mirage { pool, .. } = &*leaf {
+                if let Some(resp) = Self::dns_over_tunnel(&query, pool, &host, port).await {
+                    if let Some(ip) = first_a_record(&resp) {
+                        if !ac.is_cn(ip.into()) {
+                            debug!("[DNS] auto-verify [{}] 国内判CN但可信判海外 {} → 疑污染, 标记海外", domain, ip);
+                            ac.mark_foreign(&domain);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn start(
         inbound_tag: Arc<str>,
         listen_addr: SocketAddr,
@@ -664,11 +841,76 @@ impl DnsForwarder {
             process_name: None, // DNS 查询: 无本机进程名维度
         };
 
-        let action = st.router.route(routing_req);
-        
+        let matched = st.router.route_matched(&routing_req);
+
+        // 未命中任何显式规则 + auto_classify 开 → 按解析 IP 归属自适应分类 (见 AutoClassify)。
+        if matched.is_none() {
+            if let Some(ac) = st.auto_classify.clone() {
+                // 后台交叉校验 (verify_async) 需一条隧道: 抓 default 出站解析出的叶子 (drop(st) 前)。
+                let verify_leaf = if ac.verify_async {
+                    st.outbounds.get(st.router.default_outbound()).map(|n| n.resolve_leaf())
+                } else {
+                    None
+                };
+                drop(st);
+                let dk = domain.to_lowercase();
+                let known_foreign = ac.is_foreign_cached(&dk);
+                if !known_foreign && qtype == 1 {
+                    // A 查询: 国内解析探首个 A 归属 (先查 DNS cache 省一次上游)
+                    if let Some(cache) = &self.cache {
+                        if let Some(hit) = cache.get(&dk, qtype, req) {
+                            debug!("[DNS] auto    [{}] → cache hit", domain);
+                            return Some(hit);
+                        }
+                    }
+                    let probe = direct_query(req, &cn_dns).await;
+                    match probe.as_deref().and_then(first_a_record) {
+                        Some(ip) if ac.is_cn(ip.into()) => {
+                            debug!("[DNS] auto    [{}] → 首个A {} 属CN → 直连返回", domain, ip);
+                            if let (Some(cache), Some(r)) = (&self.cache, &probe) {
+                                cache.put(&dk, qtype, r);
+                            }
+                            // 非阻塞交叉校验: 国内判 CN, 后台经隧道可信解析确认; 可信判海外 → 疑污染,
+                            // 标记海外供**下次** (本次已返回, 不受保护 —— 非阻塞的固有取舍)。
+                            // 仅 DNS cache 开时才校验: cache 开则同域名每 TTL 只探测一次 (spawn 天然
+                            // 有界); cache 关会每次查询都重探测, 再逐次 spawn 隧道会刷爆 WarmPool。
+                            if let (Some(leaf), true) = (verify_leaf, self.cache.is_some()) {
+                                Self::spawn_cn_verify(
+                                    leaf, ac.clone(), dk.clone(), req.to_vec(),
+                                    remote_dns_host.clone(), remote_dns_port,
+                                );
+                            }
+                            return probe;
+                        }
+                        Some(ip) => {
+                            debug!("[DNS] auto    [{}] → 首个A {} 属海外 → 学习标记 + fakeip", domain, ip);
+                            ac.mark_foreign(&dk);
+                            return self.answer_fakeip(req, &domain, qtype);
+                        }
+                        None => {
+                            debug!("[DNS] auto    [{}] → 无A/解析失败 → 国内结果兜底", domain);
+                            return probe.or_else(|| Some(make_nxdomain(req)));
+                        }
+                    }
+                }
+                // 已学习海外 (任意 qtype) → fakeip
+                if known_foreign {
+                    return self.answer_fakeip(req, &domain, qtype);
+                }
+                // 未分类的非 A 查询: 还没探测。AAAA/HTTPS 回空答复逼客户端用 A (与 fakeip v4-only 一致);
+                // 其它类型 (MX/TXT…) 走国内解析兜底。
+                if qtype == 28 || qtype == 65 {
+                    return make_empty_response(req);
+                }
+                return direct_query(req, &cn_dns).await.or_else(|| Some(make_nxdomain(req)));
+            }
+        }
+
+        // 命中规则用其出站; 未命中且 auto_classify 关 → 回落 default_outbound (原行为)。
+        let action = matched.unwrap_or_else(|| st.router.default_outbound().to_string());
         let node = st.outbounds.get(action.as_str()).map(|n| n.resolve_leaf());
         drop(st);
-        
+
         if let Some(n) = node {
             match &*n {
                 OutboundNode::Block { .. } => {
@@ -724,7 +966,7 @@ impl DnsForwarder {
                         }
                     }
                     debug!("[DNS] proxy   [{}] → 隧道查 {}:{} via {}", domain, remote_dns_host, remote_dns_port, n.tag());
-                    let resp = self.tcp_over_tunnel(req, pool, &remote_dns_host, remote_dns_port).await;
+                    let resp = Self::dns_over_tunnel(req, pool, &remote_dns_host, remote_dns_port).await;
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, r);
                     }
@@ -737,7 +979,8 @@ impl DnsForwarder {
         }
     }
 
-    async fn tcp_over_tunnel(&self, req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
+    /// 经隧道向服务端上游 DNS 发一次查询取应答 (不依赖 self, 供 auto_classify 后台校验复用)。
+    async fn dns_over_tunnel(req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
         let mut tunnel = match pool.get().await {
             Ok(t) => t,
             Err(e) => {
@@ -1128,5 +1371,64 @@ mod tests {
         r[6] = 0; r[7] = 0; // ancount=0 (NODATA/NXDOMAIN)
         cache.put("x.com", 1, &r);
         assert!(cache.get("x.com", 1, &cache_a_query([1, 2])).is_none(), "无 answer 不缓存");
+    }
+
+    #[test]
+    fn first_a_record_extracts_first_ipv4() {
+        let r = cache_a_response([0, 0], 100); // A 1.2.3.4
+        assert_eq!(first_a_record(&r), Some(std::net::Ipv4Addr::new(1, 2, 3, 4)));
+        let mut na = cache_a_response([0, 0], 100);
+        na[6] = 0; na[7] = 0; // ancount=0
+        assert_eq!(first_a_record(&na), None, "无 answer → None");
+    }
+
+    fn mk_auto(ttl_ms: u64, cap: usize, cn: &[&str]) -> AutoClassify {
+        AutoClassify {
+            ttl: std::time::Duration::from_millis(ttl_ms),
+            cn_cidrs: cn.iter().map(|c| c.parse().unwrap()).collect(),
+            foreign: std::sync::Mutex::new(ForeignCache {
+                map: std::collections::HashMap::new(),
+                cap,
+            }),
+            verify_async: false,
+        }
+    }
+
+    #[test]
+    fn verify_cn_config_parses() {
+        use crate::config::{AutoClassifyConfig, VerifyCn};
+        let off: AutoClassifyConfig =
+            serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(off.verify_cn, VerifyCn::Off, "缺省 off");
+        let a: AutoClassifyConfig =
+            serde_json::from_str(r#"{"enabled":true,"verify_cn":"async"}"#).unwrap();
+        assert_eq!(a.verify_cn, VerifyCn::Async);
+        assert!(serde_json::from_str::<AutoClassifyConfig>(r#"{"enabled":true,"verify_cn":"bogus"}"#).is_err(), "非法值拒绝");
+    }
+
+    #[test]
+    fn auto_classify_is_cn() {
+        let ac = mk_auto(1000, 8, &["1.2.3.0/24"]);
+        assert!(ac.is_cn("1.2.3.9".parse().unwrap()));
+        assert!(!ac.is_cn("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn auto_classify_foreign_cache_ttl() {
+        let ac = mk_auto(60, 8, &["1.2.3.0/24"]);
+        assert!(!ac.is_foreign_cached("x.com"));
+        ac.mark_foreign("x.com");
+        assert!(ac.is_foreign_cached("x.com"), "刚标记应命中");
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        assert!(!ac.is_foreign_cached("x.com"), "过 TTL 应失效");
+    }
+
+    #[test]
+    fn auto_classify_cache_cap_bounded() {
+        let ac = mk_auto(60_000, 3, &["1.0.0.0/8"]);
+        for i in 0..20 {
+            ac.mark_foreign(&format!("d{i}.com"));
+        }
+        assert!(ac.foreign.lock().unwrap().map.len() <= 3, "容量应封顶 (软上限)");
     }
 }
