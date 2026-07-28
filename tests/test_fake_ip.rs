@@ -60,10 +60,13 @@ fn test_cidr_prefix_zero_handled() {
 }
 
 #[test]
-fn test_cidr_prefix_32_exact() {
-    // Single-IP range
-    let result = FakeIpMapper::new("192.0.2.1/32");
-    assert!(result.is_ok());
+fn test_cidr_prefix_too_small_rejected() {
+    // fake-ip 段需至少 3 个主机位 (跳过 .0/.1/broadcast 后仍有可分配空间); /30-/32 会发出
+    // 范围外 IP → 构造即拒 (v0.6.9 加固)。/29 是最小可用。
+    for p in ["192.0.2.0/30", "192.0.2.0/31", "192.0.2.1/32"] {
+        assert!(FakeIpMapper::new(p).is_err(), "{p} 主机位不足应被拒");
+    }
+    assert!(FakeIpMapper::new("192.0.2.0/29").is_ok(), "/29 应可用");
 }
 
 #[test]
