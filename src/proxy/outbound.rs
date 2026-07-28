@@ -339,7 +339,7 @@ impl OutboundManager {
                     OutboundConfig::LoadBalance { tag, outbounds, url, interval, .. } => {
                         hc_url = url.clone();
                         hc_interval = *interval;
-                        (tag, outbounds, "load-balance", *interval, 0)
+                        (tag, outbounds, "load_balance", *interval, 0)
                     }
                     _ => unreachable!(),
                 };
@@ -378,7 +378,7 @@ impl OutboundManager {
                             children,
                             current: Arc::new(RwLock::new(None)),
                         })
-                    } else if otype == "load-balance" {
+                    } else if otype == "load_balance" {
                         Arc::new(OutboundNode::LoadBalance {
                             tag: tag.clone(),
                             children,

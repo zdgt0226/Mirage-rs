@@ -340,8 +340,7 @@ pub enum OutboundConfig {
     },
     /// 负载均衡组: 把连接**分摊**到多个健康成员 (与 urltest 选最优不同)。
     /// v1 仅 `round-robin` (每连接轮流)。健康检查同 urltest (url + interval)。
-    /// type = `load_balance` (也接受 `load-balance` 连字符写法)。
-    #[serde(alias = "load-balance")]
+    /// type = `load_balance`。
     LoadBalance {
         tag: String,
         outbounds: Vec<String>,
@@ -869,10 +868,10 @@ impl Config {
                     // v1 只支持 round-robin, 别的策略明确报错 (不静默降级)。
                     if strategy != "round-robin" {
                         issues.push(format!(
-                            "load-balance `{tag}` 的 strategy `{strategy}` 暂不支持 (v1 仅 round-robin)"
+                            "load_balance `{tag}` 的 strategy `{strategy}` 暂不支持 (v1 仅 round-robin)"
                         ));
                     }
-                    (tag, outbounds, "load-balance")
+                    (tag, outbounds, "load_balance")
                 }
                 _ => continue,
             };

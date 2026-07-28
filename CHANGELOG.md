@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### ⚠️ 破坏性: 移除 `load-balance` kebab 别名 —— 统一 snake_case
+
+配置命名统一到 **snake_case 单一形式** (全仓本就 100% snake_case, 唯一例外是 `load_balance`
+额外接受的 `load-balance` 连字符写法)。现移除该别名: `type` 只认 `load_balance`, 写 `load-balance`
+会被 `check`/启动**直接拒绝** (报 `unknown variant`, 并列出合法值)。内部标签/错误消息里的
+`load-balance` 一并改为 `load_balance`, 用户所见处处一致。
+
+**迁移**: 若配置里写了 `"type": "load-balance"`, 改成 `"type": "load_balance"` 即可 (该别名是
+v0.6.7 才引入, 预计无存量依赖)。`pyreality`→`mirage` 的旧名别名**保留** (协议改名迁移, 非命名规范问题)。
+
 ### docs: README 精简后补回内核门槛/看板安全警告 + CLI 用法章
 
 README 精简时漏掉两处必要说明, 补回 (保持精简风格):
