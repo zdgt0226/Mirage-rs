@@ -80,7 +80,19 @@
             "tag": "manual-proxy",
             "outbounds": ["auto-proxy", "proxy-jp", "proxy-us", "direct-out"]
         },
-        // 4. 直连与拦截
+        // 4. LoadBalance 负载均衡组 (v0.6.7): 把连接**分摊**到多个健康成员 (urltest/fallback/
+        //    selector 都是"选一个", 它是"分摊")。建议成员**同区域** (都美国/都日本), 否则出口国
+        //    不一致会影响落地解锁; `mirage-rs test` 显 [国家码]、`import --group` 会告警混区域。
+        {
+            "type": "load_balance",
+            "tag": "balance-jp",
+            "outbounds": ["proxy-jp", "proxy-us"], // 分摊连接的成员集合
+            "strategy": "round-robin",             // v1 仅支持 round-robin (每连接原子游标轮流)
+            "url": "http://www.gstatic.com/generate_204", // 健康检查拨测地址
+            "interval": 300                        // 健康检查间隔 (秒)
+            // ⚠ round-robin 下同会话多连接可能落不同节点, 查 IP 一致性的站点受影响
+        },
+        // 5. 直连与拦截
         {
             "type": "direct",
             "tag": "direct-out"
@@ -111,6 +123,15 @@
             {
                 "domain_keyword": ["ads", "tracker"],
                 "outbound": "block-out"
+            },
+            // 多条件组合: 一条规则写多个字段默认 OR (任一命中); 显式 "mode": "and" 则**全部满足**
+            // 才命中 (下例: 既是 netflix 域名、又落在美国 IP 才走负载均衡组)。mode 只认 or/and,
+            // 拼错会被 `mirage-rs check` 拦下 (v0.6.9+ 起校验, 不再静默当 or)。
+            {
+                "mode": "and",
+                "domain_suffix": ["netflix.com"],
+                "geoip": ["us"],
+                "outbound": "balance-jp"
             }
         ]
     },
@@ -159,5 +180,32 @@
                 "use": "remote-dns"        // 走代理查询
             }
         ]
+    },
+
+    // 调优 / Geo 数据 (v0.4.3+ 多源下载; v0.6.7 节点区域判定也读这里的 geoip.dat)
+    "tuning": {
+        "geodata_dir": "/etc/mirage/geo",   // geo .dat 存放目录 (下载/热重载都在此)
+
+        // 多源 Geo 下载: 每源独立 URL + via。下载后存为 <name>.dat, 路由规则引用
+        // 形如 "geosite": ["cn"] 用默认库, 或 "geosite": ["loyalsoldier.dat:cn"] 指名库。
+        // via: direct=直连拉 (客户端常用) / proxy=走本地 socks/mixed 入站 (国内服务器拉 GitHub 用)。
+        "geo_sources": [
+            {
+                "name": "geosite",           // 域名规则库 → geosite.dat
+                "kind": "geosite",
+                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+                "via": "direct"
+            },
+            {
+                "name": "geoip",             // IP 段库 → geoip.dat (节点区域判定也用它)
+                "kind": "geoip",
+                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+                "via": "direct"
+            }
+        ],
+        "geo_update_days": 7                 // 每 7 天检查更新 (默认 7)
+
+        // 服务端专用: "dns_tcp_resolver": "1.1.1.1" —— 出向 UDP 被封的 VPS 走 DNS-over-TCP 解析
+        // 域名 (客户端通常不需要, 见 config_server.jsonc)。
     }
 }

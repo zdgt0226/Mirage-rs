@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### docs: 配置模板同步近期功能 + 修服务端模板死字段
+
+`templates/*.jsonc` 补齐近期功能, jq 格式化 + 注释, 两模板均 `mirage-rs check` 零未知字段:
+
+- **客户端** (`config_client.jsonc`): 加 `load_balance` 负载均衡组 (含混区域提醒) · `mode: "and"`
+  多条件组合规则示例 · `tuning` 块 (`geodata_dir` + `geo_sources` 多源下载 + `geo_update_days`,
+  节点区域判定也读 geoip.dat)。
+- **服务端** (`config_server.jsonc`): **删 4 个死字段** —— `tcp_keepalive`/`decision_cache_max_entries`
+  (alpha.18 已删)、`geosite_url`/`geoip_url` (v0.4.3 被 `geo_sources` 取代); 原模板在教用户写
+  "已被忽略、不生效"的配置。改为当前 `geo_sources` + 补 `dns_tcp_resolver` (v0.6.5 服务端特性说明)。
+
 ### fix: 全局代码审查加固 (4 路 Sonnet 独立复审, 无 P0/P1)
 
 23k Rust + 781 C 全局审查 (crypto/eBPF/proxy 数据面/DNS-router-config 四子系统并行独立复审)。

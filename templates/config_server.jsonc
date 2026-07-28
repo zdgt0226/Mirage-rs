@@ -49,12 +49,33 @@
         ]
     },
 
-    // 系统内核与网络调优参数
+    // 调优 / Geo 数据 / DNS 解析
     "tuning": {
-        "tcp_keepalive": 300,           // TCP 保活时间(秒)
-        "decision_cache_max_entries": 65536, // 路由缓存大小
-        // 后台会自动下载/更新 geoip.dat 和 dlc.dat，可自定义下载源
-        "geosite_url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
-        "geoip_url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
+        "geodata_dir": "/etc/mirage/geo",   // geo .dat 存放目录
+
+        // 多源 Geo 下载 (v0.4.3 起取代旧的 geosite_url/geoip_url 单字段)。服务端拉取用
+        // via:"direct" (服务端无本地 socks 入站, 不能走 proxy)。名字即落盘 <name>.dat。
+        "geo_sources": [
+            {
+                "name": "geosite",
+                "kind": "geosite",
+                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+                "via": "direct"
+            },
+            {
+                "name": "geoip",
+                "kind": "geoip",
+                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+                "via": "direct"
+            }
+        ],
+        "geo_update_days": 7,               // 每 7 天检查更新 (默认 7)
+
+        // 【服务端专用, v0.6.5】出向 UDP 被封的 VPS: 域名解析改走 DNS-over-TCP (自实现无依赖),
+        // 否则 glibc getaddrinfo 走 UDP 会解析不了代理目标域名。无端口默认 :53。不设=系统解析器。
+        "dns_tcp_resolver": "1.1.1.1"
+
+        // ebpf_mode 默认 auto: 服务端自动跳过 eBPF (入站是加密流, sockmap/XDP/sk_lookup
+        // 对服务端都无价值)。调试才设 "force"。
     }
 }
