@@ -409,6 +409,7 @@ mod tests {
                 router: Arc::new(router),
                 outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg)),
                 advanced_dns: None,
+                auto_classify: None,
             },
         ))
     }

@@ -439,11 +439,33 @@ pub struct AdvancedDnsConfig {
     pub default: Option<String>,
     #[serde(default)]
     pub resolvers: Vec<DnsResolver>,
-    #[serde(default)]
-    pub rules: Vec<DnsRule>,
     pub fakeip: Option<FakeIpConfig>,
     pub cache: Option<DnsCacheConfig>,
     pub xdp_interface: Option<String>,
+    /// 未命中任何显式 routing 规则的域名 (本会走 default) 的**自适应分类**: 先用国内 DNS
+    /// 解析, 首个 A 记录经 GeoIP 判 —— 属 CN 则直连返回国内结果, 属海外则改 fake-IP 代理并把
+    /// 该域名按 TTL 学习标记为海外 (后续直接 fake-IP)。国内 DNS 是最终回落。不配 = 关闭
+    /// (未命中规则照旧走 default_outbound)。
+    pub auto_classify: Option<AutoClassifyConfig>,
+}
+
+/// 见 AdvancedDnsConfig::auto_classify。
+#[derive(Debug, Deserialize, Clone)]
+pub struct AutoClassifyConfig {
+    pub enabled: bool,
+    /// 学习到的"海外"标记存活秒数 (防 CDN geo-DNS 抖动把域名永钉在代理)。默认 3600。
+    #[serde(default = "default_auto_classify_ttl")]
+    pub ttl: u64,
+    /// 学习缓存容量上限 (纯内存, LRU 淘汰)。默认 8192。
+    #[serde(default = "default_auto_classify_cap")]
+    pub max_entries: usize,
+}
+
+fn default_auto_classify_ttl() -> u64 {
+    3600
+}
+fn default_auto_classify_cap() -> usize {
+    8192
 }
 
 /// DNS 应答的 IP 版本策略。纯 DNS 服务器按记录类型分别应答, 无法在单查询里"优先",
@@ -562,13 +584,6 @@ pub fn parse_dns_upstream(s: &str) -> Option<std::net::SocketAddr> {
     None
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DnsRule {
-    #[serde(rename = "match")]
-    pub match_rule: String,
-    #[serde(rename = "use")]
-    pub use_resolver: String,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct FakeIpConfig {

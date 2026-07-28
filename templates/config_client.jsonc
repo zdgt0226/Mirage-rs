@@ -169,17 +169,19 @@
             }
         ],
 
-        // DNS 分流规则 (避免污染的核心)
-        "rules": [
-            {
-                "match": "geosite:cn",     // 国内域名
-                "use": "local-dns"         // 走国内 DNS 解析
-            },
-            {
-                "match": "geosite:geolocation-!cn", // 国外域名
-                "use": "remote-dns"        // 走代理查询
-            }
-        ]
+        // 未分类域名 (未命中任何 routing.rules 规则、本会走 default_outbound 的) 的自适应分类:
+        // 先用国内 DNS 解析, 首个 A 记录经 GeoIP 判 —— 属 CN 则直连返回国内结果; 属海外则改
+        // fake-IP 代理, 并把该域名按 TTL 学习标记为海外 (后续直接 fake-IP)。国内 DNS 是最终回落。
+        // ⚠️ 仅作用于"未命中显式规则"的灰域名; 已知被封的域名请放进 routing.rules 明确代理,
+        //    否则极少数 CN 段污染会让它被误判直连。不配 = 关闭 (未命中照旧走 default_outbound)。
+        "auto_classify": {
+            "enabled": true,
+            "ttl": 1800,             // 学习到的"海外"标记存活秒 (默认 3600; 防 CDN geo-DNS 抖动永钉代理)
+            "max_entries": 4096      // 学习缓存容量上限 (纯内存, 默认 8192)
+        }
+
+        // 注: DNS 分流复用 routing.rules (direct→国内DNS / mirage→fake-IP / block→NXDOMAIN);
+        //     旧的 advanced_dns.rules (match/use) 已移除 (从未实现)。
     },
 
     // 调优 / Geo 数据 (v0.4.3+ 多源下载; v0.6.7 节点区域判定也读这里的 geoip.dat)

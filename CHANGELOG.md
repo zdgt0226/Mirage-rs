@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### feat(dns): 未分类域名自适应分类 (auto_classify) —— 按解析 IP 归属自动分流 + 学习
+
+给**未命中任何 routing 规则** (本会走 `default_outbound`) 的"灰域名"加一层按解析 IP 归属的自适应分流:
+
+```jsonc
+"advanced_dns": {
+  "auto_classify": { "enabled": true, "ttl": 1800, "max_entries": 4096 }
+}
+```
+
+- 灰域名先用**国内 DNS** 解析, 看**首个 A 记录** vs GeoIP:
+  - **IP ∈ CN** → 返回国内结果 (直连, 国内 CDN 就近)。国内 DNS = 最终回落。
+  - **IP ∉ CN** → 改 **fake-IP** (走隧道远程解析, 免污染), 并把域名按 **TTL 学习标记为海外** →
+    后续该域名直接 fake-IP, 不再探测。
+- 命中显式规则的域名照旧 (direct/mirage/block)。学习缓存纯内存 + TTL + 容量上限 (软淘汰),
+  热重载重置。CN 判定复用 `geoip.dat` 的 cn 段 (`geodata_dir` 下)。
+- ⚠️ **仅作用于未命中规则的灰域名**: 已知被封域名请用 routing.rules 明确代理, 否则极少数 CN 段
+  污染会误判直连 (文档已强调)。geoip.dat 缺失 / cn 段空 → 自动禁用 (WARN)。
+- 实现: `router.route_matched()` 区分"命中规则 vs 落 default"; `AutoClassify` (CN 段 + TTL 缓存) 挂
+  `CoreState`; `first_a_record` 解析响应首个 A。单测: first_a_record / is_cn / TTL 缓存 / 容量封顶 /
+  route_matched。
+
+### ⚠️ 移除死字段 `advanced_dns.rules` (match/use, split-DNS)
+
+该字段自引入起**从未实现** (仅启动 WARN "被忽略")。现彻底移除: `check` 直接报"未知字段", 模板同步删除。
+DNS 分流由 `routing.rules` (复用主路由) + 新的 `auto_classify` 承担, 不再有教人写死配置的字段。
+
 ### ⚠️ 破坏性: 移除 `load-balance` kebab 别名 —— 统一 snake_case
 
 配置命名统一到 **snake_case 单一形式** (全仓本就 100% snake_case, 唯一例外是 `load_balance`

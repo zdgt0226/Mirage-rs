@@ -530,7 +530,26 @@ impl RouterEngine {
         self.rule_table.iter().any(|r| !r.process_name.is_empty())
     }
 
+    /// 命中即 default 的包装: route_matched 无命中时回落 default_outbound。
     pub fn route(&self, req: RoutingRequest) -> OutboundTag {
+        self.route_matched(&req).unwrap_or_else(|| {
+            tracing::debug!(
+                "[ROUTE] {} :{}/{} → [{}] (默认出口, 无规则命中)",
+                req.domain.map(|d| d.to_string()).or_else(|| req.ip.map(|i| i.to_string())).unwrap_or_else(|| "?".into()),
+                req.port, req.protocol, self.default_outbound
+            );
+            self.default_outbound.clone()
+        })
+    }
+
+    /// 只读的默认出站 tag (供 DNS auto_classify 判定"未命中规则")。
+    pub fn default_outbound(&self) -> &str {
+        &self.default_outbound
+    }
+
+    /// 返回命中的显式规则出站; **无任何规则命中 → None** (由调用方决定回落 default_outbound
+    /// 还是走 auto_classify)。语义/顺序与 route() 完全一致, 只是不替调用方兜 default。
+    pub fn route_matched(&self, req: &RoutingRequest) -> Option<OutboundTag> {
         let mut candidate_counts: std::collections::HashMap<RuleId, usize> = std::collections::HashMap::new();
 
         if let Some(domain) = req.domain {
@@ -595,7 +614,7 @@ impl RouterEngine {
 
         for id in valid_candidates {
             let rule = &self.rule_table[id as usize];
-            if rule.matches_port(req.port) && rule.matches_extra(&req) {
+            if rule.matches_port(req.port) && rule.matches_extra(req) {
                 tracing::debug!(
                     "[ROUTE] {} :{}/{} → [{}] (命中规则 #{})",
                     req.domain
@@ -607,21 +626,10 @@ impl RouterEngine {
                     rule.outbound,
                     id
                 );
-                return rule.outbound.clone();
+                return Some(rule.outbound.clone());
             }
         }
-
-        tracing::debug!(
-            "[ROUTE] {} :{}/{} → [{}] (默认出口, 无规则命中)",
-            req.domain
-                .map(|d| d.to_string())
-                .or_else(|| req.ip.map(|i| i.to_string()))
-                .unwrap_or_else(|| "?".into()),
-            req.port,
-            req.protocol,
-            self.default_outbound
-        );
-        self.default_outbound.clone()
+        None
     }
 }
 
@@ -858,6 +866,28 @@ mod tests {
             "与 proxy 段重叠的直连段必须排除, 否则会绕过代理泄漏"
         );
         assert_eq!(direct.len(), 1);
+    }
+
+    #[test]
+    fn route_matched_none_when_unclassified() {
+        let rules = vec![ip_rule(0, "proxy", &["1.2.3.0/24"])];
+        let engine = RouterEngine::new(rules, "default".to_string(), "/nonexistent", &HashMap::new()).unwrap();
+        let req = |ip: &str| RoutingRequest {
+            domain: None,
+            ip: Some(ip.parse().unwrap()),
+            port: 80,
+            protocol: "tcp",
+            source_ip: None,
+            source_mac: None,
+            inbound: None,
+            process_name: None,
+        };
+        // 命中规则 → Some
+        assert_eq!(engine.route_matched(&req("1.2.3.5")).as_deref(), Some("proxy"));
+        // 未命中 → None (供 auto_classify 介入); route() 才回落 default
+        assert!(engine.route_matched(&req("9.9.9.9")).is_none());
+        assert_eq!(engine.route(req("9.9.9.9")), "default");
+        assert_eq!(engine.default_outbound(), "default");
     }
 }
 

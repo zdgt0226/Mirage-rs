@@ -610,15 +610,6 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                      API 鉴权请改用 `gui.token` (见 README)。该字段将在未来版本移除。"
                 );
             }
-            if let Some(adv) = &config.advanced_dns {
-                if !adv.rules.is_empty() {
-                    warn!(
-                        "config 里的 `advanced_dns.rules` ({} 条) **尚未实现, 当前被完全忽略** —— \
-                         DNS 分流目前由 routing.rules (主路由) 决定。别依赖它。",
-                        adv.rules.len()
-                    );
-                }
-            }
             if let Some(gui) = config.gui {
                 gui_enabled = gui.enabled;
                 gui_listen = gui.listen;
