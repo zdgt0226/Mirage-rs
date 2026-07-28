@@ -2,39 +2,25 @@
 
 ![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.8-10b981.svg)
 
-基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 内核级 eBPF 加速 + 内置 Neon Dashboard。
+基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
 > **定位**: 面向**自建跨境线路的个人/小团队** —— 有一台墙外 VPS + 一台能当网关的 Linux 机器。
-> 主打「零配置 eBPF 透明网关」+ 抗被动识别。**不追求做通用的 Clash/sing-box 替代品**, 而是自建者的顺手工具。
-> 当前功能边界与未完成项见文末 [路线图 / TODO](#路线图--todo)。
+> 主打「零配置 eBPF 透明网关」+ 抗被动识别。
 
-## 核心特性
+> **运行要求**: **Linux 内核 ≥ 5.10** —— eBPF 透明网关依赖 `sk_lookup`(5.9+) / `sk_assign`(5.7+) /
+> XDP DNS, 旧内核 (如 Ubuntu 20.04 的 5.4、老 NAS/OpenWrt) 上这些程序**加载会失败**。
+> 内核不够也不必放弃: **轻量 / SOCKS 模式不碰 eBPF**, 任意较新 Linux 都能跑 (只是没有透明网关)。
+> 服务端**不需要** eBPF (入站是加密流, 自动跳过), 内核门槛只针对**客户端/网关侧**。
 
-**传输与抗识别**
-- **零延迟认证与伪装**: 首包完成身份验证 + TLS 1.3 ClientHello 字节级仿真 (Chrome / Firefox / OkHttp 三套 profile 轮换, 后量子 X25519MLKEM768), 时序与指纹复刻真实站点
-- **TCP Brutal 拥塞控制**: 单条 TCP 死磕设定速率, 跨洲专线 / 高丢包链路吊打 BBR (设计哲学见下方专章)
-- **无锁化异步架构**: 全异步数据搬运, 千兆网络 + 上万连接下内存低占用, 直连数据面走 `splice(2)` 零拷贝
+---
 
-**透明网关 (eBPF)**
-- **eBPF sk_lookup / tc_divert / XDP**: 内核级透明代理 (拦截 LAN 裸-IP 转发流量) + fake-IP DNS 加速 (Linux ≥ 5.10)
-- **抗风暴 DNS**: fake-IP 稳定 TTL + 空答复 SOA 负缓存 + 国内上游多路并行/重传, 根治开网页时的 DNS 查询风暴
+## 🌟 核心特性概览
 
-**出站 / 中转 (v0.6.0-alpha.7+)**
-- **WireGuard 出站 & 上游**: 客户端按规则走 WG 出站, 或服务端接 WG 上游作中转 —— TCP/UDP/隧道内 DNS 全通; boringtun + smoltcp 用户态实现, **不需内核 WG 模块 / root / 网络接口**。已对真实 WG 服务端五层验证互通
-- **中转站模式**: 服务端可接 Shadowsocks (SIP004 + SIP022) 或 WireGuard 上游出口, 把 Mirage 当中转
-
-**路由分流**
-- **多维路由**: `domain_suffix` / `domain_keyword` / `domain_regex` (Aho-Corasick + RegexSet 一次扫描) / `geosite` / `geoip` (LPM trie) / `ip_cidr` / `port` / `inbound` (按入站 tag)
-- **裸 IP 目标按域名分流 (alpha.7)**: SNI/Host 嗅探扩到全部入站 —— app 自己解析完送 IP 时, 域名规则仍生效 (仅用于路由判定, 不改连接目的地)
-- **SOCKS5 UDP 逐数据报路由 (alpha.7)**: UDP 每个数据报独立走路由, 不再绕过规则
-- **geo 自动更新**: 条件请求 (ETag/304) + 多镜像回落 + 落地前校验 + 重启不重下
-
-**易用性 / 运维**
-- **轻量模式**: `lite-client` / `lite-server` —— 「SOCKS5 进, 全部走隧道」, 三五项填完就能用, 与完整版协议互通
-- **配置工具链**: `check` (重启前闸门, 有问题非零退出) / `format` / `import` (导入 mirage:// 节点, 可选建 urltest 组) / `test` (节点可用性测试: 完整握手+认证)
-- **入站认证**: SOCKS5 (RFC 1929) 与 HTTP (Basic) 均可设账号密码, 杜绝开放代理
-- **Neon Pulse Dashboard**: 内置网页大屏, Canvas 时序图展示 eBPF 命中率 / 吞吐 / 连接动态
-- **日志自动滚动压缩**: 超阈值滚动 + gzip 归档 (阈值/份数可配), 长跑网关不撑爆磁盘
+* **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（多浏览器 Profile 轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。
+* **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速。
+* **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
+* **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
+* **内置 Web 看板**: Neon Pulse Dashboard，实时监控流速、eBPF 拦截率，并支持可视化热重载规则。
 
 ---
 
@@ -63,228 +49,9 @@ sudo bash install.sh
 装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`
 (轻量版是 `mirage-rs-lite-{server,client}`)。
 
-## 手动部署 (熟悉用户)
+---
 
-前往 [Releases](https://github.com/zdgt0226/Mirage-rs/releases) 拉最新二进制:
-- **`mirage-rs-amd64-musl`** — 推荐, 静态链接, 全 Linux 通吃
-- `mirage-rs-amd64` — gnu 动态链接, glibc ≥ 2.35 (Ubuntu 22.04+ / Debian 12+ / RHEL 9+)
-- `mirage-rs-arm64-musl` — ARM (树莓派 / 甲骨文云 / Ampere)
-
-每个 binary 都有配套 `.sha256`, 校验:
-```bash
-sha256sum -c mirage-rs-amd64-musl.sha256
-```
-
-启动:
-```bash
-./mirage-rs-amd64-musl client -c /etc/mirage-rs/config_client.json
-./mirage-rs-amd64-musl server -c /etc/mirage-rs/config_server.json
-```
-
-配置校验与格式化 (不启动服务):
-```bash
-# 校验: 未知字段 (拼写错误) / 引用了不存在的 outbound / 明显无效值。
-# 有问题即非零退出, 适合当重启前的闸门:
-mirage-rs check -c /etc/mirage-rs/config_client.json && systemctl restart mirage-rs-client
-
-# 格式化输出到 stdout (不改动原文件, 保留原键序与全部字段):
-mirage-rs format -c config.json > config.pretty.json
-
-# 导入 mirage:// 节点为新的 mirage 出站 (会写回配置, 自动备份为 config.json.bak):
-mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
-
-# 导入前先测节点可用 (--test 仅告警; --require-live 不可用则拒绝导入):
-mirage-rs import -c config.json --require-live "mirage://密码@host:443?sni=www.apple.com"
-
-# 导入并建 urltest 组按 RTT 自动选路 (建/更新 "auto" 组 + 指向它, --group-name 改名):
-mirage-rs import -c config.json --group "mirage://密码@host:443?sni=www.apple.com"
-
-# 建组时自定义 urltest 参数 (都可选; 未给的建组走默认/更新时保留原值):
-mirage-rs import -c config.json --group \
-  --group-interval 120 \      # 健康检查间隔秒 (默认 300; 0=关)
-  --group-tolerance 30 \      # RTT 容差 ms, 现节点领先超过它才切换 (默认 50)
-  --group-test-type ping \    # ping==http (穿隧道 HTTP 探测, 端到端) / rtt (内核 RTT, 轻量)
-  --group-url http://cp.cloudflare.com/generate_204 \  # HTTP 探测地址 (ping/http 模式用)
-  "mirage://密码@host:443?sni=www.apple.com"
-
-# 测已配 mirage 节点可用性 (完整握手 + 认证验证, 报 RTT; 全通过退出 0):
-mirage-rs test -c config.json            # 测全部 mirage 出站
-mirage-rs test -c config.json --tag proxy # 只测某个 tag
-
-# 批量导入节点: 来源可为 URL 或本地文件; 内容可为 mirage:// 列表 或 export 的 JSON 片段:
-mirage-rs subscribe -c config.json https://example.com/sub   # 远程 mirage:// 列表 (经典订阅)
-mirage-rs subscribe -c config.json --group https://example.com/sub  # 顺带建 urltest 组
-mirage-rs subscribe -c config.json share.json                # 合并本地 JSON 片段 (export 产出)
-mirage-rs subscribe -c config.json --routing share.json      # 连路由规则一起并 (侵入, 默认不并)
-
-# 反向: 交互式导出配置片段 (选节点 + 匹配的组/路由/geo) 为可分享 JSON:
-mirage-rs export -c config.json -o share.json
-mirage-rs export -c config.json > share.json   # 无 -o 则写 stdout (提示走 stderr)
-```
-
-> **导出 `export`**: 交互问导出哪些 mirage 节点 (回车=全部, 或 `1,3,5-7` 选部分)、是否带
-> 路由规则、是否带 geo 下载地址。**组自动按所选节点匹配** —— 组内未选成员剔除, 剔空则跳过;
-> 引用到未导出出站的规则丢弃。被组/规则引用的 `direct`/`block` 一并带上。输出 JSON 片段
-> (`nodes` + `outbounds` + 可选 `routing`/`geo_sources`)。用 `subscribe <片段>` 导回, 闭环。
-
-> **导入格式**: `subscribe` 自动辨来源内容 —— 以 `{` 开头当 **JSON 片段**合并 (节点+组+可选路由/geo),
-> 否则当**每行一个 `mirage://` URI** (整段 base64 则先解码, 兼容经典订阅; 跳过空行 / `#` 注释)。
-> 均按 `server:port` 去重 (重导只加新); tag 撞名自动改名 (`-2`/`-3`) 并**同步重映射**片段里组/规则的
-> 引用。合并片段时 `--routing` 才并路由规则 (侵入); `default_outbound` 不动。周期自动刷新暂未做。
-
-> **urltest 测试方式 `test_type` 说明**: `ping` 与 `http` **完全等价** —— 都是**穿隧道 HTTP
-> 探测** (周期性 GET `--group-url` 的 generate_204), 量**端到端**耗时, 含 VPS 到目标的**出口
-> 线路质量**, 最贴近真实浏览体验 (默认, 推荐)。`rtt` 是 eBPF 抓的**内核 TCP RTT**, 只量客户端
-> 到 VPS **那一跳**, 轻量/被动零探测流量, 但**盲于出口质量** —— 离你近却出口拥塞的节点会被
-> `rtt` 误判成最优。选"浏览最流畅"用 `ping`; 只在乎就近、想省探测流量用 `rtt` (节点无活连接时
-> `rtt` 自动回落 HTTP 探测)。
-
-`import` 会交互式询问出站 tag 并**保证不与现有出站 tag 冲突**(撞名就重问, 绝不覆盖既有节点)。
-默认只添加出站、**不动路由** —— 要让流量走它, 需自行把 `routing.default_outbound` 或某条
-`rule` 的 `outbound` 改成新 tag, 再 `check` 一遍后重启。导入后若代理节点 > 1, 会**建议**
-(不擅自改路由) 用 urltest 自动选路; 加 `--group` 才显式建组并把 `default_outbound` 指向它。
-
-**出站组类型** (rule / default_outbound 可指向组, 组成员是其它出站):
-
-| type | 行为 |
-|---|---|
-| `urltest` | 选**延迟最低**的健康成员 (自动测速, `test_type` rtt/ping, `tolerance` 容差) |
-| `fallback` | 选**第一个健康**成员 (主备切换) |
-| `selector` | 手动指定当前成员 |
-| `load_balance` | 把连接**分摊**到多个健康成员 (负载均衡)。v1 `strategy: "round-robin"` (每连接轮流); `url`+`interval` 同 urltest 做健康检查。⚠️ round-robin 下同一会话的多条连接可能落到不同节点, 查 IP 一致性的站点会受影响 (会话粘滞的 consistent-hash 后续加) |
-
-```json
-{ "type": "load_balance", "tag": "lb", "outbounds": ["n1","n2","n3"], "strategy": "round-robin" }
-```
-
-**节点区域** (GeoIP): `mirage-rs test` 每节点显示 `[国家码]` (如 `[US]`/`[JP]`) —— 用已下载的
-`geoip.dat` 查 `server` IP 所在国 (离线, 免费; 直连出口的节点即出口国)。`import --group` 建组时,
-若组内节点**跨多个区域**会告警 —— 负载均衡/自动选路混区域会让出口国不一致 (落地解锁/延迟受影响),
-建议同区域各自分组。(节点自身再经上游中转时 server IP ≠ 真出口, 属已知限制。)
-
-**`mirage-rs test`**: 测节点是否真能用 —— 走**完整 Mirage 握手并解密服务端首帧确认认证**,
-裸 TCP 连通不算数 (伪装前置是真站点, `:443` 本来就通)。结果分 ✓可用 (报 RTT) / ⚠可达但未确认
-认证 (旧服务端?) / ✗不可用 (连接失败 / 握手超时 / 认证失败=密码不符或非 Mirage 服务端)。
-
-**RTT + HTTP 协同判断网络质量** (默认开, `--no-http` 关): 认证确认后再**穿隧道拉一次**探测
-地址 (默认 `http://www.gstatic.com/generate_204`, `--probe-url` 可换), 同时报三个指标:
-
-```
-  proxy  1.2.3.4:443  ✓ 可用  (TCP 42ms · 握手 88ms · HTTP 210ms; 出口 ≈ 168ms, 偏高)
-```
-
-- **TCP** = 客户端↔VPS 网络往返 (≈到门口距离); **HTTP** = 穿隧道端到端, 含 **VPS 到目标的出口**。
-- `出口 ≈ HTTP − TCP`: 低 TCP 但高 HTTP = 离你近但**出口线路烂**; 两者都高 = 网络到 VPS 就远。
-  单看 RTT 会把"近但出口烂"的节点误判成好, HTTP 端到端补上这个盲区。
-- HTTP 探测失败 (出口连不上/超时) 不影响可用判定 —— 节点仍算 ✓可用, 只标"出口可能不通"。
-- 默认会产生真实出口流量 (每节点穿隧道拉一次); 不想要用 `--no-http` 只测握手。
-
-> 服务**启动时**也会跑同一套校验, 但那里只打 WARN 不阻止启动 (配置多一个字段就让网关起不来
-> 代价太大)。`check` 反过来求"拦得住", 所以有问题就非零退出 —— 两者的严格度差异是刻意的。
-
-⚠️ **内核必须 ≥ 5.10**, 详见下方 [系统兼容性](#系统兼容性)。
-
-### 中转站模式 (服务端接 Shadowsocks 上游)
-
-服务端可以**不直连目标**, 而是把流量再经 Shadowsocks 发往上游出口 —— 即把 Mirage 当中转站:
-
-```
-客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
-```
-
-典型用途: Mirage 服务端放在离你近、线路好的位置(如香港)只做中转, 真正的出口落在另一台
-SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻量服务端配置)加:
-
-```jsonc
-"upstream": {
-    "type": "shadowsocks",
-    "server": "1.2.3.4",
-    "server_port": 8388,
-    "password": "ss-password",
-    "method": "aes-256-gcm",    // SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
-                                // SIP022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm
-                                //         / 2022-blake3-chacha20-poly1305
-    "udp": "block"              // block(默认) | direct, 见下方说明
-}
-```
-
-不配 `upstream` = 直连目标(原行为)。加密方式写错会**直接报错拒绝启动**, 而不是悄悄降级
-成直连 —— 配了中转却走直连意味着出口 IP 与预期完全不同, 必须让人立刻知道。
-
-> ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 尚未实现, 因此 `udp` **默认 `block`**
-> (直接拒绝 UDP 中继)。这是刻意的: 若放行, UDP 会从**本机 IP** 直连出去而 TCP 从上游出去,
-> 出口 IP 不一致 —— 对落地解锁场景这不是"不一致"而是**功能性错误**(流媒体走 QUIC 时会被判
-> 成错误区域, 且不会像被封那样回落 TCP, 表现为解锁时灵时不灵)。**安全的失败方式是"不发",
-> 而非"发到别处去"**。代价: QUIC 回落 TCP(页面照常), 游戏/WebRTC 不可用。
-> 确需旧行为写 `"udp": "direct"`(启动会 WARN)。轻量客户端本就仅 TCP, 不受影响。
->
-> 📌 同时支持 **SIP004 AEAD** 与 **SIP022 (Shadowsocks 2022)**;
-> **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、已被社区废弃、易被主动探测识别。
->
-> 📌 **SIP022 的 `password` 与 SIP004 语义完全不同**: 它不是任意密码, 而是 **base64 编码的密钥本身**
-> (2022-blake3-aes-128-gcm 要 16 字节, aes-256 要 32 字节), 不做密码拉伸。用
-> `openssl rand -base64 32` 生成。长度不对会被 `mirage-rs check` 直接拦下并说明应有长度 ——
-> 这类错**不会**让服务端起不来, 而是每条连接都静默失败, 所以必须提前拦住。
-
-### WireGuard 出站 / 上游 (v0.6.0-alpha.7+)
-
-WireGuard 可以用在**两个位置**:
-
-**① 客户端出站** —— 按路由规则把选中的流量走 WG,不经 Mirage 隧道:
-
-```jsonc
-{
-    "type": "wireguard",
-    "tag": "wg-out",
-    "private_key": "wg genkey 生成的 base64",
-    "peer_public_key": "对端公钥 base64",
-    "preshared_key": "可选, wg genpsk 生成",
-    "endpoint": "1.2.3.4:51820",
-    "address": "10.0.0.2",          // 隧道内分配给你的地址, 不带掩码
-    "mtu": 1420,                    // 可选, 默认 1420
-    "persistent_keepalive": 25,     // 可选, 穿 NAT 用
-    "dns": "10.0.0.1"               // 可选, 隧道内 DNS —— 见下方说明
-}
-```
-
-**② 服务端上游** —— 与 SS 中转同一个位置,把 Mirage 当中转站、出口落在 WG 对端:
-
-```
-客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(WireGuard)──▶ WG 对端 ──▶ 目标
-```
-
-给 `mirage_server` 入站加 `"upstream": { "type": "wireguard", ... }`,字段同上(外加
-`"udp": "block"`)。
-
-> 📌 **密钥是标准 WireGuard 的 base64 32 字节 x25519 密钥**(`wg genkey` / `wg pubkey` 的输出),
-> **不是任意密码**。长度不对会被 `mirage-rs check` 直接拦下 —— 这类错**不会**让进程起不来,
-> 而是让每条连接静默失败(服务看着健康却什么都代理不了),所以必须提前拦住。
->
-> ⚠️ **配错时降级为 `block`(拒绝连接), 而不是 `direct`**。这是刻意的: 你配 WG 的意图就是
-> 流量从 WG 出去, 悄悄改走直连意味着本该走隧道的流量从**本机 IP 裸奔出去**且毫无察觉。
-> 与上面 SS 的 UDP 策略同一条原则 —— **安全的失败方式是"不发", 而非"发到别处去"**。
->
-> 📌 **`dns` 字段决定域名在哪解析**(对齐 wg-quick 的 `DNS =`):
-> - **配了** → 域名**经隧道解析**, 查询本身也在隧道内, 且拿到的是**对端地区**的解析结果。
->   走 CDN/流媒体时这是必须的 —— 否则流量确实从对端出去了, 但目标 IP 是按你**本地位置**
->   挑的, WG 出口等于白配。
-> - **不配** → 保持本机解析(原行为), 不强加一次额外往返。代价即上面那条。
->
-> 解析用明文 DNS(53/UDP), 但整条查询在隧道内, 对隧道外不可见。
->
-> 📌 服务端上游的 `udp` **默认 `tunnel`** —— UDP 也走 WG 隧道, **与 TCP 同一个出口 IP**。
-> 这与 SS 上游默认 `block` 不同, 因为 block 的理由(UDP 从本机 IP 出去、与 TCP 出口不一致)
-> 在 WG 上不成立: 隧道本就跑 IP 包, 天然能承载 UDP。
-> 想禁用写 `"udp": "block"`; 想让 UDP 绕过隧道走本机写 `"udp": "direct"`(会 WARN)。
-> 给 **SS** 上游写 `"udp": "tunnel"` 会被 `check` 拦下 —— SS 的 UDP 尚未实现。
-
-**实现说明**: WG 是 L3 IP 包协议, 隧道里跑的不是字节流。因此内部用
-[`boringtun`](https://github.com/cloudflare/boringtun)(Noise IK 握手/加解密)+
-[`smoltcp`](https://github.com/smoltcp-rs/smoltcp)(用户态 TCP/IP 栈)把被代理的 TCP/UDP
-连接转成 IP 包。**不需要**内核 WireGuard 模块、不需要 root、不创建网络接口。
-
-已对真实 WireGuard 服务端实测互通(握手 / 裸 IP 包 / TCP / UDP 四层全通),
-验证器见 `examples/verify_wg_real_peer.rs`。
+## 🛠️ 灵活的部署形态
 
 ### 轻量模式 (只要"能翻墙"就够了)
 
@@ -345,148 +112,55 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 
 ---
 
-## 🖥️ 科幻大屏：Neon Pulse Dashboard
+### 中转站模式 (服务端接 Shadowsocks 上游)
 
-我们为 Mirage-rs 打造了一个前端 Web UI。
-只要在 config 里 `gui.enabled: true`, `gui.listen: "127.0.0.1:9090"` (install.sh 默认开启):
+服务端可以**不直连目标**, 而是把流量再经 Shadowsocks 发往上游出口 —— 即把 Mirage 当中转站:
 
-1. 打开浏览器, 访问: `http://127.0.0.1:9090`
-2. 您将看到一个炫酷的 **THE NEON PULSE** 面板。
-3. **功能一览**：
-   - **历史流速全景图**：上下行速率、eBPF 硬件加速拦截量的 2 分钟滚动折线图，F5 刷新数据不会丢失。
-   - **节点秒级切换**：支持 URLTest（自动测速最快节点）、Selector（手动点选切换）。每个节点都会显示 BPF 与 HTTP 真实握手延迟。
-   - **活体规则系统**：点击 "+ Add Rule" 可视化添加分流规则（GeoIP、域名后缀等），点击 "Save & Apply" **无感热重载生效**，不会断开正在看视频或下载的 TCP 连接。
-   - **沉浸式终端日志**：不用再盯着黑白命令行，实时路由分发动作直接在面板彩色刷新。
+```
+客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
+```
 
-> **⚠️ 核心安全警告 (v0.5.0-alpha.1+)**：面板默认 `127.0.0.1` 只监听本机是安全的。若要暴露到 LAN/公网（`gui.listen: "0.0.0.0:..."`），**务必设 `gui.token`**——设了之后所有 `/api/*` 请求都要带它（`Authorization: Bearer <token>` / `mirage_token` cookie / `?token=`），否则任何可达者都能读日志/配置、改路由规则。`install.sh` 选「全网开放」时会**自动生成随机 token 并打印**。浏览器首次访问 `http://host:9090/?token=XXX` 即种 HttpOnly cookie，之后免带。不设 token 仍可用（向后兼容），但非本机暴露时会有 WARN 提醒。生产环境仍建议叠加 Nginx TLS。
+典型用途: Mirage 服务端放在离你近、线路好的位置(如香港)只做中转, 真正的出口落在另一台
+SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻量服务端配置)加:
 
----
-
-## 配置文件
-
-`install.sh` 生成的 config 已经是可用状态, 手动配置需要注意 alpha.14+ 引入的新字段。
-
-### 客户端配置示例 (`/etc/mirage-rs/config_client.json`)
-
-> ⚠️ **入站监听地址与认证 (v0.6.0-alpha.2)**: 下面示例用 `127.0.0.1` = **仅本机可用**, 这是安全的默认。
-> 要给局域网共享需改成 `0.0.0.0`, 但**必须同时加 `auth`**, 否则任何能连到 1080 的人都能白嫖你的
-> 隧道 —— 流量从你的服务端出去, 出口 IP 会被滥用甚至拉黑:
-> ```jsonc
-> { "type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "port": 1080,
->   "auth": { "username": "u", "password": "强密码" } }
-> ```
-> 不加 auth 而监听非回环地址时, 启动会 WARN 提醒。
-
-```json
-{
-  "schema_version": 1,
-  "log_level": "info",
-  "log_file": "/var/log/mirage-rs/client.log",
-  "inbounds": [
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "127.0.0.1",
-      "port": 1080
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "mirage",
-      "tag": "proxy",
-      "server": "vps.example.com",
-      "server_port": 443,
-      "password": "your-strong-password",
-      "camouflage_host": "www.cloudflare.com",
-      "pool_size": 50
-    },
-    { "tag": "direct", "type": "direct" },
-    { "tag": "block", "type": "block" }
-  ],
-  "gui": {
-    "enabled": true,
-    "listen": "127.0.0.1:9090"
-  },
-  "routing": {
-    "default_outbound": "proxy",
-    "rules": [
-      { "outbound": "direct", "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] },
-      { "outbound": "direct", "geosite": ["cn", "apple-cn", "google-cn"] },
-      { "outbound": "direct", "geoip": ["cn"] }
-    ]
-  },
-  "tuning": {
-    "ebpf_mode": "off",
-    "geodata_dir": "/etc/mirage-rs/geosite",
-    "geo_update_days": 7,
-    "geo_sources": [
-      {
-        "name": "geosite",
-        "kind": "geosite",
-        "url":  "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat",
-        "via":  "proxy"
-      },
-      {
-        "name": "geoip",
-        "kind": "geoip",
-        "url":  "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
-        "via":  "proxy"
-      }
-    ]
-  }
+```jsonc
+"upstream": {
+    "type": "shadowsocks",
+    "server": "1.2.3.4",
+    "server_port": 8388,
+    "password": "ss-password",
+    "method": "aes-256-gcm",    // SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
+                                // SIP022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm
+                                //         / 2022-blake3-chacha20-poly1305
+    "udp": "block"              // block(默认) | direct, 见下方说明
 }
 ```
 
-#### 关键字段说明
+不配 `upstream` = 直连目标(原行为)。加密方式写错会**直接报错拒绝启动**, 而不是悄悄降级
+成直连 —— 配了中转却走直连意味着出口 IP 与预期完全不同, 必须让人立刻知道。
 
-- **`log_file`** (alpha.14+): 可选日志文件路径, 同时输出 stdout (journalctl) + 该文件. 不设保持老 stdout-only 行为
-  - **自动滚动压缩 (v0.4.5)**: 单文件超 **10MB** 自动滚动, 旧文件后台 gzip 压缩为 `server.log.1.gz` … `.10.gz` (保留最近 **10** 份, 约 10:1 压缩 → 磁盘 ~10MB 封顶)。压缩在后台线程跑, 不阻塞日志写入; 无需任何配置, 设了 `log_file` 即生效。滚动大小/份数目前硬编码 (`src/monitor.rs::LOG_ROTATE_BYTES / LOG_KEEP_ARCHIVES`)
-- **`inbounds[]`**: 标准结构化 (数组), `type: mixed` 同时支持 SOCKS5 + HTTP
-- **`outbounds[]`**: `type: mirage` 是代理节点 (旧名 `pyreality` 已弃用)
-  - `pool_size`: WarmPool 上限 (默认 16). alpha.11+ 有自动 floor=10 保证突发无 wait build
-  - `brutal_rate_mbps` (可选): 客户端出站 brutal 速率. 默认不开 (0 或不写字段)
-- **`gui.enabled`** + **`gui.listen`**: alpha.4+ 结构化 (老的 `gui_listen` 单字段弃用)
-- **`gui.token`** (v0.5.0-alpha.1+): 可选 API 鉴权 token。设了则所有 `/api/*` 要求携带 (Bearer header / `mirage_token` cookie / `?token=`)。不设=不鉴权 (localhost 默认安全)；`gui.listen` 改 `0.0.0.0` 暴露时**强烈建议**设，install.sh 会自动生成。常量时间校验防时序侧信道
-  - ⚠️ **`api.secret` 是废弃 stub，不提供任何鉴权**（历史遗留，解析后从不被使用）。老配置里若有它，**它什么都没做** —— API 鉴权只认 `gui.token`。启动时会 WARN 提醒，未来版本移除。同理 `advanced_dns.rules` 也尚未实现、当前被忽略（DNS 分流由 `routing.rules` 决定）
-- **`routing.rules[]`**: `ip_cidr` / `geosite` / `geoip` / `domain_suffix` / `domain_regex` / `inbound` / `process_name` 等
-  - **`process_name`**: 按**发起程序名**精确匹配 (可执行文件 basename, 如 clash/sing-box), 实现"Telegram 走代理、微信直连":
-    ```jsonc
-    { "process_name": ["telegram", "Telegram"], "outbound": "proxy" }
-    ```
-    **仅对本机 loopback socks/mixed 入站可判定** —— 通过 `/proc` 反查发起连接的程序。
-    透明/LAN 转发的连接进程在**别的机器**上, 无从取, 带 `process_name` 的规则对它们不命中
-    (同 `inbound` 的"信息缺失不猜")。仅当配了 `process_name` 规则时才查 `/proc` (零开销 opt-in)。
-  - **`inbound`**: 按**入站 tag** 限定规则只对某些入站生效。多入站部署才有意义 ——
-    例如给家人开一个 socks 入站走固定落地、自己那个走另一条:
-    ```jsonc
-    { "inbound": "in-family", "domain_suffix": "netflix.com", "outbound": "landing-jp" }
-    ```
-    不写 = 不限入站(与原行为一致)。写错入站名会被 `mirage-rs check` 拦下 ——
-    否则症状是"规则写了不生效", 极难自查
-  - ⚠️ **与 fake-IP 的固有交互**: DNS 查询是从 **dns 入站**进来的, 所以一条
-    `{"inbound": "tproxy", ...}` 的规则**不会**影响 DNS/fake-IP 决策 —— 那条查询并非
-    来自 tproxy。后果是该域名不会被分配 fake-IP, 透明模式下只能靠 SNI 嗅探拿回域名
-    (通常仍能正确分流, 但少了 fake-IP 这一层)。这不是遗漏, 是"决策发生在另一个入站上"
-    的必然结果。要让 DNS 决策也受限, 规则里写 dns 入站自己的 tag
-- **`tuning.ebpf_mode`**: `"auto"` / `"force"` / `"off"`. alpha.7 起 install.sh 客户端默认 `"off"` (BPF SockMap 直连转发有已知问题, 见 CHANGELOG alpha.7)
-- **`tuning.geo_sources[]`**: 多源 geo 数据下载 (v0.4.3+ 替代旧的 `geosite_url` / `geoip_url`)
-  - `via`: `"direct"` 或 `"proxy"`. **`"proxy"` 走客户端 mirage 出口拉 GitHub** — 大陆用户强烈推荐, `install.sh` 默认就是它
-  - alpha.14+ 自动 fallback: via=proxy 失败会自动重试 direct
-  - alpha.15+ 30s timeout + 空 body 拒收覆盖旧 .dat
-  - alpha.17+ 支持热更新: 改 config 加/删 geo_sources 秒生效不必 restart
-  - **`url` 可写单个字符串, 也可写数组当镜像列表** —— 逐个试, 第一个成功即止。
-    GitHub 在部分网络下时通时不通, 多给一两个镜像能显著提高拿到规则的概率
-  - **重启不再重复下载**: 记住上次下载时间 (`meta.json` + 文件 mtime), 没到
-    `geo_update_days` 就完全不发请求。此前每次启动都无条件全量重下, 反复重启
-    容易被上游限流
-  - **条件请求 (ETag / Last-Modified)**: 到期后先问上游"变了没", 没变回 304
-    就复用本地文件, 省掉几 MB 传输
-  - **落地前校验内容**: 不只看大小 —— "HTTP 200 但返回 HTML 错误页/限流页"那种响应
-    有好几 KB, 光比大小拦不住, 会直接覆盖掉好用的 `.dat` 让规则**集体失效**。
-    现在会数里面有几个分类 (真实数据几百个, 垃圾 0 个), 为 0 则保留原文件
-- **`tuning.geo_update_days`**: 更新间隔天数, 默认 7. alpha.18 起硬 clamp min=1 防 tight loop 打死 CPU
+> ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 尚未实现, 因此 `udp` **默认 `block`**
+> (直接拒绝 UDP 中继)。这是刻意的: 若放行, UDP 会从**本机 IP** 直连出去而 TCP 从上游出去,
+> 出口 IP 不一致 —— 对落地解锁场景这不是"不一致"而是**功能性错误**(流媒体走 QUIC 时会被判
+> 成错误区域, 且不会像被封那样回落 TCP, 表现为解锁时灵时不灵)。**安全的失败方式是"不发",
+> 而非"发到别处去"**。代价: QUIC 回落 TCP(页面照常), 游戏/WebRTC 不可用。
+> 确需旧行为写 `"udp": "direct"`(启动会 WARN)。轻量客户端本就仅 TCP, 不受影响。
+>
+> 📌 同时支持 **SIP004 AEAD** 与 **SIP022 (Shadowsocks 2022)**;
+> **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、已被社区废弃、易被主动探测识别。
+>
+> 📌 **SIP022 的 `password` 与 SIP004 语义完全不同**: 它不是任意密码, 而是 **base64 编码的密钥本身**
+> (2022-blake3-aes-128-gcm 要 16 字节, aes-256 要 32 字节), 不做密码拉伸。用
+> `openssl rand -base64 32` 生成。长度不对会被 `mirage-rs check` 直接拦下并说明应有长度 ——
+> 这类错**不会**让服务端起不来, 而是每条连接都静默失败, 所以必须提前拦住。
+
+---
+
+## ⚙️ 服务端配置说明
 
 ### 服务端配置示例 (`/etc/mirage-rs/config_server.json`)
+<details>
+<summary>点击查看: 服务端配置示例 (config_server.json)</summary>
 
 ```json
 {
@@ -518,358 +192,64 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
   }
 }
 ```
+</details>
+
+</details>
 
 密码 + `camouflage_host` 必须跟客户端完全一致。`brutal_rate_mbps` 是服务端到客户端方向 (下载) 的 brutal 目标速率, 见下方 Brutal 章节。
+
+> ⚠️ **看板安全**: `gui.listen` 默认 `127.0.0.1` (只本机, 安全)。若改 `0.0.0.0` 暴露到 LAN/公网,
+> **务必设 `gui.token`** —— 看板能读日志/配置**并可视化改路由规则**, 无鉴权暴露 = 任何可达者
+> 都能把你的流量重定向。设了之后 `/api/*` 需带 token (`Authorization: Bearer <token>` /
+> `mirage_token` cookie / `?token=`, 常量时间校验防时序侧信道)。install.sh 选「全网开放」会自动
+> 生成随机 token 并打印。不设仍可用 (向后兼容), 但非本机暴露时会 WARN。生产建议叠 Nginx TLS。
 
 > **出向 UDP 被封的 VPS**: 系统 `getaddrinfo` (glibc) 默认用 **UDP:53** 查 DNS, 封了 UDP
 > 就解析不了代理目标域名 (代理域名全挂)。加 `"tuning": {"dns_tcp_resolver": "1.1.1.1"}` 让
 > **本进程所有域名解析改走 DNS-over-TCP** (地址无端口默认 53), 脱离系统解析器。不设 = 系统解析器。
 > (零改代码的替代: VPS 上 `echo "options use-vc" >> /etc/resolv.conf` 强制 glibc 走 TCP。)
 
-### 透明网关完整配置模板 (v0.6.1)
-
-部署形态 2 (透明网关) 的一份**功能齐全**模板, 涵盖 transparent + dns 入站、fake-IP、DNS 缓存, 以及 v0.6.1 新增的 **DNS 劫持 / 静态解析 / IP 版本策略**。`install.sh` 网关模式会交互生成等价配置; 手改照此。
-
-> 下方是 **JSONC** (带注释便于阅读)。真正的 `config.json` **不能带注释** —— 去掉 `//` 行后即通过 `jq` 校验的严格 JSON (`jq empty config.json` 无报错)。install.sh 生成的就是无注释版。
-
-```jsonc
-{
-  "schema_version": 1,
-  "log_level": "info",
-  "log_file": "/var/log/mirage-rs/gateway.log", // 同时写文件 + stdout; 超 10MB 自动滚动 gzip
-
-  "inbounds": [
-    {
-      "type": "transparent",           // eBPF 透明网关入站 (tc_divert + sk_lookup)
-      "tag": "transparent-in",
-      "listen": "0.0.0.0",
-      "port": 12345,                   // sk_lookup 内部用, 随意选个空闲端口
-      "interface": "eth0",             // 面向 LAN 的网卡 —— tc_divert 挂这里抓裸-IP 转发流量
-      "proxy_local": false,            // true = 网关本机自身流量也走代理 (需本机 DNS 指向 mirage)
-      "dns_hijack": true               // v0.6.1: 接管流经 LAN 的 53/UDP+TCP 查询, LAN 设备无需改 DNS
-    },
-    {
-      "type": "dns",                   // DNS 服务入站: LAN 设备 (或被 dns_hijack 截获的) 查询由它应答
-      "tag": "dns-in",
-      "listen": "0.0.0.0",
-      "port": 53
-    }
-  ],
-
-  "outbounds": [
-    {
-      "type": "mirage",                // 代理节点 (旧名 pyreality 已弃用)
-      "tag": "proxy",
-      "server": "vps.example.com",
-      "server_port": 443,
-      "password": "your-strong-password",   // 必须与服务端一致
-      "camouflage_host": "www.cloudflare.com", // SNI 伪装, 必须与服务端一致
-      "pool_size": 50                  // WarmPool 预热连接数上限
-    },
-    { "tag": "direct", "type": "direct" },
-    { "tag": "block",  "type": "block"  }
-  ],
-
-  "routing": {
-    "default_outbound": "proxy",       // 未命中任何规则 → 走代理
-    "rules": [
-      { "outbound": "block",  "geosite": ["category-ads-all"] },                              // 广告域名直接 NXDOMAIN
-      { "outbound": "direct", "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] }, // 私网直连
-      { "outbound": "direct", "geosite": ["cn", "apple-cn", "google-cn"] },                   // 国内域名直连
-      { "outbound": "direct", "geoip": ["cn"] }                                               // 国内 IP 直连
-      // 可加 "inbound": ["dns-hijack"] 的规则专门路由被劫持的 DNS 解析 (仅 dns_hijack=true 时该 tag 有效)
-    ]
-  },
-
-  "advanced_dns": {
-    "resolvers": [
-      { "tag": "direct", "address": "223.5.5.5" },        // 直连(国内)上游, 不带端口默认 53; 配多个 = 并行竞速 + 重传
-      { "tag": "direct", "address": "114.114.114.114", "protocol": "tcp" }, // protocol:"tcp" = 走 TCP 解析 (默认 udp)
-      { "tag": "remote", "address": "8.8.8.8", "via": "proxy" } // 境外上游, 经隧道查 (抗污染)
-    ],
-    "fakeip": {
-      "enabled": true,
-      "inet4_range": "198.18.0.0/15",                    // 代理域名返回此段 fake-IP, tc_divert 按段拦截
-      "persist_path": "/var/lib/mirage-rs/fakeip.cache"  // 重启后旧 fake-IP 仍可反查, 避免断流
-    },
-    "cache": { "enabled": true, "max_entries": 10000 },  // 按上游最小 TTL 缓存, 免每查打上游/耗隧道
-
-    "ip_strategy": "prefer_ipv4",                        // v0.6.1: dual(默认)/ipv4_only/ipv6_only/prefer_ipv4/prefer_ipv6
-                                                         //   纯抑制某族(NODATA); prefer 仅 static 完全生效, direct 降 dual; 不动 proxied
-    "static": {                                          // v0.6.1: 自定义解析 (类 dnsmasq), 精确+子域最长匹配, 绕过 fake-IP/路由/上游
-      "test.local": "192.168.1.100",                     //   命中 test.local 及所有子域 → 该 IPv4
-      "nas.lan": ["10.0.0.9", "fd00::9"]                 //   单值或数组; A 查询回 v4, AAAA 回 v6
-    }
-  },
-
-  "tuning": {
-    "ebpf_mode": "auto",               // 网关必须启用 eBPF (auto: 网关/客户端启用); 别设 "off"
-    "geodata_dir": "/etc/mirage-rs/geosite",
-    "geo_update_days": 7,
-    "geo_sources": [
-      { "name": "geosite", "kind": "geosite", "url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat", "via": "proxy" },
-      { "name": "geoip",   "kind": "geoip",   "url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",             "via": "proxy" }
-    ]
-  },
-
-  "gui": {
-    "enabled": true,
-    "listen": "127.0.0.1:9090",
-    "token": "生成的随机token"          // listen 改 0.0.0.0 暴露时强烈建议设; install.sh 自动生成
-  }
-}
-```
-
-> **透明网关额外要求 (非 config)**: tc_divert 的 sk_assign 依赖 `ip rule fwmark 1 lookup 100` + `ip route add local default dev lo table 100`, `install.sh` 网关模式会自动装并绑定到服务生命周期。手动部署需自行加。
-
-### 节点 URI 导出/导入 (alpha.4+)
-
-服务端 `install.sh` 配完自动输出:
-```
-mirage://<url-encoded-pwd>@<host>:<port>?sni=<sni>&brutal=<mbps>
-```
-保存到 `/etc/mirage-rs/node-export.txt` (chmod 600). 客户端 `install.sh` 选"粘贴节点导入", 直接一步填充 host / port / password / SNI. 装了 `qrencode` 还能出 UTF8 二维码方便手机拍照。
+> 注: 客户端与透明网关的详细配置示例见 `templates/` 目录下的注释版模板。
 
 ---
 
-### 裸 IP 目标的域名分流 (SNI/Host 嗅探)
+## 🧰 CLI 用法
 
-有些 app 不把域名交给代理, 而是自己解析完直接送 IP。这种连接如果只按 IP 分流,
-`domain_suffix` / `geosite` 规则就全都用不上。
-
-Mirage 会在**目标是裸 IP** 时嗅一下 TLS SNI / HTTP Host, 拿到域名后参与路由判定:
-
-- 只对裸 IP 做 —— 浏览器等送域名的客户端零成本
-- 超时 300ms —— 客户端不先说话的协议 (SSH/SMTP 等) 最多多等这么久
-- **只影响路由判定, 不改连接目的地**: 仍连客户端指定的原始 IP。否则重新解析域名可能
-  落到另一个 IP(CDN/多 A 记录), 等于擅自改了目的地
-- 域名与原始 IP **同时**参与匹配, 所以 `domain_suffix` 和 `ip_cidr` 规则都有效
-
-## 🌐 透明网关 DNS 与 fake-IP
-
-透明网关模式 (`install.sh` 部署模式选 2) 会起一个 DNS 服务 (`type: dns` 入站, 默认 `:53`), LAN 设备把 DNS 指向它。它按域名的分流去向分两条路处理:
-
-### 代理域名 → fake-IP (本地即时应答, 不出网)
-
-被代理规则命中的域名, DNS 直接返回一个 **fake-IP** (默认 `198.18.0.0/15` 段的地址), 客户端拿它建连, 网关的 `tc_divert` 按 fake-IP 段拦截并按域名走隧道。fake-IP 映射稳定 (一个域名固定一个 fake-IP)。
-
-**持久化 (v0.5.0-alpha.4+)**: `advanced_dns.fakeip.persist_path`(install.sh 网关模式默认 `/var/lib/mirage-rs/fakeip.cache`)。设了则启动加载 + 周期(60s)/退出落盘。**意义**: 网关重启后,客户端还揣着的旧 fake-IP(≤300s TTL)仍能反查到域名,避免重启后那段时间代理连接反查失败而断。映射无时间 TTL(稳定,由 round-robin 有界),换 fakeip 网段时旧缓存自动失效。不设 = 纯内存(向后兼容)。
-
-**v0.4.5 抗 DNS 风暴的三处协议/行为调整** (根治开网页时几百倍 DNS 放大 + 偶发 ~11s 卡顿):
-
-| 调整 | 之前 | v0.4.5 | 原因 |
-|---|---|---|---|
-| fake-IP A 记录 **TTL** | 1s | **300s** | 1s 让客户端几乎每个请求都重查, grass.io/遥测把查询量放大数百倍 → DNS 偶发丢包 → Windows 重传累积 11s。映射本就稳定, 300s 无损 |
-| AAAA / type65(HTTPS) **空答复** | 纯 NODATA (无 SOA) | 带一条合成 **SOA** (TTL/MINIMUM=300) | 无 SOA 时 (RFC 2308) 客户端**不做负缓存**, `getaddrinfo` 每次并发重查 AAAA/type65 → 残留查询风暴。带 SOA 后客户端缓存 NODATA 5 分钟 |
-| type65 处理 | 逐个走隧道真解析 | 直接空答复 (免隧道) | 现代浏览器对每域名都发 type65, 逐个走隧道会瞬间打空 WarmPool |
-
-> ⚠️ **XDP DNS 加速 (`advanced_dns.xdp_interface`) 默认不开、也不建议开**: 该路径对带 EDNS0 (现代客户端近乎必带) 的查询处理不完整, 开了反而可能让缓存域名解析失败。fake-IP 由用户态 DNS 服务处理已足够快且稳。
-
-### 国内/直连域名 → 真实上游解析 (多上游并行 + 重传, v0.4.5)
-
-被"直连"规则命中的域名 (国内站点等) 走真实上游 DNS (配置里 `tag: direct` / `cn` 的 resolver)。
-
-**v0.4.5 前**: 单上游、单发、**不重传** —— 上游 (114/223 等公共 DNS 高峰期偶发丢包/限速) 丢一个 UDP 包就整体失败, 网关不回包 → 客户端靠自身重传累积 ~11s 才成功 (国外域名走 fake-IP 不碰上游, 故只有国内域名暴露)。
-
-**v0.4.5**: `udp_query` 重写为**多上游并行 + 重传**:
-- 每轮向**所有** `direct`/`cn` 上游各发一份查询, 等 800ms, 无匹配响应则重传, 最多 3 轮 (总上限 2.4s ≪ 客户端 11s)
-- 任一上游先回且 tx_id/QR 匹配即用 —— 上游健康时仍是**几十毫秒返回, 不增加延迟**, 只有真丢包才触发重传/换上游
-- 配置里配**多个** `tag: direct` resolver 即启用多上游; 一个都没配时默认双公共 DNS 兜底 (`114.114.114.114` + `223.5.5.5`)
-
-**配置示例** (`install.sh` 透明网关模式会问"主用/备用直连 DNS" 自动生成):
-
-```json
-"advanced_dns": {
-    "resolvers": [
-        { "tag": "direct", "address": "223.5.5.5" },
-        { "tag": "direct", "address": "114.114.114.114", "protocol": "tcp" },
-        { "tag": "remote", "address": "8.8.8.8", "via": "proxy" }
-    ],
-    "fakeip": { "enabled": true, "inet4_range": "198.18.0.0/15" }
-}
-```
-
-> 尊重配置: 你配了 `direct` resolver 就**只用你配的那些** (不掺公共 DNS, 避免内网/split-horizon 域名被公共 DNS 解析错); 只有一个 `direct` 都没配时才回落到双公共兜底。`remote` (境外) DNS 走隧道查, 抗污染。
-
-**`address` 端口**: 不带端口默认 **53** (`223.5.5.5` == `223.5.5.5:53`), 无需再写 `:53`。裸 IPv6 直接写 (`2001:4860:4860::8888`), 要带端口用方括号 (`[2001:4860:4860::8888]:5353`)。
-
-**`protocol`** (v0.6.1, 可选): 每个 `direct`/`cn` 上游的传输协议, `"udp"` (默认) 或 `"tcp"`。UDP/53 被封或投毒的网络可给上游加 `"protocol": "tcp"` 走 TCP 解析 (RFC 7766 长度分帧, **多 TCP 上游并行竞速** + 3s 整体超时)。UDP 上游仍走并行竞速+重传; 两类混配则并发竞速取先回的。仅作用于 `direct`/`cn` 上游 —— `remote` (境外) 恒经隧道 TCP 查, 不受此字段影响。
-
-### DNS 劫持 (可选, v0.6.1)
-
-透明网关默认要求 LAN 设备把 DNS 指向网关 (`dns` 入站) 才能拿 fake-IP。开启 `transparent` 入站的 `"dns_hijack": true` 后, **流经 LAN 的 53 端口查询 (UDP+TCP) 被自动接管**, 设备无需改 DNS 设置。纯用户态 (复用 tc_divert 的 sk_assign + 透明回包), 不改包、不加 iptables。仅在配了 `interface` 时有意义; 不碰本机自身 DNS、不处理 DoT/DoH。路由维度走合成入站 tag `dns-hijack` (可写 `"inbound":["dns-hijack"]` 规则专门路由)。
-
-### 静态解析 (`advanced_dns.static`, v0.6.1)
-
-自定义域名 → IP (类 dnsmasq `address=/domain/ip`), 命中即直接回 A/AAAA, **绕过 fake-IP / 路由 / 上游** —— 本地测试环境把测试域名钉到内网 IP 尤其有用。匹配 = **精确 + 子域, 最长键优先** (`test.local` 命中 `api.test.local`)。值单 IP 或数组 (混 v4/v6)。命中但无对应族 / 非 A·AAAA → NODATA, 不放行上游 (防泄漏)。
-
-```json
-"static": { "test.local": "192.168.1.100", "nas.lan": ["10.0.0.9", "fd00::9"] }
-```
-
-### IP 版本策略 (`advanced_dns.ip_strategy`, v0.6.1)
-
-控制 v4/v6 应答。纯 DNS 服务器只能**抑制某一族** (回 NODATA 逼客户端用另一族), 真"优先"是客户端 Happy Eyeballs 挑的。5 档 (默认 `dual`):
-
-| 值 | 效果 |
-|---|---|
-| `dual` | A/AAAA 都应答 (默认) |
-| `ipv4_only` / `ipv6_only` | 硬抑制 AAAA / A (static + direct 处处) |
-| `prefer_ipv4` / `prefer_ipv6` | 有首选族则抑制另一族 (**仅 static 完全生效**; direct 无法探测降为 `dual`) |
-
-不影响 proxied (恒 v4-fakeIP)。与 IPv6 数据面**解耦**: static/direct 返回真实地址, 客户端原生连接。完整用法见上文 [透明网关完整配置模板](#透明网关完整配置模板-v061)。
-
-### DNS 响应缓存 (v0.5.0-alpha.3+, honoring TTL)
-
-`advanced_dns.cache: { "enabled": true, "max_entries": 10000 }`（install.sh 网关模式默认开启）：按上游返回的**最小 TTL** 缓存直连 + 隧道-DNS 的响应，过期再查。
-
-- **直连域名**不再每查都打 114/223 上游；
-- **最实在的收益**：非 fake-IP 模式 / 罕见 qtype (MX/TXT/SRV) 的**隧道-DNS 不再每次消耗一条 WarmPool 隧道**——缓存命中直接免隧道。
-- 只缓存有答案的正响应（NODATA/NXDOMAIN 不缓存，客户端 SOA 负缓存已兜 AAAA）；命中时 patch tx_id + question 段兼容 0x20；TTL clamp `[1, 3600]`s。
-- fake-IP 路径本地即时应答，无需缓存。
-
-> **为什么不用 DoH/DoT**：墙内 DoT(853) 端口即封、DoH(443) 靠 SNI 阻断 + 封公共解析器 IP + 投毒，对公共解析器长期不可靠。Mirage 的抗审查 DNS 靠的是**远端解析**（被墙域名走 fake-IP，真解析推到墙外服务端）+ 本缓存 + TTL，而非加密到公共解析器。
-
----
-
-## ⚡ 高级玩家指南：拥抱 Linux 极客内核
-
-### 开启 TCP Brutal 模块（仅在服务端执行）
-要想体验让拥塞控制算法跑出上限的快感，您可以在服务端（墙外 VPS）安装 `tcp_brutal` 内核模块：
-
-**方法一：官方一键安装（推荐）**
-```bash
-curl -fsSL https://tcp.hy2.sh/ | bash
-```
-
-**方法二：手动编译安装**
-```bash
-git clone https://github.com/apernet/tcp-brutal
-cd tcp-brutal && make && sudo make install
-sudo modprobe tcp_brutal
-```
-*提示：Mirage-rs 会自动检测内核是否有该模块，如果没有，会自动回退到默认的 BBR 或 Cubic，绝不崩溃。*
-
-### brutal_rate_mbps 的设计哲学 (v0.4.4-alpha.10+ 新解, 请务必看)
-
-**Brutal CC 死磕设定速率, 不响应丢包**, 适合"高 RTT + 低丢包"的**跨洲专线 / 移动 4G/5G 无线**链路 — 这种链路上 BBR/Cubic 见丢包就退让, brutal 反而能吃满。
-
-**关键设计** (alpha.8+ 修正):
-- 服务端在 **listener socket 预设** `TCP_CONGESTION = brutal`, accept 出来的子 socket 从 SYN-ACK 起就跑 brutal (kernel pacing 状态干净)
-- accepted socket 只补 `TCP_BRUTAL_PARAMS` (rate + cwnd_gain=15)
-- 无 autofallback (alpha.9+): brutal 顶着丢包硬跑到底, 跟 Python POC 行为一致
-
-**速率取值**:
-
-| 场景 | 单连接 rate 建议 | 说明 |
-|---|---|---|
-| 100M 出口 (家宽) | 30~50 Mbps | 链路带宽的 30-50% |
-| 1G 出口 (VPS) | 300~500 Mbps | 链路带宽的 30-50% |
-| 极限吃满 (跨洲专线) | 链路带宽的 1.5-2 倍 | Hysteria2 派设值哲学, 让 brutal 有余量填满信道 |
-| 关闭 brutal | `0` 或不设 | 系统默认 BBR, 适合低 RTT 高丢包的 CDN 链路 |
-
-**为什么单连接可以设这么高**? WarmPool 里同一时刻真正在传数据的通常只有 1-3 条 tunnel (浏览器每 host 6-8 并发), 空闲 tunnel 不占用带宽. 所以"单条 × pool_size 总和"这个公式**不成立**, brutal 的单条 rate 可以直接对齐链路带宽。
-
-**如果发现慢**:
-1. 用 `ss -tipn 'sport = :你的端口'` 看 `retrans` 比例
-2. `retrans < 5%` → 链路适合 brutal, rate 可以往上加
-3. `retrans > 15%` → 链路不适合 brutal (低 RTT 高丢包 CDN 常见), 把 rate 设 0 关掉走 BBR 反而更快
-4. 观察 `pacing_rate` 是否达到设定, `delivery_rate` 是否接近 `pacing_rate`
-
-alpha.5-11 的排错长征见 [CHANGELOG](CHANGELOG.md), 大约 8 个 alpha 版本才把这套调准。
-
-### eBPF 性能巨兽开关（仅限 Linux 客户端/网关）
-我们在 `v0.2.x` 为核心路由链路植入了内核态网卡劫持。
-**启用条件**：
-1. 内核 ≥ 5.10 (sk_lookup 透明代理 + sockmap 加速 + XDP DNS 全部需要)。
-2. 使用 `sudo` 权限运行客户端 `sudo ./mirage client -c config...`
-3. 享受魔法：启动日志将提示 `[eBPF] XDP program successfully loaded and attached to primary interface`，并且您的 Neon 仪表盘上会出现耀眼的 **eBPF ENGINE: ONLINE**！它能直接在网卡接收端剥离解析包，无视系统网络栈延迟。
-
----
-
-## 🐧 系统兼容性
-
-Mirage-rs 是 **eBPF 原生**代理, 性能与隐蔽性深度依赖现代 Linux 内核能力。我们和 [dae](https://github.com/daeuniverse/dae) 一样选择**不为老内核做架构妥协** — 没有 TPROXY 后备模式, 没有 TUN 后备模式。
-
-### 内核版本要求
-
-| 内核版本 | 状态 | 说明 |
-|---|---|---|
-| **≥ 5.10** (LTS) | ✅ 全功能 | sk_lookup 透明代理 + sockmap splice + XDP DNS 全部可用 |
-| 5.9 | ⚠️ 边界版本 | sk_lookup 首版, 推荐升级至 5.10 LTS |
-| < 5.9 | ❌ 不支持 | 透明代理路径无法启动 |
-
-### 主流发行版查表
-
-| 发行版 | 默认内核 | 状态 |
-|---|---|---|
-| Debian 12 (Bookworm) | 6.1 | ✅ |
-| Debian 11 (Bullseye) | 5.10 | ✅ |
-| Debian 10 / 9 | 4.19 / 4.9 | ❌ |
-| Ubuntu 24.04 / 22.04 LTS | 6.8 / 5.15 | ✅ |
-| Ubuntu 20.04 LTS | 5.4 (HWE 内核可达 5.15) | ⚠️ 启用 HWE 后可用 |
-| Ubuntu 18.04 及更早 | < 5.4 | ❌ |
-| RHEL / Rocky / Alma 9 | 5.14 | ✅ |
-| RHEL / CentOS 8 | 4.18 (ELRepo 可装 kernel-ml) | ⚠️ 装 kernel-ml 后可用 |
-| RHEL / CentOS 7 | 3.10 | ❌ |
-| Alpine 3.18+ | 6.x | ⚠️ 客户端需手动开启 BPF 内核配置 (见下方); 服务端无需 |
-| Arch Linux / Manjaro | 滚动最新 | ✅ |
-
-如果你需要 SOCKS5 / HTTP 普通入站, 老内核也能跑 (不启用 eBPF 模块即可), 但 v0.3 的透明代理核心特性会自动跳过。
-
-### Alpine Linux 内核要求 ⚠️ (仅客户端)
-
-**服务端不受影响** — 自 v0.4.1-alpha.3 起, `mirage server` 默认完全跳过 eBPF 加载 (服务端走"协议解密 → 直连"路径, sockmap splice/sockops/XDP/sk_lookup 全部子系统在服务端都无价值). Alpine 服务端可以直接用 stock `linux-lts` / `linux-virt` 内核.
-
-**客户端需要手动开启 BPF 内核配置**: Alpine 默认的 `linux-lts` / `linux-virt` 内核**关闭了 BPF cgroup 子系统** (`CONFIG_CGROUP_BPF=n`), 导致 SockOps 加载时 `bpf_link_create failed`。Mirage-rs 客户端会启动但 RTT 监控 + Brutal CC 动态速率全部失效。
-
-完整启用步骤参考 [dae 的 Alpine 教程](https://github.com/daeuniverse/dae/blob/main/docs/en/tutorials/run-on-alpine.md), 关键的内核配置:
-
-```
-CONFIG_BPF=y
-CONFIG_BPF_SYSCALL=y
-CONFIG_BPF_JIT=y
-CONFIG_CGROUP_BPF=y          # ← Alpine 默认 =n, 必须开
-CONFIG_DEBUG_INFO=y
-CONFIG_DEBUG_INFO_BTF=y      # ← BTF 调试信息, CO-RE 用
-CONFIG_BPF_STREAM_PARSER=y   # ← sockmap splice 需要
-CONFIG_NET_INGRESS=y
-CONFIG_NET_EGRESS=y
-CONFIG_NET_CLS_BPF=m
-CONFIG_NET_CLS_ACT=y
-CONFIG_BPF_EVENTS=y
-CONFIG_KPROBES=y
-CONFIG_KPROBE_EVENTS=y
-```
-
-验证当前内核是否支持:
-
-```sh
-zcat /proc/config.gz | grep -E 'CGROUP_BPF|BPF_SYSCALL|DEBUG_INFO_BTF|BPF_STREAM_PARSER'
-```
-
-如果上面输出有 `=n` 或没有, 你需要从 alpine-aports 源码重编内核, 或换用 `daeuniverse/dae` 仓库提供的预编译 Alpine 内核包。
-
----
-
-## 卸载
-
-`install.sh` 主菜单第 4 项 "卸载 (Uninstall)":
-- 停止 + 禁用 `mirage-rs-{server,client}` 与 `mirage-rs-lite-{server,client}` systemd 服务 (同时清老名字 `mirage-server` / `mirage-client` 兼容 alpha.8 之前的部署)
-- 删除 unit 文件 + 二进制 `/usr/local/bin/mirage-rs`
-- 交互询问是否删 `/var/log/mirage-rs` (默认 y) / `/etc/mirage-rs` config (默认 n, 重装可复用) / `/var/lib/mirage-rs` / `/etc/sysctl.d/99-mirage.conf`
+节点/配置管理子命令 (都写回配置文件, 原子写 + `.bak` 备份):
 
 ```bash
-sudo bash install.sh
-# 选 4 → 全自动清理
+# 校验 / 格式化配置 (启动前闸门; check 挑未知字段+悬空引用, format 保留键序不吞字段)
+mirage-rs check  -c config.json
+mirage-rs format -c config.json
+
+# 导入单个节点 URI (交互问 tag, 不撞现有; --test 测活, --require-live 不通则不导, --group 建 urltest 组)
+mirage-rs import -c config.json "mirage://密码@host:443?sni=www.apple.com"
+
+# 订阅批量导入: 来源可为 URL 或本地文件; 内容可为 mirage:// 列表 或 export 的 JSON 片段
+mirage-rs subscribe -c config.json https://example.com/sub    # 远程 mirage:// 列表 (--group 建组)
+mirage-rs subscribe -c config.json share.json                 # 合并本地 JSON 片段
+mirage-rs subscribe -c config.json --routing share.json       # 连路由规则一起并 (侵入, 默认不并)
+
+# 导出配置片段 (subscribe 的反向): 交互选节点 + 匹配的组/路由/geo → 可分享 JSON
+mirage-rs export -c config.json -o share.json                 # 无 -o 则写 stdout (提示走 stderr)
+
+# 测节点可用性 (完整 Mirage 握手+认证, 非裸 TCP; 显 RTT + [国家码]; 默认穿隧道 HTTP 探测)
+mirage-rs test -c config.json                                 # --tag 只测某个; --no-http 关探测
 ```
+
+> 组类型 (rule / default_outbound 可指向): `urltest` (选延迟最低) · `fallback` (第一个健康) ·
+> `selector` (手动) · `load_balance` (round-robin 分摊)。`import`/`subscribe --group` 会自动建
+> urltest 组并把 `default_outbound` 指向它。`test` 与 `--group` 建组会读 `geoip.dat` 显示节点区域,
+> 混区域时告警 (负载均衡/自动选路出口国不一致会影响落地解锁)。
+
+---
 
 ## 路线图 / TODO
 
 > 图例: `[x]` 已完成并发布 · `[ ]` 未完成 · `[~]` 部分完成。完成一项即勾选一项。
 > 这是**候选池而非排期** —— 走一步看一步, 哪个撞到痛点先修哪个。
 
-**核心链路 (已完成)**
+### ✅ 已完成
 
 - [x] 透明网关整链路真机跑通 (TCP + UDP + 隧道 + 回源)
 - [x] TLS ClientHello 字节级仿真 (三 profile 轮换 + JA4 对照 harness + 后量子 key_share)
@@ -881,76 +261,47 @@ sudo bash install.sh
 - [x] 配置工具链 (`check` / `format` / `import` + urltest 建组 / `test` 节点握手测活) + 启动时配置校验
 - [x] 入站认证 (SOCKS5 / HTTP), 修默认开放代理
 - [x] DNS: 可选劫持 (接管 LAN 53/UDP+TCP, 默认关) · 静态解析 (类 dnsmasq, 精确+子域) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回) (v0.6.1)
+- [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
 
-**未完成 / 未完善**
+### 🚧 部分完成
+
+- [~] **订阅链接** —— `mirage-rs subscribe <url>` 批量导入 (格式=每行 `mirage://` 或整段 base64, server:port 去重, 可选 --group)。**周期自动刷新**待做
+- [~] **SS 上游 UDP** —— 未实现; 需要 UDP 同出口可**直接用 WireGuard 上游** (已通)
+
+### ⏳ 未完成 (计划池)
 
 - [ ] **IPv6 全栈** —— 当前 WireGuard 与透明代理数据面均 **IPv4-only** (DNS 层已可控 v4/v6 返回, 但数据面未通)。这是最大的结构性缺口, IPv6 优先/仅 IPv6 网络 (尤其国内移动网) 下会漏流量或不可用
-- [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
-- [~] **订阅链接** —— `mirage-rs subscribe <url>` 批量导入 (格式=每行 `mirage://` 或整段 base64, server:port 去重, 可选 --group)。**周期自动刷新**待做
 - [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连
 - [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段
 - [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
-- [~] **SS 上游 UDP** —— 未实现; 需要 UDP 同出口可**直接用 WireGuard 上游** (已通)
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
-
-**性能 (计划 v0.7.0, 需先 profile 定位瓶颈再动手)**
-
 - [ ] **加密吞吐 (首选, 已 profile)** —— 隧道硬编码 ChaCha20-Poly1305, 不吃 AES-NI。实测本机 AES-256-GCM 比 ChaCha20 快 **2.1x** (release), 回环隧道 154 MB/s 加密占大头。方向: **cipher agility** (有 AES-NI 用 AES-GCM, 否则 ChaCha20, 即 TLS 做法; 需两端协商 cipher, 注意向后兼容)
 - [ ] **隧道 relay 缓冲/合帧再调** —— 当前 BufWriter 64KB, 高 BDP 链路可能有余量
 - [ ] **io_uring 替代 relay 的 read/write 循环** —— 大工程, 高并发小包收益明显
 - [ ] **MSS clamp / 网络层** —— 见 landscape 参考 P1
-
-**评估后决定不做** (避免重复提)
-
 - **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
 - **TLS session resumption 仿真** —— 抓包 + 统计实测证明: 真 Chrome 的 `legacy_session_id` 也每次全新随机, 我们与之不可区分, 立项前提不成立
 - **追平 sing-box 全部协议/规则** —— 定位是零配置 eBPF 网关, 不是通用代理框架
-
 ---
 
-## 版本演进
+**评估后决定不做** (避免重复提)
 
-近期 (v0.5.0 → v0.6.8):
+## 📜 版本迭代概览 (Changelog)
 
-| 版本 | 关键改动 |
-|---|---|
-| v0.5.0 系列 | Neon Dashboard / DNS 缓存 honoring TTL / fake-IP 路由完善 |
-| v0.6.0-alpha.1~6 | 轻量模式 · 中转站 (SS 上游) · 配置工具链 · 入站认证 · SS 2022 · 死代码清理 |
-| **v0.6.0-alpha.7** | **WireGuard 全套** (客户端出站 + 服务端上游, 真机五层验证) · 裸 IP 按域名分流 · 路由 `inbound` 维度 · SOCKS5 UDP 逐包路由 · geo 更新器大修 |
-| **v0.6.0-alpha.8** | 外部审计修复 (DNS 哈希碰撞 P1 / cgroup 自连竞态 / LPM 半更新) + 真机部署反馈 (geo 代理认证 / 日志滚动可配 / 部署汇总) |
-| **v0.6.1** | **DNS 三件套**: 可选劫持 (tc_divert sk_assign 复用, 纯用户态接管 LAN 53/UDP+TCP) · 静态解析 (`advanced_dns.static`, 类 dnsmasq 精确+子域最长匹配) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回)。自审 + Sonnet 独立复审 |
-| **v0.6.2** | DNS 直连上游: 地址默认端口 53 (与 remote 统一) · 每上游可选 `protocol: "tcp"` (RFC 7766, 多 TCP 上游并行竞速)。自审 + Sonnet 独立复审 |
-| **v0.6.3** | `mirage-rs test` 节点测活 (完整握手+认证, 非裸 TCP) · `import` 加 `--test`/`--require-live` 测活 + `--group` urltest 自动建组 (可调 interval/tolerance/test_type/url)。自审 + 两轮 Sonnet 复审 |
-| **v0.6.4** | `mirage-rs test` 加穿隧道 HTTP 探测 (默认开): RTT+HTTP 协同判网络质量 (出口 ≈ HTTP−TCP), 补上单看 RTT 的出口盲区; 并发测活。自审 + Sonnet 复审 |
-| **v0.6.5** | 服务端可选 `tuning.dns_tcp_resolver`: 出向 UDP 被封的 VPS 域名解析改走 DNS-over-TCP (自实现无依赖), 解决 getaddrinfo 走 UDP 解析不了代理目标域名。自审 + Sonnet 复审 |
-| **v0.6.6** | `process_name` 分流 (本机 loopback 入站经 /proc 反查可执行名, "Telegram 走代理、微信直连") + dump_tls session_id 分析工具。自审 + Sonnet 复审 |
-| **v0.6.7** | **负载均衡出站组** `load_balance` (round-robin 分摊健康成员) · `subscribe <url>` **订阅链接批量导入** (多字母表 base64 · server:port 去重 · --group 建组) · **节点区域判定** GeoIP (`test` 显 `[国家码]` · `--group` 混区域告警)。自审 + 各 Sonnet 独立复审 |
-| **v0.6.8** | **配置片段 export/import 闭环**: `export` 交互挑节点导出 JSON 片段 (组按所选匹配/悬空丢弃/两阶段 fixpoint); `subscribe` 升级吃 **URL 或本地文件 × mirage:// 列表或 JSON 片段** (`merge_fragment` server:port 去重 + tag 撞名改名并重映射组/规则 · `--routing` 门 · geo 按 name 合并)。自审 + 三轮 Sonnet 独立复审 |
+Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`](CHANGELOG.md)。
 
-<details>
-<summary>更早的里程碑 (alpha.4 → v0.4.5 final)</summary>
-
-alpha.4 → **v0.4.5 (final)** 的重要里程碑:
-
-| 版本 | 关键改动 |
-|---|---|
-| alpha.4-9 | Brutal 排错长征 (cwnd_gain / listener 时序 / autofallback / cwnd_gain 15) |
-| alpha.7 | eBPF SockMap 直连转发弃用 → 改 splice(2)+pipe 零拷贝 |
-| alpha.10-11 | WarmPool 反馈算法修正 (cwnd_gain=15 对齐 POC, floor 提到 10) |
-| alpha.12-18 | 初始 target 修正 / TIME_SYNC 降噪 / log_file / geo 完整性校验+via proxy fallback / 热更新架构 UpdaterHandle / update_days clamp |
-| alpha.19-26 | **透明网关成型**: tc_divert 纯 eBPF 抓 LAN 裸-IP 分流 (netns 实测) + 透明 UDP + cgroup/connect4 本机流量 + 异常链路修复 (握手缓存毒化/僵尸泄漏/pool 饿死) |
-| alpha.27-31 | 真机部署踩坑修复: 透明 listener `Backlog::MAXCONN` EINVAL 根治, fake-IP TCP/UDP 真机首次跑通 |
-| alpha.32-34 | **抗 DNS 风暴**: fake-IP TTL 1s→300s + 空答复 SOA 负缓存 (根治网页 ~11s 卡顿) + **全量代码审计** (逐行审 ~11K Rust + 852 eBPF C, 修 5 处: 越界 panic / varint 溢出 / XDP-EDNS0 畸形 / 重放窗口 / fd 复用) |
-| **alpha.35** | DNS 上游解析加**重传 + 多上游并行兜底** (根治国内域名偶发 11s) |
-| **v0.4.5 (final)** | 日志按大小滚动 + gzip 压缩归档收尾 |
-
-> **协议调整摘要 (v0.4 → v0.4.5)**: ①时间同步内嵌协议 (服务端 handshake 后经加密 channel 下发 `[0x01][ver][8B unix sec]` 帧, 客户端写全局 offset, 0 外部依赖/0 指纹); ②DNS 空答复带合成 SOA (RFC 2308 负缓存); ③fake-IP 稳定 TTL 300s。密码派生 info 常量 `pyrealiy-session` 为历史冻结值, **切勿修改** (两端必须一致)。
-
-</details>
-
-完整清单见 [CHANGELOG.md](CHANGELOG.md)。
+| 版本 | 发布日期 | 核心重大特性 |
+| :--- | :--- | :--- |
+| **v0.6.8** | 2026-07-28 | **配置片段 Export/Import 闭环**: 支持交互式导出节点与规则 JSON 片段，支持 `subscribe` 导入本地文件合并；全局代码护栏加固。 |
+| **v0.6.7** | 2026-07-28 | **负载均衡组**: 新增 `load_balance` 出站组 (Round-Robin 分摊)；支持 URL 订阅批量导入；集成节点 GeoIP 区域判定与分组告警。 |
+| **v0.6.6** | 2026-07-27 | **进程名分流**: 支持按发起程序名路由 (`process_name`)；新增 `dump_tls` 会话指纹量化分析工具。 |
+| **v0.6.5** | 2026-07-27 | **DNS-over-TCP兜底**: 服务端可选 `dns_tcp_resolver`，彻底解决 VPS 屏蔽出口 UDP 导致的域名解析失败问题。 |
+| **v0.6.4** | 2026-07-26 | **智能网络质量探测**: 节点测活集成 HTTP 穿隧道端到端探测，联动 TCP RTT 揭露劣质出口节点。 |
+| **v0.6.1** | 2026-07-26 | **DNS 三件套重构**: 支持局域网 53 端口劫持；新增静态解析；新增 IPv4/IPv6 双栈返回控制。 |
+| **v0.6.0** | 2026-07-23 | **WireGuard 全面接入**: 客户端出站与服务端上游支持 WireGuard；修复 SOCKS5 UDP 绕过路由问题。 |
+| **v0.5.0** | 早期 | 引入 Neon Pulse Dashboard 看板；重写 DNS 引擎支持 TTL 缓存。 |
+| **v0.4.5** | 早期 | 抗 DNS 风暴机制完善；TCP Brutal CC 优化定型；eBPF 透明网关正式成型。 |
 
 ---
-
 *"在数字迷雾中构筑坚不可摧的幻象。" —— Mirage-rs 团队*

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### docs: README 精简后补回内核门槛/看板安全警告 + CLI 用法章
+
+README 精简时漏掉两处必要说明, 补回 (保持精简风格):
+
+- **运行要求 (内核 ≥5.10)**: eBPF 透明网关依赖 sk_lookup/sk_assign/XDP, 旧内核加载失败; 说明轻量/
+  SOCKS 模式不碰 eBPF 可兜底, 服务端侧不需 eBPF。原精简版通篇不提内核门槛。
+- **看板安全警告 (`gui.token`)**: 看板可视化改路由规则, `0.0.0.0` 暴露又不设 token = 任何可达者能
+  重定向流量。补回醒目警告。
+- **新增「CLI 用法」章**: 集中 check/format/import/subscribe/export/test 命令示例 + 组类型/区域判定说明
+  (原先散见于 roadmap/changelog)。
+
 ### docs: 配置模板同步近期功能 + 修服务端模板死字段
 
 `templates/*.jsonc` 补齐近期功能, jq 格式化 + 注释, 两模板均 `mirage-rs check` 零未知字段:
