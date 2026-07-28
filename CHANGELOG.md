@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.6.9] - DNS 自适应分流 + 命名统一 + 全局审查加固 (2026-07-29)
 
 ### feat(dns): 未分类域名自适应分类 (auto_classify) —— 按解析 IP 归属自动分流 + 学习
 

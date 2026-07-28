@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.8-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.6.9-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -293,6 +293,7 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.6.9** | 2026-07-29 | **DNS 未分类域名自适应分流** (`auto_classify`): 灰域名按解析 IP 归属自动直连/代理 + TTL 学习, 可选 `verify_cn` 非阻塞交叉校验防污染。配置命名统一 snake_case (移除 `load-balance` 别名); 移除从未实现的 `advanced_dns.rules`; 4 路 Sonnet 全局审查加固。 |
 | **v0.6.8** | 2026-07-28 | **配置片段 Export/Import 闭环**: 支持交互式导出节点与规则 JSON 片段，支持 `subscribe` 导入本地文件合并；全局代码护栏加固。 |
 | **v0.6.7** | 2026-07-28 | **负载均衡组**: 新增 `load_balance` 出站组 (Round-Robin 分摊)；支持 URL 订阅批量导入；集成节点 GeoIP 区域判定与分组告警。 |
 | **v0.6.6** | 2026-07-27 | **进程名分流**: 支持按发起程序名路由 (`process_name`)；新增 `dump_tls` 会话指纹量化分析工具。 |
