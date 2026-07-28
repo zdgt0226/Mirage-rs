@@ -459,6 +459,22 @@ pub struct AutoClassifyConfig {
     /// 学习缓存容量上限 (纯内存, LRU 淘汰)。默认 8192。
     #[serde(default = "default_auto_classify_cap")]
     pub max_entries: usize,
+    /// 国内解析出 CN IP 时是否**交叉校验** (防少数 CN 段污染被误判直连)。默认 off。
+    /// `async`: 立即返回国内答复 (零延迟), 后台经隧道可信解析校验 —— 若可信结果是海外则把
+    /// 域名标记海外, **下次**走 fakeip (本次连接不受保护, 这是非阻塞的固有取舍)。
+    #[serde(default)]
+    pub verify_cn: VerifyCn,
+}
+
+/// auto_classify 对"国内解析出 CN IP"结果的交叉校验方式。
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyCn {
+    /// 不校验 (默认): 信国内的 CN 结果直连。CN 段污染有窄漏洞, 但罕见。
+    #[default]
+    Off,
+    /// 非阻塞: 立即返回, 后台隧道校验, 污染则标记海外供下次。零延迟, 首连不保护。
+    Async,
 }
 
 fn default_auto_classify_ttl() -> u64 {

@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [dns, routing, geoip, fakeip, anti-pollution]
 created: "2026-07-29T00:59:15"
-updated: "2026-07-29T00:59:15"
+updated: "2026-07-29T01:58:19"
 ---
 
 ## compiled_truth
@@ -47,3 +47,8 @@ updated: "2026-07-29T00:59:15"
   summary: "灰域名国内解析→首个A的GeoIP判CN直连/海外fakeip+TTL学习; 复用geoip cn段; 只对未命中规则的域名"
   source: brain update-truth
   affects: [dns-auto-classify]
+
+- time: 2026-07-29T01:58:19
+  kind: decision
+  summary: "加可选交叉校验 verify_cn: off(默认)/async; async=零延迟非阻塞后台隧道校验CN结果, 污染标记海外供下次"
+  affects: [src/dns/server.rs]

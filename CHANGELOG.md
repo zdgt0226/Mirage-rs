@@ -23,6 +23,10 @@
 - 实现: `router.route_matched()` 区分"命中规则 vs 落 default"; `AutoClassify` (CN 段 + TTL 缓存) 挂
   `CoreState`; `first_a_record` 解析响应首个 A。单测: first_a_record / is_cn / TTL 缓存 / 容量封顶 /
   route_matched。
+- **可选交叉校验** `verify_cn: "off"(默认) | "async"`: 国内解出 CN IP 时防少数 CN 段污染误判直连。
+  `async` = 立即返回国内答复 (**零延迟**), 后台经隧道**可信解析**确认 —— 若可信判海外则标记该域名,
+  **下次**走 fakeip (本次连接不受保护, 非阻塞固有取舍; 阻塞式会拖慢命中的国内域名首查故不做)。
+  隧道复用 `default_outbound` 解析出的 mirage 叶子; 非 mirage / 隧道失败则静默不校。
 
 ### ⚠️ 移除死字段 `advanced_dns.rules` (match/use, split-DNS)
 

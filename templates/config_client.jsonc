@@ -177,7 +177,11 @@
         "auto_classify": {
             "enabled": true,
             "ttl": 1800,             // 学习到的"海外"标记存活秒 (默认 3600; 防 CDN geo-DNS 抖动永钉代理)
-            "max_entries": 4096      // 学习缓存容量上限 (纯内存, 默认 8192)
+            "max_entries": 4096,     // 学习缓存容量上限 (纯内存, 默认 8192)
+            // 国内解出 CN IP 时是否交叉校验 (防少数 CN 段污染误判直连)。off(默认)/async。
+            // async = 立即返回国内答复(零延迟), 后台经隧道可信解析确认; 若可信判海外则标记该域名,
+            //         下次走 fakeip (本次连接不受保护, 这是非阻塞的固有取舍)。
+            "verify_cn": "async"
         }
 
         // 注: DNS 分流复用 routing.rules (direct→国内DNS / mirage→fake-IP / block→NXDOMAIN);
