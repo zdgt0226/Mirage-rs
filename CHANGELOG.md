@@ -1,5 +1,28 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### fix: 全局代码审查加固 (4 路 Sonnet 独立复审, 无 P0/P1)
+
+23k Rust + 781 C 全局审查 (crypto/eBPF/proxy 数据面/DNS-router-config 四子系统并行独立复审)。
+热路径 (AEAD 帧、proxy 数据面、DNS 解析、geo protobuf) 全清; 一条报告为**假阳性驳回**
+(`config_watcher.rs:130` 那行 prefix 硬编码 32/128 恒合法, 到不了 unwrap)。修的都是防御/受限项:
+
+- **fake-ip 段 prefix 下界** (`dns/fake_ip.rs`): 现拒 `/30`-`/32` (主机位不足会发范围外 IP; 最小 `/29`)。
+- **路由 `mode` 校验** (`config.rs`): 非法 mode (拼错如 `adn`) 现在 `check` 报错, 不再静默当 `or`
+  (原会让 and 规则悄悄放宽)。
+- **AEAD nonce 耗尽拦截** (`crypto/aead.rs` 收发两侧): nonce 到 `u64::MAX` 即断, 拒绝 (key,nonce) 复用
+  (2^64 帧物理不可达, 但显式拦比依赖"到不了"稳)。
+- **eBPF loader prefix_len 守卫** (`ebpf/transparent.rs`+`cgroup_connect.rs`): `> 32` 直接报错, 防
+  `32 - prefix_len` 移位下溢 (源头虽已校验, 加固纵深)。
+- **eBPF map `.unwrap()` → `context()`** (`ebpf/transparent.rs`): map 缺失给具名错误而非 panic。
+- **握手模板长度 cast clamp** (`crypto/handshake_cache.rs`): record/hs 长度改 `clamp` 到合法位宽,
+  不再让越界静默回绕。
+
+**刻意不修** (2 条, 均 P3): ① `hello_auth` 的 `SHA256(password)` 非常时 —— 修它需把密码 pad 到定长,
+**会改 auth token 派生、破坏协议兼容**, 而只泄露密码长度的时序边际, 不值。② `tc_divert.c` MSS clamp
+10 次上限 —— 非可利用 (漏 clamp 安全), 改 eBPF 循环动 verifier 且 eBPF CI 已知坏无法验。
+
 ## [v0.6.8] - 配置片段 export/import 闭环 (2026-07-28)
 
 ### feat(cli): `mirage-rs export` —— 交互式导出配置片段 (subscribe 的反向)

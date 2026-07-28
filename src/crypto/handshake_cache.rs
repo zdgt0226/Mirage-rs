@@ -227,8 +227,10 @@ fn patch_server_hello(flight: &[u8], client_session_id: &[u8]) -> Vec<u8> {
     let old_record_len = u16::from_be_bytes([flight[3], flight[4]]) as usize;
     let old_hs_len = u32::from_be_bytes([0, flight[6], flight[7], flight[8]]) as usize;
     
-    let new_record_len = (old_record_len as isize + diff) as u16;
-    let new_hs_len = (old_hs_len as isize + diff) as u32;
+    // clamp 到各字段合法范围, 别让负值/越界静默回绕成乱长度 (record 16bit, hs 24bit)。
+    // 正常输入 (session_id <= 32B) 恒落区间内, clamp 只是防御。
+    let new_record_len = (old_record_len as isize + diff).clamp(0, u16::MAX as isize) as u16;
+    let new_hs_len = (old_hs_len as isize + diff).clamp(0, 0xFF_FFFF) as u32;
     
     result[3] = (new_record_len >> 8) as u8;
     result[4] = (new_record_len & 0xFF) as u8;

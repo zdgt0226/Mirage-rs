@@ -840,6 +840,14 @@ impl Config {
                     rule.outbound
                 ));
             }
+            // mode 只认 "or"/"and"; 拼错 (如 "adn") 会静默当 "or", 让 and 规则悄悄放宽成 or。
+            if let Some(m) = &rule.mode {
+                if m != "or" && m != "and" {
+                    issues.push(format!(
+                        "routing.rules[{i}].mode = `{m}` 非法 (只认 or/and; 会被当 or 处理)"
+                    ));
+                }
+            }
             // 同理: 引用了不存在的入站 tag, 该规则**永远不会命中**且毫无提示。
             // 拼错入站名是很容易犯的错, 而症状是"规则写了不生效", 极难自查。
             for t in &rule.inbound {
@@ -1221,6 +1229,19 @@ mod validation_tests {
         let mut v = base();
         v["routing"]["default_outbound"] = serde_json::json!("nope");
         assert!(has(&issues_of(&v), "default_outbound"));
+    }
+
+    #[test]
+    fn invalid_rule_mode_reported() {
+        let mut v = base();
+        v["routing"]["rules"] = serde_json::json!([
+            { "outbound": "direct", "mode": "adn", "domain_suffix": ["example.com"] } // 拼错 and
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "mode") && has(&is, "adn"), "非法 mode 应报, 实际: {is:?}");
+        // 合法 mode 不报
+        v["routing"]["rules"][0]["mode"] = serde_json::json!("and");
+        assert!(!has(&issues_of(&v), "mode 非法"), "合法 and 不该报 mode");
     }
 
     #[test]

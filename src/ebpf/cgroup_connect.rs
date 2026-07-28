@@ -42,6 +42,9 @@ mod sys {
 
     impl CgroupConnectEngine {
         pub fn init(listen_port: u16, fakeip_net: Ipv4Addr, prefix_len: u8) -> Result<Self> {
+            if prefix_len > 32 {
+                anyhow::bail!("fake-ip prefix_len /{prefix_len} 非法 (须 <= 32)"); // 防 32-prefix 移位下溢
+            }
             static ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_CGROUP_CONNECT_ELF"));
             let mut bpf = Ebpf::load(ELF).context("Failed to load cgroup_connect.elf")?;
             let mask: u32 = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
