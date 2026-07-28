@@ -4,7 +4,7 @@ title: "外部审计逐条核实: 术语专业但真伪参半"
 category: concept
 status: active
 created: "2026-07-20T11:43:27"
-updated: "2026-07-24T00:55:30"
+updated: "2026-07-28T09:14:51"
 ---
 
 ## compiled_truth
@@ -77,4 +77,10 @@ updated: "2026-07-24T00:55:30"
   kind: decision
   summary: "补 2026-07-23 四条审计实例 + 两条可复用教训 (建议先验依赖能力/修复暴露重复代码)"
   source: "2026-07-23 审计"
+  affects: [external-audit-verification]
+
+- time: 2026-07-28T09:14:51
+  kind: evidence
+  summary: "Gemini 4 条通用警告 (CO-RE/日志阻塞/GeoSite OOM/重载黑洞) 逐条核实: 0 真 bug, 全被现有设计覆盖或机制误判"
+  source: "ebpf-src/tc_divert.c, src/monitor.rs, src/router/geo.rs, src/config_watcher.rs"
   affects: [external-audit-verification]
