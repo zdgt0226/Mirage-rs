@@ -872,7 +872,9 @@ impl DnsForwarder {
                             }
                             // 非阻塞交叉校验: 国内判 CN, 后台经隧道可信解析确认; 可信判海外 → 疑污染,
                             // 标记海外供**下次** (本次已返回, 不受保护 —— 非阻塞的固有取舍)。
-                            if let Some(leaf) = verify_leaf {
+                            // 仅 DNS cache 开时才校验: cache 开则同域名每 TTL 只探测一次 (spawn 天然
+                            // 有界); cache 关会每次查询都重探测, 再逐次 spawn 隧道会刷爆 WarmPool。
+                            if let (Some(leaf), true) = (verify_leaf, self.cache.is_some()) {
                                 Self::spawn_cn_verify(
                                     leaf, ac.clone(), dk.clone(), req.to_vec(),
                                     remote_dns_host.clone(), remote_dns_port,

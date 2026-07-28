@@ -27,6 +27,8 @@
   `async` = 立即返回国内答复 (**零延迟**), 后台经隧道**可信解析**确认 —— 若可信判海外则标记该域名,
   **下次**走 fakeip (本次连接不受保护, 非阻塞固有取舍; 阻塞式会拖慢命中的国内域名首查故不做)。
   隧道复用 `default_outbound` 解析出的 mirage 叶子; 非 mirage / 隧道失败则静默不校。
+  **需 `advanced_dns.cache` 开**: cache 关时同域名每次查询都重探测, 逐次 spawn 隧道会刷爆 WarmPool,
+  故 cache 关时校验自动跳过 (cache 开则每 TTL 每域名只探测一次, spawn 天然有界)。
 
 ### ⚠️ 移除死字段 `advanced_dns.rules` (match/use, split-DNS)
 
