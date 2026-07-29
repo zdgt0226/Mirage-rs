@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.7.0] - cipher agility (AES-256-GCM 协商) + IPv6 隧道传输 (2026-07-30)
 
 ### feat(crypto): cipher agility —— 两端有 AES-NI 时协商 AES-256-GCM (大流量 ~2x)
 
