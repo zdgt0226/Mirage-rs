@@ -271,6 +271,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 ### ⏳ 未完成 (计划池)
 
 - [ ] **IPv6 全栈** —— 当前 WireGuard 与透明代理数据面均 **IPv4-only** (DNS 层已可控 v4/v6 返回, 但数据面未通)。这是最大的结构性缺口, IPv6 优先/仅 IPv6 网络 (尤其国内移动网) 下会漏流量或不可用
+- [ ] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① 设备规则: 路由已有 `source_ip_cidr`/`source_mac`, 只需给 TCP 透明路径填 `source_ip` (现为 None, ~2 行, UDP 已填) 即对 TCP 生效。② 每主机用量: eBPF 按源 IP 计上下行字节 (tc 看得到含 splice 直连的全部流量, 用户态计数会漏) → 用户态读 map → API + Neon 面板 per-host 视图 + 可选设备别名
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连
 - [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段

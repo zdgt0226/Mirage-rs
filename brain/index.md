@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-28T18:38:19.350Z._
+_Auto-generated. Last updated 2026-07-29T03:24:40.416Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -18,6 +18,7 @@ _Auto-generated. Last updated 2026-07-28T18:38:19.350Z._
 - [geo-dat-parsing-robustness](pages/geo-dat-parsing-robustness.md) — category: decision | v2ray/v2fly 的 `geosite.dat` / `geoip.dat` 是 protobuf 编码的外部数据, 手写解析器踩过两处 bug, 均已修并带回归测试:
 - [ipv6-full-stack-design](pages/ipv6-full-stack-design.md) — category: decision | tags: [ipv6, transparent, ebpf, fakeip, tc_divert, roadmap] | **目标**: 补齐 IPv6 透明代理, 闭合当前唯一真缺口 —— "应用用 **v6 字面量**直连本应被代理的目标 (不经 DNS)"。
 - [ipv6-v4only-tradeoff](pages/ipv6-v4only-tradeoff.md) — category: decision | **现状**:透明路径整条 **IPv4-only**。
+- [lan-host-monitor-device-rules](pages/lan-host-monitor-device-rules.md) — category: decision | tags: [roadmap, lan, monitoring, ebpf, routing, webui] | **计划池** (2026-07-29 定, 随 WebUI 优化再开发)。
 - [load-balance-outbound](pages/load-balance-outbound.md) — category: decision | tags: [outbound, load-balance, routing, group] | ## 决定
 - [mss-clamp-merged-into-tc-divert](pages/mss-clamp-merged-into-tc-divert.md) — category: decision | **决定**(`66e0262`,方案A):把 MSS clamp **内联进 `tc_divert.c`**(`clamp_tcp_mss()`),
 - [no-clash-api](pages/no-clash-api.md) — category: decision | **决定**:**不做 Clash API 兼容**,走自有 API 路径。
