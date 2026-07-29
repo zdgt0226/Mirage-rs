@@ -76,6 +76,67 @@ pub fn local_supports_aes() -> bool {
     detect_best_cipher() == Cipher::Aes256Gcm
 }
 
+// ── cipher agility 协商 ──────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 服务端 cipher agility 开关 (启动时从 config.tuning.cipher_agility 设一次)。
+static SERVER_CIPHER_AGILITY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_server_cipher_agility(on: bool) {
+    SERVER_CIPHER_AGILITY.store(on, Ordering::Relaxed);
+}
+pub fn server_cipher_agility() -> bool {
+    SERVER_CIPHER_AGILITY.load(Ordering::Relaxed)
+}
+
+/// TIME_SYNC 帧 proto_ver: 0x01=仅 ChaCha20 (老/默认), 0x02=支持 agility 协商。
+pub const PROTO_VER_LEGACY: u8 = 0x01;
+pub const PROTO_VER_AGILITY: u8 = 0x02;
+
+/// 客户端→服务端 CIPHER_NEGO 帧: [0xFF,0xFF,client_aes(0/1)]。前两字节是"不可能的 target_len
+/// (65535)"哨兵, 与真 target 帧区分; 老服务端永不收到 (它没发 proto_ver=0x02)。
+pub const CIPHER_NEGO_SENTINEL: [u8; 2] = [0xFF, 0xFF];
+/// 服务端→客户端 CIPHER_ACK 帧: [0x03, final_cipher_wire]。
+pub const CIPHER_ACK_TYPE: u8 = 0x03;
+
+/// 构造 CIPHER_NEGO 帧。
+pub fn build_cipher_nego(client_supports_aes: bool) -> [u8; 3] {
+    [CIPHER_NEGO_SENTINEL[0], CIPHER_NEGO_SENTINEL[1], client_supports_aes as u8]
+}
+
+/// 一帧是否 CIPHER_NEGO (服务端识别客户端首帧)。是则返回 client_supports_aes。
+pub fn parse_cipher_nego(frame: &[u8]) -> Option<bool> {
+    if frame.len() == 3 && frame[0] == CIPHER_NEGO_SENTINEL[0] && frame[1] == CIPHER_NEGO_SENTINEL[1] {
+        Some(frame[2] != 0)
+    } else {
+        None
+    }
+}
+
+/// 协商最终 cipher: 仅当**两端都支持** AES 才用 AES, 否则 ChaCha20 (无加速方 AES 反而更慢)。
+pub fn negotiate(client_aes: bool, server_aes: bool) -> Cipher {
+    if client_aes && server_aes {
+        Cipher::Aes256Gcm
+    } else {
+        Cipher::ChaCha20Poly1305
+    }
+}
+
+/// 构造 CIPHER_ACK 帧。
+pub fn build_cipher_ack(final_cipher: Cipher) -> [u8; 2] {
+    [CIPHER_ACK_TYPE, final_cipher.to_wire()]
+}
+
+/// 解析 CIPHER_ACK 帧 → 最终 cipher。格式/字节非法 → None。
+pub fn parse_cipher_ack(frame: &[u8]) -> Option<Cipher> {
+    if frame.len() == 2 && frame[0] == CIPHER_ACK_TYPE {
+        Cipher::from_wire(frame[1])
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +157,42 @@ mod tests {
         let c = detect_best_cipher();
         assert!(c == Cipher::ChaCha20Poly1305 || c == Cipher::Aes256Gcm);
         assert_eq!(local_supports_aes(), c == Cipher::Aes256Gcm);
+    }
+
+    #[test]
+    fn negotiate_only_aes_when_both() {
+        use Cipher::*;
+        assert_eq!(negotiate(true, true), Aes256Gcm, "两端都 AES → AES");
+        assert_eq!(negotiate(true, false), ChaCha20Poly1305, "一端无 AES → ChaCha20");
+        assert_eq!(negotiate(false, true), ChaCha20Poly1305);
+        assert_eq!(negotiate(false, false), ChaCha20Poly1305);
+    }
+
+    #[test]
+    fn nego_frame_roundtrip() {
+        assert_eq!(parse_cipher_nego(&build_cipher_nego(true)), Some(true));
+        assert_eq!(parse_cipher_nego(&build_cipher_nego(false)), Some(false));
+        // 真 target 帧 (非哨兵) 不误判成 NEGO
+        assert_eq!(parse_cipher_nego(&[0x00, 0x05, b'h']), None);
+        assert_eq!(parse_cipher_nego(&[0xFF, 0xFF]), None, "长度不足 3 不算");
+        assert_eq!(parse_cipher_nego(b"\x00\x0aexample.com"), None);
+    }
+
+    #[test]
+    fn ack_frame_roundtrip() {
+        for c in [Cipher::ChaCha20Poly1305, Cipher::Aes256Gcm] {
+            assert_eq!(parse_cipher_ack(&build_cipher_ack(c)), Some(c));
+        }
+        assert_eq!(parse_cipher_ack(&[0x03, 0x00]), None, "非法 cipher 字节");
+        assert_eq!(parse_cipher_ack(&[0x01, 0x02]), None, "非 ACK type");
+    }
+
+    #[test]
+    fn server_agility_flag_global() {
+        set_server_cipher_agility(true);
+        assert!(server_cipher_agility());
+        set_server_cipher_agility(false);
+        assert!(!server_cipher_agility());
     }
 
     #[test]

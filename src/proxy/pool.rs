@@ -568,7 +568,7 @@ impl WarmPool {
         write_half.flush().await?;
 
         // 4. 派生会话密钥 (使用 client_random 作为 salt)
-        let (mut crypto_reader, crypto_writer) = create_crypto_pair(
+        let (mut crypto_reader, mut crypto_writer) = create_crypto_pair(
             read_half,
             write_half,
             &cfg.password,
@@ -579,11 +579,17 @@ impl WarmPool {
         // 5. v0.4 协议: 收 server 主动下发的 TIME_SYNC 帧, 写入全局 TIME_OFFSET.
         //    帧格式: [0x01 type][0x01 ver][8B u64 BE server unix sec] = 10 字节
         //    失败/超时降级: 用 local time 继续 (不阻塞连接), 仅 INFO 一次.
+        // proto_ver 0x02 = 服务端开了 cipher agility, 需在下方协商。
+        let mut server_agility = false;
         match tokio::time::timeout(
             std::time::Duration::from_secs(3),
             crypto_reader.recv_data()
         ).await {
-            Ok(Ok(data)) if data.len() == 10 && data[0] == 0x01 && data[1] == 0x01 => {
+            Ok(Ok(data)) if data.len() == 10 && data[0] == 0x01
+                && (data[1] == crate::crypto::cipher::PROTO_VER_LEGACY
+                    || data[1] == crate::crypto::cipher::PROTO_VER_AGILITY) =>
+            {
+                server_agility = data[1] == crate::crypto::cipher::PROTO_VER_AGILITY;
                 let server_time = u64::from_be_bytes(data[2..10].try_into().unwrap());
                 crate::time_sync::set_offset_from_server_time(server_time);
             }
@@ -611,6 +617,27 @@ impl WarmPool {
             }
             Err(_) => {
                 tracing::info!("TIME_SYNC: timeout waiting for server time (3s), proceeding with local time. Old server?");
+            }
+        }
+
+        // 6. cipher agility 协商 (仅服务端广播 0x02 时): 发 CIPHER_NEGO(本机AES), 读 CIPHER_ACK,
+        //    两端 rekey 到协商 cipher。协商在加密 ChaCha20 信道内完成, ClientHello 未动 (指纹不变)。
+        //    任何失败 → 保持 ChaCha20 (fail-safe, 不影响连接可用性)。
+        if server_agility {
+            let nego = crate::crypto::cipher::build_cipher_nego(crate::crypto::cipher::local_supports_aes());
+            if crypto_writer.send_data(&nego).await.is_ok() {
+                match tokio::time::timeout(std::time::Duration::from_secs(3), crypto_reader.recv_data()).await {
+                    Ok(Ok(ack)) => {
+                        if let Some(final_cipher) = crate::crypto::cipher::parse_cipher_ack(&ack) {
+                            crypto_writer.rekey(final_cipher);
+                            crypto_reader.rekey(final_cipher);
+                            tracing::debug!("cipher agility 协商为 {:?}", final_cipher);
+                        } else {
+                            tracing::warn!("cipher agility: CIPHER_ACK 格式异常, 维持 ChaCha20");
+                        }
+                    }
+                    _ => tracing::warn!("cipher agility: 未收到 CIPHER_ACK, 维持 ChaCha20"),
+                }
             }
         }
 

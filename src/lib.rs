@@ -268,6 +268,8 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
 
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             if let Some(tuning) = config.tuning {
+                // 服务端 cipher agility 开关 (设进全局, control.rs 读)。
+                crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }
                 if let Some(m) = tuning.ebpf_mode { ebpf_mode = m; }
                 geo_sources = tuning.geo_sources;
