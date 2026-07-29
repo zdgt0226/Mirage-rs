@@ -8,6 +8,7 @@ pub mod config_watcher;
 pub mod ebpf;
 pub mod monitor;
 pub mod net_monitor;
+pub mod net_util;
 pub mod node_uri;
 pub mod lite;
 pub mod api;
@@ -675,7 +676,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
 
         match inbound {
             crate::config::InboundConfig::Socks { tag, listen, port, auth } => {
-                let listen_addr = format!("{}:{}", listen, port);
+                let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 warn_if_open_proxy("socks", &listen, port, auth.is_some());
                 let auth = auth.clone().map(std::sync::Arc::new);
@@ -698,7 +699,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 });
             }
             crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, .. } => {
-                let listen_addr = format!("{}:{}", listen, port);
+                let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
                 let ebp = ebpf_clone.clone();
                 // 0 视为未启用 (兼容旧 install.sh 模板里写 0 表示 "no brutal")
@@ -714,7 +715,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 });
             }
             crate::config::InboundConfig::Mixed { tag, listen, port, auth } => {
-                let listen_addr = format!("{}:{}", listen, port);
+                let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 warn_if_open_proxy("mixed", &listen, port, auth.is_some());
                 let auth = auth.clone().map(std::sync::Arc::new);
@@ -738,7 +739,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             }
             crate::config::InboundConfig::Transparent { tag, listen, port, interface, proxy_local, dns_hijack } => {
                 let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
-                let listen_addr = format!("{}:{}", listen, port);
+                let listen_addr = crate::net_util::join_host_port(&listen, port);
                 // 本机出向重定向 (cgroup/connect4): 开启后网关本机自身 fake-IP 流量也走代理。
                 let cgroup_engine = if let (true, true, Some(fm)) = (proxy_local, enable_ebpf, &fake_ip_mapper) {
                     let net = fm.network();
@@ -825,7 +826,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 });
             }
             crate::config::InboundConfig::Dns { tag, listen, port } => {
-                let listen_addr = format!("{}:{}", listen, port);
+                let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let dns_tag: std::sync::Arc<str> = tag.as_str().into();
                 let st_for_dns = state_clone.clone();
                 let fm_for_dns = fake_mapper_clone.clone();

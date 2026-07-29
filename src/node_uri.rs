@@ -58,9 +58,18 @@ impl NodeUri {
             None => (hostport_query, ""),
         };
 
-        let (host, port_str) = hostport
-            .rsplit_once(':')
-            .ok_or_else(|| anyhow!("缺少端口 (格式: host:port)"))?;
+        // IPv6 字面量用方括号 `[2606::1]:443` (裸 v6 的 ':' 会与端口分隔符歧义)。
+        // 括号形式: 取 `]:` 之后为端口, 括号内为 host (剥括号)。否则按最后一个 ':' 分。
+        let (host, port_str) = if let Some(rest6) = hostport.strip_prefix('[') {
+            let (h, p) = rest6
+                .split_once("]:")
+                .ok_or_else(|| anyhow!("IPv6 字面量格式应为 [addr]:port"))?;
+            (h, p)
+        } else {
+            hostport
+                .rsplit_once(':')
+                .ok_or_else(|| anyhow!("缺少端口 (格式: host:port)"))?
+        };
         let port: u16 = port_str
             .parse()
             .map_err(|_| anyhow!("端口非法: `{port_str}`"))?;
@@ -103,6 +112,18 @@ mod tests {
         assert_eq!(n.host, "1.2.3.4");
         assert_eq!(n.port, 443);
         assert_eq!(n.sni, "www.apple.com");
+    }
+
+    #[test]
+    fn parses_bracketed_ipv6_host() {
+        let n = NodeUri::parse("mirage://pw@[2606:4700:4700::1111]:443?sni=www.apple.com").unwrap();
+        assert_eq!(n.host, "2606:4700:4700::1111", "括号剥离, host 不带 []");
+        assert_eq!(n.port, 443);
+        // 拼回可用 socket 串 (join_host_port 会重新加括号)
+        assert_eq!(
+            crate::net_util::join_host_port(&n.host, n.port).parse::<std::net::SocketAddr>().is_ok(),
+            true
+        );
     }
 
     #[test]
