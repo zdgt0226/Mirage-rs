@@ -1,5 +1,24 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(ipv6): 隧道传输支持 IPv6 (服务端 v6 监听 + 客户端连 v6 服务端)
+
+让 IPv6-only / v6-优先的客户端网络 (国内移动网) 能够到墙外服务端。**瘦身自原"IPv6 全栈"大 epic**
+—— 透明数据面 v6 (fake-v6/tc_divert v6/…) 评估后**不做**: fake-IP + 服务端远程解析已让客户端 v6
+数据面不必要 (海外域名 AAAA 被抑制 → 走 v4 fake-IP/隧道; 连海外 v6-only 站也由服务端侧连 v6)。
+
+- **v6 地址拼接修复** (`net_util::join_host_port`): 裸 v6 字面量自动加方括号 (`2606::1` → `[2606::1]:443`,
+  `::` → `[::]:443`)。裸 `format!("{}:{}")` 对 v6 会产生歧义串 (`:::443`) 导致 bind/connect 失败。
+- 应用于: 客户端连服务端 (`pool.rs`) · 节点测活 (`probe.rs`) · 所有入站 listen bind (`lib.rs`, 服务端
+  `listen: "::"` 现能 v6 监听)。SS 上游本就已处理 v6。
+- **节点 URI 解析** (`node_uri`): 支持 `mirage://密码@[2606::1]:443?sni=...` 括号 v6, host 剥括号。
+- 服务端→海外目标的 v6 (`connect_smart`) 本就支持 (按域名解析 + 双族 failover)。
+- **策略** (已实现, 无需改): 被代理(海外)域名的 AAAA 查询回 NODATA (`dns/server.rs` fake-IP 分支),
+  强制海外流量走 v4 fake-IP → 隧道。国内域名 v4/v6 原生直连。
+- 残留 (接受): 罕见的"应用用 v6 字面量直连被代理目标"(不经 DNS) 会绕过代理; 纯 v6-only 无 v4 的
+  LAN 终端访海外够不到 fake-IP。单测: `net_util` (v6 括号/socketaddr 可解析) + `node_uri` v6。
+
 ## [v0.6.9] - DNS 自适应分流 + 命名统一 + 全局审查加固 (2026-07-29)
 
 ### feat(dns): 未分类域名自适应分类 (auto_classify) —— 按解析 IP 归属自动分流 + 学习

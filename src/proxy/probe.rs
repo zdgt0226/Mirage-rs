@@ -55,7 +55,7 @@ async fn probe_inner(
     http_probe: Option<&str>,
 ) -> anyhow::Result<ProbeOutcome> {
     let dl = Duration::from_secs(timeout_secs);
-    let addr = format!("{server}:{port}");
+    let addr = crate::net_util::join_host_port(server, port);
 
     // 1. TCP 建连 (计 RTT)。黑洞路由下会挂到内核 syn_retries, 故必须带超时。
     let t0 = Instant::now();
