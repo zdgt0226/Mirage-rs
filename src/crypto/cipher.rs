@@ -64,7 +64,11 @@ pub fn detect_best_cipher() -> Cipher {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("aes") {
+        // 需 aes + pmull (GHASH 加速): 缺 pmull 则 AES-GCM 走软件 GHASH, 比 ChaCha20 还慢
+        // (性能悬崖)。对称于 x86 的 aes+pclmulqdq。
+        if std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("pmull")
+        {
             return Cipher::Aes256Gcm;
         }
     }
