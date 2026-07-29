@@ -1,5 +1,29 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(crypto): cipher agility —— 两端有 AES-NI 时协商 AES-256-GCM (大流量 ~2x)
+
+隧道 AEAD 从硬编码 ChaCha20-Poly1305 改为**可协商**: 两端都有硬件 AES 加速时自动切
+AES-256-GCM (实测 2.1x), 否则维持 ChaCha20 (无加速方 AES 反而更慢)。
+
+```jsonc
+"tuning": { "cipher_agility": true }   // 服务端开关, 默认 false; 客户端自动响应无需配置
+```
+
+- **协商** (全在**加密信道内**, ClientHello 一字不改 → **TLS 指纹零触碰**): 服务端开了 `cipher_agility`
+  才在 TIME_SYNC 广播 `proto_ver=0x02`; 客户端见 0x02 → 发 `CIPHER_NEGO(本机 AES 能力)`, 服务端回
+  `CIPHER_ACK(final = 两端都 AES ? AES : ChaCha)`, 两端 `rekey` 到 final。
+- **re-key**: 重派生该 cipher 密钥 (HKDF info 折 cipher 后缀做**域分隔** → 与 ChaCha key 不同) + nonce
+  归零 (新 (key,algo) 组合, 归零安全)。ChaCha20 后缀为空 → bootstrap 密钥**字节兼容老协议**。
+- **AES-NI 检测**: x86 `aes+pclmulqdq` / aarch64 `aes`, 其它架构 → ChaCha20。保守 (仅确有加速才选 AES)。
+- **向后兼容**: `cipher_agility` 默认 false = 行为不变; 老客户端发真 target (非 NEGO) → 服务端不协商;
+  新客户端遇老服务端 (proto_ver=0x01) → 不协商。**⚠️ 开关只在所有客户端都升到 v0.7.0+ 时开**
+  (老客户端严格只认 proto_ver=0x01, 收到 0x02 丢时间同步)。
+- 实现 old-coder 证据流程: crypto 层单测 (wire/检测/域分隔/rekey nonce 归零/跨 cipher fail-closed/兼容
+  key 字节一致) + 协商纯函数单测 + 集成测试场景 7-10 (both-AES→AES / 单端无 AES→ChaCha / 开关关→ChaCha
+  / 老客户端→ChaCha); 手工变异证明 (去 nonce 归零 / 域分隔失效 / negotiate AND→OR 均被杀)。全套测试绿。
+
 ## [v0.6.9] - DNS 自适应分流 + 命名统一 + 全局审查加固 (2026-07-29)
 
 ### feat(dns): 未分类域名自适应分类 (auto_classify) —— 按解析 IP 归属自动分流 + 学习
