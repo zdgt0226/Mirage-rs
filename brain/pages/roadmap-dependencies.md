@@ -5,7 +5,7 @@ category: reference
 status: active
 tags: [roadmap, planning, dependencies]
 created: "2026-07-29T11:45:40"
-updated: "2026-07-29T11:45:40"
+updated: "2026-07-30T00:57:43"
 ---
 
 ## compiled_truth
@@ -49,3 +49,8 @@ updated: "2026-07-29T11:45:40"
   summary: "计划池依赖图: 地基=统一出站流(4)+IPv6(1); cipher agility(8)独立先做; tc_divert三项批量; 建议开发序"
   source: brain update-truth
   affects: [roadmap-dependencies]
+
+- time: 2026-07-30T00:57:43
+  kind: decision
+  summary: "IPv6(1)瘦身: 透明数据面v6 epic 否决, 降为'隧道传输走v6'小PR; 不再是挡LAN监控/链式代理的大地基。唯一地基剩统一出站流(4)"
+  affects: [ipv6-full-stack-design]
