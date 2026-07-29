@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use ring::aead::{self, LessSafeKey, UnboundKey, Nonce as RingNonce};
+use crate::crypto::cipher::Cipher;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
@@ -36,11 +37,17 @@ fn derive_master(password: &str, salt: &[u8]) -> [u8; 32] {
     okm
 }
 
-fn expand_key(master: &[u8; 32], info: &[u8]) -> LessSafeKey {
+/// 从 master + 方向 info + cipher 派生 AEAD 密钥。cipher 折进 HKDF info 做**域分隔**:
+/// 不同 cipher 得不同 key, 使 re-key 时 (key,algo) 整体变化, nonce 归零安全。
+/// ChaCha20 的后缀为空 → info 与旧版一致 → bootstrap 密钥**字节兼容**老协议。
+fn expand_key(master: &[u8; 32], info: &[u8], cipher: Cipher) -> LessSafeKey {
     let hk = Hkdf::<Sha256>::from_prk(master).unwrap();
+    let mut full_info = Vec::with_capacity(info.len() + 10);
+    full_info.extend_from_slice(info);
+    full_info.extend_from_slice(cipher.hkdf_suffix());
     let mut okm = [0u8; 32];
-    hk.expand(info, &mut okm).unwrap();
-    let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &okm).unwrap();
+    hk.expand(&full_info, &mut okm).unwrap();
+    let unbound = UnboundKey::new(cipher.ring_algorithm(), &okm).unwrap();
     LessSafeKey::new(unbound)
 }
 
@@ -62,6 +69,9 @@ pub struct CryptoWriter<W: AsyncWrite + Unpin> {
     writer: BufWriter<W>,
     cipher: LessSafeKey,
     nonce: u64,
+    /// 保存 master + cipher_kind 供 re-key (cipher agility) 重派生密钥。
+    master: [u8; 32],
+    cipher_kind: Cipher,
     /// 加密临时区: [chunk_bytes, content_type=0x17] → seal_in_place 后附 tag
     buffer: Vec<u8>,
     /// 出线组帧区: [5B TLS header, encrypted_buffer]. 单次 write_all 送出,
@@ -73,18 +83,35 @@ pub struct CryptoWriter<W: AsyncWrite + Unpin> {
 
 impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
     pub fn new(writer: W, master_key: &[u8; 32], is_initiator: bool) -> Self {
-        let info = if is_initiator { b"c2s" } else { b"s2c" };
-        let cipher = expand_key(master_key, info);
+        // bootstrap 恒 ChaCha20 (与老协议字节兼容); 协商成功后由 rekey 切 AES。
+        let info: &[u8] = if is_initiator { b"c2s" } else { b"s2c" };
+        let cipher = expand_key(master_key, info, Cipher::ChaCha20Poly1305);
         Self {
             writer: BufWriter::with_capacity(WRITER_BUF_CAPACITY, writer),
             cipher,
             nonce: 0,
+            master: *master_key,
+            cipher_kind: Cipher::ChaCha20Poly1305,
             // 预分配最大容量，杜绝运行时内存分配开销
             buffer: Vec::with_capacity(MAX_RECORD_SIZE + TAG_SIZE),
             framed: Vec::with_capacity(5 + MAX_RECORD_SIZE + TAG_SIZE),
             is_initiator,
             rng: fastrand::Rng::new(),
         }
+    }
+
+    /// 切换 AEAD 算法 (cipher agility 协商后)。重派生该 cipher 的密钥 + **nonce 归零**
+    /// (新 (key,algo) 组合, 归零不复用)。只应在协商确定后调一次。
+    pub fn rekey(&mut self, cipher: Cipher) {
+        let info: &[u8] = if self.is_initiator { b"c2s" } else { b"s2c" };
+        self.cipher = expand_key(&self.master, info, cipher);
+        self.cipher_kind = cipher;
+        self.nonce = 0;
+    }
+
+    /// 当前 cipher (供协商/调试)。
+    pub fn cipher(&self) -> Cipher {
+        self.cipher_kind
     }
 
     /// 发送 TLS 1.3 格式的加密数据块
@@ -180,23 +207,40 @@ pub struct CryptoReader<R> {
     reader: R,
     cipher: LessSafeKey,
     nonce: u64,
+    master: [u8; 32],
+    cipher_kind: Cipher,
     is_initiator: bool,
 }
 
 impl<R: AsyncRead + Unpin> CryptoReader<R> {
     pub fn new(reader: R, master_key: &[u8; 32], is_initiator: bool) -> Self {
-        let info = if is_initiator { b"s2c" } else { b"c2s" };
-        let cipher = expand_key(master_key, info);
+        let info: &[u8] = if is_initiator { b"s2c" } else { b"c2s" };
+        let cipher = expand_key(master_key, info, Cipher::ChaCha20Poly1305);
         Self {
             reader,
             cipher,
             nonce: 0,
+            master: *master_key,
+            cipher_kind: Cipher::ChaCha20Poly1305,
             is_initiator,
         }
     }
 
     pub fn inner(&self) -> &R {
         &self.reader
+    }
+
+    /// 切换 AEAD 算法 (cipher agility 协商后, 与对端 writer 的 rekey 同步)。重派生密钥 + nonce 归零。
+    pub fn rekey(&mut self, cipher: Cipher) {
+        let info: &[u8] = if self.is_initiator { b"s2c" } else { b"c2s" };
+        self.cipher = expand_key(&self.master, info, cipher);
+        self.cipher_kind = cipher;
+        self.nonce = 0;
+    }
+
+    /// 当前 cipher (供协商/调试)。
+    pub fn cipher(&self) -> Cipher {
+        self.cipher_kind
     }
 
     /// 接收并解密 TLS 1.3 格式的加密数据块
@@ -272,6 +316,89 @@ pub fn create_crypto_pair<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         CryptoReader::new(reader, &master, is_initiator),
         CryptoWriter::new(writer, &master, is_initiator),
     )
+}
+
+#[cfg(test)]
+mod rekey_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    /// writer(c2s, initiator) ↔ reader(c2s, 非 initiator) 一对; 可选先 rekey 到某 cipher。
+    async fn roundtrip(rekey_to: Option<Cipher>) {
+        let (a, b) = duplex(64 * 1024);
+        let master = [7u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        let mut r = CryptoReader::new(b, &master, false);
+        if let Some(c) = rekey_to {
+            w.rekey(c);
+            r.rekey(c);
+        }
+        let msg = b"hello cipher agility 1234567890 payload";
+        w.send_data(msg).await.unwrap();
+        assert_eq!(&r.recv_data().await.unwrap(), msg);
+    }
+
+    #[tokio::test]
+    async fn roundtrip_default_chacha() {
+        roundtrip(None).await;
+    }
+    #[tokio::test]
+    async fn roundtrip_rekey_aes() {
+        roundtrip(Some(Cipher::Aes256Gcm)).await;
+    }
+    #[tokio::test]
+    async fn roundtrip_rekey_chacha() {
+        roundtrip(Some(Cipher::ChaCha20Poly1305)).await;
+    }
+
+    #[tokio::test]
+    async fn mismatched_cipher_fails_closed() {
+        // writer 切 AES, reader 留 ChaCha20 → 解密必失败 (fail-closed, 不静默出乱数据)。
+        let (a, b) = duplex(64 * 1024);
+        let master = [9u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        let mut r = CryptoReader::new(b, &master, false);
+        w.rekey(Cipher::Aes256Gcm);
+        w.send_data(b"boom").await.unwrap();
+        assert!(r.recv_data().await.is_err(), "cipher 不同步必须解密失败");
+    }
+
+    #[tokio::test]
+    async fn rekey_resets_nonce_and_keeps_stream() {
+        // 发 5 帧推进 nonce → rekey → nonce 归零 + 新 cipher 端到端仍通。
+        let (a, b) = duplex(64 * 1024);
+        let master = [3u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        let mut r = CryptoReader::new(b, &master, false);
+        for _ in 0..5 {
+            w.send_data(b"x").await.unwrap();
+            r.recv_data().await.unwrap();
+        }
+        assert_eq!(w.nonce, 5);
+        assert_eq!(r.nonce, 5);
+        w.rekey(Cipher::Aes256Gcm);
+        r.rekey(Cipher::Aes256Gcm);
+        assert_eq!(w.nonce, 0, "rekey 后 writer nonce 归零");
+        assert_eq!(r.nonce, 0, "rekey 后 reader nonce 归零");
+        w.send_data(b"post-rekey-payload").await.unwrap();
+        assert_eq!(&r.recv_data().await.unwrap(), b"post-rekey-payload");
+    }
+
+    #[test]
+    fn chacha_key_bytes_match_legacy() {
+        // 向后兼容硬约束: ChaCha20 (后缀空) 派生的密钥必须与"折 cipher 前"完全一致。
+        let master = [42u8; 32];
+        let k_new = expand_key(&master, b"c2s", Cipher::ChaCha20Poly1305);
+        let hk = Hkdf::<Sha256>::from_prk(&master).unwrap();
+        let mut okm = [0u8; 32];
+        hk.expand(b"c2s", &mut okm).unwrap();
+        let k_old = LessSafeKey::new(UnboundKey::new(&aead::CHACHA20_POLY1305, &okm).unwrap());
+        let mut b1 = b"legacy-compat".to_vec();
+        let mut b2 = b1.clone();
+        k_new.seal_in_place_append_tag(format_nonce(0), aead::Aad::empty(), &mut b1).unwrap();
+        k_old.seal_in_place_append_tag(format_nonce(0), aead::Aad::empty(), &mut b2).unwrap();
+        assert_eq!(b1, b2, "ChaCha20 密钥必须与旧版字节一致 (向后兼容)");
+    }
 }
 
 #[cfg(test)]

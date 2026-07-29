@@ -1,10 +1,11 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-29T16:57:54.278Z._
+_Auto-generated. Last updated 2026-07-29T17:49:21.229Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
 - [chain-proxy-roadmap](pages/chain-proxy-roadmap.md) — category: decision | status: draft | tags: [roadmap, chain-proxy, wireguard, shadowsocks, architecture] | ## 用户诉求 (2026-07-27)
+- [cipher-agility](pages/cipher-agility.md) — category: decision | tags: [crypto, aead, performance, negotiation, aes] | **决定** (v0.7.0 首选性能项, 见 [[perf-roadmap-v070]]): 隧道 AEAD 从硬编码 ChaCha20-Poly1305 改可协商 —— 两端都有硬件 AES 加速时切 **AES-256-GCM** (实测 2.1x), 否则 ChaCha2
 - [config-export-fragment](pages/config-export-fragment.md) — category: decision | tags: [cli, export, subscription, config, share] | `mirage-rs export` = subscribe 的反向。
 - [dns-auto-classify](pages/dns-auto-classify.md) — category: decision | tags: [dns, routing, geoip, fakeip, anti-pollution] | **决定**: 给**未命中任何 routing 规则** (本走 default_outbound) 的"灰域名"加按解析 IP 归属的自适应分流。
 - [dns-direct-upstream-tcp](pages/dns-direct-upstream-tcp.md) — category: decision | tags: [dns, upstream, tcp, config] | ## 决定
@@ -23,6 +24,7 @@ _Auto-generated. Last updated 2026-07-29T16:57:54.278Z._
 - [mss-clamp-merged-into-tc-divert](pages/mss-clamp-merged-into-tc-divert.md) — category: decision | **决定**(`66e0262`,方案A):把 MSS clamp **内联进 `tc_divert.c`**(`clamp_tcp_mss()`),
 - [no-clash-api](pages/no-clash-api.md) — category: decision | **决定**:**不做 Clash API 兼容**,走自有 API 路径。
 - [no-doh-dot](pages/no-doh-dot.md) — category: decision | **决定**:**不把 DoH/DoT 当作抗审查手段**。
+- [no-plaintext-handshake-control](pages/no-plaintext-handshake-control.md) — category: decision | tags: [tls, fingerprint, covert-channel, security, handshake] | **原则**: TLS 握手的**明文阶段** (ClientHello 等) 只干一件事 —— **完美伪装成一次普通 HTTPS 访问**。
 - [node-region-geoip](pages/node-region-geoip.md) — category: decision | tags: [geoip, region, load-balance, cli, group] | ## 决定
 - [node-test-and-autogroup](pages/node-test-and-autogroup.md) — category: decision | tags: [cli, import, probe, urltest, routing] | ## 背景
 - [orphan-filter-blackhole](pages/orphan-filter-blackhole.md) — category: decision | **问题**:进程被 SIGKILL / 正常停止后,tc 过滤器**仍挂在网卡上**(tc 持有 prog 引用,不随进程消失),

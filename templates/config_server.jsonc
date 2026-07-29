@@ -73,7 +73,13 @@
 
         // 【服务端专用, v0.6.5】出向 UDP 被封的 VPS: 域名解析改走 DNS-over-TCP (自实现无依赖),
         // 否则 glibc getaddrinfo 走 UDP 会解析不了代理目标域名。无端口默认 :53。不设=系统解析器。
-        "dns_tcp_resolver": "1.1.1.1"
+        "dns_tcp_resolver": "1.1.1.1",
+
+        // 【服务端专用, v0.7.0】cipher agility (默认 false)。开了则与客户端在加密信道内协商 AEAD:
+        // 两端都有硬件 AES 加速时切 AES-256-GCM (大流量 ~2x), 否则维持 ChaCha20-Poly1305。
+        // ⚠️ 仅在**所有客户端都已升到 v0.7.0+** 时开 —— 老客户端严格只认旧协议版本, 收到新版本会
+        // 丢时间同步。ClientHello 一字不改, TLS 指纹不受影响。客户端无需配置, 自动响应。
+        "cipher_agility": false
 
         // ebpf_mode 默认 auto: 服务端自动跳过 eBPF (入站是加密流, sockmap/XDP/sk_lookup
         // 对服务端都无价值)。调试才设 "force"。

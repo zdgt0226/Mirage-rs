@@ -665,6 +665,12 @@ pub struct TuningConfig {
     /// 代理目标域名解析不了。地址无端口默认 53 (见 parse_dns_upstream)。不设 = 系统解析器。
     #[serde(default)]
     pub dns_tcp_resolver: Option<String>,
+    /// **服务端** cipher agility 开关 (默认 false)。开了则服务端在 TIME_SYNC 广播 `proto_ver=0x02`,
+    /// 与客户端在加密信道内协商 AEAD —— 两端都有硬件 AES 加速时切 AES-256-GCM (大流量 ~2x),
+    /// 否则维持 ChaCha20-Poly1305。**仅在所有客户端都已升到支持 agility 的版本时开** (老客户端
+    /// 严格只认 proto_ver=0x01, 收到 0x02 会丢时间同步)。ClientHello 一字不改, 指纹不受影响。
+    #[serde(default)]
+    pub cipher_agility: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]

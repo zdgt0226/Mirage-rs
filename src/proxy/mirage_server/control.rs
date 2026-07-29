@@ -35,7 +35,12 @@ pub(super) async fn dispatch_authenticated(
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let mut frame = [0u8; 10];
         frame[0] = 0x01; // type = TIME_SYNC
-        frame[1] = 0x01; // proto version
+        // proto_ver: 开了 cipher_agility 才广播 0x02 (老客户端严格只认 0x01, 见 config 注释)。
+        frame[1] = if crate::crypto::cipher::server_cipher_agility() {
+            crate::crypto::cipher::PROTO_VER_AGILITY
+        } else {
+            crate::crypto::cipher::PROTO_VER_LEGACY
+        };
         frame[2..10].copy_from_slice(&now.to_be_bytes());
         if let Err(e) = writer.send_data(&frame).await {
             tracing::error!("Mirage Server: failed to send TIME_SYNC frame: {:?}", e);
@@ -76,6 +81,34 @@ pub(super) async fn dispatch_authenticated(
             tracing::debug!("Mirage Server: idle warmup reaped after 60s (client sweeper missed)");
             return;
         }
+    };
+
+    // cipher agility: 开关开 + 客户端首帧是 CIPHER_NEGO → 协商 AEAD, 回 CIPHER_ACK, 两端 rekey,
+    // 再读**真**首帧 (target)。非 NEGO (老客户端发的真 target) → 原样, 维持 ChaCha20。
+    let first_chunk = if crate::crypto::cipher::server_cipher_agility() {
+        if let Some(client_aes) = crate::crypto::cipher::parse_cipher_nego(&first_chunk) {
+            let final_cipher = crate::crypto::cipher::negotiate(
+                client_aes,
+                crate::crypto::cipher::local_supports_aes(),
+            );
+            let ack = crate::crypto::cipher::build_cipher_ack(final_cipher);
+            if let Err(e) = writer.send_data(&ack).await {
+                tracing::error!("Mirage Server: send CIPHER_ACK failed: {:?}", e);
+                return;
+            }
+            writer.rekey(final_cipher);
+            reader.rekey(final_cipher);
+            tracing::debug!("Mirage Server: cipher agility 协商为 {:?}", final_cipher);
+            // 读 rekey 后的真首帧
+            match tokio::time::timeout(std::time::Duration::from_secs(60), reader.recv_data()).await {
+                Ok(Ok(d)) => d,
+                _ => return,
+            }
+        } else {
+            first_chunk
+        }
+    } else {
+        first_chunk
     };
 
     info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
