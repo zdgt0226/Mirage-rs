@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-30T17:52:06.910Z._
+_Auto-generated. Last updated 2026-07-30T18:52:42.497Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -44,4 +44,5 @@ _Auto-generated. Last updated 2026-07-30T17:52:06.910Z._
 - [syn-only-sk-assign](pages/syn-only-sk-assign.md) — category: decision | **决定**:`tc_divert` 对 TCP **只在首 SYN**(`th->syn && !th->ack`)做 `bpf_sk_assign`;
 - [tailscale-support-deferred](pages/tailscale-support-deferred.md) — category: decision | tags: [wireguard, tailscale, scope] | **决定**: 暂不为 Mirage 实现 Tailscale 原生支持。
 - [tls-fingerprint-mimicry](pages/tls-fingerprint-mimicry.md) — category: decision | ## compiled_truth
+- [udp-capacity-findings](pages/udp-capacity-findings.md) — category: decision | <current best understanding — replace this with the real content>
 - [unified-outbound-stream](pages/unified-outbound-stream.md) — category: decision | tags: [refactor, outbound, geo, architecture] | **候选重构 (无排期)**: 抽一个 `OutboundNode::connect(target) -> impl AsyncRead + AsyncWrite`,

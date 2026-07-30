@@ -5,7 +5,7 @@ category: reference
 status: active
 tags: [roadmap, planning, dependencies]
 created: "2026-07-29T11:45:40"
-updated: "2026-07-30T00:57:43"
+updated: "2026-07-31T02:52:25"
 ---
 
 ## compiled_truth
@@ -54,3 +54,9 @@ updated: "2026-07-30T00:57:43"
   kind: decision
   summary: "IPv6(1)瘦身: 透明数据面v6 epic 否决, 降为'隧道传输走v6'小PR; 不再是挡LAN监控/链式代理的大地基。唯一地基剩统一出站流(4)"
   affects: [ipv6-full-stack-design]
+
+- time: 2026-07-31T02:52:25
+  kind: decision
+  summary: "新立项: 隧道 UDP 流复用共享隧道 (带机量)。根因见 [[udp-capacity-findings]] —— 客户端一流一隧道, 并发 UDP 上限=pool_size(默认16)。中等工程, 独立项(不阻塞别的, 也不被阻塞), 优先级排在硬地基'统一出站流(4)'之后; QUIC 回落 TCP 故非致命, 可缓解(调大 pool_size)。direct UDP 网关实测健康不在范围。"
+  source: "udp-capacity-findings 实测结论 + README 计划池新增条目"
+  affects: [roadmap-dependencies, udp-capacity-findings, src/proxy/transparent_udp.rs]
