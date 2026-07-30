@@ -1,5 +1,14 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### test(bench): UDP 带机量压测器 `scripts/bench_udp_capacity.py`
+
+无 iperf3 依赖, 纯 stdlib。斜坡拉高并发 UDP 流 (每流独立源端口 = 网关眼里一条独立流 =
+一台等效"设备"), 数回包成功率, `flow_ok%` 跌破阈值的并发数 = 带机量极限。自动判读撞的是
+`MAX_MIRAGE_UDP_FLOWS=256` (隧道加密) 还是 `MAX_FLOWS=4096` (透明 UDP 总)。含 fd 上限自动
+抬升 + 多源 IP (`--source-ips`) 支持。`echo` 子命令起目标端 UDP 回显。
+
 ## [v0.7.0] - cipher agility (AES-256-GCM 协商) + IPv6 隧道传输 (2026-07-30)
 
 ### feat(crypto): cipher agility —— 两端有 AES-NI 时协商 AES-256-GCM (大流量 ~2x)
