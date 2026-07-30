@@ -12,6 +12,8 @@
 与**退化型** (随并发爬升的丢包 → 吞吐/缓冲/路径退化, 提示去网关读 `nstat RcvbufErrors` + 盯
 echo pps 分上/下行定位), 不再乱贴常量墙标签; `opened < 请求数` 标为 fd/系统限而非网关墙。
 `echo` 子命令实时打印收包 pps + `--workers` 多进程 (SO_REUSEPORT) 排掉 echo 自身瓶颈。
+`load` 也加 `--workers` 多进程加压 (每进程独立 asyncio 事件循环) —— 实测单进程 asyncio 在
+~1-2k 流就先于网关塞死 (RTT 飙到 2-3s), 多进程按核数分摊才能真正压到网关极限。
 
 ## [v0.7.0] - cipher agility (AES-256-GCM 协商) + IPv6 隧道传输 (2026-07-30)
 

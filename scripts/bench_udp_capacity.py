@@ -165,22 +165,48 @@ def cpu_pct(a, b):
     return 100.0 * (b[0] - a[0]) / dt if dt else None
 
 
-async def run_level(loop, n, target, src_ips, rate, hold, payload):
+async def _gather_slice(n, target, src_ips, rate, hold, payload):
+    loop = asyncio.get_running_loop()
     interval = 1.0 / rate
     dgrams = max(1, int(rate * hold))
-    c0 = cpu_snapshot()
-    t0 = time.perf_counter()
     tasks = [one_flow(loop, target, src_ips[i % len(src_ips)], dgrams, interval, payload)
              for i in range(n)]
-    results = await asyncio.gather(*tasks)
+    return await asyncio.gather(*tasks)
+
+
+def _run_slice(job):
+    """进程worker入口 (top-level, 可pickle): 跑 n 条流的一个切片, 返回聚合 + rtt 列表。
+    每进程一个独立 asyncio 事件循环 → 单核 asyncio 天花板被 W 个核分摊。"""
+    n, host, port, src_ips, rate, hold, payload_len = job
+    bump_fd_limit(n)  # 每进程独立 fd 限
+    res = asyncio.run(_gather_slice(n, (host, port), src_ips, rate, hold, b"M" * payload_len))
+    opened = sum(1 for s, _, _ in res if s > 0)
+    alive = sum(1 for s, r, _ in res if s > 0 and r > 0)
+    sent = sum(s for s, _, _ in res)
+    recv = sum(r for _, r, _ in res)
+    rtts = [rt for _, _, rt in res if rt is not None]
+    return (opened, alive, sent, recv, rtts)
+
+
+def run_level(executor, workers, n, host, port, src_ips, rate, hold, payload_len):
+    """一级并发 n 条流。workers>1 时切成 W 片丢进程池并行, 破 load 端单核 asyncio 瓶颈。"""
+    c0 = cpu_snapshot()
+    t0 = time.perf_counter()
+    if workers <= 1 or executor is None:
+        parts = [_run_slice((n, host, port, src_ips, rate, hold, payload_len))]
+    else:
+        base, rem = divmod(n, workers)
+        slices = [base + (1 if i < rem else 0) for i in range(workers)]
+        jobs = [(s, host, port, src_ips, rate, hold, payload_len) for s in slices if s > 0]
+        parts = list(executor.map(_run_slice, jobs))
     elapsed = time.perf_counter() - t0
     cpu = cpu_pct(c0, cpu_snapshot())
 
-    opened = sum(1 for s, _, _ in results if s > 0)
-    alive = sum(1 for s, r, _ in results if s > 0 and r > 0)
-    tot_sent = sum(s for s, _, _ in results)
-    tot_recv = sum(r for _, r, _ in results)
-    rtts = sorted(rt for _, _, rt in results if rt is not None)
+    opened = sum(p[0] for p in parts)
+    alive = sum(p[1] for p in parts)
+    tot_sent = sum(p[2] for p in parts)
+    tot_recv = sum(p[3] for p in parts)
+    rtts = sorted(rt for p in parts for rt in p[4])
     p50 = rtts[len(rtts) // 2] if rtts else None
     p95 = rtts[int(len(rtts) * 0.95)] if rtts else None
     return {
@@ -191,23 +217,24 @@ async def run_level(loop, n, target, src_ips, rate, hold, payload):
     }
 
 
-async def run_load(args):
-    loop = asyncio.get_running_loop()
-    host, port = args.target.rsplit(":", 1)
-    target = (host, int(port))
+def run_load(args):
+    from concurrent.futures import ProcessPoolExecutor
+    host, port_s = args.target.rsplit(":", 1)
+    port = int(port_s)
     src_ips = [ip.strip() for ip in args.source_ips.split(",")] if args.source_ips else ["0.0.0.0"]
-    payload = b"M" * args.payload
     bump_fd_limit(args.max)
+    workers = max(1, args.workers)
+    executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
 
-    print(f"[load] target={target} src_ips={src_ips} rate={args.rate}/s hold={args.hold}s "
-          f"payload={args.payload}B  斜坡 {args.start}→{args.max} step {args.step}")
+    print(f"[load] target=({host!r}, {port}) src_ips={src_ips} rate={args.rate}/s hold={args.hold}s "
+          f"payload={args.payload}B workers={workers}  斜坡 {args.start}→{args.max} step {args.step}")
     print(f"{'flows':>7} {'opened':>7} {'alive':>6} {'flow_ok%':>9} "
           f"{'dgram_loss%':>12} {'p50ms':>7} {'p95ms':>7} {'cpu%':>6}")
     ceiling = None
     loss_at_ceiling = None
     fd_capped = False
     for n in range(args.start, args.max + 1, args.step):
-        r = await run_level(loop, n, target, src_ips, args.rate, args.hold, payload)
+        r = run_level(executor, workers, n, host, port, src_ips, args.rate, args.hold, args.payload)
         p50 = f"{r['p50']:.1f}" if r['p50'] is not None else "-"
         p95 = f"{r['p95']:.1f}" if r['p95'] is not None else "-"
         cpu = f"{r['cpu']:.0f}" if r['cpu'] is not None else "-"
@@ -232,20 +259,23 @@ async def run_load(args):
         print(f"[结果] 到 {args.max} flow_ok 仍未跌破 {args.threshold}%"
               + ("; 但中途撞 fd/系统限 (见 [fd] 标注), 先 `ulimit -n` 再测。" if fd_capped
                  else " —— 极限更高, 调大 --max 继续。"))
-        return
-    # 形态判读: 拐点处丢包已很高 = 吞吐/缓冲退化 (随并发爬升的 dgram_loss), 不是干净流表墙;
-    # 干净流表墙应是"墙下低丢、墙上流被拒"。二者别混。
-    if loss_at_ceiling is not None and loss_at_ceiling > 30.0:
-        shape = (f"退化型: flow_ok 拐点前 dgram_loss 已达 {loss_at_ceiling:.0f}% —— 是吞吐/缓冲/"
-                 f"路径退化 (每流还活但大量丢包), 不是流表数量墙。别急着贴 256/4096 标签; "
-                 f"去网关读 nstat RcvbufErrors + 盯 echo pps 分上/下行, 才能定位丢在哪一跳。")
-    elif 180 <= ceiling <= 340:
-        shape = "干净墙, 命中 ≈256 (隧道加密 UDP MAX_MIRAGE_UDP_FLOWS)"
-    elif 3500 <= ceiling <= 4600:
-        shape = "干净墙, 命中 ≈4096 (透明 UDP MAX_FLOWS)"
     else:
-        shape = "干净墙但非已知常量 —— 看 cpu% 与 opened 列排查 CPU/fd/网卡"
-    print(f"[结果] flow_ok 拐点 ≈ {ceiling} 条并发流 (跌破 {args.threshold}%)。判读: {shape}")
+        # 形态判读: 拐点处丢包已很高 = 吞吐/缓冲退化 (随并发爬升的 dgram_loss), 不是干净流表墙;
+        # 干净流表墙应是"墙下低丢、墙上流被拒"。二者别混。
+        if loss_at_ceiling is not None and loss_at_ceiling > 30.0:
+            shape = (f"退化型: flow_ok 拐点前 dgram_loss 已达 {loss_at_ceiling:.0f}% —— 是吞吐/缓冲/"
+                     f"路径退化 (每流还活但大量丢包), 不是流表数量墙。别急着贴 256/4096 标签; "
+                     f"去网关读 nstat RcvbufErrors + 盯 echo pps 分上/下行, 才能定位丢在哪一跳。")
+        elif 180 <= ceiling <= 340:
+            shape = "干净墙, 命中 ≈256 (隧道加密 UDP MAX_MIRAGE_UDP_FLOWS)"
+        elif 3500 <= ceiling <= 4600:
+            shape = "干净墙, 命中 ≈4096 (透明 UDP MAX_FLOWS)"
+        else:
+            shape = "干净墙但非已知常量 —— 看 cpu% 与 opened 列排查 CPU/fd/网卡"
+        print(f"[结果] flow_ok 拐点 ≈ {ceiling} 条并发流 (跌破 {args.threshold}%)。判读: {shape}")
+
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def main():
@@ -267,12 +297,14 @@ def main():
     l.add_argument("--payload", type=int, default=64, help="每包字节")
     l.add_argument("--threshold", type=float, default=95.0, help="flow_ok%% 低于此判为拐点")
     l.add_argument("--source-ips", default="", help="逗号分隔源 IP (需先 ip addr add 别名), 默认 0.0.0.0")
+    l.add_argument("--workers", type=int, default=1,
+                   help="多进程加压 (每进程独立 asyncio 事件循环), 破 load 端单核瓶颈。建议 = 测试机核数")
 
     args = ap.parse_args()
     if args.mode == "echo":
         run_echo(args.port, args.bind, args.workers)
     else:
-        asyncio.run(run_load(args))
+        run_load(args)
 
 
 if __name__ == "__main__":
