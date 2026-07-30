@@ -4,7 +4,7 @@ title: "MSS clamp 并入 tc_divert (方案A), 独立 elf 成死代码"
 category: decision
 status: active
 created: "2026-07-20T11:43:27"
-updated: "2026-07-20T12:19:59"
+updated: "2026-07-30T09:51:51"
 ---
 
 ## compiled_truth
@@ -36,3 +36,9 @@ PMTU 黑洞卡死("小请求通、大下载卡")。借鉴自 Landscape 的 `xdp_
   summary: "记录方案A选择及其留下的死代码"
   source: "git 66e0262/03211ef, ebpf-src/tc_divert.c"
   affects: [mss-clamp-merged-into-tc-divert]
+
+- time: 2026-07-30T09:51:51
+  kind: note
+  summary: "收尾复核(2026-07-30): 功能早生效(内联 clamp_tcp_mss, verify_mss_clamp.sh CI 绿)。此前记的'死代码 ebpf-src/mss_clamp.c/.elf + build.rs:45 编译'已过期——现两文件均不存在, build.rs 无 mss 引用, src 唯一 mss_clamp 是条日志串。README 路线图 MSS clamp 从计划池移入已完成[x]。这条彻底关闭。"
+  source: "grep build.rs/src/ebpf-src + README.md 核对"
+  affects: [README.md, ebpf-src/tc_divert.c]

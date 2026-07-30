@@ -262,6 +262,9 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] 入站认证 (SOCKS5 / HTTP), 修默认开放代理
 - [x] DNS: 可选劫持 (接管 LAN 53/UDP+TCP, 默认关) · 静态解析 (类 dnsmasq, 精确+子域) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回) (v0.6.1)
 - [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
+- [x] **MSS clamp** —— 内联 `tc_divert` (`clamp_tcp_mss`), MTU 自动探测网卡下发 (`max_mss = mtu-40`, PPPoE 1492), 覆盖直连转发路径, 防小 MTU 链路 PMTU 黑洞 ("小请求通、大下载卡"); `verify_mss_clamp.sh` CI 验证
+- [x] **cipher agility** (v0.7.0) —— 两端有 AES-NI 时协商 AES-256-GCM (比 ChaCha20 快 ~2.1x), 否则回落 ChaCha20; 协商全在加密信道内 (proto_ver 0x02 + CIPHER_NEGO/ACK), ClientHello 零触碰不改指纹; 服务端 `tuning.cipher_agility` 开关 (默认关=向后兼容)
+- [x] **IPv6 隧道传输** (v0.7.0, 瘦身自"IPv6 全栈") —— 隧道传输走 v6: 服务端 v6 监听 + 客户端 v6 字面量自动加方括号 (`net_util::join_host_port`) + `node_uri` v6。透明数据面 v6 大 epic **评估后否** (fake-IP + 服务端远程解析已让客户端 v6 数据面不必要; 已知限制见 brain `ipv6-full-stack-design`)
 
 ### 🚧 部分完成
 
@@ -270,23 +273,21 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 
 ### ⏳ 未完成 (计划池)
 
-- [ ] **IPv6 隧道传输** (瘦身自"IPv6 全栈") —— 只做**隧道传输走 v6** (v6-only/优先客户端网络能够到服务端): 服务端 v6 监听 + 客户端 v6 字面量加方括号 (~1 小 PR)。透明数据面 v6 大 epic **评估后否** —— fake-IP + 服务端远程解析已让客户端 v6 数据面不必要 (海外域名 AAAA 抑制走 v4 fake-IP/隧道, 连海外 v6-only 站也由服务端侧连 v6)。残留: 罕见的"v6 字面量直连被代理目标"泄漏 + 纯 v6-only 无 v4 终端访海外, 接受
 - [ ] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① 设备规则: 路由已有 `source_ip_cidr`/`source_mac`, 只需给 TCP 透明路径填 `source_ip` (现为 None, ~2 行, UDP 已填) 即对 TCP 生效。② 每主机用量: eBPF 按源 IP 计上下行字节 (tc 看得到含 splice 直连的全部流量, 用户态计数会漏) → 用户态读 map → API + Neon 面板 per-host 视图 + 可选设备别名
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连
 - [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段
 - [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
-- [ ] **加密吞吐 (首选, 已 profile)** —— 隧道硬编码 ChaCha20-Poly1305, 不吃 AES-NI。实测本机 AES-256-GCM 比 ChaCha20 快 **2.1x** (release), 回环隧道 154 MB/s 加密占大头。方向: **cipher agility** (有 AES-NI 用 AES-GCM, 否则 ChaCha20, 即 TLS 做法; 需两端协商 cipher, 注意向后兼容)
 - [ ] **隧道 relay 缓冲/合帧再调** —— 当前 BufWriter 64KB, 高 BDP 链路可能有余量
 - [ ] **io_uring 替代 relay 的 read/write 循环** —— 大工程, 高并发小包收益明显
-- [ ] **MSS clamp / 网络层** —— 见 landscape 参考 P1
+
+### 评估后决定不做（避免重复提）
+
 - **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
 - **TLS session resumption 仿真** —— 抓包 + 统计实测证明: 真 Chrome 的 `legacy_session_id` 也每次全新随机, 我们与之不可区分, 立项前提不成立
 - **追平 sing-box 全部协议/规则** —— 定位是零配置 eBPF 网关, 不是通用代理框架
 ---
-
-**评估后决定不做** (避免重复提)
 
 ## 📜 版本迭代概览 (Changelog)
 

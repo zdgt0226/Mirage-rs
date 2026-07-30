@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [ipv6, transparent, ebpf, fakeip, tc_divert, roadmap]
 created: "2026-07-28T02:32:06"
-updated: "2026-07-30T00:37:25"
+updated: "2026-07-30T02:43:30"
 ---
 
 ## compiled_truth
@@ -59,3 +59,9 @@ IPv6 从 P1-P5 五期 epic → **1 个小 PR (隧道传输 v6)**。roadmap 里 I
   summary: "IPv6 瘦身: 不做透明数据面v6 epic; 只需隧道传输走v6(小)+DNS抑制海外AAAA(已实现)。fake-IP+服务端远程解析已让客户端v6数据面不必要"
   source: "src/proxy/pool.rs, src/dns/server.rs"
   affects: [ipv6-full-stack-design]
+
+- time: 2026-07-30T02:43:30
+  kind: note
+  summary: "IPv6 数据面已知限制 (v0.7.0 隧道传输落地后复核): (1) 服务端直连 UDP 出站 socket 硬绑 v4 —— mirage_server/udp_relay.rs:78 与 transparent_udp.rs:555 均 UdpSocket::bind(0.0.0.0:0), send_to v6 目标会 Network unreachable; 当前不可达 (客户端压制海外 AAAA + 透明 UDP 面 v6 直接 drop), 属 deferred scope 非回归. 做 v6 数据面时按目标 AF 动态选 0.0.0.0:0 / [::]:0. (2) 透明 UDP 硬拦 v6: transparent_udp.rs:551/617 if real.is_ipv6() return, 有意, 数据面 v6 边界. (3) net_util::join_host_port 不处理 scope ID (fe80::1%eth0): Ipv6Addr::parse 拒 %scope; 远端节点永不会 link-local, 且 stable Rust 加括号也 parse 不了 scope, 零影响不修."
+  source: "外部审查(Gemini)复核 + 源码确认"
+  affects: [src/proxy/mirage_server/udp_relay.rs, src/proxy/transparent_udp.rs, src/net_util.rs]
