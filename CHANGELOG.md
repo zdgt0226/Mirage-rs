@@ -5,9 +5,13 @@
 ### test(bench): UDP 带机量压测器 `scripts/bench_udp_capacity.py`
 
 无 iperf3 依赖, 纯 stdlib。斜坡拉高并发 UDP 流 (每流独立源端口 = 网关眼里一条独立流 =
-一台等效"设备"), 数回包成功率, `flow_ok%` 跌破阈值的并发数 = 带机量极限。自动判读撞的是
-`MAX_MIRAGE_UDP_FLOWS=256` (隧道加密) 还是 `MAX_FLOWS=4096` (透明 UDP 总)。含 fd 上限自动
-抬升 + 多源 IP (`--source-ips`) 支持。`echo` 子命令起目标端 UDP 回显。
+一台等效"设备"), 数回包成功率, `flow_ok%` 跌破阈值的并发数 = 带机量极限。含 fd 上限自动
+抬升 + 多源 IP (`--source-ips`) 支持。
+
+判读区分**干净流表墙** (墙下低丢、墙上流被拒 → 命中 `MAX_MIRAGE_UDP_FLOWS=256` / `MAX_FLOWS=4096`)
+与**退化型** (随并发爬升的丢包 → 吞吐/缓冲/路径退化, 提示去网关读 `nstat RcvbufErrors` + 盯
+echo pps 分上/下行定位), 不再乱贴常量墙标签; `opened < 请求数` 标为 fd/系统限而非网关墙。
+`echo` 子命令实时打印收包 pps + `--workers` 多进程 (SO_REUSEPORT) 排掉 echo 自身瓶颈。
 
 ## [v0.7.0] - cipher agility (AES-256-GCM 协商) + IPv6 隧道传输 (2026-07-30)
 

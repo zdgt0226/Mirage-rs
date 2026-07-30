@@ -47,18 +47,64 @@ def bump_fd_limit(target):
 
 
 # ── echo 端 ──────────────────────────────────────────────────────────────
-def run_echo(port, bind):
+def _echo_worker(port, bind, wid):
+    """一个 echo worker: 收即回, 每秒打印收包速率 (pps) + 累计。多 worker 靠
+    SO_REUSEPORT 内核分流, 排掉单进程 echo 自身成瓶颈。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
     s.bind((bind, port))
-    print(f"[echo] 监听 {bind}:{port}/udp (Ctrl-C 退出)")
+    s.settimeout(1.0)
+    tag = f"echo{wid}" if wid is not None else "echo"
+    print(f"[{tag}] 监听 {bind}:{port}/udp (Ctrl-C 退出)")
     buf = bytearray(65535)
+    total = 0
+    last = 0
+    t = time.monotonic()
     try:
         while True:
-            n, addr = s.recvfrom_into(buf)
-            s.sendto(buf[:n], addr)
+            try:
+                n, addr = s.recvfrom_into(buf)
+                s.sendto(buf[:n], addr)
+                total += 1
+            except socket.timeout:
+                pass
+            now = time.monotonic()
+            if now - t >= 1.0:
+                pps = (total - last) / (now - t)
+                if pps > 0 or total != last:
+                    print(f"[{tag}] recv_total={total} pps={pps:.0f}", flush=True)
+                last = total
+                t = now
     except KeyboardInterrupt:
-        print("\n[echo] 停止")
+        print(f"\n[{tag}] 停止 (recv_total={total})")
+
+
+def run_echo(port, bind, workers):
+    if workers <= 1:
+        _echo_worker(port, bind, None)
+        return
+    import os
+    pids = []
+    for wid in range(workers):
+        pid = os.fork()
+        if pid == 0:
+            _echo_worker(port, bind, wid)
+            os._exit(0)
+        pids.append(pid)
+    print(f"[echo] {workers} 个 worker (SO_REUSEPORT), pids={pids}")
+    try:
+        for pid in pids:
+            os.waitpid(pid, 0)
+    except KeyboardInterrupt:
+        for pid in pids:
+            try:
+                os.kill(pid, 15)
+            except OSError:
+                pass
 
 
 # ── load 端 ──────────────────────────────────────────────────────────────
@@ -158,18 +204,22 @@ async def run_load(args):
     print(f"{'flows':>7} {'opened':>7} {'alive':>6} {'flow_ok%':>9} "
           f"{'dgram_loss%':>12} {'p50ms':>7} {'p95ms':>7} {'cpu%':>6}")
     ceiling = None
+    loss_at_ceiling = None
+    fd_capped = False
     for n in range(args.start, args.max + 1, args.step):
         r = await run_level(loop, n, target, src_ips, args.rate, args.hold, payload)
         p50 = f"{r['p50']:.1f}" if r['p50'] is not None else "-"
         p95 = f"{r['p95']:.1f}" if r['p95'] is not None else "-"
         cpu = f"{r['cpu']:.0f}" if r['cpu'] is not None else "-"
         wall = ""
-        if r['flow_ok_pct'] < args.threshold and ceiling is None:
-            ceiling = n
-            wall = "  <-- 拐点 (带机量极限)"
-        # 标注已知墙
+        # fd/系统限: opened < 请求数 → 是测试机自己的墙, 不算网关带机量极限。
         if r['opened'] < n and r['opened'] > 0:
-            wall += f"  [fd/系统限: 仅开 {r['opened']}]"
+            fd_capped = True
+            wall += f"  [fd/系统限: 仅开 {r['opened']}, 非网关墙]"
+        elif r['flow_ok_pct'] < args.threshold and ceiling is None:
+            ceiling = n
+            loss_at_ceiling = r['dgram_loss_pct']
+            wall = "  <-- flow_ok 拐点"
         print(f"{r['n']:>7} {r['opened']:>7} {r['alive']:>6} {r['flow_ok_pct']:>8.1f}% "
               f"{r['dgram_loss_pct']:>11.1f}% {p50:>7} {p95:>7} {cpu:>6}{wall}")
         # 掉到近乎全灭就停, 别空转
@@ -178,13 +228,24 @@ async def run_load(args):
             break
 
     print()
-    if ceiling:
-        near = "≈256 (隧道加密 UDP 墙 MAX_MIRAGE_UDP_FLOWS)" if 180 <= ceiling <= 340 else (
-               "≈4096 (透明 UDP 总墙 MAX_FLOWS)" if 3500 <= ceiling <= 4600 else
-               "非已知常量墙 —— 多半是 CPU/fd/网卡, 看 cpu% 列与 opened 列")
-        print(f"[结果] 带机量极限 ≈ {ceiling} 条并发流 (flow_ok% 跌破 {args.threshold}%)。判读: {near}")
+    if ceiling is None:
+        print(f"[结果] 到 {args.max} flow_ok 仍未跌破 {args.threshold}%"
+              + ("; 但中途撞 fd/系统限 (见 [fd] 标注), 先 `ulimit -n` 再测。" if fd_capped
+                 else " —— 极限更高, 调大 --max 继续。"))
+        return
+    # 形态判读: 拐点处丢包已很高 = 吞吐/缓冲退化 (随并发爬升的 dgram_loss), 不是干净流表墙;
+    # 干净流表墙应是"墙下低丢、墙上流被拒"。二者别混。
+    if loss_at_ceiling is not None and loss_at_ceiling > 30.0:
+        shape = (f"退化型: flow_ok 拐点前 dgram_loss 已达 {loss_at_ceiling:.0f}% —— 是吞吐/缓冲/"
+                 f"路径退化 (每流还活但大量丢包), 不是流表数量墙。别急着贴 256/4096 标签; "
+                 f"去网关读 nstat RcvbufErrors + 盯 echo pps 分上/下行, 才能定位丢在哪一跳。")
+    elif 180 <= ceiling <= 340:
+        shape = "干净墙, 命中 ≈256 (隧道加密 UDP MAX_MIRAGE_UDP_FLOWS)"
+    elif 3500 <= ceiling <= 4600:
+        shape = "干净墙, 命中 ≈4096 (透明 UDP MAX_FLOWS)"
     else:
-        print(f"[结果] 到 {args.max} 仍未跌破 {args.threshold}% —— 极限更高, 调大 --max 继续。")
+        shape = "干净墙但非已知常量 —— 看 cpu% 与 opened 列排查 CPU/fd/网卡"
+    print(f"[结果] flow_ok 拐点 ≈ {ceiling} 条并发流 (跌破 {args.threshold}%)。判读: {shape}")
 
 
 def main():
@@ -194,6 +255,7 @@ def main():
     e = sub.add_parser("echo", help="目标机: UDP echo 服务")
     e.add_argument("--port", type=int, default=9999)
     e.add_argument("--bind", default="0.0.0.0")
+    e.add_argument("--workers", type=int, default=1, help="SO_REUSEPORT 多进程 echo, 排掉单进程瓶颈")
 
     l = sub.add_parser("load", help="LAN 客户端: 斜坡加压找带机量极限")
     l.add_argument("--target", required=True, help="echo 机 HOST:PORT (走代理测则填 proxy 域名/fake-IP)")
@@ -208,7 +270,7 @@ def main():
 
     args = ap.parse_args()
     if args.mode == "echo":
-        run_echo(args.port, args.bind)
+        run_echo(args.port, args.bind, args.workers)
     else:
         asyncio.run(run_load(args))
 
