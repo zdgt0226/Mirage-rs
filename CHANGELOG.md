@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### fix(crypto): 服务端开 cipher_agility 时 WARN 提醒客户端须 ≥ v0.7.0
+
+防呆。开 `cipher_agility` 后 TIME_SYNC 的 `proto_ver` 变 `0x02`, 老客户端 (<v0.7.0) 不认
+`0x02` → 丢弃 TIME_SYNC 不同步时钟 → 若与服务端时钟偏差超容差 (默认 ±60s) 认证失败连不上。
+现服务端启动读到 `cipher_agility=true` 时打一条 WARN 提示升级所有客户端, 避免静默踩坑。
+
 ### test(bench): UDP 带机量压测器 `scripts/bench_udp_capacity.py`
 
 无 iperf3 依赖, 纯 stdlib。斜坡拉高并发 UDP 流 (每流独立源端口 = 网关眼里一条独立流 =

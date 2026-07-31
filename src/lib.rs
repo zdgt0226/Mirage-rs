@@ -271,6 +271,16 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             if let Some(tuning) = config.tuning {
                 // 服务端 cipher agility 开关 (设进全局, control.rs 读)。
                 crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
+                if tuning.cipher_agility {
+                    // 防呆: 开 agility 后 TIME_SYNC 的 proto_ver 变 0x02, 老客户端 (<v0.7.0)
+                    // 不认 0x02 → 丢弃 TIME_SYNC 不同步时钟 → 若本机与服务端时钟偏差超容差
+                    // (默认 ±60s) 认证直接失败连不上。故必须确保所有客户端 ≥ v0.7.0。
+                    warn!(
+                        "已开启 cipher_agility: 要求所有客户端升级到 ≥ v0.7.0。\
+                         老客户端会丢弃 TIME_SYNC (proto_ver 0x02 不识别) → 时钟不同步 → \
+                         若偏差超容差则认证失败连不上。"
+                    );
+                }
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }
                 if let Some(m) = tuning.ebpf_mode { ebpf_mode = m; }
                 geo_sources = tuning.geo_sources;
