@@ -4,7 +4,7 @@ title: "外部审计逐条核实: 术语专业但真伪参半"
 category: concept
 status: active
 created: "2026-07-20T11:43:27"
-updated: "2026-07-28T09:14:51"
+updated: "2026-08-01T02:11:04"
 ---
 
 ## compiled_truth
@@ -84,3 +84,9 @@ updated: "2026-07-28T09:14:51"
   summary: "Gemini 4 条通用警告 (CO-RE/日志阻塞/GeoSite OOM/重载黑洞) 逐条核实: 0 真 bug, 全被现有设计覆盖或机制误判"
   source: "ebpf-src/tc_divert.c, src/monitor.rs, src/router/geo.rs, src/config_watcher.rs"
   affects: [external-audit-verification]
+
+- time: 2026-08-01T02:11:04
+  kind: evidence
+  summary: "第二轮外部审查 (8 条 P0/P1/P2) 逐条核验结论 (2026-07-31)。修复 5 项 (commit d600b57 + fb628d4): ②DNS resolver tcp://|udp:// 前缀 —— 模板照抄会坏 (remote 分支 split(':') 拆成 host=tcp 查错目标, direct/cn 整条跳过回落公共 DNS), 加 strip_dns_scheme 两分支统一; ④OutboundManager::new 未解析/循环组改返回 Result 非 panic (仅启动路径可达, 热重载保留旧 outbounds); ⑤?token= 限根路径 /, /api/* 只认 header/cookie 防进 URL 日志; ⑥build.rs eBPF 编译 gate 到 feature=ebpf && target_os=linux; ③CSRF 方案 B —— 删 handler 里 is_xhr||UA=curl||Origin 启发式, 重构进 auth_mw 按认证方式分流 (Bearer header 抗 CSRF 免检, Cookie/无 token+变更方法要求同源 Origin/Referer 匹配 Host, GET 不查)。判非问题 2 项: ①Linux-only 模块无 cfg (transparent/splice/transparent_net + signal::unix) —— 代码属实但前提 moot: README/Cargo 无跨平台承诺, crate 本就 Linux-only (aya/eBPF/splice/IP_TRANSPARENT/netlink/nix), 只给 4 模块加 cfg 换不来可移植性, 是另一大 epic; ⑦mojibake 乱码 = 假, 扫过全部 src/templates/build.rs 全合法 UTF-8 零替换字符, 是审查者 Windows 环境按非 UTF-8 码页读 (路径 D:/Projects)。教训: 审查结论必对源码核验, 别照单全收 (③ 说'带 Bearer 被拒'其实无 Origin 时放行; ④说'长跑进程被杀'其实仅启动路径)。"
+  source: "8 条审查逐条核验 + 源码 + full cargo test 254 lib 全绿"
+  affects: [src/config_watcher.rs, src/proxy/outbound.rs, src/api/mod.rs, build.rs]
