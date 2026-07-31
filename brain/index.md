@@ -1,12 +1,13 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-07-31T05:58:26.473Z._
+_Auto-generated. Last updated 2026-07-31T09:02:18.649Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
 - [chain-proxy-roadmap](pages/chain-proxy-roadmap.md) — category: decision | status: draft | tags: [roadmap, chain-proxy, wireguard, shadowsocks, architecture] | ## 用户诉求 (2026-07-27)
 - [cipher-agility](pages/cipher-agility.md) — category: decision | tags: [crypto, aead, performance, negotiation, aes] | **决定** (v0.7.0 首选性能项, 见 [[perf-roadmap-v070]]): 隧道 AEAD 从硬编码 ChaCha20-Poly1305 改可协商 —— 两端都有硬件 AES 加速时切 **AES-256-GCM** (实测 2.1x), 否则 ChaCha2
 - [config-export-fragment](pages/config-export-fragment.md) — category: decision | tags: [cli, export, subscription, config, share] | `mirage-rs export` = subscribe 的反向。
+- [config-structure-evolution](pages/config-structure-evolution.md) — category: decision | <current best understanding — replace this with the real content>
 - [dns-auto-classify](pages/dns-auto-classify.md) — category: decision | tags: [dns, routing, geoip, fakeip, anti-pollution] | **决定**: 给**未命中任何 routing 规则** (本走 default_outbound) 的"灰域名"加按解析 IP 归属的自适应分流。
 - [dns-direct-upstream-tcp](pages/dns-direct-upstream-tcp.md) — category: decision | tags: [dns, upstream, tcp, config] | ## 决定
 - [dns-hijack-lan](pages/dns-hijack-lan.md) — category: decision | tags: [dns, transparent, tc_divert, fakeip] | ## 决定

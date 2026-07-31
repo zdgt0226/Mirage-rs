@@ -135,7 +135,11 @@ impl ConfigWatcher {
 
             rules.push(Rule {
                 id: i,
-                mode: r.mode.clone().unwrap_or_else(|| "or".to_string()),
+                mode: match r.mode {
+                    Some(crate::config::RuleMode::And) => "and",
+                    _ => "or",
+                }
+                .to_string(),
                 outbound: r.outbound,
                 domain_suffix: r.domain_suffix,
                 domain_keyword: r.domain_keyword,

@@ -373,10 +373,24 @@ pub struct RoutingConfig {
     pub rules: Vec<RuleConfig>,
 }
 
+/// 规则内**多类条件**的组合方式。
+/// - `or` (默认): 命中任一类条件即算命中。
+/// - `and`: 域名类 (domain_*/geosite) 与 IP 类 (ip_cidr/geoip) 必须**都**命中;
+///   同类内部仍是"任一命中"，跨类之间才是"且"。见 router 匹配逻辑。
+///
+/// 旧版此处是自由字符串 (拼错静默当 or, 会把 and 悄悄放宽); 现为枚举, 拼错在解析期即
+/// 报错 (`unknown variant`), 不再静默误路由。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleMode {
+    And,
+    Or,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct RuleConfig {
     #[serde(default)]
-    pub mode: Option<String>,
+    pub mode: Option<RuleMode>,
     pub outbound: String,
     #[serde(default, deserialize_with = "one_or_many")]
     pub domain_suffix: Vec<String>,
@@ -876,14 +890,7 @@ impl Config {
                     rule.outbound
                 ));
             }
-            // mode 只认 "or"/"and"; 拼错 (如 "adn") 会静默当 "or", 让 and 规则悄悄放宽成 or。
-            if let Some(m) = &rule.mode {
-                if m != "or" && m != "and" {
-                    issues.push(format!(
-                        "routing.rules[{i}].mode = `{m}` 非法 (只认 or/and; 会被当 or 处理)"
-                    ));
-                }
-            }
+            // mode 非法值现由 RuleMode 枚举在解析期直接拒 (unknown variant), 无需软校验。
             // 同理: 引用了不存在的入站 tag, 该规则**永远不会命中**且毫无提示。
             // 拼错入站名是很容易犯的错, 而症状是"规则写了不生效", 极难自查。
             for t in &rule.inbound {
@@ -1268,16 +1275,23 @@ mod validation_tests {
     }
 
     #[test]
-    fn invalid_rule_mode_reported() {
+    fn invalid_rule_mode_rejected_at_parse() {
+        // mode 现为 RuleMode 枚举: 拼错 (如 "adn") 在解析期直接失败 (unknown variant),
+        // 而非旧的软报告后静默当 or —— 防 and 规则被悄悄放宽成 or 致误路由。
         let mut v = base();
         v["routing"]["rules"] = serde_json::json!([
             { "outbound": "direct", "mode": "adn", "domain_suffix": ["example.com"] } // 拼错 and
         ]);
-        let is = issues_of(&v);
-        assert!(has(&is, "mode") && has(&is, "adn"), "非法 mode 应报, 实际: {is:?}");
-        // 合法 mode 不报
+        assert!(
+            Config::parse_with_diagnostics(&v.to_string()).is_err(),
+            "非法 mode 应在解析期被枚举拒绝"
+        );
+        // 合法 mode 正常解析
         v["routing"]["rules"][0]["mode"] = serde_json::json!("and");
-        assert!(!has(&issues_of(&v), "mode 非法"), "合法 and 不该报 mode");
+        assert!(
+            Config::parse_with_diagnostics(&v.to_string()).is_ok(),
+            "合法 and 应能解析"
+        );
     }
 
     #[test]

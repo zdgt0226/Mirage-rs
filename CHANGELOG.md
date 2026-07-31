@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### refactor(config): `routing.rules[].mode` 从自由字符串收成 `RuleMode` 枚举
+
+对标 sing-box/clash 后的配置结构评审首个小 win。`mode` 原为自由 `String`, 拼错 (如 `adn`)
+被静默当 `or` —— 会把 `and` 规则**悄悄放宽成 or 致误路由**。现为枚举 `{and, or}`, 拼错在
+**解析期直接报错** (`unknown variant`), 不再静默。合法值 (`and`/`or`) 行为不变, 旧配置零破坏。
+(DNS 配置合并 / `advanced_dns`→`dns` 改名 / 出站链统一等更大项捆到"统一出站流"重构, 见
+brain `config-structure-evolution`。)
+
 ### fix(crypto): 服务端开 cipher_agility 时 WARN 提醒客户端须 ≥ v0.7.0
 
 防呆。开 `cipher_agility` 后 TIME_SYNC 的 `proto_ver` 变 `0x02`, 老客户端 (<v0.7.0) 不认
