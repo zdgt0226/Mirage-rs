@@ -1,7 +1,7 @@
 //! GET /api/proxies — 列出 Selector / Urltest 组及其子节点 + 当前选择
-//! POST /api/proxies/select — 手动切换 Selector 组的当前节点 (含 CSRF 校验)
+//! POST /api/proxies/select — 手动切换 Selector 组的当前节点 (鉴权+CSRF 在 auth_mw 中间件)
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::State, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -47,22 +47,8 @@ pub struct SelectReq {
     pub target: String,
 }
 
-pub async fn select_proxy(State(app_state): State<AppState>, headers: HeaderMap, Json(req): Json<SelectReq>) -> Json<Value> {
-    let is_xhr = headers.get("x-requested-with").and_then(|h| h.to_str().ok()).unwrap_or("") == "XMLHttpRequest";
-    let is_cli = headers.get("user-agent").map_or(false, |v| v.as_bytes().starts_with(b"curl/"));
-
-    if !is_xhr && !is_cli {
-        let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
-        if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
-            let expected = format!("//{}", host);
-            if !origin.ends_with(&expected) {
-                return Json(json!({"status": "error", "message": "CSRF check failed"}));
-            }
-        } else {
-            return Json(json!({"status": "error", "message": "CSRF check failed: Missing Origin or X-Requested-With"}));
-        }
-    }
-
+pub async fn select_proxy(State(app_state): State<AppState>, Json(req): Json<SelectReq>) -> Json<Value> {
+    // 鉴权 + CSRF 由 auth_mw 中间件统一处理 (方案 B), 此处不再重复启发式检查。
     let st = app_state.state.load();
 
     if let Some(group_node) = st.outbounds.outbounds.get(&req.group) {

@@ -20,7 +20,7 @@ mod handlers;
 use axum::{
     routing::{get, post},
     response::{Html, IntoResponse, Response},
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     middleware::{self, Next},
     extract::{Request, State},
     Router,
@@ -45,21 +45,30 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// 从请求里按优先级提取 token: Authorization: Bearer <t> → mirage_token cookie → ?token=<t>。
+/// token 来源。CSRF 判定要用: **Bearer header 天然抗 CSRF** (跨站页面发不出自定义
+/// Authorization header, 除非 CORS 预检而服务端不放行); Cookie 会被浏览器跨站自动带, 需防护。
+#[derive(Clone, Copy, PartialEq)]
+enum TokenSrc {
+    Bearer,
+    Cookie,
+    Query,
+}
+
+/// 从请求里按优先级提取 token + 来源: Authorization: Bearer → mirage_token cookie → ?token=。
 /// `allow_query`: 是否接受 URL `?token=`。仅根路径 `/` 传 true (首访种 cookie 用); `/api/*`
 /// 传 false —— token 出现在 URL 会进浏览器历史/Referer/反代日志, 不该作为 API 的长期认证入口。
-fn extract_token(headers: &HeaderMap, uri: &Uri, allow_query: bool) -> Option<String> {
+fn extract_token_src(headers: &HeaderMap, uri: &Uri, allow_query: bool) -> Option<(String, TokenSrc)> {
     // 1. Authorization: Bearer <t> (CLI / 脚本首选)
     if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) {
         if let Some(t) = v.strip_prefix("Bearer ") {
-            return Some(t.trim().to_string());
+            return Some((t.trim().to_string(), TokenSrc::Bearer));
         }
     }
     // 2. Cookie: mirage_token=<t> (浏览器种一次即自动带)
     if let Some(c) = headers.get(header::COOKIE).and_then(|h| h.to_str().ok()) {
         for kv in c.split(';') {
             if let Some(t) = kv.trim().strip_prefix("mirage_token=") {
-                return Some(t.to_string());
+                return Some((t.to_string(), TokenSrc::Cookie));
             }
         }
     }
@@ -68,7 +77,7 @@ fn extract_token(headers: &HeaderMap, uri: &Uri, allow_query: bool) -> Option<St
         if let Some(q) = uri.query() {
             for kv in q.split('&') {
                 if let Some(t) = kv.strip_prefix("token=") {
-                    return Some(t.to_string());
+                    return Some((t.to_string(), TokenSrc::Query));
                 }
             }
         }
@@ -76,22 +85,65 @@ fn extract_token(headers: &HeaderMap, uri: &Uri, allow_query: bool) -> Option<St
     None
 }
 
-/// 鉴权中间件: gui.token 设了才拦。校验 Authorization/cookie/query 三者任一。
-/// 未配 token → 直接放行 (向后兼容, localhost 默认部署)。
-async fn auth_mw(State(app): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(expected) = app.gui_token.as_ref() else {
-        return next.run(req).await; // 未启用鉴权
+#[cfg(test)]
+fn extract_token(headers: &HeaderMap, uri: &Uri, allow_query: bool) -> Option<String> {
+    extract_token_src(headers, uri, allow_query).map(|(t, _)| t)
+}
+
+/// 同源判定 (CSRF 防护): Origin (优先) 或 Referer 的 authority 是否等于 Host header。
+/// 变更请求两者都无 → 判为非同源 (保守: 合法浏览器同源 POST 会带 Origin)。
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        return false;
     };
-    // ?token= 仅根路径认 (首访种 cookie); /api/* 只认 header/cookie, 避免 token 进 URL 日志。
-    let allow_query = req.uri().path() == "/";
-    match extract_token(req.headers(), req.uri(), allow_query) {
-        Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            "unauthorized: missing/invalid API token (set Authorization: Bearer, mirage_token cookie, or ?token=)",
-        )
-            .into_response(),
+    let authority_of = |url: &str| -> Option<String> {
+        url.split_once("://").map(|(_, rest)| rest.split('/').next().unwrap_or("").to_string())
+    };
+    if let Some(o) = headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
+        return authority_of(o).as_deref() == Some(host);
     }
+    if let Some(r) = headers.get(header::REFERER).and_then(|h| h.to_str().ok()) {
+        return authority_of(r).as_deref() == Some(host);
+    }
+    false
+}
+
+/// 鉴权 + CSRF 中间件。
+/// - **鉴权**: gui.token 设了才拦, 校验 Authorization/cookie/query 任一; 未配 → 放行 (localhost 默认)。
+/// - **CSRF** (方案 B): 变更方法 (POST/PUT/DELETE/PATCH) 且**非 Bearer-header 认证**时, 要求同源
+///   (Origin/Referer 匹配 Host)。理由: Bearer header 跨站发不出 → 抗 CSRF, 直接放行; cookie 会被
+///   浏览器跨站自动带, 必须同源防护; 未启用 token 的 localhost 写接口也靠这层挡恶意网页/DNS-rebinding。
+async fn auth_mw(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    // 1. 鉴权 (若配了 token), 记录认证来源供 CSRF 判定。
+    let auth_src: Option<TokenSrc> = match app.gui_token.as_ref() {
+        None => None, // 未启用鉴权
+        Some(expected) => {
+            // ?token= 仅根路径认 (首访种 cookie); /api/* 只认 header/cookie, 避免 token 进 URL 日志。
+            let allow_query = req.uri().path() == "/";
+            match extract_token_src(req.headers(), req.uri(), allow_query) {
+                Some((t, src)) if ct_eq(t.as_bytes(), expected.as_bytes()) => Some(src),
+                _ => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        "unauthorized: missing/invalid API token (set Authorization: Bearer, mirage_token cookie, or ?token=)",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    // 2. CSRF: 变更方法 + 非 Bearer 认证 → 要求同源。Bearer header 抗 CSRF, 免检。
+    let mutating = matches!(*req.method(), Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
+    if mutating && auth_src != Some(TokenSrc::Bearer) && !same_origin(req.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "csrf: cross-origin state-changing request rejected (use Authorization: Bearer for automation, or same-origin browser request)",
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
 
 /// 根路由: 服务 SPA。若带合法 ?token= 则顺手种 HttpOnly cookie, 之后 SPA 的 fetch 自动带,
@@ -243,5 +295,39 @@ mod tests {
         let h = HeaderMap::new();
         let uri: Uri = "/api/x".parse().unwrap();
         assert_eq!(extract_token(&h, &uri, false), None);
+    }
+
+    #[test]
+    fn token_source_classified() {
+        let uri: Uri = "/".parse().unwrap();
+        let h = headers_with(header::AUTHORIZATION, "Bearer b");
+        assert!(matches!(extract_token_src(&h, &uri, true), Some((_, TokenSrc::Bearer))));
+        let h = headers_with(header::COOKIE, "mirage_token=c");
+        assert!(matches!(extract_token_src(&h, &uri, true), Some((_, TokenSrc::Cookie))));
+        let uri_q: Uri = "/?token=q".parse().unwrap();
+        assert!(matches!(extract_token_src(&HeaderMap::new(), &uri_q, true), Some((_, TokenSrc::Query))));
+    }
+
+    #[test]
+    fn same_origin_checks() {
+        // Origin authority 匹配 Host → 同源
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "1.2.3.4:9090".parse().unwrap());
+        h.insert(header::ORIGIN, "http://1.2.3.4:9090".parse().unwrap());
+        assert!(same_origin(&h));
+        // Origin 不匹配 → 非同源
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "1.2.3.4:9090".parse().unwrap());
+        h.insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+        assert!(!same_origin(&h));
+        // 无 Origin 无 Referer → 保守判非同源
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "1.2.3.4:9090".parse().unwrap());
+        assert!(!same_origin(&h));
+        // 退回 Referer 匹配
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "host:80".parse().unwrap());
+        h.insert(header::REFERER, "http://host:80/page".parse().unwrap());
+        assert!(same_origin(&h));
     }
 }

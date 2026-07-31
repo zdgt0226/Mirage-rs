@@ -15,6 +15,15 @@
 - **build: eBPF 编译仅在 `feature=ebpf && target_os=linux` 触发** —— 默认/非 Linux/交叉编译
   不再无谓跑 `clang -target bpf`, 直接指向 committed ELF, 去噪声和不确定差异。
 
+### refactor(api): CSRF 防护重构进中间件, 按认证方式分流 (方案 B)
+
+删掉 `select_proxy`/`update_rules` 里各自的 `is_xhr || UA=curl || Origin` 启发式 (与 token
+鉴权冗余、UA 判断易伪造、会误拒带 Origin 的合法跨源客户端), 统一进 `auth_mw`:
+- **Bearer header 认证** → 抗 CSRF (跨站页面发不出自定义 Authorization), 免检, 合法 CLI/脚本永不误拒。
+- **Cookie/无 token 认证 + 变更方法** (POST/PUT/DELETE/PATCH) → 要求同源 (Origin/Referer 匹配 Host);
+  覆盖未配 token 的 localhost 写接口, 挡恶意网页/DNS-rebinding。
+- GET/读接口不查。SPA 同源 POST 浏览器自动带 Origin, 无需改前端。
+
 ### refactor(config): `routing.rules[].mode` 从自由字符串收成 `RuleMode` 枚举
 
 对标 sing-box/clash 后的配置结构评审首个小 win。`mode` 原为自由 `String`, 拼错 (如 `adn`)
