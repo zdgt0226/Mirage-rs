@@ -599,6 +599,18 @@ pub struct DnsResolver {
     pub protocol: DnsProtocol,
 }
 
+/// 剥掉 resolver 地址可选的 `tcp://` / `udp://` 前缀, 返回 (剥后地址, 该前缀指定的协议)。
+/// 无前缀 → (原地址, None)。让模板/用户既能写 `tcp://8.8.8.8:53` 也能写裸 `8.8.8.8:53` + protocol 字段。
+pub fn strip_dns_scheme(addr: &str) -> (&str, Option<DnsProtocol>) {
+    if let Some(rest) = addr.strip_prefix("tcp://") {
+        (rest, Some(DnsProtocol::Tcp))
+    } else if let Some(rest) = addr.strip_prefix("udp://") {
+        (rest, Some(DnsProtocol::Udp))
+    } else {
+        (addr, None)
+    }
+}
+
 /// 解析 DNS 上游地址: `ip:port` 或 `ip` (无端口默认 53)。裸 IPv6 (无方括号) 也支持:
 /// `2001:4860:4860::8888` → :53; 带端口须用方括号 `[2001:...]:53`。非法返回 None。
 pub fn parse_dns_upstream(s: &str) -> Option<std::net::SocketAddr> {
@@ -1053,6 +1065,22 @@ mod static_hosts_tests {
         pairs.iter().map(|(d, ips)| {
             (d.to_string(), StaticValue::Many(ips.iter().map(|s| s.to_string()).collect()))
         }).collect()
+    }
+
+    #[test]
+    fn strip_dns_scheme_and_parse() {
+        // 模板写 tcp://8.8.8.8:53 / udp://223.5.5.5:53: 剥前缀后能正确解出协议 + SocketAddr。
+        let (a, p) = strip_dns_scheme("tcp://8.8.8.8:53");
+        assert_eq!(a, "8.8.8.8:53");
+        assert_eq!(p, Some(DnsProtocol::Tcp));
+        assert_eq!(parse_dns_upstream(a).map(|s| s.to_string()).as_deref(), Some("8.8.8.8:53"));
+
+        let (a, p) = strip_dns_scheme("udp://223.5.5.5:53");
+        assert_eq!((a, p), ("223.5.5.5:53", Some(DnsProtocol::Udp)));
+
+        // 无前缀: 原样 + None (协议由 protocol 字段决定)
+        assert_eq!(strip_dns_scheme("1.1.1.1").0, "1.1.1.1");
+        assert_eq!(strip_dns_scheme("1.1.1.1").1, None);
     }
 
     #[test]

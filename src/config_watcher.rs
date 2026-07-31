@@ -112,7 +112,7 @@ impl ConfigWatcher {
             // If inbounds, outbounds, or fakeip ranges need to be modified, a full restart is required.
             old
         } else {
-            Arc::new(OutboundManager::new(&config))
+            Arc::new(OutboundManager::new(&config)?)
         };
         
         let mut rules = Vec::new();
@@ -170,21 +170,29 @@ impl ConfigWatcher {
             let mut remote_port = None;
             for r in &adv.resolvers {
                 if adv.default.as_ref() == Some(&r.tag) || r.tag == "remote" || r.tag == "proxy" {
-                    if r.address.contains(':') {
-                        let parts: Vec<&str> = r.address.split(':').collect();
-                        remote_host = Some(parts[0].to_string());
-                        if let Ok(p) = parts[1].parse() { remote_port = Some(p); }
+                    // 剥可选 tcp://|udp:// 前缀 (模板就是这么写的; 旧代码把 "tcp://8.8.8.8:53" 按
+                    // split(':') 拆成 host="tcp" 致隧道 DNS 查错目标)。剥后优先按 IP/[v6]:port 精确解析,
+                    // 解析不出 (域名) 再退回 host:port 粗拆, IPv6 域名场景极罕见。
+                    let (raw, _proto) = crate::config::strip_dns_scheme(&r.address);
+                    if let Some(sa) = crate::config::parse_dns_upstream(raw) {
+                        remote_host = Some(sa.ip().to_string());
+                        remote_port = Some(sa.port());
+                    } else if let Some((h, p)) = raw.rsplit_once(':').filter(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()) {
+                        remote_host = Some(h.to_string());
+                        remote_port = p.parse().ok();
                     } else {
-                        remote_host = Some(r.address.clone());
+                        remote_host = Some(raw.to_string());
                     }
                 } else if r.tag == "direct" || r.tag == "cn" {
                     // 收集全部 cn/direct 上游 (多上游兜底), 带协议; 地址无端口默认 53; 去重。
-                    match crate::config::parse_dns_upstream(&r.address) {
+                    // 同样剥 tcp://|udp:// 前缀; 前缀指定的协议优先于 protocol 字段。
+                    let (raw, proto_override) = crate::config::strip_dns_scheme(&r.address);
+                    match crate::config::parse_dns_upstream(raw) {
                         Some(addr) => {
-                            let entry = (addr, r.protocol);
+                            let entry = (addr, proto_override.unwrap_or(r.protocol));
                             if !cn_dns.contains(&entry) { cn_dns.push(entry); }
                         }
-                        None => tracing::warn!("advanced_dns.resolvers: direct 上游地址 `{}` 非法 (需 ip 或 ip:port), 已跳过", r.address),
+                        None => tracing::warn!("advanced_dns.resolvers: direct 上游地址 `{}` 非法 (需 ip / ip:port, 可带 tcp://|udp:// 前缀), 已跳过", r.address),
                     }
                 }
             }

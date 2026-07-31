@@ -46,7 +46,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// 从请求里按优先级提取 token: Authorization: Bearer <t> → mirage_token cookie → ?token=<t>。
-fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+/// `allow_query`: 是否接受 URL `?token=`。仅根路径 `/` 传 true (首访种 cookie 用); `/api/*`
+/// 传 false —— token 出现在 URL 会进浏览器历史/Referer/反代日志, 不该作为 API 的长期认证入口。
+fn extract_token(headers: &HeaderMap, uri: &Uri, allow_query: bool) -> Option<String> {
     // 1. Authorization: Bearer <t> (CLI / 脚本首选)
     if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()) {
         if let Some(t) = v.strip_prefix("Bearer ") {
@@ -61,11 +63,13 @@ fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
             }
         }
     }
-    // 3. ?token=<t> (浏览器首次访问 /?token=XXX 用; 假设 token 为 url-safe)
-    if let Some(q) = uri.query() {
-        for kv in q.split('&') {
-            if let Some(t) = kv.strip_prefix("token=") {
-                return Some(t.to_string());
+    // 3. ?token=<t> —— 仅根路径 (allow_query) 接受, 供浏览器首访 /?token=XXX 种 cookie。
+    if allow_query {
+        if let Some(q) = uri.query() {
+            for kv in q.split('&') {
+                if let Some(t) = kv.strip_prefix("token=") {
+                    return Some(t.to_string());
+                }
             }
         }
     }
@@ -78,7 +82,9 @@ async fn auth_mw(State(app): State<AppState>, req: Request, next: Next) -> Respo
     let Some(expected) = app.gui_token.as_ref() else {
         return next.run(req).await; // 未启用鉴权
     };
-    match extract_token(req.headers(), req.uri()) {
+    // ?token= 仅根路径认 (首访种 cookie); /api/* 只认 header/cookie, 避免 token 进 URL 日志。
+    let allow_query = req.uri().path() == "/";
+    match extract_token(req.headers(), req.uri(), allow_query) {
         Some(t) if ct_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
         _ => (
             StatusCode::UNAUTHORIZED,
@@ -203,21 +209,24 @@ mod tests {
     fn extract_from_bearer() {
         let h = headers_with(header::AUTHORIZATION, "Bearer abc123");
         let uri: Uri = "/api/x".parse().unwrap();
-        assert_eq!(extract_token(&h, &uri).as_deref(), Some("abc123"));
+        assert_eq!(extract_token(&h, &uri, false).as_deref(), Some("abc123"));
     }
 
     #[test]
     fn extract_from_cookie() {
         let h = headers_with(header::COOKIE, "foo=1; mirage_token=tok42; bar=2");
         let uri: Uri = "/api/x".parse().unwrap();
-        assert_eq!(extract_token(&h, &uri).as_deref(), Some("tok42"));
+        assert_eq!(extract_token(&h, &uri, false).as_deref(), Some("tok42"));
     }
 
     #[test]
-    fn extract_from_query() {
+    fn extract_from_query_only_when_allowed() {
         let h = HeaderMap::new();
         let uri: Uri = "/?a=1&token=qtok&b=2".parse().unwrap();
-        assert_eq!(extract_token(&h, &uri).as_deref(), Some("qtok"));
+        // 根路径放行 query token (首访种 cookie)
+        assert_eq!(extract_token(&h, &uri, true).as_deref(), Some("qtok"));
+        // /api/* 不放行 query token —— 防 token 进 URL 日志
+        assert_eq!(extract_token(&h, &uri, false), None);
     }
 
     #[test]
@@ -226,13 +235,13 @@ mod tests {
         h.insert(header::AUTHORIZATION, "Bearer bearer_tok".parse().unwrap());
         h.insert(header::COOKIE, "mirage_token=cookie_tok".parse().unwrap());
         let uri: Uri = "/".parse().unwrap();
-        assert_eq!(extract_token(&h, &uri).as_deref(), Some("bearer_tok"));
+        assert_eq!(extract_token(&h, &uri, true).as_deref(), Some("bearer_tok"));
     }
 
     #[test]
     fn extract_none_when_absent() {
         let h = HeaderMap::new();
         let uri: Uri = "/api/x".parse().unwrap();
-        assert_eq!(extract_token(&h, &uri), None);
+        assert_eq!(extract_token(&h, &uri, false), None);
     }
 }

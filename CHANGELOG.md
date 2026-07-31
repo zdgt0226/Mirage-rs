@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### fix: 外部审查四项修复 (DNS resolver / outbound panic / API token / build.rs)
+
+- **fix(dns): resolver 地址 `tcp://`/`udp://` 前缀现能正确解析** —— 模板写 `tcp://8.8.8.8:53`,
+  旧 remote 分支 `split(':')` 拆成 host=`tcp` 致隧道 DNS 查错目标; direct/cn 分支则整条跳过
+  静默回落公共 DNS。新增 `strip_dns_scheme` 剥前缀 (前缀协议优先于 `protocol` 字段), 两分支
+  统一走 `parse_dns_upstream`, remote 分支顺带修 IPv6/端口误拆。**照抄模板不再坏 DNS**。
+- **fix(outbound): 未解析/循环出站组返回诊断错误而非 `panic!`** —— `OutboundManager::new`
+  改返回 `Result`, 坏配置给清晰报错而不是崩进程 (虽仅启动路径可达, 热重载保留旧 outbounds)。
+- **fix(api): `?token=` 仅根路径 `/` 认, `/api/*` 只认 header/cookie** —— 防 token 进 URL
+  历史/Referer/反代日志成长期认证泄露面。
+- **build: eBPF 编译仅在 `feature=ebpf && target_os=linux` 触发** —— 默认/非 Linux/交叉编译
+  不再无谓跑 `clang -target bpf`, 直接指向 committed ELF, 去噪声和不确定差异。
+
 ### refactor(config): `routing.rules[].mode` 从自由字符串收成 `RuleMode` 枚举
 
 对标 sing-box/clash 后的配置结构评审首个小 win。`mode` 原为自由 `String`, 拼错 (如 `adn`)

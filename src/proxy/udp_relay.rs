@@ -407,7 +407,7 @@ mod tests {
         Arc::new(arc_swap::ArcSwap::from_pointee(
             crate::config_watcher::CoreState {
                 router: Arc::new(router),
-                outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg)),
+                outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg).unwrap()),
                 advanced_dns: None,
                 auto_classify: None,
             },

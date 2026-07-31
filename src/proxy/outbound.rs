@@ -211,7 +211,7 @@ pub struct OutboundManager {
 }
 
 impl OutboundManager {
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let mut outbounds = HashMap::new();
         let mut deferred = Vec::new();
 
@@ -398,12 +398,16 @@ impl OutboundManager {
             }
 
             if !progress {
-                panic!("Unresolved or circular outbound groups: {:?}", next_round);
+                // 配置错误 (未解析 / 循环出站组): 返回诊断错误而非 panic 杀进程。
+                anyhow::bail!(
+                    "outbound 组无法解析或存在循环引用: {:?} (检查这些 group 的 children 是否都指向已定义的出站, 且无相互/自我引用)",
+                    next_round
+                );
             }
             pending = next_round;
         }
 
-        Self { outbounds }
+        Ok(Self { outbounds })
     }
 
     pub fn get(&self, tag: &str) -> Option<Arc<OutboundNode>> {
@@ -437,7 +441,7 @@ mod wg_tests {
     fn valid_config_builds_wireguard_node() {
         let cfg = cfg_with_wg(GOOD_KEYS);
         assert!(cfg.semantic_issues().is_empty(), "合法配置不该有告警: {:?}", cfg.semantic_issues());
-        let m = OutboundManager::new(&cfg);
+        let m = OutboundManager::new(&cfg).expect("测试配置应能构建出站");
         let node = m.outbounds.get("wg").expect("应有 wg 出站");
         assert!(matches!(&**node, OutboundNode::Wireguard { .. }), "应是 Wireguard 节点");
     }
@@ -456,7 +460,7 @@ mod wg_tests {
         let issues = cfg.semantic_issues();
         assert!(issues.iter().any(|i| i.contains("private_key")), "应报密钥问题: {issues:?}");
 
-        let m = OutboundManager::new(&cfg);
+        let m = OutboundManager::new(&cfg).expect("测试配置应能构建出站");
         match &**m.outbounds.get("wg").expect("wg 出站应存在") {
             OutboundNode::Block { .. } => {}
             OutboundNode::Direct { .. } => {
@@ -536,8 +540,23 @@ mod lb_tests {
         }"#;
         let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
         assert!(cfg.semantic_issues().is_empty(), "合法 lb 配置无告警: {:?}", cfg.semantic_issues());
-        let m = OutboundManager::new(&cfg);
+        let m = OutboundManager::new(&cfg).expect("测试配置应能构建出站");
         assert!(matches!(&**m.outbounds.get("lb").unwrap(), OutboundNode::LoadBalance { .. }));
+    }
+
+    #[test]
+    fn unresolved_outbound_group_errs_not_panics() {
+        // group 的 children 指向不存在的 tag → 永远解析不出。应返回 Err 而非 panic 杀进程。
+        let s = r#"{
+          "inbounds": [],
+          "outbounds": [
+            { "type": "direct", "tag": "direct" },
+            { "type": "selector", "tag": "grp", "outbounds": ["ghost"] }
+          ],
+          "routing": { "default_outbound": "direct", "rules": [] }
+        }"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        assert!(OutboundManager::new(&cfg).is_err(), "未解析出站组应返回 Err 而非 panic");
     }
 
     #[test]

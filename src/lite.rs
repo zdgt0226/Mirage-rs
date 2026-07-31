@@ -118,7 +118,7 @@ fn build_core_state(cfg: &LiteClientConfig) -> Result<crate::config_watcher::Cor
     let parsed: crate::config::Config =
         serde_json::from_value(full).context("展开轻量配置失败 (内部错误)")?;
 
-    let outbounds = Arc::new(crate::proxy::outbound::OutboundManager::new(&parsed));
+    let outbounds = Arc::new(crate::proxy::outbound::OutboundManager::new(&parsed)?);
     // 空规则 → 一切都落到 default_outbound; geodata_dir 不会被触碰 (没有 geosite/geoip 规则)。
     let router = crate::router::RouterEngine::new(
         Vec::new(),

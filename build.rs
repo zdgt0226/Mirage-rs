@@ -34,7 +34,13 @@ fn main() {
     let arch_inc = format!("-I/usr/include/{}-linux-gnu", uname);
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    
+
+    // 只在 feature=ebpf && Linux 目标下真编译 BPF (env! 也只在这两条件下经 aya 引用)。
+    // 否则 (默认无 ebpf / 非 Linux / 交叉编译 / 无 clang) 直接指向 committed ELF, 不跑 clang,
+    // 免无谓噪声和交叉环境的不确定差异。committed ELF 始终存在, env 变量始终有定义。
+    let ebpf_on = std::env::var_os("CARGO_FEATURE_EBPF").is_some();
+    let is_linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+
     for (src, elf_name, env_var) in [
         ("ebpf-src/sockmap.c", "sockmap.elf", "BPF_SOCKMAP_ELF"),
         ("ebpf-src/dns_xdp.c", "dns_xdp.elf", "BPF_DNS_XDP_ELF"),
@@ -42,6 +48,14 @@ fn main() {
         ("ebpf-src/tc_divert.c", "tc_divert.elf", "BPF_TC_DIVERT_ELF"),
         ("ebpf-src/cgroup_connect.c", "cgroup_connect.elf", "BPF_CGROUP_CONNECT_ELF"),
     ] {
+        let fallback_path = manifest_dir.join("ebpf-src").join(elf_name);
+
+        if !(ebpf_on && is_linux) {
+            // 不编译: 直接用 committed ELF (env 仍定义, 但此配置下 aya 不 include, 变量多半未用)。
+            println!("cargo:rustc-env={}={}", env_var, fallback_path.display());
+            continue;
+        }
+
         let src_path = manifest_dir.join(src);
         let dst_path = out_dir.join(elf_name);
 
@@ -53,13 +67,12 @@ fn main() {
                 "-o", dst_path.to_str().unwrap(),
             ])
             .status();
-        
+
         match status {
             Ok(s) if s.success() => {
                 println!("cargo:rustc-env={}={}", env_var, dst_path.display());
             }
             _ => {
-                let fallback_path = manifest_dir.join("ebpf-src").join(elf_name);
                 println!("cargo:warning=eBPF compile failed for {}, using committed ELF at {}", src, fallback_path.display());
                 println!("cargo:rustc-env={}={}", env_var, fallback_path.display());
             }
