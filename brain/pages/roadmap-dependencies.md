@@ -5,7 +5,7 @@ category: reference
 status: active
 tags: [roadmap, planning, dependencies]
 created: "2026-07-29T11:45:40"
-updated: "2026-07-31T02:52:25"
+updated: "2026-08-01T23:32:46"
 ---
 
 ## compiled_truth
@@ -60,3 +60,9 @@ updated: "2026-07-31T02:52:25"
   summary: "新立项: 隧道 UDP 流复用共享隧道 (带机量)。根因见 [[udp-capacity-findings]] —— 客户端一流一隧道, 并发 UDP 上限=pool_size(默认16)。中等工程, 独立项(不阻塞别的, 也不被阻塞), 优先级排在硬地基'统一出站流(4)'之后; QUIC 回落 TCP 故非致命, 可缓解(调大 pool_size)。direct UDP 网关实测健康不在范围。"
   source: "udp-capacity-findings 实测结论 + README 计划池新增条目"
   affects: [roadmap-dependencies, udp-capacity-findings, src/proxy/transparent_udp.rs]
+
+- time: 2026-08-01T23:32:46
+  kind: decision
+  summary: "外部审查'未来发展建议'7 条处置 + 平台决策 (2026-07-31)。#2 平台分层决策: Android/Windows 客户端将开独立项目重构 (不进本仓库), BSD 后续可能本仓库支持 → 本仓库现在不做 cfg-gating 分层 epic, CI '非 Linux 构建'门禁不适用; 核心模块 (SOCKS/Mixed/Mirage/WG) 保持合理可移植利于将来 BSD/独立项目复用。已做(commit 5b4cac1): #4 docs/threat-model.md 抗审查验收基准(T1抗主动探测/T2抗DNS污染/T3不泄真实IP/T4fail-closed/T5无时序侧信道); #1 clippy 进 CI(未 -D warnings); #3 check 报直连 DNS 上游解不出 IP。新 roadmap 项: clippy-cleanup(清 ~66 warning 后翻 cargo clippy -D warnings, 内含 1 条 MutexGuard-held-across-await 值得单独查是否真 bug)。待做高价值: #7 泄漏/场景集成测试(被代理域名永不走本地DNS/SS-UDP默认不裸奔/fake-IP丢失fail-closed/WG-DNS符合预期 → 对照 threat-model §7 施工, 抗审查最关键); #6 控制面产品化(/api/rules 加结构化校验+dry-run+reload结果回传, 原子写已有). 已在队列: #5 UDP mux(见 [[udp-capacity-findings]])."
+  source: "外部审查 7 建议 + 用户平台决策 + docs/threat-model.md"
+  affects: [roadmap-dependencies, docs/threat-model.md]
