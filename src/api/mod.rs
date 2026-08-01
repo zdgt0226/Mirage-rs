@@ -34,15 +34,11 @@ use crate::config_watcher::CoreState;
 pub use state::AppState;
 
 /// 常量时间比较, 防 token 校验的时序侧信道 (长度不同直接不等; 长度本身不敏感)。
+///
+/// 用 `ring` 审计过的实现而非手写累加器 —— 手写 `diff |= a[i]^b[i]` 虽是正确惯用法, 但
+/// Rust/LLVM **不保证**不会在优化时插入短路/向量化破坏常数时间; ring 的版本带优化屏障。
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
 /// token 来源。CSRF 判定要用: **Bearer header 天然抗 CSRF** (跨站页面发不出自定义
@@ -295,6 +291,14 @@ mod tests {
         let h = HeaderMap::new();
         let uri: Uri = "/api/x".parse().unwrap();
         assert_eq!(extract_token(&h, &uri, false), None);
+    }
+
+    #[test]
+    fn ct_eq_semantics() {
+        assert!(ct_eq(b"secret-token", b"secret-token"), "相等应 true");
+        assert!(!ct_eq(b"secret-token", b"secret-toXen"), "有差异应 false");
+        assert!(!ct_eq(b"short", b"short-longer"), "长度不同应 false");
+        assert!(ct_eq(b"", b""), "空 == 空");
     }
 
     #[test]

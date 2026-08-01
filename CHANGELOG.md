@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### fix(api/security): token 常量时间比较改用 `ring`, 消除 LLVM 优化破坏风险
+
+手写累加器常量时间比较 (`diff |= a[i]^b[i]`) 虽是正确惯用法, 但 Rust/LLVM **不保证**优化时
+不插入短路/向量化破坏常数时间。换成 `ring::constant_time::verify_slices_are_equal` (审计过、
+带优化屏障)。语义不变 (等长逐字节比、长度不同即 false)。另记两条 UDP 已知限制/权衡 (brain
+`udp-capacity-findings`): WG 上游大 UDP 超 1420 MTU 可能碎化黑洞; UDP-over-TCP 队头阻塞为
+每流独立 (mux 复用会变跨流, 已并入 UDP mux 立项约束)。
+
 ### feat(api): `POST /api/rules` 写前结构化校验 + dry-run + 告警回传
 
 外部审查建议 #6 (控制面产品化)。原来直接把提交的 rules 塞进 config 落盘, 无校验 —— 写坏
