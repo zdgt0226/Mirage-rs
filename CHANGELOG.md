@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### test(security): 抗审查泄漏守卫场景测试 `tests/test_leak_guards.rs`
+
+外部审查建议 #7 —— 把抗审查**行为保证**提成一等公民集成测试, 对照 `docs/threat-model.md` T1–T5:
+- T3: SS 上游 UDP 默认 Block (不从本机真实 IP 裸奔)。
+- T3/T4: SS 上游 udp=tunnel (未实现) → check 报错, 不静默降级。
+- T4: 未知/淘汰的 fake-IP 反查 None → 调用方 fail-closed drop 而非凭空编目标直连。
+- T4: fake-IP 淘汰后旧 IP 无残留反查 (防误路由/串味)。
+
+需真内核/netns 的行为 (透明数据面全链路) 仍由 `examples/verify_*.sh` (CI ebpf-verify) 覆盖;
+T2 (被代理域名不采信本地 DNS / WG 隧道内 DNS) 待补, 见 threat-model §7 清单。
+
 ### chore: 发布门禁 clippy + 抗审查威胁模型文档 + check 加 DNS 上游校验
 
 外部审查"未来发展建议"首批 (便宜高杠杆):

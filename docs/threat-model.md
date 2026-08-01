@@ -75,10 +75,13 @@ TLS 站点区分开。
 
 | 目标 | 场景断言 | 状态 |
 |------|---------|------|
-| T2 | 被代理域名解析永不采信本地 UDP:53 结果 | 待补 |
-| T3 | SS 上游 UDP 默认 block,不从本机裸奔 | 待补 |
-| T3/T4 | fake-IP 丢失/淘汰无域名 → drop 而非直连 | 待补 |
-| T2 | WG 上游隧道内 DNS 解析符合预期 (不漏到本地) | 待补 |
+| T3 | SS 上游 UDP 默认 block,不从本机裸奔 | ✅ `tests/test_leak_guards.rs::t3_ss_upstream_udp_defaults_to_block` |
+| T3/T4 | SS 上游 udp=tunnel (未实现) → check 报错不静默降级 | ✅ `::t3_ss_upstream_tunnel_udp_rejected_at_check` |
+| T4 | 未知/淘汰的 fake-IP 反查 None → 调用方 drop 而非直连 | ✅ `::t4_fakeip_unknown_inrange_ip_returns_none_not_invented` |
+| T4 | fake-IP 淘汰后旧 IP 无残留反查 (防误路由) | ✅ `::t4_fakeip_eviction_leaves_no_stale_reverse_mapping` |
+| T2 | 被代理域名解析永不采信本地 UDP:53 结果 | 待补 (需 DNS 路由集成/netns) |
+| T2 | WG 上游隧道内 DNS 解析符合预期 (不漏到本地) | 待补 (需 netns) |
 | T1 | 认证失败 → 转发伪装站 (会话密钥解不开其 TLS) | 部分 (probe.rs 有相关判定) |
 
-> 这张表是 #7 "泄漏测试变集成测试" 的施工清单。
+> 这张表是 #7 "泄漏测试变集成测试" 的施工清单。纯用户态可判定的守卫见
+> `tests/test_leak_guards.rs`; 需真内核/netns 的行为由 `examples/verify_*.sh` (CI ebpf-verify) 覆盖。
