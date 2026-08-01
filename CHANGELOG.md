@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### feat(api): `POST /api/rules` 写前结构化校验 + dry-run + 告警回传
+
+外部审查建议 #6 (控制面产品化)。原来直接把提交的 rules 塞进 config 落盘, 无校验 —— 写坏
+配置会让核心引擎热重载解析失败。现在:
+- **写前校验**: 把新 rules 拼进整份候选 config, `parse_with_diagnostics` 结构化校验 (schema) +
+  `semantic_issues` 语义检查; **解析失败直接拒绝, 绝不落盘** (返回 `stage:"validate"` + 原因)。
+- **dry-run**: `?dry_run=1` 只校验不写, 回 `issues` 列表 (前端"保存前预检")。
+- **结果回传**: 写成功返回 `{written:true, issues:[...]}`, issues 即热重载会看到的告警。
+- 原子写 (.tmp + rename) 保留; `status:"success"` 字段不变, 前端无需改。
+
 ### test(security): 抗审查泄漏守卫场景测试 `tests/test_leak_guards.rs`
 
 外部审查建议 #7 —— 把抗审查**行为保证**提成一等公民集成测试, 对照 `docs/threat-model.md` T1–T5:
