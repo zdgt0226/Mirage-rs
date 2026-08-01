@@ -1052,6 +1052,23 @@ impl Config {
             }
         }
 
+        // DNS 上游地址校验: 直连/国内上游 (tag=direct/cn) 运行时要求解析成 IP —— 解不出会被
+        // **静默跳过**回落公共 DNS。把这个运行期沉默失败前移到 check, 明确报错而非默默 fallback。
+        // 支持 tcp://|udp:// 前缀 (剥后再验)。remote/proxy/default 上游允许域名, 不在此严格验 IP。
+        if let Some(adv) = &self.advanced_dns {
+            for r in &adv.resolvers {
+                if r.tag == "direct" || r.tag == "cn" {
+                    let (raw, _) = strip_dns_scheme(&r.address);
+                    if parse_dns_upstream(raw).is_none() {
+                        issues.push(format!(
+                            "advanced_dns.resolvers: 直连上游 `{}` 的 address `{}` 解析不出 IP (需 ip / ip:port, 可带 tcp://|udp:// 前缀) —— 运行时会被静默跳过并回落公共 DNS",
+                            r.tag, r.address
+                        ));
+                    }
+                }
+            }
+        }
+
         issues
     }
 }
@@ -1320,6 +1337,19 @@ mod validation_tests {
             Config::parse_with_diagnostics(&v.to_string()).is_ok(),
             "合法 and 应能解析"
         );
+    }
+
+    #[test]
+    fn bad_direct_dns_upstream_reported_at_check() {
+        // 直连上游地址解不出 IP → check 明确报错 (而非运行期静默跳过回落公共 DNS)。
+        let mut v = base();
+        v["advanced_dns"] = serde_json::json!({
+            "resolvers": [{ "tag": "direct", "address": "not-an-ip" }]
+        });
+        assert!(has(&issues_of(&v), "静默跳过"), "坏直连 DNS 上游应报, 实际: {:?}", issues_of(&v));
+        // 合法 IP + tcp:// 前缀不报
+        v["advanced_dns"]["resolvers"][0]["address"] = serde_json::json!("tcp://8.8.8.8:53");
+        assert!(!has(&issues_of(&v), "静默跳过"), "合法上游不该报");
     }
 
     #[test]

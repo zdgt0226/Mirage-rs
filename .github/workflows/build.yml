@@ -17,6 +17,10 @@ jobs:
       run: cargo build --verbose
     - name: Check with ebpf feature
       run: cargo check --features ebpf --verbose
+    # 发布门禁: clippy 拦 clippy 级 error + 让 warning 在 CI 日志可见。
+    # 现存 ~66 条 warning (多为风格) 清理后再翻成 `-D warnings` 硬拦, 见 roadmap clippy-cleanup。
+    - name: Clippy
+      run: cargo clippy --all-targets
     - name: Run tests
       run: cargo test --verbose
 

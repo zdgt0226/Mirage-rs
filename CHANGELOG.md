@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### chore: 发布门禁 clippy + 抗审查威胁模型文档 + check 加 DNS 上游校验
+
+外部审查"未来发展建议"首批 (便宜高杠杆):
+- **docs(security): 新增 `docs/threat-model.md`** —— 抗审查验收基准 (T1 抗主动探测 / T2 抗 DNS
+  污染 / T3 不泄真实 IP / T4 fail-closed / T5 无时序侧信道), 每功能对照验收; 内含 §7 泄漏测试施工清单。
+- **ci: clippy 进发布门禁** (`cargo clippy --all-targets`, 现存 ~66 条 warning 清理后再翻 `-D warnings`)。
+- **fix(config): `check` 报告直连 DNS 上游解析不出 IP** —— 原为运行期静默跳过回落公共 DNS,
+  现在 `semantic_issues` 明确报错 (支持 `tcp://`/`udp://` 前缀剥离后校验)。
+
 ### fix: 外部审查四项修复 (DNS resolver / outbound panic / API token / build.rs)
 
 - **fix(dns): resolver 地址 `tcp://`/`udp://` 前缀现能正确解析** —— 模板写 `tcp://8.8.8.8:53`,
