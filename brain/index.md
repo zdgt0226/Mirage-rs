@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-08-01T17:25:36.070Z._
+_Auto-generated. Last updated 2026-08-01T17:29:31.139Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -18,6 +18,7 @@ _Auto-generated. Last updated 2026-08-01T17:25:36.070Z._
 - [fakeip-remote-resolution](pages/fakeip-remote-resolution.md) — category: decision | **决定**:被代理域名的 DNS 查询返回**保留段 fake-IP**(198.18.0.0/15),真实域名随隧道送到**墙外服务端远程解析**。
 - [fingerprint-hot-update](pages/fingerprint-hot-update.md) — category: decision | tags: [tls, fingerprint, hot-update, anytls] | **结论**: 值得做, 优先级 **P2**(排在 TLS resumption 之后)。
 - [geo-dat-parsing-robustness](pages/geo-dat-parsing-robustness.md) — category: decision | v2ray/v2fly 的 `geosite.dat` / `geoip.dat` 是 protobuf 编码的外部数据, 手写解析器踩过两处 bug, 均已修并带回归测试:
+- [high-throughput-dataplane-reservation](pages/high-throughput-dataplane-reservation.md) — category: decision | <current best understanding — replace this with the real content>
 - [ipv6-full-stack-design](pages/ipv6-full-stack-design.md) — category: decision | tags: [ipv6, transparent, ebpf, fakeip, tc_divert, roadmap] | **决定 (2026-07-30 瘦身)**: 原"整条透明数据面 v6"大 epic (fake-v6/tc_divert v6/sk_lookup v6/v6 listener/direct_cidr6) **评估后否**。
 - [ipv6-v4only-tradeoff](pages/ipv6-v4only-tradeoff.md) — category: decision | **现状**:透明路径整条 **IPv4-only**。
 - [lan-host-monitor-device-rules](pages/lan-host-monitor-device-rules.md) — category: decision | tags: [roadmap, lan, monitoring, ebpf, routing, webui] | **计划池** (2026-07-29 定, 随 WebUI 优化再开发)。
