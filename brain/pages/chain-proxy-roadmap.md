@@ -5,7 +5,7 @@ category: decision
 status: draft
 tags: [roadmap, chain-proxy, wireguard, shadowsocks, architecture]
 created: "2026-07-27T01:30:56"
-updated: "2026-08-02T22:46:39"
+updated: "2026-08-03T02:31:01"
 ---
 
 ## compiled_truth
@@ -70,3 +70,15 @@ updated: "2026-08-02T22:46:39"
   summary: "子件 ⑤ 出站套娃 Mirage-over-X 已实现并入 main (2026-08-02, PR #20, Sonnet 复核 0 严重)。Mirage 出站配 underlying=<tag> → 对 server:port 的连接经该出站拨号 (物理网卡→另一出站): Mirage-over-WG / Mirage-over-Mirage 双跳。实现: 步骤1 Tunnel 传输改 enum TunnelRead/TunnelWrite {Tcp 快路径不变 | Boxed 骑 OutStream}; 步骤2 connect_upstream 分 TCP/underlying 两路 + do_fake_tls 泛型握手 + read_server_handshake 泛型 + PoolConfig.underlying + OutboundManager 拓扑排序(延后建+环报Err)+ semantic_issues 校验。已知限制(文档化, 非 bug): 嵌套隧道入池但无裸 fd → is_stale 保守判健康, 死的嵌套靠 max_age 回收+首写失败重试, 不被 sweeper 主动清; 嵌套无 brutal(CC 由 underlying 负责)。剩子件: ②SS 入站 ③WG 入站 (各自协议服务端, 独立大工程); ④编排靠现有 routing inbound 条件基本已具备(缺的只是 WG/SS 入站)。后续增强候选: 嵌套死隧道主动探活; handler 用 connect+relay 去重(Phase C, 动热路径)。"
   source: "PR #20 合并 + Sonnet 复核"
   affects: [src/proxy/tunnel.rs, src/proxy/pool.rs, src/proxy/outbound.rs, src/config.rs]
+
+- time: 2026-08-03T02:30:05
+  kind: decision
+  summary: "WG 入站 (③): **不做 boringtun WG responder**, 改用**内核 WireGuard 服务端 + 现有 eBPF 透明网关** (2026-08-03, 用户'干净设备'用法确立)。用法: 移动设备用系统原生 WireGuard 接入家中网关 (设备↔家域内 WG, **不跨 GFW 不被封**), 既访问家中 LAN 又经网关 Mirage 抗审查出海; 设备上**零翻墙痕迹** (只是通用 VPN, 降查水表风险), 翻墙逻辑全在网关。此前误判 WG 入站无用 (以为 WG 必跨 GFW 被封), 实际域内 WG 有效, 用法成立。为何不用 boringtun responder: 该用法需 AllowedIPs=0.0.0.0/0 的透明 over WG (模型 B), smoltcp 用户态栈做不了透明; 而内核 WG 天生能, 且久经考验 —— 同 Tailscale 立场 (跑成熟原生件 + Mirage 管出海), 别重造 WG 轮子。技术机制 (关键): 透明拦截**按 fake-IP 目标, 非 mark/SO_MARK**; SO_MARK 只标本机进程自发 socket, 标不了 wg0 peer 转发流量, 错工具。fake-IP 拦截靠  (fake-IP 段=本机地址→本地投递→触发 sk_lookup) + **sk_lookup 挂 netns 不绑网卡** (transparent.rs:73) → **dest-based, iface 无关 → wg0 到 fake-IP 流量自动命中, 和 LAN 一样, 零额外配置/无 mark/无防火墙**。防火墙仅用于非代理直连腿的标准 ip_forward+NAT。命门=手机 WG 配 DNS=网关内网 IP (海外域名才解成 fake-IP)。bare-IP 直连 (无域名) 需 tc_divert 绑 wg0, 但手机场景罕见。待做 (小, 几乎无新 eBPF): install.sh 加家庭 WG 服务端一键配置 + wg0 纳入 (ip_forward/NAT/fake-IP local 路由) + 真机验 wg0-ingress→local 投递 + rp_filter 放行。boringtun WG 入站/responder 从计划池删。"
+  source: "用户干净设备用法 + transparent_net.rs fake-IP local 路由机制 + transparent.rs:73 sk_lookup netns 挂载"
+  affects: [chain-proxy-roadmap, src/proxy/transparent_net.rs, src/ebpf/transparent.rs, install.sh]
+
+- time: 2026-08-03T02:31:01
+  kind: note
+  summary: "(补上条被 shell 吃掉的一句) fake-IP 拦截靠: ip route replace local 198.18.0.0/15 dev lo —— 把 fake-IP 段声明成本机地址, 使发往它的包走本地投递而非转发, 从而触发 netns 上的 sk_lookup 重定向到 Mirage。见 transparent_net.rs。"
+  source: "更正上条 backtick 缺失"
+  affects: [chain-proxy-roadmap]
