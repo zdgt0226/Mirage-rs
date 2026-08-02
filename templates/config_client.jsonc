@@ -112,6 +112,14 @@
             "type": "block",
             "tag": "block-out"
         }
+        // 【链式代理出站】Shadowsocks 出站: 经 SS 加密连 SS 服务器。配 "underlying" 即 SS-over-X
+        // —— underlying 指向 mirage 出站 = SS 连接骑 Mirage 隧道 (类 shadow-tls+ss 嵌套):
+        // {
+        //     "type": "shadowsocks", "tag": "ss-out",
+        //     "server": "ss.example.com", "server_port": 8388,
+        //     "method": "aes-256-gcm", "password": "...",
+        //     "underlying": "proxy-jp"     // ← SS 到 ss-server 的连接经 proxy-jp(Mirage) 隧道拨号
+        // }
     ],
 
     "routing": {

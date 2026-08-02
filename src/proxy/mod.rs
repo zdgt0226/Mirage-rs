@@ -4,6 +4,7 @@ pub mod tunnel;
 pub mod mirage_stream;
 pub mod internal_socks;
 pub mod ss_inbound;
+pub mod ss_stream;
 pub mod socks5;
 pub mod handler;
 pub mod udp_relay;

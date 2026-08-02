@@ -296,6 +296,18 @@ pub enum OutboundConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         underlying: Option<String>,
     },
+    /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
+    /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。
+    Shadowsocks {
+        tag: String,
+        server: String,
+        server_port: u16,
+        method: String,
+        password: String,
+        /// SS-over-X: SS 到 server 的连接经该出站拨号 (而非物理网卡)。不设 = 直连。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        underlying: Option<String>,
+    },
     /// WireGuard 出站: 选中的流量经 WG 隧道发往 peer, 不走 Mirage 隧道。
     ///
     /// 密钥都是标准 WireGuard 的 **base64 32 字节 x25519 密钥** (与 `wg genkey`/`wg pubkey`
@@ -837,6 +849,7 @@ impl Config {
                 | OutboundConfig::Wireguard { tag, .. }
                 | OutboundConfig::Direct { tag }
                 | OutboundConfig::Block { tag }
+                | OutboundConfig::Shadowsocks { tag, .. }
                 | OutboundConfig::Urltest { tag, .. }
                 | OutboundConfig::Fallback { tag, .. }
                 | OutboundConfig::Selector { tag, .. }
@@ -985,6 +998,25 @@ impl Config {
                         issues.push(format!("mirage 出站 `{tag}` 的 underlying 自引用 (会形成环)"));
                     } else if !tags.contains(&u.as_str()) {
                         issues.push(format!("mirage 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"));
+                    }
+                }
+            }
+            // Shadowsocks 出站: method 合法性 + underlying 存在/非自引用。
+            if let OutboundConfig::Shadowsocks { tag, server, password, method, underlying, .. } = ob {
+                if server.trim().is_empty() {
+                    issues.push(format!("shadowsocks 出站 `{tag}` 的 server 为空"));
+                }
+                if password.is_empty() {
+                    issues.push(format!("shadowsocks 出站 `{tag}` 的 password 为空"));
+                }
+                if let Err(e) = crate::proxy::shadowsocks::Method::parse(method) {
+                    issues.push(format!("shadowsocks 出站 `{tag}` 的 method 非法: {e}"));
+                }
+                if let Some(u) = underlying {
+                    if u == tag {
+                        issues.push(format!("shadowsocks 出站 `{tag}` 的 underlying 自引用 (会形成环)"));
+                    } else if !tags.contains(&u.as_str()) {
+                        issues.push(format!("shadowsocks 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"));
                     }
                 }
             }

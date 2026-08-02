@@ -30,6 +30,13 @@ pub enum OutboundNode {
     Block {
         tag: String,
     },
+    /// Shadowsocks 出站: 经 SS 加密连 SS 服务器。`underlying` 设了则 SS 连接经该出站拨号
+    /// (SS-over-X, 如 underlying=Mirage = 类 shadow-tls+ss 嵌套); 否则直连。
+    Shadowsocks {
+        tag: String,
+        cfg: Arc<crate::proxy::shadowsocks::SsConfig>,
+        underlying: Option<Arc<OutboundNode>>,
+    },
     Urltest {
         tag: String,
         children: Vec<Arc<OutboundNode>>,
@@ -63,6 +70,7 @@ impl OutboundNode {
             Self::Wireguard { tag, .. } => tag,
             Self::Direct { tag } => tag,
             Self::Block { tag } => tag,
+            Self::Shadowsocks { tag, .. } => tag,
             Self::Urltest { tag, .. } => tag,
             Self::Fallback { tag, .. } => tag,
             Self::Selector { tag, .. } => tag,
@@ -89,7 +97,7 @@ impl OutboundNode {
     pub fn is_healthy(self: &Arc<Self>) -> bool {
         match &**self {
             Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).is_healthy(),
-            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => true,
+            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } | Self::Shadowsocks { .. } => true,
             Self::Urltest { children, .. } | Self::Fallback { children, .. } | Self::Selector { children, .. } | Self::LoadBalance { children, .. } => {
                 children.iter().any(|c| c.is_healthy())
             }
@@ -102,7 +110,7 @@ impl OutboundNode {
                 let rtt = rtt_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if rtt > 0 && rtt != u64::MAX { Some(rtt) } else { None }
             },
-            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => None,
+            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } | Self::Shadowsocks { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. } => {
                 let leaf = self.resolve_leaf();
                 if std::ptr::eq(&*leaf, &**self) { None } else { leaf.latency_rtt_ms() }
@@ -113,7 +121,7 @@ impl OutboundNode {
     pub fn latency_http_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
             Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).latency_ms(),
-            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } => None,
+            Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } | Self::Shadowsocks { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. } => {
                 let leaf = self.resolve_leaf();
                 if std::ptr::eq(&*leaf, &**self) { None } else { leaf.latency_http_ms() }
@@ -251,6 +259,30 @@ impl OutboundNode {
                 let s = crate::proxy::wg::socket::WgTcpStream::connect(wt, remote).await?;
                 Ok(OutStream::Wg(s))
             }
+            OutboundNode::Shadowsocks { cfg, underlying, .. } => {
+                // 1. 拨 SS 服务器: 有 underlying 则骑它 (SS-over-X, 如 SS-over-Mirage), 否则直连。
+                //    两半装箱 → SsStream 类型统一 (BoxRead/BoxWrite)。
+                let ss_server = Address::Domain(cfg.server.clone(), cfg.port);
+                let (r, w): (crate::proxy::tunnel::BoxRead, crate::proxy::tunnel::BoxWrite) =
+                    match underlying {
+                        Some(u) => {
+                            // Box::pin: connect 直接递归调 connect (SS-over-X), async 递归须装箱。
+                            let out = Box::pin(u.connect(&ss_server)).await?;
+                            let (r, w) = tokio::io::split(out);
+                            (Box::new(r), Box::new(w))
+                        }
+                        None => {
+                            let s = tokio::net::TcpStream::connect((cfg.server.as_str(), cfg.port)).await?;
+                            let _ = s.set_nodelay(true);
+                            let (r, w) = s.into_split();
+                            (Box::new(r), Box::new(w))
+                        }
+                    };
+                // 2. SS 客户端握手, 真实目标作为 SS 目标头 (server 端到端解出并连)。
+                let (reader, writer) =
+                    crate::proxy::shadowsocks::client_handshake_over(r, w, cfg, &target.host_port()).await?;
+                Ok(OutStream::Ss(crate::proxy::ss_stream::SsStream::new(reader, writer)))
+            }
             // resolve_leaf 已把组解到叶子; 仍是组 = 无健康成员可用。
             other => anyhow::bail!("outbound `{}` 无可用叶子出站, 无法连接 {target}", other.tag()),
         }
@@ -315,6 +347,7 @@ pub enum OutStream {
     Direct(tokio::net::TcpStream),
     Mirage(crate::proxy::mirage_stream::MirageStream),
     Wg(crate::proxy::wg::socket::WgTcpStream),
+    Ss(crate::proxy::ss_stream::SsStream),
 }
 
 impl tokio::io::AsyncRead for OutStream {
@@ -327,6 +360,7 @@ impl tokio::io::AsyncRead for OutStream {
             OutStream::Direct(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             OutStream::Mirage(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             OutStream::Wg(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OutStream::Ss(s) => std::pin::Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -341,6 +375,7 @@ impl tokio::io::AsyncWrite for OutStream {
             OutStream::Direct(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             OutStream::Mirage(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             OutStream::Wg(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            OutStream::Ss(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
     fn poll_flush(
@@ -351,6 +386,7 @@ impl tokio::io::AsyncWrite for OutStream {
             OutStream::Direct(s) => std::pin::Pin::new(s).poll_flush(cx),
             OutStream::Mirage(s) => std::pin::Pin::new(s).poll_flush(cx),
             OutStream::Wg(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OutStream::Ss(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
     fn poll_shutdown(
@@ -361,6 +397,7 @@ impl tokio::io::AsyncWrite for OutStream {
             OutStream::Direct(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             OutStream::Mirage(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             OutStream::Wg(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OutStream::Ss(s) => std::pin::Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -404,6 +441,24 @@ impl OutboundManager {
             total_retrans: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             total_segs_out: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
         })
+    }
+
+    /// 建一个 Shadowsocks 出站节点。`underlying` = SS-over-X 的底层出站 (None = 直连 SS 服务器)。
+    /// SS 无连接池 (按需 connect), 故不像 Mirage 起 WarmPool。
+    fn build_ss(oc: &OutboundConfig, underlying: Option<Arc<OutboundNode>>) -> anyhow::Result<Arc<OutboundNode>> {
+        let OutboundConfig::Shadowsocks { tag, server, server_port, method, password, .. } = oc
+        else {
+            unreachable!("build_ss 只接受 Shadowsocks 配置")
+        };
+        let m = crate::proxy::shadowsocks::Method::parse(method)?;
+        let cfg = Arc::new(crate::proxy::shadowsocks::SsConfig {
+            server: server.clone(),
+            port: *server_port,
+            password: password.clone(),
+            method: m,
+            block_udp: true, // SS 出站仅 TCP
+        });
+        Ok(Arc::new(OutboundNode::Shadowsocks { tag: tag.clone(), cfg, underlying }))
     }
 
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
@@ -473,6 +528,14 @@ impl OutboundManager {
                 OutboundConfig::Block { tag } => {
                     outbounds.insert(tag.clone(), Arc::new(OutboundNode::Block { tag: tag.clone() }));
                 }
+                OutboundConfig::Shadowsocks { tag, underlying, .. } => {
+                    // 同 Mirage: 无 underlying 立即建; 有则延后到 underlying 建好 (Pass 2)。
+                    if underlying.is_some() {
+                        deferred.push(oc);
+                    } else {
+                        outbounds.insert(tag.clone(), Self::build_ss(oc, None)?);
+                    }
+                }
                 _ => {
                     deferred.push(oc);
                 }
@@ -500,6 +563,18 @@ impl OutboundManager {
                         Some(u) => {
                             let u = u.clone();
                             outbounds.insert(tag.clone(), Self::build_mirage(oc, Some(u)));
+                            progress = true;
+                        }
+                        None => next_round.push(oc),
+                    }
+                    continue;
+                }
+                // SS-over-X: 同理, 等 underlying 建好再注入建 SS 出站。
+                if let OutboundConfig::Shadowsocks { tag, underlying: Some(utag), .. } = oc {
+                    match outbounds.get(utag) {
+                        Some(u) => {
+                            let u = u.clone();
+                            outbounds.insert(tag.clone(), Self::build_ss(oc, Some(u))?);
                             progress = true;
                         }
                         None => next_round.push(oc),
@@ -768,6 +843,58 @@ mod connect_tests {
         // 缺端口 / 空 host 报错
         assert!(Address::parse("noport").is_err());
         assert!(Address::parse(":80").is_err());
+    }
+
+    /// SS 出站端到端: connect() 经 SS 出站连一个 loopback SS 服务端, 验证目标解出 + 双向往返。
+    #[tokio::test]
+    async fn ss_outbound_e2e_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let m = crate::proxy::shadowsocks::Method::parse("aes-256-gcm").unwrap();
+            let (mut ssr, mut ssw) =
+                crate::proxy::shadowsocks::server_handshake(r, w, m, "sspw").await.unwrap();
+            let first = ssr.read_chunk().await.unwrap();
+            let (target, hlen) = crate::proxy::shadowsocks::decode_socks_addr(&first).unwrap();
+            assert_eq!(target, "example.com:443", "SS 服务端应解出出站目标");
+            let payload = if first.len() > hlen {
+                first[hlen..].to_vec()
+            } else {
+                ssr.read_chunk().await.unwrap()
+            };
+            assert_eq!(&payload, b"ping-ss-out");
+            ssw.write_all(b"pong-ss-out").await.unwrap();
+        });
+
+        let m = mgr(&format!(
+            r#"[{{"type":"direct","tag":"direct"}},
+                {{"type":"shadowsocks","tag":"ss","server":"{}","server_port":{},
+                  "method":"aes-256-gcm","password":"sspw"}}]"#,
+            addr.ip(), addr.port()
+        ));
+        let node = m.outbounds.get("ss").unwrap().clone();
+        let mut s = node.connect(&Address::parse("example.com:443").unwrap()).await.unwrap();
+        s.write_all(b"ping-ss-out").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = s.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"pong-ss-out", "SS 出站应收到服务端回复");
+        srv.await.unwrap();
+    }
+
+    /// SS-over-Mirage (类 shadow-tls+ss): SS 出站配 underlying=mirage 应能建成 (拓扑排序)。
+    #[tokio::test]
+    async fn ss_over_mirage_builds() {
+        let m = mgr(r#"[
+            {"type":"mirage","tag":"m","server":"192.0.2.1","server_port":443,"password":"p","camouflage_host":"a.com"},
+            {"type":"shadowsocks","tag":"ss","server":"192.0.2.2","server_port":8388,
+             "method":"aes-256-gcm","password":"pw","underlying":"m"}
+        ]"#);
+        assert!(m.outbounds.contains_key("ss"), "SS-over-Mirage 应建成");
     }
 }
 
