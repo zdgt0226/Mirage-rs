@@ -260,6 +260,11 @@ impl OutboundNode {
                 Ok(OutStream::Wg(s))
             }
             OutboundNode::Shadowsocks { cfg, underlying, .. } => {
+                // PSK 格式错先于建连校验 (fail-fast, 别白建 underlying 隧道; SIP022 的 base64 PSK
+                // 长度/格式错是配置问题)。SIP004 密码任意, 无需校验。
+                if cfg.method.is_2022() {
+                    crate::proxy::shadowsocks::decode_ss2022_psk(&cfg.password, cfg.method.key_len())?;
+                }
                 // 1. 拨 SS 服务器: 有 underlying 则骑它 (SS-over-X, 如 SS-over-Mirage), 否则直连。
                 //    两半装箱 → SsStream 类型统一 (BoxRead/BoxWrite)。
                 let ss_server = Address::Domain(cfg.server.clone(), cfg.port);
