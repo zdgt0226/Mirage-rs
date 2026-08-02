@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.8.0-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.8.1-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -296,6 +296,7 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.8.1** | 2026-08-03 | **链式代理 (Chain Proxy)**: 统一出站流接口 `OutboundNode::connect(target)` (地基) · **Mirage-over-X** 套娃 (`underlying`: Mirage 隧道经另一出站拨号, Mirage-over-WG/双跳) · **Shadowsocks 入站** (网关接受 SS 客户端 SIP004, 惰性 salt 抗主动探测) · **Shadowsocks 出站 + SS-over-Mirage** (类 shadow-tls+ss: SS 骑 Mirage 隧道) · **geo 经隧道下载免配 SOCKS 入站** (进程内临时 SOCKS)。均经 Sonnet 多轮复核。 |
 | **v0.8.0** | 2026-08-02 | **TLS record padding** (协议层): 握手后前几条加密记录追加 TLS 1.3 原生零填充, 抹掉"包长序列"指纹 (抗 GFW ML 识别); 收端恒剥零 (兼容基座), 发端 `tuning.tls_padding` 门控 (默认关), 含抹除 server 首帧 TIME_SYNC 固定 10 字节。⚠️ 开启需两端同版。**外部审查加固**: DNS resolver `tcp://` 前缀解析修复 · outbound 循环组返 Result 不 panic · API token 常量时间比较改 `ring` + CSRF 重构进中间件 + `?token=` 限根路径 + `/api/rules` 写前结构化校验/dry-run · 抗审查威胁模型文档 + 泄漏守卫测试 · clippy 门禁。 |
 | **v0.7.0** | 2026-07-30 | **Cipher agility**: 两端有硬件 AES 加速时协商 **AES-256-GCM** (大流量 ~2x, 否则 ChaCha20); 全在加密信道内协商 + `rekey`, **ClientHello 一字不改 (TLS 指纹零触碰)**, 服务端 `tuning.cipher_agility` 门控。**IPv6 隧道传输**: 服务端 v6 监听 + 客户端连 v6 服务端 (`[v6]:port` 括号处理); 透明数据面 v6 epic 评估后否 (fake-IP+服务端远程解析已让客户端 v6 数据面不必要)。 |
 | **v0.6.9** | 2026-07-29 | **DNS 未分类域名自适应分流** (`auto_classify`): 灰域名按解析 IP 归属自动直连/代理 + TTL 学习, 可选 `verify_cn` 非阻塞交叉校验防污染。配置命名统一 snake_case (移除 `load-balance` 别名); 移除从未实现的 `advanced_dns.rules`; 4 路 Sonnet 全局审查加固。 |

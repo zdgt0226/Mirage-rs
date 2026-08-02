@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.8.1] - 链式代理 (统一出站流 + Mirage-over-X + SS 双向 + SS-over-Mirage) (2026-08-03)
 
 ### feat(outbound): Shadowsocks 出站 + SS-over-Mirage 嵌套 (类 shadow-tls+ss)
 
