@@ -54,6 +54,9 @@
             // v0.3.0 起已移除 brutal_rate_bps 别名，强制使用 mbps 单位防溢出！
             "brutal_rate_mbps": 100,            // 要求服务端固定发送速率为 100 Mbps
             "brutal_base_rtt_ms": 45            // 强指定网络物理延迟(ms)，留空则自适应测算
+            // 【链式代理 Mirage-over-X】可选 "underlying": "<出站tag>" —— 本隧道对 server:port
+            // 的连接改经该出站拨号 (如经 WG 网到达 server, 或 Mirage 双跳)。所引出站须先定义、
+            // 不能成环。不写 = 直连 (默认)。嵌套路径无裸 fd → 不吃 brutal, 拥塞控制由底层出站负责。
         },
         {
             "type": "mirage",

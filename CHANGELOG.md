@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### feat(outbound): 链式代理 Mirage-over-X —— Mirage 隧道经另一出站拨号 (underlying_dialer)
+
+链式代理 (#5) 首个能力: Mirage 出站配 `underlying: "<tag>"` 后, 其对 server:port 的连接**经该
+出站拨号**而非物理网卡 —— 实现套娃 (Mirage-over-WG 经 WG 网到达 server / Mirage-over-Mirage
+双跳)。吸收 Gemini 的 underlying_dialer 注入思路。
+- 隧道传输改 `enum TunnelRead/TunnelWrite {Tcp | Boxed}`: **TCP 快路径不变** (Tcp 保留 try_read
+  探活 + 裸 fd 调 brutal); Boxed 骑另一出站的 `OutStream` (嵌套无裸 fd → 跳过 brutal, 拥塞控制
+  由底层出站负责)。`get_raw_fd → Option`, `is_stale` 对嵌套保守判健康。
+- `connect_upstream` 分物理 TCP / underlying 两路; 伪装 TLS 握手抽成对任意字节流生效的
+  `do_fake_tls`; `read_server_handshake` 泛型化。
+- OutboundManager 拓扑排序: Mirage-with-underlying 延后到依赖出站建好再注入; 环/未解析 →
+  `new()` 返回 Err (不 panic)。`check`/`semantic_issues` 报未知 underlying / 自引用。
+- 测试: Mirage-over-direct 建成 / 环形报错 / Tunnel enum is_stale / MirageStream 往返。
+
 ### refactor(outbound): `connect()` 目标改用类型化 `Address` (吸收 Gemini 建议)
 
 `OutboundNode::connect` 从 `&str` 改收 `Address { Domain(host,port) | Socket(SocketAddr) }`:

@@ -370,6 +370,42 @@ pub struct OutboundManager {
 }
 
 impl OutboundManager {
+    /// 建一个 Mirage 出站节点 (含 WarmPool)。`underlying` 为链式代理 (Mirage-over-X) 的底层出站,
+    /// None = 直连。抽出以便 Pass 1 (无 underlying) 与 Pass 2 (依赖 underlying 已建) 复用。
+    fn build_mirage(oc: &OutboundConfig, underlying: Option<Arc<OutboundNode>>) -> Arc<OutboundNode> {
+        let OutboundConfig::Mirage {
+            tag, server, server_port, password, camouflage_host, pool_size,
+            brutal_rate_mbps, brutal_base_rtt_ms, ..
+        } = oc else { unreachable!("build_mirage 只接受 Mirage 配置") };
+        let pool_cfg = Arc::new(PoolConfig {
+            server_host: server.clone(),
+            server_port: *server_port,
+            password: password.clone(),
+            camouflage_host: camouflage_host.clone(),
+            pool_size: *pool_size,
+            underlying,
+        });
+        let bytes_per_sec = brutal_rate_mbps.map(|m| m * 125_000);
+        let brutal_state = Arc::new(crate::proxy::pool::BrutalState {
+            configured_rate: bytes_per_sec,
+            current_rate: Arc::new(std::sync::atomic::AtomicU64::new(bytes_per_sec.unwrap_or(8_000_000))),
+            base_rtt: *brutal_base_rtt_ms,
+            active_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        });
+        let pool = Arc::new(WarmPool::new(pool_cfg, brutal_state));
+        Arc::new(OutboundNode::Mirage {
+            tag: tag.clone(),
+            pool,
+            server_host: server.clone(),
+            server_port: *server_port,
+            server_ip: Arc::new(RwLock::new(None)),
+            rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            snd_cwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_retrans: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            total_segs_out: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        })
+    }
+
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
         let mut outbounds = HashMap::new();
         let mut deferred = Vec::new();
@@ -377,33 +413,14 @@ impl OutboundManager {
         // Pass 1: Leaf nodes
         for oc in &cfg.outbounds {
             match oc {
-                OutboundConfig::Mirage { tag, server, server_port, password, camouflage_host, pool_size, brutal_rate_mbps, brutal_base_rtt_ms } => {
-                    let pool_cfg = Arc::new(PoolConfig {
-                        server_host: server.clone(),
-                        server_port: *server_port,
-                        password: password.clone(),
-                        camouflage_host: camouflage_host.clone(),
-                        pool_size: *pool_size,
-                    });
-                    let bytes_per_sec = brutal_rate_mbps.map(|m| m * 125_000);
-                    let brutal_state = Arc::new(crate::proxy::pool::BrutalState {
-                        configured_rate: bytes_per_sec,
-                        current_rate: Arc::new(std::sync::atomic::AtomicU64::new(bytes_per_sec.unwrap_or(8_000_000))),
-                        base_rtt: *brutal_base_rtt_ms,
-                        active_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-                    });
-                    let pool = Arc::new(WarmPool::new(pool_cfg, brutal_state));
-                    outbounds.insert(tag.clone(), Arc::new(OutboundNode::Mirage {
-                        tag: tag.clone(),
-                        pool,
-                        server_host: server.clone(),
-                        server_port: *server_port,
-                        server_ip: Arc::new(RwLock::new(None)),
-                        rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-                        snd_cwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                        total_retrans: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-                        total_segs_out: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-                    }));
+                OutboundConfig::Mirage { tag, underlying, .. } => {
+                    // 无 underlying → 直连 Mirage, Pass 1 立即建。有 underlying → 依赖另一出站,
+                    // 延后到 Pass 2 (等 underlying 建好再注入)。
+                    if underlying.is_some() {
+                        deferred.push(oc);
+                    } else {
+                        outbounds.insert(tag.clone(), Self::build_mirage(oc, None));
+                    }
                 }
                 OutboundConfig::Wireguard {
                     tag, private_key, peer_public_key, preshared_key, endpoint, address,
@@ -477,6 +494,19 @@ impl OutboundManager {
             let mut next_round = Vec::new();
 
             for oc in pending {
+                // Mirage-over-X: 依赖 underlying 出站已建, 建好则注入并建本节点, 否则下一轮再试。
+                if let OutboundConfig::Mirage { tag, underlying: Some(utag), .. } = oc {
+                    match outbounds.get(utag) {
+                        Some(u) => {
+                            let u = u.clone();
+                            outbounds.insert(tag.clone(), Self::build_mirage(oc, Some(u)));
+                            progress = true;
+                        }
+                        None => next_round.push(oc),
+                    }
+                    continue;
+                }
+
                 let mut hc_url = "".to_string();
                 let mut hc_interval = 0;
                 let mut hc_test_type = "ping".to_string();
@@ -697,6 +727,29 @@ mod connect_tests {
         let node = m.outbounds.get("block").unwrap().clone();
         let t = Address::parse("example.com:80").unwrap();
         assert!(node.connect(&t).await.is_err(), "block 出站应拒绝连接");
+    }
+
+    /// Mirage-over-X: 配了 underlying=direct 应能建成 (Pass 2 注入 underlying)。
+    /// tokio::test: build_mirage → WarmPool::new 内部 spawn 预热任务, 需 runtime。
+    #[tokio::test]
+    async fn mirage_over_underlying_builds() {
+        // 192.0.2.x = TEST-NET, 非路由 (预热后台连不上无所谓, 只验构建/注入)。
+        let m = mgr(r#"[
+            {"type":"direct","tag":"direct"},
+            {"type":"mirage","tag":"m","server":"192.0.2.1","server_port":443,"password":"p","camouflage_host":"a.com","underlying":"direct"}
+        ]"#);
+        assert!(m.outbounds.contains_key("m"), "Mirage-over-direct 应建成");
+    }
+
+    /// 环形 underlying (a→b→a) 无法解析 → OutboundManager::new 返回 Err 而非死循环/panic。
+    #[test]
+    fn cyclic_underlying_errs() {
+        let s = r#"{"inbounds":[],"outbounds":[
+            {"type":"mirage","tag":"a","server":"192.0.2.1","server_port":443,"password":"p","camouflage_host":"x","underlying":"b"},
+            {"type":"mirage","tag":"b","server":"192.0.2.2","server_port":443,"password":"p","camouflage_host":"x","underlying":"a"}
+        ],"routing":{"default_outbound":"a","rules":[]}}"#;
+        let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
+        assert!(OutboundManager::new(&cfg).is_err(), "环形 underlying 应报错");
     }
 
     #[test]
