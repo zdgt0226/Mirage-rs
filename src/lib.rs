@@ -271,6 +271,14 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             if let Some(tuning) = config.tuning {
                 // 服务端 cipher agility 开关 (设进全局, control.rs 读)。
                 crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
+                // TLS record padding 开关 (设进全局, CryptoWriter::new 读)。收端恒剥零无需开关。
+                crate::crypto::cipher::set_tls_padding(tuning.tls_padding);
+                if tuning.tls_padding {
+                    warn!(
+                        "已开启 tls_padding: 要求两端都升到支持剥零的版本。老对端不剥零, 会把填充零\
+                         当 content_type 解析失败断连。"
+                    );
+                }
                 if tuning.cipher_agility {
                     // 防呆: 开 agility 后 TIME_SYNC 的 proto_ver 变 0x02, 老客户端 (<v0.7.0)
                     // 不认 0x02 → 丢弃 TIME_SYNC 不同步时钟 → 若本机与服务端时钟偏差超容差

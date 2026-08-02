@@ -79,7 +79,13 @@
         // 两端都有硬件 AES 加速时切 AES-256-GCM (大流量 ~2x), 否则维持 ChaCha20-Poly1305。
         // ⚠️ 仅在**所有客户端都已升到 v0.7.0+** 时开 —— 老客户端严格只认旧协议版本, 收到新版本会
         // 丢时间同步。ClientHello 一字不改, TLS 指纹不受影响。客户端无需配置, 自动响应。
-        "cipher_agility": false
+        "cipher_agility": false,
+
+        // 【TLS record padding, 默认 false】开了则对握手后前几条加密记录追加 TLS 1.3 原生零填充,
+        // 抹掉"包长序列"指纹 (抗 GFW 对握手后前几包长度的 ML 识别)。收端恒剥零, 故也在客户端
+        // 配置里各自开。⚠️ 仅在**两端都已升到支持剥零的版本**时开 —— 老对端不剥零, 会把填充零
+        // 当 content type 解析失败断连 (同 cipher_agility 约束)。ClientHello 不受影响。
+        "tls_padding": false
 
         // ebpf_mode 默认 auto: 服务端自动跳过 eBPF (入站是加密流, sockmap/XDP/sk_lookup
         // 对服务端都无价值)。调试才设 "force"。
