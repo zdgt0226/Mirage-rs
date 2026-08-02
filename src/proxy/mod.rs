@@ -1,6 +1,7 @@
 pub mod brutal;
 pub mod pool;
 pub mod tunnel;
+pub mod mirage_stream;
 pub mod socks5;
 pub mod handler;
 pub mod udp_relay;
