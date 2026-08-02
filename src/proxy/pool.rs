@@ -567,10 +567,11 @@ impl WarmPool {
         write_half.write_all(&tail_bytes).await?;
         write_half.flush().await?;
 
-        // 4. 派生会话密钥 (使用 client_random 作为 salt)
+        // 4. 派生会话密钥 (使用 client_random 作为 salt)。WarmPool 隧道恒物理 TCP → Tcp 变体
+        //    (保留 try_read 探活 + 裸 fd 调 brutal, 快路径不变)。Boxed 仅用于 Mirage-over-X 嵌套。
         let (mut crypto_reader, mut crypto_writer) = create_crypto_pair(
-            read_half,
-            write_half,
+            crate::proxy::tunnel::TunnelRead::Tcp(read_half),
+            crate::proxy::tunnel::TunnelWrite::Tcp(write_half),
             &cfg.password,
             &client_random,
             true, // is_initiator = true (Client -> Server)
@@ -727,7 +728,10 @@ impl WarmPool {
         {
             let q = self.queue.lock().await;
             for t in q.iter() {
-                crate::proxy::brutal::set_brutal_rate(t.get_raw_fd(), new_rate);
+                // 池内隧道恒物理 TCP → Some(fd)。嵌套 (Boxed) 无 fd 不进池, 故 None 不会命中此处。
+                if let Some(fd) = t.get_raw_fd() {
+                    crate::proxy::brutal::set_brutal_rate(fd, new_rate);
+                }
                 total += 1;
             }
         }

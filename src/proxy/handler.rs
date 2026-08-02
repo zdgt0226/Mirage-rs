@@ -346,7 +346,8 @@ pub async fn proxy_tcp_target(
             // 但仍以正确顺序声明, 免得日后加了超时/竞速把这个窗口变成真 bug。
             // (早前把 guard 声明在 upload/download 之前, 正常路径靠下面的显式 drop 兜住顺序,
             //  唯独 cancel 路径会先关 fd 再移出 set —— 现已修正。)
-            let _guard = pool.active_fd_guard(active_fd);
+            // 物理 TCP 隧道注册 fd 供 brutal 动态调速; 嵌套 (Boxed, 无 fd) 跳过 (无 brutal)。
+            let _guard = active_fd.map(|fd| pool.active_fd_guard(fd));
 
             let ((tw, up_bytes), (tr, down_bytes)) = tokio::join!(upload, download);
             drop(_guard);   // 正常路径: 先从 set 移除，防止微秒级死 FD 暴露 (cancel 路径靠声明顺序)
