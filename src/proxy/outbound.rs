@@ -204,6 +204,116 @@ impl OutboundNode {
             _ => self.clone(),
         }
     }
+
+    /// 统一出站流接口: 经本出站连到 `target` (`host:port`), 返回一条普通字节流。
+    ///
+    /// 让**进程内消费者** (geo 下载 / 订阅刷新 / 链式代理) 直接用隧道, 不再绕 SOCKS 入站自连
+    /// (见 brain unified-outbound-stream)。组出站先 `resolve_leaf` 选叶子再连。
+    pub async fn connect(self: &Arc<Self>, target: &str) -> anyhow::Result<OutStream> {
+        let leaf = self.resolve_leaf();
+        match &*leaf {
+            OutboundNode::Direct { .. } => {
+                let s = tokio::net::TcpStream::connect(target).await?;
+                let _ = s.set_nodelay(true);
+                Ok(OutStream::Direct(s))
+            }
+            OutboundNode::Block { tag } => {
+                anyhow::bail!("outbound `{tag}` 是 block, 拒绝连接 {target}")
+            }
+            OutboundNode::Mirage { pool, .. } => {
+                let mut tunnel = pool.get().await?;
+                // 目标头: [2B len][host:port]; 服务端据此远程解析并连接。与 handler.rs 一致。
+                let tb = target.as_bytes();
+                if tb.len() > u16::MAX as usize {
+                    anyhow::bail!("target 过长: {} 字节", tb.len());
+                }
+                let mut hdr = Vec::with_capacity(2 + tb.len());
+                hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());
+                hdr.extend_from_slice(tb);
+                tunnel.writer.send_data(&hdr).await?;
+                Ok(OutStream::Mirage(crate::proxy::mirage_stream::MirageStream::from_tunnel(tunnel)))
+            }
+            OutboundNode::Wireguard { .. } => {
+                let wt = leaf.wg_tunnel().await?;
+                let (host, port) = split_host_port(target)?;
+                let remote = crate::proxy::wg::resolve_target(&wt, host, port).await?;
+                let s = crate::proxy::wg::socket::WgTcpStream::connect(wt, remote).await?;
+                Ok(OutStream::Wg(s))
+            }
+            // resolve_leaf 已把组解到叶子; 仍是组 = 无健康成员可用。
+            other => anyhow::bail!("outbound `{}` 无可用叶子出站, 无法连接 {target}", other.tag()),
+        }
+    }
+}
+
+/// 解析 `host:port` (支持 `[v6]:port`)。
+fn split_host_port(t: &str) -> anyhow::Result<(&str, u16)> {
+    if let Some(rest) = t.strip_prefix('[') {
+        let (h, p) = rest
+            .split_once("]:")
+            .ok_or_else(|| anyhow::anyhow!("非法 [v6]:port: {t}"))?;
+        Ok((h, p.parse()?))
+    } else {
+        let (h, p) = t
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("target 缺端口 (需 host:port): {t}"))?;
+        Ok((h, p.parse()?))
+    }
+}
+
+/// 统一出站字节流。闭集枚举 (无 vtable); 各变体都 Unpin, poll 委托直接 `Pin::new`。
+pub enum OutStream {
+    Direct(tokio::net::TcpStream),
+    Mirage(crate::proxy::mirage_stream::MirageStream),
+    Wg(crate::proxy::wg::socket::WgTcpStream),
+}
+
+impl tokio::io::AsyncRead for OutStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            OutStream::Direct(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OutStream::Mirage(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            OutStream::Wg(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for OutStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            OutStream::Direct(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            OutStream::Mirage(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            OutStream::Wg(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            OutStream::Direct(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OutStream::Mirage(s) => std::pin::Pin::new(s).poll_flush(cx),
+            OutStream::Wg(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            OutStream::Direct(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OutStream::Mirage(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            OutStream::Wg(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
 }
 
 pub struct OutboundManager {
@@ -491,6 +601,52 @@ mod wg_tests {
                 "配置含 {want} 错误却没被拦下: {issues:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::config::Config;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn mgr(outbounds_json: &str) -> OutboundManager {
+        let s = format!(
+            r#"{{"inbounds":[],"outbounds":{outbounds_json},"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+        );
+        let cfg: Config = serde_json::from_str(&s).unwrap();
+        OutboundManager::new(&cfg).unwrap()
+    }
+
+    /// Direct 出站的统一 connect: 应给出一条能读写的普通字节流 (回环 echo 往返)。
+    #[tokio::test]
+    async fn connect_direct_roundtrips() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut b = [0u8; 8];
+            let n = s.read(&mut b).await.unwrap();
+            s.write_all(&b[..n]).await.unwrap();
+        });
+
+        let m = mgr(r#"[{"type":"direct","tag":"direct"}]"#);
+        let node = m.outbounds.get("direct").unwrap().clone();
+        let mut s = node.connect(&addr.to_string()).await.unwrap();
+        s.write_all(b"ping").await.unwrap();
+        s.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping", "Direct connect 应回环通");
+    }
+
+    /// Block 出站 connect 必须报错 (拒绝连接), 绝不静默放行。
+    #[tokio::test]
+    async fn connect_block_errors() {
+        let m = mgr(r#"[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}]"#);
+        let node = m.outbounds.get("block").unwrap().clone();
+        assert!(node.connect("example.com:80").await.is_err(), "block 出站应拒绝连接");
     }
 }
 

@@ -1,5 +1,17 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(outbound): 统一出站流接口 + geo 经隧道下载免配 SOCKS 入站
+
+硬地基重构 (解锁链式代理), 见 brain unified-outbound-stream。
+- **Phase A**: 抽 `OutboundNode::connect(target) -> OutStream` 统一字节流接口。新增 `MirageStream`
+  把 Mirage 隧道帧式 async (`send_data`/`recv_data`) 适配成 `AsyncRead+AsyncWrite` (安全 poll
+  适配, 无 unsafe); `OutStream` 枚举覆盖 Direct/Mirage/Wireguard/Block/组。不动 handler 热路径。
+- **Phase B**: geo `via: proxy` **不再依赖用户配 socks/mixed 入站** —— 进程内自动起仅回环、免认证
+  的临时 SOCKS (`internal_socks`), 经**完整路由 → 隧道**下载 (geo 仍受规则控制)。透明网关模式
+  也能拉 geo; 顺带消除旧的"自连用户入站还得过其认证"auth bug。等价 sing-box download_detour。
+
 ## [v0.8.0] - TLS record padding (抗包长序列指纹) + 外部审查加固 (2026-08-02)
 
 ### feat(crypto): TLS record padding —— 抹掉握手后包长序列指纹 (协议层, 面向 v0.8.0)

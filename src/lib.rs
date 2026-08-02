@@ -20,24 +20,6 @@ use tracing::{info, warn, error, Level};
 /// 监听非回环地址却没配 auth = **开放代理**: 任何能连到该端口的人都能白嫖隧道,
 /// 流量从你的服务端出去, 出口 IP 会被滥用/拉黑 (对抗审查部署尤其致命 —— 招来注意力)。
 /// 不阻止启动 (向后兼容既有配置 + 可信内网仍是合法用法), 但必须让用户看见。
-/// 对 URL userinfo 段做百分号编码。
-///
-/// 必要性: 认证凭据要拼进 `socks5://user:pass@host` 时, 密码里的 `@ : / ?` 等字符会破坏
-/// URL 结构, reqwest::Proxy::all() 直接 InvalidUrl。只保留 RFC 3986 unreserved 字符,
-/// 其余全部 %XX —— userinfo 段这样最省心且绝不出错。
-fn urlencoding_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
 fn warn_if_open_proxy(kind: &str, listen: &str, port: u16, has_auth: bool) {
     if has_auth {
         return;
@@ -252,6 +234,8 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     let mut geo_sources: Vec<crate::config::GeoSource> = Vec::new();
     let mut geo_update_days: u32 = 7;
     let mut socks_proxy_url: Option<String> = None;
+    // geo via=proxy 用的内部临时 SOCKS: 先绑 (拿 URL), accept 循环等 CoreState 就绪后再起。
+    let mut internal_socks_listener: Option<tokio::net::TcpListener> = None;
     if let Ok(content) = std::fs::read_to_string(config_path) {
         // 配置校验: 拼错的键此前被 serde 静默忽略 (用户永远不知道自己配了个寂寞),
         // 引用不存在的 outbound 也不会有任何提示。这里一次性把问题打出来。
@@ -319,43 +303,21 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 !r.geosite.is_empty() || !r.geoip.is_empty()
             );
 
-            // 探测本地 socks/mixed inbound 给 geo via=proxy 用. 0.0.0.0 自动改 127.0.0.1
-            // (本地自连不能用通配地址).
-            for ib in &config.inbounds {
-                let (listen, port, auth) = match ib {
-                    crate::config::InboundConfig::Socks { listen, port, auth, .. } => (listen, port, auth),
-                    crate::config::InboundConfig::Mixed { listen, port, auth, .. } => (listen, port, auth),
-                    _ => continue,
-                };
-                // 0.0.0.0 / :: 通配符改回环 loopback (URL 里指自身). IPv6 主机 (含 ::1 /
-                // fd00:: 等) 按 RFC 3986 必须用 [] 包裹, 否则 reqwest::Proxy::all() InvalidUrl.
-                let host_raw = if listen == "0.0.0.0" {
-                    "127.0.0.1"
-                } else if listen == "::" {
-                    "::1"
-                } else {
-                    listen.as_str()
-                };
-                let host = if host_raw.contains(':') && !host_raw.starts_with('[') {
-                    format!("[{}]", host_raw)
-                } else {
-                    host_raw.to_string()
-                };
-                // ⚠️ 入站设了认证时, 凭据**必须**编进 proxy URL —— geo updater 用这个入站
-                // 当代理下载, 自己连自己的代理也要过认证。漏了会得到
-                // "client does not support username/password auth", geo 永远下不下来。
-                // reqwest::Proxy::all() 认 URL 里的 user:pass@host (RFC 1929 / Basic 都走它)。
-                socks_proxy_url = Some(match auth {
-                    Some(a) => format!(
-                        "socks5://{}:{}@{}:{}",
-                        urlencoding_encode(&a.username),
-                        urlencoding_encode(&a.password),
-                        host,
-                        port
-                    ),
-                    None => format!("socks5://{}:{}", host, port),
-                });
-                break;
+            // geo via=proxy: 起**内部临时 SOCKS** 经隧道下载, 不再自连用户 socks 入站
+            // (透明网关无入站时也能用; 免认证免了旧的"自连自认证"auth bug, 见 brain
+            // unified-outbound-stream)。先绑端口拿 URL 交给 updater, accept 循环等 CoreState
+            // 就绪后再起 (见 watcher 建好之后)。走完整路由 → geo 仍受路由规则控制。
+            let has_proxy_source = geo_sources
+                .iter()
+                .any(|s| matches!(s.via, crate::config::GeoVia::Proxy));
+            if needs_geo && has_proxy_source {
+                match crate::proxy::internal_socks::bind_loopback().await {
+                    Ok((l, url)) => {
+                        socks_proxy_url = Some(url);
+                        internal_socks_listener = Some(l);
+                    }
+                    Err(e) => warn!("内部 geo SOCKS 绑定失败: {e}; via=proxy 将回退直连"),
+                }
             }
         }
     }
@@ -444,6 +406,11 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             return Err(e);
         }
     };
+
+    // CoreState 就绪, 起内部 geo SOCKS 的 accept 循环 (端口已在上面绑好并给了 updater)。
+    if let Some(l) = internal_socks_listener.take() {
+        crate::proxy::internal_socks::serve(l, watcher.state.clone());
+    }
 
     // 初始化 eBPF 引擎 (仅当 enable_ebpf 为 true, server-only 模式默认跳过)
     let (ebpf_engine, xdp_engine, transparent_engine) = if enable_ebpf {
@@ -890,19 +857,3 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     std::process::exit(0);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::urlencoding_encode;
-
-    #[test]
-    fn userinfo_encoding_survives_special_chars() {
-        // unreserved 原样
-        assert_eq!(urlencoding_encode("mirage-1.0_x~"), "mirage-1.0_x~");
-        // 会破坏 URL 结构的字符必须被编码 —— 这正是 bug 的根因
-        assert_eq!(urlencoding_encode("p@ss:w/rd"), "p%40ss%3Aw%2Frd");
-        // openssl rand -base64 常见的 + / =
-        assert_eq!(urlencoding_encode("a+b/c="), "a%2Bb%2Fc%3D");
-        // 空字符串不炸
-        assert_eq!(urlencoding_encode(""), "");
-    }
-}

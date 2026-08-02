@@ -194,7 +194,9 @@
 
         // 多源 Geo 下载: 每源独立 URL + via。下载后存为 <name>.dat, 路由规则引用
         // 形如 "geosite": ["cn"] 用默认库, 或 "geosite": ["loyalsoldier.dat:cn"] 指名库。
-        // via: direct=直连拉 (客户端常用) / proxy=走本地 socks/mixed 入站 (国内服务器拉 GitHub 用)。
+        // via: direct=直连拉 (客户端常用) / proxy=经隧道拉 (中国拉 GitHub 用)。
+        // ⚠️ via=proxy 现在**无需配置 socks/mixed 入站** —— 进程内自动起临时 SOCKS 经隧道下载
+        // (走完整路由, geo 仍受规则控制), 透明网关模式也能用。url 可写多个镜像 (数组), 逐个回退。
         "geo_sources": [
             {
                 "name": "geosite",           // 域名规则库 → geosite.dat

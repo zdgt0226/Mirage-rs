@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [refactor, outbound, geo, architecture]
 created: "2026-07-23T10:08:11"
-updated: "2026-07-27T08:58:17"
+updated: "2026-08-02T19:28:20"
 ---
 
 ## compiled_truth
@@ -74,3 +74,9 @@ mirage 出站 → 隧道。**这是"经隧道下载"的正确语义**, 不是绕
   summary: "接口设计定为 OutboundStream 枚举(Raw/Async/Framed)保住 Direct splice + Mirage 合帧(性能持平); 重估: 无干净低风险 stage-1 消费者(geo 借 SOCKS 本就是正确语义), 真收益在 chain-proxy, 建议与之同期做"
   source: "2026-07-27 规划"
   affects: [unified-outbound-stream]
+
+- time: 2026-08-02T19:28:20
+  kind: decision
+  summary: "已实现 Phase A+B (2026-08-02, PR #19, 分支 feat/unified-outbound, Sonnet 复核无问题)。Phase A: OutboundNode::connect(target)->OutStream 统一字节流; MirageStream 适配器(帧式 async→AsyncRead+AsyncWrite, 半程 move 进 future 交还模式无 unsafe, close_notify→EOF); OutStream 枚举(Direct/Mirage/Wg 闭集委托); 覆盖全变体; 不动 handler 热路径(Phase C 去重留后续)。Phase B: geo via=proxy 改用进程内自动起的仅回环免认证临时 SOCKS(internal_socks, 走完整路由→隧道), 不再自连用户 socks 入站——透明网关也能拉 geo, 消除旧 self-connect auth bug; 等价 sing-box download_detour; lib.rs 删掉用户入站探测 + 孤儿 urlencoding_encode。测试: MirageStream 真 TCP 往返/connect Direct/Block/internal_socks 回环。剩 Phase C(handler 用 connect+relay 去重, 高风险动热路径, 可选)。此接口是链式代理(5)的前置, 现已就位。"
+  source: "PR #19 + Sonnet 复核 + full test 17 组"
+  affects: [src/proxy/mirage_stream.rs, src/proxy/internal_socks.rs, src/proxy/outbound.rs, src/lib.rs]
