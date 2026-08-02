@@ -261,6 +261,48 @@ pub fn encode_socks_addr(target: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 解析 SOCKS5 目标地址头 `[ATYP][ADDR][PORT_BE]` (encode_socks_addr 的逆, SS 入站用)。
+/// 返回 (host:port 串, 头部消耗字节数) —— 剩余字节是紧随的初始载荷。
+pub fn decode_socks_addr(buf: &[u8]) -> Result<(String, usize)> {
+    if buf.is_empty() {
+        bail!("SS 目标头为空");
+    }
+    match buf[0] {
+        0x01 => {
+            if buf.len() < 1 + 4 + 2 {
+                bail!("SS IPv4 目标头截断");
+            }
+            let ip = std::net::Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Ok((format!("{ip}:{port}"), 7))
+        }
+        0x04 => {
+            if buf.len() < 1 + 16 + 2 {
+                bail!("SS IPv6 目标头截断");
+            }
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[1..17]);
+            let ip = std::net::Ipv6Addr::from(o);
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            Ok((format!("[{ip}]:{port}"), 19))
+        }
+        0x03 => {
+            if buf.len() < 2 {
+                bail!("SS 域名目标头截断");
+            }
+            let dlen = buf[1] as usize;
+            let end = 2 + dlen;
+            if buf.len() < end + 2 {
+                bail!("SS 域名目标头截断");
+            }
+            let host = std::str::from_utf8(&buf[2..end]).map_err(|_| anyhow!("SS 域名非 UTF-8"))?;
+            let port = u16::from_be_bytes([buf[end], buf[end + 1]]);
+            Ok((format!("{host}:{port}"), end + 2))
+        }
+        a => bail!("SS 未知 ATYP: {a:#x}"),
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // SIP022 (Shadowsocks 2022) 帧结构
 // ────────────────────────────────────────────────────────────────────────────
@@ -360,12 +402,35 @@ pub struct SsWriter<W> {
     inner: W,
     crypter: Crypter,
     buf: Vec<u8>,
+    /// **惰性 salt** (仅服务端): 待发的下行 salt (明文)。服务端**不**在握手时立刻吐 salt —— 那会
+    /// 让"连上不发数据就收到一串高熵随机数"成为可被主动探测的指纹 (早期 SS 被封的核心特征)。
+    /// 改为攒到有真实下行数据要发时, 把 salt 拼进首个加密块**一次** write 送出。None = 客户端
+    /// (客户端本就该主动带 salt) 或 salt 已发。
+    pending_salt: Option<Vec<u8>>,
 }
 
 impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
-    /// 写入明文, 内部按 MAX_CHUNK 切块并逐块加密。
+    /// 写入明文, 内部按 MAX_CHUNK 切块并逐块加密。首次写入时若有惰性 salt, 拼在首块前一次送出。
     pub async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let mut pending = self.pending_salt.take();
         for chunk in data.chunks(MAX_CHUNK) {
+            if let Some(salt) = pending.take() {
+                // 惰性 salt: [salt 明文][加密长度+tag][加密载荷+tag] 一次 write。防主动探测:
+                // 探针连上不发数据 → 上游无回包 → 本函数不被调 → 服务端一字节不吐。
+                // 出错时把 salt 恢复到 pending_salt 保持状态一致 (不静默丢 salt)。注意: SS 写错
+                // 本质不可续 —— crypter nonce 有状态、seal 已推进, 调用方须丢弃本 writer, 不重试;
+                // 恢复仅为状态正确, 不承诺可续写。
+                let mut out = salt.clone();
+                if let Err(e) = self.seal_chunk_into(chunk, &mut out) {
+                    self.pending_salt = Some(salt);
+                    return Err(e);
+                }
+                if let Err(e) = self.inner.write_all(&out).await {
+                    self.pending_salt = Some(salt);
+                    return Err(e);
+                }
+                continue;
+            }
             self.buf.clear();
             // [加密长度+tag]
             self.buf.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
@@ -382,6 +447,8 @@ impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
             // 一次 write_all 送出整个 chunk, 避免长度与载荷分成两个小包
             self.inner.write_all(&self.buf).await?;
         }
+        // data 为空 (无 chunk) 时 pending 未消费 → 放回, 留到下次真有数据再发 (probe 防护)。
+        self.pending_salt = pending;
         self.inner.flush().await
     }
 
@@ -422,7 +489,7 @@ pub fn test_writer<W: AsyncWriteExt + Unpin>(
     salt: &[u8],
 ) -> SsWriter<W> {
     let subkey = hkdf_subkey(master, salt, method.key_len());
-    SsWriter { inner, crypter: Crypter::new(method, &subkey), buf: Vec::new() }
+    SsWriter { inner, crypter: Crypter::new(method, &subkey), buf: Vec::new(), pending_salt: None }
 }
 
 pub struct SsReader<R> {
@@ -589,6 +656,7 @@ pub async fn connect(
         inner: w,
         crypter: Crypter::new(cfg.method, &subkey),
         buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
+        pending_salt: None, // 客户端主动带 salt (下方 build_handshake 里), 无惰性 salt
     };
     // 整个握手 (salt + 头部) 拼成一个缓冲, **一次** write 送出。
     let handshake = build_handshake(&mut writer, cfg.method, &salt, target)?;
@@ -604,6 +672,54 @@ pub async fn connect(
         ss2022_first_done: false,
     };
     Ok((reader, writer, fd))
+}
+
+/// SS **服务端**握手 (仅 SIP004): 生成本端下行 salt 发出并建 SsWriter; SsReader 懒读客户端上行
+/// salt (首个 read_chunk 时)。返回 (SsReader, SsWriter)。首个解密 chunk 的前缀是 SOCKS 目标头
+/// (见 decode_socks_addr), 其后是初始载荷。
+///
+/// SIP022 服务端 (请求盐回显 / EIH / 时间戳防重放) **未实现** —— 调用方须在 check 阶段仅允许
+/// SIP004 method 配 SS 入站, 这里再兜一层。
+pub async fn server_handshake<R, W>(
+    read_half: R,
+    write_half: W,
+    method: Method,
+    password: &str,
+) -> Result<(SsReader<R>, SsWriter<W>)>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    if method.is_2022() {
+        bail!("SS 入站暂不支持 SIP022 (仅 SIP004: aes-128/256-gcm / chacha20-ietf-poly1305)");
+    }
+    let key_len = method.key_len();
+    let master = evp_bytes_to_key(password, key_len);
+
+    // 下行 (server→client) salt: 每连接随机, 派生写子密钥。**不立刻发** —— 存进 SsWriter 惰性
+    // salt, 攒到有真实下行数据时才随首个加密块一起送出 (见 SsWriter.pending_salt)。防主动探测:
+    // 探针连上不发数据 → 服务端一字节不吐 (若立刻发 salt = 吐一串高熵随机数, 是可探测指纹)。
+    let mut salt = vec![0u8; key_len];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
+        .map_err(|_| anyhow!("生成 salt 失败"))?;
+    let subkey = hkdf_subkey(&master, &salt, key_len);
+
+    let writer = SsWriter {
+        inner: write_half,
+        crypter: Crypter::new(method, &subkey),
+        buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
+        pending_salt: Some(salt),
+    };
+    // 上行读端: crypter=None → 首个 read_chunk 懒读 client salt 派生读子密钥。SIP004 不用 req_salt。
+    let reader = SsReader {
+        inner: read_half,
+        crypter: None,
+        method,
+        master,
+        req_salt: Vec::new(),
+        ss2022_first_done: false,
+    };
+    Ok((reader, writer))
 }
 
 #[cfg(test)]
@@ -725,6 +841,7 @@ mod tests {
                 inner: &mut wire,
                 crypter: Crypter::new(method, &subkey),
                 buf: Vec::new(),
+                pending_salt: None,
             };
             w.write_all(b"hello").await.unwrap();
             w.write_all(&vec![0xABu8; 40000]).await.unwrap(); // 跨多个 chunk
@@ -765,6 +882,7 @@ mod tests {
                 inner: &mut wire,
                 crypter: Crypter::new(method, &subkey),
                 buf: Vec::new(),
+                pending_salt: None,
             };
             w.write_all(b"payload").await.unwrap();
         }
@@ -904,6 +1022,7 @@ mod handshake_shape_tests {
             inner: CountingWriter { writes: 0, buf: Vec::new() },
             crypter: Crypter::new(method, key),
             buf: Vec::new(),
+            pending_salt: None,
         }
     }
 
@@ -936,5 +1055,72 @@ mod handshake_shape_tests {
                      说明头部没被拼进来 (会导致分多次发送 = 可观察的握手指纹)",
                     min, hs.len());
         }
+    }
+
+    /// SS 入站服务端握手端到端: 客户端 connect() ↔ 服务端 server_handshake, 验证服务端能解出
+    /// 目标地址 + 收发双向解密加密 (SIP004)。
+    #[tokio::test]
+    async fn ss_server_handshake_e2e() {
+        use tokio::net::{TcpListener, TcpStream};
+        let method = Method::parse("aes-256-gcm").unwrap();
+        let password = "sspw";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let (mut ssr, mut ssw) = server_handshake(r, w, method, password).await.unwrap();
+            // 首 chunk = SOCKS 目标头 (我们的 client 把 addr 单独封一块)。
+            let first = ssr.read_chunk().await.unwrap();
+            let (target, hlen) = decode_socks_addr(&first).unwrap();
+            assert_eq!(target, "example.com:443", "服务端应解出目标");
+            assert_eq!(&first[hlen..], b"", "本 client addr 单独成块, 无附带载荷");
+            // 下一 chunk = 客户端数据。
+            let data = ssr.read_chunk().await.unwrap();
+            assert_eq!(&data, b"hello-ss", "服务端应解密客户端数据");
+            ssw.write_all(b"reply-ss").await.unwrap();
+        });
+
+        let cfg = SsConfig {
+            server: addr.ip().to_string(),
+            port: addr.port(),
+            password: password.into(),
+            method,
+            block_udp: true,
+        };
+        let (mut cr, mut cw, _fd) = connect(&cfg, "example.com:443").await.unwrap();
+        cw.write_all(b"hello-ss").await.unwrap();
+        let back = cr.read_chunk().await.unwrap();
+        assert_eq!(&back, b"reply-ss", "客户端应解密服务端回复");
+        srv.await.unwrap();
+    }
+
+    /// 防主动探测: 探针连上但不发数据 → 服务端**一字节不吐** (惰性 salt)。
+    /// 旧的即时发 salt 会让"一碰就吐高熵随机数"成为可探测指纹。
+    #[tokio::test]
+    async fn ss_server_lazy_salt_no_probe_leak() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        let method = Method::parse("aes-256-gcm").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let (_ssr, _ssw) = server_handshake(r, w, method, "pw").await.unwrap();
+            // 握手后不写任何下行数据 (模拟未认证/无回包), 保持连接一会。
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let mut probe = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            probe.read(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "客户端发数据前服务端不应吐任何字节 (防主动探测)");
+        srv.await.unwrap();
     }
 }
