@@ -261,6 +261,48 @@ pub fn encode_socks_addr(target: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// 解析 SOCKS5 目标地址头 `[ATYP][ADDR][PORT_BE]` (encode_socks_addr 的逆, SS 入站用)。
+/// 返回 (host:port 串, 头部消耗字节数) —— 剩余字节是紧随的初始载荷。
+pub fn decode_socks_addr(buf: &[u8]) -> Result<(String, usize)> {
+    if buf.is_empty() {
+        bail!("SS 目标头为空");
+    }
+    match buf[0] {
+        0x01 => {
+            if buf.len() < 1 + 4 + 2 {
+                bail!("SS IPv4 目标头截断");
+            }
+            let ip = std::net::Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Ok((format!("{ip}:{port}"), 7))
+        }
+        0x04 => {
+            if buf.len() < 1 + 16 + 2 {
+                bail!("SS IPv6 目标头截断");
+            }
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&buf[1..17]);
+            let ip = std::net::Ipv6Addr::from(o);
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            Ok((format!("[{ip}]:{port}"), 19))
+        }
+        0x03 => {
+            if buf.len() < 2 {
+                bail!("SS 域名目标头截断");
+            }
+            let dlen = buf[1] as usize;
+            let end = 2 + dlen;
+            if buf.len() < end + 2 {
+                bail!("SS 域名目标头截断");
+            }
+            let host = std::str::from_utf8(&buf[2..end]).map_err(|_| anyhow!("SS 域名非 UTF-8"))?;
+            let port = u16::from_be_bytes([buf[end], buf[end + 1]]);
+            Ok((format!("{host}:{port}"), end + 2))
+        }
+        a => bail!("SS 未知 ATYP: {a:#x}"),
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // SIP022 (Shadowsocks 2022) 帧结构
 // ────────────────────────────────────────────────────────────────────────────
@@ -606,6 +648,53 @@ pub async fn connect(
     Ok((reader, writer, fd))
 }
 
+/// SS **服务端**握手 (仅 SIP004): 生成本端下行 salt 发出并建 SsWriter; SsReader 懒读客户端上行
+/// salt (首个 read_chunk 时)。返回 (SsReader, SsWriter)。首个解密 chunk 的前缀是 SOCKS 目标头
+/// (见 decode_socks_addr), 其后是初始载荷。
+///
+/// SIP022 服务端 (请求盐回显 / EIH / 时间戳防重放) **未实现** —— 调用方须在 check 阶段仅允许
+/// SIP004 method 配 SS 入站, 这里再兜一层。
+pub async fn server_handshake<R, W>(
+    read_half: R,
+    mut write_half: W,
+    method: Method,
+    password: &str,
+) -> Result<(SsReader<R>, SsWriter<W>)>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    if method.is_2022() {
+        bail!("SS 入站暂不支持 SIP022 (仅 SIP004: aes-128/256-gcm / chacha20-ietf-poly1305)");
+    }
+    let key_len = method.key_len();
+    let master = evp_bytes_to_key(password, key_len);
+
+    // 下行 (server→client) salt: 每连接随机, 先发出。
+    let mut salt = vec![0u8; key_len];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
+        .map_err(|_| anyhow!("生成 salt 失败"))?;
+    write_half.write_all(&salt).await?;
+    write_half.flush().await?;
+    let subkey = hkdf_subkey(&master, &salt, key_len);
+
+    let writer = SsWriter {
+        inner: write_half,
+        crypter: Crypter::new(method, &subkey),
+        buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
+    };
+    // 上行读端: crypter=None → 首个 read_chunk 懒读 client salt 派生读子密钥。SIP004 不用 req_salt。
+    let reader = SsReader {
+        inner: read_half,
+        crypter: None,
+        method,
+        master,
+        req_salt: Vec::new(),
+        ss2022_first_done: false,
+    };
+    Ok((reader, writer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,5 +1025,45 @@ mod handshake_shape_tests {
                      说明头部没被拼进来 (会导致分多次发送 = 可观察的握手指纹)",
                     min, hs.len());
         }
+    }
+
+    /// SS 入站服务端握手端到端: 客户端 connect() ↔ 服务端 server_handshake, 验证服务端能解出
+    /// 目标地址 + 收发双向解密加密 (SIP004)。
+    #[tokio::test]
+    async fn ss_server_handshake_e2e() {
+        use tokio::net::{TcpListener, TcpStream};
+        let method = Method::parse("aes-256-gcm").unwrap();
+        let password = "sspw";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let (mut ssr, mut ssw) = server_handshake(r, w, method, password).await.unwrap();
+            // 首 chunk = SOCKS 目标头 (我们的 client 把 addr 单独封一块)。
+            let first = ssr.read_chunk().await.unwrap();
+            let (target, hlen) = decode_socks_addr(&first).unwrap();
+            assert_eq!(target, "example.com:443", "服务端应解出目标");
+            assert_eq!(&first[hlen..], b"", "本 client addr 单独成块, 无附带载荷");
+            // 下一 chunk = 客户端数据。
+            let data = ssr.read_chunk().await.unwrap();
+            assert_eq!(&data, b"hello-ss", "服务端应解密客户端数据");
+            ssw.write_all(b"reply-ss").await.unwrap();
+        });
+
+        let cfg = SsConfig {
+            server: addr.ip().to_string(),
+            port: addr.port(),
+            password: password.into(),
+            method,
+            block_udp: true,
+        };
+        let (mut cr, mut cw, _fd) = connect(&cfg, "example.com:443").await.unwrap();
+        cw.write_all(b"hello-ss").await.unwrap();
+        let back = cr.read_chunk().await.unwrap();
+        assert_eq!(&back, b"reply-ss", "客户端应解密服务端回复");
+        srv.await.unwrap();
     }
 }

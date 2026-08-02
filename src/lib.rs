@@ -683,6 +683,37 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
+            crate::config::InboundConfig::Shadowsocks { tag, listen, port, method, password } => {
+                let listen_addr = crate::net_util::join_host_port(&listen, port);
+                let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
+                let m = match crate::proxy::shadowsocks::Method::parse(&method) {
+                    Ok(m) if m.is_2022() => {
+                        error!("SS 入站 `{tag}` method `{method}` 是 SIP022, 入站暂不支持, 未启动");
+                        continue;
+                    }
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("SS 入站 `{tag}` method 非法: {e}, 未启动");
+                        continue;
+                    }
+                };
+                let pw: std::sync::Arc<str> = password.as_str().into();
+                tokio::spawn(async move {
+                    if let Ok(listener) = tokio::net::TcpListener::bind(&listen_addr).await {
+                        info!("Shadowsocks inbound listening on {} (SIP004 {:?})", listen_addr, m);
+                        while let Ok((stream, _)) = listener.accept().await {
+                            let st = state_clone.clone();
+                            let pwc = pw.clone();
+                            let tg = inbound_tag.clone();
+                            tokio::spawn(async move {
+                                crate::proxy::ss_inbound::handle_ss_client(stream, st, m, pwc, tg).await;
+                            });
+                        }
+                    } else {
+                        error!("Failed to bind Shadowsocks inbound on {}", listen_addr);
+                    }
+                });
+            }
             crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, .. } => {
                 let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());

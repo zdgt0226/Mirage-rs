@@ -205,6 +205,17 @@ pub enum InboundConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<InboundAuth>,
     },
+    /// Shadowsocks 入站 (链式代理): 网关接受 SS 客户端连接 → 经路由/隧道出。仅 **SIP004** AEAD
+    /// (aes-128/256-gcm / chacha20-ietf-poly1305); SIP022 服务端未实现 (check 阶段挡)。
+    Shadowsocks {
+        tag: String,
+        listen: String,
+        port: u16,
+        /// 加密方式 (SIP004 only): aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305。
+        method: String,
+        /// 密码 (经 EVP_BytesToKey 派生主密钥, 与 SS 客户端一致)。
+        password: String,
+    },
     Dns {
         tag: String,
         listen: String,
@@ -897,6 +908,7 @@ impl Config {
                 | InboundConfig::Dns { tag, .. }
                 | InboundConfig::MirageServer { tag, .. }
                 | InboundConfig::Mixed { tag, .. }
+                | InboundConfig::Shadowsocks { tag, .. }
                 | InboundConfig::Transparent { tag, .. } => tag.as_str(),
             })
             .collect();
@@ -986,6 +998,7 @@ impl Config {
                 | InboundConfig::Dns { tag, port, .. }
                 | InboundConfig::MirageServer { tag, port, .. }
                 | InboundConfig::Mixed { tag, port, .. }
+                | InboundConfig::Shadowsocks { tag, port, .. }
                 | InboundConfig::Transparent { tag, port, .. } => (tag.as_str(), *port),
             };
             if in_tags.contains(&tag) {
@@ -994,6 +1007,19 @@ impl Config {
             in_tags.push(tag);
             if port == 0 {
                 issues.push(format!("inbound `{tag}` 的 port 为 0"));
+            }
+            if let InboundConfig::Shadowsocks { tag, method, password, .. } = ib {
+                if password.is_empty() {
+                    issues.push(format!("shadowsocks 入站 `{tag}` 的 password 为空"));
+                }
+                match crate::proxy::shadowsocks::Method::parse(method) {
+                    Ok(m) if m.is_2022() => issues.push(format!(
+                        "shadowsocks 入站 `{tag}` 的 method `{method}` 是 SIP022, 入站暂不支持 \
+                         (仅 SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305)"
+                    )),
+                    Ok(_) => {}
+                    Err(e) => issues.push(format!("shadowsocks 入站 `{tag}` 的 method 非法: {e}")),
+                }
             }
             if let InboundConfig::MirageServer { tag, password, upstream, .. } = ib {
                 if password.is_empty() {
@@ -1356,6 +1382,20 @@ mod validation_tests {
             Config::parse_with_diagnostics(&v.to_string()).is_ok(),
             "合法 and 应能解析"
         );
+    }
+
+    #[test]
+    fn ss_inbound_sip022_rejected_sip004_ok() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            {"type":"shadowsocks","tag":"ss","listen":"0.0.0.0","port":8388,
+             "method":"2022-blake3-chacha20-poly1305","password":"x"}
+        ]);
+        assert!(has(&issues_of(&v), "SIP022"), "SS 入站配 SIP022 应报, 实际: {:?}", issues_of(&v));
+        // SIP004 合法方式不报
+        v["inbounds"][0]["method"] = serde_json::json!("aes-256-gcm");
+        v["inbounds"][0]["password"] = serde_json::json!("pw");
+        assert!(!has(&issues_of(&v), "SIP022"), "SIP004 不该报 SIP022");
     }
 
     #[test]
