@@ -192,7 +192,7 @@ enum Sink {
     Direct { out: Arc<UdpSocket> },
     /// 经 Mirage 隧道: 一条隧道多路复用所有目标。
     Mirage {
-        writer: Arc<tokio::sync::Mutex<crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>>>,
+        writer: Arc<tokio::sync::Mutex<crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>>>,
     },
     /// 命中 block 规则: 逐包丢弃 (而不是拒绝整个关联)。
     Block,

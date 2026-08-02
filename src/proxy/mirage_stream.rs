@@ -17,13 +17,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::crypto::aead::{CryptoReader, CryptoWriter};
-use crate::proxy::tunnel::Tunnel;
+use crate::proxy::tunnel::{Tunnel, TunnelRead, TunnelWrite};
 
-type Reader = CryptoReader<OwnedReadHalf>;
-type Writer = CryptoWriter<OwnedWriteHalf>;
+type Reader = CryptoReader<TunnelRead>;
+type Writer = CryptoWriter<TunnelWrite>;
 type ReadFut = Pin<Box<dyn Future<Output = (Reader, io::Result<Vec<u8>>)> + Send>>;
 type WriteFut = Pin<Box<dyn Future<Output = (Writer, io::Result<()>)> + Send>>;
 
@@ -216,8 +215,8 @@ mod tests {
 
         let cs = TcpStream::connect(addr).await.unwrap();
         let (r, w) = cs.into_split();
-        let reader = CryptoReader::new(r, &master, true); // 发起端: 读 s2c
-        let writer = CryptoWriter::new(w, &master, true); // 发起端: 写 c2s
+        let reader = CryptoReader::new(TunnelRead::Tcp(r), &master, true); // 发起端: 读 s2c
+        let writer = CryptoWriter::new(TunnelWrite::Tcp(w), &master, true); // 发起端: 写 c2s
         let mut ms = MirageStream::from_tunnel(Tunnel::new(reader, writer));
 
         ms.write_all(b"hello from stream").await.unwrap();

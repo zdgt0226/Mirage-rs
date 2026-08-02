@@ -279,6 +279,11 @@ pub enum OutboundConfig {
         brutal_rate_mbps: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_base_rtt_ms: Option<u64>,
+        /// 链式代理 (Mirage-over-X): 设了则本 Mirage 隧道对 server:port 的连接**经该 tag 指定的
+        /// 出站拨号** (而非物理网卡), 实现套娃 (如 Mirage-over-WG 经 WG 网到达 server, 或
+        /// Mirage-over-Mirage 双跳)。所引 outbound 必须先定义且不能形成环。不设 = 直连 (原行为)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        underlying: Option<String>,
     },
     /// WireGuard 出站: 选中的流量经 WG 隧道发往 peer, 不走 Mirage 隧道。
     ///
@@ -952,7 +957,7 @@ impl Config {
 
         // Mirage 出站的必填项非空
         for ob in &self.outbounds {
-            if let OutboundConfig::Mirage { tag, server, server_port, password, .. } = ob {
+            if let OutboundConfig::Mirage { tag, server, server_port, password, underlying, .. } = ob {
                 if server.trim().is_empty() {
                     issues.push(format!("mirage 出站 `{tag}` 的 server 为空"));
                 }
@@ -961,6 +966,14 @@ impl Config {
                 }
                 if password.is_empty() {
                     issues.push(format!("mirage 出站 `{tag}` 的 password 为空 (服务端会认证失败)"));
+                }
+                // 链式代理 underlying: 引用的出站必须存在且不能自引用 (环由启动构建的拓扑排序拦)。
+                if let Some(u) = underlying {
+                    if u == tag {
+                        issues.push(format!("mirage 出站 `{tag}` 的 underlying 自引用 (会形成环)"));
+                    } else if !tags.contains(&u.as_str()) {
+                        issues.push(format!("mirage 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"));
+                    }
                 }
             }
         }

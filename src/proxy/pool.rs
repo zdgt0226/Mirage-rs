@@ -1,5 +1,6 @@
-use crate::crypto::aead::create_crypto_pair;
-use crate::proxy::tunnel::Tunnel;
+use crate::crypto::aead::{create_crypto_pair, CryptoReader, CryptoWriter};
+use crate::proxy::tunnel::{Tunnel, TunnelRead, TunnelWrite};
+use crate::proxy::outbound::{Address, OutboundNode};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,6 +17,9 @@ pub struct PoolConfig {
     pub password: String,
     pub camouflage_host: String,
     pub pool_size: usize,
+    /// 链式代理: 有则本 Mirage 隧道对 server 的连接经此出站拨号 (Mirage-over-X), 而非物理 TCP。
+    /// OutboundManager 构建时解析 config 的 `underlying` tag 注入。None = 直连 (默认)。
+    pub underlying: Option<Arc<OutboundNode>>,
 }
 
 /**
@@ -246,7 +250,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use std::time::Duration;
 
-pub async fn read_server_handshake(stream: &mut tokio::net::tcp::OwnedReadHalf) -> Result<()> {
+pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<()> {
     // v0.4.5-alpha.17: 放弃超时随机化, 消除固定 12s/1.5s 阈值的客户端时序指纹.
     // GFW 若主动操纵服务端响应时序 (拦截/延迟 ServerHello) 测客户端恒定放弃时间可
     // 识别 Mirage 客户端. 每连接各随机一次 (非每轮, 保持单次握手内一致), 围绕原值
@@ -519,62 +523,11 @@ impl WarmPool {
 
     /// 核心握手逻辑：建立 TCP 并包装 AEAD Crypto 层
     async fn connect_upstream(cfg: &PoolConfig, brutal_state: &BrutalState) -> Result<Tunnel> {
-        let addr = crate::net_util::join_host_port(&cfg.server_host, cfg.server_port);
-        // 建连必须有上限: 黑洞路由 (丢 SYN 不回 RST) 下 TcpStream::connect 会挂到内核
-        // tcp_syn_retries (~127s), 期间 in_flight 一直 +1, builder 判 idle+in_flight
-        // 达标而停止补货 → 池饿死、pool.get() 反复 10s 超时。8s 超时快速失败, 走 Err
-        // 分支回滚 in_flight + 退避重试, 让弹性池能切换/重连。
-        let stream = timeout(Duration::from_secs(8), TcpStream::connect(&addr))
-            .await
-            .map_err(|_| anyhow::anyhow!("connect to {} timed out (8s, 黑洞路由?)", addr))??;
-        
-        // --- Brutal 拥塞控制 ---
-        //
-        // alpha.25 撤回 alpha.21 加的显式 SO_SNDBUF/SO_RCVBUF = 8MB.
-        // 手动固定 buffer size 会 disable Linux TCP auto-tuning, 反而在高
-        // 丢包链路 (7% loss) 上造成 bufferbloat, in-flight 太多导致重传
-        // 排队拖垮吞吐. 用户实测 alpha.22 (仅带这段 sockopt) 就从 15 Mbps
-        // 掉到 2 Mbps, 7× 回归元凶. 让 kernel auto-tune 自适应 BDP+丢包.
-        use std::os::unix::io::AsRawFd;
-        let fd = stream.as_raw_fd();
-
-        // Brutal 拥塞控制 (客户端 → 服务端方向, 控制上传速度).
-        // 默认关闭: 仅当 config 显式配了 brutal_rate_mbps 才启用.
-        // 动态速率调节 (基于 BPF RTT 反馈) 在另一处循环里维护, 见
-        // BrutalState::current_rate 的所有 store 调用点.
-        if brutal_state.configured_rate.is_some() {
-            let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
-            crate::proxy::brutal::apply_brutal(fd, current_rate);
-        }
-        // ------------------------------------------------
-        
-        // 关键性能优化：关闭 Nagle 算法，降低首包延迟
-        stream.set_nodelay(true)?;
-
-        let (mut read_half, mut write_half) = stream.into_split();
-
-        // 1. 发送带 token 的 ClientHello
-        let token = crate::crypto::hello_auth::make_session_token(&cfg.password);
-        let (hello_bytes, client_random) = crate::crypto::tls_raw::build_client_hello(&cfg.camouflage_host, &token);
-        write_half.write_all(&hello_bytes).await?;
-        write_half.flush().await?;
-
-        // 2. 读取服务端的 ServerHello 及握手 flight
-        read_server_handshake(&mut read_half).await?;
-
-        // 3. 发送假 Finished tail 完成 TLS 1.3 握手模拟
-        let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail();
-        write_half.write_all(&tail_bytes).await?;
-        write_half.flush().await?;
-
-        // 4. 派生会话密钥 (使用 client_random 作为 salt)
-        let (mut crypto_reader, mut crypto_writer) = create_crypto_pair(
-            read_half,
-            write_half,
-            &cfg.password,
-            &client_random,
-            true, // is_initiator = true (Client -> Server)
-        );
+        // 建连 + 伪装握手 + 派生密钥: 默认物理 TCP; 配了 underlying 则经该出站拨号 (Mirage-over-X)。
+        let (mut crypto_reader, mut crypto_writer) = match &cfg.underlying {
+            Some(u) => Self::handshake_over_underlying(cfg, u).await?,
+            None => Self::handshake_over_tcp(cfg, brutal_state).await?,
+        };
 
         // 5. v0.4 协议: 收 server 主动下发的 TIME_SYNC 帧, 写入全局 TIME_OFFSET.
         //    帧格式: [0x01 type][0x01 ver][8B u64 BE server unix sec] = 10 字节
@@ -642,6 +595,80 @@ impl WarmPool {
         }
 
         Ok(Tunnel::new(crypto_reader, crypto_writer))
+    }
+
+    /// 物理 TCP 建连 + 伪装握手 + 派生密钥 (默认路径; 带 brutal/nodelay/裸 fd 快路径, Tcp 变体)。
+    async fn handshake_over_tcp(
+        cfg: &PoolConfig,
+        brutal_state: &BrutalState,
+    ) -> Result<(CryptoReader<TunnelRead>, CryptoWriter<TunnelWrite>)> {
+        let addr = crate::net_util::join_host_port(&cfg.server_host, cfg.server_port);
+        // 8s 超时: 黑洞路由 (丢 SYN 不回 RST) 下 connect 会挂到内核 tcp_syn_retries (~127s)。
+        let stream = timeout(Duration::from_secs(8), TcpStream::connect(&addr))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect to {} timed out (8s, 黑洞路由?)", addr))??;
+
+        // Brutal 拥塞控制 (仅 config 配了 brutal_rate_mbps 时): 直接对裸 fd 设置。
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        if brutal_state.configured_rate.is_some() {
+            let current_rate = brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
+            crate::proxy::brutal::apply_brutal(fd, current_rate);
+        }
+        stream.set_nodelay(true)?; // 关 Nagle, 降首包延迟
+
+        let (mut read_half, mut write_half) = stream.into_split();
+        let client_random = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
+        // 恒 Tcp 变体 (保留 try_read 探活 + 裸 fd 调 brutal)。
+        Ok(create_crypto_pair(
+            TunnelRead::Tcp(read_half),
+            TunnelWrite::Tcp(write_half),
+            &cfg.password,
+            &client_random,
+            true,
+        ))
+    }
+
+    /// 经 underlying 出站拨号 server:port (Mirage-over-X 链式): 无裸 fd → 无 brutal/nodelay,
+    /// 底层拥塞控制由 underlying 出站负责。返回 Boxed 变体隧道。
+    async fn handshake_over_underlying(
+        cfg: &PoolConfig,
+        underlying: &Arc<OutboundNode>,
+    ) -> Result<(CryptoReader<TunnelRead>, CryptoWriter<TunnelWrite>)> {
+        let target = Address::Domain(cfg.server_host.clone(), cfg.server_port);
+        let out = timeout(Duration::from_secs(15), underlying.connect(&target))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("经 underlying 连 {}:{} 超时 (15s)", cfg.server_host, cfg.server_port)
+            })??;
+        let (mut read_half, mut write_half) = tokio::io::split(out);
+        let client_random = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
+        Ok(create_crypto_pair(
+            TunnelRead::Boxed(Box::new(read_half)),
+            TunnelWrite::Boxed(Box::new(write_half)),
+            &cfg.password,
+            &client_random,
+            true,
+        ))
+    }
+
+    /// 伪装 TLS 握手 (发带 token 的 ClientHello / 读 server flight / 发假 Finished tail),
+    /// 返回 client_random (会话密钥派生的 salt)。对任意字节流生效 (物理 TCP / underlying 流)。
+    async fn do_fake_tls<Rd, Wr>(rh: &mut Rd, wh: &mut Wr, cfg: &PoolConfig) -> Result<[u8; 32]>
+    where
+        Rd: tokio::io::AsyncRead + Unpin,
+        Wr: tokio::io::AsyncWrite + Unpin,
+    {
+        let token = crate::crypto::hello_auth::make_session_token(&cfg.password);
+        let (hello_bytes, client_random) =
+            crate::crypto::tls_raw::build_client_hello(&cfg.camouflage_host, &token);
+        wh.write_all(&hello_bytes).await?;
+        wh.flush().await?;
+        read_server_handshake(rh).await?;
+        let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail();
+        wh.write_all(&tail_bytes).await?;
+        wh.flush().await?;
+        Ok(client_random)
     }
 
     /// O(1) 复杂度提取连接.
@@ -727,7 +754,11 @@ impl WarmPool {
         {
             let q = self.queue.lock().await;
             for t in q.iter() {
-                crate::proxy::brutal::set_brutal_rate(t.get_raw_fd(), new_rate);
+                // 物理 TCP 隧道 → Some(fd) 调 brutal。嵌套 (Mirage-over-X, Boxed) 隧道也在池里但
+                // 无裸 fd → None → 跳过 brutal (其拥塞控制由 underlying 出站的物理层负责)。
+                if let Some(fd) = t.get_raw_fd() {
+                    crate::proxy::brutal::set_brutal_rate(fd, new_rate);
+                }
                 total += 1;
             }
         }

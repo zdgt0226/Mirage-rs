@@ -1,32 +1,108 @@
-use crate::crypto::aead::{CryptoReader, CryptoWriter};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+use crate::crypto::aead::{CryptoReader, CryptoWriter};
+
+/// 类型擦除的**任意**字节流半程 (用于 Mirage-over-X 嵌套: 隧道骑另一个出站的 OutStream)。
+pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+pub type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// 隧道底层读半程。**保留 TCP 快路径** (Tcp 变体直接持 OwnedReadHalf, 可 try_read 探活 / 取
+/// 裸 fd 调 brutal); Boxed 变体用于 Mirage-over-X 嵌套 (骑另一出站的流, 无裸 fd)。
+/// 早先硬绑 OwnedReadHalf, 只能骑物理 TCP; 现改 enum 以支持链式代理, 且不牺牲 TCP 路径。
+pub enum TunnelRead {
+    Tcp(OwnedReadHalf),
+    Boxed(BoxRead),
+}
+
+pub enum TunnelWrite {
+    Tcp(OwnedWriteHalf),
+    Boxed(BoxWrite),
+}
+
+impl TunnelRead {
+    /// 非阻塞探活 (仅 TCP 变体真探; 嵌套无裸 fd → 返 WouldBlock 让 is_stale 判健康, 靠 recv 检测死)。
+    fn try_read_probe(&self) -> std::io::Result<usize> {
+        match self {
+            TunnelRead::Tcp(s) => {
+                let mut probe = [0u8; 1];
+                s.try_read(&mut probe)
+            }
+            TunnelRead::Boxed(_) => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        }
+    }
+
+    /// 裸 fd (仅 TCP 变体有; 嵌套返 None)。
+    fn raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            // OwnedReadHalf 无 as_raw_fd, 经 as_ref() 取 &TcpStream。
+            TunnelRead::Tcp(s) => Some(s.as_ref().as_raw_fd()),
+            TunnelRead::Boxed(_) => None,
+        }
+    }
+}
+
+impl AsyncRead for TunnelRead {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelRead::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            TunnelRead::Boxed(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for TunnelWrite {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            TunnelWrite::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            TunnelWrite::Boxed(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelWrite::Tcp(s) => Pin::new(s).poll_flush(cx),
+            TunnelWrite::Boxed(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            TunnelWrite::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            TunnelWrite::Boxed(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 /// 抽象出的加密信道。
-/// 拆分为 reader 和 writer，彻底解耦 TCP 的收发，避免加锁。
+/// 拆分为 reader 和 writer，彻底解耦底层传输的收发，避免加锁。
 pub struct Tunnel {
-    pub reader: CryptoReader<OwnedReadHalf>,
-    pub writer: CryptoWriter<OwnedWriteHalf>,
+    pub reader: CryptoReader<TunnelRead>,
+    pub writer: CryptoWriter<TunnelWrite>,
     pub created_at: std::time::Instant,
     pub max_age_sec: u64,
 }
 
 impl Tunnel {
-    pub fn new(reader: CryptoReader<OwnedReadHalf>, writer: CryptoWriter<OwnedWriteHalf>) -> Self {
-        Self { 
-            reader, 
-            writer, 
+    pub fn new(reader: CryptoReader<TunnelRead>, writer: CryptoWriter<TunnelWrite>) -> Self {
+        Self {
+            reader,
+            writer,
             created_at: std::time::Instant::now(),
             // 30 ~ 50s 随机抖动, 必须 < 服务端 first_chunk 超时 60s, 否则
             // pool 会发出"服务端已 reap 但客户端以为还活着"的死 tunnel,
             // 触发 handler 5 分钟级 read timeout (用户实测过).
             // 抖动是为了避免大量 warmup 同时刷新冲垮服务端.
-            max_age_sec: 30 + fastrand::u64(0..20)
+            max_age_sec: 30 + fastrand::u64(0..20),
         }
     }
 
-    pub fn get_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        self.reader.inner().as_ref().as_raw_fd()
+    /// 裸 fd。仅物理 TCP 隧道有; Mirage-over-X 嵌套隧道返 None (无裸 fd → 调用方跳过
+    /// brutal / fd 级 shutdown)。
+    pub fn get_raw_fd(&self) -> Option<std::os::unix::io::RawFd> {
+        self.reader.inner().raw_fd()
     }
 
     /// 非阻塞探测隧道是否已死/半开 (stale)。
@@ -39,15 +115,12 @@ impl Tunnel {
     ///   - `Ok(n>0)`          意外数据 (远端脏/RST 前的残留) → 不可用
     ///   - 其他 `Err`         RST / 错误 → 死
     ///
-    /// 非健康一律判 stale, 不派发。对齐 camouflage_pool::is_alive 的做法 (非阻塞、
-    /// 任何可读事件即丢弃, 消费与否无所谓因为脏隧道不保留)。
-    ///
-    /// 已知边角: 若 connect_upstream 读 TIME_SYNC 超时 (3s) 而帧迟到滞留缓冲, 这里会把
-    /// 该健康隧道误判 stale 丢弃 (罕见, builder 会补, 不致命)。
+    /// 非健康一律判 stale, 不派发。**嵌套 (Boxed) 隧道也进 WarmPool**, 但无裸 fd 可探活 →
+    /// try_read_probe 恒返 WouldBlock 判健康, 故 sweeper 不会主动清掉死的嵌套隧道; 它们靠
+    /// max_age (30~50s) 过期回收 + handler 首写失败时的换隧道重试兜底 (代价: 偶尔浪费一条)。
     pub fn is_stale(&self) -> bool {
-        let mut probe = [0u8; 1];
         !matches!(
-            self.reader.inner().try_read(&mut probe),
+            self.reader.inner().try_read_probe(),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
         )
     }
@@ -65,8 +138,13 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let (cr, cw) = client.into_split();
-        let (reader, writer) =
-            crate::crypto::aead::create_crypto_pair(cr, cw, "pw", &[0u8; 32], true);
+        let (reader, writer) = crate::crypto::aead::create_crypto_pair(
+            TunnelRead::Tcp(cr),
+            TunnelWrite::Tcp(cw),
+            "pw",
+            &[0u8; 32],
+            true,
+        );
         (Tunnel::new(reader, writer), server)
     }
 
