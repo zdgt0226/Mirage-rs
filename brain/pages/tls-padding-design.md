@@ -4,7 +4,7 @@ title: "TLS Padding 设计 (v1): 抗包长序列 ML, TLS1.3 原生零填充, 两
 category: decision
 status: active
 created: "2026-08-02T01:48:36"
-updated: "2026-08-02T01:50:37"
+updated: "2026-08-02T14:17:54"
 ---
 
 ## compiled_truth
@@ -54,3 +54,9 @@ updated: "2026-08-02T01:50:37"
   summary: "TLS padding 设计 v1: TLS1.3 原生零填充, 两阶段上线(先收端剥零再发端填充), 前 4 条 record 双向均匀随机 [0,256], 协议层改动待新 minor 版本 tag"
   source: "问答式路线 + aead.rs 帧格式核实"
   affects: [tls-padding-design]
+
+- time: 2026-08-02T14:17:54
+  kind: decision
+  summary: "已实现并随 v0.8.0 发布 (2026-08-02, PR #18, commit 91e4944)。收端恒剥零 + 发端 tuning.tls_padding 门控(默认关) 均已落地 src/crypto/aead.rs, 3 测试绿, Sonnet 复核无问题, Release CI 出 16 二进制。后续增强(记录切分/伪真实分布/长度模型升级)仍待做。"
+  source: "v0.8.0 发布"
+  affects: [src/crypto/aead.rs]
