@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.8.0] - TLS record padding (抗包长序列指纹) + 外部审查加固 (2026-08-02)
 
 ### feat(crypto): TLS record padding —— 抹掉握手后包长序列指纹 (协议层, 面向 v0.8.0)
 
