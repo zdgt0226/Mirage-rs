@@ -754,7 +754,8 @@ impl WarmPool {
         {
             let q = self.queue.lock().await;
             for t in q.iter() {
-                // 池内隧道恒物理 TCP → Some(fd)。嵌套 (Boxed) 无 fd 不进池, 故 None 不会命中此处。
+                // 物理 TCP 隧道 → Some(fd) 调 brutal。嵌套 (Mirage-over-X, Boxed) 隧道也在池里但
+                // 无裸 fd → None → 跳过 brutal (其拥塞控制由 underlying 出站的物理层负责)。
                 if let Some(fd) = t.get_raw_fd() {
                     crate::proxy::brutal::set_brutal_rate(fd, new_rate);
                 }

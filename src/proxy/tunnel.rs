@@ -115,8 +115,9 @@ impl Tunnel {
     ///   - `Ok(n>0)`          意外数据 (远端脏/RST 前的残留) → 不可用
     ///   - 其他 `Err`         RST / 错误 → 死
     ///
-    /// 非健康一律判 stale, 不派发。嵌套 (Boxed) 隧道无裸 fd 探活 → 恒返 WouldBlock 判健康,
-    /// 靠 recv 时检测死 (嵌套隧道也不进 WarmPool, 见 connect 的 underlying 路径)。
+    /// 非健康一律判 stale, 不派发。**嵌套 (Boxed) 隧道也进 WarmPool**, 但无裸 fd 可探活 →
+    /// try_read_probe 恒返 WouldBlock 判健康, 故 sweeper 不会主动清掉死的嵌套隧道; 它们靠
+    /// max_age (30~50s) 过期回收 + handler 首写失败时的换隧道重试兜底 (代价: 偶尔浪费一条)。
     pub fn is_stale(&self) -> bool {
         !matches!(
             self.reader.inner().try_read_probe(),
