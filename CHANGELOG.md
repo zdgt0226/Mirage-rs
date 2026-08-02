@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### refactor(outbound): `connect()` 目标改用类型化 `Address` (吸收 Gemini 建议)
+
+`OutboundNode::connect` 从 `&str` 改收 `Address { Domain(host,port) | Socket(SocketAddr) }`:
+Domain 交由出站远程解析 (Mirage 服务端 / WG 隧道内 DNS, 抗污染), Socket 直用免解析。替掉
+零散的 host:port 字符串解析 (删 split_host_port), 也为链式代理 (#5) 的 dialer 注入铺路。
+避开 Gemini 方案的三坑 (不加 Sync bound / 不上 async_trait / 不整体 trait 化, 见 brain
+chain-proxy-roadmap)。connect 目前仅测试消费, 趁无生产调用方定型签名免日后返工。
+
 ### feat(outbound): 统一出站流接口 + geo 经隧道下载免配 SOCKS 入站
 
 硬地基重构 (解锁链式代理), 见 brain unified-outbound-stream。

@@ -205,15 +205,21 @@ impl OutboundNode {
         }
     }
 
-    /// 统一出站流接口: 经本出站连到 `target` (`host:port`), 返回一条普通字节流。
+    /// 统一出站流接口: 经本出站连到 `target`, 返回一条普通字节流。
     ///
     /// 让**进程内消费者** (geo 下载 / 订阅刷新 / 链式代理) 直接用隧道, 不再绕 SOCKS 入站自连
     /// (见 brain unified-outbound-stream)。组出站先 `resolve_leaf` 选叶子再连。
-    pub async fn connect(self: &Arc<Self>, target: &str) -> anyhow::Result<OutStream> {
+    /// target 用类型化 [`Address`] (吸收 Gemini 建议): Domain 交由出站/服务端解析, Socket 直用,
+    /// 免各处重复解析 host:port 字符串; 也为链式代理 (#5) 的 dialer 注入铺路。
+    pub async fn connect(self: &Arc<Self>, target: &Address) -> anyhow::Result<OutStream> {
         let leaf = self.resolve_leaf();
         match &*leaf {
             OutboundNode::Direct { .. } => {
-                let s = tokio::net::TcpStream::connect(target).await?;
+                // Socket 直连 (免解析); Domain 交给 tokio 解析。
+                let s = match target {
+                    Address::Socket(sa) => tokio::net::TcpStream::connect(sa).await?,
+                    Address::Domain(h, p) => tokio::net::TcpStream::connect((h.as_str(), *p)).await?,
+                };
                 let _ = s.set_nodelay(true);
                 Ok(OutStream::Direct(s))
             }
@@ -222,8 +228,10 @@ impl OutboundNode {
             }
             OutboundNode::Mirage { pool, .. } => {
                 let mut tunnel = pool.get().await?;
-                // 目标头: [2B len][host:port]; 服务端据此远程解析并连接。与 handler.rs 一致。
-                let tb = target.as_bytes();
+                // 目标头: [2B len][host:port]; 服务端据此远程解析并连接 (Domain 保留域名交服务端
+                // 解析, 抗污染)。与 handler.rs 一致。
+                let hp = target.host_port();
+                let tb = hp.as_bytes();
                 if tb.len() > u16::MAX as usize {
                     anyhow::bail!("target 过长: {} 字节", tb.len());
                 }
@@ -235,8 +243,11 @@ impl OutboundNode {
             }
             OutboundNode::Wireguard { .. } => {
                 let wt = leaf.wg_tunnel().await?;
-                let (host, port) = split_host_port(target)?;
-                let remote = crate::proxy::wg::resolve_target(&wt, host, port).await?;
+                // WG 需 SocketAddr: Socket 直用; Domain 经隧道内 DNS 解析。
+                let remote = match target {
+                    Address::Socket(sa) => *sa,
+                    Address::Domain(h, p) => crate::proxy::wg::resolve_target(&wt, h, *p).await?,
+                };
                 let s = crate::proxy::wg::socket::WgTcpStream::connect(wt, remote).await?;
                 Ok(OutStream::Wg(s))
             }
@@ -246,18 +257,56 @@ impl OutboundNode {
     }
 }
 
-/// 解析 `host:port` (支持 `[v6]:port`)。
-fn split_host_port(t: &str) -> anyhow::Result<(&str, u16)> {
-    if let Some(rest) = t.strip_prefix('[') {
-        let (h, p) = rest
-            .split_once("]:")
-            .ok_or_else(|| anyhow::anyhow!("非法 [v6]:port: {t}"))?;
-        Ok((h, p.parse()?))
-    } else {
-        let (h, p) = t
-            .rsplit_once(':')
-            .ok_or_else(|| anyhow::anyhow!("target 缺端口 (需 host:port): {t}"))?;
-        Ok((h, p.parse()?))
+/// 类型化出站目标 (吸收 Gemini 方案): 域名与已解析地址分开, 免各处重复 host:port 字符串解析。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Address {
+    /// 域名 + 端口。交由出站远程解析 (Mirage 服务端 / WG 隧道内 DNS), 抗本地 DNS 污染。
+    Domain(String, u16),
+    /// 已解析的 socket 地址 (v4/v6)。
+    Socket(std::net::SocketAddr),
+}
+
+impl Address {
+    /// 解析 `host:port` / `[v6]:port` / `ip:port`: 纯 IP → Socket, 否则 Domain。
+    pub fn parse(s: &str) -> anyhow::Result<Address> {
+        // 完整 socket 地址 (含 ip:port / [v6]:port) 优先。
+        if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+            return Ok(Address::Socket(sa));
+        }
+        // 否则拆 host:port ([v6]:port 或域名:port)。
+        let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+            rest.split_once("]:")
+                .ok_or_else(|| anyhow::anyhow!("非法 [v6]:port: {s}"))?
+        } else {
+            s.rsplit_once(':')
+                .ok_or_else(|| anyhow::anyhow!("target 缺端口 (需 host:port): {s}"))?
+        };
+        if host.is_empty() {
+            anyhow::bail!("target host 为空: {s}");
+        }
+        Ok(Address::Domain(host.to_string(), port.parse()?))
+    }
+
+    /// 端口。
+    pub fn port(&self) -> u16 {
+        match self {
+            Address::Domain(_, p) => *p,
+            Address::Socket(sa) => sa.port(),
+        }
+    }
+
+    /// `host:port` 串 (Mirage 目标头 / 日志用); v6 socket 自带方括号。
+    pub fn host_port(&self) -> String {
+        match self {
+            Address::Domain(h, p) => crate::net_util::join_host_port(h, *p),
+            Address::Socket(sa) => sa.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.host_port())
     }
 }
 
@@ -633,7 +682,7 @@ mod connect_tests {
 
         let m = mgr(r#"[{"type":"direct","tag":"direct"}]"#);
         let node = m.outbounds.get("direct").unwrap().clone();
-        let mut s = node.connect(&addr.to_string()).await.unwrap();
+        let mut s = node.connect(&Address::parse(&addr.to_string()).unwrap()).await.unwrap();
         s.write_all(b"ping").await.unwrap();
         s.flush().await.unwrap();
         let mut buf = [0u8; 4];
@@ -646,7 +695,26 @@ mod connect_tests {
     async fn connect_block_errors() {
         let m = mgr(r#"[{"type":"direct","tag":"direct"},{"type":"block","tag":"block"}]"#);
         let node = m.outbounds.get("block").unwrap().clone();
-        assert!(node.connect("example.com:80").await.is_err(), "block 出站应拒绝连接");
+        let t = Address::parse("example.com:80").unwrap();
+        assert!(node.connect(&t).await.is_err(), "block 出站应拒绝连接");
+    }
+
+    #[test]
+    fn address_parse_classifies() {
+        // 纯 IP:port → Socket
+        assert!(matches!(Address::parse("1.2.3.4:80").unwrap(), Address::Socket(_)));
+        assert!(matches!(Address::parse("[2001:db8::1]:443").unwrap(), Address::Socket(_)));
+        // 域名:port → Domain
+        match Address::parse("example.com:443").unwrap() {
+            Address::Domain(h, p) => { assert_eq!(h, "example.com"); assert_eq!(p, 443); }
+            _ => panic!("域名应解成 Domain"),
+        }
+        // host_port 往返 + v6 方括号
+        assert_eq!(Address::parse("example.com:443").unwrap().host_port(), "example.com:443");
+        assert_eq!(Address::parse("[2001:db8::1]:443").unwrap().host_port(), "[2001:db8::1]:443");
+        // 缺端口 / 空 host 报错
+        assert!(Address::parse("noport").is_err());
+        assert!(Address::parse(":80").is_err());
     }
 }
 
