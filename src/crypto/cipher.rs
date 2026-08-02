@@ -94,6 +94,19 @@ pub fn server_cipher_agility() -> bool {
     SERVER_CIPHER_AGILITY.load(Ordering::Relaxed)
 }
 
+/// TLS record padding 开关 (启动时从 config.tuning.tls_padding 设一次)。开启后 CryptoWriter
+/// 对握手后前 N 条记录追加 TLS 1.3 原生零填充, 抹掉包长序列指纹。收端**恒剥零**(向后兼容),
+/// 故只有发端受此开关控制。**要求对端 ≥ 支持剥零的版本**, 否则老对端会把填充零当 content_type
+/// 解析失败 —— 与 cipher_agility 同类约束, 两端同版才开。
+static TLS_PADDING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_tls_padding(on: bool) {
+    TLS_PADDING.store(on, Ordering::Relaxed);
+}
+pub fn tls_padding_enabled() -> bool {
+    TLS_PADDING.load(Ordering::Relaxed)
+}
+
 /// TIME_SYNC 帧 proto_ver: 0x01=仅 ChaCha20 (老/默认), 0x02=支持 agility 协商。
 pub const PROTO_VER_LEGACY: u8 = 0x01;
 pub const PROTO_VER_AGILITY: u8 = 0x02;

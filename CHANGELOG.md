@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### feat(crypto): TLS record padding —— 抹掉握手后包长序列指纹 (协议层, 面向 v0.8.0)
+
+抗 GFW 对"握手后前几包长度序列"的 ML 识别。**TLS 1.3 原生零填充**: 数据帧 `[chunk, 0x17]`
+的 content_type 后追加随机数量的零字节, 收端从尾剥零再取 content_type —— 与真实 TLS 1.3
+padding 字节级一致, 不引入非标字段, ClientHello 不受影响。
+- **收端恒剥零** (兼容基座, 无开关): `recv_data` 先剥尾部零再取 content_type; content 自身
+  尾零在 0x17 **之前**不受影响。老发端不发零 → 剥零对其无害。
+- **发端填充** (config `tuning.tls_padding`, 默认 false): 握手后**前 4 条**记录 (含 server 首帧
+  TIME_SYNC, 抹掉其固定 10 字节) 各追加均匀随机 [0,256] 零字节。双向 (client/server 各填)。
+- ⚠️ **两端须同为支持剥零的版本**才可开 `tls_padding` (老对端不剥零会把填充零当 content_type
+  断连; 启动会 WARN)。默认关 = 行为不变, 零兼容风险。
+- 设计规格见 brain `tls-padding-design`; 首版不做记录切分 / 不伪真实站点分布 (后续增强)。
+
 ### fix(api/security): token 常量时间比较改用 `ring`, 消除 LLVM 优化破坏风险
 
 手写累加器常量时间比较 (`diff |= a[i]^b[i]`) 虽是正确惯用法, 但 Rust/LLVM **不保证**优化时

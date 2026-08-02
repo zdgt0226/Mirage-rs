@@ -697,6 +697,12 @@ pub struct TuningConfig {
     /// 严格只认 proto_ver=0x01, 收到 0x02 会丢时间同步)。ClientHello 一字不改, 指纹不受影响。
     #[serde(default)]
     pub cipher_agility: bool,
+    /// TLS record padding 开关 (默认 false)。开了则本端对握手后前几条加密记录追加 TLS 1.3
+    /// 原生零填充, 抹掉"包长序列"指纹 (抗 GFW 对握手后前几包长度的 ML 识别)。收端**恒剥零**
+    /// 不受此开关控制。**仅在两端都已升到支持剥零的版本时开** (老对端不剥零, 会把填充零当
+    /// content_type 解析失败断连) —— 与 cipher_agility 同类约束。ClientHello 不受影响。
+    #[serde(default)]
+    pub tls_padding: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]

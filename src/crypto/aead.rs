@@ -79,7 +79,16 @@ pub struct CryptoWriter<W: AsyncWrite + Unpin> {
     framed: Vec<u8>,
     is_initiator: bool,
     rng: fastrand::Rng,
+    /// TLS record padding 开关 (从全局 cipher::tls_padding_enabled() 取)。
+    padding: bool,
+    /// 已发记录数, 用于只填握手后前 PAD_FIRST_N 条 (跨 rekey 不重置, 表流内位置)。
+    records_sent: u32,
 }
+
+/// TLS padding: 只填握手后前 N 条记录 (GFW ML 主要认前几包长度序列)。
+const PAD_FIRST_N: u32 = 4;
+/// 每条最多追加的零字节数 (均匀随机 [0, PAD_MAX])。
+const PAD_MAX: usize = 256;
 
 impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
     pub fn new(writer: W, master_key: &[u8; 32], is_initiator: bool) -> Self {
@@ -97,7 +106,15 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             framed: Vec::with_capacity(5 + MAX_RECORD_SIZE + TAG_SIZE),
             is_initiator,
             rng: fastrand::Rng::new(),
+            padding: crate::crypto::cipher::tls_padding_enabled(),
+            records_sent: 0,
         }
+    }
+
+    /// 显式设置 padding (测试/需要绕过全局开关时用; 生产由 new() 从全局取)。
+    #[cfg(test)]
+    pub fn set_padding(&mut self, on: bool) {
+        self.padding = on;
     }
 
     /// 切换 AEAD 算法 (cipher agility 协商后)。重派生该 cipher 的密钥 + **nonce 归零**
@@ -144,6 +161,19 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             self.buffer.clear();
             self.buffer.extend_from_slice(chunk);
             self.buffer.push(0x17); // inner content type = application_data
+
+            // TLS 1.3 原生零填充: 握手后前 N 条记录在 content_type 之后追加随机数量的零,
+            // 抹掉包长序列指纹。收端恒剥零 (见 recv_data)。content 自身尾零在 0x17 之前不受影响。
+            if self.padding && self.records_sent < PAD_FIRST_N {
+                // 保证 chunk + 0x17 + pad ≤ MAX_RECORD_SIZE (buffer 此刻 = chunk+1)。
+                let room = MAX_RECORD_SIZE.saturating_sub(self.buffer.len());
+                let cap = PAD_MAX.min(room);
+                if cap > 0 {
+                    let pad = self.rng.usize(0..=cap);
+                    self.buffer.resize(self.buffer.len() + pad, 0);
+                }
+            }
+            self.records_sent = self.records_sent.saturating_add(1);
 
             // nonce 用尽即断: (key,nonce) 复用会毁掉 AEAD 安全。2^64 帧物理不可达,
             // 但显式拦住比依赖"到不了"稳妥 (溢出在 debug 会 panic, release 会回绕)。
@@ -280,9 +310,20 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
             return Err(anyhow!("empty plaintext received"));
         }
 
+        // TLS 1.3 原生 padding: content_type 后可能跟任意数量的零填充。从尾剥零, 第一个非零
+        // 字节即 content_type。content 自身的尾零在 content_type **之前**, 不会被误剥。
+        // 收端恒剥零 (与是否开启发端 padding 无关) —— 这是两阶段上线的兼容基座: 老发端不发零,
+        // 剥零对其无影响; 新发端发零, 老收端(无此逻辑)才会解析失败, 故收端须先普及。
+        while buffer.last() == Some(&0) {
+            buffer.pop();
+        }
+        // 剥零后若空 = 整帧全零, 畸形。
+        if buffer.is_empty() {
+            return Err(anyhow!("padding-only record (no content type)"));
+        }
         // 提取 inner_content_type
         let inner_type = buffer.pop().unwrap();
-        
+
         let payload_len = buffer.len() as u64;
         if self.is_initiator {
             crate::monitor::add_down(payload_len);
@@ -431,5 +472,51 @@ mod cipher_bench {
         let cc = bench(&aead::CHACHA20_POLY1305, "ChaCha20-Poly1305");
         let aes = bench(&aead::AES_256_GCM, "AES-256-GCM");
         println!("  → AES-256-GCM / ChaCha20 = {:.2}x", aes / cc);
+    }
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    async fn roundtrip_with_padding(payloads: &[&[u8]]) {
+        let (a, b) = duplex(256 * 1024);
+        let master = [9u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        let mut r = CryptoReader::new(b, &master, false);
+        w.set_padding(true);
+        for p in payloads {
+            w.send_data(p).await.unwrap();
+            assert_eq!(
+                &r.recv_data().await.unwrap(),
+                p,
+                "开 padding 的往返必须精确还原原文"
+            );
+        }
+    }
+
+    /// 前 4 条被填充、之后不填, 全部必须精确还原。
+    #[tokio::test]
+    async fn padding_roundtrip_exact() {
+        roundtrip_with_padding(&[b"first", b"second", b"third", b"fourth", b"fifth-nopad", b"sixth"]).await;
+    }
+
+    /// 关键安全性: content **自身尾部的零字节**不得被剥零逻辑误删 (它们在 content_type 之前)。
+    #[tokio::test]
+    async fn padding_preserves_content_trailing_zeros() {
+        roundtrip_with_padding(&[b"data\x00\x00\x00", b"\x00", b"x\x00y\x00\x00"]).await;
+    }
+
+    /// 收端恒剥零, 但发端不填时无零可剥, 尾零内容照样原样还原 (向后兼容基座)。
+    #[tokio::test]
+    async fn recv_strip_is_noop_when_sender_unpadded() {
+        let (a, b) = duplex(64 * 1024);
+        let master = [3u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true); // padding 默认 off
+        let mut r = CryptoReader::new(b, &master, false);
+        let msg = b"no padding here\x00";
+        w.send_data(msg).await.unwrap();
+        assert_eq!(&r.recv_data().await.unwrap(), msg);
     }
 }
