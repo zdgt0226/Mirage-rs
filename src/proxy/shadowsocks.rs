@@ -624,25 +624,41 @@ pub async fn connect(
 )> {
     use std::os::fd::AsRawFd;
 
+    // PSK/密码格式错是配置问题, 先于建连校验 —— 否则网络错误 (拒连/超时) 会盖住真正原因。
     let key_len = cfg.method.key_len();
-    // 两代的"密钥来源"完全不同: SIP004 把任意密码经 EVP_BytesToKey 拉伸;
-    // SIP022 不做拉伸, 配置里那串 base64 解码后**就是**密钥本身。
-    //
-    // 这一步刻意放在 **connect 之前**: PSK 格式/长度错是配置问题, 若先建连,
-    // 网络错误 (Connection refused / 超时) 会把真正的原因盖住, 用户对着
-    // "连接被拒" 根本查不到是密钥写错了。
+    if cfg.method.is_2022() {
+        decode_ss2022_psk(&cfg.password, key_len)?;
+    }
+
+    let stream = TcpStream::connect(cfg.addr()).await?;
+    stream.set_nodelay(true).ok();
+    let fd = stream.as_raw_fd();
+    let (r, w) = stream.into_split();
+    let (reader, writer) = client_handshake_over(r, w, cfg, target).await?;
+    Ok((reader, writer, fd))
+}
+
+/// SS **客户端**握手, 跑在**已建好的任意字节流半程**上 (物理 TCP, 或链式代理里另一出站给的
+/// OutStream)。生成上行 salt, 一次发出 [salt + 加密目标头], 返回 (SsReader, SsWriter)。
+/// 这样 SS 出站既能直连 SS 服务器, 也能骑 Mirage 隧道 (SS-over-Mirage, 类 shadow-tls+ss)。
+pub async fn client_handshake_over<R, W>(
+    read_half: R,
+    mut write_half: W,
+    cfg: &SsConfig,
+    target: &str,
+) -> Result<(SsReader<R>, SsWriter<W>)>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let key_len = cfg.method.key_len();
     let master = if cfg.method.is_2022() {
         decode_ss2022_psk(&cfg.password, key_len)?
     } else {
         evp_bytes_to_key(&cfg.password, key_len)
     };
 
-    let stream = TcpStream::connect(cfg.addr()).await?;
-    stream.set_nodelay(true).ok();
-    let fd = stream.as_raw_fd();
-    let (r, w) = stream.into_split();
-
-    // 上行 salt: 每连接随机
+    // 上行 salt: 每连接随机。
     let mut salt = vec![0u8; key_len];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
         .map_err(|_| anyhow!("生成 salt 失败"))?;
@@ -653,25 +669,25 @@ pub async fn connect(
     };
 
     let mut writer = SsWriter {
-        inner: w,
+        inner: write_half,
         crypter: Crypter::new(cfg.method, &subkey),
         buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
-        pending_salt: None, // 客户端主动带 salt (下方 build_handshake 里), 无惰性 salt
+        pending_salt: None, // 客户端主动带 salt (下方 build_handshake 里)
     };
-    // 整个握手 (salt + 头部) 拼成一个缓冲, **一次** write 送出。
+    // 整个握手 (salt + 头部) 拼成一个缓冲, **一次** write 送出 (避免握手指纹分段)。
     let handshake = build_handshake(&mut writer, cfg.method, &salt, target)?;
     writer.inner.write_all(&handshake).await?;
     writer.inner.flush().await?;
 
     let reader = SsReader {
-        inner: r,
+        inner: read_half,
         crypter: None,
         method: cfg.method,
         master,
         req_salt: salt,
         ss2022_first_done: false,
     };
-    Ok((reader, writer, fd))
+    Ok((reader, writer))
 }
 
 /// SS **服务端**握手 (仅 SIP004): 生成本端下行 salt 发出并建 SsWriter; SsReader 懒读客户端上行

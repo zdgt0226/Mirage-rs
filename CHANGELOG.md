@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### feat(outbound): Shadowsocks 出站 + SS-over-Mirage 嵌套 (类 shadow-tls+ss)
+
+链式代理 (#5): 新增 `type:"shadowsocks"` **出站节点** —— 选中流量经 SS 加密发往 SS 服务器,
+成为可路由/可套娃的出站。配 `underlying:"<mirage-tag>"` 即 **SS-over-Mirage**: SS 到 ss-server
+的连接**骑 Mirage 隧道**(Mirage 当相机传输 = shadow-tls 角色, SS 在内)—— 即用户要的
+shadow-tls+ss 式嵌套。
+- 复用 SS 客户端 codec 反向: `client_handshake_over` 抽出 (SS 握手跑在任意字节流上, 物理 TCP
+  或另一出站的 OutStream)。新增 `SsStream` 适配器 (SsReader/SsWriter → AsyncRead+AsyncWrite,
+  仿 MirageStream) + `OutStream::Ss`。
+- `OutboundConfig/Node::Shadowsocks` + connect() SS 分支 (underlying 则 Box::pin 递归拨底层出站,
+  否则直连) + OutboundManager 拓扑排序 (SS-with-underlying 延后建, 环/未解析 → Err) +
+  semantic_issues 校验 (method/underlying)。SS 出站无连接池 (按需 connect)。
+- 测试: SS 出站 e2e (connect ↔ loopback SS server 目标解出+双向往返) / SS-over-Mirage 建成。
+
 ### feat(inbound): 链式代理 Shadowsocks 入站 —— 网关接受 SS 客户端经隧道/规则出
 
 链式代理 (#5) 子件 ②: 新增 `type:"shadowsocks"` 入站, 网关接受 SS 客户端连接, 解出目标后经
