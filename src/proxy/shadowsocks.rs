@@ -417,9 +417,18 @@ impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
             if let Some(salt) = pending.take() {
                 // 惰性 salt: [salt 明文][加密长度+tag][加密载荷+tag] 一次 write。防主动探测:
                 // 探针连上不发数据 → 上游无回包 → 本函数不被调 → 服务端一字节不吐。
-                let mut out = salt;
-                self.seal_chunk_into(chunk, &mut out)?;
-                self.inner.write_all(&out).await?;
+                // 出错时把 salt 恢复到 pending_salt 保持状态一致 (不静默丢 salt)。注意: SS 写错
+                // 本质不可续 —— crypter nonce 有状态、seal 已推进, 调用方须丢弃本 writer, 不重试;
+                // 恢复仅为状态正确, 不承诺可续写。
+                let mut out = salt.clone();
+                if let Err(e) = self.seal_chunk_into(chunk, &mut out) {
+                    self.pending_salt = Some(salt);
+                    return Err(e);
+                }
+                if let Err(e) = self.inner.write_all(&out).await {
+                    self.pending_salt = Some(salt);
+                    return Err(e);
+                }
                 continue;
             }
             self.buf.clear();
