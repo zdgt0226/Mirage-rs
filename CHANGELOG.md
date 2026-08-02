@@ -11,7 +11,11 @@
   上行 salt) + `decode_socks_addr` (SOCKS 目标头解析)。与真实 SS 客户端互通 (标准 SIP004)。
 - 仅 **SIP004** (aes-128/256-gcm / chacha20-ietf-poly1305); SIP022 服务端 (请求盐回显/EIH) 未
   实现, `check` 阶段报错 + 启动跳过。
-- 测试: SS 服务端握手 e2e (client connect ↔ server_handshake 双向解密) / SIP022 拒绝。
+- **惰性 salt 抗主动探测**: 服务端**不**在握手时立刻吐下行 salt (那会让"连上不发数据就收到一串
+  高熵随机数"成为可探测指纹, 早期 SS 被封主因)。改为攒到有真实下行数据时把 salt 拼首个加密块
+  一次送出; 探针连上不发数据 → 服务端一字节不吐。(SsWriter 加 pending_salt。)
+- 测试: SS 服务端握手 e2e (client connect ↔ server_handshake 双向解密) / SIP022 拒绝 /
+  惰性 salt 防探测 (探针无数据 → 服务端 0 字节)。
 
 ### feat(outbound): 链式代理 Mirage-over-X —— Mirage 隧道经另一出站拨号 (underlying_dialer)
 

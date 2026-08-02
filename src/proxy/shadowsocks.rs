@@ -402,12 +402,26 @@ pub struct SsWriter<W> {
     inner: W,
     crypter: Crypter,
     buf: Vec<u8>,
+    /// **惰性 salt** (仅服务端): 待发的下行 salt (明文)。服务端**不**在握手时立刻吐 salt —— 那会
+    /// 让"连上不发数据就收到一串高熵随机数"成为可被主动探测的指纹 (早期 SS 被封的核心特征)。
+    /// 改为攒到有真实下行数据要发时, 把 salt 拼进首个加密块**一次** write 送出。None = 客户端
+    /// (客户端本就该主动带 salt) 或 salt 已发。
+    pending_salt: Option<Vec<u8>>,
 }
 
 impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
-    /// 写入明文, 内部按 MAX_CHUNK 切块并逐块加密。
+    /// 写入明文, 内部按 MAX_CHUNK 切块并逐块加密。首次写入时若有惰性 salt, 拼在首块前一次送出。
     pub async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        let mut pending = self.pending_salt.take();
         for chunk in data.chunks(MAX_CHUNK) {
+            if let Some(salt) = pending.take() {
+                // 惰性 salt: [salt 明文][加密长度+tag][加密载荷+tag] 一次 write。防主动探测:
+                // 探针连上不发数据 → 上游无回包 → 本函数不被调 → 服务端一字节不吐。
+                let mut out = salt;
+                self.seal_chunk_into(chunk, &mut out)?;
+                self.inner.write_all(&out).await?;
+                continue;
+            }
             self.buf.clear();
             // [加密长度+tag]
             self.buf.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
@@ -424,6 +438,8 @@ impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
             // 一次 write_all 送出整个 chunk, 避免长度与载荷分成两个小包
             self.inner.write_all(&self.buf).await?;
         }
+        // data 为空 (无 chunk) 时 pending 未消费 → 放回, 留到下次真有数据再发 (probe 防护)。
+        self.pending_salt = pending;
         self.inner.flush().await
     }
 
@@ -464,7 +480,7 @@ pub fn test_writer<W: AsyncWriteExt + Unpin>(
     salt: &[u8],
 ) -> SsWriter<W> {
     let subkey = hkdf_subkey(master, salt, method.key_len());
-    SsWriter { inner, crypter: Crypter::new(method, &subkey), buf: Vec::new() }
+    SsWriter { inner, crypter: Crypter::new(method, &subkey), buf: Vec::new(), pending_salt: None }
 }
 
 pub struct SsReader<R> {
@@ -631,6 +647,7 @@ pub async fn connect(
         inner: w,
         crypter: Crypter::new(cfg.method, &subkey),
         buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
+        pending_salt: None, // 客户端主动带 salt (下方 build_handshake 里), 无惰性 salt
     };
     // 整个握手 (salt + 头部) 拼成一个缓冲, **一次** write 送出。
     let handshake = build_handshake(&mut writer, cfg.method, &salt, target)?;
@@ -656,7 +673,7 @@ pub async fn connect(
 /// SIP004 method 配 SS 入站, 这里再兜一层。
 pub async fn server_handshake<R, W>(
     read_half: R,
-    mut write_half: W,
+    write_half: W,
     method: Method,
     password: &str,
 ) -> Result<(SsReader<R>, SsWriter<W>)>
@@ -670,18 +687,19 @@ where
     let key_len = method.key_len();
     let master = evp_bytes_to_key(password, key_len);
 
-    // 下行 (server→client) salt: 每连接随机, 先发出。
+    // 下行 (server→client) salt: 每连接随机, 派生写子密钥。**不立刻发** —— 存进 SsWriter 惰性
+    // salt, 攒到有真实下行数据时才随首个加密块一起送出 (见 SsWriter.pending_salt)。防主动探测:
+    // 探针连上不发数据 → 服务端一字节不吐 (若立刻发 salt = 吐一串高熵随机数, 是可探测指纹)。
     let mut salt = vec![0u8; key_len];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
         .map_err(|_| anyhow!("生成 salt 失败"))?;
-    write_half.write_all(&salt).await?;
-    write_half.flush().await?;
     let subkey = hkdf_subkey(&master, &salt, key_len);
 
     let writer = SsWriter {
         inner: write_half,
         crypter: Crypter::new(method, &subkey),
         buf: Vec::with_capacity(MAX_CHUNK + 2 * TAG_LEN + 2),
+        pending_salt: Some(salt),
     };
     // 上行读端: crypter=None → 首个 read_chunk 懒读 client salt 派生读子密钥。SIP004 不用 req_salt。
     let reader = SsReader {
@@ -814,6 +832,7 @@ mod tests {
                 inner: &mut wire,
                 crypter: Crypter::new(method, &subkey),
                 buf: Vec::new(),
+                pending_salt: None,
             };
             w.write_all(b"hello").await.unwrap();
             w.write_all(&vec![0xABu8; 40000]).await.unwrap(); // 跨多个 chunk
@@ -854,6 +873,7 @@ mod tests {
                 inner: &mut wire,
                 crypter: Crypter::new(method, &subkey),
                 buf: Vec::new(),
+                pending_salt: None,
             };
             w.write_all(b"payload").await.unwrap();
         }
@@ -993,6 +1013,7 @@ mod handshake_shape_tests {
             inner: CountingWriter { writes: 0, buf: Vec::new() },
             crypter: Crypter::new(method, key),
             buf: Vec::new(),
+            pending_salt: None,
         }
     }
 
@@ -1064,6 +1085,33 @@ mod handshake_shape_tests {
         cw.write_all(b"hello-ss").await.unwrap();
         let back = cr.read_chunk().await.unwrap();
         assert_eq!(&back, b"reply-ss", "客户端应解密服务端回复");
+        srv.await.unwrap();
+    }
+
+    /// 防主动探测: 探针连上但不发数据 → 服务端**一字节不吐** (惰性 salt)。
+    /// 旧的即时发 salt 会让"一碰就吐高熵随机数"成为可探测指纹。
+    #[tokio::test]
+    async fn ss_server_lazy_salt_no_probe_leak() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+        let method = Method::parse("aes-256-gcm").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let (_ssr, _ssw) = server_handshake(r, w, method, "pw").await.unwrap();
+            // 握手后不写任何下行数据 (模拟未认证/无回包), 保持连接一会。
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+        let mut probe = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            probe.read(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "客户端发数据前服务端不应吐任何字节 (防主动探测)");
         srv.await.unwrap();
     }
 }
