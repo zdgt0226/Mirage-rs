@@ -731,6 +731,20 @@ pub struct TuningConfig {
     /// content_type 解析失败断连) —— 与 cipher_agility 同类约束。ClientHello 不受影响。
     #[serde(default)]
     pub tls_padding: bool,
+    /// **客户端** UDP 多路复用开关 (默认 false)。开了则透明 UDP 的 Mirage 流不再一流一隧道,
+    /// 而是按 flowkey 散列到少量 (udp_mux_tunnels) 长命共享隧道复用, 拿掉"并发 UDP 流 ≤ pool_size"
+    /// 的带机量硬伤。**仅在服务端也已升到支持 mux 的版本时开** (老服务端不认 0x01 sentinel, 那些
+    /// UDP 流会失败 → 客户端回落 TCP)。代价: 同隧道内跨流队头阻塞 (一流 TCP 丢包连累同隧道其他
+    /// 复用流), 靠 udp_mux_tunnels 路数分摊; 实时 UDP 建议走 WG 上游 (原生承载无 TCP HoL)。
+    #[serde(default)]
+    pub udp_mux: bool,
+    /// UDP mux 共享隧道条数 K (默认 4)。越大 HoL 连累面越小但占越多池位。仅 udp_mux 开时生效。
+    #[serde(default = "default_udp_mux_tunnels")]
+    pub udp_mux_tunnels: usize,
+}
+
+fn default_udp_mux_tunnels() -> usize {
+    4
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]

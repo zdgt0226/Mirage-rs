@@ -1,5 +1,32 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### feat(udp): UDP mux —— 多流复用共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"带机量硬伤
+
+透明 UDP 的 Mirage 流原本**一流一隧道** (`pool.get()` 独占一条 WarmPool 隧道至流结束),
+并发 UDP 流因此封顶在 `pool_size`, 是局域网网关带机量的硬伤 (见 brain `udp-capacity-findings`)。
+新增 **session-id 多路复用**: 多条 UDP 流按 flowkey 散列到少量 (默认 K=4) **长命共享隧道**复用,
+UDP 并发脱钩 `pool_size` (只吃 K 个池位, 与流数无关)。
+- **协议** (客户端 + 服务端两端, 破坏帧格式故版本门控): 认领 `[0x01]` 单字节为 mux sentinel
+  (旧 `[0x00]`=一流一隧道路径原封不动)。mux 帧 = 旧帧超集, 在 frameLen 后插 4B sid:
+  `[2B frameLen][4B sid][ATYP][ADDR][2B port][payload]`。上行带目标地址, 下行带回包源地址,
+  客户端**按 sid 分流** (忽略地址)。
+- **服务端** `handle_udp_mux_relay`: 按 sid 维护**独立连接式 egress socket** + 独立下行泵
+  (连接式才能保证"两 sid 打同一目标"回包不串——per-sid NAT); 所有回包经单一 mpsc 汇入唯一
+  AEAD writer (cancel-safe)。支持 Direct 与 WG-tunnel 上游 (每 sid 在同一 WG 隧道内绑独立端口)。
+  sid 上限 512 封顶资源。
+- **客户端** `MuxSet`/`MuxTunnel`: K 条共享隧道懒建/死则重建; 共享 writer 泵跨流合帧 (抗长度指纹);
+  单 demux 泵按 sid 路由到各流 reply socket; per-flow 上行泵封 sid 帧 + 合本流突发。
+- **门控**: `tuning.udp_mux` (默认关) + `tuning.udp_mux_tunnels` (默认 4)。仿 tls_padding ——
+  **仅在服务端也升级后开** (老服务端不认 0x01 → 那些 UDP 流失败 → 客户端回落 TCP), 启动 WARN。
+  默认关 = 升级零行为变化。
+- **代价 (已知权衡)**: 同隧道内跨流队头阻塞 (一流 TCP 丢包连累同隧道其他复用流), 靠 K 路散列
+  分摊; 实时 UDP 建议走 WG 上游 (原生承载, 无 TCP HoL)。非 QUIC (终局方案, 后续)。
+- 测试: codec 双向 round-trip + 服务端上行解析 (ATYP 1/3/4, 畸形消费重同步, 边界); 服务端 relay
+  **两 sid 同目标不串** e2e; 客户端全链路 (MuxTunnel 上行 → 服务端 relay → demux 按 sid 回)。
+  codec 手动变异 5/5 kill (含补边界测试)。
+
 ## [v0.8.1] - 链式代理 (统一出站流 + Mirage-over-X + SS 双向 + SS-over-Mirage) (2026-08-03)
 
 ### feat(outbound): Shadowsocks 出站 + SS-over-Mirage 嵌套 (类 shadow-tls+ss)

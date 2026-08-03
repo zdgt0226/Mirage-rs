@@ -263,6 +263,15 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                          当 content_type 解析失败断连。"
                     );
                 }
+                // UDP mux 开关 (客户端; 设进全局, transparent_udp 读)。
+                crate::proxy::udp_mux::set_udp_mux(tuning.udp_mux, tuning.udp_mux_tunnels);
+                if tuning.udp_mux {
+                    warn!(
+                        "已开启 udp_mux (K={}): 要求服务端也升到支持 mux 的版本。老服务端不认 mux \
+                         sentinel, 那些 UDP 流会失败 → 客户端回落 TCP。",
+                        tuning.udp_mux_tunnels
+                    );
+                }
                 if tuning.cipher_agility {
                     // 防呆: 开 agility 后 TIME_SYNC 的 proto_ver 变 0x02, 老客户端 (<v0.7.0)
                     // 不认 0x02 → 丢弃 TIME_SYNC 不同步时钟 → 若本机与服务端时钟偏差超容差

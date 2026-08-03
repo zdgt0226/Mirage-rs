@@ -209,6 +209,12 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 > **本进程所有域名解析改走 DNS-over-TCP** (地址无端口默认 53), 脱离系统解析器。不设 = 系统解析器。
 > (零改代码的替代: VPS 上 `echo "options use-vc" >> /etc/resolv.conf` 强制 glibc 走 TCP。)
 
+> **UDP 带机量 (透明网关)**: 透明 UDP 的 Mirage 流默认**一流一隧道**, 并发 UDP 流封顶在
+> `pool_size`。做局域网网关且大量并发 UDP (QUIC/游戏) 时, 加 `"tuning": {"udp_mux": true}`
+> 开 **UDP 多路复用** —— 多流按散列复用少量 (默认 `udp_mux_tunnels: 4`) 共享隧道, 并发脱钩
+> `pool_size`。⚠️ **需服务端也升级** (老服务端不认 mux, 那些 UDP 流回落 TCP)。代价: 同隧道内
+> 跨流队头阻塞 (靠加大 `udp_mux_tunnels` 分摊); 实时 UDP 建议走 WG 上游 (原生无 TCP HoL)。
+
 > 注: 客户端与透明网关的详细配置示例见 `templates/` 目录下的注释版模板。
 
 ---

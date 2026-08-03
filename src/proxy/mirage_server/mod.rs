@@ -13,7 +13,7 @@ mod camouflage;
 mod camouflage_pool;
 mod control;
 mod tcp_relay;
-mod udp_relay;
+pub(crate) mod udp_relay;
 
 use camouflage_pool::CamouflagePool;
 

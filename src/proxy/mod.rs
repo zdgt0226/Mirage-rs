@@ -14,6 +14,7 @@ pub mod mixed;
 pub mod healthcheck;
 pub mod transparent;
 pub mod transparent_udp;
+pub mod udp_mux;
 pub mod sniff;
 pub mod splice;
 pub mod resolver;

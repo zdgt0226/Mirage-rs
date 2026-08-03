@@ -257,3 +257,279 @@ pub(super) async fn handle_udp_relay(
     let _ = writer.lock().await.send_close_notify().await;
     downlink.abort();
 }
+
+// ── UDP mux relay (session-id 多路复用) ──────────────────────────────────────
+//
+// 与 handle_udp_relay (一隧道一流) 的区别: 一条隧道复用多条客户端 UDP 流, 每流一个
+// u32 sid。服务端按 sid 维护**独立 egress socket** (连接式, 两 sid 打同目标不串) + 独立
+// 下行泵。所有下行回包经单一 mpsc 汇入唯一 AEAD writer (cancel-safe: 唯一写点在 writer
+// 泵, 各 sid 泵只 recv UDP + send channel, 中途 abort 无半截 AEAD 帧)。
+
+/// 单条 mux 隧道内的 sid 上限, 封顶资源 (每 sid ≈ 1 socket FD + 1 task + 64KB buf)。
+const MAX_MUX_SIDS: usize = 512;
+
+/// abort-on-drop: session 从表移除即中止其下行泵。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 单个 sid 的出口: Direct=连接式 UDP socket; Wireguard=隧道内 socket + 目标地址。
+enum SidEgress {
+    Direct(UdpSocket),
+    Wireguard(Arc<crate::proxy::wg::socket::WgUdpSocket>, std::net::SocketAddr),
+}
+impl SidEgress {
+    async fn send(&self, payload: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Direct(s) => s.send(payload).await.map(|_| ()),
+            Self::Wireguard(s, dst) => s
+                .send_to(payload, *dst)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        }
+    }
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Direct(s) => s.recv(buf).await,
+            Self::Wireguard(s, _) => s
+                .recv_from(buf)
+                .await
+                .map(|(n, _)| n)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        }
+    }
+}
+
+struct SidSession {
+    egress: Arc<SidEgress>,
+    _pump: AbortOnDrop,
+}
+
+type MuxSessions = Arc<std::sync::Mutex<std::collections::HashMap<u32, SidSession>>>;
+
+fn lock_mux(s: &MuxSessions) -> std::sync::MutexGuard<'_, std::collections::HashMap<u32, SidSession>> {
+    s.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) async fn handle_udp_mux_relay(
+    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
+    writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
+) {
+    debug!("Mirage Server: Started UDP MUX relay session");
+
+    // 上游是否 WG-tunnel 出口 (与 TCP 同出口 IP)。是则各 sid 在同一 WG 隧道内绑独立端口。
+    let wg_tunnel = match upstream.as_deref() {
+        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(wg))
+            if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) =>
+        {
+            match wg.tunnel().await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    error!("UDP mux: 建立 WG 上游隧道失败: {}", e);
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    // 所有 sid 下行泵的回包经此汇入唯一 AEAD writer 泵。
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+    let sessions: MuxSessions = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // uplink: 读隧道 → 解 mux 帧 → 按 sid 分发 (新 sid 建 egress + spawn 下行泵)。
+    let up_sessions = sessions.clone();
+    let up_tx = tx.clone();
+    let uplink = async move {
+        let mut buffer: Vec<u8> = Vec::new();
+        loop {
+            let chunk =
+                match tokio::time::timeout(UDP_IDLE_TIMEOUT, reader.recv_data()).await {
+                    Ok(Ok(c)) => c,
+                    _ => break,
+                };
+            buffer.extend_from_slice(&chunk);
+            while let Some((consumed, frame_opt)) =
+                crate::proxy::udp_mux::parse_mux_uplink(&buffer)
+            {
+                buffer.drain(0..consumed);
+                let Some(uf) = frame_opt else { continue }; // 畸形帧, 跳过重同步
+
+                // 已有 sid → 直接发 (锁内只取 egress Arc, await 在锁外, 避免 guard 跨 await)。
+                let existing = lock_mux(&up_sessions).get(&uf.sid).map(|s| s.egress.clone());
+                if let Some(egress) = existing {
+                    let _ = egress.send(&uf.payload).await;
+                    continue;
+                }
+                // 新 sid: 到顶则丢。
+                if lock_mux(&up_sessions).len() >= MAX_MUX_SIDS {
+                    continue;
+                }
+                // 解析目标 (IP 字面量不解析, 域名走 60s 缓存 resolver)。
+                let target_sa = match crate::proxy::resolver::resolve_first(&uf.target, uf.port)
+                    .await
+                {
+                    Ok(sa) => sa,
+                    Err(_) => continue,
+                };
+                // 建 egress。
+                let egress = match &wg_tunnel {
+                    Some(t) => match crate::proxy::wg::socket::WgUdpSocket::bind(t.clone()) {
+                        Ok(s) => SidEgress::Wireguard(Arc::new(s), target_sa),
+                        Err(e) => {
+                            debug!("UDP mux: WG 内绑 UDP 失败: {}", e);
+                            continue;
+                        }
+                    },
+                    None => match UdpSocket::bind("0.0.0.0:0").await {
+                        Ok(s) => match s.connect(target_sa).await {
+                            Ok(()) => SidEgress::Direct(s),
+                            Err(_) => continue,
+                        },
+                        Err(_) => continue,
+                    },
+                };
+                let egress = Arc::new(egress);
+                // spawn 下行泵: egress.recv → frame_mux_addr(sid) → tx。
+                let pump_egress = egress.clone();
+                let pump_tx = up_tx.clone();
+                let pump_sessions = up_sessions.clone();
+                let sid = uf.sid;
+                let pump = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match tokio::time::timeout(UDP_IDLE_TIMEOUT, pump_egress.recv(&mut buf))
+                            .await
+                        {
+                            Ok(Ok(n)) => {
+                                if let Some(f) = crate::proxy::udp_mux::frame_mux_addr(
+                                    sid,
+                                    target_sa,
+                                    &buf[..n],
+                                ) {
+                                    if pump_tx.send(f).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ => break, // idle / 错误 → 拆此 sid
+                        }
+                    }
+                    lock_mux(&pump_sessions).remove(&sid);
+                });
+                lock_mux(&up_sessions).insert(
+                    sid,
+                    SidSession { egress: egress.clone(), _pump: AbortOnDrop(pump) },
+                );
+                let _ = egress.send(&uf.payload).await;
+            }
+            if buffer.len() > 65536 * 2 {
+                break; // 防异常累积
+            }
+        }
+        // uplink 结束: 清 session 表 → 各 SidSession drop → 下行泵 abort → 释放 tx clone。
+        lock_mux(&up_sessions).clear();
+    };
+
+    // writer 泵: 唯一 AEAD 写点。rx 在 uplink 结束清表 + 主 tx drop 后关闭 → 退出。
+    drop(tx); // 只留 up_tx (uplink 持有) 与各泵 clone; uplink 退出后全部释放
+    let writer_pump = {
+        let writer = writer.clone();
+        async move {
+            while let Some(pkt) = rx.recv().await {
+                if writer.lock().await.send_data(&pkt).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::join!(uplink, writer_pump);
+
+    let _ = writer.lock().await.send_close_notify().await;
+}
+
+#[cfg(test)]
+mod mux_tests {
+    use super::*;
+    use crate::proxy::udp_mux::{frame_mux_ipv4, parse_mux_frame};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket as TokioUdp};
+
+    /// 服务端 mux relay: 两条 sid 打**同一目标**, 回包不串 (per-sid 连接式 egress 的正确性)。
+    #[tokio::test]
+    async fn mux_two_sids_same_target_no_crosstalk() {
+        // 1. UDP echo (回显 payload 给发送者)
+        let echo = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut b = [0u8; 2048];
+            loop {
+                if let Ok((n, from)) = echo.recv_from(&mut b).await {
+                    let _ = echo.send_to(&b[..n], from).await;
+                }
+            }
+        });
+
+        // 2. TCP loopback 对
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = lis.local_addr().unwrap();
+        let cli = TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = lis.accept().await.unwrap();
+
+        // 3. crypto 对 (client=initiator, server=非)
+        let (cr, cw) = {
+            let (r, w) = cli.into_split();
+            crate::crypto::aead::create_crypto_pair(r, w, "pw", b"salt1234", true)
+        };
+        let (sr, sw) = {
+            let (r, w) = srv.into_split();
+            crate::crypto::aead::create_crypto_pair(r, w, "pw", b"salt1234", false)
+        };
+
+        // 4. 起服务端 mux relay (upstream=None → Direct egress)
+        let server = tokio::spawn(async move {
+            handle_udp_mux_relay(sr, sw, None).await;
+        });
+
+        // 5. 客户端发两帧: 同目标, 不同 sid + payload
+        let mut cw = cw;
+        let ip = match echo_addr.ip() {
+            std::net::IpAddr::V4(v) => v,
+            _ => unreachable!(),
+        };
+        let port = echo_addr.port();
+        cw.send_data(&frame_mux_ipv4(1, &ip, port, b"AAA").unwrap())
+            .await
+            .unwrap();
+        cw.send_data(&frame_mux_ipv4(2, &ip, port, b"BBB").unwrap())
+            .await
+            .unwrap();
+
+        // 6. 读回包, 按 sid demux
+        let mut cr = cr;
+        let mut acc = Vec::new();
+        let mut got = std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got.len() < 2 && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), cr.recv_data()).await {
+                Ok(Ok(c)) => {
+                    acc.extend_from_slice(&c);
+                    while let Some((sid, payload, consumed)) = parse_mux_frame(&acc) {
+                        if !payload.is_empty() {
+                            got.insert(sid, payload);
+                        }
+                        acc.drain(0..consumed);
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(got.get(&1u32).map(|v| v.as_slice()), Some(&b"AAA"[..]));
+        assert_eq!(got.get(&2u32).map(|v| v.as_slice()), Some(&b"BBB"[..]));
+        server.abort();
+    }
+}

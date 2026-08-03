@@ -680,6 +680,72 @@ async fn setup_flow(
                     return;
                 }
             };
+            // ── UDP mux 路径: 多流复用少量共享隧道, 脱钩 pool_size 上限。默认关。 ──
+            if crate::proxy::udp_mux::udp_mux_enabled() {
+                let mtun = match crate::proxy::udp_mux::get_mux_tunnel(&pool, &key).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("[TPROXY-UDP] Mirage-MUX 隧道不可用: {}", e);
+                        return;
+                    }
+                };
+                let sid = mtun.alloc_sid();
+                let reply = match acquire_reply(&replies, orig_dst) {
+                    Some(r) => r,
+                    None => return,
+                };
+                guard.reply_acquired = true;
+                // 注册 sid → (reply, client), 供共享 demux 泵按 sid 回包。
+                mtun.register(sid, reply, client);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                lock_sessions(&sessions).insert(
+                    key,
+                    FlowSlot::Ready { id: flow_id, sink: FlowSink::Mirage(tx.clone()) },
+                );
+                guard.committed_id = Some(flow_id);
+                debug!("[TPROXY-UDP] new Mirage-MUX flow {} → {} (sid {})", client, tdesc, sid);
+                let _ = tx.try_send(first_payload);
+
+                let shared = mtun.uplink();
+                let mk_frame = |pkt: &[u8]| -> Option<Vec<u8>> {
+                    match &target {
+                        UdpTarget::Domain(d) => {
+                            crate::proxy::udp_mux::frame_mux_domain(sid, d, port, pkt)
+                        }
+                        UdpTarget::Ip(ip) => {
+                            crate::proxy::udp_mux::frame_mux_ipv4(sid, ip, port, pkt)
+                        }
+                    }
+                };
+                // per-flow 上行泵: rx → 封 sid 帧 (合本流突发) → 共享上行。idle/隧道死 → 退。
+                loop {
+                    let pkt = match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
+                        Ok(Some(p)) => p,
+                        _ => break,
+                    };
+                    let mut batch = match mk_frame(&pkt) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    while batch.len() < UPLINK_COALESCE_CAP {
+                        match rx.try_recv() {
+                            Ok(p) => {
+                                if let Some(f) = mk_frame(&p) {
+                                    batch.extend_from_slice(&f);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if shared.send(batch).await.is_err() {
+                        break; // 共享隧道死
+                    }
+                }
+                mtun.unregister(sid);
+                // teardown 其余 (session 槽 + reply refs--) 由 FlowGuard::drop 保证。
+                return;
+            }
+
             let mut tunnel = match pool.get().await {
                 Ok(t) => t,
                 Err(e) => {
