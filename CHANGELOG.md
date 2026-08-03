@@ -31,6 +31,7 @@ UDP 并发脱钩 `pool_size` (只吃 K 个池位, 与流数无关)。
   (那前提是每流独占隧道, mux 下失效), 改由主循环 MAX_FLOWS(4096) 兜底, 拿满带机量收益;
   ③sid 注销收进 RAII 守卫 (含 panic 保证, 对齐 FlowGuard 契约); ④frame_mux_domain 域名 >255
   返 None 不静默截断 (fail loud)。
+- `scripts/bench_udp_capacity.py` load 加 `--label` (打进表头/结果行, 标记 mux-off/mux-on 多轮对比)。
 
 ## [v0.8.1] - 链式代理 (统一出站流 + Mirage-over-X + SS 双向 + SS-over-Mirage) (2026-08-03)
 
