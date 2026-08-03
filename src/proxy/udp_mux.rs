@@ -52,13 +52,16 @@ fn wrap_frame(sid: u32, atyp_and_addr: &[u8], port: u16, payload: &[u8]) -> Opti
     Some(f)
 }
 
-/// 封上行 mux 帧 (域名目标)。超 u16 帧长返回 None (真实 UDP 极少 >60KB)。
+/// 封上行 mux 帧 (域名目标)。域名 >255 或超 u16 帧长返回 None (真实 UDP 极少 >60KB)。
+/// 不截断: 截断会静默打到错误主机, 宁可 fail loud 让调用方处理。
 pub fn frame_mux_domain(sid: u32, domain: &str, port: u16, payload: &[u8]) -> Option<Vec<u8>> {
-    let dlen = domain.len().min(255);
-    let mut a = Vec::with_capacity(2 + dlen);
+    if domain.len() > 255 {
+        return None;
+    }
+    let mut a = Vec::with_capacity(2 + domain.len());
     a.push(0x03);
-    a.push(dlen as u8);
-    a.extend_from_slice(&domain.as_bytes()[..dlen]);
+    a.push(domain.len() as u8);
+    a.extend_from_slice(domain.as_bytes());
     wrap_frame(sid, &a, port, payload)
 }
 
@@ -303,17 +306,20 @@ impl MuxTunnel {
     pub fn alloc_sid(&self) -> u32 {
         self.next_sid.fetch_add(1, Ordering::Relaxed)
     }
-    pub fn register(&self, sid: u32, reply: Arc<UdpSocket>, client: SocketAddrV4) {
-        self.flows
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid, FlowEntry { reply, client });
-    }
-    pub fn unregister(&self, sid: u32) {
+    fn unregister(&self, sid: u32) {
         self.flows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&sid);
+    }
+    /// 注册 sid → (reply, client) 并返回 RAII 守卫: 守卫 drop 时**保证**注销 (含 panic/
+    /// early-return), 与 FlowGuard 的"保证清理"契约对齐, 防 sid 泄漏吊住 reply socket。
+    pub fn register(self: &Arc<Self>, sid: u32, reply: Arc<UdpSocket>, client: SocketAddrV4) -> SidGuard {
+        self.flows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sid, FlowEntry { reply, client });
+        SidGuard { mtun: self.clone(), sid }
     }
     /// 共享上行发送端: per-flow 上行泵把封好 sid 的帧推进来, 由 writer 泵合帧发出。
     pub fn uplink(&self) -> mpsc::Sender<Vec<u8>> {
@@ -321,17 +327,30 @@ impl MuxTunnel {
     }
 }
 
+/// sid 注册的 RAII 守卫: drop 即从 MuxTunnel.flows 注销该 sid。
+pub struct SidGuard {
+    mtun: Arc<MuxTunnel>,
+    sid: u32,
+}
+impl Drop for SidGuard {
+    fn drop(&mut self) {
+        self.mtun.unregister(self.sid);
+    }
+}
+
 /// K 条共享 mux 隧道。按 flowkey 散列选隧道 (HoL 分摊); 懒创建; 死则重建。
+/// 持 pool 的 **Weak** 引用 —— 不吊住 pool 生命 (配置热重载丢弃旧 outbound → 旧 pool
+/// 应能被 drop); pool 没了 (upgrade 失败) 说明这套 MuxSet 已作废, 由 REGISTRY 剪除。
 pub struct MuxSet {
-    pool: Arc<WarmPool>,
+    pool: std::sync::Weak<WarmPool>,
     slots: Vec<tokio::sync::Mutex<Option<Arc<MuxTunnel>>>>,
 }
 
 impl MuxSet {
-    fn new(pool: Arc<WarmPool>, k: usize) -> Self {
+    fn new(pool: &Arc<WarmPool>, k: usize) -> Self {
         let k = k.max(1);
         MuxSet {
-            pool,
+            pool: Arc::downgrade(pool),
             slots: (0..k).map(|_| tokio::sync::Mutex::new(None)).collect(),
         }
     }
@@ -342,6 +361,10 @@ impl MuxSet {
         (h.finish() as usize) % self.slots.len()
     }
     async fn get(&self, key: &FlowKey) -> anyhow::Result<Arc<MuxTunnel>> {
+        let pool = self
+            .pool
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("mux: 底层 pool 已释放 (配置重载?)"))?;
         let idx = self.slot_for(key);
         let mut slot = self.slots[idx].lock().await;
         if let Some(t) = slot.as_ref() {
@@ -349,7 +372,7 @@ impl MuxSet {
                 return Ok(t.clone());
             }
         }
-        let t = MuxTunnel::create(&self.pool).await?;
+        let t = MuxTunnel::create(&pool).await?;
         *slot = Some(t.clone());
         Ok(t)
     }
@@ -367,8 +390,11 @@ pub async fn get_mux_tunnel(
     let ptr = Arc::as_ptr(pool) as usize;
     let set = {
         let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        // 剪除 pool 已释放的死条目 (配置热重载会换新 pool Arc → 旧条目作废)。**先剪再插**:
+        // 顺带堵住旧 pool 释放后新 pool 复用同地址 (ptr) 撞进旧 MuxSet 的隐患。
+        reg.retain(|_, set| set.pool.strong_count() > 0);
         reg.entry(ptr)
-            .or_insert_with(|| Arc::new(MuxSet::new(pool.clone(), udp_mux_tunnels())))
+            .or_insert_with(|| Arc::new(MuxSet::new(pool, udp_mux_tunnels())))
             .clone()
     };
     set.get(key).await
@@ -475,7 +501,7 @@ mod tests {
             _ => unreachable!(),
         };
         let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        mtun.register(1, reply, catcher_v4);
+        let _sid_guard = mtun.register(1, reply, catcher_v4);
 
         // 上行: 经共享 uplink 泵发 sid=1 帧到 echo
         mtun.uplink()
@@ -491,6 +517,16 @@ mod tests {
             .unwrap();
         assert_eq!(&b[..n], b"PING");
         server.abort();
+    }
+
+    #[test]
+    fn frame_mux_domain_over_255_returns_none() {
+        // 域名 >255 不截断 (静默打错主机), 而是 None 让调用方 fail loud。
+        let long = "a".repeat(256);
+        assert!(frame_mux_domain(1, &long, 443, b"x").is_none());
+        // 恰好 255 仍成功
+        let ok = "b".repeat(255);
+        assert!(frame_mux_domain(1, &ok, 443, b"x").is_some());
     }
 
     #[test]

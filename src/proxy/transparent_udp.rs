@@ -672,15 +672,9 @@ async fn setup_flow(
                 UdpTarget::Domain(d) => d.clone(),
                 UdpTarget::Ip(ip) => ip.to_string(),
             };
-            // 子上限: 占一个 Mirage-UDP 隧道名额 (drop 时释放)。满则丢, 别抽干隧道池。
-            let _udp_permit = match MirageUdpPermit::try_acquire() {
-                Some(p) => p,
-                None => {
-                    debug!("[TPROXY-UDP] Mirage-UDP 流到子上限 {}, 丢弃 (客户端回落 TCP)", MAX_MIRAGE_UDP_FLOWS);
-                    return;
-                }
-            };
             // ── UDP mux 路径: 多流复用少量共享隧道, 脱钩 pool_size 上限。默认关。 ──
+            // 注: 不占 MirageUdpPermit (那个 256 子上限的前提是"每流独占一条隧道", mux 下
+            // 不成立)。mux 流的并发由主循环的 MAX_FLOWS(4096) 总闸兜底, 无需再叠 256。
             if crate::proxy::udp_mux::udp_mux_enabled() {
                 let mtun = match crate::proxy::udp_mux::get_mux_tunnel(&pool, &key).await {
                     Ok(t) => t,
@@ -695,8 +689,9 @@ async fn setup_flow(
                     None => return,
                 };
                 guard.reply_acquired = true;
-                // 注册 sid → (reply, client), 供共享 demux 泵按 sid 回包。
-                mtun.register(sid, reply, client);
+                // 注册 sid → (reply, client), 返回 RAII 守卫: drop 保证注销 (含 panic), 防 sid
+                // 泄漏吊住 reply socket (对齐 FlowGuard 契约)。
+                let _sid_guard = mtun.register(sid, reply, client);
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
                 lock_sessions(&sessions).insert(
                     key,
@@ -741,11 +736,19 @@ async fn setup_flow(
                         break; // 共享隧道死
                     }
                 }
-                mtun.unregister(sid);
-                // teardown 其余 (session 槽 + reply refs--) 由 FlowGuard::drop 保证。
+                // sid 注销由 _sid_guard drop 保证; session 槽 + reply refs-- 由 FlowGuard::drop 保证。
                 return;
             }
 
+            // 子上限 (仅 legacy 一流一隧道路径): 占一个 Mirage-UDP 隧道名额 (drop 时释放)。
+            // 满则丢, 别抽干隧道池。mux 路径不走这里 (已在上面 return)。
+            let _udp_permit = match MirageUdpPermit::try_acquire() {
+                Some(p) => p,
+                None => {
+                    debug!("[TPROXY-UDP] Mirage-UDP 流到子上限 {}, 丢弃 (客户端回落 TCP)", MAX_MIRAGE_UDP_FLOWS);
+                    return;
+                }
+            };
             let mut tunnel = match pool.get().await {
                 Ok(t) => t,
                 Err(e) => {
