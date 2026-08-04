@@ -102,7 +102,7 @@ impl ConfigWatcher {
         })
     }
 
-    fn build_state(config_path: &str, geodata_dir: &str, old_outbounds: Option<Arc<OutboundManager>>) -> Result<CoreState> {
+    pub(crate) fn build_state(config_path: &str, geodata_dir: &str, old_outbounds: Option<Arc<OutboundManager>>) -> Result<CoreState> {
         info!("Loading configuration from {}", config_path);
         let config = Config::load_from_file(config_path)?;
         
@@ -334,5 +334,167 @@ impl ConfigWatcher {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod leak_guard_tests {
+    //! §7 抗审查泄漏护甲 (T2 抗 DNS 污染 / T4 fail-closed) —— 进程内驱动真实
+    //! config→CoreState→DnsForwarder.resolve_query 路径, 无 netns。见 docs/threat-model.md §7。
+    use super::*;
+    use crate::dns::fake_ip::FakeIpMapper;
+    use crate::dns::server::DnsForwarder;
+    use std::io::Write;
+
+    /// 写一个临时 config.json + 空 geodata 目录, 返回 (config_path, geodata_dir)。用后由 caller 删。
+    fn write_config(tag: &str, extra_outbounds: &str, rules: &str) -> (String, String) {
+        let base = std::env::temp_dir().join(format!(
+            "mirage-leak-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let cfg_path = base.join("config.json");
+        let geo_dir = base.join("geo");
+        std::fs::create_dir_all(&geo_dir).unwrap();
+        let cfg = format!(
+            r#"{{
+  "schema_version": 1,
+  "log_level": "error",
+  "inbounds": [],
+  "outbounds": [
+    {{ "type": "mirage", "tag": "proxy", "server": "127.0.0.1", "server_port": 19999, "password": "x", "camouflage_host": "example.com", "pool_size": 1 }},
+    {{ "type": "direct", "tag": "direct" }}{extra_outbounds}
+  ],
+  "routing": {{
+    "default_outbound": "direct",
+    "rules": [{rules}]
+  }},
+  "advanced_dns": {{ "fakeip": {{ "enabled": true, "inet4_range": "198.18.0.0/15" }} }}
+}}"#
+        );
+        std::fs::File::create(&cfg_path)
+            .unwrap()
+            .write_all(cfg.as_bytes())
+            .unwrap();
+        (
+            cfg_path.to_str().unwrap().to_string(),
+            geo_dir.to_str().unwrap().to_string(),
+        )
+    }
+
+    /// 手搓一个 DNS 查询: [tx=0x1234][flags RD][QD=1] + name(labels) + qtype + QCLASS(IN)。
+    fn dns_query(domain: &str, qtype: u16) -> Vec<u8> {
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in domain.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&[0x00, 0x01]);
+        q
+    }
+
+    /// 从 DNS 应答取 (ancount, 首个 A 记录 IPv4)。用于断言 fake-IP。
+    fn first_a_record(resp: &[u8]) -> (u16, Option<std::net::Ipv4Addr>) {
+        let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+        // 跳到 answer: header 12 + question (name..0 + 4)
+        let mut pos = 12;
+        while pos < resp.len() && resp[pos] != 0 {
+            pos += 1 + resp[pos] as usize;
+        }
+        pos += 1 + 4; // root label + qtype + qclass
+        if ancount == 0 {
+            return (0, None);
+        }
+        // answer: name(ptr 2B or labels) + type(2) + class(2) + ttl(4) + rdlen(2) + rdata
+        // name 压缩指针 0xC0.. → 2B
+        if pos < resp.len() && resp[pos] & 0xC0 == 0xC0 {
+            pos += 2;
+        } else {
+            while pos < resp.len() && resp[pos] != 0 {
+                pos += 1 + resp[pos] as usize;
+            }
+            pos += 1;
+        }
+        let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+        let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
+        pos += 10;
+        if rtype == 1 && rdlen == 4 {
+            (ancount, Some(std::net::Ipv4Addr::new(resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3])))
+        } else {
+            (ancount, None)
+        }
+    }
+
+    async fn forwarder_for(cfg: &str, geo: &str, mapper: Option<Arc<FakeIpMapper>>) -> Arc<DnsForwarder> {
+        let state = ConfigWatcher::build_state(cfg, geo, None).unwrap();
+        let arc = Arc::new(arc_swap::ArcSwap::from_pointee(state));
+        DnsForwarder::for_hijack(arc, mapper, None).await.unwrap()
+    }
+
+    /// T2: 被代理域名 A 查询 → fake-IP (198.18.0.0/15), 绝不走本地 UDP:53 真解析。
+    #[tokio::test]
+    async fn t2_proxied_domain_a_query_gets_fakeip() {
+        let (cfg, geo) = write_config(
+            "t2a",
+            "",
+            r#"{ "domain_suffix": ["proxied.test"], "outbound": "proxy" }"#,
+        );
+        let mapper = Arc::new(FakeIpMapper::new("198.18.0.0/15").unwrap());
+        let fwd = forwarder_for(&cfg, &geo, Some(mapper.clone())).await;
+        let resp = fwd
+            .resolve_query(&dns_query("www.proxied.test", 1))
+            .await
+            .expect("proxied A query 应有应答");
+        let (ancount, a) = first_a_record(&resp);
+        assert_eq!(ancount, 1, "应有 1 条 A 记录");
+        let ip = a.expect("应是 A 记录");
+        assert!(mapper.is_fake_ip(&ip), "被代理域名必须解析为 fake-IP (拿到真实 IP = 走了本地解析 = T2 违规); got {ip}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&cfg).parent().unwrap());
+    }
+
+    /// T2: 被代理域名 AAAA 查询 → 空答复 (NODATA), 不走本地 AAAA 真解析。
+    #[tokio::test]
+    async fn t2_proxied_domain_aaaa_query_returns_empty_not_local() {
+        let (cfg, geo) = write_config(
+            "t2aaaa",
+            "",
+            r#"{ "domain_suffix": ["proxied.test"], "outbound": "proxy" }"#,
+        );
+        let mapper = Arc::new(FakeIpMapper::new("198.18.0.0/15").unwrap());
+        let fwd = forwarder_for(&cfg, &geo, Some(mapper)).await;
+        let resp = fwd
+            .resolve_query(&dns_query("www.proxied.test", 28))
+            .await
+            .expect("proxied AAAA 应有应答");
+        let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+        assert_eq!(ancount, 0, "被代理域名 AAAA 必须空答复 (非本地真解析); ancount={ancount}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&cfg).parent().unwrap());
+    }
+
+    /// T4: 被 block 的域名 → NXDOMAIN (rcode=3), 不解析不泄漏。
+    #[tokio::test]
+    async fn t4_blocked_domain_returns_nxdomain() {
+        let (cfg, geo) = write_config(
+            "t4blk",
+            r#",
+    { "type": "block", "tag": "block" }"#,
+            r#"{ "domain_suffix": ["blocked.test"], "outbound": "block" }"#,
+        );
+        let mapper = Arc::new(FakeIpMapper::new("198.18.0.0/15").unwrap());
+        let fwd = forwarder_for(&cfg, &geo, Some(mapper)).await;
+        let resp = fwd
+            .resolve_query(&dns_query("x.blocked.test", 1))
+            .await
+            .expect("blocked 应有应答");
+        let rcode = resp[3] & 0x0F;
+        assert_eq!(rcode, 3, "被 block 域名必须 NXDOMAIN (rcode=3); got rcode={rcode}");
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&cfg).parent().unwrap());
     }
 }

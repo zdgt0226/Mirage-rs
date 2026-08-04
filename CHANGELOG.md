@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### test: 抗审查泄漏护甲 §7 T2/T4 (进程内, 无 netns)
+
+补齐 docs/threat-model.md §7 映射表标"待补"的 T2 抗 DNS 污染守卫 —— 进程内驱动真实
+config→CoreState→`DnsForwarder.resolve_query` 路径 (非 mock):
+- `t2_proxied_domain_a_query_gets_fakeip`: 被代理域名 A 查询 → fake-IP (198.18/15), 证明永不走本地 UDP:53 真解析。
+- `t2_proxied_domain_aaaa_query_returns_empty_not_local`: AAAA → 空答复, 不落本地解析。
+- `t4_blocked_domain_returns_nxdomain`: block 域名 → NXDOMAIN, 不解析不泄漏。
+
+均为**已存在保证的回归护甲** (guard 逻辑早在生产, §7 表此前缺测); 手动变异 3/3 kill 证明会咬
+(破 fake-IP / 破 block / 破 AAAA 空答复各令对应测试失败)。仅一处可见性改动 `ConfigWatcher::build_state`
+→ `pub(crate)` (复用生产构建器, 无逻辑改)。
+
 ### chore: clippy 清理 (安全子集)
 
 `cargo clippy --fix` 应用机器验证安全的重写, 46 → 24 warning (清 22): 去无用 `.into()`/同类型 cast、
