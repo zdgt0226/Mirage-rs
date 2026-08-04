@@ -1446,7 +1446,12 @@ EOM
             "camouflage_host": "$(json_escape "$sni")"${brutal_line}${upstream_line}
         }
     ],
-    "outbounds": [],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "direct"
+        }
+    ],
     "gui": {
         "enabled": ${server_gui_enabled},
         "listen": "${server_gui_listen}"${server_gui_token_line}
@@ -1720,7 +1725,14 @@ EOM
     fi
 
     local pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
-    
+
+    # UDP 多路复用: 多条透明 UDP 流复用少量共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"的带机量硬伤
+    # (真机实测并发天花板 20→450+)。默认开 —— 需服务端同版本 (老服务端不认 mux, 那些 UDP 流回落 TCP)。
+    local udp_mux_bool=false
+    if ask_yn "启用 UDP 多路复用 (大幅提升 UDP 带机量, 需服务端同为本版本)" y; then
+        udp_mux_bool=true
+    fi
+
     local routing_preset
     routing_preset=$(ask_choice "客户端路由（分流）策略" \
         "国内直连 / 局域网直连，其余走代理（经典中国分流，推荐）" \
@@ -1843,6 +1855,7 @@ EOM
     ${advanced_dns_line}
     "tuning": {
         "ebpf_mode": "auto",
+        "udp_mux": ${udp_mux_bool},
         "geodata_dir": "${ETC_DIR}/geosite",
         "geo_sources": [
             {

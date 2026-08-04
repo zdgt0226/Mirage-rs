@@ -1,6 +1,17 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.9.0] - UDP 多路复用 (带机量) + 外部审计修复 (2026-08-04)
+
+真机实测 (旁路网关 + 单核 VPS): 并发 UDP 流拐点 **20 → 450 (22.5×)**, 天花板受限于服务端
+fd/CPU 而非 mux 本身。两端从 v0.5 升级验证 0.5↔0.9 协议向后兼容, 生产流量正常。
+
+### chore(install): 基于真机部署的改进
+
+- **服务端生成的 config 补 `direct` 出站**: 旧模板 `"outbounds": []` + `default_outbound:"direct"`
+  在新版校验下报错 (`default_outbound 不存在于 outbounds`) —— 真机 0.5→0.9 升级即踩此坑。已补。
+- **客户端安装询问是否开启 UDP mux** (`tuning.udp_mux`, 透明网关默认开)。
+- systemd unit 早已设 `LimitNOFILE=1048576` (真机 200 流墙 = 服务端 fd 1024, 印证此设定必要)。
+- README: UDP mux 用法 + 真机结果 + 服务端配置示例补 direct 出站 + 版本历史 v0.9.0。
 
 ### fix: 外部审计 4 条修复 (WG 隧道内 DNS 死代码 / mux 背压 / DNS-TCP TXID / 常量时间比较)
 

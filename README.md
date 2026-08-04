@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.8.1-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.9.0-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -178,7 +178,9 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
       "brutal_rate_mbps": 50
     }
   ],
-  "outbounds": [],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
   "gui": {
     "enabled": true,
     "listen": "127.0.0.1:9090"
@@ -212,8 +214,11 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 > **UDP 带机量 (透明网关)**: 透明 UDP 的 Mirage 流默认**一流一隧道**, 并发 UDP 流封顶在
 > `pool_size`。做局域网网关且大量并发 UDP (QUIC/游戏) 时, 加 `"tuning": {"udp_mux": true}`
 > 开 **UDP 多路复用** —— 多流按散列复用少量 (默认 `udp_mux_tunnels: 4`) 共享隧道, 并发脱钩
-> `pool_size`。⚠️ **需服务端也升级** (老服务端不认 mux, 那些 UDP 流回落 TCP)。代价: 同隧道内
-> 跨流队头阻塞 (靠加大 `udp_mux_tunnels` 分摊); 实时 UDP 建议走 WG 上游 (原生无 TCP HoL)。
+> `pool_size`。install.sh 安装透明网关时会询问是否开启 (默认开)。⚠️ **需服务端也升级** (老服务端
+> 不认 mux, 那些 UDP 流回落 TCP)。代价: 同隧道内跨流队头阻塞 (靠加大 `udp_mux_tunnels` 分摊);
+> 实时 UDP 建议走 WG 上游 (原生无 TCP HoL)。真机实测 (旁路网关 + 单核 VPS): 并发 UDP 流拐点
+> **20 → 450 (22.5×)**, 且天花板受限于服务端 fd/CPU 而非 mux 本身 —— 高并发建议把服务端
+> `LimitNOFILE` 调高 (install.sh 的 systemd unit 已设 1048576)。
 
 > 注: 客户端与透明网关的详细配置示例见 `templates/` 目录下的注释版模板。
 
@@ -302,6 +307,7 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.9.0** | 2026-08-04 | **UDP 多路复用 (UDP mux)**: 透明 UDP 的 Mirage 流由"一流一隧道"改为多流按 flowkey 散列复用少量 (默认 K=4) 长命共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"带机量硬伤 (真机实测拐点 20→450, 22.5×)。协议加 `[0x01]` mux sentinel + 帧插 4B sid, 服务端 per-sid 连接式 egress socket (两流打同目标不串) + 单 AEAD writer cancel-safe; 客户端 K 条共享隧道持 Weak-pool 防热重载泄漏。`tuning.udp_mux` 门控默认关 (需两端同版), install.sh 装网关时询问。**外部审计 4 修**: WireGuard 隧道内 DNS 死代码接线 (config `dns` 此前被丢弃) · UDP mux 背压 (服务端 idle 对齐/饱和告警/客户端 sid 上限/首下行快拆) · DNS-over-TCP 响应校验 TXID+QR 防注入 · 常量时间比较统一 `subtle` (弃用 deprecated ring)。install.sh 修生成的服务端配置缺 direct 出站 (新版校验必需)。 |
 | **v0.8.1** | 2026-08-03 | **链式代理 (Chain Proxy)**: 统一出站流接口 `OutboundNode::connect(target)` (地基) · **Mirage-over-X** 套娃 (`underlying`: Mirage 隧道经另一出站拨号, Mirage-over-WG/双跳) · **Shadowsocks 入站** (网关接受 SS 客户端 SIP004, 惰性 salt 抗主动探测) · **Shadowsocks 出站 + SS-over-Mirage** (类 shadow-tls+ss: SS 骑 Mirage 隧道) · **geo 经隧道下载免配 SOCKS 入站** (进程内临时 SOCKS)。均经 Sonnet 多轮复核。 |
 | **v0.8.0** | 2026-08-02 | **TLS record padding** (协议层): 握手后前几条加密记录追加 TLS 1.3 原生零填充, 抹掉"包长序列"指纹 (抗 GFW ML 识别); 收端恒剥零 (兼容基座), 发端 `tuning.tls_padding` 门控 (默认关), 含抹除 server 首帧 TIME_SYNC 固定 10 字节。⚠️ 开启需两端同版。**外部审查加固**: DNS resolver `tcp://` 前缀解析修复 · outbound 循环组返 Result 不 panic · API token 常量时间比较改 `ring` + CSRF 重构进中间件 + `?token=` 限根路径 + `/api/rules` 写前结构化校验/dry-run · 抗审查威胁模型文档 + 泄漏守卫测试 · clippy 门禁。 |
 | **v0.7.0** | 2026-07-30 | **Cipher agility**: 两端有硬件 AES 加速时协商 **AES-256-GCM** (大流量 ~2x, 否则 ChaCha20); 全在加密信道内协商 + `rekey`, **ClientHello 一字不改 (TLS 指纹零触碰)**, 服务端 `tuning.cipher_agility` 门控。**IPv6 隧道传输**: 服务端 v6 监听 + 客户端连 v6 服务端 (`[v6]:port` 括号处理); 透明数据面 v6 epic 评估后否 (fake-IP+服务端远程解析已让客户端 v6 数据面不必要)。 |
