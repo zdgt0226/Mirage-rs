@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### feat(install): 家庭 WireGuard 服务端 —— 干净设备接入 (WG 入站落地)
+
+移动设备用**系统原生 WireGuard** 接入家中网关, 经网关 Mirage 抗审查出海, 设备零翻墙痕迹 (只是通用
+VPN, 降查水表风险)。**无需改 mirage 代码** —— 现有 eBPF 透明网关按 fake-IP 目标拦截 (sk_lookup 挂
+netns 不绑网卡), wg0 收到的目的 fake-IP 包自动本地投递+命中透明代理, 与 LAN 同。
+- install.sh 新增菜单 **7) 家庭 WireGuard 服务端**: 装 wireguard-tools + 内核 WG, 生成 wg0 服务端
+  (10.7.0.1/24) + NAT + `wg-quick@wg0` 开机自启; 每设备生成配置 (文本 + 二维码), 幂等追加 peer 不覆盖。
+  设备配置 DNS 强制指向网关 wg0 IP (命门: 海外域名才解成 fake-IP)。
+- **真机端到端验证**: netns 模拟 WG peer → 网关 → Mirage → google/cloudflare `HTTP 200`; 国内 baidu
+  走直连 NAT; 被代理域名只解到 fake-IP 不泄真实 IP。决策见 brain chain-proxy-roadmap (否 boringtun
+  responder, 用内核 WG + eBPF 透明网关)。
+- README: 「干净设备接入 (WireGuard 入站)」一节 + 拓扑 + 命门 DNS + 已知限制 (裸 IP 不覆盖)。
+
 ### test: 抗审查泄漏护甲 §7 T2/T4 (进程内, 无 netns)
 
 补齐 docs/threat-model.md §7 映射表标"待补"的 T2 抗 DNS 污染守卫 —— 进程内驱动真实

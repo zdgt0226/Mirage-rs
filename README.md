@@ -156,6 +156,36 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 
 ---
 
+### 干净设备接入 (WireGuard 入站)
+
+让手机/平板用**系统原生 WireGuard** 接入家中网关, 经网关的 Mirage 抗审查出海 —— **设备上零翻墙
+痕迹** (只是一条通用 VPN), 翻墙逻辑全在网关侧。
+
+```
+[手机 原生 WireGuard] ──家域内 WG(不跨 GFW)──▶ [家中网关: wg0 + eBPF 透明 + Mirage] ──▶ 海外
+```
+
+**为什么成立**: 设备↔家中网关是**局域网/家域内**的 WireGuard, 不跨 GFW 不会被封; 真正的抗审查
+出海发生在**网关**上。设备侧只有一个普通 WG 配置, 查不到任何代理/翻墙软件痕迹, 降低"查水表"风险。
+
+**一键配置**: 在已装好透明网关的机器上跑 `install.sh` 选 **`7) 家庭 WireGuard 服务端 (干净设备接入)`**:
+- 装 `wireguard-tools` + 内核 WG, 生成 `wg0` 服务端 (`10.7.0.1/24`) + NAT + 开机自启 (`wg-quick@wg0`)。
+- 为每台设备生成配置 (文本 + **二维码**), 存 `/etc/wireguard/peer-<名字>.conf`。设备装官方 WireGuard App
+  扫码即用。再加设备重跑一次, 会**追加 peer 不覆盖**旧的。
+
+**机制 (无需改代码)**: 透明拦截**按 fake-IP 目标, 不靠 SO_MARK** —— fake-IP 段是本机地址, `sk_lookup`
+挂在 netns 上**不绑网卡**, 所以 wg0 收到的、目的是 fake-IP 的包会本地投递并自动命中透明代理, 和 LAN
+流量一样, 零额外配置。国内/直连流量走标准 `ip_forward` + NAT。
+
+> **命门: 设备的 DNS 必须指向网关 wg0 IP** (`10.7.0.1`) —— 一键脚本已在设备配置里写好。**别在设备上
+> 改成公共 DNS** (8.8.8.8 等), 否则海外域名解不成 fake-IP 就走不了代理 (会直连或失败)。
+
+> **已知限制**: 不经 DNS 的**裸 IP** 直连 (少数 App 硬编码 IP) 从 wg0 进来不会被透明拦截 (tc_divert 绑
+> 物理网卡), 手机场景罕见且绝大多数流量走域名/fake-IP。真机已端到端验证 (WG peer → 网关 → Mirage →
+> google/cloudflare `HTTP 200`; 国内 baidu 走直连; 被代理域名只解到 fake-IP 不泄真实 IP)。
+
+---
+
 ## ⚙️ 服务端配置说明
 
 ### 服务端配置示例 (`/etc/mirage-rs/config_server.json`)
@@ -286,8 +316,9 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 
 - [ ] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① 设备规则: 路由已有 `source_ip_cidr`/`source_mac`, 只需给 TCP 透明路径填 `source_ip` (现为 None, ~2 行, UDP 已填) 即对 TCP 生效。② 每主机用量: eBPF 按源 IP 计上下行字节 (tc 看得到含 splice 直连的全部流量, 用户态计数会漏) → 用户态读 map → API + Neon 面板 per-host 视图 + 可选设备别名
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
-- [ ] **统一出站流接口** (重构) —— 抽 `OutboundNode::connect(target)`, 让 geo 等进程内消费者直连隧道, 不再绕 SOCKS 自连
-- [ ] **链式代理 / WG·SS 双向** —— WireGuard、Shadowsocks 既能作出站也能作**入站**, 支持"入站 X → 出站 Y"自定义转发编排。当前二者仅出站/上游, 缺入站侧; 依赖"统一出站流接口"先落地, 大工程分阶段
+- [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道
+- [~] **链式代理 / WG·SS 双向** —— SS 双向 (入站+出站) · Mirage 套娃 · SS-over-Mirage 已做 (v0.8.1); **WG 入站**改用"干净设备"落地 (内核 WG 服务端 + 现有 eBPF 透明网关, install.sh 选项 7, 非 boringtun responder) —— 见上方「干净设备接入」。剩自定义转发编排增强
+- [ ] **UDP mux → QUIC Datagram** —— TCP-mux 已解带机量 (v0.9.0); QUIC 版解跨流队头阻塞 + 实时质量, 大工程
 - [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
 - [ ] **隧道 UDP 流复用共享隧道** (带机量) —— 当前客户端每条 Mirage UDP 流独占一整条 WarmPool TCP 隧道, 并发 UDP 上限 = `pool_size` (默认 16, 旁路由实测 ~17 流即崩)。服务端帧已自带目标+按源址回程, 一条隧道本可 mux 多目标; 改客户端把 UDP 流复用少数共享隧道 + 按源址反查 demux 回 LAN client。中等工程。缓解: 调大 `pool_size`。QUIC/HTTP3 失败会回落 TCP 故非致命。**约束**: 复用共享隧道会把当前"每流独立"的 TCP 队头阻塞变成**跨流 HoL**(一条流丢包卡住所有复用流), 故不能无脑合并 —— 实时流应留独立隧道或走 WG 上游(UDP 原生, 无 TCP HoL)。direct UDP 网关实测健康无需动 (见 brain `udp-capacity-findings`)
