@@ -2187,6 +2187,139 @@ uninstall() {
     echo -e "  Mirage-rs 已从本机移除. 感谢使用." >&2
 }
 
+# ── 家庭 WireGuard 服务端 (干净设备接入) ──────────────────────────────────────
+#
+# 用法: 移动设备用**系统原生 WireGuard** 接入家中网关 (设备↔家域内 WG, 不跨 GFW 不被封),
+# 经网关的 Mirage 抗审查出海。设备上零翻墙痕迹 (只是通用 VPN)。
+#
+# 机制 (无需改 mirage 代码): 透明拦截按 fake-IP 目标 (非 SO_MARK) —— fake-IP 段是本机地址,
+# wg0 收到 peer 发来的、目的是 fake-IP 的包会本地投递并命中 sk_lookup (挂 netns 不绑网卡),
+# 与 LAN 流量一样自动走透明代理→Mirage。命门: peer 的 DNS 必须指向网关 wg0 IP, 海外域名才
+# 解成 fake-IP。直连腿 (国内/未命中) 走标准 ip_forward + NAT。真机已端到端验证。
+config_wg_server() {
+    title "家庭 WireGuard 服务端 (干净设备接入)"
+
+    # 前置: 透明网关. 没有透明入站 + fakeip, WG 进来的流量无处可代理.
+    local cfg="${ETC_DIR}/config_client.json"
+    if [[ ! -f "$cfg" ]] || ! grep -q '"transparent"' "$cfg" 2>/dev/null || ! grep -q '"fakeip"' "$cfg" 2>/dev/null; then
+        warn "未检测到已配置 fake-IP 的透明网关客户端 (${cfg})。"
+        warn "干净设备接入依赖透明网关 + fake-IP DNS —— 请先用本脚本装完整版客户端并开启透明网关。"
+        ask_yn "仍要继续配置 WG 服务端? (没有透明网关时 WG 只能直连出网, 不走代理)" n || return
+    fi
+
+    # 依赖: wireguard-tools + iptables (+ 可选 qrencode)
+    info "安装 WireGuard 工具..."
+    local pkg=""
+    for m in apt-get dnf yum apk pacman; do command -v "$m" >/dev/null 2>&1 && { pkg="$m"; break; }; done
+    case "$pkg" in
+        apt-get) apt-get install -y wireguard-tools iptables qrencode >/dev/null 2>&1 ;;
+        dnf|yum) "$pkg" install -y wireguard-tools iptables qrencode >/dev/null 2>&1 ;;
+        apk)     apk add wireguard-tools iptables libqrencode-tools >/dev/null 2>&1 ;;
+        pacman)  pacman -S --noconfirm wireguard-tools iptables qrencode >/dev/null 2>&1 ;;
+        *)       warn "未识别包管理器, 请手动确保 wg / wg-quick / iptables 可用" ;;
+    esac
+    command -v wg >/dev/null 2>&1 || { err "wireguard-tools 安装失败, 请手动安装 (wg / wg-quick)"; return; }
+    modprobe wireguard 2>/dev/null || warn "加载 wireguard 内核模块失败 (旧内核?), 若 wg-quick up 报错请检查内核 ≥ 5.6 或装 wireguard-dkms"
+
+    umask 077; mkdir -p /etc/wireguard
+    local wg_port wg_subnet wg_srv_ip endpoint egress
+    wg_port=$(ask "WireGuard 监听端口 (UDP)" "51820")
+    wg_subnet="10.7.0"
+    wg_srv_ip="${wg_subnet}.1"
+    egress=$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')
+    [[ -z "$egress" ]] && egress=$(ask "出网网卡名 (NAT 用)" "eth0")
+    info "正在探测本机公网 IP (作为设备连接的 Endpoint)..."
+    local pub; pub=$(detect_public_ip || true)
+    endpoint=$(ask "设备连接用的网关地址 (公网 IP 或 DDNS 域名)" "${pub:-你的公网IP}")
+
+    # 服务端私钥 (幂等: 已存在则复用)
+    [[ -f /etc/wireguard/server_priv ]] || wg genkey > /etc/wireguard/server_priv
+    wg pubkey < /etc/wireguard/server_priv > /etc/wireguard/server_pub
+    local srv_pub; srv_pub=$(cat /etc/wireguard/server_pub)
+
+    # 生成一台设备的 peer 密钥
+    local dev_name; dev_name=$(ask "设备名 (仅备注用, 如 phone)" "device1")
+    local peer_priv peer_pub peer_ip peer_idx
+    peer_priv=$(wg genkey); peer_pub=$(echo "$peer_priv" | wg pubkey)
+    # 分配 peer IP: 数一下现有 [Peer] 数, +2 (.1 是服务端)
+    peer_idx=2
+    if [[ -f /etc/wireguard/wg0.conf ]]; then
+        peer_idx=$(( $(grep -c '^\[Peer\]' /etc/wireguard/wg0.conf) + 2 ))
+    fi
+    peer_ip="${wg_subnet}.${peer_idx}"
+
+    # 服务端 config: 首次建头, 之后追加 [Peer]
+    if [[ ! -f /etc/wireguard/wg0.conf ]]; then
+        cat > /etc/wireguard/wg0.conf <<CONF
+[Interface]
+Address = ${wg_srv_ip}/24
+ListenPort = ${wg_port}
+PrivateKey = $(cat /etc/wireguard/server_priv)
+# 直连腿 NAT 出 ${egress}; 被代理腿 (fake-IP) 走本地透明不经此
+PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -t nat -A POSTROUTING -s ${wg_subnet}.0/24 -o ${egress} -j MASQUERADE; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -s ${wg_subnet}.0/24 -o ${egress} -j MASQUERADE; iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
+CONF
+    fi
+    cat >> /etc/wireguard/wg0.conf <<CONF
+
+# ${dev_name}
+[Peer]
+PublicKey = ${peer_pub}
+AllowedIPs = ${peer_ip}/32
+CONF
+    chmod 600 /etc/wireguard/wg0.conf
+
+    # 起 / 重载 wg0 + 持久. 已在跑则热加载新 peer (不断现有连接); 否则拉起.
+    if ip link show wg0 >/dev/null 2>&1; then
+        wg addconf wg0 <(wg-quick strip wg0) 2>/dev/null || warn "热加载 wg0 失败, 请手动 wg-quick down wg0 && wg-quick up wg0"
+        ok "已热加载新 peer 到运行中的 wg0"
+    elif [ "$INIT_SYS" = systemd ]; then
+        systemctl enable --now wg-quick@wg0 >/dev/null 2>&1 \
+            && ok "wg0 已启动并设开机自启 (wg-quick@wg0)" \
+            || { wg-quick up wg0 && warn "wg0 已起, 但 systemd unit 注册失败 (重启不自起)"; }
+    else
+        wg-quick up wg0 && warn "非 systemd, wg0 已起但重启不自起 (需自行加开机脚本)"
+    fi
+
+    # 设备配置 (AllowedIPs=0.0.0.0/0 全量走隧道; DNS=网关 wg0 IP —— 命门, 海外域名才解 fake-IP)
+    local peer_conf
+    peer_conf=$(cat <<CONF
+[Interface]
+PrivateKey = ${peer_priv}
+Address = ${peer_ip}/24
+DNS = ${wg_srv_ip}
+
+[Peer]
+PublicKey = ${srv_pub}
+Endpoint = ${endpoint}:${wg_port}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+CONF
+)
+    local out="/etc/wireguard/peer-${dev_name}.conf"
+    echo "$peer_conf" > "$out"; chmod 600 "$out"
+
+    title "设备 [${dev_name}] 的 WireGuard 配置"
+    echo "$peer_conf" >&2
+    echo >&2
+    if command -v qrencode >/dev/null 2>&1; then
+        info "扫码导入 (WireGuard App → 扫描二维码):"
+        qrencode -t ANSIUTF8 <<< "$peer_conf" >&2
+    else
+        warn "未装 qrencode, 只能手动导入上面的文本配置。"
+    fi
+    ok "配置已存至 ${out} —— 导入设备的 WireGuard 客户端即可。"
+    cat >&2 <<EOM
+
+  用法要点:
+  - 设备装官方 WireGuard App, 导入上面配置 (扫码或粘贴), 连接即可。
+  - 设备↔网关是家域内 WG (不跨 GFW), 海外流量在**网关**上经 Mirage 出海, 设备零翻墙痕迹。
+  - 命门: DNS 已设为网关 ${wg_srv_ip} —— 别在设备上改成公共 DNS, 否则海外域名解不成 fake-IP 就走不了代理。
+  - 再加一台设备: 重跑本项 (7), 会追加新 peer 不覆盖旧的。
+  - 局域网/公网防火墙需放行 UDP ${wg_port} 到本机。
+EOM
+}
+
 main() {
     title "Mirage-rs 安装向导"
     if [[ $EUID -ne 0 ]]; then
@@ -2206,12 +2339,14 @@ main() {
         "同时部署服务端与客户端" \
         "更新二进制 (Update binary)" \
         "显示服务端节点配置 (Show node info)" \
-        "卸载 (Uninstall)")
+        "卸载 (Uninstall)" \
+        "家庭 WireGuard 服务端 (干净设备接入)")
 
     case "$mode" in
         4) update_binary; return ;;
         5) show_server_node; return ;;
         6) uninstall; return ;;
+        7) config_wg_server; return ;;
     esac
 
     # 部署路径 (1/2/3): 先选形态 —— 完整版还是轻量版
