@@ -643,7 +643,7 @@ pub async fn connect(
 /// 这样 SS 出站既能直连 SS 服务器, 也能骑 Mirage 隧道 (SS-over-Mirage, 类 shadow-tls+ss)。
 pub async fn client_handshake_over<R, W>(
     read_half: R,
-    mut write_half: W,
+    write_half: W,
     cfg: &SsConfig,
     target: &str,
 ) -> Result<(SsReader<R>, SsWriter<W>)>

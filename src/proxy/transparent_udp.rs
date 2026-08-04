@@ -672,7 +672,94 @@ async fn setup_flow(
                 UdpTarget::Domain(d) => d.clone(),
                 UdpTarget::Ip(ip) => ip.to_string(),
             };
-            // 子上限: 占一个 Mirage-UDP 隧道名额 (drop 时释放)。满则丢, 别抽干隧道池。
+            // ── UDP mux 路径: 多流复用少量共享隧道, 脱钩 pool_size 上限。默认关。 ──
+            // 注: 不占 MirageUdpPermit (那个 256 子上限的前提是"每流独占一条隧道", mux 下
+            // 不成立)。mux 流的并发由主循环的 MAX_FLOWS(4096) 总闸兜底, 无需再叠 256。
+            if crate::proxy::udp_mux::udp_mux_enabled() {
+                let mtun = match crate::proxy::udp_mux::get_mux_tunnel(&pool, &key).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("[TPROXY-UDP] Mirage-MUX 隧道不可用: {}", e);
+                        return;
+                    }
+                };
+                let sid = mtun.alloc_sid();
+                let reply = match acquire_reply(&replies, orig_dst) {
+                    Some(r) => r,
+                    None => return,
+                };
+                guard.reply_acquired = true;
+                // 注册 sid → (reply, client): 返回 (RAII 守卫, got_downlink 标志)。守卫 drop 保证
+                // 注销 (含 panic), 防 sid 泄漏吊住 reply socket (对齐 FlowGuard 契约)。单隧道 sid 到
+                // 上限则 None → 丢本流 (客户端回落 TCP), 别撑爆客户端表 (与服务端 512 对齐)。
+                let (_sid_guard, got_downlink) = match mtun.try_register(sid, reply, client) {
+                    Some(v) => v,
+                    None => {
+                        debug!("[TPROXY-UDP] Mirage-MUX 单隧道 sid 到上限, 丢弃 (客户端回落 TCP)");
+                        return;
+                    }
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                lock_sessions(&sessions).insert(
+                    key,
+                    FlowSlot::Ready { id: flow_id, sink: FlowSink::Mirage(tx.clone()) },
+                );
+                guard.committed_id = Some(flow_id);
+                debug!("[TPROXY-UDP] new Mirage-MUX flow {} → {} (sid {})", client, tdesc, sid);
+                let _ = tx.try_send(first_payload);
+
+                let shared = mtun.uplink();
+                let mk_frame = |pkt: &[u8]| -> Option<Vec<u8>> {
+                    match &target {
+                        UdpTarget::Domain(d) => {
+                            crate::proxy::udp_mux::frame_mux_domain(sid, d, port, pkt)
+                        }
+                        UdpTarget::Ip(ip) => {
+                            crate::proxy::udp_mux::frame_mux_ipv4(sid, ip, port, pkt)
+                        }
+                    }
+                };
+                // per-flow 上行泵: rx → 封 sid 帧 (合本流突发) → 共享上行。
+                // 首下行到达前用短超时快拆 (MUX_FIRST_DOWNLINK): 整段无下行 (VPS 过滤出向 UDP /
+                // 服务端 sid 表满黑洞) 就别死等 60s 白占 sid, 尽快释放回落 TCP。收到下行后转 60s idle。
+                let started = Instant::now();
+                loop {
+                    let to = if got_downlink.load(Ordering::Relaxed) {
+                        IDLE_TIMEOUT
+                    } else {
+                        crate::proxy::udp_mux::MUX_FIRST_DOWNLINK.saturating_sub(started.elapsed())
+                    };
+                    if to.is_zero() {
+                        break; // 首下行窗口内无下行 → 快拆
+                    }
+                    let pkt = match tokio::time::timeout(to, rx.recv()).await {
+                        Ok(Some(p)) => p,
+                        _ => break, // idle (已有下行) 或 首下行超时 → 拆
+                    };
+                    let mut batch = match mk_frame(&pkt) {
+                        Some(f) => f,
+                        None => continue,
+                    };
+                    while batch.len() < UPLINK_COALESCE_CAP {
+                        match rx.try_recv() {
+                            Ok(p) => {
+                                if let Some(f) = mk_frame(&p) {
+                                    batch.extend_from_slice(&f);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if shared.send(batch).await.is_err() {
+                        break; // 共享隧道死
+                    }
+                }
+                // sid 注销由 _sid_guard drop 保证; session 槽 + reply refs-- 由 FlowGuard::drop 保证。
+                return;
+            }
+
+            // 子上限 (仅 legacy 一流一隧道路径): 占一个 Mirage-UDP 隧道名额 (drop 时释放)。
+            // 满则丢, 别抽干隧道池。mux 路径不走这里 (已在上面 return)。
             let _udp_permit = match MirageUdpPermit::try_acquire() {
                 Some(p) => p,
                 None => {

@@ -1,5 +1,69 @@
 # Changelog - Mirage-rs
 
+## [v0.9.0] - UDP 多路复用 (带机量) + 外部审计修复 (2026-08-04)
+
+真机实测 (旁路网关 + 单核 VPS): 并发 UDP 流拐点 **20 → 450 (22.5×)**, 天花板受限于服务端
+fd/CPU 而非 mux 本身。两端从 v0.5 升级验证 0.5↔0.9 协议向后兼容, 生产流量正常。
+
+### chore(install): 基于真机部署的改进
+
+- **服务端生成的 config 补 `direct` 出站**: 旧模板 `"outbounds": []` + `default_outbound:"direct"`
+  在新版校验下报错 (`default_outbound 不存在于 outbounds`) —— 真机 0.5→0.9 升级即踩此坑。已补。
+- **客户端安装询问是否开启 UDP mux** (`tuning.udp_mux`, 透明网关默认开)。
+- systemd unit 早已设 `LimitNOFILE=1048576` (真机 200 流墙 = 服务端 fd 1024, 印证此设定必要)。
+- README: UDP mux 用法 + 真机结果 + 服务端配置示例补 direct 出站 + 版本历史 v0.9.0。
+
+### fix: 外部审计 4 条修复 (WG 隧道内 DNS 死代码 / mux 背压 / DNS-TCP TXID / 常量时间比较)
+
+- **#1 WireGuard 隧道内 DNS 接线** (功能性静默失败): `WgConfig.dns` + `wg/dns.rs` (隧道内解析,
+  含 TXID/压缩指针环防护/TTL clamp) + `resolve_target` 全实装, 但出站/上游两处构造硬编码
+  `dns: None`, 把 config 的 `dns` 字段直接丢弃 → 用户配了隧道内 DNS 静默走本机解析 (拿本地
+  geo/CDN, WG 出口白配)。现两处正确接线 (解析成 IpAddr 传入), 并在 semantic_issues 加校验
+  (`dns` 非法 IP → check 阶段报错, 不再静默)。**尤其命中"干净设备"WG 中继用法** (DNS 是命门)。
+- **#2 UDP mux 背压** (mux 特性容量缺口, 默认关): 服务端 sid 表满时此前**静默丢新流**且无日志,
+  加上服务端 sid 活 300s / 客户端 60s 换新 sid → 高翻转 (QUIC 迁移/短连/游戏) 下死 sid 堆满
+  512 → 新流黑洞、客户端无信号。修: ①服务端 per-sid idle 300s→60s 对齐客户端 (死 sid 快回收);
+  ②饱和改限流 warn 不再静默; ③客户端单隧道 sid 上限 512 (与服务端对齐, `try_register`);
+  ④mux 流补首下行快拆 (8s 无下行即释放 sid → 回落 TCP, 对齐 legacy FIRST_DOWNLINK_TIMEOUT)。
+- **#3 DNS-over-TCP 响应校验 TXID + QR** (防注入): `resolve_via_tcp` (UDP-relay 域名解析路径)
+  此前只解 answer 段, 不比响应 ID/QR → 畸形或注入响应可把别域名 A 记录污进 60s 缓存。现校验
+  响应 TXID == 查询 TXID 且 QR=1, 不匹配返空 (对齐 dns/server.rs、wg/dns.rs; 这条最常用路径此前漏检)。
+- **#4 常量时间比较统一 subtle** (卫生 + 甩弃用依赖): API token 那处用的 `ring::constant_time::
+  verify_slices_are_equal` 已被 ring 0.17 标记 deprecated 待移除; 而 hello_auth 握手 tag 校验、
+  config 凭据比较仍是手写累加器 (功能正确但 LLVM 不保证)。三处统一换 `subtle::ConstantTimeEq`。
+- 顺手清 4 条既有构建 warning (含 #1 的两处 unused `dns`、client udp_relay 死导入、ss 多余 mut)。
+
+### feat(udp): UDP mux —— 多流复用共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"带机量硬伤
+
+透明 UDP 的 Mirage 流原本**一流一隧道** (`pool.get()` 独占一条 WarmPool 隧道至流结束),
+并发 UDP 流因此封顶在 `pool_size`, 是局域网网关带机量的硬伤 (见 brain `udp-capacity-findings`)。
+新增 **session-id 多路复用**: 多条 UDP 流按 flowkey 散列到少量 (默认 K=4) **长命共享隧道**复用,
+UDP 并发脱钩 `pool_size` (只吃 K 个池位, 与流数无关)。
+- **协议** (客户端 + 服务端两端, 破坏帧格式故版本门控): 认领 `[0x01]` 单字节为 mux sentinel
+  (旧 `[0x00]`=一流一隧道路径原封不动)。mux 帧 = 旧帧超集, 在 frameLen 后插 4B sid:
+  `[2B frameLen][4B sid][ATYP][ADDR][2B port][payload]`。上行带目标地址, 下行带回包源地址,
+  客户端**按 sid 分流** (忽略地址)。
+- **服务端** `handle_udp_mux_relay`: 按 sid 维护**独立连接式 egress socket** + 独立下行泵
+  (连接式才能保证"两 sid 打同一目标"回包不串——per-sid NAT); 所有回包经单一 mpsc 汇入唯一
+  AEAD writer (cancel-safe)。支持 Direct 与 WG-tunnel 上游 (每 sid 在同一 WG 隧道内绑独立端口)。
+  sid 上限 512 封顶资源。
+- **客户端** `MuxSet`/`MuxTunnel`: K 条共享隧道懒建/死则重建; 共享 writer 泵跨流合帧 (抗长度指纹);
+  单 demux 泵按 sid 路由到各流 reply socket; per-flow 上行泵封 sid 帧 + 合本流突发。
+- **门控**: `tuning.udp_mux` (默认关) + `tuning.udp_mux_tunnels` (默认 4)。仿 tls_padding ——
+  **仅在服务端也升级后开** (老服务端不认 0x01 → 那些 UDP 流失败 → 客户端回落 TCP), 启动 WARN。
+  默认关 = 升级零行为变化。
+- **代价 (已知权衡)**: 同隧道内跨流队头阻塞 (一流 TCP 丢包连累同隧道其他复用流), 靠 K 路散列
+  分摊; 实时 UDP 建议走 WG 上游 (原生承载, 无 TCP HoL)。非 QUIC (终局方案, 后续)。
+- 测试: codec 双向 round-trip + 服务端上行解析 (ATYP 1/3/4, 畸形消费重同步, 边界); 服务端 relay
+  **两 sid 同目标不串** e2e; 客户端全链路 (MuxTunnel 上行 → 服务端 relay → demux 按 sid 回)。
+  codec 手动变异 5/5 kill (含补边界测试)。
+- Sonnet 独立复核加固: ①MuxSet 改持 pool 的 **Weak** + REGISTRY 访问时剪除死条目 —— 堵配置热
+  重载泄漏旧 pool/隧道 (兼防 pool 地址复用碰撞); ②mux 路径不再占 legacy 的 256 子上限 permit
+  (那前提是每流独占隧道, mux 下失效), 改由主循环 MAX_FLOWS(4096) 兜底, 拿满带机量收益;
+  ③sid 注销收进 RAII 守卫 (含 panic 保证, 对齐 FlowGuard 契约); ④frame_mux_domain 域名 >255
+  返 None 不静默截断 (fail loud)。
+- `scripts/bench_udp_capacity.py` load 加 `--label` (打进表头/结果行, 标记 mux-off/mux-on 多轮对比)。
+
 ## [v0.8.1] - 链式代理 (统一出站流 + Mirage-over-X + SS 双向 + SS-over-Mirage) (2026-08-03)
 
 ### feat(outbound): Shadowsocks 出站 + SS-over-Mirage 嵌套 (类 shadow-tls+ss)

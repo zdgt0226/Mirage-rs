@@ -106,7 +106,15 @@ pub(crate) fn build_upstream(
                 })?,
                 mtu: *mtu,
                 persistent_keepalive: *persistent_keepalive,
-                dns: None,
+                // 隧道内 DNS: 配了则经本隧道解析 (出口与 WG 一致)。非法 IP → 报错不静默。
+                dns: dns
+                    .as_deref()
+                    .map(|s| {
+                        s.parse::<std::net::IpAddr>().map_err(|_| {
+                            anyhow::anyhow!("上游 WireGuard: dns `{s}` 不是合法 IP")
+                        })
+                    })
+                    .transpose()?,
             };
             info!(
                 "上游出口: WireGuard {} (隧道内地址 {}) —— 本服务端作为中转站, TCP 流量将再经 WG 转发",
@@ -261,6 +269,15 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     warn!(
                         "已开启 tls_padding: 要求两端都升到支持剥零的版本。老对端不剥零, 会把填充零\
                          当 content_type 解析失败断连。"
+                    );
+                }
+                // UDP mux 开关 (客户端; 设进全局, transparent_udp 读)。
+                crate::proxy::udp_mux::set_udp_mux(tuning.udp_mux, tuning.udp_mux_tunnels);
+                if tuning.udp_mux {
+                    warn!(
+                        "已开启 udp_mux (K={}): 要求服务端也升到支持 mux 的版本。老服务端不认 mux \
+                         sentinel, 那些 UDP 流会失败 → 客户端回落 TCP。",
+                        tuning.udp_mux_tunnels
                     );
                 }
                 if tuning.cipher_agility {

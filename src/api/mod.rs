@@ -35,10 +35,13 @@ pub use state::AppState;
 
 /// 常量时间比较, 防 token 校验的时序侧信道 (长度不同直接不等; 长度本身不敏感)。
 ///
-/// 用 `ring` 审计过的实现而非手写累加器 —— 手写 `diff |= a[i]^b[i]` 虽是正确惯用法, 但
-/// Rust/LLVM **不保证**不会在优化时插入短路/向量化破坏常数时间; ring 的版本带优化屏障。
+/// 用 `subtle::ConstantTimeEq` 而非手写累加器 —— 手写 `diff |= a[i]^b[i]` 虽是正确惯用法, 但
+/// Rust/LLVM **不保证**不会在优化时插入短路/向量化破坏常数时间; subtle 带优化屏障。
+/// (原用 `ring::constant_time::verify_slices_are_equal`, 已被 ring 标记 deprecated 待移除,
+/// 换 subtle 统一全仓常量时间比较。)
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// token 来源。CSRF 判定要用: **Bearer header 天然抗 CSRF** (跨站页面发不出自定义

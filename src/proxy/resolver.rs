@@ -223,6 +223,8 @@ async fn resolve_via_tcp(host: &str, upstream: SocketAddr) -> io::Result<Vec<IpA
 async fn query_one(host: &str, qtype: u16, upstream: SocketAddr) -> io::Result<Vec<IpAddr>> {
     let query = build_dns_query(host, qtype)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("非法域名: {host}")))?;
+    // TXID 在 query 头 2 字节 (build_dns_query 生成), 收响应时用它校验 ID 防串号/注入。
+    let tx = u16::from_be_bytes([query[0], query[1]]);
     let fut = async {
         let mut s = TcpStream::connect(upstream).await?;
         let mut framed = (query.len() as u16).to_be_bytes().to_vec();
@@ -233,7 +235,7 @@ async fn query_one(host: &str, qtype: u16, upstream: SocketAddr) -> io::Result<V
         let n = u16::from_be_bytes(len_buf) as usize;
         let mut resp = vec![0u8; n];
         s.read_exact(&mut resp).await?;
-        Ok::<_, io::Error>(parse_answer_ips(&resp))
+        Ok::<_, io::Error>(parse_answer_ips(&resp, tx))
     };
     tokio::time::timeout(DNS_TCP_TIMEOUT, fut)
         .await
@@ -269,9 +271,17 @@ fn build_dns_query(host: &str, qtype: u16) -> Option<Vec<u8>> {
 
 /// 从 DNS 响应的 answer 段抽出 A/AAAA 记录的 IP。畸形/截断即尽力而止 (返回已解出的)。
 /// 名字压缩指针只跳过不追 (取 rdata 不需要解名), 故不会有指针环。
-fn parse_answer_ips(resp: &[u8]) -> Vec<IpAddr> {
+///
+/// `expect_tx` = 发出查询时的 TXID。响应 ID 不匹配、或 QR 位非响应 → 视为伪造/串号,
+/// 返回空 (不缓存)。防注入响应把别的域名的 A 记录污进本域名 (对齐 dns/server.rs、
+/// wg/dns.rs 的校验; 这条最常用的 UDP-relay 解析路径此前漏检)。
+fn parse_answer_ips(resp: &[u8], expect_tx: u16) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     if resp.len() < 12 {
+        return ips;
+    }
+    // TXID 必须与查询一致, 且 QR=1 (bit 15 of flags) 是响应。
+    if u16::from_be_bytes([resp[0], resp[1]]) != expect_tx || (resp[2] & 0x80) == 0 {
         return ips;
     }
     let qd = u16::from_be_bytes([resp[4], resp[5]]) as usize;
@@ -357,18 +367,39 @@ mod dns_tcp_tests {
         // answer 2: name ptr AAAA rdlen=16 ::1
         r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x1C, 0x00, 0x01, 0, 0, 1, 44, 0, 16]);
         r.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-        let ips = parse_answer_ips(&r);
+        let ips = parse_answer_ips(&r, 0x1234);
         assert_eq!(ips.len(), 2);
         assert_eq!(ips[0], "1.2.3.4".parse::<IpAddr>().unwrap());
         assert_eq!(ips[1], "::1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
+    fn parse_rejects_txid_mismatch() {
+        // 与上同报文 (tx=0x1234, 含合法 A/AAAA), 但期望 tx=0x9999 → 视为注入/串号, 返回空。
+        let mut r = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        r.push(1); r.push(b'a'); r.push(3); r.extend_from_slice(b"com"); r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]);
+        r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 1, 44, 0, 4, 1, 2, 3, 4]);
+        assert!(parse_answer_ips(&r, 0x9999).is_empty()); // ID 不匹配
+        assert_eq!(parse_answer_ips(&r, 0x1234).len(), 1); // ID 匹配则正常解出
+    }
+
+    #[test]
+    fn parse_rejects_non_response_qr() {
+        // tx 匹配但 QR=0 (查询而非响应, flags 高位 0) → 拒。
+        let mut r = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 1, 0, 0, 0, 0];
+        r.push(1); r.push(b'a'); r.push(3); r.extend_from_slice(b"com"); r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]);
+        r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 1, 44, 0, 4, 1, 2, 3, 4]);
+        assert!(parse_answer_ips(&r, 0x1234).is_empty());
+    }
+
+    #[test]
     fn parse_ignores_cname_and_truncation() {
-        // AN=1 但 rdata 截断 → 尽力而止, 不 panic, 返回空
+        // AN=1 但 rdata 截断 → 尽力而止, 不 panic, 返回空。tx=0 匹配 + QR=1。
         let mut r = vec![0, 0, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0];
         r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 1, 44, 0, 4, 1, 2]); // rdlen=4 但只剩 2B
-        assert!(parse_answer_ips(&r).is_empty());
+        assert!(parse_answer_ips(&r, 0).is_empty());
     }
 
     // 真实网络: DNS-over-TCP 对 1.1.1.1 解析已知域名。默认 ignore (CI 无出口时不挂),

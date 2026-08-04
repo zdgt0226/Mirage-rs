@@ -226,7 +226,8 @@ def run_load(args):
     workers = max(1, args.workers)
     executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
 
-    print(f"[load] target=({host!r}, {port}) src_ips={src_ips} rate={args.rate}/s hold={args.hold}s "
+    label = f"[{args.label}] " if args.label else ""
+    print(f"[load] {label}target=({host!r}, {port}) src_ips={src_ips} rate={args.rate}/s hold={args.hold}s "
           f"payload={args.payload}B workers={workers}  斜坡 {args.start}→{args.max} step {args.step}")
     print(f"{'flows':>7} {'opened':>7} {'alive':>6} {'flow_ok%':>9} "
           f"{'dgram_loss%':>12} {'p50ms':>7} {'p95ms':>7} {'cpu%':>6}")
@@ -256,7 +257,7 @@ def run_load(args):
 
     print()
     if ceiling is None:
-        print(f"[结果] 到 {args.max} flow_ok 仍未跌破 {args.threshold}%"
+        print(f"[结果]{label and ' ' + label.strip()} 到 {args.max} flow_ok 仍未跌破 {args.threshold}%"
               + ("; 但中途撞 fd/系统限 (见 [fd] 标注), 先 `ulimit -n` 再测。" if fd_capped
                  else " —— 极限更高, 调大 --max 继续。"))
     else:
@@ -272,7 +273,7 @@ def run_load(args):
             shape = "干净墙, 命中 ≈4096 (透明 UDP MAX_FLOWS)"
         else:
             shape = "干净墙但非已知常量 —— 看 cpu% 与 opened 列排查 CPU/fd/网卡"
-        print(f"[结果] flow_ok 拐点 ≈ {ceiling} 条并发流 (跌破 {args.threshold}%)。判读: {shape}")
+        print(f"[结果]{label and ' ' + label.strip()} flow_ok 拐点 ≈ {ceiling} 条并发流 (跌破 {args.threshold}%)。判读: {shape}")
 
     if executor is not None:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -299,6 +300,8 @@ def main():
     l.add_argument("--source-ips", default="", help="逗号分隔源 IP (需先 ip addr add 别名), 默认 0.0.0.0")
     l.add_argument("--workers", type=int, default=1,
                    help="多进程加压 (每进程独立 asyncio 事件循环), 破 load 端单核瓶颈。建议 = 测试机核数")
+    l.add_argument("--label", default="",
+                   help="本轮标签 (如 mux-off / mux-on), 打进表头与结果行, 方便多轮对比归档")
 
     args = ap.parse_args()
     if args.mode == "echo":

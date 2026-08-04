@@ -1,6 +1,6 @@
 [package]
 name = "mirage-rs"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 
 [lib]
@@ -40,6 +40,7 @@ serde_ignored = "0.1.14"
 md-5 = "0.11.0"
 blake3 = "1.8.5"
 base64 = "0.22.1"
+subtle = "2.6"
 boringtun = "0.7"
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
 

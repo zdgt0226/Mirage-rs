@@ -504,7 +504,15 @@ impl OutboundManager {
                             address: address.parse()?,
                             mtu: *mtu,
                             persistent_keepalive: *persistent_keepalive,
-                            dns: None,
+                            // 隧道内 DNS: 配了则域名经本隧道解析 (出口与 WG 一致, 防 CDN/geo
+                            // 拿本地结果)。非法 IP 在 semantic_issues 已 fail-fast, 这里再兜底。
+                            dns: dns
+                                .as_deref()
+                                .map(|s| {
+                                    s.parse::<std::net::IpAddr>()
+                                        .map_err(|_| anyhow::anyhow!("WireGuard dns `{s}` 不是合法 IP"))
+                                })
+                                .transpose()?,
                         })
                     })();
                     match built {

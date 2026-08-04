@@ -130,11 +130,10 @@ pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u6
     }
     
     let expected_tag = poly1305_tag(password.as_bytes(), &ts_bytes, &random_prefix);
-    let mut diff = 0u8;
-    for i in 0..16 {
-        diff |= expected_tag[i] ^ token[16 + i];
-    }
-    if diff != 0 {
+    // 常量时间比 16B tag (握手 token 校验是真正的网络侧信道面)。用 subtle 而非手写累加器,
+    // 带优化屏障, 与全仓 ct 比较统一。
+    use subtle::ConstantTimeEq;
+    if !bool::from(expected_tag[..].ct_eq(&token[16..32])) {
         return false;
     }
     
