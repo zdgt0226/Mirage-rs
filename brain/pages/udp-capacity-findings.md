@@ -4,7 +4,7 @@ title: "UDP 带机量实测: direct 网关健康, 隧道受 pool_size 封顶"
 category: decision
 status: active
 created: "2026-07-31T02:28:45"
-updated: "2026-08-03T15:15:48"
+updated: "2026-08-04T22:52:18"
 ---
 
 ## compiled_truth
@@ -30,3 +30,9 @@ updated: "2026-08-03T15:15:48"
   summary: "UDP mux 已实现 (PR #23, feat/udp-mux, 默认关 tuning.udp_mux+udp_mux_tunnels=4)。方案 A session-id TCP-mux (非 QUIC 终局): 认领 0x01 sentinel (旧 0x00 一流一隧道字节不变), mux 帧=旧帧超集 frameLen 后插 4B sid, 上行带目标下行带回包源客户端按 sid 分流。服务端 handle_udp_mux_relay per-sid 连接式 egress socket (两 sid 打同目标不串) + 单 AEAD writer cancel-safe, sid 上限 512, 支持 Direct+WG 上游。客户端 MuxSet/MuxTunnel: K 条共享长命隧道 (持 Weak pool 防热重载泄漏) 按 flowkey 散列, 共享 writer 跨流合帧, 单 demux 泵按 sid 回。拿掉'并发 UDP 流<=pool_size'硬伤 (mux 下由 MAX_FLOWS 4096 兜底, 不再占 legacy 256 permit)。权衡: 同隧道跨流 HoL 靠 K 路分摊+实时走 WG 逃生。测试: codec 变异 5/5, 服务端两 sid 同目标不串 e2e + 客户端全链路 e2e, full 374 passed。Sonnet 复核 3黄1蓝全修 (REGISTRY 泄漏/256 permit/unregister guard/域名截断)。待真机 bench 验带机量破 pool_size。"
   source: "PR #23 feat/udp-mux commits ddb4208+f802e98"
   affects: [src/proxy/udp_mux.rs, src/proxy/mirage_server/udp_relay.rs, src/proxy/transparent_udp.rs, src/proxy/mirage_server/control.rs, src/config.rs]
+
+- time: 2026-08-04T22:52:18
+  kind: note
+  summary: "UDP mux 真机实测通过 (2026-08-04)。拓扑: LAN 透明网关 172.16.0.162 (2 核, 旁路由 enp1s0, pool_size=100) + Mirage 服务端 144.225.246.83 (1 核)。两端从 v0.5.0 升级到 v0.8.1 (feat/udp-mux 分支, 协议 0.5<->0.8 向后兼容真实流量正常)。测法: 网关 netns 模拟 LAN 客户端 (走 sk_lookup fake-IP 路径, 因单臂网卡无法用 tc_divert bare-IP), 目标域名 muxbench.test 经 fake-IP+服务端 /etc/hosts 解到本地 echo, scripts/bench_udp_capacity.py 斜坡加压。结果 flow_ok 拐点: mux-off=20 (退化崩, 每流独占隧道压垮 1 核服务端) / mux-on 服务端 fd=1024 时=200 / mux-on 服务端 fd=65536 时=450 (100% 稳到 400 流)。20->450 = 22.5x。关键: 每道墙都是环境限 (先服务端 fd Too-many-open-files 后 1 核 CPU), 从不是 mux 设计 —— 全程无 sid 饱和告警、无 UdpRcvbufErrors; mux 还同时正确复用真实 YouTube QUIC 多流 (K=4 共享隧道)。结论: 带机量硬伤 (并发 UDP 流<=pool_size) 已解除, 特性生产可用。部署: 两端已 systemd 化 (mirage-rs.service, LimitNOFILE=65536, enable 自启), 网关 config tuning.udp_mux=true 常开, 服务端 config 补了 direct 出站 (0.8.1 校验必需)。旧二进制/配置备份在 .bak。"
+  source: "真机 172.16.0.162 + 144.225.246.83 bench 三轮 mux-off/on + systemd 部署"
+  affects: [src/proxy/udp_mux.rs, scripts/bench_udp_capacity.py]
