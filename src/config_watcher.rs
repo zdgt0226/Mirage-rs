@@ -280,7 +280,7 @@ impl ConfigWatcher {
                         // 示的就是真正被认可导致 reload 的那条路径.
                         let trigger_path = paths.iter().find(|p| {
                             *p == &config_pathbuf
-                                || p.extension().map_or(false, |e| e == "dat")
+                                || p.extension().is_some_and(|e| e == "dat")
                         });
                         let trigger_path = match trigger_path {
                             Some(p) => p,

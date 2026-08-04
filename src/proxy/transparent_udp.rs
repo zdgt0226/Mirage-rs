@@ -212,7 +212,7 @@ fn recv_with_origdst(fd: RawFd, buf: &mut [u8]) -> nix::Result<(usize, SocketAdd
     let msg = recvmsg::<SockaddrIn>(fd, &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
 
     let client = msg.address.ok_or(nix::errno::Errno::EINVAL)?;
-    let client = SocketAddrV4::new(Ipv4Addr::from(client.ip()), client.port());
+    let client = SocketAddrV4::new(client.ip(), client.port());
 
     let mut orig = None;
     for c in msg.cmsgs()? {
@@ -383,7 +383,7 @@ pub async fn start_transparent_udp(
         if at_cap {
             // 出锁后再记 (不在锁内 format/写日志)。限流打印, 免刷屏。
             let n = CAP_DROPS.fetch_add(1, Ordering::Relaxed);
-            if n % 1000 == 0 {
+            if n.is_multiple_of(1000) {
                 warn!(
                     "[TPROXY-UDP] 并发流到上限 {} , 丢弃新流 (累计丢 {})",
                     MAX_FLOWS,

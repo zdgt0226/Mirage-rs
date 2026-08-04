@@ -605,16 +605,15 @@ pub fn ja4(ch: &[u8]) -> String {
         exts.push(et);
         match et {
             0x0000 => sni = true,
-            0x0010 => {
-                if data.len() >= 3 {
+            0x0010
+                if data.len() >= 3 => {
                     let pl = data[2] as usize;
                     if data.len() >= 3 + pl {
                         alpn = Some(String::from_utf8_lossy(&data[3..3 + pl]).to_string());
                     }
                 }
-            }
-            0x002b => {
-                if !data.is_empty() {
+            0x002b
+                if !data.is_empty() => {
                     let vl = data[0] as usize;
                     let mut k = 1;
                     while k + 1 < 1 + vl && k + 1 < data.len() {
@@ -625,9 +624,8 @@ pub fn ja4(ch: &[u8]) -> String {
                         k += 2;
                     }
                 }
-            }
-            0x000d => {
-                if data.len() >= 2 {
+            0x000d
+                if data.len() >= 2 => {
                     let sl = u16::from_be_bytes([data[0], data[1]]) as usize;
                     let mut k = 2;
                     while k + 1 < 2 + sl && k + 1 < data.len() {
@@ -635,7 +633,6 @@ pub fn ja4(ch: &[u8]) -> String {
                         k += 2;
                     }
                 }
-            }
             _ => {}
         }
     }

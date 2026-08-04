@@ -14,6 +14,13 @@ config→CoreState→`DnsForwarder.resolve_query` 路径 (非 mock):
 (破 fake-IP / 破 block / 破 AAAA 空答复各令对应测试失败)。仅一处可见性改动 `ConfigWatcher::build_state`
 → `pub(crate)` (复用生产构建器, 无逻辑改)。
 
+### chore: clippy 清理 (安全子集)
+
+`cargo clippy --fix` 应用机器验证安全的重写, 46 → 24 warning (清 22): 去无用 `.into()`/同类型 cast、
+`or_insert_with`→`or_default`、补 `Default` impl、map values 迭代、bool 化简等。全套测试保持
+376 passed 无行为变。剩 24 条需判断的 (大 enum 变体装箱 / while-let 故意的 timeout 模式 /
+too-many-args) 留给后续单独处置, 暂不翻 `-D warnings`。
+
 ## [v0.9.0] - UDP 多路复用 (带机量) + 外部审计修复 (2026-08-04)
 
 真机实测 (旁路网关 + 单核 VPS): 并发 UDP 流拐点 **20 → 450 (22.5×)**, 天花板受限于服务端

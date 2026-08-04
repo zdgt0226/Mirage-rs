@@ -376,7 +376,7 @@ pub(crate) async fn handle_udp_mux_relay(
                 // 新 sid: 到顶则丢 + 限流告警 (别静默黑洞 —— 客户端无信号, 只会看到 UDP 流死掉)。
                 if lock_mux(&up_sessions).len() >= MAX_MUX_SIDS {
                     let n = MUX_CAP_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n % 1000 == 0 {
+                    if n.is_multiple_of(1000) {
                         tracing::warn!(
                             "UDP mux: 单隧道 sid 到上限 {}, 丢弃新流 (累计丢 {})。若持续, 说明 UDP 流\
                              翻转率高 —— 客户端会回落 TCP。",

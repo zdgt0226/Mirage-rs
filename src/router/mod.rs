@@ -115,7 +115,7 @@ impl DomainTrie {
             curr = curr
                 .children
                 .entry(part.to_string())
-                .or_insert_with(DomainTrieNode::default);
+                .or_default();
         }
         curr.rule_ids.push(rule_id);
     }
@@ -595,7 +595,7 @@ impl RouterEngine {
 
         let mut valid_candidates = Vec::new();
         for (&id, &count) in &candidate_counts {
-            let rule = &self.rule_table[id as usize];
+            let rule = &self.rule_table[id];
             let required = if rule.mode == "and" {
                 let mut req_cnt = 0;
                 if rule.has_domain_filters() { req_cnt += 1; }
@@ -613,7 +613,7 @@ impl RouterEngine {
         valid_candidates.sort_unstable();
 
         for id in valid_candidates {
-            let rule = &self.rule_table[id as usize];
+            let rule = &self.rule_table[id];
             if rule.matches_port(req.port) && rule.matches_extra(req) {
                 tracing::debug!(
                     "[ROUTE] {} :{}/{} → [{}] (命中规则 #{})",

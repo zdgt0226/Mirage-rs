@@ -476,7 +476,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 let st = dns_state.load();
                 let mut futures = Vec::new();
                 
-                for (_, node) in &st.outbounds.outbounds {
+                for node in st.outbounds.outbounds.values() {
                     if let crate::proxy::outbound::OutboundNode::Mirage { server_host, server_port, server_ip, .. } = node.as_ref() {
                         let host = server_host.clone();
                         let port = *server_port;
@@ -521,7 +521,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             loop {
                 let st = core_state.load();
                 if let Ok(lock) = lock_clone.try_lock() {
-                    for (_, node) in &st.outbounds.outbounds {
+                    for node in st.outbounds.outbounds.values() {
                         if let crate::proxy::outbound::OutboundNode::Mirage { server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, .. } = node.as_ref() {
                             if let Some(_ip) = *server_ip.read().unwrap_or_else(|e| e.into_inner()) {
                                 if let Ok(actives) = pool.brutal_state.active_fds.lock() {
@@ -546,7 +546,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                     if count > 0 {
                                         let rtt = sum_rtt / count;
                                         rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
-                                        snd_cwnd.store(max_cwnd as u64, std::sync::atomic::Ordering::Relaxed);
+                                        snd_cwnd.store(max_cwnd, std::sync::atomic::Ordering::Relaxed);
                                         let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
                                         let old_segs = total_segs_out.swap(sum_segs, std::sync::atomic::Ordering::Relaxed);
                                         

@@ -21,6 +21,12 @@ pub struct MemoryWriter {
     buffer: Arc<Mutex<VecDeque<String>>>,
 }
 
+impl Default for MemoryWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryWriter {
     pub fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(1000);
