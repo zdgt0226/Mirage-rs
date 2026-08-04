@@ -5,7 +5,7 @@ category: decision
 status: draft
 tags: [roadmap, chain-proxy, wireguard, shadowsocks, architecture]
 created: "2026-07-27T01:30:56"
-updated: "2026-08-03T02:31:01"
+updated: "2026-08-05T01:25:39"
 ---
 
 ## compiled_truth
@@ -82,3 +82,9 @@ updated: "2026-08-03T02:31:01"
   summary: "(补上条被 shell 吃掉的一句) fake-IP 拦截靠: ip route replace local 198.18.0.0/15 dev lo —— 把 fake-IP 段声明成本机地址, 使发往它的包走本地投递而非转发, 从而触发 netns 上的 sk_lookup 重定向到 Mirage。见 transparent_net.rs。"
   source: "更正上条 backtick 缺失"
   affects: [chain-proxy-roadmap]
+
+- time: 2026-08-05T01:25:39
+  kind: decision
+  summary: "WG 入站'干净设备'已落地 (2026-08-05, branch feat/wg-inbound-clean-device)。install.sh 加菜单 7) 家庭 WireGuard 服务端: 装 wireguard-tools+内核 WG, 生成 wg0(10.7.0.1/24)+NAT+wg-quick@wg0 自启, 每设备生成配置(文本+二维码)幂等追加 peer, 设备 DNS 强制指向网关 wg0 IP(命门)。**零 Rust 改动** —— 决策预测的机制真机端到端验证成立: netns 模拟 WG peer → 网关 wg0-ingress → 目的 fake-IP 本地投递 → sk_lookup 命中(挂 netns 不绑网卡)→ 透明代理 → Mirage 出海, google/cloudflare HTTP 200; 国内 baidu 走直连 NAT; 被代理域名只解 fake-IP 不泄真实 IP(T2/T3)。rp_filter 网关已=0 免坑。网关坑记录: 无 iptables(纯 nft)需装 iptables, wireguard.ko 在但需 modprobe。README 加干净设备接入一节+已知限制(裸 IP 从 wg0 不被 tc_divert 拦, 罕见)。boringtun WG responder 保持否决。"
+  source: "install.sh config_wg_server + 真机 172.16.0.162 netns WG peer 端到端验证"
+  affects: [install.sh, README.md]
