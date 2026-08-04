@@ -689,9 +689,16 @@ async fn setup_flow(
                     None => return,
                 };
                 guard.reply_acquired = true;
-                // 注册 sid → (reply, client), 返回 RAII 守卫: drop 保证注销 (含 panic), 防 sid
-                // 泄漏吊住 reply socket (对齐 FlowGuard 契约)。
-                let _sid_guard = mtun.register(sid, reply, client);
+                // 注册 sid → (reply, client): 返回 (RAII 守卫, got_downlink 标志)。守卫 drop 保证
+                // 注销 (含 panic), 防 sid 泄漏吊住 reply socket (对齐 FlowGuard 契约)。单隧道 sid 到
+                // 上限则 None → 丢本流 (客户端回落 TCP), 别撑爆客户端表 (与服务端 512 对齐)。
+                let (_sid_guard, got_downlink) = match mtun.try_register(sid, reply, client) {
+                    Some(v) => v,
+                    None => {
+                        debug!("[TPROXY-UDP] Mirage-MUX 单隧道 sid 到上限, 丢弃 (客户端回落 TCP)");
+                        return;
+                    }
+                };
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
                 lock_sessions(&sessions).insert(
                     key,
@@ -712,11 +719,22 @@ async fn setup_flow(
                         }
                     }
                 };
-                // per-flow 上行泵: rx → 封 sid 帧 (合本流突发) → 共享上行。idle/隧道死 → 退。
+                // per-flow 上行泵: rx → 封 sid 帧 (合本流突发) → 共享上行。
+                // 首下行到达前用短超时快拆 (MUX_FIRST_DOWNLINK): 整段无下行 (VPS 过滤出向 UDP /
+                // 服务端 sid 表满黑洞) 就别死等 60s 白占 sid, 尽快释放回落 TCP。收到下行后转 60s idle。
+                let started = Instant::now();
                 loop {
-                    let pkt = match tokio::time::timeout(IDLE_TIMEOUT, rx.recv()).await {
+                    let to = if got_downlink.load(Ordering::Relaxed) {
+                        IDLE_TIMEOUT
+                    } else {
+                        crate::proxy::udp_mux::MUX_FIRST_DOWNLINK.saturating_sub(started.elapsed())
+                    };
+                    if to.is_zero() {
+                        break; // 首下行窗口内无下行 → 快拆
+                    }
+                    let pkt = match tokio::time::timeout(to, rx.recv()).await {
                         Ok(Some(p)) => p,
-                        _ => break,
+                        _ => break, // idle (已有下行) 或 首下行超时 → 拆
                     };
                     let mut batch = match mk_frame(&pkt) {
                         Some(f) => f,

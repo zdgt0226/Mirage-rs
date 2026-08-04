@@ -177,15 +177,10 @@ impl InboundAuth {
 }
 
 /// 常量时间字节比较 (长度不同直接 false —— 长度本身不是秘密)。
+/// 用 subtle 带优化屏障, 与全仓 ct 比较统一 (原手写累加器功能正确但 LLVM 不保证)。
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// DNS 劫持路径的合成入站 tag。劫持的 DNS 查询本身不是一个声明的 inbound (它由
@@ -881,9 +876,18 @@ impl Config {
         // 却什么都代理不了, 错误信息也指不到根因。所以必须在 check/启动阶段变成明确报错。
         for ob in &self.outbounds {
             if let OutboundConfig::Wireguard {
-                tag, private_key, peer_public_key, preshared_key, endpoint, address, mtu, ..
+                tag, private_key, peer_public_key, preshared_key, endpoint, address, mtu, dns, ..
             } = ob
             {
+                // dns 配了就必须是合法 IP —— 否则静默走本机解析 (拿本地 geo/CDN, WG 出口白配)。
+                // 这正是"配了但不生效"的静默失败类, 必须 check 阶段拦。
+                if let Some(d) = dns {
+                    if d.parse::<std::net::IpAddr>().is_err() {
+                        issues.push(format!(
+                            "outbound `{tag}`: dns `{d}` 不是合法 IP (隧道内 DNS 服务器地址, 如 10.0.0.1)"
+                        ));
+                    }
+                }
                 for (val, what) in [
                     (private_key, "private_key"),
                     (peer_public_key, "peer_public_key"),
@@ -1074,9 +1078,16 @@ impl Config {
                 // 上游出口配错会让服务端**拒绝启动**, 必须在 check 阶段就拦住 ——
                 // 否则 `check && systemctl restart` 这个闸门对这条路径形同虚设。
                 if let Some(UpstreamConfig::Wireguard {
-                    private_key, peer_public_key, preshared_key, endpoint, address, mtu, ..
+                    private_key, peer_public_key, preshared_key, endpoint, address, mtu, dns, ..
                 }) = upstream
                 {
+                    if let Some(d) = dns {
+                        if d.parse::<std::net::IpAddr>().is_err() {
+                            issues.push(format!(
+                                "mirage_server 入站 `{tag}` 的 upstream.dns `{d}` 不是合法 IP (隧道内 DNS 地址)"
+                            ));
+                        }
+                    }
                     for (val, what) in [
                         (private_key, "private_key"),
                         (peer_public_key, "peer_public_key"),

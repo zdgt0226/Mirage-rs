@@ -268,6 +268,14 @@ pub(super) async fn handle_udp_relay(
 /// 单条 mux 隧道内的 sid 上限, 封顶资源 (每 sid ≈ 1 socket FD + 1 task + 64KB buf)。
 const MAX_MUX_SIDS: usize = 512;
 
+/// mux per-sid 下行泵 idle 上限。**远短于** legacy 的 300s (UDP_IDLE_TIMEOUT) —— 客户端对
+/// mux 流 60s 即拆并单调分新 sid, 服务端若也留 300s, 高翻转 (QUIC 迁移/短连/游戏) 下死 sid
+/// 会在窗口内堆满 512 → 新流黑洞。缩到 60s 对齐客户端, 让死 sid 快速自然回收。
+const MUX_SID_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// sid 表满时的丢弃计数 (限流打印, 免刷屏)。
+static MUX_CAP_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// abort-on-drop: session 从表移除即中止其下行泵。
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
@@ -365,8 +373,17 @@ pub(crate) async fn handle_udp_mux_relay(
                     let _ = egress.send(&uf.payload).await;
                     continue;
                 }
-                // 新 sid: 到顶则丢。
+                // 新 sid: 到顶则丢 + 限流告警 (别静默黑洞 —— 客户端无信号, 只会看到 UDP 流死掉)。
                 if lock_mux(&up_sessions).len() >= MAX_MUX_SIDS {
+                    let n = MUX_CAP_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n % 1000 == 0 {
+                        tracing::warn!(
+                            "UDP mux: 单隧道 sid 到上限 {}, 丢弃新流 (累计丢 {})。若持续, 说明 UDP 流\
+                             翻转率高 —— 客户端会回落 TCP。",
+                            MAX_MUX_SIDS,
+                            n + 1
+                        );
+                    }
                     continue;
                 }
                 // 解析目标 (IP 字面量不解析, 域名走 60s 缓存 resolver)。
@@ -402,7 +419,7 @@ pub(crate) async fn handle_udp_mux_relay(
                 let pump = tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     loop {
-                        match tokio::time::timeout(UDP_IDLE_TIMEOUT, pump_egress.recv(&mut buf))
+                        match tokio::time::timeout(MUX_SID_IDLE_TIMEOUT, pump_egress.recv(&mut buf))
                             .await
                         {
                             Ok(Ok(n)) => {

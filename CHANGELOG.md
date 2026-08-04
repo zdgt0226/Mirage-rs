@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### fix: 外部审计 4 条修复 (WG 隧道内 DNS 死代码 / mux 背压 / DNS-TCP TXID / 常量时间比较)
+
+- **#1 WireGuard 隧道内 DNS 接线** (功能性静默失败): `WgConfig.dns` + `wg/dns.rs` (隧道内解析,
+  含 TXID/压缩指针环防护/TTL clamp) + `resolve_target` 全实装, 但出站/上游两处构造硬编码
+  `dns: None`, 把 config 的 `dns` 字段直接丢弃 → 用户配了隧道内 DNS 静默走本机解析 (拿本地
+  geo/CDN, WG 出口白配)。现两处正确接线 (解析成 IpAddr 传入), 并在 semantic_issues 加校验
+  (`dns` 非法 IP → check 阶段报错, 不再静默)。**尤其命中"干净设备"WG 中继用法** (DNS 是命门)。
+- **#2 UDP mux 背压** (mux 特性容量缺口, 默认关): 服务端 sid 表满时此前**静默丢新流**且无日志,
+  加上服务端 sid 活 300s / 客户端 60s 换新 sid → 高翻转 (QUIC 迁移/短连/游戏) 下死 sid 堆满
+  512 → 新流黑洞、客户端无信号。修: ①服务端 per-sid idle 300s→60s 对齐客户端 (死 sid 快回收);
+  ②饱和改限流 warn 不再静默; ③客户端单隧道 sid 上限 512 (与服务端对齐, `try_register`);
+  ④mux 流补首下行快拆 (8s 无下行即释放 sid → 回落 TCP, 对齐 legacy FIRST_DOWNLINK_TIMEOUT)。
+- **#3 DNS-over-TCP 响应校验 TXID + QR** (防注入): `resolve_via_tcp` (UDP-relay 域名解析路径)
+  此前只解 answer 段, 不比响应 ID/QR → 畸形或注入响应可把别域名 A 记录污进 60s 缓存。现校验
+  响应 TXID == 查询 TXID 且 QR=1, 不匹配返空 (对齐 dns/server.rs、wg/dns.rs; 这条最常用路径此前漏检)。
+- **#4 常量时间比较统一 subtle** (卫生 + 甩弃用依赖): API token 那处用的 `ring::constant_time::
+  verify_slices_are_equal` 已被 ring 0.17 标记 deprecated 待移除; 而 hello_auth 握手 tag 校验、
+  config 凭据比较仍是手写累加器 (功能正确但 LLVM 不保证)。三处统一换 `subtle::ConstantTimeEq`。
+- 顺手清 4 条既有构建 warning (含 #1 的两处 unused `dns`、client udp_relay 死导入、ss 多余 mut)。
+
 ### feat(udp): UDP mux —— 多流复用共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"带机量硬伤
 
 透明 UDP 的 Mirage 流原本**一流一隧道** (`pool.get()` 独占一条 WarmPool 隧道至流结束),

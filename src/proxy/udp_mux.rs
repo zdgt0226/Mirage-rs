@@ -213,9 +213,17 @@ const MUX_UPLINK_COALESCE_CAP: usize = 16 * 1024;
 
 type FlowKey = (SocketAddrV4, SocketAddrV4);
 
+/// 单条共享隧道内的 sid 上限 (客户端), 与服务端 MAX_MUX_SIDS 对齐, 封顶单隧道资源。
+const MUX_MAX_SIDS_PER_TUNNEL: usize = 512;
+/// 首个下行到达前的快拆超时: 整段收不到下行 (上游 VPS 过滤出向 UDP / 服务端 sid 表满黑洞)
+/// 就别死等 IDLE_TIMEOUT(60s) 白占 sid, 尽快释放 → 客户端回落 TCP。收到任一下行后转常规 idle。
+pub const MUX_FIRST_DOWNLINK: Duration = Duration::from_secs(8);
+
 struct FlowEntry {
     reply: Arc<UdpSocket>,
     client: SocketAddrV4,
+    /// demux 泵路由到该 sid 的首个下行时置 true, 供 per-flow 上行泵判快拆 (见 MUX_FIRST_DOWNLINK)。
+    got_downlink: Arc<AtomicBool>,
 }
 
 /// 客户端一条共享 mux 隧道。多条 UDP 流按 sid 复用: 上行经共享 writer 泵合帧发出,
@@ -278,8 +286,9 @@ impl MuxTunnel {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .get(&sid)
-                            .map(|e| (e.reply.clone(), e.client));
-                        if let Some((reply, client)) = entry {
+                            .map(|e| (e.reply.clone(), e.client, e.got_downlink.clone()));
+                        if let Some((reply, client, got)) = entry {
+                            got.store(true, Ordering::Relaxed); // 标记有下行, 解除 per-flow 快拆
                             let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
                         }
                     }
@@ -312,14 +321,23 @@ impl MuxTunnel {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&sid);
     }
-    /// 注册 sid → (reply, client) 并返回 RAII 守卫: 守卫 drop 时**保证**注销 (含 panic/
-    /// early-return), 与 FlowGuard 的"保证清理"契约对齐, 防 sid 泄漏吊住 reply socket。
-    pub fn register(self: &Arc<Self>, sid: u32, reply: Arc<UdpSocket>, client: SocketAddrV4) -> SidGuard {
-        self.flows
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid, FlowEntry { reply, client });
-        SidGuard { mtun: self.clone(), sid }
+    /// 注册 sid → (reply, client)。返回 (RAII 守卫, got_downlink 标志)。守卫 drop 时**保证**
+    /// 注销 (含 panic/early-return), 对齐 FlowGuard 契约, 防 sid 泄漏吊住 reply socket。
+    /// 单隧道 sid 到上限 (MUX_MAX_SIDS_PER_TUNNEL) 则返 None —— 调用方丢弃该流 (回落 TCP),
+    /// 别把客户端表撑爆 (与服务端 512 上限对齐)。
+    pub fn try_register(
+        self: &Arc<Self>,
+        sid: u32,
+        reply: Arc<UdpSocket>,
+        client: SocketAddrV4,
+    ) -> Option<(SidGuard, Arc<AtomicBool>)> {
+        let got_downlink = Arc::new(AtomicBool::new(false));
+        let mut flows = self.flows.lock().unwrap_or_else(|e| e.into_inner());
+        if flows.len() >= MUX_MAX_SIDS_PER_TUNNEL {
+            return None;
+        }
+        flows.insert(sid, FlowEntry { reply, client, got_downlink: got_downlink.clone() });
+        Some((SidGuard { mtun: self.clone(), sid }, got_downlink))
     }
     /// 共享上行发送端: per-flow 上行泵把封好 sid 的帧推进来, 由 writer 泵合帧发出。
     pub fn uplink(&self) -> mpsc::Sender<Vec<u8>> {
@@ -501,7 +519,7 @@ mod tests {
             _ => unreachable!(),
         };
         let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let _sid_guard = mtun.register(1, reply, catcher_v4);
+        let (_sid_guard, _got) = mtun.try_register(1, reply, catcher_v4).unwrap();
 
         // 上行: 经共享 uplink 泵发 sid=1 帧到 echo
         mtun.uplink()

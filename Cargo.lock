@@ -1521,6 +1521,7 @@ dependencies = [
  "sha2",
  "shadowsocks-crypto",
  "smoltcp",
+ "subtle",
  "tokio",
  "tower-http",
  "tracing",

@@ -106,7 +106,15 @@ pub(crate) fn build_upstream(
                 })?,
                 mtu: *mtu,
                 persistent_keepalive: *persistent_keepalive,
-                dns: None,
+                // 隧道内 DNS: 配了则经本隧道解析 (出口与 WG 一致)。非法 IP → 报错不静默。
+                dns: dns
+                    .as_deref()
+                    .map(|s| {
+                        s.parse::<std::net::IpAddr>().map_err(|_| {
+                            anyhow::anyhow!("上游 WireGuard: dns `{s}` 不是合法 IP")
+                        })
+                    })
+                    .transpose()?,
             };
             info!(
                 "上游出口: WireGuard {} (隧道内地址 {}) —— 本服务端作为中转站, TCP 流量将再经 WG 转发",
