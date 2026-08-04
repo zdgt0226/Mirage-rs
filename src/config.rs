@@ -908,7 +908,7 @@ impl Config {
                     ));
                 }
                 // endpoint 必须带端口 —— 少写端口是最常见的手抄错误
-                if !endpoint.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok()) {
+                if endpoint.rsplit(':').next().is_none_or(|p| p.parse::<u16>().is_err()) {
                     issues.push(format!(
                         "outbound `{tag}`: endpoint `{endpoint}` 缺少端口 (应形如 host:51820)"
                     ));
@@ -1106,7 +1106,7 @@ impl Config {
                             "mirage_server 入站 `{tag}` 的 upstream.address `{address}` 不是合法 IP (不带掩码)"
                         ));
                     }
-                    if !endpoint.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok()) {
+                    if endpoint.rsplit(':').next().is_none_or(|p| p.parse::<u16>().is_err()) {
                         issues.push(format!(
                             "mirage_server 入站 `{tag}` 的 upstream.endpoint `{endpoint}` 缺少端口"
                         ));

@@ -23,7 +23,7 @@ fn poly1305_tag(password_bytes: &[u8], ts_bytes: &[u8; 8], random_prefix: &[u8; 
     hasher.update(random_prefix);
     let one_time_key = hasher.finalize();
 
-    let poly = Poly1305::new(&one_time_key.into());
+    let poly = Poly1305::new(&one_time_key);
     let tag = poly.compute_unpadded(ts_bytes);
     let mut out = [0u8; 16];
     out.copy_from_slice(&tag);
@@ -69,6 +69,12 @@ pub struct TokenReplayCache {
     /// 而非当前 token 桶 —— 否则重放一个旧 token 会把参考拉回、"复活"已淘汰的桶,
     /// 使其 own 桶被当空桶重建 → 重放漏检 (F1)。hwm 只增不减, 保证淘汰单向前进。
     seen: Mutex<(u64, HashMap<u64, HashSet<Vec<u8>>>)>,
+}
+
+impl Default for TokenReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TokenReplayCache {

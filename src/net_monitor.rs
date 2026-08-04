@@ -130,11 +130,10 @@ mod imp {
                 16 | 17 | 20 | 21 => return true,
                 // RTM_NEWROUTE=24 / RTM_DELROUTE=25 —— 只认默认路由 (rtmsg.rtm_dst_len==0,
                 // 即 0.0.0.0/0 或 ::/0), 过滤具体路由抖动噪声。rtm_dst_len 在 rtmsg offset 1。
-                24 | 25 => {
-                    if pos + 16 + 2 <= buf.len() && buf[pos + 16 + 1] == 0 {
+                24 | 25
+                    if pos + 16 + 2 <= buf.len() && buf[pos + 16 + 1] == 0 => {
                         return true;
                     }
-                }
                 _ => {}
             }
             pos = (pos + nlmsg_len + 3) & !3; // NLMSG_ALIGN

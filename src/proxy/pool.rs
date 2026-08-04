@@ -60,6 +60,12 @@ pub struct PoolStats {
     pub last_sample_time: Option<Instant>,
 }
 
+impl Default for PoolStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PoolStats {
     pub fn new() -> Self {
         Self {

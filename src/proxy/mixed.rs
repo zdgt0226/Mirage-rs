@@ -158,8 +158,7 @@ pub async fn handle_client(
                 initial_payload = Some(body_extra);
             }
         } else {
-            if uri.starts_with("http://") {
-                let without_scheme = &uri[7..];
+            if let Some(without_scheme) = uri.strip_prefix("http://") {
                 let host_end = without_scheme.find('/').unwrap_or(without_scheme.len());
                 let host_part = &without_scheme[..host_end];
                 
@@ -213,11 +212,10 @@ pub async fn handle_client(
             }
         }
 
-        if is_connect {
-            if stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
+        if is_connect
+            && stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
                 return;
             }
-        }
 
         crate::proxy::handler::proxy_tcp_target(
             stream,
