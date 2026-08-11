@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-08-11T14:32:14.029Z._
+_Auto-generated. Last updated 2026-08-11T15:16:29.165Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -42,6 +42,7 @@ _Auto-generated. Last updated 2026-08-11T14:32:14.029Z._
 - [server-dns-over-tcp](pages/server-dns-over-tcp.md) — category: decision | tags: [dns, resolver, tcp, vps, server] | ## 问题
 - [session-id-not-a-fingerprint](pages/session-id-not-a-fingerprint.md) — category: decision | tags: [tls, fingerprint, resumption, evidence] | **结论**: `legacy_session_id` **不是**暴露 Mirage 的指纹。
 - [splice-over-sockmap](pages/splice-over-sockmap.md) — category: decision | **决定**(v0.4.5-alpha.3, `a6535e1`):直连出站的零拷贝从 **sockmap `sk_skb`** 改为 **`splice(2)` + pipe**。
+- [spoofdpi-desync-evaluation](pages/spoofdpi-desync-evaluation.md) — category: decision | tags: [protocol, anti-censorship, dpi, desync, routing, spoofdpi] | 用户 2026-08-05 clone /opt/claude/spoofdpi (Go) 求分析能否用于 Mirage。
 - [ss-upstream-relay](pages/ss-upstream-relay.md) — category: decision | Mirage 服务端可配 `upstream` 把流量再经 Shadowsocks 发往上游, 即作中转站:
 - [subscription-import](pages/subscription-import.md) — category: decision | tags: [cli, subscription, import, node-uri] | ## 决定
 - [syn-only-sk-assign](pages/syn-only-sk-assign.md) — category: decision | **决定**:`tc_divert` 对 TCP **只在首 SYN**(`th->syn && !th->ack`)做 `bpf_sk_assign`;
