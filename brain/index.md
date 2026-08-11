@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-08-04T17:28:59.935Z._
+_Auto-generated. Last updated 2026-08-11T14:32:14.029Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -23,6 +23,7 @@ _Auto-generated. Last updated 2026-08-04T17:28:59.935Z._
 - [ipv6-v4only-tradeoff](pages/ipv6-v4only-tradeoff.md) — category: decision | **现状**:透明路径整条 **IPv4-only**。
 - [lan-host-monitor-device-rules](pages/lan-host-monitor-device-rules.md) — category: decision | tags: [roadmap, lan, monitoring, ebpf, routing, webui] | **计划池** (2026-07-29 定, 随 WebUI 优化再开发)。
 - [load-balance-outbound](pages/load-balance-outbound.md) — category: decision | tags: [outbound, load-balance, routing, group] | ## 决定
+- [masque-evaluation](pages/masque-evaluation.md) — category: decision | tags: [protocol, anti-censorship, quic, masque, wireguard] | 用户 2026-08-05 提问: Cloudflare 的 MASQUE 能否作 WireGuard 的补充。
 - [mss-clamp-merged-into-tc-divert](pages/mss-clamp-merged-into-tc-divert.md) — category: decision | **决定**(`66e0262`,方案A):把 MSS clamp **内联进 `tc_divert.c`**(`clamp_tcp_mss()`),
 - [no-clash-api](pages/no-clash-api.md) — category: decision | **决定**:**不做 Clash API 兼容**,走自有 API 路径。
 - [no-doh-dot](pages/no-doh-dot.md) — category: decision | **决定**:**不把 DoH/DoT 当作抗审查手段**。
