@@ -1,5 +1,16 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
+### chore: clippy 收尾 —— 清零 + CI 翻 `-D warnings`
+
+`cargo clippy --all-targets` 从 ~40 条清到 **0**, CI 门禁由裸 `clippy` 翻成 `-D warnings`(新增
+warning 会红 CI)。真清理项(sort_by_key / 常量时间比较 type-alias / doc 空行 / checked_div /
+collapsible-if-let / is_ok / assert!-bool / 去无用 import·to_vec·identity-op / 同类型 cast /
+match→if-let / while-let)逐个手工修; 刻意/组织性模式(while-let 拆流惯用法 · items-after-test-module ·
+large-enum-variant 适配器状态机 · too-many-args 数据面入口 · 测试串行锁 await-holding)在源码里
+逐条 `#[allow]` 带理由。零行为改动(full 379 passed), 零测试删除。
+
 ## [v0.9.1] - WG 入站干净设备 + 抗审查泄漏护甲 + clippy 清理 (2026-08-05)
 
 ### feat(install): 家庭 WireGuard 服务端 —— 干净设备接入 (WG 入站落地)

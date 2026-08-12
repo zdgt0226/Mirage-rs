@@ -5,6 +5,7 @@
 //! 地址:
 //!   - 网关: 内核判定为"转发" → 走 ip_forward → 绕过本地投递 → sk_lookup 不运行
 //!   - 客户端: 走默认路由发出 → 不回本地投递 → sk_lookup 不运行
+//!
 //! 两种情况 fake-IP 流量都到不了 sk_lookup, 透明拦截静默失效.
 //!
 //! 修法: 装一条 `ip route add local <fakeip> dev lo`, 告诉内核 fake-IP 段是本机

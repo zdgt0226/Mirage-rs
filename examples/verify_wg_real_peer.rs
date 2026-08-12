@@ -123,9 +123,8 @@ async fn layer1_handshake(cfg: &mirage_rs::proxy::wg::WgConfig) -> Result<()> {
     }
 
     let mut dbuf = vec![0u8; 2048];
-    match tunn.decapsulate(None, &rbuf[..n], &mut dbuf) {
-        TunnResult::Err(e) => bail!("解握手应答失败: {e:?} —— 密钥不匹配的典型表现"),
-        _ => {}
+    if let TunnResult::Err(e) = tunn.decapsulate(None, &rbuf[..n], &mut dbuf) {
+        bail!("解握手应答失败: {e:?} —— 密钥不匹配的典型表现");
     }
 
     // 决定性判据: 会话建立后 encapsulate 应产出 DATA 包 (type=4), 而非又一个 init。
@@ -243,7 +242,7 @@ async fn layer1_6_ping_gateway(
     let mut tunn = mirage_rs::proxy::wg::build_tunn(cfg, 3);
     let mut out = vec![0u8; 2048];
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&[], &mut out) {
-        sock.send(&p.to_vec()).await?;
+        sock.send(p).await?;
     }
     let mut rbuf = vec![0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut rbuf))
@@ -263,7 +262,7 @@ async fn layer1_6_ping_gateway(
     eprintln!("  → ICMP echo {src} → {gw}");
     let mut ebuf = vec![0u8; 2048];
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&pkt, &mut ebuf) {
-        sock.send(&p.to_vec()).await?;
+        sock.send(p).await?;
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -310,7 +309,7 @@ async fn layer1_5_raw_ip(cfg: &mirage_rs::proxy::wg::WgConfig) -> Result<()> {
 
     // 握手
     if let TunnResult::WriteToNetwork(p) = tunn.encapsulate(&[], &mut out) {
-        sock.send(&p.to_vec()).await?;
+        sock.send(p).await?;
     }
     let mut rbuf = vec![0u8; 2048];
     let n = tokio::time::timeout(Duration::from_secs(10), sock.recv(&mut rbuf))
@@ -341,7 +340,7 @@ async fn layer1_5_raw_ip(cfg: &mirage_rs::proxy::wg::WgConfig) -> Result<()> {
     let mut ebuf = vec![0u8; 2048];
     match tunn.encapsulate(&pkt, &mut ebuf) {
         TunnResult::WriteToNetwork(p) => {
-            sock.send(&p.to_vec()).await?;
+            sock.send(p).await?;
         }
         other => bail!("加密数据包失败: {:?}", std::mem::discriminant(&other)),
     }
