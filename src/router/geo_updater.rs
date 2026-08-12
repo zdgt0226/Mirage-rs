@@ -680,7 +680,7 @@ mod tests {
         assert!(s.urls.is_empty(), "老 meta 无 urls 字段应为空");
         // 空 urls 时判据必须返回 false, 否则每次都强制重下
         let want = vec!["https://a/x.dat".to_string()];
-        assert!(!(!s.urls.is_empty() && s.urls != want), "空 urls 不该被判为变更");
+        assert!(s.urls.is_empty() || s.urls == want, "空 urls 不该被判为变更");
     }
 
     /// 真机下载验证 (默认不跑, 需网络能到 GitHub):

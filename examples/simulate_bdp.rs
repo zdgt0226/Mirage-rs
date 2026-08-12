@@ -33,7 +33,7 @@ fn main() {
         if rtt > (base_rtt_ms * 1.5) || delta_retrans > 0 {
             // Congested! Back off to measured BDP bandwidth
             // 1 MSS = 1440 bytes
-            let estimated_bdp_bytes_per_sec = (cwnd as f64 * 1440.0) / (rtt as f64 / 1000.0);
+            let estimated_bdp_bytes_per_sec = (cwnd as f64 * 1440.0) / (rtt / 1000.0);
             dynamic_rate = (estimated_bdp_bytes_per_sec as u64).max(base_rate / 10);
             action = "Backoff (Congestion)";
         } else {

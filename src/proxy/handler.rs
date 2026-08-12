@@ -102,15 +102,13 @@ pub async fn proxy_tcp_target(
         if let Ok(port) = parts[0].parse() {
             final_port = port;
             final_host = host.to_string();
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                if let IpAddr::V4(v4) = ip {
-                    if let Some(mapper) = &fake_ip_mapper {
-                        if mapper.is_fake_ip(&v4) {
-                            if let Some(domain) = mapper.lookup_domain(&v4) {
-                                info!("Fake-IP reverse lookup: {} -> {}", v4, domain);
-                                final_host = domain.clone();
-                                final_target = format!("{}:{}", domain, port);
-                            }
+            if let Ok(IpAddr::V4(v4)) = host.parse::<IpAddr>() {
+                if let Some(mapper) = &fake_ip_mapper {
+                    if mapper.is_fake_ip(&v4) {
+                        if let Some(domain) = mapper.lookup_domain(&v4) {
+                            info!("Fake-IP reverse lookup: {} -> {}", v4, domain);
+                            final_host = domain.clone();
+                            final_target = format!("{}:{}", domain, port);
                         }
                     }
                 }
@@ -323,7 +321,7 @@ pub async fn proxy_tcp_target(
 
                 // 退出前排空远端发来的残留数据, 确保发给服务端的是 FIN 而不是 RST (核心隐蔽特征)
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-                    while let Ok(_) = tunnel_reader.recv_data().await {}
+                    while tunnel_reader.recv_data().await.is_ok() {}
                 }).await;
 
                 // 半关闭传播: 远端已 EOF, 给本地客户端发 FIN (write 端半关), 让守规矩的

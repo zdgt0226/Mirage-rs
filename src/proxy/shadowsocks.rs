@@ -1077,7 +1077,7 @@ mod handshake_shape_tests {
     /// 目标地址 + 收发双向解密加密 (SIP004)。
     #[tokio::test]
     async fn ss_server_handshake_e2e() {
-        use tokio::net::{TcpListener, TcpStream};
+        use tokio::net::TcpListener;
         let method = Method::parse("aes-256-gcm").unwrap();
         let password = "sspw";
 

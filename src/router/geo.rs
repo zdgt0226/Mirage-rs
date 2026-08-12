@@ -465,7 +465,7 @@ mod tests {
     // 合成 geoip.dat: 国家 = { code(field1), cidr(field2)×N }; cidr = { ip(field1 ld), prefix(field2 varint) }。
     fn cidr_msg(ip: [u8; 4], prefix: u8) -> Vec<u8> {
         let mut m = ld(1, &ip);
-        m.extend(varint((2 << 3) | 0)); // field 2, wire 0
+        m.extend(varint(2 << 3)); // field 2, wire 0
         m.extend(varint(prefix as u64));
         m
     }

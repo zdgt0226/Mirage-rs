@@ -327,6 +327,7 @@ fn static_domain_matches(dq: &str, key: &str) -> bool {
 /// IP 版本策略是否把该查询抑制成 NODATA。
 /// - `Ipv4Only`: 抑制 AAAA(28)。 `Ipv6Only`: 抑制 A(1)。 (硬模式, 与 has_* 无关)
 /// - `PreferIpv4`: 该名字**有 v4** 时抑制 AAAA (逼 v4)。 `PreferIpv6`: 有 v6 时抑制 A。
+///
 /// direct/上游无法探测另一族存在与否 → 传 has_v4=has_v6=false, 使 prefer 恒不抑制 (=Dual);
 /// static 已知全部族 → 传真实值, prefer 完全生效。非 A/AAAA (其他 qtype) 一律不抑制。
 fn ip_strategy_suppresses(strategy: crate::config::IpStrategy, qtype: u16, has_v4: bool, has_v6: bool) -> bool {

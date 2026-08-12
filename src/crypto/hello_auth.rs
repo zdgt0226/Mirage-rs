@@ -64,11 +64,13 @@ pub const DEFAULT_AUTH_TS_TOLERANCE_SECS: u64 = 60;
 /// ReplayCache 桶大小 (秒). 保留桶数由容差自动推导 (见 verify_session_token), 二者始终一致.
 const REPLAY_BUCKET_SECS: u64 = 10;
 
+/// (high-water-mark bucket, bucket → 该桶已见 token 集)。见 `TokenReplayCache::seen`。
+type SeenBuckets = (u64, HashMap<u64, HashSet<Vec<u8>>>);
+
 pub struct TokenReplayCache {
-    /// (high-water-mark bucket, 各桶已见 token 集)。淘汰参考用**单调递增的 hwm**
-    /// 而非当前 token 桶 —— 否则重放一个旧 token 会把参考拉回、"复活"已淘汰的桶,
-    /// 使其 own 桶被当空桶重建 → 重放漏检 (F1)。hwm 只增不减, 保证淘汰单向前进。
-    seen: Mutex<(u64, HashMap<u64, HashSet<Vec<u8>>>)>,
+    /// 淘汰参考用**单调递增的 hwm** 而非当前 token 桶 —— 否则重放一个旧 token 会把参考拉回、
+    /// "复活"已淘汰的桶, 使其 own 桶被当空桶重建 → 重放漏检 (F1)。hwm 只增不减, 保证淘汰单向前进。
+    seen: Mutex<SeenBuckets>,
 }
 
 impl Default for TokenReplayCache {

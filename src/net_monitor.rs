@@ -289,6 +289,9 @@ mod imp {
 }
 
 #[cfg(test)]
+// await_holding_lock: 测试用 std Mutex(TEST_LOCK)串行化共享 process-global EPOCH_TX 的并行测试,
+// 全程独占跨 await 是刻意的(测试内无其他竞争者), 非生产并发路径。
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
 

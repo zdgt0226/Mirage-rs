@@ -129,6 +129,7 @@ fn lock_replies(r: &Replies) -> std::sync::MutexGuard<'_, HashMap<SocketAddrV4, 
 ///     永久卡 Setting → 后续包被当"建流中"丢弃 → 目标黑洞。
 ///   - committed_id=Some(id) (已 commit): 若槽仍是本流 (id 匹配) 则移除 (防误删
 ///     被替换的会话) + reply refs-- 归 0 移除关 FD。
+///
 /// 关键: 清理内联在收发循环后会被 panic/未来 early-return 跳过 → 泄漏, 故收进
 /// Drop 强制保证 (同 reply-socket FD 泄漏那次的教训)。
 struct FlowGuard {

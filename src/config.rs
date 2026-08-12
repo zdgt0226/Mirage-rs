@@ -597,7 +597,7 @@ pub fn normalize_static_hosts(
         }
         out.push((norm, ips));
     }
-    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out.sort_by_key(|x| std::cmp::Reverse(x.0.len()));
     out
 }
 

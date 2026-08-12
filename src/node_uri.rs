@@ -120,9 +120,8 @@ mod tests {
         assert_eq!(n.host, "2606:4700:4700::1111", "括号剥离, host 不带 []");
         assert_eq!(n.port, 443);
         // 拼回可用 socket 串 (join_host_port 会重新加括号)
-        assert_eq!(
-            crate::net_util::join_host_port(&n.host, n.port).parse::<std::net::SocketAddr>().is_ok(),
-            true
+        assert!(
+            crate::net_util::join_host_port(&n.host, n.port).parse::<std::net::SocketAddr>().is_ok()
         );
     }
 

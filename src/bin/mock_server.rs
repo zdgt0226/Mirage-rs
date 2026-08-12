@@ -28,13 +28,8 @@ async fn main() {
             }
             
             // Discard data forever for upload throughput testing
-            loop {
-                match reader.recv_data().await {
-                    Ok(_data) => {
-                        // Discard
-                    }
-                    Err(_) => break,
-                }
+            while reader.recv_data().await.is_ok() {
+                // Discard
             }
         });
     }

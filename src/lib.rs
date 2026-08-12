@@ -1,3 +1,18 @@
+// ── 全局 clippy allow: 均为刻意/组织性模式, 非缺陷; 逐条说明理由后翻 -D warnings ──
+// while_let_loop: relay/隧道循环刻意用 `loop { match timeout(..).await { Ok(Ok(x)) => body,
+//   _ => break } }` 显式表达"任一方向超时/读错 → 拆流", 循环体内还有基于 send 结果的 break,
+//   clippy 自己标 MaybeIncorrect(不敢自动改)。改 while-let 会藏起拆流语义且有行为风险。
+#![allow(clippy::while_let_loop)]
+// items_after_test_module: 少数文件的 #[cfg(test)] mod 后还有非测试项, 纯组织性 lint;
+//   为它移动整块 test 模块是无意义的大 churn, 不值当。
+#![allow(clippy::items_after_test_module)]
+// large_enum_variant: 适配器状态机(MirageStream/SsStream)的 Idle 变体持真实 half(较大),
+//   Busy 只是 boxed future; 尺寸差固有。装箱 Idle 反给每次 poll 加一层间接, 每连接一个非热点。
+#![allow(clippy::large_enum_variant)]
+// too_many_arguments: 数据面入口(proxy_tcp_target / start_transparent)参数多, 但都是独立
+//   运行期依赖, 塞进临时结构体只增噪声不增清晰。
+#![allow(clippy::too_many_arguments)]
+
 pub mod crypto;
 pub mod proxy;
 pub mod router;
@@ -543,8 +558,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                         }
                                     }
                                     
-                                    if count > 0 {
-                                        let rtt = sum_rtt / count;
+                                    if let Some(rtt) = sum_rtt.checked_div(count) {
                                         rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
                                         snd_cwnd.store(max_cwnd, std::sync::atomic::Ordering::Relaxed);
                                         let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
