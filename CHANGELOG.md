@@ -1,6 +1,6 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+## [v0.9.1] - WG 入站干净设备 + 抗审查泄漏护甲 + clippy 清理 (2026-08-05)
 
 ### feat(install): 家庭 WireGuard 服务端 —— 干净设备接入 (WG 入站落地)
 
