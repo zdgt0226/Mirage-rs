@@ -535,78 +535,69 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 let st = core_state.load();
-                if let Ok(lock) = lock_clone.try_lock() {
-                    for node in st.outbounds.outbounds.values() {
-                        if let crate::proxy::outbound::OutboundNode::Mirage { server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, .. } = node.as_ref() {
-                            if let Some(_ip) = *server_ip.read().unwrap_or_else(|e| e.into_inner()) {
-                                if let Ok(actives) = pool.brutal_state.active_fds.lock() {
-                                    let mut sum_retrans = 0;
-                                    let mut sum_segs = 0;
-                                    let mut sum_rtt = 0;
-                                    let mut max_cwnd = 0;
-                                    let mut count = 0;
-                                    
-                                    for &fd in actives.iter() {
-                                        if let Ok(cookie) = crate::ebpf::get_socket_cookie(fd) {
-                                            if let Ok(state) = lock.get_tcp_state_by_cookie(cookie) {
-                                                sum_retrans += state.total_retrans as u64;
-                                                sum_segs += state.data_segs_out as u64;
-                                                sum_rtt += state.srtt_us / 1000;
-                                                max_cwnd = max_cwnd.max(state.snd_cwnd as u64);
-                                                count += 1;
-                                            }
-                                        }
-                                    }
-                                    
-                                    if let Some(rtt) = sum_rtt.checked_div(count) {
-                                        rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
-                                        snd_cwnd.store(max_cwnd, std::sync::atomic::Ordering::Relaxed);
-                                        let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
-                                        let old_segs = total_segs_out.swap(sum_segs, std::sync::atomic::Ordering::Relaxed);
-                                        
-                                        let (delta_retrans, delta_segs) = if old_retrans == u64::MAX || old_segs == u64::MAX {
-                                            (0, 0)
-                                        } else {
-                                            (sum_retrans as i64 - old_retrans as i64, sum_segs as i64 - old_segs as i64)
-                                        };
-
-                                    // P3.1: Dynamic Brutal CC adjustment based on true loss rate and BDP
-                                    if let (Some(base_rate), Some(base_rtt_ms)) = (pool.brutal_state.configured_rate, pool.brutal_state.base_rtt) {
-                                        if rtt > 0 {
-                                            let cwnd = max_cwnd; // Packets
-                                            let current_rate = pool.brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
-                                            let mut dynamic_rate;
-
-                                            // Calculate loss rate (handle division by zero)
-                                            let loss_rate = if delta_segs > 0 { delta_retrans as f64 / delta_segs as f64 } else { 0.0 };
-
-                                            // Congested if RTT > 1.5x base, OR true packet loss rate exceeds 1%
-                                            if rtt > (base_rtt_ms as f64 * 1.5) as u32 || loss_rate > 0.01 {
-                                                // Congested! Back off to measured BDP bandwidth
-                                                // 1 MSS = 1440 bytes
-                                                let estimated_bdp_bytes_per_sec = (cwnd as f64 * 1440.0) / (rtt as f64 / 1000.0);
-                                                dynamic_rate = (estimated_bdp_bytes_per_sec as u64).max(base_rate / 10);
-                                            } else {
-                                                // Recover! Increase towards configured rate
-                                                dynamic_rate = (current_rate as f64 * 1.1) as u64;
-                                            }
-                                            
-                                            dynamic_rate = dynamic_rate.min(base_rate);
-                                            
-                                            // Only update if changes are significant (> 5%)
-                                            if (dynamic_rate as i64 - current_rate as i64).abs() > (current_rate / 20) as i64 {
-                                                let p = pool.clone();
-                                                tokio::spawn(async move {
-                                                    p.update_brutal_rate(dynamic_rate).await;
-                                                });
-                                            }
-                                        }
-                                    }
+                let engine = lock_clone.clone();
+                let outbounds = st.outbounds.clone();
+                // 采样是阻塞的 (每个 active fd 一次 getsockopt SO_COOKIE + TCP_INFO 系统调用 +
+                // std 锁遍历), 全丢 spawn_blocking, 不占 tokio worker。只把"需要下调/上调的速率"
+                // 带回 async 侧 apply (update_brutal_rate 是 async)。调速决策已抽成纯函数
+                // decide_brutal_rate (见 proxy::brutal, 有单测), 这里只做 IO + 分发。
+                let updates = tokio::task::spawn_blocking(move || {
+                    let mut updates: Vec<(std::sync::Arc<crate::proxy::pool::WarmPool>, u64)> = Vec::new();
+                    let Ok(lock) = engine.try_lock() else { return updates };
+                    for node in outbounds.outbounds.values() {
+                        let crate::proxy::outbound::OutboundNode::Mirage {
+                            server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, ..
+                        } = node.as_ref() else { continue };
+                        // server_ip 还没解析出来 = 该出站没建过连接, 无可采样。
+                        if server_ip.read().unwrap_or_else(|e| e.into_inner()).is_none() {
+                            continue;
+                        }
+                        let Ok(actives) = pool.brutal_state.active_fds.lock() else { continue };
+                        let mut sum_retrans = 0;
+                        let mut sum_segs = 0;
+                        let mut sum_rtt = 0;
+                        let mut max_cwnd = 0;
+                        let mut count = 0;
+                        for &fd in actives.iter() {
+                            if let Ok(cookie) = crate::ebpf::get_socket_cookie(fd) {
+                                if let Ok(state) = lock.get_tcp_state_by_cookie(cookie) {
+                                    sum_retrans += state.total_retrans as u64;
+                                    sum_segs += state.data_segs_out as u64;
+                                    sum_rtt += state.srtt_us / 1000;
+                                    max_cwnd = max_cwnd.max(state.snd_cwnd as u64);
+                                    count += 1;
                                 }
                             }
                         }
+                        let Some(rtt) = sum_rtt.checked_div(count) else { continue };
+                        rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
+                        snd_cwnd.store(max_cwnd, std::sync::atomic::Ordering::Relaxed);
+                        let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
+                        let old_segs = total_segs_out.swap(sum_segs, std::sync::atomic::Ordering::Relaxed);
+                        let (delta_retrans, delta_segs) = if old_retrans == u64::MAX || old_segs == u64::MAX {
+                            (0i64, 0i64)
+                        } else {
+                            (sum_retrans as i64 - old_retrans as i64, sum_segs as i64 - old_segs as i64)
+                        };
+                        // P3.1: 动态 Brutal 调速 (纯函数决策)。
+                        if let (Some(base_rate), Some(base_rtt_ms)) =
+                            (pool.brutal_state.configured_rate, pool.brutal_state.base_rtt)
+                        {
+                            let current_rate = pool.brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
+                            if let Some(new_rate) = crate::proxy::brutal::decide_brutal_rate(
+                                rtt, base_rtt_ms, max_cwnd, delta_retrans, delta_segs, base_rate, current_rate,
+                            ) {
+                                updates.push((pool.clone(), new_rate));
+                            }
+                        }
                     }
-                }
+                    updates
+                })
+                .await
+                .unwrap_or_default();
+
+                for (p, rate) in updates {
+                    p.update_brutal_rate(rate).await;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }

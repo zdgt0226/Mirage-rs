@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### refactor: RTT/brutal 监控去阻塞 + 调速逻辑抽纯函数 (外部审计 #5)
+
+- **调速决策抽成纯函数** `proxy::brutal::decide_brutal_rate` —— 原本内联在 `start_proxy` 750 行巨石
+  里、几乎无法单测的 P3.1 动态 Brutal 调速逻辑 (拥塞判定/BDP 回退/恢复/5% 抖动抑制) 提成无 IO 纯
+  函数, 补 **7 单测 + 手动变异 5/5 kill**。行为逐字等价。
+- **阻塞采样移出 tokio worker**: RTT 监控每 2s 的采样 (每个 active fd 一次 `getsockopt` SO_COOKIE +
+  TCP_INFO 系统调用 + std 锁遍历) 原在 `tokio::spawn` 的 async 任务里同步跑, 占 worker 线程。改丢
+  `spawn_blocking`, 只把"需调整的速率"带回 async 侧 `update_brutal_rate`。
+- 顺清死变量 `let _ip = *server_ip...` → 明确的 `is_none()` 跳过门 (server_ip 未解析=无可采样)。
+
 ### 外部审计便宜纯赚三件 (API 限流 / 供应链门禁 / 安全声明)
 
 - **feat(api): 认证失败限流 (防 token 暴力猜解)**: 新增 `src/api/ratelimit.rs` per-IP 失败计数 ——
