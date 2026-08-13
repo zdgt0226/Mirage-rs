@@ -22,6 +22,37 @@ fn cache() -> &'static Mutex<Vec<Vec<u8>>> {
     HANDSHAKE_CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// 模板是否**含齐客户端握手所需的三种 content-type**: 0x16 (ServerHello) + 0x14
+/// (ChangeCipherSpec) + 0x17 (加密 flight)。
+///
+/// 为什么必须齐: 客户端 `pool::read_server_handshake` 循环读记录**直到集齐这三种**才
+/// 返回、才发 fake tail。若服务端回放的模板缺其一 (如 camouflage_host 是 TLS 1.2 站,
+/// 其 ServerHello flight 全是 0x16 Handshake 记录、无中间盒兼容 0x14/无加密 0x17),
+/// 客户端会永远等不到 → 握手超时不发 tail → 服务端 `read_exact tail timed out`。
+/// 故 fetch 到的不完整模板必须丢弃, 回落到恒完整的 `fallback_server_hello`。
+///
+/// 顺带校验帧完整性: 每条 record 的 body 必须在 buf 内 (无有头无体的截断帧)。
+pub(crate) fn template_is_complete(t: &[u8]) -> bool {
+    let mut pos = 0usize;
+    let (mut sh, mut ccs, mut enc) = (false, false, false);
+    while pos + 5 <= t.len() {
+        let ct = t[pos];
+        let len = u16::from_be_bytes([t[pos + 3], t[pos + 4]]) as usize;
+        if pos + 5 + len > t.len() {
+            return false; // 截断帧: 有头无体
+        }
+        match ct {
+            0x16 => sh = true,
+            0x14 => ccs = true,
+            0x17 => enc = true,
+            _ => {}
+        }
+        pos += 5 + len;
+    }
+    // 必须**恰好**消费完整个 buf (无尾部残字节) 且三种齐。
+    pos == t.len() && sh && ccs && enc
+}
+
 /// 并发拉 5 个真实 ServerHello 模板, 收集成功的.
 async fn fetch_batch(host: &str) -> Vec<Vec<u8>> {
     let mut set = tokio::task::JoinSet::new();
@@ -180,7 +211,15 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     // header 必须推迟到 body 也读全后再与 body 一起 append —— 否则 body 读超时 break
     // 会在 buf 尾留下有头无体的截断 record, 缓存后客户端解析到该帧报 TLS decode 错。
     // 只追加"完整整数帧", 超时则 buf 停在此前完好帧边界。
-    for _ in 0..2 {
+    //
+    // **读到集齐 0x16+0x14+0x17 才停** (封顶 8 帧防坏站吊死)。旧版固定读 2 帧, 遇到把
+    // flight 拆成多条记录的站 (或 TLS 1.2 站) 会漏掉 0x14/0x17, 缓存出不完整模板 → 客户端
+    // read_server_handshake 永等不到三型齐、不发 tail → 服务端 read_exact tail timed out。
+    // 见 template_is_complete。
+    for _ in 0..8 {
+        if template_is_complete(&buf) {
+            break;
+        }
         if tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut header)).await.is_ok() {
             let len = u16::from_be_bytes([header[3], header[4]]) as usize;
             let mut body = vec![0u8; len];
@@ -194,8 +233,13 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
             break;
         }
     }
-    if buf.is_empty() {
-        return Err(anyhow::anyhow!("Connection closed by server"));
+    // 完整性门禁: 模板缺三型之一决不缓存 (否则毒化 cache)。返回 Err 让上层回落到恒完整的
+    // fallback_server_hello。空 buf 也在此被挡 (不完整)。
+    if !template_is_complete(&buf) {
+        return Err(anyhow::anyhow!(
+            "camouflage host template incomplete (missing 0x16/0x14/0x17 or truncated); {} bytes",
+            buf.len()
+        ));
     }
 
     Ok(buf)
@@ -420,5 +464,103 @@ mod tests {
             flight_len
         );
         assert_eq!(j + 5 + flight_len, sh.len(), "总长度自洽");
+    }
+
+    use super::{fetch_real_server_hello, template_is_complete};
+    #[allow(unused_imports)]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 拼一条 TLS record: [ct][03 03][len][body(len 个 0)]。
+    fn rec(ct: u8, len: usize) -> Vec<u8> {
+        let mut r = vec![ct, 0x03, 0x03];
+        r.extend_from_slice(&(len as u16).to_be_bytes());
+        r.extend(std::iter::repeat_n(0u8, len));
+        r
+    }
+
+    #[test]
+    fn fallback_template_is_complete() {
+        let ch = make_client_hello();
+        let fb = fallback_server_hello(&ch, &[0xAB; 32]);
+        assert!(template_is_complete(&fb), "fallback 必须含齐 0x16+0x14+0x17");
+    }
+
+    #[test]
+    fn complete_three_types_ok() {
+        let mut t = rec(0x16, 40);
+        t.extend(rec(0x14, 1));
+        t.extend(rec(0x17, 100));
+        assert!(template_is_complete(&t));
+    }
+
+    #[test]
+    fn tls12_all_handshake_records_incomplete() {
+        // TLS 1.2 站: ServerHello + Certificate + SKE + Done 全是 0x16, 无 0x14/0x17。
+        let mut t = rec(0x16, 40);
+        t.extend(rec(0x16, 800));
+        t.extend(rec(0x16, 300));
+        t.extend(rec(0x16, 4));
+        assert!(!template_is_complete(&t), "全 0x16 (缺 CCS/加密) 必须判不完整");
+    }
+
+    #[test]
+    fn missing_enc_incomplete() {
+        let mut t = rec(0x16, 40);
+        t.extend(rec(0x14, 1));
+        assert!(!template_is_complete(&t), "缺 0x17 应判不完整");
+    }
+
+    #[test]
+    fn missing_ccs_incomplete() {
+        let mut t = rec(0x16, 40);
+        t.extend(rec(0x17, 100));
+        assert!(!template_is_complete(&t), "缺 0x14 应判不完整");
+    }
+
+    #[test]
+    fn trailing_junk_incomplete() {
+        // 三型齐, 但末尾拖 2B 垃圾 (不足一条记录头, 循环不处理)。
+        // 只有 `pos == t.len()` 尾部等长检能挡, 截断守卫挡不到。
+        let mut t = rec(0x16, 40);
+        t.extend(rec(0x14, 1));
+        t.extend(rec(0x17, 100));
+        t.extend_from_slice(&[0xFF, 0xFF]);
+        assert!(!template_is_complete(&t), "尾部残字节应判不完整");
+    }
+
+    #[test]
+    fn truncated_record_incomplete() {
+        // 记录头声称 body 100B, 实际只给 10B → 截断帧, 判不完整。
+        let mut t = rec(0x16, 40);
+        t.extend(rec(0x14, 1));
+        let mut bad = vec![0x17, 0x03, 0x03];
+        bad.extend_from_slice(&100u16.to_be_bytes());
+        bad.extend(std::iter::repeat_n(0u8, 10)); // 只 10B, 不足 100
+        t.extend(bad);
+        assert!(!template_is_complete(&t), "截断帧应判不完整");
+    }
+
+    /// fetch 边界端到端: 假 camouflage 站只回一条 ServerHello(0x16) 单帧 (模拟拆帧/
+    /// TLS1.2 站), `fetch_real_server_hello` 必须判不完整、返回 Err —— 决不能把它当合法
+    /// 模板灌进 cache 毒化全局。这正是用户 read_exact tail timed out 的复现根因。
+    #[tokio::test]
+    async fn fetch_rejects_serverhello_only_template() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await; // 读掉 ClientHello
+            // 只回一条 ServerHello record: [0x16][03 03][len=48][48B]。缺 0x14/0x17。
+            let mut sh = vec![0x16, 0x03, 0x03];
+            sh.extend_from_slice(&48u16.to_be_bytes());
+            sh.extend(std::iter::repeat_n(0u8, 48));
+            let _ = sock.write_all(&sh).await;
+            // 保持连接开着让后续读走超时路径, 不主动关。
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let res = fetch_real_server_hello(&addr.to_string()).await;
+        assert!(res.is_err(), "只回 ServerHello 的不完整模板必须被拒, 得到: {:?}", res.map(|b| b.len()));
     }
 }

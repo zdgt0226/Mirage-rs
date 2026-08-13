@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### fix(handshake): 服务端只缓存"三型齐"的 camouflage 模板 (修完整服务端↔客户端握手超时)
+
+- **症状**: 服务端完整模式对接客户端 (含轻量模式) 偶发 `Mirage Server: read_exact tail timed out!`,
+  握手卡死。根因: `handshake_cache::fetch_real_server_hello` 抓 camouflage 站 ServerHello 时**固定只
+  多读 2 帧**, 遇到把 flight 拆成多条记录的站 (或 TLS 1.2 站, 其响应全是 0x16 Handshake 记录、无
+  中间盒兼容 CCS 0x14、无加密 0x17) 会缓存出**缺 content-type 的残模板**。客户端
+  `pool::read_server_handshake` 必须读到 **0x16+0x14+0x17 三型齐**才发 64B fake Client Finished
+  tail —— 拿到残模板就永远等不到 → 不发 tail → 服务端读 tail 超时。
+- **为何沙箱没复现**: 无外网时 fetch 全失败, 走 `fallback_server_hello` (恒含齐三型), 故本地测试全绿。
+  非轻量模式特有, 完整客户端同样中招。
+- **修法**: 新增纯函数 `template_is_complete` (走 TLS record 头、校验三型齐 + 帧无截断 + 无尾部残字节)。
+  fetch 改为**读到集齐三型才停** (封顶 8 帧防坏站吊死), 末尾加**完整性门禁**: 残模板一律 `Err` 丢弃,
+  上层回落到恒完整的 fallback。绝不缓存残模板毒化全局 cache。
+- 补 **6 单测** (fallback 齐/三型齐/TLS1.2 全 0x16/缺 0x17/缺 0x14/尾部残字节/截断帧) + **1 async
+  fetch 边界测** (假站只回单 ServerHello → 必 Err) + **手动变异 4/4 kill** (`&&`→`||` / 去尾部等长检 /
+  去后续帧读取 / 去 fetch 门禁)。
+- **e2e 回归测** (`test_lite_e2e::server_falls_back_when_camouflage_template_incomplete`): 完整服务端
+  camouflage_host 指向本地"只回残 ServerHello"的假站, 轻量客户端经 SOCKS5 打通 echo 隧道必须成功
+  (服务端回落 fallback)。同时钉住跨模式互通 (完整服务端↔轻量客户端)。**反证**: 去掉修复该测 10s 读超时
+  FAILED, 加回即过 —— 真能咬这个回归。
+
 ### refactor: RTT/brutal 监控去阻塞 + 调速逻辑抽纯函数 (外部审计 #5)
 
 - **调速决策抽成纯函数** `proxy::brutal::decide_brutal_rate` —— 原本内联在 `start_proxy` 750 行巨石
