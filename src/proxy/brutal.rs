@@ -373,3 +373,116 @@ pub fn spawn_fallback_monitor(fd: i32) {
         }
     });
 }
+
+/// Brutal 动态调速决策 (P3.1): 从一次采样窗口的 TCP 指标算出新目标速率。
+///
+/// **纯函数**, 无 IO/锁/syscall —— 好单测。判据 (与内联旧逻辑逐字一致):
+/// - `rtt_ms == 0`: 无有效样本 → None (不调)。
+/// - 拥塞 (rtt > 1.5×base **或** 真实丢包率 > 1%): 回退到实测 BDP (`cwnd×MSS / rtt`),
+///   下限 `base_rate/10`。
+/// - 未拥塞: 向配置速率恢复 (`current×1.1`)。
+/// - 一律不超过 `base_rate`。
+/// - 仅当相对当前变化 > 5% 才返回 Some(新速率), 否则 None (免抖动式频繁改)。
+///
+/// `delta_segs`/`delta_retrans` 是相邻窗口的增量; `delta_segs<=0` 时丢包率取 0 (防除零)。
+pub fn decide_brutal_rate(
+    rtt_ms: u32,
+    base_rtt_ms: u64,
+    cwnd_pkts: u64,
+    delta_retrans: i64,
+    delta_segs: i64,
+    base_rate: u64,
+    current_rate: u64,
+) -> Option<u64> {
+    const MSS_BYTES: f64 = 1440.0;
+    if rtt_ms == 0 {
+        return None;
+    }
+    // 真实丢包率 (增量重传 / 增量发送段); delta_segs<=0 时取 0 防除零。
+    let loss_rate = if delta_segs > 0 {
+        delta_retrans as f64 / delta_segs as f64
+    } else {
+        0.0
+    };
+    let mut dynamic_rate = if rtt_ms > (base_rtt_ms as f64 * 1.5) as u32 || loss_rate > 0.01 {
+        // 拥塞: 回退到实测 BDP, 下限 base_rate/10。
+        let estimated_bdp = (cwnd_pkts as f64 * MSS_BYTES) / (rtt_ms as f64 / 1000.0);
+        (estimated_bdp as u64).max(base_rate / 10)
+    } else {
+        // 未拥塞: 向配置速率恢复。
+        (current_rate as f64 * 1.1) as u64
+    };
+    dynamic_rate = dynamic_rate.min(base_rate);
+    // 仅显著变化 (>5%) 才调, 免抖动。
+    if (dynamic_rate as i64 - current_rate as i64).abs() > (current_rate / 20) as i64 {
+        Some(dynamic_rate)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod decide_tests {
+    use super::decide_brutal_rate;
+
+    // base_rate=100Mbps 级 (bytes/s), base_rtt=50ms, cwnd=100 pkt。
+    const BASE_RATE: u64 = 12_500_000; // 100 Mbps
+    const BASE_RTT: u64 = 50;
+
+    #[test]
+    fn zero_rtt_no_decision() {
+        assert_eq!(decide_brutal_rate(0, BASE_RTT, 100, 0, 1000, BASE_RATE, BASE_RATE), None);
+    }
+
+    #[test]
+    fn congested_by_high_rtt_backs_off() {
+        // rtt=100 > 1.5*50=75 → 拥塞 → 回退到 BDP。当前满速, 变化应显著 → Some 且 < base_rate。
+        let r = decide_brutal_rate(100, BASE_RTT, 100, 0, 1000, BASE_RATE, BASE_RATE);
+        let rate = r.expect("拥塞应产出新速率");
+        assert!(rate < BASE_RATE, "拥塞应回退到低于满速; got {rate}");
+    }
+
+    #[test]
+    fn congested_by_loss_backs_off() {
+        // rtt 正常但丢包率 = 20/1000 = 2% > 1% → 拥塞。
+        let r = decide_brutal_rate(50, BASE_RTT, 100, 20, 1000, BASE_RATE, BASE_RATE);
+        assert!(r.is_some(), "丢包超阈应触发回退");
+        assert!(r.unwrap() < BASE_RATE);
+    }
+
+    #[test]
+    fn healthy_recovers_toward_base() {
+        // 未拥塞 (rtt=50 不超 75, 丢包 0), 当前被压到 base/2 → 应向上恢复 (current*1.1)。
+        let current = BASE_RATE / 2;
+        let r = decide_brutal_rate(50, BASE_RTT, 100, 0, 1000, BASE_RATE, current);
+        let rate = r.expect("恢复应产出新速率");
+        assert!(rate > current, "健康应向上恢复; got {rate} vs current {current}");
+        assert!(rate <= BASE_RATE, "不得超过 base_rate");
+    }
+
+    #[test]
+    fn capped_at_base_rate() {
+        // 已接近满速的健康态: current*1.1 会超 base → 必须封顶到 base。
+        let current = BASE_RATE; // 已满速
+        let r = decide_brutal_rate(50, BASE_RTT, 100, 0, 1000, BASE_RATE, current);
+        // current*1.1 > base → capped to base → 与 current 相等 → 变化 0 → None
+        assert_eq!(r, None, "满速健康态无显著变化, 不该调");
+    }
+
+    #[test]
+    fn small_change_below_5pct_no_update() {
+        // 未拥塞健康态, current = base*99%: 恢复目标 current*1.1 被 cap 到 base,
+        // 差值 = base-current = 1% of base < current/20 (≈5%) → 变化不显著 → None。
+        let current = BASE_RATE * 99 / 100;
+        let r = decide_brutal_rate(50, BASE_RTT, 100, 0, 1000, BASE_RATE, current);
+        assert_eq!(r, None, "变化不足 5% 阈值, 不该调");
+    }
+
+    #[test]
+    fn loss_rate_zero_when_no_segs() {
+        // delta_segs=0 不能除零 panic; rtt 正常 → 未拥塞 → 走恢复分支。
+        let current = BASE_RATE / 2;
+        let r = decide_brutal_rate(50, BASE_RTT, 100, 5, 0, BASE_RATE, current);
+        assert!(r.is_some(), "delta_segs=0 应安全 (丢包率取 0), 走恢复");
+    }
+}
