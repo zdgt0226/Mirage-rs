@@ -27,4 +27,6 @@ pub struct AppState {
     pub history: Arc<std::sync::RwLock<HistoryData>>,
     /// 可选 API 鉴权 token (gui.token)。None = 不鉴权。auth 中间件按它校验所有请求。
     pub gui_token: Option<Arc<String>>,
+    /// 认证失败限流 (per-IP 锁定, 防 token 暴力猜解)。仅在配了 gui_token 时生效。
+    pub rate_limiter: Arc<std::sync::Mutex<super::ratelimit::RateLimiter>>,
 }

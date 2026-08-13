@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### 外部审计便宜纯赚三件 (API 限流 / 供应链门禁 / 安全声明)
+
+- **feat(api): 认证失败限流 (防 token 暴力猜解)**: 新增 `src/api/ratelimit.rs` per-IP 失败计数 ——
+  窗口 60s 内失败 ≥10 次锁定该 IP 300s (期间一律 429), 成功清零; IP 取自 TCP 连接
+  (`ConnectInfo`, 不可伪造, 无"伪造源锁死合法用户"的 DoS); map 硬封顶 10k 条 (超限淘汰最旧)。
+  仅配了 `gui.token` 时生效。纯逻辑 7 单测 + 手动变异 5/5 kill。
+- **chore(ci): 供应链门禁 cargo-deny**: 新增 `deny.toml` (advisories/licenses/sources) + CI job。
+  首跑即抓出真问题: `anyhow` 1.0.102 命中 RUSTSEC-2026-0190 (downcast_mut unsound) → 升 1.0.104;
+  声明项目 license `GPL-3.0-or-later`; allow-list 收录实际用到的宽松许可 (0BSD/CDLA 等)。现四检全绿。
+- **docs(readme): 安全声明**: 明确"未经专业安全审计" + "当前无前向保密 (口令泄露=历史/未来流量可解)"
+  + 单一共享口令 + 负责任使用。对齐外部审计 #1/#2/#3, 避免用户产生错误信任。见 brain external-audit-2026-08。
+
 ### chore: clippy 收尾 —— 清零 + CI 翻 `-D warnings`
 
 `cargo clippy --all-targets` 从 ~40 条清到 **0**, CI 门禁由裸 `clippy` 翻成 `-D warnings`(新增
