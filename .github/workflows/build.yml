@@ -75,3 +75,14 @@ jobs:
       run: sudo bash examples/verify_udp_transparent.sh
     - name: XDP 极速 DNS — 收发改包 + BPF/用户态哈希一致 (端到端)
       run: sudo bash examples/verify_dns_xdp.sh
+
+  # 供应链门禁: 安全公告 (RUSTSEC) + 许可证 + 依赖来源。见 deny.toml。
+  supply-chain:
+    name: 供应链 (cargo-deny)
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: cargo-deny check
+      uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        command: check advisories bans licenses sources

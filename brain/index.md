@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-08-12T09:09:09.362Z._
+_Auto-generated. Last updated 2026-08-13T02:04:39.305Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -14,6 +14,7 @@ _Auto-generated. Last updated 2026-08-12T09:09:09.362Z._
 - [dns-ip-strategy](pages/dns-ip-strategy.md) — category: decision | tags: [dns, ipv6, static, strategy] | ## 决定
 - [dns-static-resolution](pages/dns-static-resolution.md) — category: decision | tags: [dns, static, testing, fakeip] | ## 决定
 - [ebpf-scope-narrowed](pages/ebpf-scope-narrowed.md) — category: decision | **决定**:eBPF 只承担三件事 —— ① `tc_divert` 拦截转发流量并 `sk_assign` 给透明 listener;
+- [external-audit-2026-08](pages/external-audit-2026-08.md) — category: decision | tags: [security, audit, forward-secrecy, supply-chain, api] | 外部审计报告(2026-08)逐条核实与处置。
 - [external-audit-verification](pages/external-audit-verification.md) — category: concept | ## compiled_truth
 - [fakeip-remote-resolution](pages/fakeip-remote-resolution.md) — category: decision | **决定**:被代理域名的 DNS 查询返回**保留段 fake-IP**(198.18.0.0/15),真实域名随隧道送到**墙外服务端远程解析**。
 - [fingerprint-hot-update](pages/fingerprint-hot-update.md) — category: decision | tags: [tls, fingerprint, hot-update, anytls] | **结论**: 值得做, 优先级 **P2**(排在 TLS resumption 之后)。

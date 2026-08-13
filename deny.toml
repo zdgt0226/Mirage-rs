@@ -1,0 +1,43 @@
+# cargo-deny 配置: 供应链门禁 (安全公告 / 许可证 / 依赖来源)。
+# CI 跑 `cargo deny check`; 本地同。见 https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# RUSTSEC 安全公告: 有漏洞的依赖直接红 CI。
+version = 2
+yanked = "deny"
+# 个别公告确认不影响本项目时, 在这里列 ID 豁免 (附理由注释), 而不是关闭整类检查。
+ignore = []
+
+[licenses]
+version = 2
+# 允许的许可证 (SPDX)。都是宽松/常见的开源许可; 出现不在列内的会红, 逼人工审。
+allow = [
+    "GPL-3.0-or-later", # 本项目自身的许可 (根目录 LICENSE)
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",              # smoltcp 等; BSD Zero Clause, 最宽松
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0", # 宽松数据许可
+    "OpenSSL",
+]
+# 置信度阈值: 低于此的许可识别当作未知处理。
+confidence-threshold = 0.8
+
+[bans]
+# 同一 crate 多版本: 只告警不拦 (传递依赖里很常见, 拦了太吵)。
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# 只信 crates.io; git/其它源出现要人工确认。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

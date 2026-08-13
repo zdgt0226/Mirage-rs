@@ -16,6 +16,7 @@
 mod state;
 mod sampler;
 mod handlers;
+mod ratelimit;
 
 use axum::{
     routing::{get, post},
@@ -112,16 +113,48 @@ fn same_origin(headers: &HeaderMap) -> bool {
 /// - **CSRF** (方案 B): 变更方法 (POST/PUT/DELETE/PATCH) 且**非 Bearer-header 认证**时, 要求同源
 ///   (Origin/Referer 匹配 Host)。理由: Bearer header 跨站发不出 → 抗 CSRF, 直接放行; cookie 会被
 ///   浏览器跨站自动带, 必须同源防护; 未启用 token 的 localhost 写接口也靠这层挡恶意网页/DNS-rebinding。
-async fn auth_mw(State(app): State<AppState>, req: Request, next: Next) -> Response {
+async fn auth_mw(
+    State(app): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
     // 1. 鉴权 (若配了 token), 记录认证来源供 CSRF 判定。
     let auth_src: Option<TokenSrc> = match app.gui_token.as_ref() {
-        None => None, // 未启用鉴权
+        None => None, // 未启用鉴权 (无 token = 无暴力面, 不限流)
         Some(expected) => {
+            let ip = peer.ip();
+            let now = std::time::Instant::now();
+            // 先看该 IP 是否已因反复失败被锁定 → 429, 挡在 token 比较之前 (省 CPU + 明确信号)。
+            if app
+                .rate_limiter
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_locked(ip, now)
+            {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many failed auth attempts; this IP is temporarily locked out",
+                )
+                    .into_response();
+            }
             // ?token= 仅根路径认 (首访种 cookie); /api/* 只认 header/cookie, 避免 token 进 URL 日志。
             let allow_query = req.uri().path() == "/";
             match extract_token_src(req.headers(), req.uri(), allow_query) {
-                Some((t, src)) if ct_eq(t.as_bytes(), expected.as_bytes()) => Some(src),
+                Some((t, src)) if ct_eq(t.as_bytes(), expected.as_bytes()) => {
+                    // 认证成功 → 清该 IP 失败记录。
+                    app.rate_limiter
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note_success(ip);
+                    Some(src)
+                }
                 _ => {
+                    // 认证失败 → 记一次, 累计超阈后续请求会被上面的 is_locked 拦成 429。
+                    app.rate_limiter
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note_failure(ip, now);
                     return (
                         StatusCode::UNAUTHORIZED,
                         "unauthorized: missing/invalid API token (set Authorization: Bearer, mirage_token cookie, or ?token=)",
@@ -188,6 +221,7 @@ pub async fn start_server(
         config_path,
         history: history.clone(),
         gui_token,
+        rate_limiter: Arc::new(std::sync::Mutex::new(ratelimit::RateLimiter::new())),
     };
 
     // 2. 启动 1Hz 采样后台 task
@@ -232,6 +266,8 @@ pub async fn start_server(
             return;
         }
     };
+    // into_make_service_with_connect_info: 让 auth_mw 能拿到 TCP peer IP (per-IP 限流用)。
+    let app = app.into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("GUI serve 退出: {}", e);
     }
