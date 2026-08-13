@@ -413,3 +413,38 @@ mod dns_tcp_tests {
         assert!(ips.iter().any(|ip| ip.is_ipv4()), "至少一个 A 记录");
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    //! 模糊/属性测试: 任意字节 + 任意 TXID 喂给 DNS 应答解析器, **绝不 panic**
+    //! (偏移遍历 / name 压缩指针 / rdlen 全部要边界安全)。
+    use super::parse_answer_ips;
+    use proptest::prelude::*;
+
+    proptest! {
+        // 纯随机字节 (浅层)。
+        #[test]
+        fn parse_answer_ips_raw_never_panics(data: Vec<u8>, tx: u16) {
+            let _ = parse_answer_ips(&data, tx);
+        }
+
+        // 构造合规 12B 头 (匹配 tx + QR=1) + 小 QD/AN 计数 + 随机 rdata, 钻进 question/answer
+        // 循环 (skip_name 压缩指针 / rtype / rdlen 偏移全部要边界安全)。
+        #[test]
+        fn parse_answer_ips_structured_never_panics(
+            tx: u16,
+            qd in 0u8..3,
+            an in 0u8..8,
+            rest in prop::collection::vec(any::<u8>(), 0..200),
+        ) {
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&tx.to_be_bytes());
+            msg.extend_from_slice(&[0x81, 0x80]); // flags: QR=1
+            msg.extend_from_slice(&(qd as u16).to_be_bytes());
+            msg.extend_from_slice(&(an as u16).to_be_bytes());
+            msg.extend_from_slice(&[0, 0, 0, 0]); // NS/AR = 0
+            msg.extend_from_slice(&rest);
+            let _ = parse_answer_ips(&msg, tx);
+        }
+    }
+}

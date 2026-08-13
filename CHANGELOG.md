@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### test: 解析器属性/模糊测试 (proptest, 外部审计 #12)
+
+给三类**解析密集 + 安全敏感**的 parser 补 proptest 属性测试 (`任意输入绝不 panic`), 跑在 stable、
+进现有测试套/CI, 无需 nightly/cargo-fuzz:
+- **协议帧** `udp_mux::parse_mux_frame` / `parse_mux_uplink`: 随机 + **长度前缀合规**两种输入,
+  钻进 sid/ATYP/域名长度/port 偏移, 断言 consumed ∈ [2, len] (进度保证防死循环/越界)。
+- **DNS 应答** `resolver::parse_answer_ips`: 随机 + **合规 12B 头 + 随机 rdata**, 钻进 skip_name
+  压缩指针 / rtype / rdlen 偏移遍历。
+- **config 解析** `serde_json::<Config>`: 任意字符串 + 随机 JSON 对象不 panic。
+- 变异验证: 去掉帧的 `frame.len()<4` 守卫 / DNS 的 `pos+10` 越界守卫, 均被对应 proptest 抓成红。
+  (裸随机 Vec 因长度前缀几乎总不合规而测不到深层 —— 故用"合规前缀 + 随机 body"的生成策略。)
+- 新增 dev-dependency `proptest`。
+
 ## [v0.9.2] - 握手模板完整性修复 + 外部审计便宜纯赚 + RTT/brutal 去阻塞 (2026-08-14)
 
 ### fix(handshake): 服务端只缓存"三型齐"的 camouflage 模板 (修完整服务端↔客户端握手超时)
