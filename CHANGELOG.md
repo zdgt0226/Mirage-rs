@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### test: 跨模式互通回归测试 (完整服务端 ↔ 轻量客户端)
+
+用户部署反馈"完整模式服务端与轻量模式客户端无法对接"。排查: **协议层本就互通** —— 四种组合
+(完整↔轻量, 双向, 含 sni 不匹配 / cipher_agility+tls_padding 全开) 真机 + 子进程 e2e 全部打通,
+lite 客户端复用与完整版**完全相同**的 Mirage 出站。"不通"实为 **password 不一致** (sni/camouflage_host
+不同不影响 auth, 仅是伪装 SNI) 或**走了 UDP** (轻量仅 TCP, 按规范回 0x07)。新增子进程 e2e 测试
+`full_server_interops_with_lite_client` (故意用不同 sni + 同 password) 把"能互通"钉成 CI 保证;
+变异验证 (改错 password → 测试红) 确认它真检测互通断裂。
+
 ### refactor: RTT/brutal 监控去阻塞 + 调速逻辑抽纯函数 (外部审计 #5)
 
 - **调速决策抽成纯函数** `proxy::brutal::decide_brutal_rate` —— 原本内联在 `start_proxy` 750 行巨石

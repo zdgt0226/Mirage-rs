@@ -155,3 +155,42 @@ fn lite_client_rejects_udp_associate() {
     std::fs::remove_file(&srv_cfg).ok();
     std::fs::remove_file(&cli_cfg).ok();
 }
+
+/// 跨模式互通 (契约): **完整模式服务端** (`mirage server`, mirage_server 入站) 必须能被
+/// **轻量模式客户端** (`mirage lite-client`) 正常对接 —— 两者共用同一套 Mirage 协议与伪装,
+/// 只要 password 一致就该通 (camouflage_host/sni 不同不影响 auth, 仅是伪装 SNI)。
+///
+/// 真机部署踩过"以为不通"的坑: 实为 password 不一致 / 走了 UDP。这个测试把"能互通"钉成 CI 保证。
+#[test]
+fn full_server_interops_with_lite_client() {
+    let echo = spawn_echo();
+    let (sport, cport) = (18573, 11573);
+    // 完整模式服务端 config (mirage_server 入站 + direct 出站)。sni 故意与客户端**不同**,
+    // 证明只需 password 一致即可互通。
+    let srv_cfg = write_cfg(
+        "full_srv.json",
+        &format!(
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-xmode","camouflage_host":"www.cloudflare.com"}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+        ),
+    );
+    let cli_cfg = write_cfg(
+        "lite_cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-xmode","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+        ),
+    );
+
+    let _s = spawn("server", &srv_cfg);
+    assert!(wait_port(sport), "完整模式服务端未监听");
+    let _c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "轻量客户端未监听");
+
+    let mut s = socks5_connect(cport, echo).expect("跨模式 SOCKS5 CONNECT 失败 (完整服务端↔轻量客户端应互通)");
+    s.write_all(b"cross-mode-full-server-lite-client").unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"cross-mode-full-server-lite-client", "跨模式隧道回环数据应原样返回");
+
+    std::fs::remove_file(&srv_cfg).ok();
+    std::fs::remove_file(&cli_cfg).ok();
+}
