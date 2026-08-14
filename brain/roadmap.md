@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-08-14T10:14:16"
+updated: "2026-08-14T20:38:48"
 ---
 
 # Roadmap
@@ -10,8 +10,15 @@ updated: "2026-08-14T10:14:16"
 > **用户确认 (2026-07-21)**: 方向大致对, 但**当前无固定计划 / 无承诺时间表** —— 走一步看一步,
 > 哪个撞到痛点就修哪个。下表是"候选池"而非排期。
 
-## 已完成的主线 (v0.7.0 – v0.9.2, 均已发布并入 main)
+## 已完成的主线 (v0.7.0 – v0.9.2, 均已发布并入 main; PFS 等已进 main 待发版)
 
+- **前向保密 PFS (审计 #2, 最大真安全缺口)** ✅ 已进 main —— opt-in 一次性 X25519 ECDH, 公钥搭
+  fake-TLS random 字段交换 (零指纹变化 + 高位随机化抗指纹), `password‖ecdh` 混进 master, 口令泄露
+  也解不了已录流量; 两端同开, 失配 fail-closed。详见 [[handshake-forward-secrecy]]。
+- **审计尾单批** (待发版, 已进 main / PR 待合) ✅ —— #4 start_proxy 巨石拆分 (753→400, src/startup.rs) ·
+  #8 握手失配统一诊断 (密码/时钟/pfs 单边, 客户端+服务端共用) · #7 实处 (install.sh 补 pfs 开关 +
+  config 模板防漂移测试) · WgTcpStream::connect 同步失败泄漏 socket 修复 · RateLimiter 摊还式定期清理。
+  详见 [[external-audit-2026-08]]。
 - **握手模板完整性修复** (v0.9.2) ✅ —— 服务端 `handshake_cache` 只缓存**含齐 0x16+0x14+0x17 三型**的
   camouflage 模板 (纯函数 `template_is_complete` 校验; 缺型/截断/尾部残字节一律弃、回落恒完整的
   fallback)。修完整服务端↔客户端 (含轻量模式, 非轻量特有) 偶发 `read_exact tail timed out` 握手卡死:
@@ -71,7 +78,9 @@ updated: "2026-08-14T10:14:16"
 | IPv6 全栈 (透明数据面) | 结构性 | 见 [[ipv6-v4only-tradeoff]]; 透明 v6 epic 已降级, 隧道传输 v6 已做 |
 | SS 上游 UDP | 生态 | 需求驱动; **WG 上游 UDP 已通**, 要 UDP 同出口直接用 WG。见 [[ss-upstream-relay]] |
 | 订阅链接 | 生态 | 基础已有 (node_uri + import), 但订阅格式要先定义 |
-| orphan 验证器接回 CI | 工程债 | 需 runner 日志访问权。见 [[orphan-filter-blackhole]] |
+| orphan 验证器接回 CI | 工程债 (审计 #10) | 需 runner 日志访问权。见 [[orphan-filter-blackhole]] |
+| install.sh 二进制签名 | 分发 (审计 #13) | 现只 sha256。cosign keyless (GitHub OIDC 免存密钥) 可行, 但**需 CI 实跑验证**才知对错。价值: 供应链完整性。 |
+| bench 性能门禁 | 工程债 (审计 #14) | 已有 aead cipher_bench (手写)。加 criterion + CI 门禁需基线管理; **价值边际** —— 抗审查瓶颈在网络非本地 crypto。 |
 | TLS padding 后续 | 抗审查 | 记录切分 / 伪真实站点分布 / 长度模型升级 |
 
 ## 评估过但**不做**的 (避免重复讨论)

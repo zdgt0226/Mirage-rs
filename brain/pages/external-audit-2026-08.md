@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [security, audit, forward-secrecy, supply-chain, api]
 created: "2026-08-13T09:15:07"
-updated: "2026-08-14T12:40:23"
+updated: "2026-08-14T20:37:49"
 ---
 
 ## compiled_truth
@@ -54,3 +54,9 @@ updated: "2026-08-14T12:40:23"
   summary: "#2 前向保密已落地: opt-in X25519 ECDH (config pfs, 两端同开), 见 handshake-forward-secrecy。至此审计便宜纯赚+中等正确性+最大真缺口全清, 残余仅质量/分发/工程债 (#4已拆#7留/#8/#13/#14/#10)"
   source: commit feat/pfs-x25519-ecdh
   affects: [external-audit-2026-08, handshake-forward-secrecy]
+
+- time: 2026-08-14T20:37:49
+  kind: decision
+  summary: "#8 握手失配统一诊断 (session_decrypt_failure_hint: 密码/时钟/pfs, 客户端+服务端共用) 与 #7 实处 (install.sh 补 pfs 开关 + config 模板防漂移测试) 落地待合 (PR feat/handshake-mismatch-diagnostics + chore/install-pfs-toggle)。至此真安全缺口+便宜纯赚+正确性+最大缺口+#4拆分+#7实处+#8诊断全清。残余仅 #13 install.sh 签名 (需 CI OIDC 验证) / #14 bench 门禁 (价值边际, 瓶颈在网络非本地 crypto) / #10 orphan CI 接回 (需 runner 日志权限), 三条依赖 CI/runner/价值边际, 记 roadmap 待外部条件"
+  source: "commits 65ed64f (#8), d3fe8df (#7)"
+  affects: [external-audit-2026-08]
