@@ -653,3 +653,46 @@ mod tests {
         assert_eq!(consumed, 5);
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    //! 模糊/属性测试: 任意字节喂给 mux 帧解析器, **绝不 panic**, 且 Some 时 consumed 在
+    //! [2, len] 内 (进度保证 —— 防 demux while 循环因 consumed=0 死循环 / 越界)。
+    use super::{parse_mux_frame, parse_mux_uplink};
+    use proptest::prelude::*;
+
+    /// 构造一个**长度前缀合规**的帧: [2B len=body.len()][body]。这样解析器一定进入
+    /// sid/ATYP/offset 深层路径 (纯随机 Vec 的长度前缀几乎总不合规 → 早退, 测不到深层)。
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut b = (body.len().min(u16::MAX as usize) as u16).to_be_bytes().to_vec();
+        b.extend_from_slice(body);
+        b
+    }
+
+    proptest! {
+        // 纯随机 (浅层, 主要测长度前缀边界)。
+        #[test]
+        fn parse_mux_frame_raw_never_panics(data: Vec<u8>) {
+            if let Some((_s, _p, consumed)) = parse_mux_frame(&data) {
+                prop_assert!(consumed >= 2 && consumed <= data.len());
+            }
+        }
+
+        // 长度合规 → 钻进 sid/ATYP/域名长度/port 偏移解析, 各边界都要安全。
+        #[test]
+        fn parse_mux_frame_framed_never_panics(body in prop::collection::vec(any::<u8>(), 0..300)) {
+            let buf = framed(&body);
+            if let Some((_s, _p, consumed)) = parse_mux_frame(&buf) {
+                prop_assert!(consumed >= 2 && consumed <= buf.len());
+            }
+        }
+
+        #[test]
+        fn parse_mux_uplink_framed_never_panics(body in prop::collection::vec(any::<u8>(), 0..300)) {
+            let buf = framed(&body);
+            if let Some((consumed, _f)) = parse_mux_uplink(&buf) {
+                prop_assert!(consumed >= 2 && consumed <= buf.len());
+            }
+        }
+    }
+}

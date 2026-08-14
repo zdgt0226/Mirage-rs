@@ -1749,3 +1749,33 @@ mod inbound_rule_tests {
         assert!(cfg(r#"["in-a"]"#).semantic_issues().is_empty(), "数组应通过");
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    //! 模糊/属性测试: 任意字符串喂给 config 反序列化, **绝不 panic** (serde 只应返回 Ok/Err)。
+    use super::Config;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn config_deserialize_never_panics(s in ".*") {
+            let _ = serde_json::from_str::<Config>(&s);
+        }
+
+        // 结构化 JSON (随机键值对象) 更可能钻进 serde 的字段解析路径。
+        #[test]
+        fn config_deserialize_random_json_never_panics(
+            keys in prop::collection::vec("[a-z_]{1,12}", 0..8),
+            vals in prop::collection::vec(any::<i64>(), 0..8),
+        ) {
+            let mut obj = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 { obj.push(','); }
+                let v = vals.get(i).copied().unwrap_or(0);
+                obj.push_str(&format!("\"{k}\":{v}"));
+            }
+            obj.push('}');
+            let _ = serde_json::from_str::<Config>(&obj);
+        }
+    }
+}
