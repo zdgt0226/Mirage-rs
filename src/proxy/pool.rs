@@ -1,4 +1,4 @@
-use crate::crypto::aead::{create_crypto_pair, CryptoReader, CryptoWriter};
+use crate::crypto::aead::{create_crypto_pair, create_crypto_pair_pfs, CryptoReader, CryptoWriter};
 use crate::proxy::tunnel::{Tunnel, TunnelRead, TunnelWrite};
 use crate::proxy::outbound::{Address, OutboundNode};
 use anyhow::Result;
@@ -20,6 +20,8 @@ pub struct PoolConfig {
     /// 链式代理: 有则本 Mirage 隧道对 server 的连接经此出站拨号 (Mirage-over-X), 而非物理 TCP。
     /// OutboundManager 构建时解析 config 的 `underlying` tag 注入。None = 直连 (默认)。
     pub underlying: Option<Arc<OutboundNode>>,
+    /// 前向保密: 握手做一次性 X25519 ECDH (见 crypto::pfs)。须与服务端 pfs 同开。默认 false。
+    pub pfs: bool,
 }
 
 /**
@@ -256,7 +258,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use std::time::Duration;
 
-pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<()> {
+/// 客户端伪装握手产物: 会话 salt + 可选 PFS ECDH 共享秘密。
+struct ClientHandshake {
+    client_random: [u8; 32],
+    /// PFS 开时 = 与服务端临时公钥 ECDH 出的共享秘密; 关时 None。
+    ecdh: Option<[u8; 32]>,
+}
+
+/// 读服务端 flight (ServerHello + CCS + 加密段), 返回捕获的 **ServerHello.random**。
+///
+/// PFS 下 server_random = 服务端临时 X25519 公钥 (见 crypto::pfs); 非 PFS 下调用方忽略之。
+/// 仍要求集齐 0x16+0x14+0x17 三型才成功 (见 handshake-template-completeness)。
+pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<[u8; 32]> {
     // v0.4.5-alpha.17: 放弃超时随机化, 消除固定 12s/1.5s 阈值的客户端时序指纹.
     // GFW 若主动操纵服务端响应时序 (拦截/延迟 ServerHello) 测客户端恒定放弃时间可
     // 识别 Mirage 客户端. 每连接各随机一次 (非每轮, 保持单次握手内一致), 围绕原值
@@ -267,6 +280,8 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
     let mut saw_sh = false;
     let mut saw_ccs = false;
     let mut saw_enc = false;
+    // ServerHello.random (record body[6..38]): PFS 下即服务端临时公钥。首个 0x16 时捕获。
+    let mut server_random = [0u8; 32];
 
     loop {
         let t = if saw_ccs { post_ccs_timeout } else { pre_ccs_timeout };
@@ -282,15 +297,20 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                         if ct == 0x15 {
                             return Err(anyhow::anyhow!("Server sent TLS alert"));
                         } else if ct == 0x16 {
+                            // 首个 ServerHello: 捕获 random (body[6..38])。ServerHello body 布局:
+                            // [0x02 type][3B len][2B version][32B random]... → random 在 [6..38]。
+                            if !saw_sh && body.len() >= 38 {
+                                server_random.copy_from_slice(&body[6..38]);
+                            }
                             saw_sh = true;
                         } else if ct == 0x14 {
                             saw_ccs = true;
                         } else if ct == 0x17 {
                             saw_enc = true;
                         }
-                        
+
                         if saw_sh && saw_ccs && saw_enc {
-                            return Ok(());
+                            return Ok(server_random);
                         }
                     }
                     Ok(Err(e)) => return Err(anyhow::anyhow!("Incomplete body: {}", e)),
@@ -310,7 +330,7 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
     if !saw_sh || !saw_ccs || !saw_enc {
         return Err(anyhow::anyhow!("Incomplete flight: sh={}, ccs={}, enc={}", saw_sh, saw_ccs, saw_enc));
     }
-    Ok(())
+    Ok(server_random)
 }
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -624,15 +644,25 @@ impl WarmPool {
         stream.set_nodelay(true)?; // 关 Nagle, 降首包延迟
 
         let (mut read_half, mut write_half) = stream.into_split();
-        let client_random = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
-        // 恒 Tcp 变体 (保留 try_read 探活 + 裸 fd 调 brutal)。
-        Ok(create_crypto_pair(
-            TunnelRead::Tcp(read_half),
-            TunnelWrite::Tcp(write_half),
-            &cfg.password,
-            &client_random,
-            true,
-        ))
+        let hs = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
+        // 恒 Tcp 变体 (保留 try_read 探活 + 裸 fd 调 brutal)。PFS 开时走 ecdh 派生。
+        Ok(match hs.ecdh {
+            Some(ecdh) => create_crypto_pair_pfs(
+                TunnelRead::Tcp(read_half),
+                TunnelWrite::Tcp(write_half),
+                &cfg.password,
+                &hs.client_random,
+                &ecdh,
+                true,
+            ),
+            None => create_crypto_pair(
+                TunnelRead::Tcp(read_half),
+                TunnelWrite::Tcp(write_half),
+                &cfg.password,
+                &hs.client_random,
+                true,
+            ),
+        })
     }
 
     /// 经 underlying 出站拨号 server:port (Mirage-over-X 链式): 无裸 fd → 无 brutal/nodelay,
@@ -648,33 +678,64 @@ impl WarmPool {
                 anyhow::anyhow!("经 underlying 连 {}:{} 超时 (15s)", cfg.server_host, cfg.server_port)
             })??;
         let (mut read_half, mut write_half) = tokio::io::split(out);
-        let client_random = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
-        Ok(create_crypto_pair(
-            TunnelRead::Boxed(Box::new(read_half)),
-            TunnelWrite::Boxed(Box::new(write_half)),
-            &cfg.password,
-            &client_random,
-            true,
-        ))
+        let hs = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
+        Ok(match hs.ecdh {
+            Some(ecdh) => create_crypto_pair_pfs(
+                TunnelRead::Boxed(Box::new(read_half)),
+                TunnelWrite::Boxed(Box::new(write_half)),
+                &cfg.password,
+                &hs.client_random,
+                &ecdh,
+                true,
+            ),
+            None => create_crypto_pair(
+                TunnelRead::Boxed(Box::new(read_half)),
+                TunnelWrite::Boxed(Box::new(write_half)),
+                &cfg.password,
+                &hs.client_random,
+                true,
+            ),
+        })
     }
 
-    /// 伪装 TLS 握手 (发带 token 的 ClientHello / 读 server flight / 发假 Finished tail),
-    /// 返回 client_random (会话密钥派生的 salt)。对任意字节流生效 (物理 TCP / underlying 流)。
-    async fn do_fake_tls<Rd, Wr>(rh: &mut Rd, wh: &mut Wr, cfg: &PoolConfig) -> Result<[u8; 32]>
+    /// 伪装 TLS 握手 (发带 token 的 ClientHello / 读 server flight / 发假 Finished tail)。
+    /// 返回 client_random (会话密钥派生的 salt) + 可选 ecdh (PFS 开时)。
+    /// 对任意字节流生效 (物理 TCP / underlying 流)。
+    async fn do_fake_tls<Rd, Wr>(rh: &mut Rd, wh: &mut Wr, cfg: &PoolConfig) -> Result<ClientHandshake>
     where
         Rd: tokio::io::AsyncRead + Unpin,
         Wr: tokio::io::AsyncWrite + Unpin,
     {
         let token = crate::crypto::hello_auth::make_session_token(&cfg.password);
-        let (hello_bytes, client_random) =
-            crate::crypto::tls_raw::build_client_hello(&cfg.camouflage_host, &token);
+        // PFS: 生成一次性 X25519 对, 公钥当 ClientHello.random 发出 (见 crypto::pfs)。
+        let ephemeral = if cfg.pfs {
+            Some(crate::crypto::pfs::Ephemeral::generate()?)
+        } else {
+            None
+        };
+        let (hello_bytes, client_random) = match &ephemeral {
+            Some(e) => (
+                crate::crypto::tls_raw::build_client_hello_with_random(
+                    &cfg.camouflage_host,
+                    &token,
+                    &e.public,
+                ),
+                e.public,
+            ),
+            None => crate::crypto::tls_raw::build_client_hello(&cfg.camouflage_host, &token),
+        };
         wh.write_all(&hello_bytes).await?;
         wh.flush().await?;
-        read_server_handshake(rh).await?;
+        let server_random = read_server_handshake(rh).await?;
         let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail();
         wh.write_all(&tail_bytes).await?;
         wh.flush().await?;
-        Ok(client_random)
+        // PFS: 与服务端临时公钥 (= server_random) 做 ECDH 得共享秘密。
+        let ecdh = match ephemeral {
+            Some(e) => Some(e.agree(&server_random)?),
+            None => None,
+        };
+        Ok(ClientHandshake { client_random, ecdh })
     }
 
     /// O(1) 复杂度提取连接.

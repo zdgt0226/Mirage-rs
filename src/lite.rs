@@ -54,6 +54,9 @@ pub struct LiteClientConfig {
     pub pool_size: usize,
     #[serde(default)]
     pub brutal_rate_mbps: Option<u64>,
+    /// 前向保密 (PFS): 握手做一次性 X25519 ECDH。**须与服务端 `pfs` 同开**。默认关。
+    #[serde(default)]
+    pub pfs: bool,
     #[serde(default = "d_log_level")]
     pub log_level: String,
 }
@@ -76,6 +79,9 @@ pub struct LiteServerConfig {
     /// 可选上游出口: 配了则本服务端作为中转站, 流量再经 SS 发往上游 (仅 TCP)。
     #[serde(default)]
     pub upstream: Option<crate::config::UpstreamConfig>,
+    /// 前向保密 (PFS): 握手做一次性 X25519 ECDH。**须与客户端 `pfs` 同开**。默认关。
+    #[serde(default)]
+    pub pfs: bool,
     #[serde(default = "d_log_level")]
     pub log_level: String,
 }
@@ -111,6 +117,7 @@ fn build_core_state(cfg: &LiteClientConfig) -> Result<crate::config_watcher::Cor
             "camouflage_host": cfg.sni,
             "pool_size": cfg.pool_size,
             "brutal_rate_mbps": cfg.brutal_rate_mbps,
+            "pfs": cfg.pfs,
         }],
         "routing": { "default_outbound": TAG, "rules": [] },
         "advanced_dns": null, "api": null, "tuning": null, "gui": null,
@@ -230,6 +237,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
         brutal_bps,
         cfg.auth_ts_tolerance_secs,
         ss_upstream,
+        cfg.pfs,
     )
     .await;
     Ok(())

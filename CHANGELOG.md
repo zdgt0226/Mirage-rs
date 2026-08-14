@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### feat(crypto): 可选前向保密 PFS (一次性 X25519 ECDH, 外部审计 #2)
+
+补上外部审计 #2 (最大真安全缺口): 原会话密钥纯从口令派生, **口令泄露=历史+未来流量全可解**。
+新增 opt-in 前向保密, 两端 config `"pfs": true` 开启后即便口令泄露也解不了已录流量。
+
+- **载体零指纹变化**: 两端各生成一次性 X25519 对, 公钥直接搭 fake-TLS 的 random 字段交换 ——
+  ClientHello.random = 客户端临时公钥, ServerHello.random = 服务端临时公钥。任意 32B 都是合法
+  X25519 公钥且看起来均匀随机, 而这俩字段本就每连接随机、明文交换, 故**无需额外解析、指纹与
+  非 PFS 无异**。⚠️ 抗指纹细节: 裸 X25519 u 坐标 < 2^255-19 → 最高位恒 0 (正常 TLS random 该位
+  随机), 会留 1 bit 分布偏差 → 发出前**随机化公钥最高位** (收端按 RFC 7748 mask 掉, 不影响
+  ECDH), 使 random 字段各 bit 均匀。ECDH 共享秘密混进会话 master (`derive_master_pfs`: IKM = password‖ecdh, 新 HKDF
+  label `pyrealiy-session-pfs`)。临时私钥用完即弃、从不上线 = 前向保密。认证仍靠口令 token, 与
+  加密解耦 (对标 REALITY)。新增 `crypto::pfs` (ring X25519 agreement)。
+- **opt-in + 两端同开**: 默认关, `pfs=false` 时行为与旧版逐字一致 (向后兼容)。改了会话密钥派生,
+  **两端必须同开** —— 失配 fail-closed (AEAD 解密失败, 不静默出乱数据)。config `pfs` 加到
+  mirage 出站 / mirage_server 入站 / lite 两端。
+- 测试: `crypto::pfs` 3 单测 (ECDH 对称/异端异秘/公钥 32B) + `aead` 4 单测 (派生确定性/域分隔/ecdh
+  变则变/往返+失配 fail-closed) + e2e 2 条 (两端同开隧道通 / 失配回环不成功) + 手动变异 (客户端
+  pfs gate 破 → e2e FAILED)。
+
 ### fix(wg): WgTcpStream::connect 同步失败时泄漏 smoltcp socket (128KB/次)
 
 `WgTcpStream::connect` 先 `sockets.add(sock)` (含 64KB 收 + 64KB 发缓冲) 再 `sock.connect(...)`。

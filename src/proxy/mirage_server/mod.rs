@@ -59,6 +59,7 @@ pub async fn start_server(
     brutal_rate_bytes_per_sec: Option<u64>,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    pfs: bool,
 ) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
@@ -123,7 +124,7 @@ pub async fn start_server(
                 let pool = cam_pool.clone();
                 let up = upstream.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool, auth_ts_tolerance_secs, up).await;
+                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool, auth_ts_tolerance_secs, up, pfs).await;
                 });
             }
             Err(e) => {

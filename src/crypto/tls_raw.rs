@@ -540,12 +540,23 @@ fn pick_profile() -> Profile {
 pub fn build_client_hello(server_name: &str, session_id: &[u8; 32]) -> (Vec<u8>, [u8; 32]) {
     let mut client_random = [0u8; 32];
     rand::fill(&mut client_random);
-    let record = match pick_profile() {
-        Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, &client_random),
-        Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, &client_random),
-        Profile::OkHttp => build_okhttp(server_name.as_bytes(), session_id, &client_random),
-    };
-    (record, client_random)
+    (build_client_hello_with_random(server_name, session_id, &client_random), client_random)
+}
+
+/// 同 [`build_client_hello`], 但 client_random 由调用方指定。
+///
+/// PFS 用: 传入客户端一次性 X25519 公钥当 ClientHello.random (见 crypto::pfs) —— 任意 32B
+/// 都是合法 X25519 公钥且看起来均匀随机, 故指纹与随机 random 无异, 服务端读它做 ECDH。
+pub fn build_client_hello_with_random(
+    server_name: &str,
+    session_id: &[u8; 32],
+    client_random: &[u8; 32],
+) -> Vec<u8> {
+    match pick_profile() {
+        Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, client_random),
+        Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, client_random),
+        Profile::OkHttp => build_okhttp(server_name.as_bytes(), session_id, client_random),
+    }
 }
 
 /// 指定 profile 构造 (供 dump/测试用, 不轮换)。
