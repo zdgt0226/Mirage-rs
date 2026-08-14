@@ -23,6 +23,15 @@
 - `spawn_ebpf_monitor_tasks` —— eBPF 启用时的后台 DNS 解析 (60s) + RTT 监控/Brutal 调速 (2s)。
 - 未动 inbound match 循环 (含 continue 控制流, 单独抽风险高, 留后续)。full 409 passed 前后一致。
 
+### refactor(api): RateLimiter 摊还式定期清理冷却条目
+
+原 `evict` 只在**插入新 IP 且 map 已满 (MAP_CAP=10k)** 时才清过期条目 —— 常态下 map 会一直
+保留已冷却完的 IP 记录直到撑满才清。有上限故非漏洞, 但白占内存。
+
+改法: 抽出 `sweep_expired` (原 evict 的 retain 谓词), 由 `is_locked` (每请求必调) **摊还式**驱动
+—— 距上次清扫超 `SWEEP_INTERVAL` (60s) 就全表 retain 一次, 常态下也及时回收冷却条目, 不必等满。
+O(n) 但每 60s 至多一次, 无后台任务/无额外锁。补 2 单测 (过期回收 / 锁定中不误删) + 手动变异 2/2 kill。
+
 ### test: 解析器属性/模糊测试 (proptest, 外部审计 #12)
 
 给三类**解析密集 + 安全敏感**的 parser 补 proptest 属性测试 (`任意输入绝不 panic`), 跑在 stable、
