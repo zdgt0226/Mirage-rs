@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.9.3] - 可选前向保密 PFS + 供应链签名/容器 + 审计尾单清扫 (2026-08-14)
+
 ### feat(release): cosign keyless 产物签名 + ghcr 多架构容器镜像 (外部审计 #13)
 
 Release 流水线补供应链完整性, **零密钥** (无需任何 secret):
