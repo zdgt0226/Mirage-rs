@@ -1324,7 +1324,7 @@ mod tests {
 
 #[cfg(test)]
 mod validation_tests {
-    use super::{Config, RuleConfig};
+    use super::{Config, InboundConfig, OutboundConfig, RuleConfig};
 
     /// 一份最小可用配置; 各用例在其上做局部破坏。
     fn base() -> serde_json::Value {
@@ -1635,6 +1635,70 @@ mod validation_tests {
         let is = issues_of(&v);
         assert!(has(&is, "inbound tag `in` 重复定义"), "实际: {is:?}");
         assert!(has(&is, "port 为 0"), "实际: {is:?}");
+    }
+
+    /// 外部审计 #7 —— config 模板防漂移: install.sh 生成的**全字段**配置必须逐个字段**真正
+    /// 生效**, 而非被静默吞。
+    ///
+    /// 为什么不靠"未知字段"检测: serde_ignored **不下钻** `#[serde(tag="type")]` 内部标签枚举
+    /// (inbound/outbound), 里面拼错/改名的字段会被静默忽略、回落默认值, unknown-field 诊断看不到。
+    /// 故这里改成**断言解析后的字段值 == 模板设定值**: 若 Rust struct 字段被改名, 模板里那把 key
+    /// 就会被 serde 忽略 → 字段回落默认 → 断言失败, 挡住"结构改了但 install.sh 模板没跟上"的漂移。
+    #[test]
+    fn install_sh_config_templates_fields_take_effect() {
+        // 完整服务端 (config_server.json 全字段形态)。
+        let server_json = serde_json::json!({
+            "schema_version": 1,
+            "log_level": "info",
+            "log_file": "/var/log/mirage/server.log",
+            "inbounds": [{
+                "type": "mirage_server", "tag": "mirage-in",
+                "listen": "0.0.0.0", "port": 8443,
+                "password": "pw", "camouflage_host": "www.apple.com",
+                "brutal_rate_mbps": 100, "auth_ts_tolerance_secs": 42, "pfs": true,
+                "upstream": {
+                    "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+                    "method": "aes-256-gcm", "password": "up", "udp": "block"
+                }
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "routing": {"default_outbound": "direct", "rules": []}
+        });
+        let (server, _) = Config::parse_with_diagnostics(&server_json.to_string()).expect("服务端应解析");
+        let InboundConfig::MirageServer {
+            camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, pfs, ..
+        } = &server.inbounds[0] else { panic!("首入站应为 mirage_server") };
+        // 每个字段的模板值都必须真正落到 struct 上 (改名/删字段则回落默认 → 此处失配)。
+        assert_eq!(camouflage_host.as_deref(), Some("www.apple.com"), "camouflage_host 漂移");
+        assert_eq!(*brutal_rate_mbps, Some(100), "brutal_rate_mbps 漂移");
+        assert_eq!(*auth_ts_tolerance_secs, 42, "auth_ts_tolerance_secs 漂移");
+        assert!(*pfs, "pfs 漂移 (模板设 true 却没生效 → 字段可能被改名)");
+        assert!(upstream.is_some(), "upstream 漂移");
+
+        // 完整客户端 (config_client.json 全字段形态)。
+        let client_json = serde_json::json!({
+            "schema_version": 1,
+            "log_level": "info",
+            "log_file": "/var/log/mirage/client.log",
+            "log_rotate_mb": 7, "log_keep_archives": 3,
+            "inbounds": [{"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "port": 1080}],
+            "outbounds": [
+                {"type": "mirage", "tag": "proxy", "server": "1.2.3.4", "server_port": 8443,
+                 "password": "pw", "camouflage_host": "www.apple.com", "pool_size": 9, "pfs": true},
+                {"type": "direct", "tag": "direct"},
+                {"type": "block", "tag": "block"}
+            ],
+            "routing": {"default_outbound": "proxy", "rules": []}
+        });
+        let (client, _) = Config::parse_with_diagnostics(&client_json.to_string()).expect("客户端应解析");
+        // 顶层字段 (serde_ignored 能看到, 但顺带断值更稳)。
+        assert_eq!(client.log_rotate_mb, Some(7), "log_rotate_mb 漂移");
+        assert_eq!(client.log_keep_archives, Some(3), "log_keep_archives 漂移");
+        let OutboundConfig::Mirage { camouflage_host, pool_size, pfs, .. } = &client.outbounds[0]
+        else { panic!("首出站应为 mirage") };
+        assert_eq!(camouflage_host, "www.apple.com", "客户端 camouflage_host 漂移");
+        assert_eq!(*pool_size, 9, "pool_size 漂移");
+        assert!(*pfs, "客户端 pfs 漂移 (模板设 true 却没生效)");
     }
 }
 

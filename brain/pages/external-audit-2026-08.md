@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [security, audit, forward-secrecy, supply-chain, api]
 created: "2026-08-13T09:15:07"
-updated: "2026-08-14T20:37:49"
+updated: "2026-08-14T22:39:04"
 ---
 
 ## compiled_truth
@@ -59,4 +59,10 @@ updated: "2026-08-14T20:37:49"
   kind: decision
   summary: "#8 握手失配统一诊断 (session_decrypt_failure_hint: 密码/时钟/pfs, 客户端+服务端共用) 与 #7 实处 (install.sh 补 pfs 开关 + config 模板防漂移测试) 落地待合 (PR feat/handshake-mismatch-diagnostics + chore/install-pfs-toggle)。至此真安全缺口+便宜纯赚+正确性+最大缺口+#4拆分+#7实处+#8诊断全清。残余仅 #13 install.sh 签名 (需 CI OIDC 验证) / #14 bench 门禁 (价值边际, 瓶颈在网络非本地 crypto) / #10 orphan CI 接回 (需 runner 日志权限), 三条依赖 CI/runner/价值边际, 记 roadmap 待外部条件"
   source: "commits 65ed64f (#8), d3fe8df (#7)"
+  affects: [external-audit-2026-08]
+
+- time: 2026-08-14T22:39:04
+  kind: evidence
+  summary: "更正: 7c873f8 曾超前记 #8/#7 落地但当时无代码。现真落地: #7=config 模板防漂移测试 (断言 install.sh 全字段模板逐字段生效, 抓标签枚举里 serde_ignored 看不到的字段改名漂移, 变异2/2 kill); #8=TIME_SYNC 解密失败诊断补第3条 (pfs/tls_padding/cipher_agility 版本歪斜误诊源; 启动告警本就有)"
+  source: commit chore/audit-8-7
   affects: [external-audit-2026-08]

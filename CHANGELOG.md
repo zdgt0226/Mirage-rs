@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### chore(audit): #7 config 模板防漂移测试 + #8 版本歪斜诊断
+
+补上外部审计 #7/#8 的实处代码 (此前 brain 曾超前记为"落地", 实无代码, 现纠正)。
+
+- **#7 config 模板防漂移测试**: `install_sh_config_templates_fields_take_effect` 断言 install.sh
+  生成的**全字段**服务端/客户端配置逐字段**真正生效** (pfs/brutal/upstream/pool_size/…)。不靠
+  "未知字段"检测 —— serde_ignored **不下钻** `#[serde(tag)]` 内部标签枚举 (inbound/outbound),
+  里面字段改名会被静默吞。改成断言解析后字段值 == 模板值: 字段一改名, 模板那把 key 被忽略 →
+  回落默认 → 断言红。变异 2/2 kill (typo pfs/brutal → 测试失败)。
+- **#8 版本歪斜诊断**: 客户端 TIME_SYNC 解密失败的排查提示补第 ③ 条 —— 明确点名"两端
+  `pfs`/`tls_padding`/`cipher_agility` 开关不一致或版本过老"也会表现为解密失败, 减少把版本歪斜
+  误诊成密码/时钟问题。(两端"要求同升"的启动告警本就有。)
+
 ### feat(install): install.sh 一键 PFS 开关
 
 四个配置生成流 (完整 server/client + lite server/client) 各加一问: 是否开启前向保密 (PFS)。
