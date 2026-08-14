@@ -18,6 +18,9 @@ pub const WINDOW: Duration = Duration::from_secs(60);
 pub const LOCKOUT: Duration = Duration::from_secs(300);
 /// map 条目上限, 满时清理过期条目 (防恶意海量源 IP 撑爆内存)。
 pub const MAP_CAP: usize = 10_000;
+/// 定期全表清扫间隔: is_locked (每请求必调) 驱动的摊还式清理, 距上次清扫超此时长就清一次。
+/// 让已冷却的条目在常态下 (map 未满) 也能被及时回收, 而非一直留到 MAP_CAP 才清。
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct FailRecord {
@@ -29,18 +32,29 @@ struct FailRecord {
 }
 
 /// 认证失败限流状态表 (per-IP)。放进 AppState, 全局共享。
-#[derive(Default)]
 pub struct RateLimiter {
     map: HashMap<IpAddr, FailRecord>,
+    /// 上次全表清扫时刻; is_locked 驱动的摊还式定期清理用 (见 SWEEP_INTERVAL)。
+    last_sweep: Instant,
 }
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            map: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
     }
 
     /// 认证**前**调用: 该 IP 当前是否处于锁定期。
+    ///
+    /// 每请求必经此处, 顺带驱动**摊还式定期清理**: 距上次清扫超 SWEEP_INTERVAL 就全表 retain
+    /// 一次已过期条目 (常态下也回收冷却完的 IP, 不必等 map 满)。O(n) 但每 60s 至多一次。
     pub fn is_locked(&mut self, ip: IpAddr, now: Instant) -> bool {
+        if now.duration_since(self.last_sweep) >= SWEEP_INTERVAL {
+            self.sweep_expired(now);
+            self.last_sweep = now;
+        }
         match self.map.get(&ip) {
             Some(r) => r.locked_until.is_some_and(|until| now < until),
             None => false,
@@ -75,14 +89,20 @@ impl RateLimiter {
         self.map.remove(&ip);
     }
 
-    /// 硬封顶: 先删所有已完全过期的条目 (锁定期与窗口都已过); 若仍达上限, 淘汰
-    /// window_start 最旧的一条 (最可能已不活跃)。保证 map.len() 不超过 MAP_CAP。
-    fn evict(&mut self, now: Instant) {
+    /// 删所有已完全过期的条目: 锁定期已过 **且** 计数窗口已过 (二者都不活跃)。
+    /// 由 evict (满时) 与 is_locked (每 SWEEP_INTERVAL) 共用。
+    fn sweep_expired(&mut self, now: Instant) {
         self.map.retain(|_, r| {
             let lock_active = r.locked_until.is_some_and(|until| now < until);
             let window_active = now.duration_since(r.window_start) <= WINDOW;
             lock_active || window_active
         });
+    }
+
+    /// 硬封顶: 先删所有已完全过期的条目; 若仍达上限, 淘汰 window_start 最旧的一条
+    /// (最可能已不活跃)。保证 map.len() 不超过 MAP_CAP。
+    fn evict(&mut self, now: Instant) {
+        self.sweep_expired(now);
         while self.map.len() >= MAP_CAP {
             if let Some(oldest) = self
                 .map
@@ -198,5 +218,36 @@ mod tests {
             rl.note_failure(IpAddr::from([o[0], o[1], o[2], o[3]]), t);
         }
         assert!(rl.len() <= MAP_CAP, "map 必须硬封顶 <= MAP_CAP (当前 {})", rl.len());
+    }
+
+    #[test]
+    fn periodic_sweep_reclaims_expired_entries() {
+        let mut rl = RateLimiter::new();
+        let t = Instant::now();
+        for n in 1..=5 {
+            rl.note_failure(ip(n), t); // 各一次失败, 未锁定, 窗口 60s
+        }
+        assert_eq!(rl.len(), 5);
+        // 不到清扫间隔: is_locked 不清扫, 条目仍在。
+        let _ = rl.is_locked(ip(9), t + Duration::from_secs(30));
+        assert_eq!(rl.len(), 5, "未到 SWEEP_INTERVAL 不应清");
+        // 超过清扫间隔且条目已过期 (窗口过 + 未锁定): is_locked 摊还式清扫回收。
+        let later = t + WINDOW + SWEEP_INTERVAL + Duration::from_secs(1);
+        let _ = rl.is_locked(ip(9), later);
+        assert_eq!(rl.len(), 0, "过期条目应被摊还式清扫回收");
+    }
+
+    #[test]
+    fn periodic_sweep_keeps_active_lockouts() {
+        let mut rl = RateLimiter::new();
+        let t = Instant::now();
+        for _ in 0..MAX_FAILURES {
+            rl.note_failure(ip(1), t); // 锁定 ip(1) 300s
+        }
+        assert!(rl.is_locked(ip(1), t));
+        // 过了清扫间隔但仍在锁定期内: 清扫不能误删锁定中的条目。
+        let mid = t + SWEEP_INTERVAL + Duration::from_secs(1);
+        assert!(rl.is_locked(ip(1), mid), "锁定期内即使触发清扫也不应解锁");
+        assert_eq!(rl.len(), 1, "锁定中的条目不应被清扫回收");
     }
 }
