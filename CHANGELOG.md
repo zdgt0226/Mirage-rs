@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### feat(install): install.sh 一键 PFS 开关
+
+四个配置生成流 (完整 server/client + lite server/client) 各加一问: 是否开启前向保密 (PFS)。
+选是则写入 `"pfs": true`。每问都提示**两端必须一致** (一端开一端没开会连不上)。默认否 (向后兼容)。
+`mirage check` 已认该字段。纯 config 生成改动, 无 Rust 代码。
+
 ### feat(crypto): 可选前向保密 PFS (一次性 X25519 ECDH, 外部审计 #2)
 
 补上外部审计 #2 (最大真安全缺口): 原会话密钥纯从口令派生, **口令泄露=历史+未来流量全可解**。
