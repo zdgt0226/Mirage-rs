@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-08-05T00:20:00"
+updated: "2026-08-14T10:14:16"
 ---
 
 # Roadmap
@@ -10,8 +10,22 @@ updated: "2026-08-05T00:20:00"
 > **用户确认 (2026-07-21)**: 方向大致对, 但**当前无固定计划 / 无承诺时间表** —— 走一步看一步,
 > 哪个撞到痛点就修哪个。下表是"候选池"而非排期。
 
-## 已完成的主线 (v0.7.0 – v0.9.0, 均已发布并入 main)
+## 已完成的主线 (v0.7.0 – v0.9.2, 均已发布并入 main)
 
+- **握手模板完整性修复** (v0.9.2) ✅ —— 服务端 `handshake_cache` 只缓存**含齐 0x16+0x14+0x17 三型**的
+  camouflage 模板 (纯函数 `template_is_complete` 校验; 缺型/截断/尾部残字节一律弃、回落恒完整的
+  fallback)。修完整服务端↔客户端 (含轻量模式, 非轻量特有) 偶发 `read_exact tail timed out` 握手卡死:
+  旧版 fetch 固定只多读 2 帧, 遇拆帧站/TLS1.2 站缓存出残模板 → 客户端永等不到三型齐、不发 tail。带
+  e2e 回归 (本地残 camouflage 站, 去修复即 10s 超时 FAILED)。详见 [[handshake-template-completeness]]。
+- **外部审计便宜纯赚 + 去阻塞** (v0.9.2) ✅ —— API 认证失败 per-IP 限流 (#28) · cargo-deny 供应链
+  门禁 (抓出 anyhow RUSTSEC-2026-0190 → 升 1.0.104) · README 安全声明 · RTT/brutal 监控去阻塞
+  (spawn_blocking) + 调速逻辑抽纯函数 (#29) · 三类 parser 补 proptest 属性测试 (#30)。
+- **clippy 清零 + CI -D warnings** (v0.9.2) ✅ —— `clippy --all-targets` 清到 0, CI 门禁翻
+  `-D warnings` (新 warning 即红)。**候选池"clippy → -D warnings"已落地。**
+- **WG 入站"干净设备"落地** (v0.9.1) ✅ —— install.sh 菜单项 7 家庭 WireGuard 服务端 (内核 WG +
+  eBPF 透明网关, 非 boringtun responder), wg0 纳入透明网关, 真机验证过。移动设备经家中网关代理零翻墙
+  痕迹。**候选池"WG 入站干净设备"已落地。** 见 [[chain-proxy-roadmap]]。
+- **§7 抗审查泄漏护甲** (v0.9.1) ✅ —— T2/T4 进程内泄漏测试 (fake-IP / 空 AAAA / block→NXDOMAIN)。
 - **统一出站流接口** (v0.8.1) ✅ —— `OutboundNode::connect(target)->OutStream`, 帧式 async 包成
   AsyncRead+AsyncWrite (MirageStream/SsStream/WgTcpStream 适配器)。解锁链式代理 + geo 经隧道免绕
   SOCKS 自连。详见 [[unified-outbound-stream]]。**此前是候选池"结构性"地基, 已落地。**
@@ -48,12 +62,10 @@ updated: "2026-08-05T00:20:00"
 | 项 | 性质 | 判断 |
 |---|---|---|
 | **UDP mux → QUIC Datagram** | 传输/抗审查 | mux 终局无 HoL 版 (quinn + 握手 + 伪装整合)。TCP-mux 已缓解带机量; QUIC 解跨流队头阻塞 + 实时质量。大工程。见 [[udp-capacity-findings]] |
-| **WG 入站"干净设备"落地** | 部署 | 方案已定: 内核 WG 服务端 + 现有 eBPF 透明网关 (非 boringtun responder)。install.sh 一键 (家庭 WG + wg0 纳入透明网关) + 真机验未做。移动设备经家中网关代理, 零翻墙痕迹降查水表风险。见 [[chain-proxy-roadmap]] |
 | **rule-set 远程规则集 + 自动更新** | 路由生态 | 维护成本大头。**先想清安全模型**: HTTPS + 哈希/签名固定 · 更新失败保留旧规则 · 先验证再原子切换 |
 | **process_name 分流** | 路由维度 | 客户端刚需 (TG 走代理/微信直连)。已有 cgroup/connect4 eBPF 基础。见 [[routing-rules]] |
 | **指纹 profile 热下发** | 抗识别 | 服务端下发新 ClientHello 免客户端发版 (数据侧可热更)。⚠️ 按装机份额错开切换。见 [[fingerprint-hot-update]] |
 | **§7 泄漏测试补全** | 抗审查测试 | 剩 WG 隧道内 DNS (需 netns) + T1 认证失败转发伪装站 (probe.rs 部分)。 |
-| **clippy → -D warnings** | 工程债 | 已清安全子集 46→24; 剩 24 需判断 (大 enum 装箱 / while-let 故意 timeout 模式 / too-many-args) 后翻 -D。 |
 | TLS resumption | 破坏性协议变更 | 零会话复用是真实统计指纹; 工装就绪, 两端需同升。见 [[tls-fingerprint-mimicry]] |
 | ICMP 处理 | 体验缺口 | ping/traceroute 被代理域名不通。**失败形态待真机确认, 用户说部署网关时再定** |
 | IPv6 全栈 (透明数据面) | 结构性 | 见 [[ipv6-v4only-tradeoff]]; 透明 v6 epic 已降级, 隧道传输 v6 已做 |
