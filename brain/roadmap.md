@@ -2,7 +2,7 @@
 slug: roadmap
 title: Roadmap
 role: milestones
-updated: "2026-08-14T20:38:48"
+updated: "2026-08-14T23:47:53"
 ---
 
 # Roadmap
@@ -10,15 +10,20 @@ updated: "2026-08-14T20:38:48"
 > **用户确认 (2026-07-21)**: 方向大致对, 但**当前无固定计划 / 无承诺时间表** —— 走一步看一步,
 > 哪个撞到痛点就修哪个。下表是"候选池"而非排期。
 
-## 已完成的主线 (v0.7.0 – v0.9.2, 均已发布并入 main; PFS 等已进 main 待发版)
+## 已完成的主线 (v0.7.0 – v0.9.3, 均已发布并入 main)
 
-- **前向保密 PFS (审计 #2, 最大真安全缺口)** ✅ 已进 main —— opt-in 一次性 X25519 ECDH, 公钥搭
+- **前向保密 PFS (审计 #2, 最大真安全缺口)** ✅ (v0.9.3) —— opt-in 一次性 X25519 ECDH, 公钥搭
   fake-TLS random 字段交换 (零指纹变化 + 高位随机化抗指纹), `password‖ecdh` 混进 master, 口令泄露
-  也解不了已录流量; 两端同开, 失配 fail-closed。详见 [[handshake-forward-secrecy]]。
-- **审计尾单批** (待发版, 已进 main / PR 待合) ✅ —— #4 start_proxy 巨石拆分 (753→400, src/startup.rs) ·
-  #8 握手失配统一诊断 (密码/时钟/pfs 单边, 客户端+服务端共用) · #7 实处 (install.sh 补 pfs 开关 +
-  config 模板防漂移测试) · WgTcpStream::connect 同步失败泄漏 socket 修复 · RateLimiter 摊还式定期清理。
-  详见 [[external-audit-2026-08]]。
+  也解不了已录流量; 两端同开, 失配 fail-closed。install.sh 一键开关。详见 [[handshake-forward-secrecy]]。
+- **供应链签名 + 容器 (审计 #13)** ✅ (v0.9.3) —— cosign **keyless** (Sigstore OIDC, 零密钥) 签
+  SHA256SUMS (bundle 挂 Release) + ghcr **多架构容器镜像** (buildx amd64/arm64, musl+alpine,
+  GITHUB_TOKEN 推送, 镜像亦签名)。v0.9.3 首发实测全绿, podman pull 可用。
+- **审计尾单批** ✅ (v0.9.3) —— #4 start_proxy 巨石拆分 (753→400, src/startup.rs) · #8 版本歪斜诊断
+  (TIME_SYNC 解密失败提示补 pfs/tls_padding/cipher_agility 单边) · #7 config 模板防漂移测试
+  (断言标签枚举字段真生效, serde_ignored 抓不到的) · WgTcpStream::connect 同步失败泄漏 socket 修复 ·
+  RateLimiter 摊还式定期清理 · proptest。详见 [[external-audit-2026-08]]。
+  **外部审计纯代码/零密钥项至此全清; 残余仅 #14 bench (边际, 建议永跳) / #10 orphan CI (需 ≥6.1
+  自托管 runner, GH runner 5.15 跑不了跨进程 sk_assign)。**
 - **握手模板完整性修复** (v0.9.2) ✅ —— 服务端 `handshake_cache` 只缓存**含齐 0x16+0x14+0x17 三型**的
   camouflage 模板 (纯函数 `template_is_complete` 校验; 缺型/截断/尾部残字节一律弃、回落恒完整的
   fallback)。修完整服务端↔客户端 (含轻量模式, 非轻量特有) 偶发 `read_exact tail timed out` 握手卡死:
