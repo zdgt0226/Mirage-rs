@@ -299,6 +299,13 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                         } else if ct == 0x16 {
                             // 首个 ServerHello: 捕获 random (body[6..38])。ServerHello body 布局:
                             // [0x02 type][3B len][2B version][32B random]... → random 在 [6..38]。
+                            //
+                            // PFS 边界: 假设**首条 0x16 record 就含完整 ServerHello 的 random**
+                            // (与服务端 get_server_hello_pfs 覆写 flight[11..43] 的假设对称:
+                            // 11-5=6, 帧头 5B)。random 在 body 前 38 字节内, fallback 是单条完整
+                            // record, fetch 模板首条通常也完整, 故实践中恒满足。若伪装站把
+                            // ServerHello 拆到首条 record < 38B (极罕见), 这里捕获不到 → server_random
+                            // 留全 0 → do_fake_tls 里 ECDH 失配 → fail-closed (安全, 见那里的 warn)。
                             if !saw_sh && body.len() >= 38 {
                                 server_random.copy_from_slice(&body[6..38]);
                             }
@@ -732,7 +739,19 @@ impl WarmPool {
         wh.flush().await?;
         // PFS: 与服务端临时公钥 (= server_random) 做 ECDH 得共享秘密。
         let ecdh = match ephemeral {
-            Some(e) => Some(e.agree(&server_random)?),
+            Some(e) => {
+                // server_random 全 0 = 没捕获到服务端临时公钥 (对端没开 pfs, 或 ServerHello
+                // 模板首条 record 不含完整 random —— 极罕见)。此时 ECDH 用全 0 公钥, master 必与
+                // 服务端失配 → fail-closed 连不上 (不会静默出明文, 但也连不通)。给个明确 warn。
+                if server_random == [0u8; 32] {
+                    tracing::warn!(
+                        "PFS: 未从服务端 ServerHello 捕获到临时公钥 (全 0) —— 对端很可能未开启 pfs, \
+                         或伪装站响应异常。本连接将因会话密钥失配而失败; 请确认服务端 config 也设 \
+                         \"pfs\": true。"
+                    );
+                }
+                Some(e.agree(&server_random)?)
+            }
             None => None,
         };
         Ok(ClientHandshake { client_random, ecdh })

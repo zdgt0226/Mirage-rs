@@ -300,3 +300,40 @@ fn pfs_mismatch_fails_closed() {
     std::fs::remove_file(&srv_cfg).ok();
     std::fs::remove_file(&cli_cfg).ok();
 }
+
+/// PFS 完整模式覆盖: **完整 mirage_server 入站** (走 handshake.rs + control.rs 服务端侧 PFS
+/// 路径, 非 lite start_server) + 完整 direct 出站, 对接 lite-client pfs=true。证明 PFS 在
+/// 完整服务端握手路径也端到端可用 (lite↔lite 之外的另一条真实路径)。
+#[test]
+fn pfs_full_server_interops_with_lite_client() {
+    let echo = spawn_echo();
+    let (sport, cport) = (18583, 11583);
+    // 完整模式服务端: mirage_server 入站 + pfs=true + direct 出站。
+    let srv_cfg = write_cfg(
+        "pfs_full_srv.json",
+        &format!(
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-pfs-full","camouflage_host":"www.apple.com","pfs":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+        ),
+    );
+    let cli_cfg = write_cfg(
+        "pfs_full_cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs-full","sni":"www.apple.com","pool_size":2,"pfs":true,"log_level":"warn"}}"#
+        ),
+    );
+
+    let _s = spawn("server", &srv_cfg);
+    assert!(wait_port(sport), "完整模式 PFS 服务端未监听");
+    let _c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "PFS 客户端未监听");
+
+    let mut s = socks5_connect(cport, echo)
+        .expect("完整服务端 PFS ↔ lite 客户端 PFS 应互通");
+    s.write_all(b"pfs-full-server-lite-client").unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"pfs-full-server-lite-client", "完整模式 PFS 隧道回环应原样返回");
+
+    std::fs::remove_file(&srv_cfg).ok();
+    std::fs::remove_file(&cli_cfg).ok();
+}
