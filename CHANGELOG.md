@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(release): cosign keyless 产物签名 + ghcr 多架构容器镜像 (外部审计 #13)
+
+Release 流水线补供应链完整性, **零密钥** (无需任何 secret):
+- **cosign keyless 签名**: CI 聚合 `SHA256SUMS` 后用 cosign keyless (Sigstore, 身份 = 本仓库
+  Release workflow 的 GitHub OIDC; Fulcio 短时证书 + Rekor 透明日志) 签名, 产出一文件 bundle
+  `SHA256SUMS.cosign.bundle` 挂进 Release。无长期私钥、可公开审计。Release notes 内附 `cosign
+  verify-blob` 验证命令。
+- **多架构容器镜像**: 新 `container` job 用 buildx 构 linux/amd64+arm64 (装 musl 静态二进制,
+  alpine 基镜 + ca-certificates), 推 `ghcr.io/<owner>/mirage-rs:<tag>` 与 `:latest` (GITHUB_TOKEN,
+  无 secret), 镜像亦 cosign keyless 签名。新增 `Dockerfile`。
+- 顶层 workflow 权限收窄为 `contents: read`, 各 job 按需最小提权 (release: contents+id-token;
+  container: packages+id-token)。
+- README 补容器用法 + 验签命令。⚠️ 首次推 ghcr 生成的 package 默认 private, 需 owner 在仓库
+  Packages 设置里改 public 一次 (匿名 `docker pull` 才可用)。真实验证在下次发版 (tag) 时。
+
 ### chore(audit): #7 config 模板防漂移测试 + #8 版本歪斜诊断
 
 补上外部审计 #7/#8 的实处代码 (此前 brain 曾超前记为"落地", 实无代码, 现纠正)。

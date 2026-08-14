@@ -61,6 +61,31 @@ sudo bash install.sh
 装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`
 (轻量版是 `mirage-rs-lite-{server,client}`)。
 
+### 容器镜像 (multi-arch amd64/arm64)
+
+```bash
+docker run --rm -v /etc/mirage-rs:/etc/mirage-rs \
+  ghcr.io/zdgt0226/mirage-rs:latest server -c /etc/mirage-rs/config_server.json
+```
+
+### 验证产物签名 (cosign keyless, 无需任何公钥)
+
+Release 里的 `SHA256SUMS` 由 CI 用 **cosign keyless** (Sigstore, 身份 = 本仓库 Release workflow 的 GitHub OIDC) 签名, 容器镜像同样签名 —— 无长期私钥、可公开审计 (Rekor 透明日志):
+
+```bash
+# 校验和签名 (下载 SHA256SUMS + SHA256SUMS.cosign.bundle 后)
+cosign verify-blob --bundle SHA256SUMS.cosign.bundle \
+  --certificate-identity-regexp '^https://github.com/zdgt0226/Mirage-rs/\.github/workflows/release\.yml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+
+# 容器镜像签名
+cosign verify ghcr.io/zdgt0226/mirage-rs:latest \
+  --certificate-identity-regexp '^https://github.com/zdgt0226/Mirage-rs/\.github/workflows/release\.yml@refs/tags/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 ---
 
 ## 🛠️ 灵活的部署形态

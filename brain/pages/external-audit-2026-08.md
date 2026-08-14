@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [security, audit, forward-secrecy, supply-chain, api]
 created: "2026-08-13T09:15:07"
-updated: "2026-08-14T22:39:04"
+updated: "2026-08-14T23:01:40"
 ---
 
 ## compiled_truth
@@ -65,4 +65,10 @@ updated: "2026-08-14T22:39:04"
   kind: evidence
   summary: "更正: 7c873f8 曾超前记 #8/#7 落地但当时无代码。现真落地: #7=config 模板防漂移测试 (断言 install.sh 全字段模板逐字段生效, 抓标签枚举里 serde_ignored 看不到的字段改名漂移, 变异2/2 kill); #8=TIME_SYNC 解密失败诊断补第3条 (pfs/tls_padding/cipher_agility 版本歪斜误诊源; 启动告警本就有)"
   source: commit chore/audit-8-7
+  affects: [external-audit-2026-08]
+
+- time: 2026-08-14T23:01:40
+  kind: evidence
+  summary: "#13 签名+容器落地 (keyless 零密钥): cosign keyless 签 SHA256SUMS (Sigstore OIDC, bundle 挂 Release) + ghcr multi-arch 容器镜像 (buildx amd64/arm64, musl+alpine, GITHUB_TOKEN 推送, 镜像亦签名) + Dockerfile。⚠️ 首推 ghcr package 默认 private 需 owner 改 public 一次; 真实验证在下次 tag 发版。残余仅 #14 bench (边际) / #10 orphan (需≥6.1自托管runner, GH runner 5.15 跑不了跨进程 sk_assign)"
+  source: commit feat/release-signing-container
   affects: [external-audit-2026-08]
