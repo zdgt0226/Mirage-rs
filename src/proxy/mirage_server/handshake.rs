@@ -50,6 +50,7 @@ pub(super) async fn handle_connection(
     cam_pool: Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    pfs: bool,
 ) {
     stream.set_nodelay(true).unwrap_or_default();
 
@@ -143,9 +144,27 @@ pub(super) async fn handle_connection(
         return;
     }
 
+    // PFS: 生成服务端一次性 X25519 对。公钥注入回放模板的 ServerHello.random 发给客户端,
+    // 私钥留着与 client_random (= 客户端临时公钥) 做 ECDH。见 crypto::pfs。
+    let server_ephemeral = if pfs {
+        match crate::crypto::pfs::Ephemeral::generate() {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::error!("Mirage Server: PFS 临时密钥生成失败: {e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     // 2.5 Send ServerHello template back to satisfy Mirage Client's TLS state machine
-    let template =
-        crate::crypto::handshake_cache::get_server_hello(&camouflage_host, &client_hello).await;
+    let template = crate::crypto::handshake_cache::get_server_hello_pfs(
+        &camouflage_host,
+        &client_hello,
+        server_ephemeral.as_ref().map(|e| &e.public),
+    )
+    .await;
 
     // v0.4.5-alpha.13: 消除 auth-succ vs auth-fail 时序侧信道.
     // auth-fail 走 camouflage 转发有 ~1 RTT 延迟 (探针→server→camouflage→回),
@@ -182,6 +201,18 @@ pub(super) async fn handle_connection(
         }
     }
 
+    // PFS: 与 client_random (= 客户端临时公钥) 做 ECDH 得共享秘密, 混进会话 master。
+    let ecdh = match server_ephemeral {
+        Some(e) => match e.agree(&client_random) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                tracing::error!("Mirage Server: PFS ECDH 协商失败: {err}");
+                return;
+            }
+        },
+        None => None,
+    };
+
     // Hand off to control plane (crypto setup + TIME_SYNC + dispatch)
-    control::dispatch_authenticated(stream, password, client_random, upstream).await;
+    control::dispatch_authenticated(stream, password, client_random, upstream, ecdh).await;
 }

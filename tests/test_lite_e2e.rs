@@ -222,3 +222,118 @@ fn server_falls_back_when_camouflage_template_incomplete() {
     std::fs::remove_file(&srv_cfg).ok();
     std::fs::remove_file(&cli_cfg).ok();
 }
+
+/// PFS 两端同开 (pfs=true): 握手做 X25519 ECDH, 隧道照常打通 echo 回环。
+/// 证明前向保密路径端到端可用 (ClientHello.random=客户端临时公钥, ServerHello.random=
+/// 服务端临时公钥, ecdh 混进 master), 且不破坏正常代理。
+#[test]
+fn pfs_both_ends_tunnel_works() {
+    let echo = spawn_echo();
+    let (sport, cport) = (18581, 11581);
+    let srv_cfg = write_cfg(
+        "pfs_srv.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-pfs","sni":"www.apple.com","pfs":true,"log_level":"warn"}}"#
+        ),
+    );
+    let cli_cfg = write_cfg(
+        "pfs_cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs","sni":"www.apple.com","pool_size":2,"pfs":true,"log_level":"warn"}}"#
+        ),
+    );
+
+    let _s = spawn("lite-server", &srv_cfg);
+    assert!(wait_port(sport), "PFS 服务端未监听");
+    let _c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "PFS 客户端未监听");
+
+    let mut s = socks5_connect(cport, echo).expect("PFS 两端同开 SOCKS5 CONNECT 应成功");
+    s.write_all(b"hello-through-pfs-tunnel").unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"hello-through-pfs-tunnel", "PFS 隧道回环数据应原样返回");
+
+    std::fs::remove_file(&srv_cfg).ok();
+    std::fs::remove_file(&cli_cfg).ok();
+}
+
+/// PFS 失配 (服务端 pfs=true, 客户端 pfs=false): 两端派生的会话 master 不同 (label 域分隔 +
+/// 客户端根本没做 ECDH), 加密帧互相解不开 → 隧道回环拿不到数据。钉住"两端必须同开 pfs"
+/// 契约 (fail-closed, 不静默出乱数据)。
+///
+/// 注: SOCKS5 CONNECT 的 REP=0 是乐观提前回的, 失配在**数据中继**阶段才暴露, 故断言整条
+/// 回环不成功 (CONNECT 失败 / 无回显 / 回显不符 任一即可)。
+#[test]
+fn pfs_mismatch_fails_closed() {
+    let echo = spawn_echo();
+    let (sport, cport) = (18582, 11582);
+    let srv_cfg = write_cfg(
+        "pfs_mm_srv.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-mm","sni":"www.apple.com","pfs":true,"log_level":"warn"}}"#
+        ),
+    );
+    // 客户端不开 pfs (默认 false)。
+    let cli_cfg = write_cfg(
+        "pfs_mm_cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-mm","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+        ),
+    );
+
+    let _s = spawn("lite-server", &srv_cfg);
+    assert!(wait_port(sport), "服务端未监听");
+    let _c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "客户端未监听");
+
+    // master 失配 → 加密中继解不开 → 整条回环不该成功 (CONNECT 失败 / 无回显 / 回显不符)。
+    let ok_roundtrip = (|| -> Option<()> {
+        let mut s = socks5_connect(cport, echo).ok()?;
+        s.write_all(b"pfs-mismatch-probe").ok()?;
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).ok()?;
+        (n > 0 && &buf[..n] == b"pfs-mismatch-probe").then_some(())
+    })();
+    assert!(ok_roundtrip.is_none(), "PFS 失配下不该有成功的隧道回环 (fail-closed)");
+
+    std::fs::remove_file(&srv_cfg).ok();
+    std::fs::remove_file(&cli_cfg).ok();
+}
+
+/// PFS 完整模式覆盖: **完整 mirage_server 入站** (走 handshake.rs + control.rs 服务端侧 PFS
+/// 路径, 非 lite start_server) + 完整 direct 出站, 对接 lite-client pfs=true。证明 PFS 在
+/// 完整服务端握手路径也端到端可用 (lite↔lite 之外的另一条真实路径)。
+#[test]
+fn pfs_full_server_interops_with_lite_client() {
+    let echo = spawn_echo();
+    let (sport, cport) = (18583, 11583);
+    // 完整模式服务端: mirage_server 入站 + pfs=true + direct 出站。
+    let srv_cfg = write_cfg(
+        "pfs_full_srv.json",
+        &format!(
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-pfs-full","camouflage_host":"www.apple.com","pfs":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+        ),
+    );
+    let cli_cfg = write_cfg(
+        "pfs_full_cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs-full","sni":"www.apple.com","pool_size":2,"pfs":true,"log_level":"warn"}}"#
+        ),
+    );
+
+    let _s = spawn("server", &srv_cfg);
+    assert!(wait_port(sport), "完整模式 PFS 服务端未监听");
+    let _c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "PFS 客户端未监听");
+
+    let mut s = socks5_connect(cport, echo)
+        .expect("完整服务端 PFS ↔ lite 客户端 PFS 应互通");
+    s.write_all(b"pfs-full-server-lite-client").unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"pfs-full-server-lite-client", "完整模式 PFS 隧道回环应原样返回");
+
+    std::fs::remove_file(&srv_cfg).ok();
+    std::fs::remove_file(&cli_cfg).ok();
+}

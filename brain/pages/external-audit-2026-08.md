@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [security, audit, forward-secrecy, supply-chain, api]
 created: "2026-08-13T09:15:07"
-updated: "2026-08-13T09:15:39"
+updated: "2026-08-14T12:40:23"
 ---
 
 ## compiled_truth
@@ -48,3 +48,9 @@ updated: "2026-08-13T09:15:39"
   summary: Rewrote compiled_truth to the new best understanding
   source: "逐条核实 2026-08"
   affects: [external-audit-2026-08]
+
+- time: 2026-08-14T12:40:23
+  kind: decision
+  summary: "#2 前向保密已落地: opt-in X25519 ECDH (config pfs, 两端同开), 见 handshake-forward-secrecy。至此审计便宜纯赚+中等正确性+最大真缺口全清, 残余仅质量/分发/工程债 (#4已拆#7留/#8/#13/#14/#10)"
+  source: commit feat/pfs-x25519-ecdh
+  affects: [external-audit-2026-08, handshake-forward-secrecy]

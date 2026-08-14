@@ -15,16 +15,27 @@ pub(super) async fn dispatch_authenticated(
     password: String,
     client_random: [u8; 32],
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    ecdh: Option<[u8; 32]>,
 ) {
-    // 3. Setup Crypto Stream
+    // 3. Setup Crypto Stream。PFS 开时 (ecdh=Some) 走混入 ecdh 的 master 派生。
     let (read_half, write_half) = stream.into_split();
-    let (mut reader, mut writer) = crate::crypto::aead::create_crypto_pair(
-        read_half,
-        write_half,
-        &password,
-        &client_random,
-        false, // is_initiator = false (Server)
-    );
+    let (mut reader, mut writer) = match ecdh {
+        Some(ecdh) => crate::crypto::aead::create_crypto_pair_pfs(
+            read_half,
+            write_half,
+            &password,
+            &client_random,
+            &ecdh,
+            false, // is_initiator = false (Server)
+        ),
+        None => crate::crypto::aead::create_crypto_pair(
+            read_half,
+            write_half,
+            &password,
+            &client_random,
+            false, // is_initiator = false (Server)
+        ),
+    };
 
     // 3.5 v0.4 协议: 通过加密 channel 主动下发服务器时间, 让客户端无需 NTP/HTTP 探测.
     //     帧格式: [0x01 type=TIME_SYNC][0x01 proto_ver][8B u64 BE server unix sec] = 10 字节

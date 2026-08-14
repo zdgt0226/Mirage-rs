@@ -359,6 +359,38 @@ pub fn create_crypto_pair<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     )
 }
 
+/// 前向保密 (PFS) master: 在口令派生的基础上**混入临时 X25519 ECDH 共享秘密**。
+///
+/// - salt 仍是 client_random (= 客户端临时公钥, 见 crypto::pfs)。
+/// - IKM = password || ecdh —— ecdh 是一次性的, 私钥用完即弃, 故口令泄露也解不了已录流量。
+/// - **新 info label `pyrealiy-session-pfs`**: 刻意与非 PFS 的 `pyrealiy-session` 域分隔 →
+///   pfs 与非 pfs 两端派生出不同密钥, 一端开一端没开会解密失败 (两端必须同开 pfs)。
+fn derive_master_pfs(password: &str, salt: &[u8], ecdh: &[u8; 32]) -> [u8; 32] {
+    let mut ikm = Vec::with_capacity(password.len() + 32);
+    ikm.extend_from_slice(password.as_bytes());
+    ikm.extend_from_slice(ecdh);
+    let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+    let mut okm = [0u8; 32];
+    hk.expand(b"pyrealiy-session-pfs", &mut okm).unwrap();
+    okm
+}
+
+/// 同 `create_crypto_pair`, 但走 PFS master 派生 (混入 ecdh 共享秘密)。仅 pfs 两端调用。
+pub fn create_crypto_pair_pfs<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: R,
+    writer: W,
+    password: &str,
+    salt: &[u8],
+    ecdh: &[u8; 32],
+    is_initiator: bool,
+) -> (CryptoReader<R>, CryptoWriter<W>) {
+    let master = derive_master_pfs(password, salt, ecdh);
+    (
+        CryptoReader::new(reader, &master, is_initiator),
+        CryptoWriter::new(writer, &master, is_initiator),
+    )
+}
+
 #[cfg(test)]
 mod rekey_tests {
     use super::*;
@@ -439,6 +471,53 @@ mod rekey_tests {
         k_new.seal_in_place_append_tag(format_nonce(0), aead::Aad::empty(), &mut b1).unwrap();
         k_old.seal_in_place_append_tag(format_nonce(0), aead::Aad::empty(), &mut b2).unwrap();
         assert_eq!(b1, b2, "ChaCha20 密钥必须与旧版字节一致 (向后兼容)");
+    }
+
+    #[test]
+    fn pfs_master_deterministic_and_domain_separated() {
+        let salt = [1u8; 32];
+        let ecdh = [2u8; 32];
+        // 确定性: 同输入同密钥 (两端才能派同一 master)。
+        assert_eq!(
+            derive_master_pfs("pw", &salt, &ecdh),
+            derive_master_pfs("pw", &salt, &ecdh),
+        );
+        // 域分隔: PFS master 必须 != 非 PFS master (label 不同 → 一端开一端没开会解密失败)。
+        assert_ne!(
+            derive_master_pfs("pw", &salt, &ecdh),
+            derive_master("pw", &salt),
+            "PFS master 必须与非 PFS 域分隔",
+        );
+        // ecdh 变 → master 变 (ecdh 真的进了派生; 这是 PFS 的根)。
+        assert_ne!(
+            derive_master_pfs("pw", &salt, &ecdh),
+            derive_master_pfs("pw", &salt, &[9u8; 32]),
+            "不同 ecdh 必须派生不同 master",
+        );
+    }
+
+    #[tokio::test]
+    async fn pfs_pair_roundtrips() {
+        // 两端同 (password, salt, ecdh) → create_crypto_pair_pfs 端到端解密通。
+        let (a, b) = duplex(64 * 1024);
+        let salt = [7u8; 32];
+        let ecdh = [8u8; 32];
+        let (_ra, mut wa) = create_crypto_pair_pfs(tokio::io::empty(), a, "pw", &salt, &ecdh, true);
+        let (mut rb, _wb) = create_crypto_pair_pfs(b, tokio::io::sink(), "pw", &salt, &ecdh, false);
+        let msg = b"pfs payload 0123456789";
+        wa.send_data(msg).await.unwrap();
+        assert_eq!(&rb.recv_data().await.unwrap(), msg);
+    }
+
+    #[tokio::test]
+    async fn pfs_mismatched_ecdh_fails_closed() {
+        // 一端 ecdh 不同 (模拟 pfs 失配) → master 不同 → 解密必失败, 不静默出乱数据。
+        let (a, b) = duplex(64 * 1024);
+        let salt = [7u8; 32];
+        let (_ra, mut wa) = create_crypto_pair_pfs(tokio::io::empty(), a, "pw", &salt, &[8u8; 32], true);
+        let (mut rb, _wb) = create_crypto_pair_pfs(b, tokio::io::sink(), "pw", &salt, &[9u8; 32], false);
+        wa.send_data(b"boom").await.unwrap();
+        assert!(rb.recv_data().await.is_err(), "ecdh 不一致必须解密失败 (fail-closed)");
     }
 }
 

@@ -236,6 +236,10 @@ pub enum InboundConfig {
         /// 不配 = 直连目标 (原行为)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         upstream: Option<UpstreamConfig>,
+        /// 前向保密 (PFS): 开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
+        /// **两端必须同开** (改了会话密钥派生, 一端开一端没开会解密失败)。默认关 (向后兼容)。
+        #[serde(default)]
+        pfs: bool,
     },
     Mixed {
         tag: String,
@@ -290,6 +294,10 @@ pub enum OutboundConfig {
         /// Mirage-over-Mirage 双跳)。所引 outbound 必须先定义且不能形成环。不设 = 直连 (原行为)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         underlying: Option<String>,
+        /// 前向保密 (PFS): 开则握手做一次性 X25519 ECDH。**须与服务端 `pfs` 同开** (改了
+        /// 会话密钥派生, 失配会解密失败)。默认关 (向后兼容)。
+        #[serde(default)]
+        pfs: bool,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。

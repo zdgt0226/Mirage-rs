@@ -116,7 +116,29 @@ pub async fn prewarm(camouflage_host: &str) {
 }
 
 pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec<u8> {
+    get_server_hello_pfs(camouflage_host, client_hello, None).await
+}
+
+/// 同 `get_server_hello`, 但可用 `server_random_override` 把回放模板的 ServerHello.random
+/// (flight[11..43]) 覆写成指定 32B —— PFS 用它注入服务端一次性 X25519 公钥 (见 crypto::pfs)。
+/// 覆写在**所有返回路径末尾**统一施加, 故 patch/fallback 各分支都生效。
+pub async fn get_server_hello_pfs(
+    camouflage_host: &str,
+    client_hello: &[u8],
+    server_random_override: Option<&[u8; 32]>,
+) -> Vec<u8> {
     let client_session_id = get_session_id(client_hello).unwrap_or(&[]);
+
+    // 末尾统一覆写 ServerHello.random (若 PFS 指定了)。flight 恒以 0x16 ServerHello 记录起头,
+    // random 在 [11..43] (5B record header + 4B hs header + 2B version = 11)。
+    let apply = |mut flight: Vec<u8>| -> Vec<u8> {
+        if let Some(pk) = server_random_override {
+            if flight.len() >= 43 && flight[0] == 0x16 {
+                flight[11..43].copy_from_slice(pk);
+            }
+        }
+        flight
+    };
 
     if cache().lock().await.is_empty() {
         // 主动预热正常应已填充; 走到这说明预热失败或未运行 —— 懒预热兜底.
@@ -141,7 +163,7 @@ pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec
                 attempts += 1;
             }
             if cache().lock().await.is_empty() {
-                return fallback_server_hello(client_hello, client_session_id);
+                return apply(fallback_server_hello(client_hello, client_session_id));
             }
         }
     }
@@ -151,7 +173,7 @@ pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec
     let response = guard[template_idx].clone();
     drop(guard);
 
-    patch_server_hello(&response, client_session_id)
+    apply(patch_server_hello(&response, client_session_id))
 }
 
 async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {

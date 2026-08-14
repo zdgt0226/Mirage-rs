@@ -383,7 +383,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, .. } => {
+            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, pfs, .. } => {
                 let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
                 let ebp = ebpf_clone.clone();
@@ -396,7 +396,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     Err(e) => { error!("上游出口配置无效, 服务端未启动: {e}"); continue; }
                 };
                 tokio::spawn(async move {
-                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs, ss_upstream).await;
+                    crate::proxy::mirage_server::start_server(&listen_addr, &password, &cam_host, ebp, brutal_bps, auth_ts_tolerance_secs, ss_upstream, pfs).await;
                 });
             }
             crate::config::InboundConfig::Mixed { tag, listen, port, auth } => {
