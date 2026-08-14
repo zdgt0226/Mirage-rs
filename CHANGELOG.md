@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.9.2] - 握手模板完整性修复 + 外部审计便宜纯赚 + RTT/brutal 去阻塞 (2026-08-14)
+
 ### fix(handshake): 服务端只缓存"三型齐"的 camouflage 模板 (修完整服务端↔客户端握手超时)
 
 - **症状**: 服务端完整模式对接客户端 (含轻量模式) 偶发 `Mirage Server: read_exact tail timed out!`,
