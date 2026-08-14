@@ -1234,6 +1234,14 @@ EOM
     [[ -n "$ss_up" ]] && upstream_line=",
     \"upstream\": ${ss_up}"
 
+    # 前向保密 (PFS): opt-in, 客户端必须同样开启。
+    local pfs_line=""
+    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？口令泄露也解不了已录流量。⚠️ 客户端必须同样开启才能连上" n; then
+        pfs_line=",
+    \"pfs\": true"
+        info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
+    fi
+
     mkdir -p "$ETC_DIR"
     cat > "${ETC_DIR}/lite_server.json" <<EOF
 {
@@ -1242,7 +1250,7 @@ EOM
     "password": "$(json_escape "$pwd")",
     "sni": "$(json_escape "$sni")",
     "auth_ts_tolerance_secs": 60,
-    "log_level": "info"${upstream_line}
+    "log_level": "info"${upstream_line}${pfs_line}
 }
 EOF
     chmod 600 "${ETC_DIR}/lite_server.json"
@@ -1323,6 +1331,14 @@ EOM
         ok "SOCKS5 认证已启用 (RFC 1929)"
     fi
 
+    # 前向保密 (PFS): opt-in, 必须与服务端一致。
+    local pfs_line=""
+    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？⚠️ 必须与服务端设置一致" n; then
+        pfs_line=",
+    \"pfs\": true"
+        info "已开启 PFS —— 服务端配置也必须设 \"pfs\": true, 否则连不上。"
+    fi
+
     mkdir -p "$ETC_DIR"
     cat > "${ETC_DIR}/lite_client.json" <<EOF
 {
@@ -1333,7 +1349,7 @@ EOM
     "password": "$(json_escape "$pwd")",
     "sni": "$(json_escape "$sni")",
     "pool_size": 4,
-    "log_level": "info"${auth_json}
+    "log_level": "info"${auth_json}${pfs_line}
 }
 EOF
     chmod 600 "${ETC_DIR}/lite_client.json"
@@ -1422,6 +1438,14 @@ EOM
     [[ -n "$ss_up_full" ]] && upstream_line=",
             \"upstream\": ${ss_up_full}"
 
+    # 前向保密 (PFS): opt-in, 两端必须一致。开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
+    local pfs_line=""
+    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？口令泄露也解不了已录流量。⚠️ 客户端必须同样开启才能连上" n; then
+        pfs_line=",
+            \"pfs\": true"
+        info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
+    fi
+
     local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
@@ -1443,7 +1467,7 @@ EOM
             "listen": "0.0.0.0",
             "port": ${port},
             "password": "$(json_escape "$pwd")",
-            "camouflage_host": "$(json_escape "$sni")"${brutal_line}${upstream_line}
+            "camouflage_host": "$(json_escape "$sni")"${brutal_line}${upstream_line}${pfs_line}
         }
     ],
     "outbounds": [
@@ -1801,6 +1825,14 @@ EOM
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
+    # 前向保密 (PFS): opt-in, 必须与服务端一致 (服务端开了这里也得开, 否则连不上)。
+    local pfs_line=""
+    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？⚠️ 必须与服务端设置一致" n; then
+        pfs_line=",
+            \"pfs\": true"
+        info "已开启 PFS —— 服务端配置也必须设 \"pfs\": true, 否则连不上。"
+    fi
+
     # 日志滚动: 默认按 10MB 滚动 + gzip 保留 10 份 (磁盘约 10MB 封顶), 已足够绝大多数场景。
     # 只在用户想调时才问, 不加噪。
     local log_rotate_line=""
@@ -1836,7 +1868,7 @@ EOM
             "server_port": ${srv_port},
             "password": "$(json_escape "$pwd")",
             "camouflage_host": "$(json_escape "$sni")",
-            "pool_size": ${pool_size}
+            "pool_size": ${pool_size}${pfs_line}
         },
         {
             "type": "direct",
