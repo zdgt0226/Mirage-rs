@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### fix(wg): WgTcpStream::connect 同步失败时泄漏 smoltcp socket (128KB/次)
+
+`WgTcpStream::connect` 先 `sockets.add(sock)` (含 64KB 收 + 64KB 发缓冲) 再 `sock.connect(...)`。
+若 connect **同步**失败 (如目标端口 0/不可达路由 → smoltcp Unaddressable), 原 `?` 直接早退,
+此时 WgTcpStream 尚未构造、Drop 不触发, 已 add 的 socket **永留 SocketSet 泄漏 128KB**。经隧道
+每遭遇一次此类建连失败漏一次, 长跑/被扫描可 OOM。(超时路径已处理: stream 已构造 → Drop 摘除。)
+
+修法: connect 失败时显式 `sockets.remove(handle)` 再 bail。补 RED→GREEN 回归测 (端口 0 触发失败,
+断言 SocketSet 计数归零) + 手动变异 1/1 kill。UDP 路径 `bind` 在 `add` 之前故无此问题。
+
 ### test: 解析器属性/模糊测试 (proptest, 外部审计 #12)
 
 给三类**解析密集 + 安全敏感**的 parser 补 proptest 属性测试 (`任意输入绝不 panic`), 跑在 stable、

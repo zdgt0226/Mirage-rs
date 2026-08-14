@@ -92,8 +92,12 @@ impl WgTcpStream {
             let local_port = tunnel.alloc_port();
             let g = &mut *g;
             let sock = g.sockets.get_mut::<tcp::Socket>(handle);
-            sock.connect(g.iface.context(), remote, local_port)
-                .map_err(|e| anyhow!("WireGuard: 发起 TCP 连接失败: {e:?}"))?;
+            if let Err(e) = sock.connect(g.iface.context(), remote, local_port) {
+                // connect 同步失败: 此时 WgTcpStream 尚未构造, Drop 不触发, 必须显式摘除刚
+                // add 的 socket, 否则它 (含 128KB 收发缓冲) 永留 SocketSet 泄漏。
+                g.sockets.remove(handle);
+                anyhow::bail!("WireGuard: 发起 TCP 连接失败: {e:?}");
+            }
             handle
         };
         tunnel.poll_now();
@@ -387,6 +391,28 @@ mod tests {
         // 摘除后再取应 panic (smoltcp 对无效 handle 的行为), 用 iter 计数更稳妥
         let n = lock_inner(&t.inner).sockets.iter().count();
         assert_eq!(n, 0, "stream drop 后 socket 未从 SocketSet 摘除 —— 每条连接泄漏缓冲");
+    }
+
+    /// connect() **同步失败**时 (此处用目标端口 0 触发 smoltcp Unaddressable), 此时
+    /// WgTcpStream 尚未构造、Drop 不会触发 —— 必须显式摘除已 add 的 socket, 否则它 (含
+    /// 128KB 收发缓冲) 永留 SocketSet 泄漏。每次目标建连失败漏 128KB, 长跑/被扫会 OOM。
+    #[tokio::test]
+    async fn failed_connect_does_not_leak_socket() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let t = Arc::new(
+            super::WgTunnel::connect(&cfg(peer.local_addr().unwrap().to_string()))
+                .await
+                .unwrap(),
+        );
+        // 目标端口 0 → smoltcp tcp::Socket::connect 同步返回 Unaddressable。
+        let remote = "10.0.0.1:0".parse().unwrap();
+        let r = WgTcpStream::connect(t.clone(), remote).await;
+        assert!(r.is_err(), "端口 0 应建连失败");
+        assert_eq!(
+            lock_inner(&t.inner).sockets.iter().count(),
+            0,
+            "connect 失败后 socket 必须已摘除, 否则泄漏 128KB"
+        );
     }
 }
 
