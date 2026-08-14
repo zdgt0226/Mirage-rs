@@ -12,6 +12,17 @@
 修法: connect 失败时显式 `sockets.remove(handle)` 再 bail。补 RED→GREEN 回归测 (端口 0 触发失败,
 断言 SocketSet 计数归零) + 手动变异 1/1 kill。UDP 路径 `bind` 在 `add` 之前故无此问题。
 
+### refactor: start_proxy 巨石拆分 (外部审计 #4/#7, 纯行为保持)
+
+`src/lib.rs::start_proxy` **753 → 400 行**。把内聚启动逻辑逐字抽到新模块 `src/startup.rs`,
+**零行为变化** (仅内联块换成函数调用):
+- `init_logging` —— tracing subscriber 初始化 (级别/文件/滚动)。
+- `scan_runtime_config` —— 配置校验诊断 + tuning 全局开关 (cipher agility/tls padding/udp mux/
+  dns-over-tcp) + geo 设置 + ebpf_mode + 预绑内部 geo SOCKS, 返回 `RuntimeScan`。
+- `decide_enable_ebpf` (纯函数, 补 6 分支单测) + `init_engines` (ebpf/xdp/transparent)。
+- `spawn_ebpf_monitor_tasks` —— eBPF 启用时的后台 DNS 解析 (60s) + RTT 监控/Brutal 调速 (2s)。
+- 未动 inbound match 循环 (含 continue 控制流, 单独抽风险高, 留后续)。full 409 passed 前后一致。
+
 ### test: 解析器属性/模糊测试 (proptest, 外部审计 #12)
 
 给三类**解析密集 + 安全敏感**的 parser 补 proptest 属性测试 (`任意输入绝不 panic`), 跑在 stable、
