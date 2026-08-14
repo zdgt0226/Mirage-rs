@@ -68,6 +68,31 @@ fn spawn_echo() -> u16 {
     port
 }
 
+/// 起一个"残 camouflage 站": 只回一条 ServerHello record (缺 CCS 0x14 / 加密 0x17),
+/// 然后 hold 住连接。模拟把 flight 拆成多条记录的站 / TLS 1.2 站 —— 服务端 fetch 到这种
+/// **不完整模板必须判残、丢弃、回落到恒完整的 fallback_server_hello**, 否则缓存残模板 →
+/// 客户端 read_server_handshake 永等不到三型齐 → 不发 tail → 服务端 read_exact tail 超时。
+fn spawn_incomplete_camouflage() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut s = s;
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf); // 吃掉 ClientHello
+                // 只回一条 ServerHello: [0x16][03 03][len=48][48B 全 0]。缺 0x14/0x17。
+                let mut sh = vec![0x16, 0x03, 0x03];
+                sh.extend_from_slice(&48u16.to_be_bytes());
+                sh.extend(std::iter::repeat_n(0u8, 48));
+                let _ = s.write_all(&sh);
+                std::thread::sleep(std::time::Duration::from_secs(30)); // hold, 让后续读走超时
+            });
+        }
+    });
+    port
+}
+
 /// 经 SOCKS5 CONNECT 到 127.0.0.1:port, 返回已建立的流。
 fn socks5_connect(proxy: u16, target_port: u16) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(("127.0.0.1", proxy))?;
@@ -151,6 +176,48 @@ fn lite_client_rejects_udp_associate() {
     s.read_exact(&mut rep).unwrap();
     // 必须按 SOCKS5 规范回 0x07 (command not supported), 而不是静默断开让客户端干等
     assert_eq!(rep[1], 0x07, "轻量模式仅 TCP, UDP ASSOCIATE 应回 REP=0x07");
+
+    std::fs::remove_file(&srv_cfg).ok();
+    std::fs::remove_file(&cli_cfg).ok();
+}
+
+/// 回归 (fetch 边界): **完整模式服务端**的 camouflage_host 指向一个只回残 ServerHello 的站,
+/// **轻量模式客户端**必须仍能打通隧道 —— 服务端得判残模板、丢弃、回落到恒完整的 fallback。
+///
+/// 这条同时钉两件事: ①跨模式互通 (完整服务端 ↔ 轻量客户端, password 一致即通);
+/// ②fetch 完整性门禁 (残模板不毒化 cache)。**修复前**服务端 prewarm 会缓存残模板 → 每条连接
+/// 回放残模板 → 客户端永等不到三型齐、不发 tail → SOCKS5 CONNECT 10s 读超时失败。见 commit
+/// e309e7e / handshake_cache::template_is_complete。
+#[test]
+fn server_falls_back_when_camouflage_template_incomplete() {
+    let echo = spawn_echo();
+    let camo = spawn_incomplete_camouflage();
+    let (sport, cport) = (18574, 11574);
+    // 完整模式服务端: camouflage_host = 本地残站。fetch 必残 → 弃 → 回落 fallback。
+    let srv_cfg = write_cfg(
+        "fallback_srv.json",
+        &format!(
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-fb","camouflage_host":"127.0.0.1:{camo}"}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+        ),
+    );
+    let cli_cfg = write_cfg(
+        "fallback_cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-fb","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+        ),
+    );
+
+    let _s = spawn("server", &srv_cfg);
+    assert!(wait_port(sport), "完整模式服务端未监听");
+    let _c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "轻量客户端未监听");
+
+    let mut s = socks5_connect(cport, echo)
+        .expect("残 camouflage 下 SOCKS5 CONNECT 失败: 服务端未回落 fallback (缓存了残模板 → tail 超时)");
+    s.write_all(b"incomplete-camouflage-fallback").unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"incomplete-camouflage-fallback", "回落 fallback 后隧道回环数据应原样返回");
 
     std::fs::remove_file(&srv_cfg).ok();
     std::fs::remove_file(&cli_cfg).ok();
