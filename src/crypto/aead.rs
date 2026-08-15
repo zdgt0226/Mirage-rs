@@ -544,13 +544,28 @@ mod cipher_bench {
         gbps
     }
 
+    /// crypto **相对吞吐哨兵** (`#[ignore]`, 仅 CI 显式跑: `cargo test --release -- --ignored`)。
+    ///
+    /// 用**比值** (非绝对 GB/s) 当门 —— 两个 cipher 同机同条件跑, 比值抵消大部分绝对计时噪声。
+    /// AES-NI 机器上 AES-256-GCM 实测 ~2× ChaCha20 (cipher agility 选 AES 的前提)。设宽松下限
+    /// 1.3× 抗噪, 但 AES 回归到 ChaCha 水平 (没走 AES-NI / ring 算法配错 / 硬件加速丢失) 会跌破。
+    /// 仅在检测到 AES-NI 时断言 (无 AES-NI 的 arm 等平台只打印不断言, ChaCha 本就更快)。
     #[test]
     #[ignore]
-    fn compare_chacha_vs_aesgcm() {
+    fn aes_chacha_throughput_ratio_sentinel() {
         println!("\n== AEAD seal 吞吐 (16KB record, 本 CPU) ==");
         let cc = bench(&aead::CHACHA20_POLY1305, "ChaCha20-Poly1305");
         let aes = bench(&aead::AES_256_GCM, "AES-256-GCM");
-        println!("  → AES-256-GCM / ChaCha20 = {:.2}x", aes / cc);
+        let ratio = aes / cc;
+        println!("  → AES-256-GCM / ChaCha20 = {ratio:.2}x");
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("aes") && std::is_x86_feature_detected!("pclmulqdq") {
+            assert!(
+                ratio >= 1.3,
+                "AES/ChaCha 吞吐比 {ratio:.2}x < 1.3 哨兵下限 —— AES-NI 机器上 AES 该显著更快; \
+                 cipher agility 选 AES 的前提崩了 (没走 AES-NI / ring 算法配错)?"
+            );
+        }
     }
 }
 

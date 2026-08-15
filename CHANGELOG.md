@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### test(ci): crypto/brutal 相对基准哨兵进 CI
+
+给两处"没人看的相对性能特征"补 CI 哨兵 —— **用相对比值/收敛轨迹**当门, 抗绝对计时噪声:
+- **crypto (AES/ChaCha 吞吐比)**: `aes_chacha_throughput_ratio_sentinel` (`#[ignore]`, CI 用
+  `cargo test --release -- --ignored` 显式跑)。断言 AES-NI 机器上 AES-256-GCM / ChaCha20 ≥ 1.3×
+  (实测 ~2.1×)。比值同机同条件抵消噪声; AES 硬件加速丢失/ring 算法配错 = cipher agility 选 AES
+  的前提崩了, 会跌破。仅 x86_64 且检测到 AES-NI 时断言。build.yml 加专门步骤。
+- **brutal (收敛轨迹)**: `scenario_congestion_converges_to_bdp_then_recovers` (普通 #[test], 已在
+  Run tests 覆盖)。驱动 `decide_brutal_rate` 走满速→拥塞→恢复全程, 断言拥塞收敛到 BDP±20%、恢复
+  爬回 ≥90% 满速。确定性无计时; 补单决策测覆盖不到的"跨 tick 整体收敛"。
+- 均是**相对/行为**哨兵, 非绝对吞吐门 —— 不上共享 runner 的假报警。
+
 ### test(udp-mux): 容量不变量 CI 守卫 (防 22.5× 带机量静默回归)
 
 UDP mux 的 20→450 并发 (22.5×) 靠"N 流散列复用到 K 共享隧道 + MAX_FLOWS 总闸", 此前**零 CI

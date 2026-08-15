@@ -23,6 +23,11 @@ jobs:
       run: cargo clippy --all-targets -- -D warnings
     - name: Run tests
       run: cargo test --verbose
+    # crypto 相对吞吐哨兵: AES-NI 机器上 AES/ChaCha 比值应 ≥1.3× (实测 ~2×)。用比值抗计时噪声,
+    # 抓 AES 硬件加速丢失/ring 算法配错 = cipher agility 选 AES 的前提崩了。release + 显式点名
+    # (避开 resolver.rs 的其它 #[ignore])。brutal 场景哨兵是普通 #[test] 已在 Run tests 覆盖。
+    - name: Crypto 相对吞吐哨兵 (AES/ChaCha 比值)
+      run: cargo test --release aes_chacha_throughput_ratio_sentinel -- --ignored --nocapture
 
   # 透明代理 eBPF 机制的 netns 集成验证。
   #
