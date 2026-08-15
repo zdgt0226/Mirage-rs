@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### docs(readme): 同步到 v0.9.4 (补 4 版发布 + PFS/供应链特性 + 修陈旧路线图)
+
+README 落后 4 个版本, 追平: 版本徽章 → v0.9.4; 核心特性概览补**可选 PFS** + **供应链签名/容器** +
+无 eBPF 服务端说明; changelog 表补 v0.9.1–v0.9.4 行; 路线图 ✅ 补 UDP mux / PFS / 供应链 / 审计
+清零 / CI 哨兵; 删陈旧的"隧道 UDP 流复用"未完成项 (v0.9.0 mux 已做, 与 ✅ 自相矛盾)。
+
 ## [v0.9.4] - CI 回归哨兵 (mux 容量 + crypto/brutal 相对基准) + 日志降噪 (2026-08-16)
 
 ### test(ci): crypto/brutal 相对基准哨兵进 CI
