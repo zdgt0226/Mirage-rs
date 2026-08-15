@@ -485,4 +485,46 @@ mod decide_tests {
         let r = decide_brutal_rate(50, BASE_RTT, 100, 5, 0, BASE_RATE, current);
         assert!(r.is_some(), "delta_segs=0 应安全 (丢包率取 0), 走恢复");
     }
+
+    /// 相对基准哨兵 (多 tick 收敛, 确定性无计时): 驱动 decide_brutal_rate 走"满速→拥塞→恢复"
+    /// 全程, 钉住算法**整体收敛轨迹**相对 BDP / base_rate 的正确性。单决策测覆盖不到"跨 tick 是否
+    /// 真收敛 / 回得来"; 改坏迭代逻辑 (恢复不再爬、回退不再瞄 BDP) 会在此暴露。
+    #[test]
+    fn scenario_congestion_converges_to_bdp_then_recovers() {
+        // 拥塞态 (rtt=100 > 1.5*50) 的实测 BDP = cwnd*MSS / rtt_s = 100*1440 / 0.1 = 1_440_000 B/s。
+        let bdp = (100.0 * 1440.0 / (100.0 / 1000.0)) as u64;
+
+        // 阶段1 满速健康: 应稳定不抖。
+        assert_eq!(
+            decide_brutal_rate(50, BASE_RTT, 100, 0, 1000, BASE_RATE, BASE_RATE),
+            None,
+            "满速健康态应稳定不抖"
+        );
+
+        // 阶段2 拥塞: 迭代应收敛到 ~BDP (远低于满速)。
+        let mut rate = BASE_RATE;
+        for _ in 0..10 {
+            if let Some(nr) = decide_brutal_rate(100, BASE_RTT, 100, 0, 1000, BASE_RATE, rate) {
+                rate = nr;
+            }
+        }
+        assert!(rate < BASE_RATE, "拥塞后应远低于满速; got {rate}");
+        assert!(
+            (rate as i64 - bdp as i64).unsigned_abs() <= bdp / 5,
+            "拥塞态应收敛到 BDP±20% ({bdp}); got {rate}"
+        );
+        let congested = rate;
+
+        // 阶段3 恢复: 清洁 tick 迭代应爬回接近满速。
+        for _ in 0..40 {
+            if let Some(nr) = decide_brutal_rate(50, BASE_RTT, 100, 0, 1000, BASE_RATE, rate) {
+                rate = nr;
+            }
+        }
+        assert!(rate > congested, "恢复应爬升: {rate} > {congested}");
+        assert!(
+            rate >= BASE_RATE * 9 / 10,
+            "足够清洁 tick 后应恢复到 ≥90% 满速; got {rate} / base {BASE_RATE}"
+        );
+    }
 }
