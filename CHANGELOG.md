@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### test(udp-mux): 容量不变量 CI 守卫 (防 22.5× 带机量静默回归)
+
+UDP mux 的 20→450 并发 (22.5×) 靠"N 流散列复用到 K 共享隧道 + MAX_FLOWS 总闸", 此前**零 CI
+保护** (bench_udp_capacity.py 只真机手动跑) —— 改坏复用逻辑/调低 MAX_FLOWS 会**功能容量静默
+回归**。补确定性守卫 (无 timing 噪声, 非性能 bench):
+- 抽 `udp_mux::slot_index` 纯函数 (原 MuxSet::slot_for 的散列)。测: ①恒落 [0,K) 不越界;
+  ②1000 条流散布到**全部 K=4 槽** —— 证 N 流骑 ≤K 隧道 (复用), 非退化成单槽/1流1隧道。
+- `transparent_udp` 守 `MAX_FLOWS ≥ 1024` / `MAX_MIRAGE_UDP_FLOWS ≥ 128` (远高于 450 实测, 静默
+  调低即 CI 红)。
+- 手动变异 2/2 kill (slot 塌成单槽 → 散布测红; MAX_FLOWS→256 → 下限测红)。
+
+cipher agility 的**功能选择逻辑**本就有测 (negotiate 仅两端都支持才 AES + 检测对齐); 其相对
+**速度**是硬件事实 + timing 噪声, 不进 CI 门 (避免假报警, 即 #14 边际的根因)。
+
 ### chore(log): camouflage 模板拉取失败回落 fallback 降为 WARN (原 ERROR)
 
 无外网/camouflage 不可达的 VPS/容器服务端拉不到真 ServerHello 模板时会回落到恒完整的合成
