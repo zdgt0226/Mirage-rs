@@ -899,7 +899,27 @@ async fn setup_flow(
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_udp_domain, frame_udp_ipv4, parse_udp_frame_payload};
+    use super::{frame_udp_domain, frame_udp_ipv4, parse_udp_frame_payload, MAX_FLOWS, MAX_MIRAGE_UDP_FLOWS};
+
+    /// 容量守卫: UDP 流总闸不得被静默调低到威胁已验带机量之下。
+    ///
+    /// 真机实测 UDP mux 并发拐点 20→450 (22.5×, 见 [[udp-capacity-findings]])。MAX_FLOWS 是客户端
+    /// 侧总并发流上限, 若有人把它从 4096 悄悄改小 (如回到几百), 450 并发直接被这道闸截断 = 容量
+    /// 静默回归。设 1024 下限 (远高于 450 实测, 留足余量; 真正天花板在服务端 fd/CPU 非此闸)。
+    /// mux 子闸 MAX_MIRAGE_UDP_FLOWS 同理不得低于 128 (太小会让 mux 流被无谓限死)。
+    // 常量断言故意为之: 就是要在**改小常量时编译期/CI 即红**的容量下限守卫。
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn udp_flow_caps_stay_above_proven_capacity() {
+        assert!(
+            MAX_FLOWS >= 1024,
+            "MAX_FLOWS={MAX_FLOWS} 低于 1024 下限 —— 会截断已验的 450 并发带机量 (容量回归)"
+        );
+        assert!(
+            MAX_MIRAGE_UDP_FLOWS >= 128,
+            "MAX_MIRAGE_UDP_FLOWS={MAX_MIRAGE_UDP_FLOWS} 过低 —— mux 流会被无谓限死"
+        );
+    }
 
     #[test]
     fn frame_ipv4_bytes_and_roundtrip() {

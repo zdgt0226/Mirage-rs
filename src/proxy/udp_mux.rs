@@ -356,6 +356,19 @@ impl Drop for SidGuard {
     }
 }
 
+/// flowkey → slot 索引 (恒在 `[0, num_slots)`)。抽成纯函数以便**容量不变量**单测。
+///
+/// 这是 UDP mux 复用的根: 任意 flowkey 都散列进固定的 num_slots 个槽 → **N 条并发流最多只占
+/// num_slots 条共享 Mirage 隧道** (而非 1 流 1 隧道)。真机实测带机量并发拐点 20→450 (22.5×) 即
+/// 源于此。若改坏 (如退化成全撞一个槽、或 num_slots 崩成 1), 带机量会**静默回归** —— 见
+/// udp_mux::tests 的容量守卫 + [[udp-capacity-findings]]。
+pub(crate) fn slot_index(key: &FlowKey, num_slots: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    (h.finish() as usize) % num_slots.max(1)
+}
+
 /// K 条共享 mux 隧道。按 flowkey 散列选隧道 (HoL 分摊); 懒创建; 死则重建。
 /// 持 pool 的 **Weak** 引用 —— 不吊住 pool 生命 (配置热重载丢弃旧 outbound → 旧 pool
 /// 应能被 drop); pool 没了 (upgrade 失败) 说明这套 MuxSet 已作废, 由 REGISTRY 剪除。
@@ -373,10 +386,7 @@ impl MuxSet {
         }
     }
     fn slot_for(&self, key: &FlowKey) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        (h.finish() as usize) % self.slots.len()
+        slot_index(key, self.slots.len())
     }
     async fn get(&self, key: &FlowKey) -> anyhow::Result<Arc<MuxTunnel>> {
         let pool = self
@@ -421,7 +431,43 @@ pub async fn get_mux_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv6Addr, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+    fn fk(src_port: u16, dst_b: u8, dst_port: u16) -> FlowKey {
+        (
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), src_port),
+            SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, dst_b), dst_port),
+        )
+    }
+
+    /// 容量守卫①: slot_index 恒落在 [0, num_slots) —— 任意流都映射进固定槽数, 不越界。
+    #[test]
+    fn slot_index_within_bounds() {
+        for k in 1..=16usize {
+            for p in 0..500u16 {
+                let idx = slot_index(&fk(p, (p % 251) as u8, 1024 + p), k);
+                assert!(idx < k, "slot_index {idx} 越界 (k={k})");
+            }
+        }
+        // num_slots=0 也不 panic (max(1) 兜底)。
+        assert_eq!(slot_index(&fk(1, 1, 1), 0), 0);
+    }
+
+    /// 容量守卫②(核心): K 条共享隧道下, 大量并发流散布到**全部 K 个槽** ——
+    /// 证明 N 条流骑 ≤ K 条隧道 (mux 复用), 而非退化成全撞一个槽或 1 流 1 隧道。
+    /// 这是 20→450 (22.5×) 带机量的根; 改坏此散列即静默容量回归。见 [[udp-capacity-findings]]。
+    #[test]
+    fn flows_multiplex_across_all_k_slots() {
+        let k = 4; // 默认 udp_mux_tunnels
+        let mut hit = vec![false; k];
+        // 1000 条不同 flowkey (不同源端口 + 不同目标)。
+        for i in 0..1000u16 {
+            let idx = slot_index(&fk(20000 + i, (i % 251) as u8, 443), k);
+            hit[idx] = true;
+        }
+        let used = hit.iter().filter(|b| **b).count();
+        assert_eq!(used, k, "1000 条流必须散布到全部 {k} 个槽 (实际用了 {used}) —— 少于 K = 复用退化 = 容量回归");
+    }
 
     #[test]
     fn parse_mux_uplink_domain() {
