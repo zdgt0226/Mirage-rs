@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### chore(log): camouflage 模板拉取失败回落 fallback 降为 WARN (原 ERROR)
+
+无外网/camouflage 不可达的 VPS/容器服务端拉不到真 ServerHello 模板时会回落到恒完整的合成
+fallback (握手不受影响) —— 这是**优雅降级非故障**, 原打 ERROR 级会让无外网服务端满屏吓人。
+降为 WARN。经无 eBPF 环境可用性实测发现 (服务端 TCP/UDP/PFS 均正常, 唯此日志过响)。
+
 ## [v0.9.3] - 可选前向保密 PFS + 供应链签名/容器 + 审计尾单清扫 (2026-08-14)
 
 ### feat(release): cosign keyless 产物签名 + ghcr 多架构容器镜像 (外部审计 #13)

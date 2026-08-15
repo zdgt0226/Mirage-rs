@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use rand::RngExt;
 
 static HANDSHAKE_CACHE: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
@@ -150,7 +150,10 @@ pub async fn get_server_hello_pfs(
             if !templates.is_empty() {
                 guard.extend(templates);
             } else {
-                error!("Failed to fetch any templates from {}. Using fallback.", camouflage_host);
+                // WARN 而非 ERROR: 这是**优雅降级**, 非故障 —— 拉不到真模板 (无外网/camouflage
+                // 不可达的 VPS/容器很常见) 就用恒完整的合成 fallback, 握手照常。降级为 WARN 免得
+                // 无外网服务端满屏吓人的 ERROR。
+                warn!("Failed to fetch any templates from {}. Using synthetic fallback (握手不受影响).", camouflage_host);
                 guard.push(fallback_server_hello(client_hello, client_session_id));
             }
             drop(guard);
