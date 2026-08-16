@@ -109,7 +109,7 @@ jobs:
           set -euo pipefail
           uname_m=$(uname -m)
           mkdir -p ebpf-src
-          for src in sockmap dns_xdp transparent; do
+          for src in sockmap dns_xdp transparent tc_divert cgroup_connect; do
               echo "=== Compiling ebpf-src/${src}.c ==="
               clang -O2 -g -target bpf \
                   -I/usr/include/${uname_m}-linux-gnu \

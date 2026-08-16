@@ -4,6 +4,13 @@
 
 ## [v0.9.5] - eBPF ELF 漂移根治 + source_ip 设备规则 + 外部审计批修 (2026-08-16)
 
+### ci(release): 显式 BPF 编译步补全 5 个程序 (修 musl 发版)
+
+#44 删除 committed ELF 后, release.yml 的显式编译步只编 `sockmap/dns_xdp/transparent` 3 个 →
+musl 目标经 cross 容器 (无 clang) 构建时 `tc_divert`/`cgroup_connect` 无可回落 ELF → build.rs
+panic, musl 二进制发版失败 (v0.9.5 首发暴露, 因删 ELF 后首次真跑此路径)。显式步改编全 5 个。
+
+
 ### fix(diag): 握手失配统一诊断补服务端侧 (外部审计 #8 完整化)
 
 此前 #8 只做了客户端 (pool TIME_SYNC 解密失败提示), **服务端 control.rs 的 first_chunk 解密失败
