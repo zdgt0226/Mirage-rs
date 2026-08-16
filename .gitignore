@@ -18,3 +18,7 @@ __pycache__/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 graft/
+
+# eBPF 目标文件由 build.rs (--features ebpf, 需 clang) 编到 OUT_DIR; release CI 编到 ebpf-src/ 作临时校验。
+# 不提交 —— 曾因 committed ELF 与源码漂移静默加载陈旧 BPF (见 build.rs 硬报错说明)。
+ebpf-src/*.elf

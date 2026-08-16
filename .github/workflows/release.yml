@@ -95,10 +95,12 @@ jobs:
 
       # === BPF compilation (shared by all targets) ===
       # Compile BPF objects on the runner with the runner's clang BEFORE running
-      # cargo/cross build. This guarantees that:
-      #   1) ebpf-src/*.elf is valid (overwrites any stale committed fallback)
-      #   2) Even if cross container lacks clang and build.rs falls back to the
-      #      committed path, the fallback content is fresh and valid.
+      # cargo/cross build. ebpf-src/*.elf 不入库 (见 .gitignore) —— 这一步是唯一生成它们的地方。
+      # This guarantees that:
+      #   1) ebpf-src/*.elf 由 runner 的 clang 新鲜生成 (无陈旧可能)。
+      #   2) musl 目标经 cross-rs 容器构建, 容器内**无 clang** → build.rs 回落到这批**新鲜**
+      #      ebpf-src/*.elf (build.rs 只在文件存在时回落, 否则硬 panic; 本地无 clang 无此文件)。
+      #      本步骤是 musl 发版能成立的前提。
       #   3) gnu build's build.rs has the same baseline (host clang) — eliminating
       #      pre-built binary divergence between runs.
       - name: Compile BPF objects (explicit)
