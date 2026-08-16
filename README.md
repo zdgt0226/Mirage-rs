@@ -88,6 +88,18 @@ cosign verify ghcr.io/zdgt0226/mirage-rs:latest \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
+### 从源码构建
+
+```bash
+cargo build --release                 # 纯用户态版 (默认, 无需 clang)
+cargo build --release --features ebpf # 含 eBPF 透明网关 (需 clang + llvm)
+```
+
+> ⚠️ **`--features ebpf` 必须装 clang/llvm** (`apt install clang llvm libbpf-dev`) —— 要编译内核
+> BPF 程序。缺 clang 时构建会**明确报错提示装 clang**, 而非神秘失败 (eBPF 目标文件不入库, 不会
+> 静默加载陈旧版本; 见 `build.rs`)。**默认构建 (无 `--features ebpf`) 不碰 BPF, 不需要 clang。**
+> 大多数用户直接用上面的预编译二进制/容器即可, 无需自编译。
+
 ---
 
 ## 🛠️ 灵活的部署形态
