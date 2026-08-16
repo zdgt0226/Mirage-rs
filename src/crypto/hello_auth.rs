@@ -163,6 +163,36 @@ pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u6
     true
 }
 
+/// 会话 bootstrap 加密帧 (客户端读 TIME_SYNC / 服务端读 first_chunk) 解密失败时的**统一排查
+/// 提示**。两侧 (`pool` 客户端 + `control` 服务端) 共用同一文案, 避免诊断分散/漏项 (审计 #8)。
+///
+/// token 认证已过却解不开首个加密帧 = 会话密钥失配, 收敛为: 密码不一致 / 时钟超容差 (TIME_SYNC
+/// 未 bootstrap) / 高级特征单边 (`pfs`/`tls_padding`/`cipher_agility` 一端开一端没开都改密钥或分帧
+/// 派生)。返回 `&'static str` 便于两侧 `warn!` 复用, 且被测试锁住三项防未来漏删。
+pub fn session_decrypt_failure_hint() -> &'static str {
+    "bootstrap 加密帧读取失败 (解密失败或帧畸形)。最常见是**会话密钥失配**, 排查: \
+     ①两端 password 是否完全一致; \
+     ②系统时钟是否与对端相差超过容差 (默认 ±60s) —— 两端各跑 `date -u` 对一下, 并确认 NTP \
+     正常且**不走本代理** (否则隧道挂→NTP不同步→时钟更偏 死循环); \
+     ③两端高级特征是否一致: `pfs`/`tls_padding`/`cipher_agility` 一端开一端没开 (或版本过老不支持) \
+     都会改会话密钥或分帧派生 → 必然失配 (见 README 安全声明 / tuning 各项注释)。若三项都排除, \
+     可能是链路损坏或协议版本不匹配。"
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::session_decrypt_failure_hint;
+
+    /// 锁住诊断三项都在, 防未来重构漏删某个排查方向 (审计 #8: 显式诊断不留静默失配)。
+    #[test]
+    fn hint_covers_all_three_mismatch_causes() {
+        let h = session_decrypt_failure_hint();
+        assert!(h.contains("password"), "诊断须提密码不一致");
+        assert!(h.contains("时钟"), "诊断须提时钟容差");
+        assert!(h.contains("pfs"), "诊断须提高级特征单边 (pfs 等)");
+    }
+}
+
 #[cfg(test)]
 mod tolerance_tests {
     use super::ts_within_tolerance;

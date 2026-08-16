@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### fix(diag): 握手失配统一诊断补服务端侧 (外部审计 #8 完整化)
+
+此前 #8 只做了客户端 (pool TIME_SYNC 解密失败提示), **服务端 control.rs 的 first_chunk 解密失败
+仍是裸 `recv_data failed` 无线索**, 运维无从下手。补齐:
+- 新增 `hello_auth::session_decrypt_failure_hint()` **统一文案** (密码/时钟/高级特征单边
+  pfs·tls_padding·cipher_agility), 客户端 (pool) + 服务端 (control) **共用**, 两侧诊断一致。单测
+  锁三项防漏删。
+- 服务端 first_chunk 解密失败改一次性 WARN + 该 hint (非裸 error); 客户端也切到共用 helper。
+- 纯日志诊断, 无控制流/行为变化。(从一个陈旧遗留分支抢救出的服务端诊断价值, 干净重施到当前 main。)
+
 ### docs(readme): 同步 source_ip 设备规则落地
 
 - 特性概览路由行补「源设备/网段 (`source_ip_cidr`)」维度。
