@@ -90,7 +90,9 @@ pub async fn handle_udp_associate_routed(
                 ip: req_ip,
                 port: dport,
                 protocol: "udp",
-                source_ip: Some(client.ip()),
+                // 与 TCP 一致: v4-mapped v6 归一成 v4, 否则双栈 socket 上的 v4 客户端匹配不中
+                // v4 source_ip_cidr 设备规则 (见 handler::normalize_peer_ip)。
+                source_ip: Some(crate::proxy::handler::normalize_peer_ip(client.ip())),
                 source_mac: None,
                 inbound: inbound_tag.as_deref(),
                 process_name: None, // UDP: 无本机进程名查询
