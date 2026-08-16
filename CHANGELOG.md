@@ -14,6 +14,24 @@ if needed" 但没做) —— 而路由匹配遇到有 `source_ip_cidr` 的规则
 (`::ffff:a.b.c.d`, 双栈 socket 常见) 归一成 v4, 否则 v4 CIDR 规则 `contains` 匹配不中。补 3 单测
 (v4-mapped 归一 / 纯 v4 / 纯 v6)。SOCKS-UDP relay 的 source_ip 同样过归一 (与 TCP 一致; 透明 UDP
 本就是 SocketAddrV4 恒 v4 无需归一)。
+### fix: 外部审计 (Gemini) 一批真缺陷 (IPv6 端口 / 阻塞落盘 / 句柄泄漏 / 扫盘并发闸)
+
+多模型审计报出一批, 逐条独立核实后修真的 (共识 ≠ 正确, 见下 #2/#3/#6 修正):
+- **HTTP 代理 IPv6 目标端口丢失** (mixed.rs): `host.contains(':')` 判端口, 对 `[2001:db8::1]`
+  恒真 → 不补 `:80` → 下游 `rsplitn(2,':')` 把 IPv6 尾段误切成端口 → IPv6 HTTP 代理请求全挂。
+  改用括号感知的 `host_has_explicit_port` (端口是 `]` 之后的冒号)。两处调用点同修 + 4 单测。
+- **Fake-IP 周期落盘阻塞 tokio worker** (fake_ip.rs): `spawn_flusher` 每 60s 在 async 任务里直接
+  `std::fs::write`+`rename` 同步 IO → 卡 worker (软路由闪存尤甚)。丢 `spawn_blocking`。
+- **SOCKS-UDP downlinks 句柄累积** (udp_relay.rs): 弱网下同一关联反复重建 sink, 旧下行 AbortHandle
+  不剔除 → 长寿命 UDP 关联 (语音/游戏) 句柄微泄漏。push 前 `retain(!is_finished)`。
+- **proc_lookup 扫盘打爆 blocking 池** (proc_lookup.rs): 突发本机建连 (配 process_name 时) 各自
+  全量扫 `/proc/*/fd` → 耗尽默认 512 blocking 线程。加 `PROC_SCAN_SEM` **并发闸** (≤16 同时扫,
+  抢不到即跳过降级)。⚠️ 审计原建议的 "inode→PID 缓存" **无效** —— socket inode 每连接唯一, 对
+  "数千新建连"零命中; 限并发才对症。
+- **未修 (说明)**: ①**半关闭不透传** (poll_shutdown 只 flush): Mirage 框式 AEAD 隧道**本无半关帧**
+  (shadowsocks/vmess 同), 要传 FIN 需**新增协议半关帧** (双端大改), 且 1800s idle 兜底 —— 是固有
+  限制非简单 bug, 留单独议。②**冷启时钟闭锁** (无 RTC + NTP 走代理): 已是代码注释权衡过的架构
+  取舍 (`auth_ts_tolerance` 可调 + 别走代理跑 NTP), 非新缺陷。
 
 ### docs(build): 无 clang + ebpf 场景引导 + build.rs 失败横幅
 
