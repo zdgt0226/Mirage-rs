@@ -836,6 +836,10 @@ impl DnsForwarder {
             ip: None,
             port: remote_dns_port,
             protocol: "udp",
+            // 故意 None: 按**源设备/网段分流 DNS 查询** (每主机 DNS 策略) 尚未实现, 非疏漏。
+            // 要做时把 run_loop `recv_from` 拿到的 `from` 一路传进 process_query 填这里即可
+            // (成本极低)。填了会让 source_ip_cidr 规则开始作用于 DNS 解析路由 —— 属行为新增,
+            // 需明确是想要的产品行为再开。见 [[source-ip-routing]]。
             source_ip: None,
             source_mac: None,
             inbound: Some(&self.inbound_tag),
