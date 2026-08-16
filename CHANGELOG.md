@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### chore: 清审计 🟡 尾单 (splice 快路径补测 + 删死 feature)
+
+- **splice.rs 补测** (审计 🟡2): 直连零拷贝快路径 (`每个直连连接都走`, unsafe libc splice) 此前
+  **0 测试**。补 ①pipe 池 acquire→release 归还语义 ②`splice_relay` 回环端到端 (local ↔ splice ↔
+  echo target, 双向数据原样返回 + 返回收发字节数正确)。
+- **删死 feature** (审计 🟡3): `tower-http` 的 `cors` feature 声明但全 src 无 `CorsLayer` 用法 (仅
+  一句注释提及 CORS 概念), 删之。无行为变化, Cargo.lock 不变。
+- (审计 🟡1 mirage.rs/config.rs 巨石拆分**未做** —— 纯维护面、无正确性收益, 缓。)
+
 ### fix(ebpf): 根除 committed ELF 与源码漂移 (删 ELF + clang 硬要求)
 
 **问题** (git 历史证实): 仓库里 committed 的 `sockmap/dns_xdp/tc_divert.elf` 落后于 `.c` —— 源码

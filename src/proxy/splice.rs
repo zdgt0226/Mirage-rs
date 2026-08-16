@@ -290,3 +290,68 @@ pub async fn splice_relay(local: TcpStream, target: TcpStream) -> io::Result<(u6
         e = watchdog_fut => Err(e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{acquire_pipe, pool_stats, release_pipe, splice_relay};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// pipe 池: acquire → release 后池中应有可复用 pipe (基本归还语义)。
+    #[test]
+    fn pipe_pool_release_returns_to_pool() {
+        let p = acquire_pipe().expect("acquire pipe");
+        release_pipe(p);
+        let (_created, _reused, pooled) = pool_stats();
+        assert!(pooled >= 1, "release 后池中应至少 1 个可复用 pipe, 实际 {pooled}");
+    }
+
+    /// splice 直连快路径端到端: local ↔ splice_relay ↔ target(echo)。
+    /// 证明零拷贝双向中继在回环上真的通 + 返回的收发字节数正确。这是"每个直连连接都走"的
+    /// 核心路径, 此前 0 测试。
+    #[tokio::test]
+    async fn splice_relay_bidirectional_loopback() {
+        // echo 服务 (target 侧目标)
+        let echo_lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_lis.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = echo_lis.accept().await {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // local 对: client ↔ local_stream
+        let local_lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = local_lis.local_addr().unwrap();
+        let mut client = TcpStream::connect(local_addr).await.unwrap();
+        let (local_stream, _) = local_lis.accept().await.unwrap();
+        // target: 连 echo
+        let target = TcpStream::connect(echo_addr).await.unwrap();
+
+        // splice 中继
+        let relay = tokio::spawn(async move { splice_relay(local_stream, target).await });
+
+        // client 发 → 经 splice up → echo → 经 splice down → client 收
+        let msg = b"splice-fast-path";
+        client.write_all(msg).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], msg, "splice 双向回环应原样返回");
+
+        // 关 client 写端 → up EOF → echo EOF → down EOF → relay 返回
+        client.shutdown().await.unwrap();
+        let (up, down) = relay.await.unwrap().expect("splice_relay 应正常结束");
+        assert_eq!(up as usize, msg.len(), "up 字节数应 = 发送长度");
+        assert_eq!(down as usize, msg.len(), "down 字节数应 = 回显长度");
+    }
+}
