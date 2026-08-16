@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.9.5] - eBPF ELF 漂移根治 + source_ip 设备规则 + 外部审计批修 (2026-08-16)
+
 ### fix(diag): 握手失配统一诊断补服务端侧 (外部审计 #8 完整化)
 
 此前 #8 只做了客户端 (pool TIME_SYNC 解密失败提示), **服务端 control.rs 的 first_chunk 解密失败
