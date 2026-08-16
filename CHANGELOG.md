@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### docs(readme): 同步 source_ip 设备规则落地
+
+- 特性概览路由行补「源设备/网段 (`source_ip_cidr`)」维度。
+- 路线图「LAN 每主机监控 + 设备专用规则」①设备规则 `[ ]`→`[~]`: source_ip_cidr 现对透明 TCP +
+  SOCKS-UDP + 透明 UDP 全路径生效 (#47); ②每主机用量仍待做。
+
 ### docs(routing): 钉住 source_ip 语义 (本机 cgroup 出向 / DNS 路径暂 None)
 
 #47 补 source_ip 后的两处语义澄清 (审计后续观察, 均非 bug, comment-only 零行为变化):
