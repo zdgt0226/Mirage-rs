@@ -92,6 +92,13 @@ fn main() {
                     );
                     println!("cargo:rustc-env={}={}", env_var, fallback_path.display());
                 } else {
+                    // cargo:warning 会被 cargo 用醒目黄色单独打印 (即便 panic 回溯很长也一眼可见),
+                    // 先把"根因=缺 clang"横幅顶出来, 再 panic 中止 —— 避免用户对着一堆构建错误猜。
+                    println!("cargo:warning=╔══════════════════════════════════════════════════════════╗");
+                    println!("cargo:warning=║  eBPF 构建失败: 找不到可用的 clang (编译 BPF 程序必需)   ║");
+                    println!("cargo:warning=║  修: apt install clang llvm libbpf-dev                    ║");
+                    println!("cargo:warning=║  或: 去掉 --features ebpf 构建纯用户态版 (默认即无需 clang) ║");
+                    println!("cargo:warning=╚══════════════════════════════════════════════════════════╝");
                     panic!(
                         "eBPF 编译失败且无可回落的 ELF: {src}\n\
                          开启了 `--features ebpf` 就必须能编译 BPF 程序。请安装 clang + llvm \

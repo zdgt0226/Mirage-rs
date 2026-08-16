@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### docs(build): 无 clang + ebpf 场景引导 + build.rs 失败横幅
+
+- README 加「从源码构建」段: 默认构建无需 clang; `--features ebpf` 必须装 clang/llvm, 缺则明确
+  报错 (非神秘失败) —— 让用户一眼知道是缺 clang。
+- build.rs eBPF 编译失败 (缺 clang 且无可回落 ELF) 时, panic 前先用 `cargo:warning` 打**醒目黄色
+  横幅** (根因 + 修法), 即便 panic 回溯很长也一眼可见。纯提示改进, 无行为变化。
+
 ### chore: 清审计 🟡 尾单 (splice 快路径补测 + 删死 feature)
 
 - **splice.rs 补测** (审计 🟡2): 直连零拷贝快路径 (`每个直连连接都走`, unsafe libc splice) 此前
