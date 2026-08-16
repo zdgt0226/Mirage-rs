@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### fix(ebpf): 根除 committed ELF 与源码漂移 (删 ELF + clang 硬要求)
+
+**问题** (git 历史证实): 仓库里 committed 的 `sockmap/dns_xdp/tc_divert.elf` 落后于 `.c` —— 源码
+修复 (如 dns_xdp **域名哈希碰撞 P1**、tc_divert 孤儿过滤器黑洞) 不在旧 ELF 里。build.rs 在
+`--features ebpf` 且 **clang 缺失**时会**静默回落**加载这些陈旧 ELF → 悄悄跑带 bug 的 BPF (流量
+可能劫持到错 IP)。触发面窄 (默认无 ebpf 构建根本不 include ELF; release CI 显式重编译; ebpf+clang
+也重编译), 但确实存在于 ebpf+无 clang 这条路径。
+
+**修法** (根除漂移类, 而非脆弱的 byte-cmp 守卫 —— 不同 clang 版本字节差达 6×, byte-cmp 会假报警):
+- build.rs: `--features ebpf` + clang 缺失/失败 由静默回落改为 **硬 panic** (提示装 clang 或去掉
+  ebpf feature)。开了 ebpf 就必须能编 BPF, 不再有"静默陈旧"路径。
+- **删除 5 个 committed `ebpf-src/*.elf`** + `.gitignore` —— 它们只在被删的回落路径用过, 现无引用
+  (release CI 编到临时目录校验, build.rs 编到 OUT_DIR)。漂移类彻底消失。
+- 默认构建 (无 ebpf, 无需 clang) 与 `--features ebpf` (有 clang 重编译) 均验证通过, full 429 passed。
+
 ### docs(readme): 同步到 v0.9.4 (补 4 版发布 + PFS/供应链特性 + 修陈旧路线图)
 
 README 落后 4 个版本, 追平: 版本徽章 → v0.9.4; 核心特性概览补**可选 PFS** + **供应链签名/容器** +

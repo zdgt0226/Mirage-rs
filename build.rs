@@ -51,7 +51,9 @@ fn main() {
         let fallback_path = manifest_dir.join("ebpf-src").join(elf_name);
 
         if !(ebpf_on && is_linux) {
-            // 不编译: 直接用 committed ELF (env 仍定义, 但此配置下 aya 不 include, 变量多半未用)。
+            // 不编译 BPF (默认无 ebpf / 非 Linux): env 仍定义以满足 env! 展开, 但此配置下
+            // aya 加载代码整体 #[cfg(feature="ebpf")] 编译掉、include_bytes! 不生成, 故该路径
+            // 指向的文件从不被读 (committed ELF 已删除, 这里只是个占位路径字符串)。
             println!("cargo:rustc-env={}={}", env_var, fallback_path.display());
             continue;
         }
@@ -73,8 +75,31 @@ fn main() {
                 println!("cargo:rustc-env={}={}", env_var, dst_path.display());
             }
             _ => {
-                println!("cargo:warning=eBPF compile failed for {}, using committed ELF at {}", src, fallback_path.display());
-                println!("cargo:rustc-env={}={}", env_var, fallback_path.display());
+                // clang 缺失/失败。**只回落到本地存在的 ebpf-src/*.elf, 且这些文件不入库**
+                // (见 .gitignore) —— 故回落只可能命中"刚由可信流程新鲜生成"的 ELF:
+                //   · release CI: 先在 runner 上用 clang 显式编译 BPF 到 ebpf-src/*.elf, 再经
+                //     cross-rs 容器 (容器内无 clang) 构建 musl 目标 → 容器里 build.rs 回落到这批
+                //     **新鲜** ELF。这是 musl 发版能成立的关键。
+                //   · 本地 `--features ebpf` 无 clang: ebpf-src/*.elf 不存在 (未入库/未生成) →
+                //     **硬 panic**, 不再像旧版静默加载仓库里的陈旧 committed ELF (那会跑带 bug 的
+                //     BPF, 如 dns_xdp 域名哈希碰撞 P1 → 流量劫持到错 IP)。
+                if fallback_path.exists() {
+                    println!(
+                        "cargo:warning=clang 不可用, {} 回落到已存在的 {} (应仅出现在 CI 交叉编译: \
+                         该 ELF 由 runner 上的显式 clang 步骤新鲜生成)",
+                        src,
+                        fallback_path.display()
+                    );
+                    println!("cargo:rustc-env={}={}", env_var, fallback_path.display());
+                } else {
+                    panic!(
+                        "eBPF 编译失败且无可回落的 ELF: {src}\n\
+                         开启了 `--features ebpf` 就必须能编译 BPF 程序。请安装 clang + llvm \
+                         (如 `apt install clang llvm libbpf-dev`), 或去掉 `--features ebpf` \
+                         构建纯用户态版本 (默认即无 ebpf, 不需要 clang)。\n\
+                         (注: ebpf-src/*.elf 不入库, 故本地无 clang 时无陈旧 ELF 可静默加载。)"
+                    );
+                }
             }
         }
     }
