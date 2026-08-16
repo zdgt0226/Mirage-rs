@@ -9,11 +9,24 @@
 //! **成本**: 每次查要扫 `/proc/*/fd` (随系统总 fd 数, 非本连接)。每条新连接的 socket inode
 //! 都不同, 无法跨连接缓存 —— 故不缓存。调用方 (handler) 已用 `router.uses_process_name()` +
 //! loopback + `spawn_blocking` 三重门控: 没配 process_name 规则完全不触发, 触发也不占 reactor。
+//! 另有 `PROC_SCAN_SEM` **并发闸** (≤16 同时扫盘): 突发本机建连时防大量扫描打爆 blocking 池,
+//! 抢不到许可即跳过 (降级不排队)。
 //!
 //! **进程名 = 可执行文件 basename** (`/proc/PID/exe`), 与 clash/sing-box 一致; 取不到 (无权限/
 //! 内核线程) 回落 `/proc/PID/comm` (注意 comm 被内核截断到 15 字符)。
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::LazyLock;
+use tokio::sync::Semaphore;
+
+/// **并发闸**: 限制同时进行的 `/proc/*/fd` 扫描数。突发本机建连 (配了 process_name 规则时) 会让
+/// 大量 spawn_blocking 各自全量扫盘, 打爆 tokio 默认 512 的 blocking 池 → 饿死全局 DNS/文件 IO。
+/// 抢不到许可的连接**直接跳过进程名查询** (降级: process_name 规则对它不匹配, 落到后续规则),
+/// 而非排队扫盘。
+///
+/// 为何用并发闸而非缓存: socket inode **每连接唯一** (见模块头), inode→PID 缓存对"数千新建连"
+/// 场景零命中, 挡不住这个 hazard; 限并发才是对症的。
+static PROC_SCAN_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(16));
 
 /// peer 是否本机 (含双栈下的 v4-mapped loopback `::ffff:127.0.0.1`)。
 /// `Ipv6Addr::is_loopback` 只认 `::1`, 不认 v4-mapped, 故单独判。供 handler 预门控复用。
@@ -31,6 +44,8 @@ pub fn process_name_for_peer(peer: SocketAddr) -> Option<String> {
     if !is_local_peer(peer.ip()) {
         return None;
     }
+    // 并发闸: 抢不到许可 (已有 16 个扫描在跑) 就跳过, 不排队扫盘。permit 持有到本函数返回。
+    let _permit = PROC_SCAN_SEM.try_acquire().ok()?;
     let inode = socket_inode_for_local(peer)?;
     let pid = pid_for_socket_inode(inode)?;
     name_for_pid(pid)

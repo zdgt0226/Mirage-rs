@@ -5,6 +5,20 @@ use std::sync::Arc;
 use crate::config_watcher::CoreState;
 use arc_swap::ArcSwap;
 
+/// HTTP Host/目标是否**已自带端口**。IPv6 字面量按 RFC 7230 必须用方括号
+/// (`[2001:db8::1]:8080`) —— 端口是 `]` 之后的冒号; 裸 `[2001:db8::1]` (无端口) 里的冒号在括号
+/// 内、不算端口。非括号 host (域名 / v4) 里出现冒号即端口。
+///
+/// 修 bug: 旧代码一律 `host.contains(':')`, 对 `[2001:db8::1]` 恒判"已有端口"→ 不补 `:80` →
+/// 下游 `rsplitn(2, ':')` 把 IPv6 尾段误切成端口 → 解析失败端口变 0 → IPv6 HTTP 代理请求全挂。
+fn host_has_explicit_port(host: &str) -> bool {
+    if host.starts_with('[') {
+        host.rfind(']').is_some_and(|i| host[i + 1..].contains(':'))
+    } else {
+        host.contains(':')
+    }
+}
+
 /// 解 base64 (标准字母表, 容忍尾部 '='), 失败返回 None。
 /// 只为 HTTP `Proxy-Authorization: Basic` 一处需要, 手写 ~20 行免得为此引入依赖。
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
@@ -167,7 +181,7 @@ pub async fn handle_client(
                     None => host_part,
                 };
                 
-                if actual_host.contains(':') {
+                if host_has_explicit_port(actual_host) {
                     target = actual_host.to_string();
                 } else {
                     target = format!("{}:80", actual_host);
@@ -203,7 +217,7 @@ pub async fn handle_client(
                     Some(h) => h,
                     None => return,
                 };
-                if host.contains(':') {
+                if host_has_explicit_port(&host) {
                     target = host;
                 } else {
                     target = format!("{}:80", host);
@@ -227,6 +241,28 @@ pub async fn handle_client(
             inbound_tag,
             false,
         ).await;
+    }
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::host_has_explicit_port;
+
+    #[test]
+    fn ipv6_bracketed_without_port_needs_default() {
+        // 修的核心 bug: 括号内的冒号不算端口 → 必须补 :80。
+        assert!(!host_has_explicit_port("[2001:db8::1]"));
+    }
+    #[test]
+    fn ipv6_bracketed_with_port_detected() {
+        assert!(host_has_explicit_port("[2001:db8::1]:8080"));
+    }
+    #[test]
+    fn domain_and_v4() {
+        assert!(!host_has_explicit_port("example.com"));
+        assert!(host_has_explicit_port("example.com:443"));
+        assert!(!host_has_explicit_port("1.2.3.4"));
+        assert!(host_has_explicit_port("1.2.3.4:80"));
     }
 }
 

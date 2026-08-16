@@ -111,6 +111,10 @@ pub async fn handle_udp_associate_routed(
                 match build_sink(&node, client_socket.clone(), client).await {
                     Some((sink, ah)) => {
                         if let Some(ah) = ah {
+                            // 弱网下同一关联可反复重建 sink → 旧下行任务已退出但 AbortHandle 仍
+                            // 挂在列表里累积。push 前先剔除已完成的, 防长寿命 UDP 关联 (语音/游戏)
+                            // 句柄泄漏。
+                            downlinks.retain(|h| !h.is_finished());
                             downlinks.push(ah);
                         }
                         debug!("[SOCKS-UDP] 为出站 [{}] 建立 sink", tag);

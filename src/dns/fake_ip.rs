@@ -169,7 +169,10 @@ impl FakeIpMapper {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                self.flush();
+                // flush() 是同步磁盘写 (std::fs::write + rename)。丢 spawn_blocking, 否则每 60s
+                // 会卡住承载它的 tokio worker 数毫秒~数秒 (机械盘/软路由闪存尤甚)。
+                let mapper = self.clone();
+                let _ = tokio::task::spawn_blocking(move || mapper.flush()).await;
             }
         });
     }
