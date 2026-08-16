@@ -591,14 +591,11 @@ impl WarmPool {
                 // 池子每次补货都会撞到, 故只详细提示一次 (避免刷屏)。两大常见原因见下。
                 static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !HINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    // 统一诊断文案 (与服务端 control.rs 共用, 见 hello_auth::session_decrypt_failure_hint)。
                     tracing::warn!(
-                        "隧道认证疑似失败 (TIME_SYNC 解密失败: {:?})。排查: ①密码与服务端是否一致; \
-                         ②本机系统时钟与服务端相差是否超过服务端容差 (默认 ±60s) —— 两端各跑 `date -u` \
-                         对一下, 并确认 NTP 正常且**不走本代理** (否则隧道挂→NTP不同步→时钟更偏 死循环); \
-                         ③**两端高级特征版本歪斜**: 若一端配了 `pfs`/`tls_padding`/`cipher_agility` 而另一端\
-                         没开或版本过老不支持, 会话密钥/分帧对不上, 同样表现为解密失败 —— 确认两端这些开关\
-                         **完全一致且版本相同** (见 README 安全声明 / tuning 各项注释)。",
-                        e
+                        "隧道认证疑似失败 (TIME_SYNC 解密失败: {:?})。{}",
+                        e,
+                        crate::crypto::hello_auth::session_decrypt_failure_hint()
                     );
                 } else {
                     tracing::debug!("TIME_SYNC: recv failed: {:?}, proceeding without sync", e);

@@ -81,7 +81,18 @@ pub(super) async fn dispatch_authenticated(
             if msg.contains("close_notify") {
                 tracing::debug!("Mirage Server: warmup gracefully closed by client");
             } else {
-                tracing::error!("Mirage Server: recv_data failed: {:?}", e);
+                // token 认证已过却解不开首个加密帧 = 会话密钥失配。给一次完整排查提示 (密码/时钟/
+                // 高级特征单边), 而非裸 error 让运维无从下手。池化补货会反复撞到, 故只详细提示一次。
+                static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !HINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        "Mirage Server: first_chunk 解密失败 ({:?})。{}",
+                        e,
+                        crate::crypto::hello_auth::session_decrypt_failure_hint()
+                    );
+                } else {
+                    tracing::debug!("Mirage Server: recv_data failed: {:?}", e);
+                }
             }
             return;
         }
