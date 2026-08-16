@@ -176,6 +176,10 @@ pub async fn proxy_tcp_target(
     };
 
     // 源 IP: 透明网关下 = LAN 客户端真实 IP (TPROXY 保留源地址); SOCKS/mixed 下 = 发起方 IP。
+    // ⚠️ 语义 = **发起方 IP, 非仅 LAN 设备**: 本机出向 (cgroup/connect4 重定向本机 fake-IP 连接)
+    // 走这条时 peer 是 127.0.0.1 → source_ip=127.0.0.1 也参与 source_ip_cidr 匹配。故"非某网段
+    // 一律走 X"这类规则会把本机流量也算进去 (本机是发起方之一, 语义自洽; 但与"只想圈 LAN 设备"
+    // 的直觉有细微差别, 要精确圈 LAN 就在 cidr 里排除 127.0.0.0/8)。见 brain source-ip-routing。
     // 供 routing 的 `source_ip_cidr` (按设备/网段分流) 匹配。此前恒 None → 设备规则对**透明 TCP
     // 静默不生效** (UDP 已填, 见 transparent_udp), 用户配了按设备分流网页流量却半瘫。
     // v4-mapped v6 (::ffff:a.b.c.d, 双栈 socket 常见) 归一成 v4, 否则 v4 CIDR 规则 contains 不中。

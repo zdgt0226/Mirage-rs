@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### docs(routing): 钉住 source_ip 语义 (本机 cgroup 出向 / DNS 路径暂 None)
+
+#47 补 source_ip 后的两处语义澄清 (审计后续观察, 均非 bug, comment-only 零行为变化):
+- **source_ip = 发起方 IP 非仅 LAN 设备**: 本机出向 (cgroup/connect4 重定向本机 fake-IP 连接) 走
+  透明路径时 peer=127.0.0.1 → source_ip=127.0.0.1 也参与 source_ip_cidr 匹配。"非某网段一律走 X"
+  会把本机流量算进去 (语义自洽, 要精确圈 LAN 就在 cidr 排除 127.0.0.0/8)。handler.rs 加注释。
+- **DNS 查询路径 source_ip 仍 None** (dns/server.rs): 按源分流 DNS (每主机 DNS 策略) 未实现, 标注
+  为**故意 None 非疏漏** + 怎么做 (把 run_loop 的 from 传进来)。不现在填 —— 填了 = source_ip_cidr
+  开始作用于 DNS 解析路由 = 行为新增, 需产品决策。
+- 新增 brain [[source-ip-routing]] 汇总各路径 source_ip 填充语义与陷阱。
+
 ### fix(routing): 透明 TCP 填 source_ip，设备/网段规则 (source_ip_cidr) 对 TCP 生效
 
 `proxy_tcp_target` 建 RoutingRequest 时 `source_ip` 恒 `None` (注释写着"Can extract from local
