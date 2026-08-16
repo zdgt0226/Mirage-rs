@@ -32,7 +32,7 @@
 * **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关（向后兼容），认证仍靠口令、与加密解耦（对标 REALITY）。
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
-* **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
+* **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
 * **内置 Web 看板**: Neon Pulse Dashboard，实时监控流速、eBPF 拦截率，并支持可视化热重载规则。
 * **供应链完整性**: Release 产物 (SHA256SUMS) 与多架构容器镜像 (`ghcr.io`) 均经 **cosign keyless** 签名 (Sigstore OIDC + Rekor 透明日志，零密钥可公开审计)。
 
@@ -370,7 +370,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 
 ### ⏳ 未完成 (计划池)
 
-- [ ] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① 设备规则: 路由已有 `source_ip_cidr`/`source_mac`, 只需给 TCP 透明路径填 `source_ip` (现为 None, ~2 行, UDP 已填) 即对 TCP 生效。② 每主机用量: eBPF 按源 IP 计上下行字节 (tc 看得到含 splice 直连的全部流量, 用户态计数会漏) → 用户态读 map → API + Neon 面板 per-host 视图 + 可选设备别名
+- [~] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① **设备规则已生效**: `source_ip_cidr` 现对透明 TCP + SOCKS-UDP + 透明 UDP 全路径匹配 (给 proxy_tcp_target 填 `source_ip` = 发起方 IP, v4-mapped 归一; 见 brain `source-ip-routing`)。DNS 查询维度暂 None (每主机 DNS 策略未实现)。② **每主机用量** (待做): eBPF 按源 IP 计上下行字节 (tc 看得到含 splice 直连的全部流量, 用户态计数会漏) → 用户态读 map → API + Neon 面板 per-host 视图 + 可选设备别名
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道
 - [~] **链式代理 / WG·SS 双向** —— SS 双向 (入站+出站) · Mirage 套娃 · SS-over-Mirage 已做 (v0.8.1); **WG 入站**改用"干净设备"落地 (内核 WG 服务端 + 现有 eBPF 透明网关, install.sh 选项 7, 非 boringtun responder) —— 见上方「干净设备接入」。剩自定义转发编排增强
