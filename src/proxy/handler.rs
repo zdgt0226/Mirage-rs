@@ -66,6 +66,17 @@ pub async fn handle_client(
     proxy_tcp_target(local, target, Vec::new(), state, ebpf_engine, fake_ip_mapper, inbound_tag, false).await;
 }
 
+/// 把连接 peer 的 IP 归一成路由用的源 IP。
+///
+/// 双栈 socket 上一个 IPv4 客户端可能以 v4-mapped v6 (形如 ffff 前缀的 v6) 出现; 不归一则 v4
+/// 的 source_ip_cidr 规则匹配不中 → 设备分流对这类连接失效。故把 v4-mapped 折回 v4, 其余原样。
+pub(crate) fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
 /**
  * [TCP 流量核心路由与转发]
  * 核心流程：
@@ -164,13 +175,19 @@ pub async fn proxy_tcp_target(
         None
     };
 
+    // 源 IP: 透明网关下 = LAN 客户端真实 IP (TPROXY 保留源地址); SOCKS/mixed 下 = 发起方 IP。
+    // 供 routing 的 `source_ip_cidr` (按设备/网段分流) 匹配。此前恒 None → 设备规则对**透明 TCP
+    // 静默不生效** (UDP 已填, 见 transparent_udp), 用户配了按设备分流网页流量却半瘫。
+    // v4-mapped v6 (::ffff:a.b.c.d, 双栈 socket 常见) 归一成 v4, 否则 v4 CIDR 规则 contains 不中。
+    let source_ip = local.peer_addr().ok().map(|a| normalize_peer_ip(a.ip()));
+
     // Parse target for router
     let mut routing_req = RoutingRequest {
         domain: None,
         ip: None,
         port: final_port,
         protocol: "tcp",
-        source_ip: None, // Can extract from local if needed
+        source_ip,
         source_mac: None,
         inbound: inbound_tag.as_deref(),
         process_name: process_name.as_deref(),
@@ -507,5 +524,28 @@ pub async fn proxy_tcp_target(
         _ => {
             tracing::warn!("Unexpected leaf type {:?} for {}, dropping", leaf.tag(), target);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_peer_ip;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// v4-mapped v6 归一成 v4 —— 否则透明 TCP 的双栈客户端匹配不中 v4 source_ip_cidr 设备规则。
+    #[test]
+    fn v4_mapped_normalized_to_v4() {
+        let mapped = IpAddr::V6("::ffff:1.2.3.4".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(normalize_peer_ip(mapped), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+    #[test]
+    fn plain_v4_unchanged() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(normalize_peer_ip(v4), v4);
+    }
+    #[test]
+    fn real_v6_unchanged() {
+        let v6 = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(normalize_peer_ip(v6), v6);
     }
 }

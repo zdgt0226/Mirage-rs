@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### fix(routing): 透明 TCP 填 source_ip，设备/网段规则 (source_ip_cidr) 对 TCP 生效
+
+`proxy_tcp_target` 建 RoutingRequest 时 `source_ip` 恒 `None` (注释写着"Can extract from local
+if needed" 但没做) —— 而路由匹配遇到有 `source_ip_cidr` 的规则时, source_ip 为 None 直接判不匹配。
+后果: 用户配的**按设备/网段分流** (`source_ip_cidr`) 对**透明 TCP (网页浏览主流量) 静默失效**,
+只 UDP 生效 (transparent_udp 已填 source_ip)。配了以为在跑, 实则半瘫。
+
+修法: 从 `local.peer_addr()` 提取源 IP 填进 RoutingRequest —— 透明网关下即 LAN 客户端真实 IP
+(TPROXY 保留源址), SOCKS/mixed 下即发起方。一处改, 覆盖所有 TCP 入站路径。顺带 v4-mapped v6
+(`::ffff:a.b.c.d`, 双栈 socket 常见) 归一成 v4, 否则 v4 CIDR 规则 `contains` 匹配不中。补 3 单测
+(v4-mapped 归一 / 纯 v4 / 纯 v6)。SOCKS-UDP relay 的 source_ip 同样过归一 (与 TCP 一致; 透明 UDP
+本就是 SocketAddrV4 恒 v4 无需归一)。
+
 ### docs(build): 无 clang + ebpf 场景引导 + build.rs 失败横幅
 
 - README 加「从源码构建」段: 默认构建无需 clang; `--features ebpf` 必须装 clang/llvm, 缺则明确
