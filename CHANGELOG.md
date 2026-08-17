@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### feat(icmp): fake-IP ICMP echo 本地反射 (ping 代理域名可通)
+
+路线图 #6 ICMP 处理第一步 (先本地, 真隧道 RTT 留后续)。LAN 客户端 `ping` 一个走代理的域名时,
+DNS 回的是 fake-IP (默认 `198.18.0.0/16`), 该 IP 无真实主机, echo request 转发出去无路由被丢 →
+ping 超时, 用户以为"不通"。
+
+- `tc_divert.c` 新增 ICMP 分支: 仅对 **fake-IP 段** 的 Echo Request 就地翻成 Echo Reply 弹回客户端
+  (交换 MAC / 交换 IP src·dst / `type 8→0` / ICMP 校验和增量修正 / `bpf_redirect` 回同网卡 egress)。
+  IP 校验和因 src·dst 交换是反码和的换位而保持有效; TTL 不动。校验和增量已用 Rust 独立复算比对确认。
+- `DivertCfg` 加 `fakeip_net/fakeip_mask` 两字段, 由 `lib.rs` 从 `fake_ip_mapper` 灌入; fake-IP 未
+  启用 (mask=0) 则反射整体关闭, 不影响任何现有分流路径。只反射 fake-IP 段 (非全体非直连), 避免对真实
+  IP 谎报 RTT。
+- 对齐 Clash/sing-box 的 fake-ip ping 体验。RTT 是本机假值 (~0ms), 仅解决"看起来不通"; 端到端真 RTT
+  需 ICMP 隧道 (roadmap 后续)。**本机自身 (非 LAN 客户端) ping fake-IP 不经 tc ingress, 暂不覆盖。**
+- 仅 `--features ebpf` 网关模式生效; 待真机验证 (netns/redirect 路径本地难复现)。
+
 ## [v0.9.5] - eBPF ELF 漂移根治 + source_ip 设备规则 + 外部审计批修 (2026-08-16)
 
 ### ci(release): 显式 BPF 编译步补全 5 个程序 (修 musl 发版)

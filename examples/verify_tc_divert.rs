@@ -26,6 +26,8 @@ use nix::sys::socket::{
 struct DivertCfg {
     listen_port: u32,
     mtu: u32,
+    fakeip_net: u32,
+    fakeip_mask: u32,
 }
 unsafe impl aya::Pod for DivertCfg {}
 
@@ -76,7 +78,7 @@ fn main() -> anyhow::Result<()> {
     let mut bpf = Ebpf::load(ELF)?;
     {
         let mut cfg = Array::<_, DivertCfg>::try_from(bpf.map_mut("tc_divert_cfg").unwrap())?;
-        cfg.set(0, DivertCfg { listen_port: LPORT as u32, mtu: 0 }, 0)?;
+        cfg.set(0, DivertCfg { listen_port: LPORT as u32, mtu: 0, ..Default::default() }, 0)?;
     }
     {
         // 灌直连段 1.1.1.0/24。key.addr 需与 BPF __be32 同布局 (网络序):

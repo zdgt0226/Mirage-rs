@@ -21,11 +21,26 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+// linux/icmp.h 会拖进 linux/if.h → glibc sys/socket.h (需 stubs-32.h, BPF 编不了),
+// 故不 include, 手动补需要的常量与最小 ICMP 头 (只用前 4 字节 type/code/checksum)。
+#ifndef IPPROTO_ICMP
+#define IPPROTO_ICMP 1
+#endif
+#define ICMP_ECHO 8
+#define ICMP_ECHOREPLY 0
+struct icmp_min_hdr {
+    __u8 type;
+    __u8 code;
+    __be16 checksum;
+};
+
 #define MIRAGE_FWMARK 0x1 // 被劫持包打此 mark, 配 ip rule fwmark→local 路由表
 
 struct divert_cfg {
     __u32 listen_port; // 透明监听端口 (host order)
     __u32 mtu;         // MSS clamp: max_mss = mtu-40; 0 或 <68 表示关闭
+    __be32 fakeip_net; // fake-IP 段网络地址 (网络序); 0 表示未启用 fake-IP
+    __be32 fakeip_mask; // fake-IP 段掩码 (网络序); 0 关闭 ICMP echo 反射
 };
 
 // TCP SYN MSS clamp: 转发的 SYN/SYN-ACK 若 MSS 选项超 (mtu-40) 则钳制, 防小 MTU
@@ -110,6 +125,34 @@ static __always_inline int is_direct_dst(__u32 daddr_be) {
     return 0;
 }
 
+// fake-IP ICMP echo 本地反射: LAN 客户端 ping 一个代理域名 (DNS 回的 fake-IP) 时,
+// fake-IP 无真实主机, echo request 转发出去无路由被丢 → ping 超时。这里就地把
+// Echo Request 翻成 Echo Reply 弹回客户端, 让 ping "通" (RTT 是本机假值, 真隧道 RTT
+// 是后续 roadmap 项)。对齐 Clash/sing-box 的 fake-ip ping 体验。
+//
+// 变换: 交换 MAC、交换 IP src/dst (IP 校验和是各 16bit 字的反码和, 交换 src↔dst
+// 不改总和, 保持有效)、type 8→0、ICMP 校验和增量修正 (只 type 字节变)。
+// TTL 不动 (客户端直连一跳, 保持 IP 校验和有效)。redirect 回同网卡 egress。
+static __always_inline int reflect_icmp_echo(struct __sk_buff *skb, struct ethhdr *eth,
+                                             struct iphdr *ip, struct icmp_min_hdr *icmp) {
+    // MAC 交换
+    __u8 mac[6];
+    __builtin_memcpy(mac, eth->h_dest, 6);
+    __builtin_memcpy(eth->h_dest, eth->h_source, 6);
+    __builtin_memcpy(eth->h_source, mac, 6);
+    // IP src/dst 交换 (IP 校验和不变)
+    __be32 t = ip->saddr;
+    ip->saddr = ip->daddr;
+    ip->daddr = t;
+    // ICMP type 8→0: type/code 16bit 字由 0x0800 变 0x0000, 反码和减 0x0800,
+    // 故校验和 (= ~和) 加 0x0800, 带环绕进位。
+    __u32 c = bpf_ntohs(icmp->checksum) + 0x0800;
+    c = (c & 0xffff) + (c >> 16);
+    icmp->checksum = bpf_htons((__u16)c);
+    icmp->type = ICMP_ECHOREPLY; // 0
+    return bpf_redirect(skb->ifindex, 0); // 同网卡 egress 弹回 client
+}
+
 SEC("classifier")
 int tc_divert(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
@@ -131,6 +174,20 @@ int tc_divert(struct __sk_buff *skb) {
     struct divert_cfg *cfg = bpf_map_lookup_elem(&tc_divert_cfg, &zero);
     if (!cfg)
         return TC_ACT_OK;
+
+    // fake-IP ICMP echo 本地反射 (仅 fake-IP 段, 见 reflect_icmp_echo 注释)。
+    // TCP/UDP 都不是 → 不影响下方分流路径; 只在 fakeip_mask 非 0 (启用 fake-IP) 时生效。
+    if (ip->protocol == IPPROTO_ICMP) {
+        if (cfg->fakeip_mask && (ip->daddr & cfg->fakeip_mask) == cfg->fakeip_net) {
+            struct icmp_min_hdr *icmp = (void *)(ip + 1);
+            if ((void *)(icmp + 1) > data_end)
+                return TC_ACT_OK;
+            if (icmp->type != ICMP_ECHO || icmp->code != 0)
+                return TC_ACT_OK; // 只反射 Echo Request, 其余 (unreachable 等) 交内核
+            return reflect_icmp_echo(skb, eth, ip, icmp);
+        }
+        return TC_ACT_OK;
+    }
 
     // 转发 TCP SYN 钳 MSS: 放在分流判定前, 覆盖直连 (TC_ACT_OK) 路径 —— 直连转发的
     // 大段才是 PMTU 黑洞高发区。改包后指针失效, 重新取。

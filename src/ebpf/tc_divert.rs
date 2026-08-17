@@ -16,6 +16,7 @@ mod sys {
     use aya::Ebpf;
     use ipnet::Ipv4Net;
     use std::collections::HashSet;
+    use std::net::Ipv4Addr;
     use std::sync::Mutex;
     use tracing::{info, warn};
 
@@ -24,6 +25,8 @@ mod sys {
     struct DivertCfg {
         listen_port: u32,
         mtu: u32, // MSS clamp: max_mss=mtu-40; 0 关闭
+        fakeip_net: u32,  // 网络序; fake-IP 段网络地址
+        fakeip_mask: u32, // 网络序; 0 关闭 ICMP echo 反射
     }
     unsafe impl aya::Pod for DivertCfg {}
 
@@ -36,16 +39,27 @@ mod sys {
     }
 
     impl TcDivertEngine {
-        pub fn init(listen_port: u16, mtu: u32) -> Result<Self> {
+        pub fn init(listen_port: u16, mtu: u32, fakeip_net: Ipv4Addr, prefix_len: u8) -> Result<Self> {
             static TC_DIVERT_ELF: &[u8] = aya::include_bytes_aligned!(env!("BPF_TC_DIVERT_ELF"));
             let mut bpf = Ebpf::load(TC_DIVERT_ELF).context("Failed to load tc_divert.elf")?;
+            // fake-IP 段掩码 (prefix_len==0 或 >32 → 0, 关闭 ICMP 反射)。
+            let mask: u32 = if prefix_len == 0 || prefix_len > 32 { 0 } else { !0u32 << (32 - prefix_len) };
             {
                 let mut cfg = Array::<_, DivertCfg>::try_from(
                     bpf.map_mut("tc_divert_cfg").context("tc_divert_cfg map missing")?,
                 )?;
-                cfg.set(0, DivertCfg { listen_port: listen_port as u32, mtu }, 0)?;
+                cfg.set(0, DivertCfg {
+                    listen_port: listen_port as u32,
+                    mtu,
+                    fakeip_net: (u32::from(fakeip_net) & mask).to_be(),
+                    fakeip_mask: mask.to_be(),
+                }, 0)?;
             }
-            info!("eBPF tc_divert engine initialized (listen_port={}, mss_clamp mtu={}).", listen_port, mtu);
+            info!(
+                "eBPF tc_divert engine initialized (listen_port={}, mss_clamp mtu={}, fake-IP ICMP 反射={}).",
+                listen_port, mtu,
+                if mask != 0 { format!("{}/{}", fakeip_net, prefix_len) } else { "关".to_string() }
+            );
             Ok(Self {
                 bpf: Mutex::new(bpf),
                 loaded: Mutex::new(HashSet::new()),
@@ -139,11 +153,12 @@ mod sys {
 mod sys {
     use anyhow::Result;
     use ipnet::Ipv4Net;
+    use std::net::Ipv4Addr;
 
     pub struct TcDivertEngine {}
 
     impl TcDivertEngine {
-        pub fn init(_listen_port: u16, _mtu: u32) -> Result<Self> {
+        pub fn init(_listen_port: u16, _mtu: u32, _fakeip_net: Ipv4Addr, _prefix_len: u8) -> Result<Self> {
             Err(anyhow::anyhow!("eBPF disabled"))
         }
         pub fn attach(&self, _iface: &str) -> Result<()> {
