@@ -41,7 +41,7 @@ pub async fn get_overview(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "up": up,
         "down": down,
-        "connections": 0,
+        "connections": crate::monitor::live_conn_count(),
         "bpf_success": bpf_success,
         "bpf_fallback": bpf_fallback,
         "xdp_attached": xdp_attached,

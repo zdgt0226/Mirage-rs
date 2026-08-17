@@ -3,6 +3,7 @@
 //! 所有 handler 函数都接收 `State<AppState>` 作为 axum 路由参数.
 
 pub mod overview;
+pub mod connections;
 pub mod bpf_tunnels;
 pub mod history;
 pub mod logs;
