@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### perf(relay): 客户端上行贪婪收割 (对称服务端 download, 高 BDP 上传少碎片)
+
+修复上下行不对称: 服务端 download 早已 64KB heap buf + greedy `try_read` 收割
+(单 read 后非阻塞收割 kernel 里已到达的更多数据 → 单 `send_data` → CryptoWriter 的
+BufWriter 合成单 write syscall), 但**客户端 upload 仍是 16KB 栈 buf、一读一写、无收割**,
+高 BDP 大文件上传时 flush/write syscall 与帧碎片偏多。
+
+- `handler.rs` 上行 relay: `[0u8; 16384]` 栈 → `vec![0u8; 65536]` 堆, 加 greedy try_read
+  收割 (与服务端 tcp_relay download 同款; `local_read` 是真 fd 的 OwnedReadHalf 支持 try_read)。
+- 透明字节流合并, 语义等价 (test_lite_e2e 端到端覆盖上行路径, 全绿)。BufWriter 容量不动
+  (68KB 已覆盖 64KB send_data worst case)。
+- **未动**全局 read/BufWriter 尺寸: 灌大到 256KB 是投机, 且 BufWriter 挂每条 warm 池隧道
+  (空闲也吃内存), 无实测高 BDP 瓶颈前不做。
+
 ### feat(icmp): fake-IP ICMP echo 本地反射 (ping 代理域名可通)
 
 路线图 #6 ICMP 处理第一步 (先本地, 真隧道 RTT 留后续)。LAN 客户端 `ping` 一个走代理的域名时,

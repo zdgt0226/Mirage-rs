@@ -277,7 +277,10 @@ pub async fn proxy_tcp_target(
             let mut tunnel_writer = tunnel.writer;
 
             let upload = async {
-                let mut buf = [0u8; 16384];
+                // 64KB 堆 buf (非 16KB 栈): 与服务端 download 对称, 配下方 greedy
+                // try_read 一次收割更多本地数据 → 单 send_data → CryptoWriter 的
+                // BufWriter(68KB) 合成单 write syscall。高 BDP 上传少碎片。
+                let mut buf = vec![0u8; 65536];
                 let mut up_bytes: u64 = 0;
                 loop {
                     // 空闲超时包在每次 read 内层 (非整个 loop 外层, 见 MIRAGE_RELAY_IDLE 注释)
@@ -287,10 +290,22 @@ pub async fn proxy_tcp_target(
                             break;
                         }
                         Ok(Ok(n)) => {
-                            if tunnel_writer.send_data(&buf[..n]).await.is_err() {
+                            // 贪婪收割: blocking read 拿到第一片后, 非阻塞 try_read 继续填 buf
+                            // 剩余空间, kernel 里有多少已到达就装多少, WouldBlock 即止 (不增延迟)。
+                            // 对称服务端 tcp_relay download 路径 (local_read 是真 fd 的 OwnedReadHalf)。
+                            let mut total = n;
+                            while total < buf.len() {
+                                match local_read.try_read(&mut buf[total..]) {
+                                    Ok(0) => break, // 本地半关闭
+                                    Ok(more) => total += more,
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break,
+                                }
+                            }
+                            if tunnel_writer.send_data(&buf[..total]).await.is_err() {
                                 break;
                             }
-                            up_bytes += n as u64;
+                            up_bytes += total as u64;
                         }
                         Ok(Err(_)) => {
                             let _ = tunnel_writer.send_close_notify().await;
