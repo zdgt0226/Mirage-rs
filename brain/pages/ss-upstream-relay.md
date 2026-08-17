@@ -4,7 +4,7 @@ title: "SS 上游中转: 仅 TCP, UDP 默认阻断, 为何不先实现 SS UDP"
 category: decision
 status: active
 created: "2026-07-21T09:27:41"
-updated: "2026-07-21T09:29:04"
+updated: "2026-08-17T21:41:20"
 ---
 
 ## compiled_truth
@@ -44,3 +44,9 @@ Mirage 服务端可配 `upstream` 把流量再经 Shadowsocks 发往上游, 即�
   summary: "沉淀 SS 中转的边界与 UDP 取舍"
   source: src/proxy/shadowsocks.rs
   affects: [ss-upstream-relay]
+
+- time: 2026-08-17T21:41:20
+  kind: decision
+  summary: "SS 上游 UDP 升级为'评估后决定不做': WG 上游 UDP 已覆盖同出口需求 + SS 多数默认不开 UDP + 无握手不可探测; 仅'落地机只会SS不能上WG且必须UDP'窄场景翻案"
+  source: "对话 2026-08-17"
+  affects: [roadmap]

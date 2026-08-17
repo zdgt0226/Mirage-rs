@@ -366,7 +366,6 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 ### 🚧 部分完成
 
 - [~] **订阅链接** —— `mirage-rs subscribe <url>` 批量导入 (格式=每行 `mirage://` 或整段 base64, server:port 去重, 可选 --group)。**周期自动刷新**待做
-- [~] **SS 上游 UDP** —— 未实现; 需要 UDP 同出口可**直接用 WireGuard 上游** (已通)
 
 ### ⏳ 未完成 (计划池)
 
@@ -385,6 +384,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
 - **TLS session resumption 仿真** —— 抓包 + 统计实测证明: 真 Chrome 的 `legacy_session_id` 也每次全新随机, 我们与之不可区分, 立项前提不成立
 - **追平 sing-box 全部协议/规则** —— 定位是零配置 eBPF 网关, 不是通用代理框架
+- **SS 上游 UDP** —— ①要 UDP 同出口**直接用 WireGuard 上游** (已通), 功能已覆盖; ②多数 SS 服务器默认不开 UDP, **实现≠能用**; ③SS UDP 无握手, 上游不支持时"包石沉大海"无法探测只能等报障; ④当前默认 `block` 已是安全失败方式 (不静默从本机 IP 直发致出口 IP 不一致)。仅"落地机只会 SS 不能上 WG 且必须走 UDP"这一窄场景才翻案
 ---
 
 ## 📜 版本迭代概览 (Changelog)
