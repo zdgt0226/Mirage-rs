@@ -369,6 +369,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 
 ### ⏳ 未完成 (计划池)
 
+- [~] **WebUI 重构 (分阶段)** —— ①**活跃连接登记表 + `/api/connections`** (Phase 1, 未发版): 用户态连接登记表 (域名·入站·选中出站·协议·进程·时长·上下行字节 + 最近关闭环), 修 `/api/overview` 此前硬编码的 `connections:0`; 全用户态 lite/网关通用 (区别于仅 eBPF 的 `bpf/tunnels`); TCP 全出站覆盖, **UDP 登记 = Phase 1b**。②前端连接面板 = Phase 2。③路由规则结构化编辑器 (后端 `/api/rules` 已含 dry_run, 缺 UI) = Phase 3。④per-出站/规则命中统计 = Phase 4
 - [~] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① **设备规则已生效**: `source_ip_cidr` 现对透明 TCP + SOCKS-UDP + 透明 UDP 全路径匹配 (给 proxy_tcp_target 填 `source_ip` = 发起方 IP, v4-mapped 归一; 见 brain `source-ip-routing`)。DNS 查询维度暂 None (每主机 DNS 策略未实现)。② **每主机用量** (待做): eBPF 按源 IP 计上下行字节 (tc 看得到含 splice 直连的全部流量, 用户态计数会漏) → 用户态读 map → API + Neon 面板 per-host 视图 + 可选设备别名
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道

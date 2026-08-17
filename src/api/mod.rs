@@ -5,6 +5,7 @@
 //! - `sampler`: 后台 task, 每秒采样上下行流量 / BPF 命中数 Delta 压入 history
 //! - `handlers/`: 每个 endpoint 一个文件
 //!   - overview: GET /api/overview (Dashboard 顶部汇总)
+//!   - connections: GET /api/connections (活跃连接 + 最近关闭, 域名连接信息)
 //!   - bpf_tunnels: GET /api/bpf/tunnels (per-tunnel BPF 数据)
 //!   - history: GET /api/history (120s 滑动窗口数据)
 //!   - logs: GET /api/logs (内存日志)
@@ -230,6 +231,7 @@ pub async fn start_server(
     // 3. 装配 axum 路由 + 鉴权中间件 (route_layer: 只对已匹配路由跑, 不含 404)
     let app = Router::new()
         .route("/api/overview", get(handlers::overview::get_overview))
+        .route("/api/connections", get(handlers::connections::get_connections))
         .route("/api/history", get(handlers::history::get_history))
         .route("/api/logs", get(handlers::logs::get_logs))
         .route("/api/proxies", get(handlers::proxies::get_proxies))

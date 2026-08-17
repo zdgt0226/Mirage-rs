@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### feat(webui): 活跃连接登记表 + /api/connections (域名连接信息, Phase 1)
+
+WebUI 重构 Phase 1 (纯后端): 补「域名连接信息」数据源。此前 `/api/overview` 的
+`connections` 是**硬编码 0**, 用户态无任何活跃连接登记。
+
+- 新增 `monitor` 连接登记表 (全局单例, RAII `ConnGuard`): 每条 TCP relay 在路由决策后
+  登记 `{域名/IP 目标, 入站 tag, 选中出站 tag, 协议, 进程名, 时长, 上下行字节}`, 断连
+  自动注销并入「最近关闭」环形 buffer (cap 100, 看"刚才谁连了哪")。
+- per-连接字节: `AtomicU64` 无锁累加。Mirage 隧道路径 relay 循环里 live 累加; splice
+  直连 / WG `copy_bidirectional` 只在关闭时返回总量, 故活跃期间显示 0、关闭补总量。
+- 新 `GET /api/connections` 出 `{active, recent_closed}`; `/api/overview` 的
+  `connections` 改真实活跃数。全用户态、与 eBPF 无关 (lite/网关都有数据, 区别于仅
+  eBPF sockops 的 `/api/bpf/tunnels`)。
+- 登记装在 `handler.rs` 路由 choke point, 覆盖 transparent + SOCKS/mixed 入站的全部
+  TCP 出站 (Mirage/Direct/WG)。**UDP 连接登记留 Phase 1b** (mux 分流较复杂)。
+- 前端连接面板 = Phase 2。
+
 ### perf(relay): 客户端上行贪婪收割 (对称服务端 download, 高 BDP 上传少碎片)
 
 修复上下行不对称: 服务端 download 早已 64KB heap buf + greedy `try_read` 收割

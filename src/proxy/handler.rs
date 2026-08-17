@@ -214,7 +214,17 @@ pub async fn proxy_tcp_target(
     let target = final_target;
     
     info!("Router selected outbound [{}] for target {}", outbound_tag, target);
-    
+
+    // 活跃连接登记 (WebUI 域名连接信息数据源); _conn drop (fn 退出) 时注销并入最近关闭环。
+    // 字节数按下面各出站路径累加: Mirage live 累加, splice/WG 关闭时补总量。
+    let _conn = crate::monitor::register(
+        target.clone(),
+        inbound_tag.as_deref().unwrap_or("-").to_string(),
+        outbound_tag.to_string(),
+        "tcp",
+        process_name.clone(),
+    );
+
     let outbound = match current_state.outbounds.get(&outbound_tag) {
         Some(o) => o,
         None => {
@@ -276,6 +286,7 @@ pub async fn proxy_tcp_target(
             let tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
 
+            let up_conn = _conn.counter();
             let upload = async {
                 // 64KB 堆 buf (非 16KB 栈): 与服务端 download 对称, 配下方 greedy
                 // try_read 一次收割更多本地数据 → 单 send_data → CryptoWriter 的
@@ -306,6 +317,7 @@ pub async fn proxy_tcp_target(
                                 break;
                             }
                             up_bytes += total as u64;
+                            up_conn.up(total as u64);
                         }
                         Ok(Err(_)) => {
                             let _ = tunnel_writer.send_close_notify().await;
@@ -326,6 +338,7 @@ pub async fn proxy_tcp_target(
                 (tunnel_writer, up_bytes)
             };
 
+            let dn_conn = _conn.counter();
             let download = async {
                 // alpha.21 曾尝试 mpsc(32) producer/consumer 批量, 但外部审计
                 // 指出 tokio 调度器倾向立刻醒 consumer, `try_recv` 抓空, 批量
@@ -349,6 +362,7 @@ pub async fn proxy_tcp_target(
                                 break;
                             }
                             down_bytes += data.len() as u64;
+                            dn_conn.down(data.len() as u64);
                         }
                         Ok(Err(_)) => break,
                         Err(_) => break, // 空闲超时
@@ -443,6 +457,9 @@ pub async fn proxy_tcp_target(
             let relay_start = std::time::Instant::now();
             match crate::proxy::splice::splice_relay(local, target_stream).await {
                 Ok((up, down)) => {
+                    // splice 只在结束返回总字节, 关闭时补进连接登记 (活跃期间显示 0)。
+                    _conn.counter().up(up);
+                    _conn.counter().down(down);
                     let (pool_hits, pool_misses, pool_len) = crate::proxy::splice::pool_stats();
                     debug!(
                         "[DIRECT] {} 关闭 (↑{} ↓{}, 存活 {:.1}s, peer={} relay={}ms \
@@ -528,11 +545,16 @@ pub async fn proxy_tcp_target(
             // 里), 无法 splice —— 只能用通用异步拷贝。
             let mut local = local;
             match tokio::io::copy_bidirectional(&mut local, &mut remote).await {
-                Ok((up, down)) => debug!(
-                    "[WG] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
-                    target, human_bytes(up), human_bytes(down),
-                    t_start.elapsed().as_secs_f64()
-                ),
+                Ok((up, down)) => {
+                    // copy_bidirectional 只在结束返回总字节, 关闭时补进连接登记。
+                    _conn.counter().up(up);
+                    _conn.counter().down(down);
+                    debug!(
+                        "[WG] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                        target, human_bytes(up), human_bytes(down),
+                        t_start.elapsed().as_secs_f64()
+                    );
+                }
                 Err(e) => debug!("[WG] {} 出错: {}", target, e),
             }
         }

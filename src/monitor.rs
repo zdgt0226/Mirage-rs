@@ -1,7 +1,8 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::collections::VecDeque;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 pub static GLOBAL_UP: AtomicU64 = AtomicU64::new(0);
 pub static GLOBAL_DOWN: AtomicU64 = AtomicU64::new(0);
@@ -13,6 +14,142 @@ pub fn add_up(bytes: u64) {
 
 pub fn add_down(bytes: u64) {
     GLOBAL_DOWN.fetch_add(bytes, Ordering::Relaxed);
+}
+
+// ============================================================================
+// 活跃连接登记表 (WebUI「域名连接信息」数据源)
+//
+// 每条 relay 建连时 register() 拿一个 ConnGuard, 断连 (guard drop) 自动注销并把
+// 快照压进"最近关闭"环形 buffer。字节数: Mirage 路径在 relay 循环里 live 累加,
+// splice/WG 只在关闭时补总量 (它们的 relay 原语只在结束时返回总字节)。
+// 全用户态、与 eBPF 无关, lite/网关模式都有数据 (区别于仅 eBPF 的 bpf/tunnels)。
+// ============================================================================
+
+const CLOSED_RING_CAP: usize = 100;
+static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// 单条连接的活跃状态。up/down 是原子, relay 侧无锁累加。
+pub struct ConnInfo {
+    pub id: u64,
+    pub target: String,        // 域名:端口 或 IP:端口
+    pub inbound: String,       // 入站 tag
+    pub outbound: String,      // 路由选中的出站 tag
+    pub proto: &'static str,   // "tcp" / "udp"
+    pub process: Option<String>,
+    pub start: Instant,
+    pub up: AtomicU64,
+    pub down: AtomicU64,
+}
+
+/// API/环形 buffer 用的连接快照 (脱离锁与原子)。
+#[derive(Clone, serde::Serialize)]
+pub struct ConnSnapshot {
+    pub id: u64,
+    pub target: String,
+    pub inbound: String,
+    pub outbound: String,
+    pub proto: &'static str,
+    pub process: Option<String>,
+    pub age_ms: u128,
+    pub up: u64,
+    pub down: u64,
+    pub closed: bool,
+}
+
+fn snapshot(c: &ConnInfo, closed: bool) -> ConnSnapshot {
+    ConnSnapshot {
+        id: c.id,
+        target: c.target.clone(),
+        inbound: c.inbound.clone(),
+        outbound: c.outbound.clone(),
+        proto: c.proto,
+        process: c.process.clone(),
+        age_ms: c.start.elapsed().as_millis(),
+        up: c.up.load(Ordering::Relaxed),
+        down: c.down.load(Ordering::Relaxed),
+        closed,
+    }
+}
+
+struct Registry {
+    live: HashMap<u64, Arc<ConnInfo>>,
+    closed: VecDeque<ConnSnapshot>,
+}
+
+static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
+    Mutex::new(Registry { live: HashMap::new(), closed: VecDeque::with_capacity(CLOSED_RING_CAP) })
+});
+
+/// relay 侧无锁累加字节的句柄 (Arc 克隆, 可 move 进各方向的 async 块)。
+#[derive(Clone)]
+pub struct ConnCounter(Arc<ConnInfo>);
+
+impl ConnCounter {
+    pub fn up(&self, n: u64) {
+        self.0.up.fetch_add(n, Ordering::Relaxed);
+    }
+    pub fn down(&self, n: u64) {
+        self.0.down.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// 连接生命周期 RAII 句柄: drop 时从活跃表移除并压进最近关闭环。
+pub struct ConnGuard(Arc<ConnInfo>);
+
+impl ConnGuard {
+    pub fn counter(&self) -> ConnCounter {
+        ConnCounter(self.0.clone())
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        reg.live.remove(&self.0.id);
+        let snap = snapshot(&self.0, true);
+        if reg.closed.len() >= CLOSED_RING_CAP {
+            reg.closed.pop_front();
+        }
+        reg.closed.push_back(snap);
+    }
+}
+
+/// 登记一条新连接, 返回生命周期句柄 (drop 即注销)。
+pub fn register(
+    target: String,
+    inbound: String,
+    outbound: String,
+    proto: &'static str,
+    process: Option<String>,
+) -> ConnGuard {
+    let id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let info = Arc::new(ConnInfo {
+        id,
+        target,
+        inbound,
+        outbound,
+        proto,
+        process,
+        start: Instant::now(),
+        up: AtomicU64::new(0),
+        down: AtomicU64::new(0),
+    });
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).live.insert(id, info.clone());
+    ConnGuard(info)
+}
+
+/// (活跃连接快照, 最近关闭快照)。活跃按 id 升序 (稳定展示)。
+pub fn conn_snapshots() -> (Vec<ConnSnapshot>, Vec<ConnSnapshot>) {
+    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut live: Vec<ConnSnapshot> = reg.live.values().map(|c| snapshot(c, false)).collect();
+    live.sort_by_key(|s| s.id);
+    let closed: Vec<ConnSnapshot> = reg.closed.iter().cloned().collect();
+    (live, closed)
+}
+
+/// 当前活跃连接数 (供 overview 卡片, 替换此前硬编码的 0)。
+pub fn live_conn_count() -> usize {
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).live.len()
 }
 
 #[derive(Clone)]
@@ -359,5 +496,65 @@ mod log_rotate_tests {
         for p in [log.clone(), archive_name(&log, 1), archive_name(&log, 2)] {
             let _ = std::fs::remove_file(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod conn_registry_tests {
+    use super::*;
+
+    // REGISTRY 是进程全局单例; 两个测试并行会互相扰动活跃计数, 用锁串行化。
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn register_count_counter_and_drop_to_closed_ring() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base_live = live_conn_count();
+
+        let g1 = register("example.com:443".into(), "socks".into(), "proxy".into(), "tcp", Some("curl".into()));
+        let g2 = register("1.1.1.1:80".into(), "tproxy".into(), "direct".into(), "tcp", None);
+        assert_eq!(live_conn_count(), base_live + 2);
+
+        // 无锁累加
+        g1.counter().up(100);
+        g1.counter().down(250);
+
+        let (active, _) = conn_snapshots();
+        let s1 = active.iter().find(|s| s.id == g1.0.id).expect("g1 在活跃表");
+        assert_eq!((s1.up, s1.down), (100, 250));
+        assert_eq!(s1.target, "example.com:443");
+        assert_eq!(s1.outbound, "proxy");
+        assert_eq!(s1.process.as_deref(), Some("curl"));
+        assert!(!s1.closed);
+        // 活跃按 id 升序
+        let ids: Vec<u64> = active.iter().map(|s| s.id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted);
+
+        let g1_id = g1.0.id;
+        drop(g1);
+        assert_eq!(live_conn_count(), base_live + 1); // g2 仍活跃
+
+        // g1 进最近关闭环, closed=true, 保留最终字节
+        let (_, closed) = conn_snapshots();
+        let c1 = closed.iter().find(|s| s.id == g1_id).expect("g1 入最近关闭环");
+        assert!(c1.closed);
+        assert_eq!((c1.up, c1.down), (100, 250));
+
+        drop(g2);
+        assert_eq!(live_conn_count(), base_live);
+    }
+
+    #[test]
+    fn closed_ring_capped() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 连开连关多于容量, 环长不超过 CLOSED_RING_CAP。
+        for i in 0..(CLOSED_RING_CAP + 20) {
+            let g = register(format!("h{i}:1"), "in".into(), "out".into(), "tcp", None);
+            drop(g);
+        }
+        let (_, closed) = conn_snapshots();
+        assert!(closed.len() <= CLOSED_RING_CAP, "closed ring 超容量: {}", closed.len());
     }
 }
