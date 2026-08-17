@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [icmp, tc-divert, fake-ip, ebpf]
 created: "2026-08-17T13:26:22"
-updated: "2026-08-17T13:26:45"
+updated: "2026-08-17T20:45:31"
 ---
 
 ## compiled_truth
@@ -52,3 +52,9 @@ tc_divert.c 加 ICMP 分支: **仅 fake-IP 段** 的 Echo Request(type8,code0) �
   summary: "先本地反射: tc_divert 对 fake-IP echo 就地回 reply, ping 代理域名可通; 真隧道 RTT 后续"
   source: brain update-truth
   affects: [icmp-fakeip-reflect]
+
+- time: 2026-08-17T20:45:31
+  kind: decision
+  summary: "真隧道 ICMP (第二步) 暂不做: 捕获路径三条 (AF_PACKET/TUN/无) 均待真机且边际价值低, 保留第一步本地反射"
+  source: "对话 2026-08-17"
+  affects: [roadmap]
