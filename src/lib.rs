@@ -454,7 +454,12 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                         // MSS clamp 的 mtu: 取该网卡 MTU (PPPoE 会是 1492), 读不到则 1500。
                         let mtu: u32 = std::fs::read_to_string(format!("/sys/class/net/{}/mtu", iface))
                             .ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1500);
-                        match crate::ebpf::TcDivertEngine::init(port, mtu) {
+                        // fake-IP 段传给 tc_divert 做 ICMP echo 本地反射 (LAN 客户端 ping 代理域名可通)。
+                        // fake-ip 未启用 (mapper None) → 传 0.0.0.0/0, mask=0 关闭反射。
+                        let (fk_net, fk_prefix) = fake_ip_mapper.as_ref()
+                            .map(|fm| (fm.network(), fm.prefix_len()))
+                            .unwrap_or((std::net::Ipv4Addr::UNSPECIFIED, 0));
+                        match crate::ebpf::TcDivertEngine::init(port, mtu, fk_net, fk_prefix) {
                             Ok(engine) => {
                                 let engine = std::sync::Arc::new(engine);
                                 let cidrs = watcher.state.load().direct_v4_cidrs();

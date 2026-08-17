@@ -39,6 +39,8 @@ use nix::sys::socket::{
 struct DivertCfg {
     listen_port: u32,
     mtu: u32,
+    fakeip_net: u32,
+    fakeip_mask: u32,
 }
 unsafe impl aya::Pod for DivertCfg {}
 
@@ -51,7 +53,7 @@ fn do_attach() -> anyhow::Result<()> {
     let mut bpf = Ebpf::load(ELF)?;
     {
         let mut cfg = Array::<_, DivertCfg>::try_from(bpf.map_mut("tc_divert_cfg").unwrap())?;
-        cfg.set(0, DivertCfg { listen_port: LPORT as u32, mtu: 0 }, 0)?;
+        cfg.set(0, DivertCfg { listen_port: LPORT as u32, mtu: 0, ..Default::default() }, 0)?;
     }
     {
         let mut trie = LpmTrie::<_, u32, u8>::try_from(bpf.map_mut("direct_cidr").unwrap())?;

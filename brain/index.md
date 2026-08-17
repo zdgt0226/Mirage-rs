@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-08-17T01:27:11.913Z._
+_Auto-generated. Last updated 2026-08-17T05:27:26.103Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -24,6 +24,7 @@ _Auto-generated. Last updated 2026-08-17T01:27:11.913Z._
 - [handshake-forward-secrecy](pages/handshake-forward-secrecy.md) — category: decision | tags: [security, forward-secrecy, handshake, x25519, pfs] | ## 决策
 - [handshake-template-completeness](pages/handshake-template-completeness.md) — category: decision | tags: [handshake, camouflage, tls, cache] | ## 不变量
 - [high-throughput-dataplane-reservation](pages/high-throughput-dataplane-reservation.md) — category: decision | <current best understanding — replace this with the real content>
+- [icmp-fakeip-reflect](pages/icmp-fakeip-reflect.md) — category: decision | tags: [icmp, tc-divert, fake-ip, ebpf] | 路线图 #6 ICMP 处理第一步。
 - [ipv6-full-stack-design](pages/ipv6-full-stack-design.md) — category: decision | tags: [ipv6, transparent, ebpf, fakeip, tc_divert, roadmap] | **决定 (2026-07-30 瘦身)**: 原"整条透明数据面 v6"大 epic (fake-v6/tc_divert v6/sk_lookup v6/v6 listener/direct_cidr6) **评估后否**。
 - [ipv6-v4only-tradeoff](pages/ipv6-v4only-tradeoff.md) — category: decision | **现状**:透明路径整条 **IPv4-only**。
 - [lan-host-monitor-device-rules](pages/lan-host-monitor-device-rules.md) — category: decision | tags: [roadmap, lan, monitoring, ebpf, routing, webui] | **计划池** (2026-07-29 定, 随 WebUI 优化再开发)。
