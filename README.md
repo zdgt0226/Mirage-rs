@@ -30,7 +30,7 @@
 
 * **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（多浏览器 Profile 轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。
 * **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关（向后兼容），认证仍靠口令、与加密解耦（对标 REALITY）。
-* **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
+* **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
 * **内置 Web 看板**: Neon Pulse Dashboard，实时监控流速、eBPF 拦截率，并支持可视化热重载规则。
@@ -375,7 +375,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道
 - [~] **链式代理 / WG·SS 双向** —— SS 双向 (入站+出站) · Mirage 套娃 · SS-over-Mirage 已做 (v0.8.1); **WG 入站**改用"干净设备"落地 (内核 WG 服务端 + 现有 eBPF 透明网关, install.sh 选项 7, 非 boringtun responder) —— 见上方「干净设备接入」。剩自定义转发编排增强
 - [ ] **UDP mux → QUIC Datagram** —— TCP-mux 已解带机量 (v0.9.0); QUIC 版解跨流队头阻塞 + 实时质量, 大工程
-- [ ] **ICMP 处理** —— ping/traceroute 被代理域名当前不通 (待真机确认失败形态)
+- [~] **ICMP 处理** —— ①fake-IP echo **本地反射已做** (未发版): LAN 客户端 `ping` 被代理域名可通 —— `tc_divert` 就地把 fake-IP 段的 Echo Request 翻成 Echo Reply 弹回 (RTT 是本机假值, 对齐 Clash/sing-box fake-ip ping)。②真隧道 ICMP (端到端真 RTT) **评估后暂不做**: 捕获路径 (AF_PACKET / TUN / 无) 均需真机验证, TUN 违背 TUN-free eBPF 定位, 边际价值低 (应用走 TCP)。本机自身 ping fake-IP 不经 tc ingress, 暂不覆盖。
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
 - [ ] **隧道 relay 缓冲/合帧再调** —— 当前 BufWriter 64KB, 高 BDP 链路可能有余量
 - [ ] **io_uring 替代 relay 的 read/write 循环** —— 大工程, 高并发小包收益明显
