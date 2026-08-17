@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(webui): 连接面板前端 (Phase 2)
+
+WebUI 重构 Phase 2: 消费 Phase 1 的 `/api/connections`, Neon Dashboard 加「Active
+Connections」面板 (放在 Outbounds 与 BPF Tunnels 之间)。
+
+- 活跃连接表: TARGET (域名:端口) · ROUTE (入站 → 出站, direct 灰/block 红/代理绿) ·
+  PROTO · PROCESS · AGE · ↑上行/↓下行 (human bytes)。1Hz 轮询, 复用 `setHtmlIfChanged`
+  差量刷新 (无闪烁)。
+- 「RECENT CLOSED」段: 最近关闭连接 (新在前, 最多 20 条, 半透明)，看"刚才谁连了哪"。
+- 纯前端 (index.html, include_str 编译进二进制); 字节/时长格式化 + HTML 转义自带。
+
 ### feat(webui): 活跃连接登记表 + /api/connections (域名连接信息, Phase 1)
 
 WebUI 重构 Phase 1 (纯后端): 补「域名连接信息」数据源。此前 `/api/overview` 的

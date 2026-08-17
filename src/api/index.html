@@ -449,6 +449,13 @@
         </div>
 
         <div class="panel full-width">
+            <h2>Active Connections <span id="connCount" style="font-size: 0.7em; color: var(--text-muted); font-weight: normal;">(0 active)</span></h2>
+            <div id="connectionsContainer" style="overflow-x: auto;">
+                <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading connections...</div>
+            </div>
+        </div>
+
+        <div class="panel full-width">
             <h2>Active BPF Tunnels <span id="tunnelCount" style="font-size: 0.7em; color: var(--text-muted); font-weight: normal;">(0 active)</span></h2>
             <div id="tunnelsContainer" style="overflow-x: auto;">
                 <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading tunnels...</div>
@@ -984,12 +991,82 @@
             setHtmlIfChanged('tunnelsContainer', html);
         }
 
+        // ── Active Connections (域名连接信息, /api/connections) ──────────────
+        function connEsc(s) { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; }
+        function fmtBytes(n) {
+            n = Number(n) || 0;
+            if (n < 1024) return n + ' B';
+            const u = ['KB', 'MB', 'GB', 'TB']; let i = -1, v = n;
+            do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
+            return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+        }
+        function fmtAge(ms) {
+            const s = Math.floor((Number(ms) || 0) / 1000);
+            if (s < 60) return s + 's';
+            const m = Math.floor(s / 60);
+            if (m < 60) return m + 'm' + (s % 60) + 's';
+            const h = Math.floor(m / 60);
+            return h + 'h' + (m % 60) + 'm';
+        }
+        function connTable(rows, closed) {
+            let h = '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
+            h += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
+            h += '<th style="padding: 8px 6px;">TARGET</th><th style="padding: 8px 6px;">ROUTE</th>';
+            h += '<th style="padding: 8px 6px;">PROTO</th><th style="padding: 8px 6px;">PROCESS</th>';
+            h += '<th style="padding: 8px 6px;">AGE</th><th style="padding: 8px 6px; text-align: right;">↑ / ↓</th></tr></thead><tbody>';
+            rows.forEach(c => {
+                const routeColor = c.outbound === 'direct' ? 'var(--text-muted)'
+                    : (c.outbound === 'block' ? '#ef4444' : '#10b981');
+                const op = closed ? 0.55 : 1;
+                h += `<tr style="border-top: 1px solid rgba(255,255,255,0.05); opacity: ${op};">`;
+                h += `<td style="padding: 8px 6px; color: var(--text-main);">${connEsc(c.target)}</td>`;
+                h += `<td style="padding: 8px 6px;"><span style="color: var(--text-muted);">${connEsc(c.inbound)}</span> → <span style="color: ${routeColor};">${connEsc(c.outbound)}</span></td>`;
+                h += `<td style="padding: 8px 6px; color: var(--text-muted);">${connEsc(c.proto)}</td>`;
+                h += `<td style="padding: 8px 6px; color: var(--text-muted);">${c.process ? connEsc(c.process) : '—'}</td>`;
+                h += `<td style="padding: 8px 6px; color: var(--text-muted);">${fmtAge(c.age_ms)}</td>`;
+                h += `<td style="padding: 8px 6px; text-align: right;">↑${fmtBytes(c.up)} <span style="color: var(--text-muted);">/</span> ↓${fmtBytes(c.down)}</td>`;
+                h += '</tr>';
+            });
+            h += '</tbody></table>';
+            return h;
+        }
+        async function fetchConnections() {
+            let data;
+            try {
+                const res = await fetch('/api/connections');
+                data = await res.json();
+            } catch (e) {
+                setHtmlIfChanged('connectionsContainer',
+                    '<div style="color: #ef4444; padding: 20px;">Failed to load connections.</div>');
+                return;
+            }
+            const active = data.active || [];
+            const recent = data.recent_closed || [];
+            const label = `(${active.length} active)`;
+            const countEl = document.getElementById('connCount');
+            if (countEl.innerText !== label) countEl.innerText = label;
+
+            let html = '';
+            if (active.length === 0) {
+                html += '<div style="color: var(--text-muted); text-align: center; padding: 20px;">No active connections.</div>';
+            } else {
+                html += connTable(active, false);
+            }
+            if (recent.length) {
+                // 最近关闭: 新的在前, 最多 20 条
+                html += '<div style="margin-top: 16px; color: var(--text-muted); font-size: 0.8em; letter-spacing: 1px;">RECENT CLOSED (' + recent.length + ')</div>';
+                html += connTable(recent.slice().reverse().slice(0, 20), true);
+            }
+            setHtmlIfChanged('connectionsContainer', html);
+        }
+
         setInterval(fetchOverview, 1000);
         setInterval(fetchLogs, 2000);
         setInterval(fetchProxies, 5000);
         setInterval(fetchTunnels, 1000);
+        setInterval(fetchConnections, 1000);
 
-        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules(); fetchTunnels();
+        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules(); fetchTunnels(); fetchConnections();
     </script>
 </body>
 </html>
