@@ -80,6 +80,28 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
     Mutex::new(Registry { live: HashMap::new(), closed: VecDeque::with_capacity(CLOSED_RING_CAP) })
 });
 
+/// per-出站累计统计 (WebUI「分流量」)。up/down/conns 累计, 跨连接生命周期存活 ——
+/// 连接进登记环会被淘汰, 但累计量不丢。live 数在快照时从 REGISTRY 现算 (不在此存)。
+#[derive(Default, Clone)]
+struct OutboundAgg {
+    up: u64,
+    down: u64,
+    conns: u64,
+}
+
+static OUTBOUND_STATS: LazyLock<Mutex<HashMap<String, OutboundAgg>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 单个出站的统计快照 (API 用)。
+#[derive(Clone, serde::Serialize)]
+pub struct OutboundStat {
+    pub tag: String,
+    pub up: u64,
+    pub down: u64,
+    pub conns: u64, // 累计连接数
+    pub live: u64,  // 当前活跃连接数
+}
+
 /// relay 侧无锁累加字节的句柄 (Arc 克隆, 可 move 进各方向的 async 块)。
 #[derive(Clone)]
 pub struct ConnCounter(Arc<ConnInfo>);
@@ -111,6 +133,14 @@ impl Drop for ConnGuard {
             reg.closed.pop_front();
         }
         reg.closed.push_back(snap);
+        drop(reg);
+        // per-出站累计字节 (连接终态才有 splice/WG 的最终量; Mirage 的 live 累加也在此定格)。
+        let up = self.0.up.load(Ordering::Relaxed);
+        let down = self.0.down.load(Ordering::Relaxed);
+        let mut os = OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let agg = os.entry(self.0.outbound.clone()).or_default();
+        agg.up += up;
+        agg.down += down;
     }
 }
 
@@ -134,8 +164,34 @@ pub fn register(
         up: AtomicU64::new(0),
         down: AtomicU64::new(0),
     });
+    // per-出站累计连接数 +1 (登记即计, 与字节在 drop 时补齐)。
+    OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner())
+        .entry(info.outbound.clone()).or_default().conns += 1;
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).live.insert(id, info.clone());
     ConnGuard(info)
+}
+
+/// per-出站统计快照 (累计 up/down/conns + 当前活跃 live)。live 从活跃登记表现算。
+pub fn outbound_stats() -> Vec<OutboundStat> {
+    // 现算每个出站的活跃连接数。
+    let mut live: HashMap<String, u64> = HashMap::new();
+    {
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        for c in reg.live.values() {
+            *live.entry(c.outbound.clone()).or_insert(0) += 1;
+        }
+    }
+    let os = OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<OutboundStat> = os.iter().map(|(tag, a)| OutboundStat {
+        tag: tag.clone(),
+        up: a.up,
+        down: a.down,
+        conns: a.conns,
+        live: live.get(tag).copied().unwrap_or(0),
+    }).collect();
+    // 累计流量降序 (大头在前)。
+    out.sort_by(|a, b| (b.up + b.down).cmp(&(a.up + a.down)).then(a.tag.cmp(&b.tag)));
+    out
 }
 
 /// (活跃连接快照, 最近关闭快照)。活跃按 id 升序 (稳定展示)。

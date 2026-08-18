@@ -456,6 +456,13 @@
         </div>
 
         <div class="panel full-width">
+            <h2>Traffic by Outbound &amp; Rule Hits</h2>
+            <div id="statsContainer" style="overflow-x: auto;">
+                <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading stats...</div>
+            </div>
+        </div>
+
+        <div class="panel full-width">
             <h2>Active BPF Tunnels <span id="tunnelCount" style="font-size: 0.7em; color: var(--text-muted); font-weight: normal;">(0 active)</span></h2>
             <div id="tunnelsContainer" style="overflow-x: auto;">
                 <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading tunnels...</div>
@@ -1108,13 +1115,74 @@
             setHtmlIfChanged('connectionsContainer', html);
         }
 
+        // ── Traffic by Outbound & Rule Hits (/api/stats) ─────────────────────
+        async function fetchStats() {
+            let data;
+            try {
+                const res = await fetch('/api/stats');
+                data = await res.json();
+            } catch (e) {
+                setHtmlIfChanged('statsContainer', '<div style="color: #ef4444; padding: 20px;">Failed to load stats.</div>');
+                return;
+            }
+            const outbounds = data.outbounds || [];
+            const rules = data.rules || [];
+            const def = data.default || { outbound: '', hits: 0 };
+
+            // 出站分流量表
+            let html = '<div style="color: var(--text-muted); font-size: 0.8em; letter-spacing: 1px; margin-bottom: 8px;">BY OUTBOUND</div>';
+            if (outbounds.length === 0) {
+                html += '<div style="color: var(--text-muted); padding: 8px 6px;">No traffic yet.</div>';
+            } else {
+                html += '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
+                html += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
+                html += '<th style="padding: 8px 6px;">OUTBOUND</th><th style="padding: 8px 6px; text-align: right;">LIVE</th>';
+                html += '<th style="padding: 8px 6px; text-align: right;">CONNS</th><th style="padding: 8px 6px; text-align: right;">↑ UP</th><th style="padding: 8px 6px; text-align: right;">↓ DOWN</th></tr></thead><tbody>';
+                outbounds.forEach(o => {
+                    const c = o.outbound === 'direct' ? 'var(--text-muted)' : (o.outbound === 'block' ? '#ef4444' : '#10b981');
+                    html += `<tr style="border-top: 1px solid rgba(255,255,255,0.05);">`;
+                    html += `<td style="padding: 8px 6px; color: ${c};">${connEsc(o.tag)}</td>`;
+                    html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-main);">${o.live}</td>`;
+                    html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-muted);">${o.conns}</td>`;
+                    html += `<td style="padding: 8px 6px; text-align: right;">${fmtBytes(o.up)}</td>`;
+                    html += `<td style="padding: 8px 6px; text-align: right;">${fmtBytes(o.down)}</td>`;
+                    html += '</tr>';
+                });
+                html += '</tbody></table>';
+            }
+
+            // 规则命中表
+            html += '<div style="color: var(--text-muted); font-size: 0.8em; letter-spacing: 1px; margin: 16px 0 8px;">RULE HITS <span style="text-transform: none; letter-spacing: 0;">(自本次配置加载起)</span></div>';
+            html += '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
+            html += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
+            html += '<th style="padding: 8px 6px;">#</th><th style="padding: 8px 6px;">OUTBOUND</th><th style="padding: 8px 6px; text-align: right;">HITS</th></tr></thead><tbody>';
+            rules.forEach(r => {
+                const c = r.outbound === 'direct' ? 'var(--text-muted)' : (r.outbound === 'block' ? '#ef4444' : '#10b981');
+                const dim = r.hits === 0 ? 'opacity: 0.5;' : '';
+                html += `<tr style="border-top: 1px solid rgba(255,255,255,0.05); ${dim}">`;
+                html += `<td style="padding: 8px 6px; color: var(--text-muted);">${r.index}</td>`;
+                html += `<td style="padding: 8px 6px; color: ${c};">${connEsc(r.outbound)}</td>`;
+                html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-main);">${r.hits.toLocaleString()}</td>`;
+                html += '</tr>';
+            });
+            const dc = def.outbound === 'direct' ? 'var(--text-muted)' : (def.outbound === 'block' ? '#ef4444' : '#10b981');
+            html += `<tr style="border-top: 1px solid rgba(255,255,255,0.12);">`;
+            html += `<td style="padding: 8px 6px; color: var(--text-muted);">default</td>`;
+            html += `<td style="padding: 8px 6px; color: ${dc};">${connEsc(def.outbound)}</td>`;
+            html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-main);">${(def.hits || 0).toLocaleString()}</td>`;
+            html += '</tr></tbody></table>';
+
+            setHtmlIfChanged('statsContainer', html);
+        }
+
         setInterval(fetchOverview, 1000);
         setInterval(fetchLogs, 2000);
         setInterval(fetchProxies, 5000);
         setInterval(fetchTunnels, 1000);
         setInterval(fetchConnections, 1000);
+        setInterval(fetchStats, 2000);
 
-        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules(); fetchTunnels(); fetchConnections();
+        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules(); fetchTunnels(); fetchConnections(); fetchStats();
     </script>
 </body>
 </html>

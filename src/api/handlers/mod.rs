@@ -4,6 +4,7 @@
 
 pub mod overview;
 pub mod connections;
+pub mod stats;
 pub mod bpf_tunnels;
 pub mod history;
 pub mod logs;

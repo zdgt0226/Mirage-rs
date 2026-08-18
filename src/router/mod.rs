@@ -3,9 +3,13 @@ use ipnet::{IpNet, Ipv4Net};
 use regex::RegexSet;
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type OutboundTag = String;
 pub type RuleId = usize;
+
+/// 规则命中统计: (每条规则的 (index, outbound, hits), (默认出口, 默认命中数))。见 hit_stats()。
+pub type RuleHitStats = (Vec<(usize, String, u64)>, (String, u64));
 
 /// 两个 v4 CIDR 是否重叠 (较短前缀的一方包含另一方的网络地址即重叠)。
 fn cidr_overlaps(a: &Ipv4Net, b: &Ipv4Net) -> bool {
@@ -249,6 +253,12 @@ pub struct RouterEngine {
     // 所有解析后的 v4 CIDR 及其所属规则 (ip_cidr 手动 + geoip/geosite 解析统一在此)。
     // 供 eBPF tc_divert direct_cidr map 用, 见 direct_v4_cidrs()。
     all_v4_cidrs: Vec<(Ipv4Net, RuleId)>,
+
+    // 规则命中计数 (WebUI 规则命中统计)。索引与 rule_table 对齐; default_hits = 无规则命中
+    // 走默认出口的次数。随本 engine 生命周期 —— 配置热重载重建 engine 即归零 (= 本次配置期内
+    // 的命中量, 语义清晰)。route_matched 命中时 +1, 只读 &self (原子)。
+    hit_counts: Vec<AtomicU64>,
+    default_hits: AtomicU64,
 }
 
 pub struct RoutingRequest<'a> {
@@ -488,6 +498,7 @@ impl RouterEngine {
             None
         };
 
+        let hit_counts = (0..rules.len()).map(|_| AtomicU64::new(0)).collect();
         Ok(Self {
             domain_trie,
             keyword_matcher,
@@ -498,7 +509,18 @@ impl RouterEngine {
             rule_table: rules,
             default_outbound,
             all_v4_cidrs,
+            hit_counts,
+            default_hits: AtomicU64::new(0),
         })
+    }
+
+    /// 规则命中统计快照: (rule_index, outbound, hits) 列表 + (默认出口, 默认命中数)。
+    /// 供 GET /api/stats。索引即 config routing.rules 里的顺序。
+    pub fn hit_stats(&self) -> RuleHitStats {
+        let rules = self.rule_table.iter().enumerate()
+            .map(|(i, r)| (i, r.outbound.clone(), self.hit_counts[i].load(Ordering::Relaxed)))
+            .collect();
+        (rules, (self.default_outbound.clone(), self.default_hits.load(Ordering::Relaxed)))
     }
 
     /// 收集会被"直连"的 v4 CIDR 集, 供 eBPF tc_divert 的 direct_cidr map 用作内核
@@ -538,6 +560,7 @@ impl RouterEngine {
                 req.domain.map(|d| d.to_string()).or_else(|| req.ip.map(|i| i.to_string())).unwrap_or_else(|| "?".into()),
                 req.port, req.protocol, self.default_outbound
             );
+            self.default_hits.fetch_add(1, Ordering::Relaxed);
             self.default_outbound.clone()
         })
     }
@@ -626,6 +649,7 @@ impl RouterEngine {
                     rule.outbound,
                     id
                 );
+                self.hit_counts[id].fetch_add(1, Ordering::Relaxed);
                 return Some(rule.outbound.clone());
             }
         }
@@ -947,6 +971,24 @@ mod inbound_tests {
         ]);
         assert_eq!(e.route(req("example.com", Some("in-a"))), "via_a");
         assert_eq!(e.route(req("example.com", Some("in-b"))), "via_b");
+    }
+
+    /// 规则命中计数 (WebUI Phase 4): 命中规则 +1, 无命中走默认 +1。
+    #[test]
+    fn hit_counts_track_rule_and_default() {
+        let e = engine(vec![
+            rule_for_inbound(0, "via_a", vec![]), // 匹配 example.com
+            rule_for_inbound(1, "via_b", vec![]), // 同样匹配, 但规则 0 先命中 → 规则 1 永远 0
+        ]);
+        e.route(req("example.com", None)); // 命中规则 0
+        e.route(req("example.com", None)); // 命中规则 0
+        e.route(req("other.org", None)); // 无匹配 → 默认
+
+        let (rules, (default_ob, default_hits)) = e.hit_stats();
+        assert_eq!(rules[0], (0, "via_a".to_string(), 2));
+        assert_eq!(rules[1], (1, "via_b".to_string(), 0));
+        assert_eq!(default_ob, "default");
+        assert_eq!(default_hits, 1);
     }
 
     /// 不带 `inbound` 条件的规则对所有入站生效 (向后兼容: 老配置行为不变)。
