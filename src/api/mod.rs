@@ -232,6 +232,7 @@ pub async fn start_server(
     let app = Router::new()
         .route("/api/overview", get(handlers::overview::get_overview))
         .route("/api/connections", get(handlers::connections::get_connections))
+        .route("/api/stats", get(handlers::stats::get_stats))
         .route("/api/history", get(handlers::history::get_history))
         .route("/api/logs", get(handlers::logs::get_logs))
         .route("/api/proxies", get(handlers::proxies::get_proxies))

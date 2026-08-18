@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(webui): per-出站分流量 + 规则命中统计 (Phase 4)
+
+WebUI 重构 Phase 4: 新 `GET /api/stats` + 前端「Traffic by Outbound & Rule Hits」面板。
+
+- **per-出站统计**: 每个出站 tag 的累计上下行字节 + 累计连接数 + 当前活跃数。源: monitor
+  连接登记表 —— register 时出站连接数 +1, 连接关闭时把终态字节累加进该出站 (累计量跨连接
+  存活, 不随登记环淘汰而丢)。活跃数快照时从活跃表现算。
+- **规则命中统计**: router 每条规则一个原子命中计数, `route_matched` 命中即 +1; 无规则命中
+  走默认出口记 `default_hits`。随 engine 生命周期 —— 配置热重载重建 engine 即归零 (= 本次
+  配置期内命中量)。索引对齐 config routing.rules 顺序, 便于对照哪条规则在起作用/是死规则。
+- 前端面板: BY OUTBOUND 表 (OUTBOUND·LIVE·CONNS·↑·↓, 按流量降序) + RULE HITS 表
+  (#·OUTBOUND·HITS, 0 命中半透明标识死规则, 附 default 行), 2Hz 差量刷新。
+- 真机 smoke: 规则命中 (example.com→规则0 hits=1, 默认 hits=1) + per-出站字节/连接数均实测正确。
+  router 命中计数单测锁行为。348→349 lib + 全集成 + clippy 0。
+
 ### feat(webui): 路由规则编辑器增强 (Phase 3)
 
 WebUI 重构 Phase 3: 补齐规则编辑器的维度与安全性 (后端 `/api/rules` 早已含 dry_run
