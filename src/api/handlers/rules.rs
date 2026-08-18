@@ -13,7 +13,12 @@ pub async fn get_rules(State(app_state): State<AppState>) -> Json<Value> {
     if let Ok(content) = tokio::fs::read_to_string(&app_state.config_path).await {
         if let Ok(v) = serde_json::from_str::<Value>(&content) {
             if let Some(rules) = v.get("routing").and_then(|r| r.get("rules")) {
-                return Json(json!({"status": "success", "rules": rules}));
+                // 出站 tag 列表 (供前端 outbound 下拉建议); 从 config.outbounds[].tag 取, 与规则同源 authoritative。
+                let outbounds: Vec<&str> = v.get("outbounds")
+                    .and_then(|o| o.as_array())
+                    .map(|arr| arr.iter().filter_map(|o| o.get("tag").and_then(|t| t.as_str())).collect())
+                    .unwrap_or_default();
+                return Json(json!({"status": "success", "rules": rules, "outbounds": outbounds}));
             }
         }
     }
@@ -28,8 +33,18 @@ pub struct UpdateRulesReq {
 #[derive(Deserialize, Default)]
 pub struct UpdateRulesQuery {
     /// `?dry_run=1`: 只校验候选配置, 不落盘 (前端"保存前预检")。
-    #[serde(default)]
+    /// axum 的 Query 对裸 `bool` 只认 `true`/`false`, 但本参数文档契约是 `=1` ——
+    /// 用 flexible 反序列化同时吃 `1`/`true`/`yes`/`on`, 否则 `?dry_run=1` 会 400。
+    #[serde(default, deserialize_with = "de_flexible_bool")]
     pub dry_run: bool,
+}
+
+fn de_flexible_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    Ok(matches!(s.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 pub async fn update_rules(

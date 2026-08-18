@@ -749,6 +749,7 @@
         }
 
         let currentRules = [];
+        let availableOutbounds = [];
 
         async function fetchRules() {
             try {
@@ -756,6 +757,7 @@
                 const data = await res.json();
                 if (data.status === 'success') {
                     currentRules = data.rules || [];
+                    availableOutbounds = data.outbounds || [];
                     renderRules();
                 }
             } catch(e) {}
@@ -768,16 +770,18 @@
                 return;
             }
             
-            let html = '';
+            // outbound 下拉建议 (datalist, authoritative 从后端 config.outbounds 取; 仍可自由输入)
+            const dlOpts = availableOutbounds.map(t => `<option value="${connEsc(t)}"></option>`).join('');
+            let html = `<datalist id="outboundOptions">${dlOpts}</datalist>`;
             currentRules.forEach((rule, idx) => {
                 const outbound = rule.outbound || '';
-                
+
                 const renderField = (key, label) => {
                     const vals = rule[key] || [];
                     let tagsHtml = vals.map((v, vIdx) => `
-                        <div class="rule-tag">${v} <span onclick="removeRuleItem(${idx}, '${key}', ${vIdx})">×</span></div>
+                        <div class="rule-tag">${connEsc(String(v))} <span onclick="removeRuleItem(${idx}, '${key}', ${vIdx})">×</span></div>
                     `).join('');
-                    
+
                     return `
                         <div class="rule-field">
                             <label>${label}</label>
@@ -790,24 +794,35 @@
                     `;
                 };
 
+                // 首命中即用 → 顺序关键, 提供上下移。
+                const upBtn = idx > 0 ? `<button class="btn-add" title="上移" onclick="moveRule(${idx}, -1)">↑</button>` : '';
+                const downBtn = idx < currentRules.length - 1 ? `<button class="btn-add" title="下移" onclick="moveRule(${idx}, 1)">↓</button>` : '';
+
                 html += `
                     <div class="rule-card">
                         <div class="rule-header">
                             <strong>Rule #${idx + 1}</strong>
-                            <button class="btn-remove" onclick="removeRule(${idx})">Delete Rule</button>
+                            <div style="display: flex; gap: 6px; align-items: center;">
+                                ${upBtn}${downBtn}
+                                <button class="btn-remove" onclick="removeRule(${idx})">Delete Rule</button>
+                            </div>
                         </div>
                         <div class="rule-fields">
                             <div class="rule-field">
                                 <label>Outbound</label>
-                                <input type="text" value="${outbound}" onchange="updateRuleOutbound(${idx}, this.value)" placeholder="e.g. proxy, direct">
+                                <input type="text" list="outboundOptions" value="${connEsc(outbound)}" onchange="updateRuleOutbound(${idx}, this.value)" placeholder="e.g. proxy, direct">
                             </div>
                             ${renderField('domain_suffix', 'Domain Suffix')}
                             ${renderField('domain_keyword', 'Domain Keyword')}
+                            ${renderField('domain_regex', 'Domain Regex')}
                             ${renderField('geosite', 'Geosite')}
                             ${renderField('ip_cidr', 'IP CIDR')}
                             ${renderField('geoip', 'GeoIP')}
                             ${renderField('source_ip_cidr', 'Source IP')}
+                            ${renderField('process_name', 'Process Name')}
+                            ${renderField('inbound', 'Inbound')}
                             ${renderField('protocol', 'Protocol')}
+                            ${renderField('port', 'Port')}
                         </div>
                     </div>
                 `;
@@ -831,12 +846,27 @@
 
         function addRuleItem(ruleIdx, key) {
             const input = document.getElementById(`input_${ruleIdx}_${key}`);
-            const val = input.value.trim();
-            if (val) {
-                if (!currentRules[ruleIdx][key]) currentRules[ruleIdx][key] = [];
-                currentRules[ruleIdx][key].push(val);
-                renderRules();
+            let val = input.value.trim();
+            if (!val) return;
+            // port 是数字数组 (Vec<u16>): 字符串 "443" 反序列化不成 u16, 必须存 Number 并校验范围。
+            if (key === 'port') {
+                const n = parseInt(val, 10);
+                if (!Number.isInteger(n) || n < 1 || n > 65535) {
+                    alert('Port 必须是 1–65535 的整数');
+                    return;
+                }
+                val = n;
             }
+            if (!currentRules[ruleIdx][key]) currentRules[ruleIdx][key] = [];
+            currentRules[ruleIdx][key].push(val);
+            renderRules();
+        }
+
+        function moveRule(idx, dir) {
+            const j = idx + dir;
+            if (j < 0 || j >= currentRules.length) return;
+            [currentRules[idx], currentRules[j]] = [currentRules[j], currentRules[idx]];
+            renderRules();
         }
 
         function removeRuleItem(ruleIdx, key, itemIdx) {
@@ -847,17 +877,34 @@
             renderRules();
         }
 
+        async function postRules(dryRun) {
+            const res = await fetch('/api/rules' + (dryRun ? '?dry_run=1' : ''), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: JSON.stringify({ rules: currentRules })
+            });
+            return res.json();
+        }
+
         async function saveRules() {
             try {
-                const res = await fetch('/api/rules', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Requested-With': 'XMLHttpRequest'
-                    },
-                    body: JSON.stringify({ rules: currentRules })
-                });
-                const data = await res.json();
+                // 1. 先 dry_run 预检: 后端整份候选 config 结构+语义校验, 不落盘。
+                //    结构非法 (status=error) → 拒绝保存, 别把配置写坏; 只是语义告警 (issues) → 提示后可继续。
+                const dry = await postRules(true);
+                if (dry.status !== 'success') {
+                    alert('校验未通过, 未保存:\n' + (dry.message || '未知错误'));
+                    return;
+                }
+                const issues = dry.issues || [];
+                if (issues.length > 0 &&
+                    !confirm('规则有以下告警 (不阻断, 但请确认):\n\n• ' + issues.join('\n• ') + '\n\n仍要保存并应用?')) {
+                    return;
+                }
+                // 2. 真正写入 + 热重载。
+                const data = await postRules(false);
                 if (data.status === 'success') {
                     const btn = document.querySelector('.btn-save');
                     const oldText = btn.innerText;
@@ -867,8 +914,9 @@
                         btn.innerText = oldText;
                         btn.style.background = '';
                     }, 2000);
+                    fetchRules(); // 回读确认落盘结果 (兼顾 config 多写者竞态, 见 brain config-write-race)
                 } else {
-                    alert('Error saving rules: ' + data.message);
+                    alert('Error saving rules: ' + (data.message || '未知错误'));
                 }
             } catch(e) {
                 alert('Failed to save rules!');
