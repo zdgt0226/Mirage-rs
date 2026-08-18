@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### feat(webui): 路由规则编辑器增强 (Phase 3)
+
+WebUI 重构 Phase 3: 补齐规则编辑器的维度与安全性 (后端 `/api/rules` 早已含 dry_run
+校验, 此前前端未用)。
+
+- **补维度字段**: `domain_regex` / `process_name` / `inbound` / `port` (此前只有
+  suffix/keyword/geosite/ip_cidr/geoip/source_ip_cidr/protocol)。process_name 打通
+  "TG 走代理 / 微信直连" 类进程分流的可视化配置。port 存 Number 并校验 1–65535
+  (Vec<u16> 反序列化不吃字符串)。
+- **Save 前 dry_run 预检**: 先 `POST /api/rules?dry_run=1` 整份候选 config 结构+语义
+  校验; 结构非法直接拒绝 (不写坏配置), 仅语义告警则弹确认后再写。写后回读确认落盘
+  (兼顾 config 多写者竞态, 见 brain config-write-race)。
+- **规则上下移** (↑/↓): 路由首命中即用, 顺序关键, 之前只能删+重加。
+- **outbound 下拉建议** (datalist): `GET /api/rules` 新增 `outbounds` 字段 (从
+  config.outbounds[].tag 取, authoritative), 前端做输入建议防手误, 仍可自由输入。
+- 纯前端 + 一处后端小改 (get_rules 附 outbound 标签); 全用现成校验/热重载。
+
 ### feat(webui): 连接面板前端 (Phase 2)
 
 WebUI 重构 Phase 2: 消费 Phase 1 的 `/api/connections`, Neon Dashboard 加「Active
