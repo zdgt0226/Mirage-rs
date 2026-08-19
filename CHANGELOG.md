@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.9.6] - WebUI 重构 (连接可视化 + 规则编辑器 + 分流统计) + fake-IP ICMP 反射 (2026-08-19)
+
 ### feat(webui): 透明 UDP 连接纳入登记表 (Phase 1b)
 
 WebUI 重构 Phase 1b: 透明 UDP flow 进连接登记表 (此前只有 TCP)。
