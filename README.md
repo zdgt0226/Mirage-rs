@@ -377,14 +377,14 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [ ] **UDP mux → QUIC Datagram** —— TCP-mux 已解带机量 (v0.9.0); QUIC 版解跨流队头阻塞 + 实时质量, 大工程
 - [~] **ICMP 处理** —— ①fake-IP echo **本地反射已做** (未发版): LAN 客户端 `ping` 被代理域名可通 —— `tc_divert` 就地把 fake-IP 段的 Echo Request 翻成 Echo Reply 弹回 (RTT 是本机假值, 对齐 Clash/sing-box fake-ip ping)。②真隧道 ICMP (端到端真 RTT) **评估后暂不做**: 捕获路径 (AF_PACKET / TUN / 无) 均需真机验证, TUN 违背 TUN-free eBPF 定位, 边际价值低 (应用走 TCP)。本机自身 ping fake-IP 不经 tc ingress, 暂不覆盖。
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
-- [~] **隧道 relay 缓冲/合帧再调** —— 客户端**上行**已对称服务端 download 加 64KB heap buf + greedy `try_read` 收割 (单 read 后非阻塞收割 kernel 已到达数据 → 单 `send_data` → BufWriter 合成单 write syscall), 修上下行不对称的上传碎片 (未发版)。BufWriter(68KB) 与全局 read 尺寸暂不灌大 (256KB 投机 + BufWriter 挂每条 warm 池隧道空闲吃内存, 待实测高 BDP 瓶颈)
-- [ ] **io_uring 替代 relay 的 read/write 循环** —— 大工程, 高并发小包收益明显
+- [x] **隧道 relay 缓冲/合帧再调** —— 客户端**上行**已对称服务端 download 加 64KB heap buf + greedy `try_read` 收割 (修上下行不对称的上传碎片, 未发版)。**BufWriter/全局 read 灌大 (256KB) 评估后不做**: loopback bench 证明 relay 是 crypto CPU-bound 非 syscall-bound (见下 io_uring 条), 灌大不解瓶颈反增 warm 池空闲内存
 
 ### 评估后决定不做（避免重复提）
 
 - **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
 - **TLS session resumption 仿真** —— 抓包 + 统计实测证明: 真 Chrome 的 `legacy_session_id` 也每次全新随机, 我们与之不可区分, 立项前提不成立
 - **追平 sing-box 全部协议/规则** —— 定位是零配置 eBPF 网关, 不是通用代理框架
+- **io_uring 替代 relay read/write 循环** —— loopback bench (2026-08-19): 直连 splice 1418 MB/s vs 隧道单流 137 MB/s, 并发随核涨 4 核饱和 = relay 瓶颈是 **AEAD crypto CPU 非 syscall**。io_uring 优化 syscall 开销 → 优化错位零收益; 且 tokio-uring 独立 runtime 塞进全 tokio 库要整体迁移。唯一有效杠杆是更快 crypto (cipher agility AES-NI 已做)。单流 1.1 Gbps 已超真实跨境链路 —— 部署里网络才是瓶颈
 - **SS 上游 UDP** —— ①要 UDP 同出口**直接用 WireGuard 上游** (已通), 功能已覆盖; ②多数 SS 服务器默认不开 UDP, **实现≠能用**; ③SS UDP 无握手, 上游不支持时"包石沉大海"无法探测只能等报障; ④当前默认 `block` 已是安全失败方式 (不静默从本机 IP 直发致出口 IP 不一致)。仅"落地机只会 SS 不能上 WG 且必须走 UDP"这一窄场景才翻案
 ---
 
