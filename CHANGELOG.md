@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### feat(webui): 看板界面重构 (Neon Pulse → Mirage Console)
+
+WebUI 视觉与信息架构整体重构: 从霓虹玻璃拟态 (glassmorphism + 辉光 + 渐变) 换成简洁高效的
+现代监控台风格 (对标 Linear / shadcn / Vercel)。纯前端, 后端 API 一字未改。
+
+- **布局**: 左侧栏切视图 (Overview / Connections / Routing / Logs), 不再一条长滚动; 顶栏常驻
+  实时上下行速率 + 引擎状态。**按视图轮询** (仅活跃视图拉重接口; 规则编辑器进入时拉一次不轮询,
+  免打断编辑)。
+- **设计**: 冷石板灰中性 + 克制青强调 (去霓虹, 品牌延续); 语义色 (emerald/amber/red) 独立于强调;
+  Hanken Grotesk (UI) + JetBrains Mono (数字/目标/日志, tabular 对齐); 发丝线表格 + KPI tile,
+  无模糊无辉光。**暗/亮双主题** 完整 token (跟随系统 + 手动切换; dataviz 校验器双主题全 PASS)。
+- **流量图**: 重画为 Canvas 面积图 (↑青 ↓紫双序列, 发丝网格 + 强调端点 + 悬停十字线 tooltip,
+  色盲可辨 + 对比达标)。
+- 全部既有能力保留: overview/history/connections/stats/proxies(选点)/rules(dry_run预检+进程分流
+  维度+拖排)/bpf-tunnels/logs 全接线, 真机 smoke 7 端点 200 + 字段对齐。
+
 ## [v0.9.6] - WebUI 重构 (连接可视化 + 规则编辑器 + 分流统计) + fake-IP ICMP 反射 (2026-08-19)
 
 ### feat(webui): 透明 UDP 连接纳入登记表 (Phase 1b)
