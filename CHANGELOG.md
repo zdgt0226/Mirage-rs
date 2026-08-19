@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### feat(webui): 透明 UDP 连接纳入登记表 (Phase 1b)
+
+WebUI 重构 Phase 1b: 透明 UDP flow 进连接登记表 (此前只有 TCP)。
+
+- `transparent_udp::setup_flow` 每条 flow (client→orig_dst) 在路由决策后登记
+  `{目标(域名/IP:port), 入站, 选中出站, proto=udp}`, flow 结束 (idle/拆流) 自动注销并入
+  最近关闭环。与 TCP 侧一致, `/api/connections` + `/api/stats` 直接多出 UDP 行。
+- 字节: up = 首包 (后续上行在主循环逐包分发不按流计); down 在 Direct / WG / 非-mux
+  Mirage 三条下行循环里与既有 `down_ctr` 并行累加。**Mirage-MUX 下行走 demux 任务不经这些
+  循环, 字节暂不计 (仍登记可见)**; SOCKS-UDP / client-mux 关联级登记留后续 (per-outbound
+  sink 无 per-flow 对象)。
+- WebUI 重构四阶段 + 1b 收官: 域名连接表 + 最近关闭 + per-出站分流量 + 规则命中 + 结构化
+  规则编辑器, TCP/UDP 全覆盖 (SOCKS-UDP 除外)。
+
 ### feat(webui): per-出站分流量 + 规则命中统计 (Phase 4)
 
 WebUI 重构 Phase 4: 新 `GET /api/stats` + 前端「Traffic by Outbound & Rule Hits」面板。

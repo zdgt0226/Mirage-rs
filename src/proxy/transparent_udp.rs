@@ -532,6 +532,19 @@ async fn setup_flow(
     let t_start = Instant::now();
     let down_ctr = Arc::new(AtomicU64::new(0));
 
+    // WebUI 连接登记 (Phase 1b: UDP 纳入登记表)。_conn drop (本 flow 结束) 时注销并入最近关闭环。
+    // up = 首包 (后续上行在主循环逐包分发, 不按流计, 同上注释); down 在 Direct/WG/非-mux Mirage
+    // 三条下行循环里累加 (与 down_ctr 并行)。Mirage-MUX 下行走 demux 任务不经这些循环, 其字节暂不计
+    // (仍登记可见)。SOCKS-UDP / client-mux 关联级登记留后续 (per-outbound sink 无 per-flow 对象)。
+    let target_str = match &target {
+        Some(UdpTarget::Domain(d)) => format!("{d}:{port}"),
+        Some(UdpTarget::Ip(ip)) => format!("{ip}:{port}"),
+        None => format!("{fake_ip}:{port}"),
+    };
+    let _conn = crate::monitor::register(target_str, inbound_tag.to_string(), tag.clone(), "udp", None);
+    _conn.counter().up(first_payload.len() as u64);
+    let conn_ctr = _conn.counter();
+
     match route {
         // ── Direct 腿: 本地解析 + 直发 UDP socket ──
         Route::Direct => {
@@ -583,6 +596,7 @@ async fn setup_flow(
                     Ok(Ok(n)) => {
                         let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
                         down_ctr.fetch_add(n as u64, Ordering::Relaxed);
+                        conn_ctr.down(n as u64);
                     }
                     _ => break,
                 }
@@ -648,6 +662,7 @@ async fn setup_flow(
                     Ok(Ok((n, _from))) => {
                         let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
                         down_ctr.fetch_add(n as u64, Ordering::Relaxed);
+                        conn_ctr.down(n as u64);
                     }
                     _ => break,
                 }
@@ -843,6 +858,7 @@ async fn setup_flow(
 
             // downlink: 隧道 → 解帧取 payload → reply_socket 发回客户端 (伪源 orig_dst)
             let dl_ctr = down_ctr.clone();
+            let dl_conn = conn_ctr.clone();
             let downlink = async move {
                 let mut acc: Vec<u8> = Vec::new();
                 let mut got_downlink = false;
@@ -858,6 +874,7 @@ async fn setup_flow(
                         if !payload.is_empty() {
                             let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
                             dl_ctr.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            dl_conn.down(payload.len() as u64);
                             got_downlink = true;
                         }
                         acc.drain(0..consumed);
