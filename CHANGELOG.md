@@ -2,6 +2,41 @@
 
 ## [Unreleased]
 
+### feat(webui): 服务端/客户端模式分视图 + Admin 入口脚手架 (T0)
+
+多模式 WebUI 地基: 看板按运行模式 (server / client) 展示不同功能。
+
+- 后端: `is_server` 从 `start_proxy` 接线到 `AppState`, `/api/overview` 新增 `mode` 字段
+  (`server` / `client`)。
+- 前端: 导航按 `data-mode` 分 —— 通用 (Overview/Connections/Logs) + 客户端专属 (Routing +
+  Admin/Devices) + 服务端专属 (Admin/Clients); brand-sub 随模式变 (transparent gateway /
+  proxy server); 切模式即隐藏不属于本模式的项。
+- **「特定入口」Admin 区脚手架**: 客户端 `Devices` (LAN 设备规则 / 按设备限速) · 服务端
+  `Clients` (域名排行 / 连接历史 / 客户端管理·版本 / 屏蔽 / 按客户端限速)。均为**明确标注
+  "planned" 的占位卡**, 说明各自后端依赖 (设备发现=eBPF 按源监控 · 服务端登记+聚合+持久化 ·
+  握手版本字段 · 流量整形数据面), 不假装已实现。后续分层落地。
+- i18n 覆盖新增文案 (中/英, 95 处两语对称)。真机 smoke: client→mode=client, server→
+  mode=server, 导航按模式正确显隐。
+
+### feat(webui): 看板界面重构 (Neon Pulse → Mirage Console)
+
+WebUI 视觉与信息架构整体重构: 从霓虹玻璃拟态 (glassmorphism + 辉光 + 渐变) 换成简洁高效的
+现代监控台风格 (对标 Linear / shadcn / Vercel)。纯前端, 后端 API 一字未改。
+
+- **布局**: 左侧栏切视图 (Overview / Connections / Routing / Logs), 不再一条长滚动; 顶栏常驻
+  实时上下行速率 + 引擎状态。**按视图轮询** (仅活跃视图拉重接口; 规则编辑器进入时拉一次不轮询,
+  免打断编辑)。
+- **设计**: 冷石板灰中性 + 克制青强调 (去霓虹, 品牌延续); 语义色 (emerald/amber/red) 独立于强调;
+  Hanken Grotesk (UI) + JetBrains Mono (数字/目标/日志, tabular 对齐); 发丝线表格 + KPI tile,
+  无模糊无辉光。**暗/亮双主题** 完整 token (跟随系统 + 手动切换; dataviz 校验器双主题全 PASS)。
+- **流量图**: 重画为 Canvas 面积图 (↑青 ↓紫双序列, 发丝网格 + 强调端点 + 悬停十字线 tooltip,
+  色盲可辨 + 对比达标)。
+- 全部既有能力保留: overview/history/connections/stats/proxies(选点)/rules(dry_run预检+进程分流
+  维度+拖排)/bpf-tunnels/logs 全接线, 真机 smoke 7 端点 200 + 字段对齐。
+- **多语言 (i18n)**: 简体中文 / English 双语, 侧栏 `中/EN` 一键切 (存 localStorage; 首访按浏览器
+  语言默认 zh/en)。自包含字典 `{en,zh}` + `t(key)`, 静态元素 `data-i18n` + 动态串走 `t()`;
+  72 处文案两语对称 (脚本校验无缺译)。可再加语言只需补字典一列。
+
 ## [v0.9.6] - WebUI 重构 (连接可视化 + 规则编辑器 + 分流统计) + fake-IP ICMP 反射 (2026-08-19)
 
 ### feat(webui): 透明 UDP 连接纳入登记表 (Phase 1b)

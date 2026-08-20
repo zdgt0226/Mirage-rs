@@ -1,1188 +1,635 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mirage-rs Dashboard</title>
-    <style>
-        :root {
-            --bg: #0d0f18;
-            --panel-bg: rgba(255, 255, 255, 0.03);
-            --panel-border: rgba(255, 255, 255, 0.05);
-            --text-main: #e2e8f0;
-            --text-muted: #94a3b8;
-            --accent-up: #38bdf8;
-            --accent-down: #a78bfa;
-        }
-
-        body {
-            margin: 0;
-            padding: 0;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background-color: var(--bg);
-            color: var(--text-main);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-
-        .blob {
-            position: fixed;
-            filter: blur(100px);
-            z-index: -1;
-            opacity: 0.5;
-        }
-        .blob-1 { top: -100px; left: -100px; width: 400px; height: 400px; background: rgba(56, 189, 248, 0.3); border-radius: 50%; }
-        .blob-2 { bottom: -100px; right: -100px; width: 400px; height: 400px; background: rgba(167, 139, 250, 0.3); border-radius: 50%; }
-
-        header {
-            width: 100%;
-            max-width: 1200px;
-            padding: 40px 20px 20px 20px;
-            box-sizing: border-box;
-        }
-
-        h1 {
-            margin: 0;
-            font-size: 2.5rem;
-            font-weight: 800;
-            background: linear-gradient(to right, var(--accent-up), var(--accent-down));
-            -webkit-background-clip: text;
-            color: transparent;
-            letter-spacing: -1px;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 1200px;
-            padding: 20px;
-            box-sizing: border-box;
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 24px;
-        }
-
-        .panel {
-            background: var(--panel-bg);
-            border: 1px solid var(--panel-border);
-            border-radius: 20px;
-            padding: 30px;
-            backdrop-filter: blur(20px);
-            -webkit-backdrop-filter: blur(20px);
-            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-
-        .panel h2 {
-            margin-top: 0;
-            font-size: 1.1rem;
-            color: var(--text-muted);
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            font-weight: 600;
-        }
-
-        .stat-group {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-end;
-            margin-top: 20px;
-        }
-
-        .stat-val {
-            font-size: 3rem;
-            font-weight: 700;
-            font-variant-numeric: tabular-nums;
-        }
-        
-        .stat-val.up { color: var(--accent-up); text-shadow: 0 0 20px rgba(56, 189, 248, 0.4); }
-        .stat-val.down { color: var(--accent-down); text-shadow: 0 0 20px rgba(167, 139, 250, 0.4); }
-
-        .stat-unit {
-            font-size: 1rem;
-            color: var(--text-muted);
-            margin-bottom: 8px;
-            margin-left: 8px;
-        }
-
-        .total-bytes {
-            font-size: 0.85rem;
-            color: var(--text-muted);
-            margin-top: 10px;
-        }
-
-        .full-width {
-            grid-column: 1 / -1;
-        }
-
-        .terminal {
-            background: #000;
-            border-radius: 12px;
-            padding: 20px;
-            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
-            font-size: 0.85rem;
-            color: #10b981;
-            height: 300px;
-            overflow-y: auto;
-            border: 1px solid #1f2937;
-        }
-
-        .terminal div {
-            margin-bottom: 4px;
-            word-break: break-all;
-        }
-        
-        .terminal .log-debug { color: #6b7280; }
-        .terminal .log-info { color: #38bdf8; }
-        .terminal .log-warn { color: #f59e0b; }
-        .terminal .log-error { color: #ef4444; }
-
-        .proxy-group {
-            margin-bottom: 20px;
-            padding: 15px;
-            background: rgba(0,0,0,0.2);
-            border-radius: 12px;
-            border: 1px solid var(--panel-border);
-        }
-
-        .proxy-group-title {
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin-bottom: 15px;
-            display: flex;
-            justify-content: space-between;
-        }
-
-        .badge {
-            font-size: 0.75rem;
-            background: var(--accent-down);
-            color: #fff;
-            padding: 2px 8px;
-            border-radius: 12px;
-        }
-
-        .node-list {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-            gap: 10px;
-        }
-
-        .node-btn {
-            background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.1);
-            color: var(--text-main);
-            padding: 10px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 0.9rem;
-            transition: all 0.2s;
-            text-align: center;
-        }
-
-        .node-btn:hover {
-            background: rgba(255,255,255,0.1);
-        }
-
-        .node-btn.active {
-            background: rgba(56, 189, 248, 0.2);
-            border-color: var(--accent-up);
-            color: #fff;
-        }
-
-        .rule-card {
-            background: rgba(0,0,0,0.2);
-            border: 1px solid var(--panel-border);
-            border-radius: 12px;
-            padding: 15px;
-            margin-bottom: 15px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-        .rule-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .rule-fields {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 15px;
-        }
-        .rule-field {
-            display: flex;
-            flex-direction: column;
-            gap: 5px;
-            font-size: 0.85rem;
-        }
-        .rule-field input, .rule-field select {
-            background: rgba(255,255,255,0.05);
-            border: 1px solid rgba(255,255,255,0.1);
-            color: var(--text-main);
-            padding: 8px;
-            border-radius: 6px;
-            outline: none;
-            width: 100%;
-            box-sizing: border-box;
-        }
-        .rule-field input:focus, .rule-field select:focus {
-            border-color: var(--accent-up);
-        }
-        .btn-add, .btn-remove {
-            background: rgba(255,255,255,0.1);
-            border: none;
-            color: var(--text-main);
-            padding: 6px 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 0.85rem;
-        }
-        .btn-add:hover { background: rgba(56, 189, 248, 0.2); }
-        .btn-remove:hover { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
-        .rule-tags-container {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 5px;
-            margin-top: 5px;
-        }
-        .rule-tag {
-            background: rgba(167, 139, 250, 0.2);
-            color: #d8b4fe;
-            padding: 2px 8px;
-            border-radius: 12px;
-            font-size: 0.75rem;
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }
-        .rule-tag span { cursor: pointer; color: #fca5a5; }
-
-        .btn-save {
-            position: absolute;
-            bottom: 20px;
-            right: 20px;
-            background: linear-gradient(135deg, var(--accent-up), #2563eb);
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 8px;
-            font-weight: 600;
-            cursor: pointer;
-            box-shadow: 0 4px 12px rgba(56, 189, 248, 0.3);
-            transition: all 0.2s;
-        }
-
-        .btn-save:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 16px rgba(56, 189, 248, 0.4);
-        }
-
-        .btn-save:active {
-            transform: translateY(0);
-        }
-        
-        /* Neon Dashboard Styles */
-        .neon-dashboard {
-            position: relative;
-            overflow: hidden;
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-
-        .neon-title-bar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            z-index: 2;
-            position: relative;
-        }
-
-        .neon-title {
-            margin: 0;
-            font-size: 1.5rem;
-            background: linear-gradient(to right, #38bdf8, #a78bfa);
-            -webkit-background-clip: text;
-            color: transparent;
-            text-shadow: 0 0 20px rgba(56,189,248,0.5);
-            font-weight: 800;
-            letter-spacing: 2px;
-        }
-
-        .ebpf-status {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-weight: 700;
-            font-size: 0.85rem;
-            letter-spacing: 2px;
-            background: rgba(0,0,0,0.4);
-            padding: 6px 16px;
-            border-radius: 20px;
-            border: 1px solid rgba(255,255,255,0.05);
-        }
-
-        .ebpf-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            background: #6b7280;
-            box-shadow: 0 0 10px #6b7280;
-            transition: all 0.3s;
-        }
-        
-        .ebpf-dot.online {
-            background: #10b981;
-            box-shadow: 0 0 15px #10b981, 0 0 30px #10b981;
-            animation: pulse-green 2s infinite;
-        }
-
-        @keyframes pulse-green {
-            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-            70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
-            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-        }
-
-        .stats-row {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            z-index: 2;
-            position: relative;
-        }
-
-        .stat-box {
-            background: rgba(0,0,0,0.3);
-            border: 1px solid rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 15px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-        }
-
-        .stat-label {
-            font-size: 0.8rem;
-            color: var(--text-muted);
-            letter-spacing: 1.5px;
-            margin-bottom: 5px;
-            font-weight: 600;
-        }
-
-        #neonCanvas {
-            width: 100%;
-            height: 300px;
-            display: block;
-            border-radius: 16px;
-            background: radial-gradient(circle at center, rgba(13,15,24,0.8) 0%, rgba(0,0,0,0.9) 100%);
-            border: 1px solid rgba(255,255,255,0.05);
-            box-shadow: inset 0 0 50px rgba(0,0,0,0.5);
-            z-index: 1;
-        }
-
-        @media (max-width: 768px) {
-            .container { grid-template-columns: 1fr; }
-            .stats-row { grid-template-columns: 1fr; }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mirage Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground:#F6F7F9; --surface:#FFFFFF; --surface-2:#F0F2F5; --raised:#FFFFFF;
+    --border:#E2E6EC; --border-strong:#D2D8E0;
+    --text:#131824; --muted:#5C6675; --faint:#8A93A2;
+    --accent:#0B8BA8; --accent-ink:#FFFFFF; --accent-soft:rgba(11,139,168,.10);
+    --up:#0B8BA8; --down:#6B5FD0;
+    --ok:#12986A; --warn:#B87615; --crit:#C6453F;
+    --ok-soft:rgba(18,152,106,.12); --warn-soft:rgba(184,118,21,.12); --crit-soft:rgba(198,69,63,.12);
+    --shadow:0 1px 2px rgba(16,22,34,.04),0 4px 16px rgba(16,22,34,.04);
+    --grid:rgba(19,24,36,.06);
+  }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+    --ground:#0A0D13; --surface:#111621; --surface-2:#171D2A; --raised:#141A26;
+    --border:#212938; --border-strong:#2C3546;
+    --text:#E7EBF2; --muted:#8A94A6; --faint:#626C7D;
+    --accent:#2E9FB6; --accent-ink:#04121A; --accent-soft:rgba(46,159,182,.14);
+    --up:#2E9FB6; --down:#8B7FE8;
+    --ok:#35C08A; --warn:#E0A23A; --crit:#E5645E;
+    --ok-soft:rgba(53,192,138,.14); --warn-soft:rgba(224,162,58,.14); --crit-soft:rgba(229,100,94,.14);
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.28);
+    --grid:rgba(231,235,242,.06);
+  }}
+  :root[data-theme="dark"]{
+    --ground:#0A0D13; --surface:#111621; --surface-2:#171D2A; --raised:#141A26;
+    --border:#212938; --border-strong:#2C3546;
+    --text:#E7EBF2; --muted:#8A94A6; --faint:#626C7D;
+    --accent:#2E9FB6; --accent-ink:#04121A; --accent-soft:rgba(46,159,182,.14);
+    --up:#2E9FB6; --down:#8B7FE8;
+    --ok:#35C08A; --warn:#E0A23A; --crit:#E5645E;
+    --ok-soft:rgba(53,192,138,.14); --warn-soft:rgba(224,162,58,.14); --crit-soft:rgba(229,100,94,.14);
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 20px rgba(0,0,0,.28);
+    --grid:rgba(231,235,242,.06);
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--ground);color:var(--text);font-family:"Hanken Grotesk",-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased;}
+  .mono{font-family:"JetBrains Mono",ui-monospace,"SF Mono",monospace;font-variant-numeric:tabular-nums;}
+  .num{font-variant-numeric:tabular-nums;}
+  .app{display:grid;grid-template-columns:232px 1fr;min-height:100vh;}
+  .sidebar{background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;}
+  .brand{display:flex;align-items:center;gap:10px;padding:20px 20px 16px;}
+  .brand-mark{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;background:linear-gradient(150deg,var(--accent),var(--down));color:#fff;flex:none;}
+  .brand-mark svg{width:17px;height:17px;}
+  .brand-name{font-weight:700;letter-spacing:-.2px;font-size:15px;}
+  .brand-sub{font-size:11px;color:var(--faint);margin-top:-2px;}
+  .nav{padding:8px 12px;display:flex;flex-direction:column;gap:2px;}
+  .nav-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.8px;color:var(--faint);padding:12px 10px 6px;font-weight:600;}
+  .nav-item{display:flex;align-items:center;gap:11px;padding:8px 10px;border-radius:8px;color:var(--muted);cursor:pointer;font-weight:500;border:none;background:none;width:100%;text-align:left;font-family:inherit;font-size:14px;transition:background .12s,color .12s;}
+  .nav-item svg{width:17px;height:17px;flex:none;opacity:.85;}
+  .nav-item:hover{background:var(--surface-2);color:var(--text);}
+  .nav-item.active{background:var(--accent-soft);color:var(--accent);font-weight:600;}
+  .nav-item .count{margin-left:auto;font-size:11px;color:var(--faint);}
+  .nav-item.active .count{color:var(--accent);}
+  .sidebar-foot{margin-top:auto;padding:14px 16px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
+  .ver{font-size:11px;color:var(--faint);}
+  .icon-btn{background:none;border:1px solid var(--border);color:var(--muted);width:30px;height:30px;border-radius:8px;cursor:pointer;display:grid;place-items:center;transition:.12s;}
+  .icon-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-2);}
+  .icon-btn svg{width:15px;height:15px;}
+  .main{min-width:0;}
+  .topbar{display:flex;align-items:center;gap:16px;padding:16px 28px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--ground) 86%,transparent);backdrop-filter:blur(8px);}
+  .view-title{font-size:17px;font-weight:700;letter-spacing:-.3px;}
+  .view-sub{color:var(--faint);font-size:12.5px;}
+  .top-right{margin-left:auto;display:flex;align-items:center;gap:10px;}
+  .rate-pill{display:flex;align-items:center;gap:7px;padding:6px 11px;border-radius:8px;background:var(--surface);border:1px solid var(--border);font-size:12.5px;}
+  .rate-pill b{font-weight:600;}
+  .dot{width:7px;height:7px;border-radius:50%;flex:none;}
+  .dot.up{background:var(--up);} .dot.down{background:var(--down);}
+  .status-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 10px;border-radius:999px;}
+  .status-chip.ok{color:var(--ok);background:var(--ok-soft);}
+  .status-chip.off{color:var(--crit);background:var(--crit-soft);}
+  .status-chip .dot{width:6px;height:6px;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 22%,transparent);}
+  .content{padding:24px 28px 48px;max-width:1180px;}
+  .view{display:none;} .view.active{display:block;}
+  .grid{display:grid;gap:16px;}
+  .kpis{grid-template-columns:repeat(4,1fr);margin-bottom:16px;}
+  .cols-2{grid-template-columns:1.3fr 1fr;}
+  @media (max-width:900px){.kpis{grid-template-columns:repeat(2,1fr);}.cols-2{grid-template-columns:1fr;}.app{grid-template-columns:64px 1fr;}.brand-name,.brand-sub,.nav-label,.nav-item span,.nav-item .count,.ver{display:none;}.nav-item{justify-content:center;}}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);}
+  .card-pad{padding:18px 20px;}
+  .card-head{display:flex;align-items:center;justify-content:space-between;padding:15px 20px;border-bottom:1px solid var(--border);gap:10px;}
+  .card-title{font-size:13px;font-weight:600;letter-spacing:.2px;}
+  .card-title .hint{color:var(--faint);font-weight:400;margin-left:8px;font-size:12px;}
+  .kpi{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;box-shadow:var(--shadow);}
+  .kpi-label{font-size:11.5px;color:var(--muted);font-weight:500;display:flex;align-items:center;gap:7px;}
+  .kpi-label .g{width:8px;height:8px;border-radius:2px;}
+  .kpi-val{font-size:27px;font-weight:700;letter-spacing:-.5px;margin-top:8px;display:flex;align-items:baseline;gap:6px;}
+  .kpi-val small{font-size:13px;font-weight:500;color:var(--muted);}
+  .kpi-delta{font-size:12px;margin-top:5px;color:var(--faint);}
+  .chartwrap{position:relative;padding:8px 12px 12px;}
+  #trafficChart{width:100%;height:240px;display:block;}
+  .legend{display:flex;gap:16px;}
+  .legend span{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);}
+  .legend i{width:10px;height:10px;border-radius:3px;}
+  .tip{position:absolute;pointer-events:none;background:var(--raised);border:1px solid var(--border-strong);border-radius:9px;padding:8px 10px;font-size:12px;box-shadow:var(--shadow);opacity:0;transition:opacity .1s;min-width:150px;}
+  .tip .t-time{color:var(--faint);font-size:11px;margin-bottom:5px;}
+  .tip .t-row{display:flex;align-items:center;gap:7px;justify-content:space-between;}
+  .tip .t-row i{width:8px;height:8px;border-radius:2px;}
+  .tbl{width:100%;border-collapse:collapse;}
+  .tbl th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:var(--faint);font-weight:600;padding:10px 20px;border-bottom:1px solid var(--border);}
+  .tbl td{padding:11px 20px;border-bottom:1px solid var(--border);font-size:13px;}
+  .tbl tr:last-child td{border-bottom:none;}
+  .tbl tbody tr{transition:background .1s;}
+  .tbl tbody tr:hover{background:var(--surface-2);}
+  .tbl .r{text-align:right;}
+  .target{font-weight:500;}
+  .route{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12.5px;}
+  .route .arrow{color:var(--faint);}
+  .badge{font-size:11px;font-weight:600;padding:2px 8px;border-radius:6px;font-family:"JetBrains Mono",monospace;}
+  .badge.proxy{color:var(--ok);background:var(--ok-soft);}
+  .badge.direct{color:var(--muted);background:var(--surface-2);}
+  .badge.block{color:var(--crit);background:var(--crit-soft);}
+  .badge.udp{color:var(--down);background:color-mix(in srgb,var(--down) 14%,transparent);}
+  .badge.tcp{color:var(--faint);background:var(--surface-2);}
+  .dim{color:var(--faint);}
+  .empty{color:var(--faint);text-align:center;padding:26px;font-size:13px;}
+  .soon{font-size:10.5px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--warn);background:var(--warn-soft);padding:3px 8px;border-radius:6px;}
+  .stub{color:var(--muted);font-size:13px;line-height:1.65;}
+  .stub code{font-family:"JetBrains Mono",monospace;font-size:12px;background:var(--surface-2);padding:1px 5px;border-radius:5px;}
+  [data-mode]{}
+  .meter-row{display:grid;grid-template-columns:76px 1fr auto;align-items:center;gap:12px;padding:9px 0;}
+  .meter-row + .meter-row{border-top:1px solid var(--border);}
+  .meter{height:8px;border-radius:999px;background:var(--surface-2);overflow:hidden;}
+  .meter > i{display:block;height:100%;border-radius:999px;}
+  .health-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border-radius:10px;overflow:hidden;}
+  .health-cell{background:var(--surface);padding:14px 16px;}
+  .health-cell .h-l{font-size:11.5px;color:var(--muted);}
+  .health-cell .h-v{font-size:18px;font-weight:700;margin-top:3px;display:flex;align-items:center;gap:8px;}
+  .rule-card{border:1px solid var(--border);border-radius:11px;padding:14px 16px;}
+  .rule-card + .rule-card{margin-top:12px;}
+  .rule-top{display:flex;align-items:center;gap:10px;margin-bottom:12px;}
+  .rule-n{font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--faint);}
+  .rule-fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;}
+  .rule-field label{font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--faint);font-weight:600;display:block;margin-bottom:6px;}
+  .rule-field input{width:100%;background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:7px 9px;border-radius:7px;outline:none;font-family:inherit;font-size:13px;}
+  .rule-field input:focus{border-color:var(--accent);}
+  .rule-tags-container{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px;}
+  .rule-tag{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 8px;border-radius:7px;background:var(--accent-soft);color:var(--accent);font-family:"JetBrains Mono",monospace;}
+  .rule-tag span{cursor:pointer;opacity:.7;}
+  .rule-tag span:hover{opacity:1;}
+  .btn{font-family:inherit;font-size:13px;font-weight:600;padding:8px 14px;border-radius:8px;cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--text);transition:.12s;}
+  .btn:hover{background:var(--surface-2);border-color:var(--border-strong);}
+  .btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);}
+  .btn.primary:hover{filter:brightness(1.06);}
+  .btn-add{background:var(--surface-2);border:1px solid var(--border);color:var(--muted);border-radius:7px;padding:6px 9px;cursor:pointer;font-family:inherit;font-size:13px;line-height:1;}
+  .btn-add:hover{color:var(--accent);border-color:var(--accent);}
+  .btn-remove{background:none;border:1px solid var(--border);color:var(--crit);border-radius:7px;padding:6px 10px;cursor:pointer;font-family:inherit;font-size:12px;}
+  .btn-remove:hover{background:var(--crit-soft);}
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
+  .search{flex:1;display:flex;align-items:center;gap:9px;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--muted);}
+  .search input{border:none;background:none;outline:none;color:var(--text);font-family:inherit;font-size:13px;width:100%;}
+  .search svg{width:15px;height:15px;}
+  .node-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;}
+  .node-btn{background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:10px 12px;cursor:pointer;transition:.12s;}
+  .node-btn:hover{border-color:var(--border-strong);}
+  .node-btn.active{border-color:var(--accent);background:var(--accent-soft);}
+  .node-btn .n-tag{font-weight:600;font-size:13px;}
+  .proxy-group{margin-bottom:18px;}
+  .proxy-group:last-child{margin-bottom:0;}
+  .proxy-group-title{font-size:13px;font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:8px;}
+  .term{background:color-mix(in srgb,var(--ground) 60%,#000 8%);border:1px solid var(--border);border-radius:10px;padding:16px 18px;height:520px;overflow-y:auto;font-family:"JetBrains Mono",monospace;font-size:12.5px;line-height:1.7;}
+  .term div{margin-bottom:2px;word-break:break-word;}
+  .term .log-debug{color:var(--faint);} .term .log-info{color:var(--accent);} .term .log-warn{color:var(--warn);} .term .log-error{color:var(--crit);}
+  .sub-head{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--faint);font-weight:600;margin:22px 4px 10px;}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+  @media (prefers-reduced-motion:reduce){*{transition:none !important;}}
+</style>
 </head>
 <body>
-    <div class="blob blob-1"></div>
-    <div class="blob blob-2"></div>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 12h4l2 6 4-14 2 8h6"/></svg></div>
+      <div><div class="brand-name">Mirage</div><div class="brand-sub" data-i18n="brand.sub">transparent gateway</div></div>
+    </div>
+    <nav class="nav">
+      <div class="nav-label" data-i18n="nav.monitor">Monitor</div>
+      <button class="nav-item active" data-view="overview" data-mode="both"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span data-i18n="nav.overview">Overview</span></button>
+      <button class="nav-item" data-view="connections" data-mode="both"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span data-i18n="nav.connections">Connections</span><span class="count num" id="navConn">0</span></button>
+      <button class="nav-item" data-view="logs" data-mode="both"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span data-i18n="nav.logs">Logs</span></button>
+      <div class="nav-label" data-i18n="nav.control" data-mode="client">Control</div>
+      <button class="nav-item" data-view="routing" data-mode="client"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M8 6h5a3 3 0 013 3M8 18h5a3 3 0 003-3"/></svg><span data-i18n="nav.routing">Routing</span></button>
+      <div class="nav-label" data-i18n="nav.admin">Admin</div>
+      <button class="nav-item" data-view="devices" data-mode="client"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span data-i18n="nav.devices">Devices</span></button>
+      <button class="nav-item" data-view="clients" data-mode="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3"/><path d="M4 20a5 5 0 0110 0M16 6a3 3 0 010 6M15 20a5 5 0 00-1-3.2"/></svg><span data-i18n="nav.clients">Clients</span></button>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="ver mono">v0.9.6</span>
+      <div style="display:flex;gap:6px">
+        <button class="icon-btn" id="langBtn" title="Language" aria-label="Language" style="width:auto;padding:0 9px;font-weight:600;font-size:12px">EN</button>
+        <button class="icon-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme"></button>
+      </div>
+    </div>
+  </aside>
 
-    <header>
-        <h1>Mirage Engine</h1>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="view-title" id="vTitle">Overview</div>
+        <div class="view-sub" id="vSub">Live traffic &amp; engine health</div>
+      </div>
+      <div class="top-right">
+        <div class="rate-pill"><span class="dot up"></span><b class="mono" id="upRate">0</b><span class="dim" id="upUnit">B/s ↑</span></div>
+        <div class="rate-pill"><span class="dot down"></span><b class="mono" id="downRate">0</b><span class="dim" id="downUnit">B/s ↓</span></div>
+        <span class="status-chip off" id="engineChip"><span class="dot"></span><span id="engineText">Connecting…</span></span>
+      </div>
     </header>
 
-    <div class="container">
-        <!-- NEON PULSE DASHBOARD -->
-        <div class="panel full-width neon-dashboard">
-            <div class="neon-title-bar">
-                <h2 class="neon-title">THE NEON PULSE</h2>
-                <div style="display: flex; gap: 10px;">
-                    <div class="ebpf-status">
-                        <div class="ebpf-dot" id="ebpfDot"></div>
-                        <span id="ebpfText" style="color: #6b7280;">eBPF ENGINE: OFFLINE</span>
-                    </div>
-                    <div class="ebpf-status">
-                        <div class="ebpf-dot" id="brutalDot"></div>
-                        <span id="brutalText" style="color: #6b7280;">Brutal CC: STATIC</span>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="stats-row">
-                <div class="stat-box">
-                    <div class="stat-label">UPSTREAM VELOCITY</div>
-                    <div style="display: flex; align-items: baseline;">
-                        <span class="stat-val up" id="upSpeed">0.0</span>
-                        <span class="stat-unit" id="upUnit">KB/s</span>
-                    </div>
-                    <div class="total-bytes" id="upTotal">Total: 0 B</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-label">DOWNSTREAM VELOCITY</div>
-                    <div style="display: flex; align-items: baseline;">
-                        <span class="stat-val down" id="downSpeed">0.0</span>
-                        <span class="stat-unit" id="downUnit">KB/s</span>
-                    </div>
-                    <div class="total-bytes" id="downTotal">Total: 0 B</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-label">BPF FAST-PATH / XDP HIT</div>
-                    <div style="display: flex; align-items: baseline;">
-                        <span class="stat-val" id="bpfSuccess" style="color: #10b981; text-shadow: 0 0 20px rgba(16,185,129,0.4);">0</span>
-                        <span class="stat-unit">PKTS/s</span>
-                    </div>
-                    <div class="total-bytes" id="bpfTotal">Total: 0 PKTS Accelerated</div>
-                </div>
-            </div>
-
-            <canvas id="neonCanvas"></canvas>
+    <div class="content">
+      <!-- OVERVIEW -->
+      <section class="view active" id="overview">
+        <div class="grid kpis">
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--up)"></span><span data-i18n="kpi.upload">Upload</span></div><div class="kpi-val mono"><span id="kUp">0</span><small id="kUpU">B/s</small></div><div class="kpi-delta" id="kUpTot">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--down)"></span><span data-i18n="kpi.download">Download</span></div><div class="kpi-val mono"><span id="kDown">0</span><small id="kDownU">B/s</small></div><div class="kpi-delta" id="kDownTot">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--ok)"></span><span data-i18n="kpi.conns">Active connections</span></div><div class="kpi-val mono" id="kConn">0</div><div class="kpi-delta" id="kConnSub">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--accent)"></span><span data-i18n="kpi.tunnels">Warm tunnels</span></div><div class="kpi-val mono" id="kTun">0</div><div class="kpi-delta" id="kBrutal">—</div></div>
         </div>
-
-        <div class="panel full-width">
-            <h2>Outbounds & Proxies</h2>
-            <div id="proxiesContainer">Loading proxies...</div>
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-head"><div class="card-title"><span data-i18n="card.throughput">Throughput</span><span class="hint" data-i18n="card.last120">last 120s</span></div>
+            <div class="legend"><span><i style="background:var(--up)"></i><span data-i18n="kpi.upload">Upload</span></span><span><i style="background:var(--down)"></i><span data-i18n="kpi.download">Download</span></span></div></div>
+          <div class="chartwrap"><canvas id="trafficChart"></canvas><div class="tip" id="tip"></div></div>
         </div>
-
-        <div class="panel full-width">
-            <h2>Active Connections <span id="connCount" style="font-size: 0.7em; color: var(--text-muted); font-weight: normal;">(0 active)</span></h2>
-            <div id="connectionsContainer" style="overflow-x: auto;">
-                <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading connections...</div>
-            </div>
+        <div class="grid cols-2">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="card.byOutbound">Traffic by outbound</div></div><div class="card-pad" id="obBars"><div class="empty" data-i18n="empty.noTraffic">No traffic yet.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="card.ebpf">eBPF &amp; engine</div></div>
+            <div class="card-pad"><div class="health-grid">
+              <div class="health-cell"><div class="h-l" data-i18n="health.hijack">sk_lookup hijack</div><div class="h-v"><span class="mono" id="hHijack">—</span></div></div>
+              <div class="health-cell"><div class="h-l" data-i18n="health.fallback">Fallback</div><div class="h-v mono" id="hFallback">—</div></div>
+              <div class="health-cell"><div class="h-l">XDP DNS</div><div class="h-v" id="hXdp">—</div></div>
+              <div class="health-cell"><div class="h-l">Brutal CC</div><div class="h-v" id="hBrutal">—</div></div>
+            </div></div>
+          </div>
         </div>
+      </section>
 
-        <div class="panel full-width">
-            <h2>Traffic by Outbound &amp; Rule Hits</h2>
-            <div id="statsContainer" style="overflow-x: auto;">
-                <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading stats...</div>
-            </div>
+      <!-- CONNECTIONS -->
+      <section class="view" id="connections">
+        <div class="toolbar">
+          <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="connFilter" data-i18n-ph="ph.filter" placeholder="Filter by domain, outbound, process…"></div>
         </div>
+        <div class="card">
+          <div class="card-head"><div class="card-title"><span data-i18n="card.active">Active</span><span class="hint" id="connN"></span></div></div>
+          <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.target">Target</th><th data-i18n="th.route">Route</th><th data-i18n="th.proto">Proto</th><th data-i18n="th.process">Process</th><th class="r" data-i18n="th.age">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="connBody"></tbody></table></div>
+        </div>
+        <div class="sub-head" data-i18n="card.recentClosed">Recent closed</div>
+        <div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.target">Target</th><th data-i18n="th.route">Route</th><th data-i18n="th.proto">Proto</th><th class="r" data-i18n="th.age">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="closedBody"></tbody></table></div></div>
+        <div class="sub-head"><span data-i18n="card.bpfTunnels">BPF tunnels</span> <span class="dim" style="text-transform:none;letter-spacing:0" data-i18n="card.bpfHint">— per-tunnel RTT (eBPF sockops)</span></div>
+        <div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.remote">Remote</th><th class="r">RTT</th><th class="r" data-i18n="th.retrans">Retrans</th><th class="r">cwnd</th></tr></thead><tbody id="tunBody"></tbody></table></div></div>
+      </section>
 
-        <div class="panel full-width">
-            <h2>Active BPF Tunnels <span id="tunnelCount" style="font-size: 0.7em; color: var(--text-muted); font-weight: normal;">(0 active)</span></h2>
-            <div id="tunnelsContainer" style="overflow-x: auto;">
-                <div style="color: var(--text-muted); text-align: center; padding: 20px;">Loading tunnels...</div>
-            </div>
+      <!-- ROUTING -->
+      <section class="view" id="routing">
+        <div class="grid cols-2" style="margin-bottom:20px">
+          <div class="card"><div class="card-head"><div class="card-title"><span data-i18n="card.ruleHits">Rule hits</span><span class="hint" data-i18n="card.sinceLoad">since config load</span></div></div>
+            <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>#</th><th data-i18n="th.outbound">Outbound</th><th class="r" data-i18n="th.hits">Hits</th></tr></thead><tbody id="hitsBody"></tbody></table></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="card.outboundTotals">Outbound totals</div></div><div class="card-pad" id="obTotals"><div class="empty" data-i18n="empty.noTraffic">No traffic yet.</div></div></div>
         </div>
+        <div class="card" style="margin-bottom:20px">
+          <div class="card-head"><div class="card-title" data-i18n="card.proxyGroups">Proxy groups</div></div>
+          <div class="card-pad" id="proxiesContainer"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><div class="card-title"><span data-i18n="card.routingRules">Routing rules</span><span class="hint" data-i18n="card.firstMatch">first match wins · reorder matters</span></div>
+            <div style="display:flex;gap:8px"><button class="btn" onclick="addRule()" data-i18n="btn.addRule">+ Add rule</button><button class="btn primary" id="saveBtn" onclick="saveRules()" data-i18n="btn.save">Save &amp; apply</button></div></div>
+          <div class="card-pad" id="visualRulesContainer"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+        </div>
+      </section>
 
-        <div class="panel full-width">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                <h2 style="margin: 0;">Routing Rules</h2>
-                <div>
-                    <button class="btn-add" onclick="addRule()">+ Add Rule</button>
-                    <button class="btn-save" onclick="saveRules()" style="position: relative; right: 0; bottom: 0; margin-left: 10px;">Save & Apply</button>
-                </div>
-            </div>
-            <div id="visualRulesContainer">Loading rules...</div>
-        </div>
+      <!-- LOGS -->
+      <section class="view" id="logs">
+        <div class="card"><div class="card-head"><div class="card-title"><span data-i18n="card.liveLog">Live log</span><span class="hint" data-i18n="card.inMemBuf">in-memory buffer</span></div></div>
+          <div class="card-pad"><div class="term" id="term"></div></div></div>
+      </section>
 
-        <div class="panel full-width">
-            <h2>Live Routing Logs</h2>
-            <div class="terminal" id="terminal"></div>
+      <!-- DEVICES (client-mode admin) -->
+      <section class="view" id="devices">
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="dev.lanDevices">LAN devices</div></div>
+          <div class="card-pad"><div class="empty" data-i18n="dev.discoverSoon">LAN device discovery — planned (needs eBPF per-source monitor).</div></div></div>
+        <div class="grid cols-2">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceRule">Per-device rules</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceRuleDesc">Scope routing rules to a device / subnet. Backend `source_ip_cidr` already routes per source — this surfaces it per discovered device.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceSpeed">Per-device speed limit</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceSpeedDesc">Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.</div></div></div>
         </div>
+      </section>
+
+      <!-- CLIENTS (server-mode admin) -->
+      <section class="view" id="clients">
+        <div class="grid cols-2" style="margin-bottom:16px">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.domainRank">Top domains</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.domainRankDesc">Ranked target domains across clients. Needs server-side connection registration (server sees each target header) + top-N aggregation.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.connHistory">Connection history</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.connHistoryDesc">Past connections beyond the live/recent window. Needs persistence (embedded store).</div></div></div>
+        </div>
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="srv.clientMgmt">Connected clients</div><span class="soon" data-i18n="soon">planned</span></div>
+          <div class="card-pad"><div class="stub" data-i18n="srv.clientMgmtDesc">Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.</div></div></div>
+        <div class="grid cols-2">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.block">Block client</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.blockDesc">Reject a client IP / identity at accept. Medium; backend blacklist at the listener.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.rateLimit">Per-client rate limit</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.rateLimitDesc">Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.</div></div></div>
+        </div>
+      </section>
     </div>
+  </main>
+</div>
 
-    <script>
-        let lastUp = 0; let lastDown = 0; let lastBpfSuccess = 0; let isFirstTick = true; let lastLogLines = 0;
-        
-        // ==========================================
-        // 实时波形图：历史记录加载与同步逻辑
-        // ==========================================
-        const HISTORY_LEN = 120; // 定义波形图的最大点数，对应 2 分钟 (每秒一刷)
-        let historyUp = new Array(HISTORY_LEN).fill(0);
-        let historyDown = new Array(HISTORY_LEN).fill(0);
-        let historyBpf = new Array(HISTORY_LEN).fill(0);
-        let lastFetchTime = performance.now();
+<script>
+(function(){
+  const root=document.documentElement;
+  const sun='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>';
+  const moon='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A8.5 8.5 0 1111.2 3a6.5 6.5 0 009.8 9.8z"/></svg>';
+  const curDark=()=>{const t=root.getAttribute('data-theme');return t?t==='dark':matchMedia('(prefers-color-scheme: dark)').matches;};
+  const syncBtn=()=>{document.getElementById('themeBtn').innerHTML=curDark()?sun:moon;};
+  document.getElementById('themeBtn').onclick=()=>{root.setAttribute('data-theme',curDark()?'light':'dark');syncBtn();drawChart();};
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{syncBtn();drawChart();});
+  syncBtn();
 
-        // 首次加载页面时，向后端拉取已被缓存的过去 120 秒的历史数据
-        // 这样可以保证刷新网页时，历史折线图无缝衔接，不需要从零重新绘制
-        async function fetchHistory() {
-            try {
-                const res = await fetch('/api/history');
-                const data = await res.json();
-                if (data.up && data.up.length === HISTORY_LEN) {
-                    historyUp = data.up;
-                    historyDown = data.down;
-                    historyBpf = data.bpf_success;
-                }
-            } catch(err) {}
-        }
-        
-        // 页面打开时立即执行一次全量历史拉取
-        fetchHistory();
+  // ── i18n ──
+  const I18N = {
+    en: {
+      'brand.sub':'transparent gateway','nav.monitor':'Monitor','nav.control':'Control',
+      'nav.overview':'Overview','nav.connections':'Connections','nav.routing':'Routing','nav.logs':'Logs',
+      'sub.overview':'Live traffic & engine health','sub.connections':'Domain-level active flows','sub.routing':'Rules, hits & proxy selection','sub.logs':'In-memory routing log',
+      'engine.online':'Engine online','engine.offline':'Engine offline','engine.connecting':'Connecting…',
+      'kpi.upload':'Upload','kpi.download':'Download','kpi.conns':'Active connections','kpi.tunnels':'Warm tunnels','kpi.liveFlows':'live flows',
+      'unit.total':'total','unit.connections':'connections',
+      'card.throughput':'Throughput','card.last120':'last 120s','card.byOutbound':'Traffic by outbound','card.ebpf':'eBPF & engine',
+      'card.active':'Active','card.recentClosed':'Recent closed','card.bpfTunnels':'BPF tunnels','card.bpfHint':'— per-tunnel RTT (eBPF sockops)',
+      'card.ruleHits':'Rule hits','card.sinceLoad':'since config load','card.outboundTotals':'Outbound totals','card.proxyGroups':'Proxy groups',
+      'card.routingRules':'Routing rules','card.firstMatch':'first match wins · reorder matters','card.liveLog':'Live log','card.inMemBuf':'in-memory buffer',
+      'health.hijack':'sk_lookup hijack','health.fallback':'Fallback',
+      'badge.attached':'attached','badge.off':'off','badge.active':'active','badge.static':'static',
+      'brutal.active':'Brutal CC active','brutal.static':'Brutal CC static',
+      'th.target':'Target','th.route':'Route','th.proto':'Proto','th.process':'Process','th.age':'Age','th.remote':'Remote','th.retrans':'Retrans','th.outbound':'Outbound','th.hits':'Hits',
+      'btn.addRule':'+ Add rule','btn.save':'Save & apply','btn.delete':'Delete','saved':'Saved & applied',
+      'ph.filter':'Filter by domain, outbound, process…',
+      'empty.loading':'Loading…','empty.noTraffic':'No traffic yet.','empty.noConn':'No active connections.','empty.nothing':'Nothing yet.',
+      'empty.noTun':'No tunnels. Needs eBPF sockops + live traffic.','empty.noGroups':'No Selector / UrlTest groups.','empty.noRules':'No rules. Add one above.',
+      'rule.default':'default','fld.add':'Add',
+      'save.invalid':'Validation failed — not saved:','save.warnHead':'Pre-check (dry_run) warnings — non-blocking:','save.warnTail':'Save and apply anyway?','save.failed':'Failed to save rules','save.portErr':'Port must be an integer 1–65535',
+      'nav.admin':'Admin','nav.devices':'Devices','nav.clients':'Clients',
+      'sub.devices':'LAN devices & per-device policy','sub.clients':'Connected clients & server controls',
+      'brand.sub.server':'proxy server','soon':'planned',
+      'dev.lanDevices':'LAN devices','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
+      'dev.perDeviceRule':'Per-device rules','dev.perDeviceRuleDesc':'Scope routing rules to a device / subnet. Backend source_ip_cidr already routes per source — this surfaces it per discovered device.',
+      'dev.perDeviceSpeed':'Per-device speed limit','dev.perDeviceSpeedDesc':'Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.',
+      'srv.domainRank':'Top domains','srv.domainRankDesc':'Ranked target domains across clients. Needs server-side connection registration + top-N aggregation.',
+      'srv.connHistory':'Connection history','srv.connHistoryDesc':'Past connections beyond the live/recent window. Needs persistence (embedded store).',
+      'srv.clientMgmt':'Connected clients','srv.clientMgmtDesc':'Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.',
+      'srv.block':'Block client','srv.blockDesc':'Reject a client IP / identity at accept. Medium; backend blacklist at the listener.',
+      'srv.rateLimit':'Per-client rate limit','srv.rateLimitDesc':'Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.',
+    },
+    zh: {
+      'brand.sub':'透明网关','nav.monitor':'监控','nav.control':'控制',
+      'nav.overview':'概览','nav.connections':'连接','nav.routing':'路由','nav.logs':'日志',
+      'sub.overview':'实时流量与引擎状态','sub.connections':'域名级活跃连接','sub.routing':'规则、命中与节点选择','sub.logs':'内存路由日志',
+      'engine.online':'引擎在线','engine.offline':'引擎离线','engine.connecting':'连接中…',
+      'kpi.upload':'上传','kpi.download':'下载','kpi.conns':'活跃连接','kpi.tunnels':'预热隧道','kpi.liveFlows':'活跃流',
+      'unit.total':'累计','unit.connections':'个连接',
+      'card.throughput':'吞吐','card.last120':'近 120 秒','card.byOutbound':'按出站分流量','card.ebpf':'eBPF 与引擎',
+      'card.active':'活跃','card.recentClosed':'最近关闭','card.bpfTunnels':'BPF 隧道','card.bpfHint':'— 每隧道 RTT (eBPF sockops)',
+      'card.ruleHits':'规则命中','card.sinceLoad':'自配置加载起','card.outboundTotals':'出站累计','card.proxyGroups':'代理组',
+      'card.routingRules':'路由规则','card.firstMatch':'首命中即用 · 顺序重要','card.liveLog':'实时日志','card.inMemBuf':'内存缓冲',
+      'health.hijack':'sk_lookup 劫持','health.fallback':'回落',
+      'badge.attached':'已挂载','badge.off':'未挂','badge.active':'活跃','badge.static':'静态',
+      'brutal.active':'Brutal CC 活跃','brutal.static':'Brutal CC 静态',
+      'th.target':'目标','th.route':'走向','th.proto':'协议','th.process':'进程','th.age':'时长','th.remote':'远端','th.retrans':'重传','th.outbound':'出站','th.hits':'命中',
+      'btn.addRule':'+ 加规则','btn.save':'保存并应用','btn.delete':'删除','saved':'已保存并应用',
+      'ph.filter':'按域名、出站、进程过滤…',
+      'empty.loading':'加载中…','empty.noTraffic':'暂无流量。','empty.noConn':'无活跃连接。','empty.nothing':'暂无。',
+      'empty.noTun':'无隧道，需 eBPF sockops + 实时流量。','empty.noGroups':'无 Selector / UrlTest 组。','empty.noRules':'无规则，点上方添加。',
+      'rule.default':'默认','fld.add':'添加',
+      'save.invalid':'校验未通过，未保存：','save.warnHead':'保存前预检 (dry_run) 发现告警（不阻断）：','save.warnTail':'仍要保存并应用？','save.failed':'保存失败','save.portErr':'端口必须是 1–65535 的整数',
+      'nav.admin':'管理','nav.devices':'设备','nav.clients':'客户端',
+      'sub.devices':'局域网设备与按设备策略','sub.clients':'连接的客户端与服务端管控',
+      'brand.sub.server':'代理服务端','soon':'计划中',
+      'dev.lanDevices':'局域网设备','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
+      'dev.perDeviceRule':'按设备规则','dev.perDeviceRuleDesc':'把路由规则限定到某设备/网段。后端 source_ip_cidr 已能按来源分流 —— 这里按发现的设备可视化配置。',
+      'dev.perDeviceSpeed':'按设备限速','dev.perDeviceSpeedDesc':'按设备限带宽。需新建流量整形数据面（tc / eBPF token bucket）—— 最大一块，单独跟踪。',
+      'srv.domainRank':'域名排行','srv.domainRankDesc':'跨客户端的目标域名排行。需服务端连接登记 + top-N 聚合。',
+      'srv.connHistory':'连接历史','srv.connHistoryDesc':'live/最近窗口之外的历史连接。需持久化（内嵌存储）。',
+      'srv.clientMgmt':'连接的客户端','srv.clientMgmtDesc':'每客户端视图：来源 IP、版本、流量。版本需握手加字段（两端）。之后按客户端屏蔽 + 限速在此操作。',
+      'srv.block':'屏蔽客户端','srv.blockDesc':'在 accept 处按客户端 IP/身份拒绝。中等量；监听侧加黑名单。',
+      'srv.rateLimit':'按客户端限速','srv.rateLimitDesc':'按客户端隧道限带宽。需流量整形数据面 —— 大工程，与设备限速一并跟踪。',
+    },
+  };
+  let lang = localStorage.getItem('mirage_lang') || ((navigator.language||'').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+  if(lang!=='zh'&&lang!=='en') lang='en';
+  const t = k => (I18N[lang]&&I18N[lang][k]) || I18N.en[k] || k;
+  function applyI18n(){
+    document.documentElement.lang = lang==='zh'?'zh-CN':'en';
+    document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'));});
+    document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.getAttribute('data-i18n-ph'));});
+    document.getElementById('langBtn').textContent = lang==='zh'?'EN':'中';
+    // brand-sub 随模式 (server/client) 不同; 顶栏标题/副标随语言刷新
+    document.querySelector('.brand-sub').textContent = MODE==='server'?t('brand.sub.server'):t('brand.sub');
+    document.getElementById('vTitle').textContent=t('nav.'+view);
+    document.getElementById('vSub').textContent=t('sub.'+view);
+  }
+  // 运行模式 (server/client): 隐藏不属于本模式的导航/视图。data-mode="both" 恒显。
+  let MODE=null;
+  function applyMode(m){
+    MODE=m;
+    document.querySelectorAll('[data-mode]').forEach(el=>{el.style.display=(el.dataset.mode==='both'||el.dataset.mode===m)?'':'none';});
+    document.querySelector('.brand-sub').textContent = m==='server'?t('brand.sub.server'):t('brand.sub');
+    const av=document.querySelector('.nav-item.active');
+    if(av&&av.style.display==='none')document.querySelector('.nav-item[data-view="overview"]').click();
+  }
+  document.getElementById('langBtn').onclick=()=>{lang=lang==='zh'?'en':'zh';localStorage.setItem('mirage_lang',lang);applyI18n();refreshAll();};
 
-        function formatBytes(bytes) {
-            if (bytes === 0) return { val: '0', unit: 'B' };
-            const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return { val: parseFloat((bytes / Math.pow(k, i)).toFixed(2)), unit: sizes[i] };
-        }
+  const css=v=>getComputedStyle(root).getPropertyValue(v).trim();
+  const esc=s=>{const d=document.createElement('div');d.textContent=String(s??'');return d.innerHTML;};
+  function fmtB(n){n=Number(n)||0;if(n<1024)return n+' B';const u=['KB','MB','GB','TB'];let i=-1,v=n;do{v/=1024;i++;}while(v>=1024&&i<u.length-1);return (v<10?v.toFixed(1):Math.round(v))+' '+u[i];}
+  function fmtRateParts(n){n=Number(n)||0;if(n<1024)return[String(Math.round(n)),'B/s'];const u=['KB/s','MB/s','GB/s'];let i=-1,v=n;do{v/=1024;i++;}while(v>=1024&&i<u.length-1);return[(v<10?v.toFixed(1):Math.round(v)).toString(),u[i]];}
+  function fmtAge(ms){const s=Math.floor((Number(ms)||0)/1000);if(s<60)return s+'s';const m=Math.floor(s/60);if(m<60)return m+'m'+(s%60)+'s';const h=Math.floor(m/60);return h+'h'+(m%60)+'m';}
+  const badge=t=>{const k=(t==='direct'||t==='block'||t==='tcp'||t==='udp')?t:'proxy';return `<span class="badge ${k}">${esc(t)}</span>`;};
 
-        async function fetchOverview() {
-            try {
-                const res = await fetch('/api/overview'); const data = await res.json();
-                const now = performance.now();
-                lastFetchTime = now;
-                
-                let upSpeed = 0; let downSpeed = 0; let bpfSpeed = 0;
-                
-                if (!isFirstTick) {
-                    upSpeed = Math.max(0, data.up - lastUp);
-                    downSpeed = Math.max(0, data.down - lastDown);
-                    bpfSpeed = Math.max(0, data.bpf_success - lastBpfSuccess);
-                    
-                    const upFmt = formatBytes(upSpeed); const downFmt = formatBytes(downSpeed);
-                    document.getElementById('upSpeed').innerText = upFmt.val;
-                    document.getElementById('upUnit').innerText = upFmt.unit + '/s';
-                    document.getElementById('downSpeed').innerText = downFmt.val;
-                    document.getElementById('downUnit').innerText = downFmt.unit + '/s';
-                    document.getElementById('bpfSuccess').innerText = bpfSpeed;
-                }
-                
-                // eBPF Status Indicator
-                // 之前只看 xdp_attached, 但服务端不挂 XDP (XDP 是客户端 DNS 拦截用),
-                // 服务端永远 OFFLINE 误导用户. 改成看 engine_online (sockmap/sockops
-                // 加载成功), 服务端和客户端都能正确显示.
-                const dot = document.getElementById('ebpfDot');
-                const text = document.getElementById('ebpfText');
-                if (data.engine_online === true) {
-                    if (!dot.classList.contains('online')) {
-                        dot.classList.add('online');
-                    }
-                    // 每次刷新都更新文案 (XDP 状态可能变化)
-                    text.innerText = data.xdp_attached === 1
-                        ? 'eBPF ENGINE: ONLINE (sockmap + XDP)'
-                        : 'eBPF ENGINE: ONLINE (sockmap)';
-                    text.style.color = '#10b981';
-                    text.style.textShadow = '0 0 10px rgba(16,185,129,0.5)';
-                } else {
-                    dot.classList.remove('online');
-                    text.innerText = 'eBPF ENGINE: OFFLINE';
-                    text.style.color = '#6b7280';
-                    text.style.textShadow = 'none';
-                }
+  // ── nav / view routing ──
+  let view='overview';
+  document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{
+    document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');view=b.dataset.view;
+    document.getElementById(view).classList.add('active');
+    document.getElementById('vTitle').textContent=t('nav.'+view);
+    document.getElementById('vSub').textContent=t('sub.'+view);
+    if(view==='routing'){fetchProxies();fetchRules();}
+    if(view==='connections')fetchConnections();
+    if(view==='logs')fetchLogs();
+    if(view==='overview')drawChart();
+  });
 
-                // Brutal CC Status Indicator — 任一 tunnel 有 srtt_us > 0 即 ACTIVE
-                // (BPF sock_ops RTT_CB 已生效, 动态调速能拿到反馈). 否则 STATIC.
-                const brutalDot = document.getElementById('brutalDot');
-                const brutalText = document.getElementById('brutalText');
-                if (data.brutal_cc_active === true) {
-                    if (!brutalDot.classList.contains('online')) brutalDot.classList.add('online');
-                    brutalText.innerText = 'Brutal CC: ACTIVE';
-                    brutalText.style.color = '#10b981';
-                    brutalText.style.textShadow = '0 0 10px rgba(16,185,129,0.5)';
-                } else {
-                    brutalDot.classList.remove('online');
-                    brutalText.innerText = 'Brutal CC: STATIC';
-                    brutalText.style.color = '#6b7280';
-                    brutalText.style.textShadow = 'none';
-                }
+  // ── history (bytes/s per tick) ──
+  const HN=120;
+  let hUp=new Array(HN).fill(0), hDown=new Array(HN).fill(0);
+  let lastUp=0,lastDown=0,first=true;
 
-                historyUp.push(upSpeed); historyUp.shift();
-                historyDown.push(downSpeed); historyDown.shift();
-                historyBpf.push(bpfSpeed); historyBpf.shift();
+  async function fetchOverview(){
+    let d;try{d=await(await fetch('/api/overview')).json();}catch(e){setEngine(false);return;}
+    if(d.mode&&d.mode!==MODE)applyMode(d.mode);
+    let us=0,ds=0;
+    if(!first){us=Math.max(0,d.up-lastUp);ds=Math.max(0,d.down-lastDown);}
+    lastUp=d.up;lastDown=d.down;first=false;
+    hUp.push(us);hUp.shift();hDown.push(ds);hDown.shift();
+    const up=fmtRateParts(us),dn=fmtRateParts(ds);
+    document.getElementById('upRate').textContent=up[0];document.getElementById('upUnit').textContent=up[1]+' ↑';
+    document.getElementById('downRate').textContent=dn[0];document.getElementById('downUnit').textContent=dn[1]+' ↓';
+    document.getElementById('kUp').textContent=up[0];document.getElementById('kUpU').textContent=up[1];
+    document.getElementById('kDown').textContent=dn[0];document.getElementById('kDownU').textContent=dn[1];
+    document.getElementById('kUpTot').textContent=fmtB(d.up)+' '+t('unit.total');
+    document.getElementById('kDownTot').textContent=fmtB(d.down)+' '+t('unit.total');
+    document.getElementById('kConn').textContent=d.connections??0;
+    document.getElementById('navConn').textContent=d.connections??0;
+    document.getElementById('kTun').textContent=d.tunnel_count??0;
+    setEngine(d.engine_online===true);
+    // health
+    const succ=d.bpf_success||0,fb=d.bpf_fallback||0,tot=succ+fb;
+    document.getElementById('hHijack').textContent=tot>0?((succ/tot*100).toFixed(1)+'%'):'—';
+    document.getElementById('hFallback').textContent=tot>0?((fb/tot*100).toFixed(1)+'%'):'0%';
+    document.getElementById('hXdp').innerHTML=d.xdp_attached===1?`<span class="badge proxy">${t('badge.attached')}</span>`:`<span class="badge direct">${t('badge.off')}</span>`;
+    const bru=d.brutal_cc_active===true;
+    document.getElementById('hBrutal').innerHTML=bru?`<span class="badge proxy">${t('badge.active')}</span>`:`<span class="badge direct">${t('badge.static')}</span>`;
+    document.getElementById('kBrutal').textContent=bru?t('brutal.active'):t('brutal.static');
+    document.getElementById('kConnSub').textContent=t('kpi.liveFlows');
+    if(view==='overview')drawChart();
+  }
+  function setEngine(on){const c=document.getElementById('engineChip'),el=document.getElementById('engineText');
+    c.className='status-chip '+(on?'ok':'off');el.textContent=on?t('engine.online'):t('engine.offline');}
 
-                const upTot = formatBytes(data.up); const downTot = formatBytes(data.down);
-                document.getElementById('upTotal').innerText = `Total: ${upTot.val} ${upTot.unit}`;
-                document.getElementById('downTotal').innerText = `Total: ${downTot.val} ${downTot.unit}`;
-                document.getElementById('bpfTotal').innerText = `Total: ${data.bpf_success} PKTS Accelerated`;
-                
-                lastUp = data.up; lastDown = data.down; lastBpfSuccess = data.bpf_success; isFirstTick = false;
-            } catch (err) {}
-        }
+  // ── traffic chart ──
+  const cv=document.getElementById('trafficChart'),tip=document.getElementById('tip');let geo=null;
+  function drawChart(){
+    const dpr=Math.min(devicePixelRatio||1,2),w=cv.clientWidth,h=cv.clientHeight;
+    if(!w)return;cv.width=w*dpr;cv.height=h*dpr;const g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,w,h);
+    const padL=52,padR=14,padT=14,padB=22,cw=w-padL-padR,ch=h-padT-padB;
+    const max=Math.max(...hUp,...hDown,1024)*1.15;
+    const X=i=>padL+(i/(HN-1))*cw,Y=v=>padT+ch-(v/max)*ch;
+    geo={padL,padT,ch,cw,w,h,max,X,Y};
+    const grid=css('--grid'),faint=css('--faint');
+    g.font='11px "JetBrains Mono",monospace';g.textBaseline='middle';
+    for(let k=0;k<=4;k++){const val=max*k/4,y=Y(val);g.strokeStyle=grid;g.lineWidth=1;g.beginPath();g.moveTo(padL,y);g.lineTo(w-padR,y);g.stroke();
+      const p=fmtRateParts(val);g.fillStyle=faint;g.textAlign='right';g.fillText(p[0]+p[1][0],padL-8,y);}
+    g.textAlign='center';g.textBaseline='top';
+    for(const s of[0,30,60,90,120]){const i=HN-1-(s/120)*(HN-1);g.fillStyle=faint;g.fillText(s===0?'now':'-'+s+'s',X(i),h-padB+6);}
+    for(const[arr,col]of[[hDown,css('--down')],[hUp,css('--up')]]){
+      g.beginPath();arr.forEach((v,i)=>{const x=X(i),y=Y(v);i?g.lineTo(x,y):g.moveTo(x,y);});
+      const gr=g.createLinearGradient(0,padT,0,padT+ch);gr.addColorStop(0,col+'44');gr.addColorStop(1,col+'00');
+      g.lineTo(X(HN-1),padT+ch);g.lineTo(X(0),padT+ch);g.closePath();g.fillStyle=gr;g.fill();
+      g.beginPath();arr.forEach((v,i)=>{const x=X(i),y=Y(v);i?g.lineTo(x,y):g.moveTo(x,y);});g.strokeStyle=col;g.lineWidth=2;g.lineJoin='round';g.stroke();
+      const lx=X(HN-1),ly=Y(arr[HN-1]);g.fillStyle=css('--surface');g.beginPath();g.arc(lx,ly,4.5,0,7);g.fill();g.fillStyle=col;g.beginPath();g.arc(lx,ly,3,0,7);g.fill();}
+  }
+  cv.addEventListener('mousemove',e=>{if(!geo)return;const r=cv.getBoundingClientRect();let i=Math.round((e.clientX-r.left-geo.padL)/geo.cw*(HN-1));i=Math.max(0,Math.min(HN-1,i));drawChart();
+    const g=cv.getContext('2d');g.strokeStyle=css('--border-strong');g.lineWidth=1;g.beginPath();g.moveTo(geo.X(i),geo.padT);g.lineTo(geo.X(i),geo.padT+geo.ch);g.stroke();
+    [[hUp,'--up'],[hDown,'--down']].forEach(([a,c])=>{g.fillStyle=css('--surface');g.beginPath();g.arc(geo.X(i),geo.Y(a[i]),4.5,0,7);g.fill();g.fillStyle=css(c);g.beginPath();g.arc(geo.X(i),geo.Y(a[i]),3,0,7);g.fill();});
+    const up=fmtRateParts(hUp[i]),dn=fmtRateParts(hDown[i]);
+    tip.style.opacity=1;tip.style.left=Math.min(geo.w-162,geo.X(i)+10)+'px';tip.style.top=(geo.padT+8)+'px';
+    tip.innerHTML=`<div class="t-time">${i===HN-1?'now':'-'+Math.round((HN-1-i)/(HN-1)*120)+'s'}</div><div class="t-row"><span><i style="background:var(--up)"></i>Up</span><b class="mono">${up[0]} ${up[1]}</b></div><div class="t-row"><span><i style="background:var(--down)"></i>Down</span><b class="mono">${dn[0]} ${dn[1]}</b></div>`;});
+  cv.addEventListener('mouseleave',()=>{tip.style.opacity=0;drawChart();});
+  addEventListener('resize',()=>{if(view==='overview')drawChart();});
 
-        // --- Neon Canvas Rendering ---
-        function drawLine(ctx, dataArr, colorStr, rgbaStr, maxVal, offsetY, height, width, slideX, step) {
-            ctx.beginPath();
-            for(let i=0; i<HISTORY_LEN; i++) {
-                let val = dataArr[i];
-                let x = i * step - slideX;
-                let y = offsetY + height - (val / Math.max(maxVal, 1)) * (height * 0.8) - (height * 0.1);
-                if(i===0) ctx.moveTo(x, y);
-                else ctx.lineTo(x, y);
-            }
-            
-            ctx.strokeStyle = colorStr;
-            ctx.lineWidth = 3;
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
-            ctx.shadowBlur = 15;
-            ctx.shadowColor = colorStr;
-            ctx.stroke();
-            
-            ctx.lineTo(width, offsetY + height);
-            ctx.lineTo(0, offsetY + height);
-            ctx.closePath();
-            
-            let grad = ctx.createLinearGradient(0, offsetY, 0, offsetY + height);
-            grad.addColorStop(0, rgbaStr);
-            grad.addColorStop(1, 'transparent');
-            ctx.fillStyle = grad;
-            ctx.shadowBlur = 0; 
-            ctx.fill();
-        }
+  // ── connections ──
+  function connRow(c,closed){
+    const rc=c.outbound==='direct'?'var(--muted)':(c.outbound==='block'?'var(--crit)':'var(--ok)');
+    const cols=closed
+      ?`<td class="target mono">${esc(c.target)}</td><td>${badge(c.outbound)}</td><td>${badge(c.proto)}</td><td class="r mono dim">${fmtAge(c.age_ms)}</td><td class="r mono">↑${fmtB(c.up)} <span class="dim">/</span> ↓${fmtB(c.down)}</td>`
+      :`<td class="target mono">${esc(c.target)}</td><td><span class="route"><span class="dim">${esc(c.inbound)}</span><span class="arrow">→</span><span style="color:${rc};font-weight:600">${esc(c.outbound)}</span></span></td><td>${badge(c.proto)}</td><td class="dim">${c.process?esc(c.process):'—'}</td><td class="r mono dim">${fmtAge(c.age_ms)}</td><td class="r mono">↑${fmtB(c.up)} <span class="dim">/</span> ↓${fmtB(c.down)}</td>`;
+    return `<tr${closed?' style="opacity:.6"':''}>${cols}</tr>`;
+  }
+  async function fetchConnections(){
+    let d;try{d=await(await fetch('/api/connections')).json();}catch(e){return;}
+    const f=(document.getElementById('connFilter').value||'').toLowerCase();
+    const match=c=>!f||[c.target,c.inbound,c.outbound,c.process,c.proto].some(x=>String(x||'').toLowerCase().includes(f));
+    const act=(d.active||[]).filter(match),rc=(d.recent_closed||[]).slice().reverse().slice(0,25).filter(match);
+    document.getElementById('connN').textContent=(d.active||[]).length+' '+t('unit.connections');
+    document.getElementById('connBody').innerHTML=act.length?act.map(c=>connRow(c,false)).join(''):`<tr><td colspan="6" class="empty">${t('empty.noConn')}</td></tr>`;
+    document.getElementById('closedBody').innerHTML=rc.length?rc.map(c=>connRow(c,true)).join(''):`<tr><td colspan="5" class="empty">${t('empty.nothing')}</td></tr>`;
+  }
+  document.getElementById('connFilter').addEventListener('input',fetchConnections);
 
-        function drawGrid(ctx, w, h) {
-            ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            for(let x=0; x<w; x+=100) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
-            for(let y=0; y<h; y+=50) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
-            ctx.stroke();
-        }
+  async function fetchTunnels(){
+    let d;try{d=await(await fetch('/api/bpf/tunnels')).json();}catch(e){return;}
+    const t=d.tunnels||[];
+    document.getElementById('tunBody').innerHTML=t.length?t.map(x=>{
+      const rc=x.rtt_ms<50?'var(--ok)':(x.rtt_ms<150?'var(--warn)':'var(--crit)');
+      return `<tr><td class="mono">${esc(x.remote||'?')}</td><td class="r mono" style="color:${rc}">${x.rtt_ms.toFixed(1)} ms</td><td class="r mono" style="color:${x.retrans>0?'var(--crit)':'var(--faint)'}">${x.retrans}</td><td class="r mono dim">${x.cwnd}</td></tr>`;
+    }).join(''):`<tr><td colspan="4" class="empty">${t('empty.noTun')}</td></tr>`;
+  }
 
-        function renderCanvas() {
-            const canvas = document.getElementById('neonCanvas');
-            if(!canvas) return requestAnimationFrame(renderCanvas);
-            
-            const rect = canvas.getBoundingClientRect();
-            if(canvas.width !== rect.width * 2) {
-                canvas.width = rect.width * 2;
-                canvas.height = rect.height * 2;
-            }
-            
-            const ctx = canvas.getContext('2d');
-            const w = canvas.width;
-            const h = canvas.height;
-            
-            ctx.clearRect(0, 0, w, h);
-            drawGrid(ctx, w, h);
-            
-            let now = performance.now();
-            let elapsed = Math.min(1000, now - lastFetchTime);
-            let step = w / (HISTORY_LEN - 1);
-            let slideX = (elapsed / 1000.0) * step;
-            
-            // Top Track: Up/Down Speed (60% height)
-            let maxSpeed = Math.max(...historyUp, ...historyDown, 1024 * 50); // min 50KB/s scale
-            drawLine(ctx, historyUp, '#38bdf8', 'rgba(56, 189, 248, 0.3)', maxSpeed, 0, h * 0.6, w, slideX, step);
-            drawLine(ctx, historyDown, '#a78bfa', 'rgba(167, 139, 250, 0.3)', maxSpeed, 0, h * 0.6, w, slideX, step);
-            
-            // Bottom Track: BPF Success Rate (40% height)
-            let maxBpf = Math.max(...historyBpf, 10);
-            drawLine(ctx, historyBpf, '#10b981', 'rgba(16, 185, 129, 0.3)', maxBpf, h * 0.6, h * 0.4, w, slideX, step);
-            
-            // Draw track divider
-            ctx.beginPath();
-            ctx.moveTo(0, h * 0.6);
-            ctx.lineTo(w, h * 0.6);
-            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-            ctx.setLineDash([10, 10]);
-            ctx.stroke();
-            ctx.setLineDash([]);
-            
-            requestAnimationFrame(renderCanvas);
-        }
-        
-        requestAnimationFrame(renderCanvas);
-        // --- End Neon Canvas Rendering ---
+  // ── stats ──
+  function bars(el,withConn){
+    const obs=statsCache.outbounds||[];
+    if(!obs.length){document.getElementById(el).innerHTML=`<div class="empty">${t('empty.noTraffic')}</div>`;return;}
+    const max=Math.max(...obs.map(o=>o.up+o.down),1);
+    const col=t=>t==='direct'?'var(--muted)':(t==='block'?'var(--crit)':(t==='proxy'?'var(--ok)':'var(--down)'));
+    document.getElementById(el).innerHTML=obs.map(o=>`<div class="meter-row"><span>${badge(o.tag)}</span><div class="meter"><i style="width:${Math.max(4,(o.up+o.down)/max*100)}%;background:${col(o.tag)}"></i></div><span class="mono dim" style="font-size:12px">${withConn?o.live+' live · ':''}↑${fmtB(o.up)} ↓${fmtB(o.down)}</span></div>`).join('');
+  }
+  let statsCache={};
+  async function fetchStats(){
+    let d;try{d=await(await fetch('/api/stats')).json();}catch(e){return;}
+    statsCache=d;
+    if(view==='overview')bars('obBars',false);
+    if(view==='routing'){
+      bars('obTotals',true);
+      const rules=d.rules||[],def=d.default||{outbound:'',hits:0};
+      const col=t=>t==='direct'?'var(--muted)':(t==='block'?'var(--crit)':'var(--ok)');
+      document.getElementById('hitsBody').innerHTML=rules.map(r=>`<tr${r.hits===0?' style="opacity:.45"':''}><td class="mono dim">${r.index}</td><td><span style="color:${col(r.outbound)};font-weight:600">${esc(r.outbound)}</span></td><td class="r mono">${(r.hits||0).toLocaleString()}</td></tr>`).join('')+
+        `<tr style="border-top:1px solid var(--border-strong)"><td class="dim">${t('rule.default')}</td><td class="dim">${esc(def.outbound)}</td><td class="r mono">${(def.hits||0).toLocaleString()}</td></tr>`;
+    }
+  }
 
-        async function fetchLogs() {
-            try {
-                const res = await fetch('/api/logs'); const data = await res.json();
-                const term = document.getElementById('terminal');
-                if (data.logs.length !== lastLogLines || data.logs.length > 0) {
-                    term.innerHTML = '';
-                    data.logs.forEach(log => {
-                        const div = document.createElement('div');
-                        div.innerText = log;
-                        if (log.includes('DEBUG')) div.className = 'log-debug';
-                        else if (log.includes('INFO')) div.className = 'log-info';
-                        else if (log.includes('WARN')) div.className = 'log-warn';
-                        else if (log.includes('ERROR')) div.className = 'log-error';
-                        term.appendChild(div);
-                    });
-                    term.scrollTop = term.scrollHeight; lastLogLines = data.logs.length;
-                }
-            } catch (err) {}
-        }
+  // ── proxies ──
+  async function fetchProxies(){
+    let d;try{d=await(await fetch('/api/proxies')).json();}catch(e){return;}
+    const c=document.getElementById('proxiesContainer');
+    if(!d.proxies||!d.proxies.length){c.innerHTML=`<div class="empty">${t('empty.noGroups')}</div>`;return;}
+    c.innerHTML=d.proxies.map(p=>`<div class="proxy-group"><div class="proxy-group-title">${esc(p.tag)} <span class="badge direct">${esc(p.type)}</span></div><div class="node-list">`+
+      p.children.map(ch=>{
+        const act=ch.tag===p.selected?'active':'';
+        const oc=p.type==='Selector'?`onclick="switchProxy('${esc(p.tag)}','${esc(ch.tag)}')"`:'';
+        let lat='';
+        if(ch.latency_rtt_ms!=null){const cl=ch.latency_rtt_ms<100?'var(--ok)':(ch.latency_rtt_ms<300?'var(--warn)':'var(--crit)');lat+=`<div class="mono" style="font-size:11px;color:${cl};margin-top:4px">BPF ${ch.latency_rtt_ms} ms</div>`;}
+        if(ch.latency_http_ms!=null){const cl=ch.latency_http_ms<100?'var(--ok)':(ch.latency_http_ms<300?'var(--warn)':'var(--crit)');lat+=`<div class="mono" style="font-size:11px;color:${cl};margin-top:2px">HTTP ${ch.latency_http_ms} ms</div>`;}
+        if(!lat)lat='<div class="dim mono" style="font-size:11px;margin-top:4px">—</div>';
+        return `<div class="node-btn ${act}" ${oc}><div class="n-tag">${esc(ch.tag)}</div>${lat}</div>`;
+      }).join('')+`</div></div>`).join('');
+  }
+  window.switchProxy=async(group,target)=>{try{await fetch('/api/proxies/select',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({group,target})});fetchProxies();}catch(e){}};
 
-        async function switchProxy(group, target) {
-            try {
-                await fetch('/api/proxies/select', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-                    body: JSON.stringify({ group, target })
-                });
-                fetchProxies(); // Refresh UI
-            } catch(e) {}
-        }
+  // ── logs ──
+  let lastLog=-1;
+  async function fetchLogs(){
+    let d;try{d=await(await fetch('/api/logs')).json();}catch(e){return;}
+    if(d.logs.length===lastLog)return;lastLog=d.logs.length;
+    const term=document.getElementById('term');
+    term.innerHTML=d.logs.map(l=>{let c='log-info';if(l.includes('DEBUG'))c='log-debug';else if(l.includes('WARN'))c='log-warn';else if(l.includes('ERROR'))c='log-error';return `<div class="${c}">${esc(l)}</div>`;}).join('');
+    term.scrollTop=term.scrollHeight;
+  }
 
-        async function fetchProxies() {
-            try {
-                const res = await fetch('/api/proxies'); const data = await res.json();
-                const container = document.getElementById('proxiesContainer');
-                if(data.proxies.length === 0) {
-                    container.innerHTML = 'No Selector or UrlTest groups found.'; return;
-                }
-                
-                let html = '';
-                data.proxies.forEach(p => {
-                    html += `<div class="proxy-group">
-                        <div class="proxy-group-title">${p.tag} <span class="badge">${p.type}</span></div>
-                        <div class="node-list">`;
-                    
-                    p.children.forEach(child => {
-                        const isActive = (child.tag === p.selected) ? 'active' : '';
-                        const onclick = p.type === 'Selector' ? `onclick="switchProxy('${p.tag}', '${child.tag}')"` : '';
-                        
-                        let pingHtml = '';
-                        if (child.latency_rtt_ms !== null) {
-                            let color = child.latency_rtt_ms < 100 ? '#10b981' : (child.latency_rtt_ms < 300 ? '#f59e0b' : '#ef4444');
-                            pingHtml += `<div style="font-size: 0.75rem; color: ${color}; margin-top: 4px;">BPF: ${child.latency_rtt_ms} ms</div>`;
-                        }
-                        if (child.latency_http_ms !== null) {
-                            let color = child.latency_http_ms < 100 ? '#10b981' : (child.latency_http_ms < 300 ? '#f59e0b' : '#ef4444');
-                            pingHtml += `<div style="font-size: 0.75rem; color: ${color}; margin-top: 2px;">HTTP: ${child.latency_http_ms} ms</div>`;
-                        }
-                        if (pingHtml === '') {
-                            pingHtml = `<div style="font-size: 0.75rem; color: #6b7280; margin-top: 4px;">-</div>`;
-                        }
+  // ── rules editor (data logic ported verbatim; render restyled) ──
+  let currentRules=[],availableOutbounds=[];
+  window.addRule=()=>{currentRules.unshift({outbound:'direct'});renderRules();};
+  window.removeRule=i=>{currentRules.splice(i,1);renderRules();};
+  window.updateRuleOutbound=(i,v)=>{currentRules[i].outbound=v;};
+  window.moveRule=(i,dir)=>{const j=i+dir;if(j<0||j>=currentRules.length)return;[currentRules[i],currentRules[j]]=[currentRules[j],currentRules[i]];renderRules();};
+  window.addRuleItem=(ri,key)=>{const inp=document.getElementById(`input_${ri}_${key}`);let v=inp.value.trim();if(!v)return;if(key==='port'){const n=parseInt(v,10);if(!Number.isInteger(n)||n<1||n>65535){alert(t('save.portErr'));return;}v=n;}if(!currentRules[ri][key])currentRules[ri][key]=[];currentRules[ri][key].push(v);renderRules();};
+  window.removeRuleItem=(ri,key,ii)=>{currentRules[ri][key].splice(ii,1);if(currentRules[ri][key].length===0)delete currentRules[ri][key];renderRules();};
+  async function fetchRules(){try{const d=await(await fetch('/api/rules')).json();if(d.status==='success'){currentRules=d.rules||[];availableOutbounds=d.outbounds||[];renderRules();}}catch(e){}}
+  const RF=[['domain_suffix','Domain Suffix'],['domain_keyword','Domain Keyword'],['domain_regex','Domain Regex'],['geosite','Geosite'],['ip_cidr','IP CIDR'],['geoip','GeoIP'],['source_ip_cidr','Source IP'],['process_name','Process Name'],['inbound','Inbound'],['protocol','Protocol'],['port','Port']];
+  function renderRules(){
+    const c=document.getElementById('visualRulesContainer');
+    if(!currentRules.length){c.innerHTML=`<div class="empty">${t('empty.noRules')}</div>`;return;}
+    const dl=`<datalist id="outboundOptions">${availableOutbounds.map(t=>`<option value="${esc(t)}"></option>`).join('')}</datalist>`;
+    const field=(idx,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span onclick="removeRuleItem(${idx},'${key}',${vi})">×</span></div>`).join('');
+      return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="input_${idx}_${key}" placeholder="${t('fld.add')}" onkeypress="if(event.key==='Enter')addRuleItem(${idx},'${key}')"><button class="btn-add" onclick="addRuleItem(${idx},'${key}')">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
+    c.innerHTML=dl+currentRules.map((rule,idx)=>{
+      const up=idx>0?`<button class="btn-add" title="Up" onclick="moveRule(${idx},-1)">↑</button>`:'';
+      const dn=idx<currentRules.length-1?`<button class="btn-add" title="Down" onclick="moveRule(${idx},1)">↓</button>`:'';
+      return `<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(idx+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<div style="margin-left:auto;display:flex;gap:6px">${up}${dn}<button class="btn-remove" onclick="removeRule(${idx})">${t('btn.delete')}</button></div></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="outboundOptions" value="${esc(rule.outbound||'')}" onchange="updateRuleOutbound(${idx},this.value)" placeholder="e.g. proxy, direct"></div>${RF.map(([k,l])=>field(idx,rule,k,l)).join('')}</div></div>`;
+    }).join('');
+  }
+  async function postRules(dry){const r=await fetch('/api/rules'+(dry?'?dry_run=1':''),{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({rules:currentRules})});return r.json();}
+  window.saveRules=async()=>{try{
+    const dry=await postRules(true);
+    if(dry.status!=='success'){alert(t('save.invalid')+'\n'+(dry.message||''));return;}
+    const issues=dry.issues||[];
+    if(issues.length&&!confirm(t('save.warnHead')+'\n\n• '+issues.join('\n• ')+'\n\n'+t('save.warnTail')))return;
+    const d=await postRules(false);
+    if(d.status==='success'){const b=document.getElementById('saveBtn'),o=b.textContent;b.textContent=t('saved');setTimeout(()=>b.textContent=o,2000);fetchRules();}
+    else alert((d.message||''));
+  }catch(e){alert(t('save.failed'));}};
 
-                        html += `<div class="node-btn ${isActive}" ${onclick}>
-                            <div>${child.tag}</div>
-                            ${pingHtml}
-                        </div>`;
-                    });
-                    
-                    html += `</div></div>`;
-                });
-                container.innerHTML = html;
-            } catch (err) {}
-        }
+  // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}}
 
-        let currentRules = [];
-        let availableOutbounds = [];
-
-        async function fetchRules() {
-            try {
-                const res = await fetch('/api/rules');
-                const data = await res.json();
-                if (data.status === 'success') {
-                    currentRules = data.rules || [];
-                    availableOutbounds = data.outbounds || [];
-                    renderRules();
-                }
-            } catch(e) {}
-        }
-
-        function renderRules() {
-            const container = document.getElementById('visualRulesContainer');
-            if (currentRules.length === 0) {
-                container.innerHTML = 'No rules found. Add one above.';
-                return;
-            }
-            
-            // outbound 下拉建议 (datalist, authoritative 从后端 config.outbounds 取; 仍可自由输入)
-            const dlOpts = availableOutbounds.map(t => `<option value="${connEsc(t)}"></option>`).join('');
-            let html = `<datalist id="outboundOptions">${dlOpts}</datalist>`;
-            currentRules.forEach((rule, idx) => {
-                const outbound = rule.outbound || '';
-
-                const renderField = (key, label) => {
-                    const vals = rule[key] || [];
-                    let tagsHtml = vals.map((v, vIdx) => `
-                        <div class="rule-tag">${connEsc(String(v))} <span onclick="removeRuleItem(${idx}, '${key}', ${vIdx})">×</span></div>
-                    `).join('');
-
-                    return `
-                        <div class="rule-field">
-                            <label>${label}</label>
-                            <div style="display: flex; gap: 5px;">
-                                <input type="text" id="input_${idx}_${key}" placeholder="Add ${label}" onkeypress="if(event.key === 'Enter') addRuleItem(${idx}, '${key}')">
-                                <button class="btn-add" onclick="addRuleItem(${idx}, '${key}')">+</button>
-                            </div>
-                            <div class="rule-tags-container">${tagsHtml}</div>
-                        </div>
-                    `;
-                };
-
-                // 首命中即用 → 顺序关键, 提供上下移。
-                const upBtn = idx > 0 ? `<button class="btn-add" title="上移" onclick="moveRule(${idx}, -1)">↑</button>` : '';
-                const downBtn = idx < currentRules.length - 1 ? `<button class="btn-add" title="下移" onclick="moveRule(${idx}, 1)">↓</button>` : '';
-
-                html += `
-                    <div class="rule-card">
-                        <div class="rule-header">
-                            <strong>Rule #${idx + 1}</strong>
-                            <div style="display: flex; gap: 6px; align-items: center;">
-                                ${upBtn}${downBtn}
-                                <button class="btn-remove" onclick="removeRule(${idx})">Delete Rule</button>
-                            </div>
-                        </div>
-                        <div class="rule-fields">
-                            <div class="rule-field">
-                                <label>Outbound</label>
-                                <input type="text" list="outboundOptions" value="${connEsc(outbound)}" onchange="updateRuleOutbound(${idx}, this.value)" placeholder="e.g. proxy, direct">
-                            </div>
-                            ${renderField('domain_suffix', 'Domain Suffix')}
-                            ${renderField('domain_keyword', 'Domain Keyword')}
-                            ${renderField('domain_regex', 'Domain Regex')}
-                            ${renderField('geosite', 'Geosite')}
-                            ${renderField('ip_cidr', 'IP CIDR')}
-                            ${renderField('geoip', 'GeoIP')}
-                            ${renderField('source_ip_cidr', 'Source IP')}
-                            ${renderField('process_name', 'Process Name')}
-                            ${renderField('inbound', 'Inbound')}
-                            ${renderField('protocol', 'Protocol')}
-                            ${renderField('port', 'Port')}
-                        </div>
-                    </div>
-                `;
-            });
-            container.innerHTML = html;
-        }
-
-        function addRule() {
-            currentRules.unshift({ outbound: "direct" });
-            renderRules();
-        }
-
-        function removeRule(idx) {
-            currentRules.splice(idx, 1);
-            renderRules();
-        }
-
-        function updateRuleOutbound(idx, val) {
-            currentRules[idx].outbound = val;
-        }
-
-        function addRuleItem(ruleIdx, key) {
-            const input = document.getElementById(`input_${ruleIdx}_${key}`);
-            let val = input.value.trim();
-            if (!val) return;
-            // port 是数字数组 (Vec<u16>): 字符串 "443" 反序列化不成 u16, 必须存 Number 并校验范围。
-            if (key === 'port') {
-                const n = parseInt(val, 10);
-                if (!Number.isInteger(n) || n < 1 || n > 65535) {
-                    alert('Port 必须是 1–65535 的整数');
-                    return;
-                }
-                val = n;
-            }
-            if (!currentRules[ruleIdx][key]) currentRules[ruleIdx][key] = [];
-            currentRules[ruleIdx][key].push(val);
-            renderRules();
-        }
-
-        function moveRule(idx, dir) {
-            const j = idx + dir;
-            if (j < 0 || j >= currentRules.length) return;
-            [currentRules[idx], currentRules[j]] = [currentRules[j], currentRules[idx]];
-            renderRules();
-        }
-
-        function removeRuleItem(ruleIdx, key, itemIdx) {
-            currentRules[ruleIdx][key].splice(itemIdx, 1);
-            if (currentRules[ruleIdx][key].length === 0) {
-                delete currentRules[ruleIdx][key];
-            }
-            renderRules();
-        }
-
-        async function postRules(dryRun) {
-            const res = await fetch('/api/rules' + (dryRun ? '?dry_run=1' : ''), {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                body: JSON.stringify({ rules: currentRules })
-            });
-            return res.json();
-        }
-
-        async function saveRules() {
-            try {
-                // 1. 先 dry_run 预检: 后端整份候选 config 结构+语义校验, 不落盘。
-                //    结构非法 (status=error) → 拒绝保存, 别把配置写坏; 只是语义告警 (issues) → 提示后可继续。
-                const dry = await postRules(true);
-                if (dry.status !== 'success') {
-                    alert('校验未通过, 未保存:\n' + (dry.message || '未知错误'));
-                    return;
-                }
-                const issues = dry.issues || [];
-                if (issues.length > 0 &&
-                    !confirm('规则有以下告警 (不阻断, 但请确认):\n\n• ' + issues.join('\n• ') + '\n\n仍要保存并应用?')) {
-                    return;
-                }
-                // 2. 真正写入 + 热重载。
-                const data = await postRules(false);
-                if (data.status === 'success') {
-                    const btn = document.querySelector('.btn-save');
-                    const oldText = btn.innerText;
-                    btn.innerText = 'Saved & Applied!';
-                    btn.style.background = '#10b981';
-                    setTimeout(() => {
-                        btn.innerText = oldText;
-                        btn.style.background = '';
-                    }, 2000);
-                    fetchRules(); // 回读确认落盘结果 (兼顾 config 多写者竞态, 见 brain config-write-race)
-                } else {
-                    alert('Error saving rules: ' + (data.message || '未知错误'));
-                }
-            } catch(e) {
-                alert('Failed to save rules!');
-            }
-        }
-
-        // ──────────────────────────────────────────────────────────────────────
-        // Active BPF Tunnels: 1Hz 轮询 /api/bpf/tunnels, 表格化展示 cookie /
-        // remote / rtt / retrans / 趋势. 点击行展开 cookie / cwnd / data_segs
-        // 详情. RTT 趋势靠 JS 端维护 5 点滚动窗口跟当前值对比 ↑/↓/→.
-        // ──────────────────────────────────────────────────────────────────────
-        const tunnelRttHistory = new Map(); // cookie(string) -> [rtt, rtt, ...]
-        const tunnelExpanded = new Set();
-
-        function tunnelHtmlEscape(s) {
-            const d = document.createElement('div');
-            d.innerText = String(s);
-            return d.innerHTML;
-        }
-
-        function tunnelComputeTrend(hist) {
-            if (hist.length < 2) return '<span style="color: var(--text-muted);">→</span>';
-            const recent = hist[hist.length - 1];
-            const prev = hist[hist.length - 2];
-            if (recent > prev * 1.1) return '<span style="color: #ef4444;">↑</span>';
-            if (recent < prev * 0.9) return '<span style="color: #10b981;">↓</span>';
-            return '<span style="color: var(--text-muted);">→</span>';
-        }
-
-        function tunnelToggle(cookie) {
-            if (tunnelExpanded.has(cookie)) tunnelExpanded.delete(cookie);
-            else tunnelExpanded.add(cookie);
-            fetchTunnels(); // 重新渲染应用新展开状态
-        }
-
-        // 内容不变就不写 innerHTML: 每秒轮询若数据一致 (idle / 无变化), 避免整块
-        // DOM 销毁重建导致的重绘闪烁 + 丢失选中/滚动态. 数据真变了才更新.
-        function setHtmlIfChanged(id, html) {
-            const el = document.getElementById(id);
-            if (el && el.__lastHtml !== html) {
-                el.__lastHtml = html;
-                el.innerHTML = html;
-            }
-        }
-
-        async function fetchTunnels() {
-            let data;
-            try {
-                const res = await fetch('/api/bpf/tunnels');
-                data = await res.json();
-            } catch (e) {
-                setHtmlIfChanged('tunnelsContainer',
-                    '<div style="color: #ef4444; padding: 20px;">Failed to load tunnels.</div>');
-                return;
-            }
-            const tunnels = data.tunnels || [];
-            const countLabel = `(${tunnels.length} active)`;
-            const countEl = document.getElementById('tunnelCount');
-            if (countEl.innerText !== countLabel) countEl.innerText = countLabel;
-
-            if (tunnels.length === 0) {
-                setHtmlIfChanged('tunnelsContainer',
-                    '<div style="color: var(--text-muted); text-align: center; padding: 20px;">' +
-                    'No active tunnels. BPF tracks RTT only after sock_ops callback fires — send real traffic through the proxy to generate samples.' +
-                    '</div>');
-                return;
-            }
-
-            // 维护 per-cookie RTT 历史 (5 点滚动)
-            const seen = new Set();
-            tunnels.forEach(t => {
-                const cookie = String(t.cookie);
-                seen.add(cookie);
-                if (!tunnelRttHistory.has(cookie)) tunnelRttHistory.set(cookie, []);
-                const h = tunnelRttHistory.get(cookie);
-                h.push(t.rtt_ms);
-                if (h.length > 5) h.shift();
-            });
-            // GC: cookie 不在新返回里 = LRU 已淘汰, 清掉历史
-            for (const k of [...tunnelRttHistory.keys()]) {
-                if (!seen.has(k)) tunnelRttHistory.delete(k);
-            }
-
-            let html = '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
-            html += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
-            html += '<th style="padding: 10px 6px;">REMOTE</th>';
-            html += '<th style="padding: 10px 6px;">RTT (ms)</th>';
-            html += '<th style="padding: 10px 6px;">RETRANS</th>';
-            html += '<th style="padding: 10px 6px; text-align: right;">TREND</th>';
-            html += '</tr></thead><tbody>';
-
-            tunnels.forEach(t => {
-                const cookie = String(t.cookie);
-                const hist = tunnelRttHistory.get(cookie) || [];
-                const trend = tunnelComputeTrend(hist);
-                const expanded = tunnelExpanded.has(cookie);
-                const rttColor = t.rtt_ms < 50 ? '#10b981' : (t.rtt_ms < 150 ? '#fbbf24' : '#ef4444');
-                const retransColor = t.retrans > 0 ? '#ef4444' : 'var(--text-muted)';
-
-                html += `<tr style="border-top: 1px solid rgba(255,255,255,0.05); cursor: pointer;" onclick="tunnelToggle('${cookie}')">`;
-                html += `<td style="padding: 10px 6px;">${tunnelHtmlEscape(t.remote || '?:?')}</td>`;
-                html += `<td style="padding: 10px 6px; color: ${rttColor}; text-shadow: 0 0 8px ${rttColor}40;">${t.rtt_ms.toFixed(1)}</td>`;
-                html += `<td style="padding: 10px 6px; color: ${retransColor};">${t.retrans}</td>`;
-                html += `<td style="padding: 10px 6px; text-align: right; font-size: 1.3em;">${trend}</td>`;
-                html += '</tr>';
-
-                if (expanded) {
-                    // Cookie 显示为 0x... 16 位 hex; cwnd/data_segs 详情
-                    const cookieHex = '0x' + BigInt(cookie).toString(16).padStart(16, '0');
-                    html += '<tr style="background: rgba(0,0,0,0.25);">';
-                    html += '<td colspan="4" style="padding: 10px 16px; font-size: 0.8em; color: var(--text-muted); letter-spacing: 0.5px;">';
-                    html += `cookie: <span style="color: var(--text);">${cookieHex}</span> &nbsp;|&nbsp; `;
-                    html += `cwnd: <span style="color: var(--text);">${t.cwnd}</span> &nbsp;|&nbsp; `;
-                    html += `data_segs: <span style="color: var(--text);">${t.data_segs.toLocaleString()}</span>`;
-                    html += '</td></tr>';
-                }
-            });
-
-            html += '</tbody></table>';
-            setHtmlIfChanged('tunnelsContainer', html);
-        }
-
-        // ── Active Connections (域名连接信息, /api/connections) ──────────────
-        function connEsc(s) { const d = document.createElement('div'); d.textContent = String(s ?? ''); return d.innerHTML; }
-        function fmtBytes(n) {
-            n = Number(n) || 0;
-            if (n < 1024) return n + ' B';
-            const u = ['KB', 'MB', 'GB', 'TB']; let i = -1, v = n;
-            do { v /= 1024; i++; } while (v >= 1024 && i < u.length - 1);
-            return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
-        }
-        function fmtAge(ms) {
-            const s = Math.floor((Number(ms) || 0) / 1000);
-            if (s < 60) return s + 's';
-            const m = Math.floor(s / 60);
-            if (m < 60) return m + 'm' + (s % 60) + 's';
-            const h = Math.floor(m / 60);
-            return h + 'h' + (m % 60) + 'm';
-        }
-        function connTable(rows, closed) {
-            let h = '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
-            h += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
-            h += '<th style="padding: 8px 6px;">TARGET</th><th style="padding: 8px 6px;">ROUTE</th>';
-            h += '<th style="padding: 8px 6px;">PROTO</th><th style="padding: 8px 6px;">PROCESS</th>';
-            h += '<th style="padding: 8px 6px;">AGE</th><th style="padding: 8px 6px; text-align: right;">↑ / ↓</th></tr></thead><tbody>';
-            rows.forEach(c => {
-                const routeColor = c.outbound === 'direct' ? 'var(--text-muted)'
-                    : (c.outbound === 'block' ? '#ef4444' : '#10b981');
-                const op = closed ? 0.55 : 1;
-                h += `<tr style="border-top: 1px solid rgba(255,255,255,0.05); opacity: ${op};">`;
-                h += `<td style="padding: 8px 6px; color: var(--text-main);">${connEsc(c.target)}</td>`;
-                h += `<td style="padding: 8px 6px;"><span style="color: var(--text-muted);">${connEsc(c.inbound)}</span> → <span style="color: ${routeColor};">${connEsc(c.outbound)}</span></td>`;
-                h += `<td style="padding: 8px 6px; color: var(--text-muted);">${connEsc(c.proto)}</td>`;
-                h += `<td style="padding: 8px 6px; color: var(--text-muted);">${c.process ? connEsc(c.process) : '—'}</td>`;
-                h += `<td style="padding: 8px 6px; color: var(--text-muted);">${fmtAge(c.age_ms)}</td>`;
-                h += `<td style="padding: 8px 6px; text-align: right;">↑${fmtBytes(c.up)} <span style="color: var(--text-muted);">/</span> ↓${fmtBytes(c.down)}</td>`;
-                h += '</tr>';
-            });
-            h += '</tbody></table>';
-            return h;
-        }
-        async function fetchConnections() {
-            let data;
-            try {
-                const res = await fetch('/api/connections');
-                data = await res.json();
-            } catch (e) {
-                setHtmlIfChanged('connectionsContainer',
-                    '<div style="color: #ef4444; padding: 20px;">Failed to load connections.</div>');
-                return;
-            }
-            const active = data.active || [];
-            const recent = data.recent_closed || [];
-            const label = `(${active.length} active)`;
-            const countEl = document.getElementById('connCount');
-            if (countEl.innerText !== label) countEl.innerText = label;
-
-            let html = '';
-            if (active.length === 0) {
-                html += '<div style="color: var(--text-muted); text-align: center; padding: 20px;">No active connections.</div>';
-            } else {
-                html += connTable(active, false);
-            }
-            if (recent.length) {
-                // 最近关闭: 新的在前, 最多 20 条
-                html += '<div style="margin-top: 16px; color: var(--text-muted); font-size: 0.8em; letter-spacing: 1px;">RECENT CLOSED (' + recent.length + ')</div>';
-                html += connTable(recent.slice().reverse().slice(0, 20), true);
-            }
-            setHtmlIfChanged('connectionsContainer', html);
-        }
-
-        // ── Traffic by Outbound & Rule Hits (/api/stats) ─────────────────────
-        async function fetchStats() {
-            let data;
-            try {
-                const res = await fetch('/api/stats');
-                data = await res.json();
-            } catch (e) {
-                setHtmlIfChanged('statsContainer', '<div style="color: #ef4444; padding: 20px;">Failed to load stats.</div>');
-                return;
-            }
-            const outbounds = data.outbounds || [];
-            const rules = data.rules || [];
-            const def = data.default || { outbound: '', hits: 0 };
-
-            // 出站分流量表
-            let html = '<div style="color: var(--text-muted); font-size: 0.8em; letter-spacing: 1px; margin-bottom: 8px;">BY OUTBOUND</div>';
-            if (outbounds.length === 0) {
-                html += '<div style="color: var(--text-muted); padding: 8px 6px;">No traffic yet.</div>';
-            } else {
-                html += '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
-                html += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
-                html += '<th style="padding: 8px 6px;">OUTBOUND</th><th style="padding: 8px 6px; text-align: right;">LIVE</th>';
-                html += '<th style="padding: 8px 6px; text-align: right;">CONNS</th><th style="padding: 8px 6px; text-align: right;">↑ UP</th><th style="padding: 8px 6px; text-align: right;">↓ DOWN</th></tr></thead><tbody>';
-                outbounds.forEach(o => {
-                    const c = o.outbound === 'direct' ? 'var(--text-muted)' : (o.outbound === 'block' ? '#ef4444' : '#10b981');
-                    html += `<tr style="border-top: 1px solid rgba(255,255,255,0.05);">`;
-                    html += `<td style="padding: 8px 6px; color: ${c};">${connEsc(o.tag)}</td>`;
-                    html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-main);">${o.live}</td>`;
-                    html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-muted);">${o.conns}</td>`;
-                    html += `<td style="padding: 8px 6px; text-align: right;">${fmtBytes(o.up)}</td>`;
-                    html += `<td style="padding: 8px 6px; text-align: right;">${fmtBytes(o.down)}</td>`;
-                    html += '</tr>';
-                });
-                html += '</tbody></table>';
-            }
-
-            // 规则命中表
-            html += '<div style="color: var(--text-muted); font-size: 0.8em; letter-spacing: 1px; margin: 16px 0 8px;">RULE HITS <span style="text-transform: none; letter-spacing: 0;">(自本次配置加载起)</span></div>';
-            html += '<table style="width: 100%; border-collapse: collapse; font-family: monospace; font-size: 0.9em;">';
-            html += '<thead><tr style="text-align: left; color: var(--text-muted); font-size: 0.85em; letter-spacing: 1px;">';
-            html += '<th style="padding: 8px 6px;">#</th><th style="padding: 8px 6px;">OUTBOUND</th><th style="padding: 8px 6px; text-align: right;">HITS</th></tr></thead><tbody>';
-            rules.forEach(r => {
-                const c = r.outbound === 'direct' ? 'var(--text-muted)' : (r.outbound === 'block' ? '#ef4444' : '#10b981');
-                const dim = r.hits === 0 ? 'opacity: 0.5;' : '';
-                html += `<tr style="border-top: 1px solid rgba(255,255,255,0.05); ${dim}">`;
-                html += `<td style="padding: 8px 6px; color: var(--text-muted);">${r.index}</td>`;
-                html += `<td style="padding: 8px 6px; color: ${c};">${connEsc(r.outbound)}</td>`;
-                html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-main);">${r.hits.toLocaleString()}</td>`;
-                html += '</tr>';
-            });
-            const dc = def.outbound === 'direct' ? 'var(--text-muted)' : (def.outbound === 'block' ? '#ef4444' : '#10b981');
-            html += `<tr style="border-top: 1px solid rgba(255,255,255,0.12);">`;
-            html += `<td style="padding: 8px 6px; color: var(--text-muted);">default</td>`;
-            html += `<td style="padding: 8px 6px; color: ${dc};">${connEsc(def.outbound)}</td>`;
-            html += `<td style="padding: 8px 6px; text-align: right; color: var(--text-main);">${(def.hits || 0).toLocaleString()}</td>`;
-            html += '</tr></tbody></table>';
-
-            setHtmlIfChanged('statsContainer', html);
-        }
-
-        setInterval(fetchOverview, 1000);
-        setInterval(fetchLogs, 2000);
-        setInterval(fetchProxies, 5000);
-        setInterval(fetchTunnels, 1000);
-        setInterval(fetchConnections, 1000);
-        setInterval(fetchStats, 2000);
-
-        fetchOverview(); fetchLogs(); fetchProxies(); fetchRules(); fetchTunnels(); fetchConnections(); fetchStats();
-    </script>
+  // ── polling ──
+  setInterval(fetchOverview,1000);
+  setInterval(()=>{if(view==='connections'){fetchConnections();fetchTunnels();}},1000);
+  setInterval(()=>{if(view==='overview'||view==='routing')fetchStats();},2000);
+  setInterval(()=>{if(view==='logs')fetchLogs();},2000);
+  setInterval(()=>{if(view==='routing')fetchProxies();},5000);
+  applyI18n();
+  fetchOverview();fetchStats();
+})();
+</script>
 </body>
 </html>

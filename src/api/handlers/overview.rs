@@ -48,5 +48,7 @@ pub async fn get_overview(State(state): State<AppState>) -> Json<Value> {
         "engine_online": engine_online,
         "tunnel_count": tunnel_count,
         "brutal_cc_active": brutal_cc_active,
+        // 运行模式, 供 WebUI 分服务端/客户端视图 + 「特定入口」Admin 区决定展示哪些功能。
+        "mode": if state.is_server { "server" } else { "client" },
     }))
 }
