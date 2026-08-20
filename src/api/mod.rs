@@ -204,6 +204,7 @@ pub async fn start_server(
     xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
     config_path: String,
     token: Option<String>,
+    is_server: bool,
 ) {
     // 1. 初始化历史数据结构，窗口大小设定为 120 (即记录过去 120 秒 / 2分钟 的数据)
     // 预先填充 0 以避免前端在数据不足时渲染异常
@@ -223,6 +224,7 @@ pub async fn start_server(
         history: history.clone(),
         gui_token,
         rate_limiter: Arc::new(std::sync::Mutex::new(ratelimit::RateLimiter::new())),
+        is_server,
     };
 
     // 2. 启动 1Hz 采样后台 task

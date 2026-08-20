@@ -122,6 +122,10 @@
   .badge.tcp{color:var(--faint);background:var(--surface-2);}
   .dim{color:var(--faint);}
   .empty{color:var(--faint);text-align:center;padding:26px;font-size:13px;}
+  .soon{font-size:10.5px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--warn);background:var(--warn-soft);padding:3px 8px;border-radius:6px;}
+  .stub{color:var(--muted);font-size:13px;line-height:1.65;}
+  .stub code{font-family:"JetBrains Mono",monospace;font-size:12px;background:var(--surface-2);padding:1px 5px;border-radius:5px;}
+  [data-mode]{}
   .meter-row{display:grid;grid-template-columns:76px 1fr auto;align-items:center;gap:12px;padding:9px 0;}
   .meter-row + .meter-row{border-top:1px solid var(--border);}
   .meter{height:8px;border-radius:999px;background:var(--surface-2);overflow:hidden;}
@@ -179,11 +183,14 @@
     </div>
     <nav class="nav">
       <div class="nav-label" data-i18n="nav.monitor">Monitor</div>
-      <button class="nav-item active" data-view="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span data-i18n="nav.overview">Overview</span></button>
-      <button class="nav-item" data-view="connections"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span data-i18n="nav.connections">Connections</span><span class="count num" id="navConn">0</span></button>
-      <div class="nav-label" data-i18n="nav.control">Control</div>
-      <button class="nav-item" data-view="routing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M8 6h5a3 3 0 013 3M8 18h5a3 3 0 003-3"/></svg><span data-i18n="nav.routing">Routing</span></button>
-      <button class="nav-item" data-view="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span data-i18n="nav.logs">Logs</span></button>
+      <button class="nav-item active" data-view="overview" data-mode="both"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span data-i18n="nav.overview">Overview</span></button>
+      <button class="nav-item" data-view="connections" data-mode="both"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span data-i18n="nav.connections">Connections</span><span class="count num" id="navConn">0</span></button>
+      <button class="nav-item" data-view="logs" data-mode="both"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span data-i18n="nav.logs">Logs</span></button>
+      <div class="nav-label" data-i18n="nav.control" data-mode="client">Control</div>
+      <button class="nav-item" data-view="routing" data-mode="client"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M8 6h5a3 3 0 013 3M8 18h5a3 3 0 003-3"/></svg><span data-i18n="nav.routing">Routing</span></button>
+      <div class="nav-label" data-i18n="nav.admin">Admin</div>
+      <button class="nav-item" data-view="devices" data-mode="client"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span data-i18n="nav.devices">Devices</span></button>
+      <button class="nav-item" data-view="clients" data-mode="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="9" cy="8" r="3"/><path d="M4 20a5 5 0 0110 0M16 6a3 3 0 010 6M15 20a5 5 0 00-1-3.2"/></svg><span data-i18n="nav.clients">Clients</span></button>
     </nav>
     <div class="sidebar-foot">
       <span class="ver mono">v0.9.6</span>
@@ -272,6 +279,36 @@
         <div class="card"><div class="card-head"><div class="card-title"><span data-i18n="card.liveLog">Live log</span><span class="hint" data-i18n="card.inMemBuf">in-memory buffer</span></div></div>
           <div class="card-pad"><div class="term" id="term"></div></div></div>
       </section>
+
+      <!-- DEVICES (client-mode admin) -->
+      <section class="view" id="devices">
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="dev.lanDevices">LAN devices</div></div>
+          <div class="card-pad"><div class="empty" data-i18n="dev.discoverSoon">LAN device discovery — planned (needs eBPF per-source monitor).</div></div></div>
+        <div class="grid cols-2">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceRule">Per-device rules</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceRuleDesc">Scope routing rules to a device / subnet. Backend `source_ip_cidr` already routes per source — this surfaces it per discovered device.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceSpeed">Per-device speed limit</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceSpeedDesc">Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.</div></div></div>
+        </div>
+      </section>
+
+      <!-- CLIENTS (server-mode admin) -->
+      <section class="view" id="clients">
+        <div class="grid cols-2" style="margin-bottom:16px">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.domainRank">Top domains</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.domainRankDesc">Ranked target domains across clients. Needs server-side connection registration (server sees each target header) + top-N aggregation.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.connHistory">Connection history</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.connHistoryDesc">Past connections beyond the live/recent window. Needs persistence (embedded store).</div></div></div>
+        </div>
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="srv.clientMgmt">Connected clients</div><span class="soon" data-i18n="soon">planned</span></div>
+          <div class="card-pad"><div class="stub" data-i18n="srv.clientMgmtDesc">Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.</div></div></div>
+        <div class="grid cols-2">
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.block">Block client</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.blockDesc">Reject a client IP / identity at accept. Medium; backend blacklist at the listener.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.rateLimit">Per-client rate limit</div><span class="soon" data-i18n="soon">planned</span></div>
+            <div class="card-pad"><div class="stub" data-i18n="srv.rateLimitDesc">Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.</div></div></div>
+        </div>
+      </section>
     </div>
   </main>
 </div>
@@ -310,6 +347,17 @@
       'empty.noTun':'No tunnels. Needs eBPF sockops + live traffic.','empty.noGroups':'No Selector / UrlTest groups.','empty.noRules':'No rules. Add one above.',
       'rule.default':'default','fld.add':'Add',
       'save.invalid':'Validation failed — not saved:','save.warnHead':'Pre-check (dry_run) warnings — non-blocking:','save.warnTail':'Save and apply anyway?','save.failed':'Failed to save rules','save.portErr':'Port must be an integer 1–65535',
+      'nav.admin':'Admin','nav.devices':'Devices','nav.clients':'Clients',
+      'sub.devices':'LAN devices & per-device policy','sub.clients':'Connected clients & server controls',
+      'brand.sub.server':'proxy server','soon':'planned',
+      'dev.lanDevices':'LAN devices','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
+      'dev.perDeviceRule':'Per-device rules','dev.perDeviceRuleDesc':'Scope routing rules to a device / subnet. Backend source_ip_cidr already routes per source — this surfaces it per discovered device.',
+      'dev.perDeviceSpeed':'Per-device speed limit','dev.perDeviceSpeedDesc':'Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.',
+      'srv.domainRank':'Top domains','srv.domainRankDesc':'Ranked target domains across clients. Needs server-side connection registration + top-N aggregation.',
+      'srv.connHistory':'Connection history','srv.connHistoryDesc':'Past connections beyond the live/recent window. Needs persistence (embedded store).',
+      'srv.clientMgmt':'Connected clients','srv.clientMgmtDesc':'Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.',
+      'srv.block':'Block client','srv.blockDesc':'Reject a client IP / identity at accept. Medium; backend blacklist at the listener.',
+      'srv.rateLimit':'Per-client rate limit','srv.rateLimitDesc':'Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.',
     },
     zh: {
       'brand.sub':'透明网关','nav.monitor':'监控','nav.control':'控制',
@@ -332,6 +380,17 @@
       'empty.noTun':'无隧道，需 eBPF sockops + 实时流量。','empty.noGroups':'无 Selector / UrlTest 组。','empty.noRules':'无规则，点上方添加。',
       'rule.default':'默认','fld.add':'添加',
       'save.invalid':'校验未通过，未保存：','save.warnHead':'保存前预检 (dry_run) 发现告警（不阻断）：','save.warnTail':'仍要保存并应用？','save.failed':'保存失败','save.portErr':'端口必须是 1–65535 的整数',
+      'nav.admin':'管理','nav.devices':'设备','nav.clients':'客户端',
+      'sub.devices':'局域网设备与按设备策略','sub.clients':'连接的客户端与服务端管控',
+      'brand.sub.server':'代理服务端','soon':'计划中',
+      'dev.lanDevices':'局域网设备','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
+      'dev.perDeviceRule':'按设备规则','dev.perDeviceRuleDesc':'把路由规则限定到某设备/网段。后端 source_ip_cidr 已能按来源分流 —— 这里按发现的设备可视化配置。',
+      'dev.perDeviceSpeed':'按设备限速','dev.perDeviceSpeedDesc':'按设备限带宽。需新建流量整形数据面（tc / eBPF token bucket）—— 最大一块，单独跟踪。',
+      'srv.domainRank':'域名排行','srv.domainRankDesc':'跨客户端的目标域名排行。需服务端连接登记 + top-N 聚合。',
+      'srv.connHistory':'连接历史','srv.connHistoryDesc':'live/最近窗口之外的历史连接。需持久化（内嵌存储）。',
+      'srv.clientMgmt':'连接的客户端','srv.clientMgmtDesc':'每客户端视图：来源 IP、版本、流量。版本需握手加字段（两端）。之后按客户端屏蔽 + 限速在此操作。',
+      'srv.block':'屏蔽客户端','srv.blockDesc':'在 accept 处按客户端 IP/身份拒绝。中等量；监听侧加黑名单。',
+      'srv.rateLimit':'按客户端限速','srv.rateLimitDesc':'按客户端隧道限带宽。需流量整形数据面 —— 大工程，与设备限速一并跟踪。',
     },
   };
   let lang = localStorage.getItem('mirage_lang') || ((navigator.language||'').toLowerCase().startsWith('zh') ? 'zh' : 'en');
@@ -342,9 +401,19 @@
     document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'));});
     document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.getAttribute('data-i18n-ph'));});
     document.getElementById('langBtn').textContent = lang==='zh'?'EN':'中';
-    // 顶栏标题 + 引擎状态随语言刷新
+    // brand-sub 随模式 (server/client) 不同; 顶栏标题/副标随语言刷新
+    document.querySelector('.brand-sub').textContent = MODE==='server'?t('brand.sub.server'):t('brand.sub');
     document.getElementById('vTitle').textContent=t('nav.'+view);
     document.getElementById('vSub').textContent=t('sub.'+view);
+  }
+  // 运行模式 (server/client): 隐藏不属于本模式的导航/视图。data-mode="both" 恒显。
+  let MODE=null;
+  function applyMode(m){
+    MODE=m;
+    document.querySelectorAll('[data-mode]').forEach(el=>{el.style.display=(el.dataset.mode==='both'||el.dataset.mode===m)?'':'none';});
+    document.querySelector('.brand-sub').textContent = m==='server'?t('brand.sub.server'):t('brand.sub');
+    const av=document.querySelector('.nav-item.active');
+    if(av&&av.style.display==='none')document.querySelector('.nav-item[data-view="overview"]').click();
   }
   document.getElementById('langBtn').onclick=()=>{lang=lang==='zh'?'en':'zh';localStorage.setItem('mirage_lang',lang);applyI18n();refreshAll();};
 
@@ -377,6 +446,7 @@
 
   async function fetchOverview(){
     let d;try{d=await(await fetch('/api/overview')).json();}catch(e){setEngine(false);return;}
+    if(d.mode&&d.mode!==MODE)applyMode(d.mode);
     let us=0,ds=0;
     if(!first){us=Math.max(0,d.up-lastUp);ds=Math.max(0,d.down-lastDown);}
     lastUp=d.up;lastDown=d.down;first=false;

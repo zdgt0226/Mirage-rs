@@ -312,7 +312,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         let cfg_path = config_path.to_string();
         let token = gui_token.clone();
         tokio::spawn(async move {
-            crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token).await;
+            crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token, is_server).await;
         });
     }
 

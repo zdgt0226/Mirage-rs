@@ -29,4 +29,7 @@ pub struct AppState {
     pub gui_token: Option<Arc<String>>,
     /// 认证失败限流 (per-IP 锁定, 防 token 暴力猜解)。仅在配了 gui_token 时生效。
     pub rate_limiter: Arc<std::sync::Mutex<super::ratelimit::RateLimiter>>,
+    /// 运行模式: true=服务端 (mirage server), false=客户端/网关。WebUI 按此分视图 + 决定
+    /// 服务端专属功能 (域名排行/连接历史/客户端管理) vs 客户端专属 (LAN 设备规则)。
+    pub is_server: bool,
 }

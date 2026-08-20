@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### feat(webui): 服务端/客户端模式分视图 + Admin 入口脚手架 (T0)
+
+多模式 WebUI 地基: 看板按运行模式 (server / client) 展示不同功能。
+
+- 后端: `is_server` 从 `start_proxy` 接线到 `AppState`, `/api/overview` 新增 `mode` 字段
+  (`server` / `client`)。
+- 前端: 导航按 `data-mode` 分 —— 通用 (Overview/Connections/Logs) + 客户端专属 (Routing +
+  Admin/Devices) + 服务端专属 (Admin/Clients); brand-sub 随模式变 (transparent gateway /
+  proxy server); 切模式即隐藏不属于本模式的项。
+- **「特定入口」Admin 区脚手架**: 客户端 `Devices` (LAN 设备规则 / 按设备限速) · 服务端
+  `Clients` (域名排行 / 连接历史 / 客户端管理·版本 / 屏蔽 / 按客户端限速)。均为**明确标注
+  "planned" 的占位卡**, 说明各自后端依赖 (设备发现=eBPF 按源监控 · 服务端登记+聚合+持久化 ·
+  握手版本字段 · 流量整形数据面), 不假装已实现。后续分层落地。
+- i18n 覆盖新增文案 (中/英, 95 处两语对称)。真机 smoke: client→mode=client, server→
+  mode=server, 导航按模式正确显隐。
+
 ### feat(webui): 看板界面重构 (Neon Pulse → Mirage Console)
 
 WebUI 视觉与信息架构整体重构: 从霓虹玻璃拟态 (glassmorphism + 辉光 + 渐变) 换成简洁高效的
