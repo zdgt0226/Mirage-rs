@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### feat(webui): 服务端连接登记 + 域名排行 (T1-a)
+
+多模式 WebUI T1 首块: 服务端也登记连接 + 域名排行, 点亮服务端 Admin/Clients 的「Top domains」+
+让服务端 Connections 视图有数据。
+
+- **服务端连接登记**: `mirage_server` 的 `handle_tcp_relay` 在收到 target 后登记进 monitor
+  `{目标, 客户端 IP(inbound), 出站(direct/ss-upstream/wg-upstream), tcp}`, 覆盖 direct + ss/wg
+  全路径; 字节在 direct relay 双向循环累加 (ss/wg 子路径仅登记可见, 同客户端 splice 限制)。
+  客户端 IP 从 `dispatch_authenticated` 的 stream peer 取, 透传进 relay。UDP 服务端 relay 先接
+  住 client_ip 参数, per-datagram 域名登记留后续。
+- **域名排行聚合**: monitor 加 per-域名累计 (连接数 + 上下行字节, key=target 去 :port, IPv6 剥
+  `[..]`)。`register` 计连接数, 断连补字节。新 `GET /api/domains` 出 top-30 (按流量降序)。
+- **前端**: 服务端 Clients 视图「Top domains」占位卡 → 真表 (域名·连接数·↑↓, 3s 轮询); 服务端
+  Connections 视图现有服务端连接数据。i18n 补 3 键 (中/英, 99 处两语对称)。
+- 真机 e2e smoke: client→隧道→server→direct→目标, 服务端 `/api/domains` + `/api/connections`
+  正确登记 (target/客户端 IP/出站)。349 lib + 全集成 + clippy 0。
+
 ### feat(webui): 服务端/客户端模式分视图 + Admin 入口脚手架 (T0)
 
 多模式 WebUI 地基: 看板按运行模式 (server / client) 展示不同功能。

@@ -18,6 +18,8 @@ pub(super) async fn dispatch_authenticated(
     ecdh: Option<[u8; 32]>,
 ) {
     // 3. Setup Crypto Stream。PFS 开时 (ecdh=Some) 走混入 ecdh 的 master 派生。
+    // 客户端来源 IP (供 WebUI 服务端连接登记 / 域名排行的 inbound 维度)。
+    let client_ip = stream.peer_addr().ok().map(|a| a.ip());
     let (read_half, write_half) = stream.into_split();
     let (mut reader, mut writer) = match ecdh {
         Some(ecdh) => crate::crypto::aead::create_crypto_pair_pfs(
@@ -159,7 +161,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer, upstream).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip).await;
     } else if first_chunk.len() == 1 && first_chunk[0] == crate::proxy::udp_mux::MUX_SENTINEL {
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
         if upstream.as_ref().is_some_and(|u| u.block_udp()) {
@@ -167,7 +169,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_mux_relay(reader, writer, upstream).await;
+        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         let target_len = u16::from_be_bytes([first_chunk[0], first_chunk[1]]) as usize;
@@ -191,7 +193,7 @@ pub(super) async fn dispatch_authenticated(
                 None
             };
 
-            tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream).await;
+            tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip).await;
         } else {
             tracing::error!("Mirage Server: first_chunk too short for target_len!");
         }

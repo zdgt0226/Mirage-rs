@@ -295,8 +295,8 @@
       <!-- CLIENTS (server-mode admin) -->
       <section class="view" id="clients">
         <div class="grid cols-2" style="margin-bottom:16px">
-          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.domainRank">Top domains</div><span class="soon" data-i18n="soon">planned</span></div>
-            <div class="card-pad"><div class="stub" data-i18n="srv.domainRankDesc">Ranked target domains across clients. Needs server-side connection registration (server sees each target header) + top-N aggregation.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.domainRank">Top domains</div><span class="hint" data-i18n="srv.byTraffic">by traffic</span></div>
+            <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.domain">Domain</th><th class="r" data-i18n="th.conns">Conns</th><th class="r">↑ / ↓</th></tr></thead><tbody id="domBody"><tr><td colspan="3" class="empty" data-i18n="empty.noTraffic">No traffic yet.</td></tr></tbody></table></div></div>
           <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.connHistory">Connection history</div><span class="soon" data-i18n="soon">planned</span></div>
             <div class="card-pad"><div class="stub" data-i18n="srv.connHistoryDesc">Past connections beyond the live/recent window. Needs persistence (embedded store).</div></div></div>
         </div>
@@ -340,7 +340,7 @@
       'health.hijack':'sk_lookup hijack','health.fallback':'Fallback',
       'badge.attached':'attached','badge.off':'off','badge.active':'active','badge.static':'static',
       'brutal.active':'Brutal CC active','brutal.static':'Brutal CC static',
-      'th.target':'Target','th.route':'Route','th.proto':'Proto','th.process':'Process','th.age':'Age','th.remote':'Remote','th.retrans':'Retrans','th.outbound':'Outbound','th.hits':'Hits',
+      'th.target':'Target','th.route':'Route','th.proto':'Proto','th.process':'Process','th.age':'Age','th.remote':'Remote','th.retrans':'Retrans','th.outbound':'Outbound','th.hits':'Hits','th.domain':'Domain','th.conns':'Conns','srv.byTraffic':'by traffic',
       'btn.addRule':'+ Add rule','btn.save':'Save & apply','btn.delete':'Delete','saved':'Saved & applied',
       'ph.filter':'Filter by domain, outbound, process…',
       'empty.loading':'Loading…','empty.noTraffic':'No traffic yet.','empty.noConn':'No active connections.','empty.nothing':'Nothing yet.',
@@ -373,7 +373,7 @@
       'health.hijack':'sk_lookup 劫持','health.fallback':'回落',
       'badge.attached':'已挂载','badge.off':'未挂','badge.active':'活跃','badge.static':'静态',
       'brutal.active':'Brutal CC 活跃','brutal.static':'Brutal CC 静态',
-      'th.target':'目标','th.route':'走向','th.proto':'协议','th.process':'进程','th.age':'时长','th.remote':'远端','th.retrans':'重传','th.outbound':'出站','th.hits':'命中',
+      'th.target':'目标','th.route':'走向','th.proto':'协议','th.process':'进程','th.age':'时长','th.remote':'远端','th.retrans':'重传','th.outbound':'出站','th.hits':'命中','th.domain':'域名','th.conns':'连接','srv.byTraffic':'按流量',
       'btn.addRule':'+ 加规则','btn.save':'保存并应用','btn.delete':'删除','saved':'已保存并应用',
       'ph.filter':'按域名、出站、进程过滤…',
       'empty.loading':'加载中…','empty.noTraffic':'暂无流量。','empty.noConn':'无活跃连接。','empty.nothing':'暂无。',
@@ -435,6 +435,7 @@
     document.getElementById('vSub').textContent=t('sub.'+view);
     if(view==='routing'){fetchProxies();fetchRules();}
     if(view==='connections')fetchConnections();
+    if(view==='clients')fetchDomains();
     if(view==='logs')fetchLogs();
     if(view==='overview')drawChart();
   });
@@ -557,6 +558,15 @@
     }
   }
 
+  // ── domain ranking (server Admin) ──
+  async function fetchDomains(){
+    let d;try{d=await(await fetch('/api/domains')).json();}catch(e){return;}
+    const rows=d.domains||[];
+    document.getElementById('domBody').innerHTML=rows.length?rows.map(x=>
+      `<tr><td class="target mono">${esc(x.host)}</td><td class="r mono dim">${x.conns.toLocaleString()}</td><td class="r mono">↑${fmtB(x.up)} <span class="dim">/</span> ↓${fmtB(x.down)}</td></tr>`).join('')
+      :`<tr><td colspan="3" class="empty">${t('empty.noTraffic')}</td></tr>`;
+  }
+
   // ── proxies ──
   async function fetchProxies(){
     let d;try{d=await(await fetch('/api/proxies')).json();}catch(e){return;}
@@ -619,7 +629,7 @@
   }catch(e){alert(t('save.failed'));}};
 
   // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
-  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}}
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients')fetchDomains();}
 
   // ── polling ──
   setInterval(fetchOverview,1000);
@@ -627,6 +637,7 @@
   setInterval(()=>{if(view==='overview'||view==='routing')fetchStats();},2000);
   setInterval(()=>{if(view==='logs')fetchLogs();},2000);
   setInterval(()=>{if(view==='routing')fetchProxies();},5000);
+  setInterval(()=>{if(view==='clients')fetchDomains();},3000);
   applyI18n();
   fetchOverview();fetchStats();
 })();

@@ -52,6 +52,7 @@ pub(super) async fn handle_udp_relay(
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
     writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    _client_ip: Option<std::net::IpAddr>,
 ) {
     debug!("Mirage Server: Started UDP relay session");
 
@@ -325,6 +326,7 @@ pub(crate) async fn handle_udp_mux_relay(
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
     writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    _client_ip: Option<std::net::IpAddr>,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
 
@@ -509,7 +511,7 @@ mod mux_tests {
 
         // 4. 起服务端 mux relay (upstream=None → Direct egress)
         let server = tokio::spawn(async move {
-            handle_udp_mux_relay(sr, sw, None).await;
+            handle_udp_mux_relay(sr, sw, None, None).await;
         });
 
         // 5. 客户端发两帧: 同目标, 不同 sid + payload

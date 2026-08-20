@@ -24,7 +24,18 @@ pub(super) async fn handle_tcp_relay(
     mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
     mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
     upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    client_ip: Option<std::net::IpAddr>,
 ) {
+    // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径;
+    // 字节在下方 direct 路径 relay 循环累加 (ss/wg 子路径仅登记可见, 字节暂不计, 同客户端 splice 限制)。
+    let outbound_label = match upstream_cfg.as_deref() {
+        Some(crate::proxy::upstream::UpstreamOutlet::Shadowsocks(_)) => "ss-upstream",
+        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(_)) => "wg-upstream",
+        None => "direct",
+    };
+    let inbound_label = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "client".into());
+    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None);
+
     // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
     if let Some(outlet) = upstream_cfg {
         match &*outlet {
@@ -80,6 +91,7 @@ pub(super) async fn handle_tcp_relay(
         }
     };
 
+    let up_conn = _conn.counter();
     let upload = async move {
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
@@ -87,6 +99,7 @@ pub(super) async fn handle_tcp_relay(
                     if up_write.write_all(&data).await.is_err() {
                         break;
                     }
+                    up_conn.up(data.len() as u64);
                 }
                 _ => break,
             }
@@ -96,6 +109,7 @@ pub(super) async fn handle_tcp_relay(
         shutdown_upstream(stop_fd_up);
     };
 
+    let dn_conn = _conn.counter();
     let download = async move {
         // 老 16KB 太小 (alpha.21 加大到 64KB), 但仅仅加大 buf 只解决"能装多少",
         // 没解决"实际每次装了多少": tokio 的 read() 返回 kernel recv buffer 里
@@ -125,6 +139,7 @@ pub(super) async fn handle_tcp_relay(
                     if writer.send_data(&buf[..total]).await.is_err() {
                         break;
                     }
+                    dn_conn.down(total as u64);
                 }
                 _ => break,
             }
