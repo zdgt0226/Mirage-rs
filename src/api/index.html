@@ -175,19 +175,22 @@
   <aside class="sidebar">
     <div class="brand">
       <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 12h4l2 6 4-14 2 8h6"/></svg></div>
-      <div><div class="brand-name">Mirage</div><div class="brand-sub">transparent gateway</div></div>
+      <div><div class="brand-name">Mirage</div><div class="brand-sub" data-i18n="brand.sub">transparent gateway</div></div>
     </div>
     <nav class="nav">
-      <div class="nav-label">Monitor</div>
-      <button class="nav-item active" data-view="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Overview</span></button>
-      <button class="nav-item" data-view="connections"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span>Connections</span><span class="count num" id="navConn">0</span></button>
-      <div class="nav-label">Control</div>
-      <button class="nav-item" data-view="routing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M8 6h5a3 3 0 013 3M8 18h5a3 3 0 003-3"/></svg><span>Routing</span></button>
-      <button class="nav-item" data-view="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span>Logs</span></button>
+      <div class="nav-label" data-i18n="nav.monitor">Monitor</div>
+      <button class="nav-item active" data-view="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span data-i18n="nav.overview">Overview</span></button>
+      <button class="nav-item" data-view="connections"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span data-i18n="nav.connections">Connections</span><span class="count num" id="navConn">0</span></button>
+      <div class="nav-label" data-i18n="nav.control">Control</div>
+      <button class="nav-item" data-view="routing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="12" r="2.4"/><path d="M8 6h5a3 3 0 013 3M8 18h5a3 3 0 003-3"/></svg><span data-i18n="nav.routing">Routing</span></button>
+      <button class="nav-item" data-view="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span data-i18n="nav.logs">Logs</span></button>
     </nav>
     <div class="sidebar-foot">
       <span class="ver mono">v0.9.6</span>
-      <button class="icon-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme"></button>
+      <div style="display:flex;gap:6px">
+        <button class="icon-btn" id="langBtn" title="Language" aria-label="Language" style="width:auto;padding:0 9px;font-weight:600;font-size:12px">EN</button>
+        <button class="icon-btn" id="themeBtn" title="Toggle theme" aria-label="Toggle theme"></button>
+      </div>
     </div>
   </aside>
 
@@ -208,22 +211,22 @@
       <!-- OVERVIEW -->
       <section class="view active" id="overview">
         <div class="grid kpis">
-          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--up)"></span>Upload</div><div class="kpi-val mono"><span id="kUp">0</span><small id="kUpU">B/s</small></div><div class="kpi-delta" id="kUpTot">— total</div></div>
-          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--down)"></span>Download</div><div class="kpi-val mono"><span id="kDown">0</span><small id="kDownU">B/s</small></div><div class="kpi-delta" id="kDownTot">— total</div></div>
-          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--ok)"></span>Active connections</div><div class="kpi-val mono" id="kConn">0</div><div class="kpi-delta" id="kConnSub">—</div></div>
-          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--accent)"></span>Warm tunnels</div><div class="kpi-val mono" id="kTun">0</div><div class="kpi-delta" id="kBrutal">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--up)"></span><span data-i18n="kpi.upload">Upload</span></div><div class="kpi-val mono"><span id="kUp">0</span><small id="kUpU">B/s</small></div><div class="kpi-delta" id="kUpTot">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--down)"></span><span data-i18n="kpi.download">Download</span></div><div class="kpi-val mono"><span id="kDown">0</span><small id="kDownU">B/s</small></div><div class="kpi-delta" id="kDownTot">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--ok)"></span><span data-i18n="kpi.conns">Active connections</span></div><div class="kpi-val mono" id="kConn">0</div><div class="kpi-delta" id="kConnSub">—</div></div>
+          <div class="kpi"><div class="kpi-label"><span class="g" style="background:var(--accent)"></span><span data-i18n="kpi.tunnels">Warm tunnels</span></div><div class="kpi-val mono" id="kTun">0</div><div class="kpi-delta" id="kBrutal">—</div></div>
         </div>
         <div class="card" style="margin-bottom:16px">
-          <div class="card-head"><div class="card-title">Throughput<span class="hint">last 120s</span></div>
-            <div class="legend"><span><i style="background:var(--up)"></i>Upload</span><span><i style="background:var(--down)"></i>Download</span></div></div>
+          <div class="card-head"><div class="card-title"><span data-i18n="card.throughput">Throughput</span><span class="hint" data-i18n="card.last120">last 120s</span></div>
+            <div class="legend"><span><i style="background:var(--up)"></i><span data-i18n="kpi.upload">Upload</span></span><span><i style="background:var(--down)"></i><span data-i18n="kpi.download">Download</span></span></div></div>
           <div class="chartwrap"><canvas id="trafficChart"></canvas><div class="tip" id="tip"></div></div>
         </div>
         <div class="grid cols-2">
-          <div class="card"><div class="card-head"><div class="card-title">Traffic by outbound</div></div><div class="card-pad" id="obBars"><div class="empty">No traffic yet.</div></div></div>
-          <div class="card"><div class="card-head"><div class="card-title">eBPF &amp; engine</div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="card.byOutbound">Traffic by outbound</div></div><div class="card-pad" id="obBars"><div class="empty" data-i18n="empty.noTraffic">No traffic yet.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="card.ebpf">eBPF &amp; engine</div></div>
             <div class="card-pad"><div class="health-grid">
-              <div class="health-cell"><div class="h-l">sk_lookup hijack</div><div class="h-v"><span class="mono" id="hHijack">—</span></div></div>
-              <div class="health-cell"><div class="h-l">Fallback</div><div class="h-v mono" id="hFallback">—</div></div>
+              <div class="health-cell"><div class="h-l" data-i18n="health.hijack">sk_lookup hijack</div><div class="h-v"><span class="mono" id="hHijack">—</span></div></div>
+              <div class="health-cell"><div class="h-l" data-i18n="health.fallback">Fallback</div><div class="h-v mono" id="hFallback">—</div></div>
               <div class="health-cell"><div class="h-l">XDP DNS</div><div class="h-v" id="hXdp">—</div></div>
               <div class="health-cell"><div class="h-l">Brutal CC</div><div class="h-v" id="hBrutal">—</div></div>
             </div></div>
@@ -234,39 +237,39 @@
       <!-- CONNECTIONS -->
       <section class="view" id="connections">
         <div class="toolbar">
-          <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="connFilter" placeholder="Filter by domain, outbound, process…"></div>
+          <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input id="connFilter" data-i18n-ph="ph.filter" placeholder="Filter by domain, outbound, process…"></div>
         </div>
         <div class="card">
-          <div class="card-head"><div class="card-title">Active<span class="hint" id="connN">0 connections</span></div></div>
-          <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Target</th><th>Route</th><th>Proto</th><th>Process</th><th class="r">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="connBody"></tbody></table></div>
+          <div class="card-head"><div class="card-title"><span data-i18n="card.active">Active</span><span class="hint" id="connN"></span></div></div>
+          <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.target">Target</th><th data-i18n="th.route">Route</th><th data-i18n="th.proto">Proto</th><th data-i18n="th.process">Process</th><th class="r" data-i18n="th.age">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="connBody"></tbody></table></div>
         </div>
-        <div class="sub-head">Recent closed</div>
-        <div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Target</th><th>Route</th><th>Proto</th><th class="r">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="closedBody"></tbody></table></div></div>
-        <div class="sub-head">BPF tunnels <span class="dim" style="text-transform:none;letter-spacing:0">— per-tunnel RTT (eBPF sockops)</span></div>
-        <div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Remote</th><th class="r">RTT</th><th class="r">Retrans</th><th class="r">cwnd</th></tr></thead><tbody id="tunBody"></tbody></table></div></div>
+        <div class="sub-head" data-i18n="card.recentClosed">Recent closed</div>
+        <div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.target">Target</th><th data-i18n="th.route">Route</th><th data-i18n="th.proto">Proto</th><th class="r" data-i18n="th.age">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="closedBody"></tbody></table></div></div>
+        <div class="sub-head"><span data-i18n="card.bpfTunnels">BPF tunnels</span> <span class="dim" style="text-transform:none;letter-spacing:0" data-i18n="card.bpfHint">— per-tunnel RTT (eBPF sockops)</span></div>
+        <div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.remote">Remote</th><th class="r">RTT</th><th class="r" data-i18n="th.retrans">Retrans</th><th class="r">cwnd</th></tr></thead><tbody id="tunBody"></tbody></table></div></div>
       </section>
 
       <!-- ROUTING -->
       <section class="view" id="routing">
         <div class="grid cols-2" style="margin-bottom:20px">
-          <div class="card"><div class="card-head"><div class="card-title">Rule hits<span class="hint">since config load</span></div></div>
-            <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>#</th><th>Outbound</th><th class="r">Hits</th></tr></thead><tbody id="hitsBody"></tbody></table></div></div>
-          <div class="card"><div class="card-head"><div class="card-title">Outbound totals</div></div><div class="card-pad" id="obTotals"><div class="empty">No traffic yet.</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title"><span data-i18n="card.ruleHits">Rule hits</span><span class="hint" data-i18n="card.sinceLoad">since config load</span></div></div>
+            <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>#</th><th data-i18n="th.outbound">Outbound</th><th class="r" data-i18n="th.hits">Hits</th></tr></thead><tbody id="hitsBody"></tbody></table></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="card.outboundTotals">Outbound totals</div></div><div class="card-pad" id="obTotals"><div class="empty" data-i18n="empty.noTraffic">No traffic yet.</div></div></div>
         </div>
         <div class="card" style="margin-bottom:20px">
-          <div class="card-head"><div class="card-title">Proxy groups</div></div>
-          <div class="card-pad" id="proxiesContainer"><div class="empty">Loading…</div></div>
+          <div class="card-head"><div class="card-title" data-i18n="card.proxyGroups">Proxy groups</div></div>
+          <div class="card-pad" id="proxiesContainer"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
         </div>
         <div class="card">
-          <div class="card-head"><div class="card-title">Routing rules</div>
-            <div style="display:flex;gap:8px"><button class="btn" onclick="addRule()">+ Add rule</button><button class="btn primary" id="saveBtn" onclick="saveRules()">Save &amp; apply</button></div></div>
-          <div class="card-pad" id="visualRulesContainer"><div class="empty">Loading…</div></div>
+          <div class="card-head"><div class="card-title"><span data-i18n="card.routingRules">Routing rules</span><span class="hint" data-i18n="card.firstMatch">first match wins · reorder matters</span></div>
+            <div style="display:flex;gap:8px"><button class="btn" onclick="addRule()" data-i18n="btn.addRule">+ Add rule</button><button class="btn primary" id="saveBtn" onclick="saveRules()" data-i18n="btn.save">Save &amp; apply</button></div></div>
+          <div class="card-pad" id="visualRulesContainer"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
         </div>
       </section>
 
       <!-- LOGS -->
       <section class="view" id="logs">
-        <div class="card"><div class="card-head"><div class="card-title">Live log<span class="hint">in-memory buffer</span></div></div>
+        <div class="card"><div class="card-head"><div class="card-title"><span data-i18n="card.liveLog">Live log</span><span class="hint" data-i18n="card.inMemBuf">in-memory buffer</span></div></div>
           <div class="card-pad"><div class="term" id="term"></div></div></div>
       </section>
     </div>
@@ -284,6 +287,67 @@
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>{syncBtn();drawChart();});
   syncBtn();
 
+  // ── i18n ──
+  const I18N = {
+    en: {
+      'brand.sub':'transparent gateway','nav.monitor':'Monitor','nav.control':'Control',
+      'nav.overview':'Overview','nav.connections':'Connections','nav.routing':'Routing','nav.logs':'Logs',
+      'sub.overview':'Live traffic & engine health','sub.connections':'Domain-level active flows','sub.routing':'Rules, hits & proxy selection','sub.logs':'In-memory routing log',
+      'engine.online':'Engine online','engine.offline':'Engine offline','engine.connecting':'Connecting…',
+      'kpi.upload':'Upload','kpi.download':'Download','kpi.conns':'Active connections','kpi.tunnels':'Warm tunnels','kpi.liveFlows':'live flows',
+      'unit.total':'total','unit.connections':'connections',
+      'card.throughput':'Throughput','card.last120':'last 120s','card.byOutbound':'Traffic by outbound','card.ebpf':'eBPF & engine',
+      'card.active':'Active','card.recentClosed':'Recent closed','card.bpfTunnels':'BPF tunnels','card.bpfHint':'— per-tunnel RTT (eBPF sockops)',
+      'card.ruleHits':'Rule hits','card.sinceLoad':'since config load','card.outboundTotals':'Outbound totals','card.proxyGroups':'Proxy groups',
+      'card.routingRules':'Routing rules','card.firstMatch':'first match wins · reorder matters','card.liveLog':'Live log','card.inMemBuf':'in-memory buffer',
+      'health.hijack':'sk_lookup hijack','health.fallback':'Fallback',
+      'badge.attached':'attached','badge.off':'off','badge.active':'active','badge.static':'static',
+      'brutal.active':'Brutal CC active','brutal.static':'Brutal CC static',
+      'th.target':'Target','th.route':'Route','th.proto':'Proto','th.process':'Process','th.age':'Age','th.remote':'Remote','th.retrans':'Retrans','th.outbound':'Outbound','th.hits':'Hits',
+      'btn.addRule':'+ Add rule','btn.save':'Save & apply','btn.delete':'Delete','saved':'Saved & applied',
+      'ph.filter':'Filter by domain, outbound, process…',
+      'empty.loading':'Loading…','empty.noTraffic':'No traffic yet.','empty.noConn':'No active connections.','empty.nothing':'Nothing yet.',
+      'empty.noTun':'No tunnels. Needs eBPF sockops + live traffic.','empty.noGroups':'No Selector / UrlTest groups.','empty.noRules':'No rules. Add one above.',
+      'rule.default':'default','fld.add':'Add',
+      'save.invalid':'Validation failed — not saved:','save.warnHead':'Pre-check (dry_run) warnings — non-blocking:','save.warnTail':'Save and apply anyway?','save.failed':'Failed to save rules','save.portErr':'Port must be an integer 1–65535',
+    },
+    zh: {
+      'brand.sub':'透明网关','nav.monitor':'监控','nav.control':'控制',
+      'nav.overview':'概览','nav.connections':'连接','nav.routing':'路由','nav.logs':'日志',
+      'sub.overview':'实时流量与引擎状态','sub.connections':'域名级活跃连接','sub.routing':'规则、命中与节点选择','sub.logs':'内存路由日志',
+      'engine.online':'引擎在线','engine.offline':'引擎离线','engine.connecting':'连接中…',
+      'kpi.upload':'上传','kpi.download':'下载','kpi.conns':'活跃连接','kpi.tunnels':'预热隧道','kpi.liveFlows':'活跃流',
+      'unit.total':'累计','unit.connections':'个连接',
+      'card.throughput':'吞吐','card.last120':'近 120 秒','card.byOutbound':'按出站分流量','card.ebpf':'eBPF 与引擎',
+      'card.active':'活跃','card.recentClosed':'最近关闭','card.bpfTunnels':'BPF 隧道','card.bpfHint':'— 每隧道 RTT (eBPF sockops)',
+      'card.ruleHits':'规则命中','card.sinceLoad':'自配置加载起','card.outboundTotals':'出站累计','card.proxyGroups':'代理组',
+      'card.routingRules':'路由规则','card.firstMatch':'首命中即用 · 顺序重要','card.liveLog':'实时日志','card.inMemBuf':'内存缓冲',
+      'health.hijack':'sk_lookup 劫持','health.fallback':'回落',
+      'badge.attached':'已挂载','badge.off':'未挂','badge.active':'活跃','badge.static':'静态',
+      'brutal.active':'Brutal CC 活跃','brutal.static':'Brutal CC 静态',
+      'th.target':'目标','th.route':'走向','th.proto':'协议','th.process':'进程','th.age':'时长','th.remote':'远端','th.retrans':'重传','th.outbound':'出站','th.hits':'命中',
+      'btn.addRule':'+ 加规则','btn.save':'保存并应用','btn.delete':'删除','saved':'已保存并应用',
+      'ph.filter':'按域名、出站、进程过滤…',
+      'empty.loading':'加载中…','empty.noTraffic':'暂无流量。','empty.noConn':'无活跃连接。','empty.nothing':'暂无。',
+      'empty.noTun':'无隧道，需 eBPF sockops + 实时流量。','empty.noGroups':'无 Selector / UrlTest 组。','empty.noRules':'无规则，点上方添加。',
+      'rule.default':'默认','fld.add':'添加',
+      'save.invalid':'校验未通过，未保存：','save.warnHead':'保存前预检 (dry_run) 发现告警（不阻断）：','save.warnTail':'仍要保存并应用？','save.failed':'保存失败','save.portErr':'端口必须是 1–65535 的整数',
+    },
+  };
+  let lang = localStorage.getItem('mirage_lang') || ((navigator.language||'').toLowerCase().startsWith('zh') ? 'zh' : 'en');
+  if(lang!=='zh'&&lang!=='en') lang='en';
+  const t = k => (I18N[lang]&&I18N[lang][k]) || I18N.en[k] || k;
+  function applyI18n(){
+    document.documentElement.lang = lang==='zh'?'zh-CN':'en';
+    document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'));});
+    document.querySelectorAll('[data-i18n-ph]').forEach(el=>{el.placeholder=t(el.getAttribute('data-i18n-ph'));});
+    document.getElementById('langBtn').textContent = lang==='zh'?'EN':'中';
+    // 顶栏标题 + 引擎状态随语言刷新
+    document.getElementById('vTitle').textContent=t('nav.'+view);
+    document.getElementById('vSub').textContent=t('sub.'+view);
+  }
+  document.getElementById('langBtn').onclick=()=>{lang=lang==='zh'?'en':'zh';localStorage.setItem('mirage_lang',lang);applyI18n();refreshAll();};
+
   const css=v=>getComputedStyle(root).getPropertyValue(v).trim();
   const esc=s=>{const d=document.createElement('div');d.textContent=String(s??'');return d.innerHTML;};
   function fmtB(n){n=Number(n)||0;if(n<1024)return n+' B';const u=['KB','MB','GB','TB'];let i=-1,v=n;do{v/=1024;i++;}while(v>=1024&&i<u.length-1);return (v<10?v.toFixed(1):Math.round(v))+' '+u[i];}
@@ -293,14 +357,13 @@
 
   // ── nav / view routing ──
   let view='overview';
-  const subs={overview:'Live traffic & engine health',connections:'Domain-level active flows',routing:'Rules, hits & proxy selection',logs:'In-memory routing log'};
   document.querySelectorAll('.nav-item').forEach(b=>b.onclick=()=>{
     document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
     document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
     b.classList.add('active');view=b.dataset.view;
     document.getElementById(view).classList.add('active');
-    document.getElementById('vTitle').textContent=b.querySelector('span').textContent;
-    document.getElementById('vSub').textContent=subs[view];
+    document.getElementById('vTitle').textContent=t('nav.'+view);
+    document.getElementById('vSub').textContent=t('sub.'+view);
     if(view==='routing'){fetchProxies();fetchRules();}
     if(view==='connections')fetchConnections();
     if(view==='logs')fetchLogs();
@@ -323,8 +386,8 @@
     document.getElementById('downRate').textContent=dn[0];document.getElementById('downUnit').textContent=dn[1]+' ↓';
     document.getElementById('kUp').textContent=up[0];document.getElementById('kUpU').textContent=up[1];
     document.getElementById('kDown').textContent=dn[0];document.getElementById('kDownU').textContent=dn[1];
-    document.getElementById('kUpTot').textContent=fmtB(d.up)+' total';
-    document.getElementById('kDownTot').textContent=fmtB(d.down)+' total';
+    document.getElementById('kUpTot').textContent=fmtB(d.up)+' '+t('unit.total');
+    document.getElementById('kDownTot').textContent=fmtB(d.down)+' '+t('unit.total');
     document.getElementById('kConn').textContent=d.connections??0;
     document.getElementById('navConn').textContent=d.connections??0;
     document.getElementById('kTun').textContent=d.tunnel_count??0;
@@ -333,15 +396,15 @@
     const succ=d.bpf_success||0,fb=d.bpf_fallback||0,tot=succ+fb;
     document.getElementById('hHijack').textContent=tot>0?((succ/tot*100).toFixed(1)+'%'):'—';
     document.getElementById('hFallback').textContent=tot>0?((fb/tot*100).toFixed(1)+'%'):'0%';
-    document.getElementById('hXdp').innerHTML=d.xdp_attached===1?'<span class="badge proxy">attached</span>':'<span class="badge direct">off</span>';
+    document.getElementById('hXdp').innerHTML=d.xdp_attached===1?`<span class="badge proxy">${t('badge.attached')}</span>`:`<span class="badge direct">${t('badge.off')}</span>`;
     const bru=d.brutal_cc_active===true;
-    document.getElementById('hBrutal').innerHTML=bru?'<span class="badge proxy">active</span>':'<span class="badge direct">static</span>';
-    document.getElementById('kBrutal').textContent=bru?'Brutal CC active':'Brutal CC static';
-    document.getElementById('kConnSub').textContent='live flows';
+    document.getElementById('hBrutal').innerHTML=bru?`<span class="badge proxy">${t('badge.active')}</span>`:`<span class="badge direct">${t('badge.static')}</span>`;
+    document.getElementById('kBrutal').textContent=bru?t('brutal.active'):t('brutal.static');
+    document.getElementById('kConnSub').textContent=t('kpi.liveFlows');
     if(view==='overview')drawChart();
   }
-  function setEngine(on){const c=document.getElementById('engineChip'),t=document.getElementById('engineText');
-    c.className='status-chip '+(on?'ok':'off');t.textContent=on?'Engine online':'Engine offline';}
+  function setEngine(on){const c=document.getElementById('engineChip'),el=document.getElementById('engineText');
+    c.className='status-chip '+(on?'ok':'off');el.textContent=on?t('engine.online'):t('engine.offline');}
 
   // ── traffic chart ──
   const cv=document.getElementById('trafficChart'),tip=document.getElementById('tip');let geo=null;
@@ -387,9 +450,9 @@
     const f=(document.getElementById('connFilter').value||'').toLowerCase();
     const match=c=>!f||[c.target,c.inbound,c.outbound,c.process,c.proto].some(x=>String(x||'').toLowerCase().includes(f));
     const act=(d.active||[]).filter(match),rc=(d.recent_closed||[]).slice().reverse().slice(0,25).filter(match);
-    document.getElementById('connN').textContent=(d.active||[]).length+' connections';
-    document.getElementById('connBody').innerHTML=act.length?act.map(c=>connRow(c,false)).join(''):'<tr><td colspan="6" class="empty">No active connections.</td></tr>';
-    document.getElementById('closedBody').innerHTML=rc.length?rc.map(c=>connRow(c,true)).join(''):'<tr><td colspan="5" class="empty">Nothing yet.</td></tr>';
+    document.getElementById('connN').textContent=(d.active||[]).length+' '+t('unit.connections');
+    document.getElementById('connBody').innerHTML=act.length?act.map(c=>connRow(c,false)).join(''):`<tr><td colspan="6" class="empty">${t('empty.noConn')}</td></tr>`;
+    document.getElementById('closedBody').innerHTML=rc.length?rc.map(c=>connRow(c,true)).join(''):`<tr><td colspan="5" class="empty">${t('empty.nothing')}</td></tr>`;
   }
   document.getElementById('connFilter').addEventListener('input',fetchConnections);
 
@@ -399,13 +462,13 @@
     document.getElementById('tunBody').innerHTML=t.length?t.map(x=>{
       const rc=x.rtt_ms<50?'var(--ok)':(x.rtt_ms<150?'var(--warn)':'var(--crit)');
       return `<tr><td class="mono">${esc(x.remote||'?')}</td><td class="r mono" style="color:${rc}">${x.rtt_ms.toFixed(1)} ms</td><td class="r mono" style="color:${x.retrans>0?'var(--crit)':'var(--faint)'}">${x.retrans}</td><td class="r mono dim">${x.cwnd}</td></tr>`;
-    }).join(''):'<tr><td colspan="4" class="empty">No tunnels. Needs eBPF sockops + live traffic.</td></tr>';
+    }).join(''):`<tr><td colspan="4" class="empty">${t('empty.noTun')}</td></tr>`;
   }
 
   // ── stats ──
   function bars(el,withConn){
     const obs=statsCache.outbounds||[];
-    if(!obs.length){document.getElementById(el).innerHTML='<div class="empty">No traffic yet.</div>';return;}
+    if(!obs.length){document.getElementById(el).innerHTML=`<div class="empty">${t('empty.noTraffic')}</div>`;return;}
     const max=Math.max(...obs.map(o=>o.up+o.down),1);
     const col=t=>t==='direct'?'var(--muted)':(t==='block'?'var(--crit)':(t==='proxy'?'var(--ok)':'var(--down)'));
     document.getElementById(el).innerHTML=obs.map(o=>`<div class="meter-row"><span>${badge(o.tag)}</span><div class="meter"><i style="width:${Math.max(4,(o.up+o.down)/max*100)}%;background:${col(o.tag)}"></i></div><span class="mono dim" style="font-size:12px">${withConn?o.live+' live · ':''}↑${fmtB(o.up)} ↓${fmtB(o.down)}</span></div>`).join('');
@@ -420,7 +483,7 @@
       const rules=d.rules||[],def=d.default||{outbound:'',hits:0};
       const col=t=>t==='direct'?'var(--muted)':(t==='block'?'var(--crit)':'var(--ok)');
       document.getElementById('hitsBody').innerHTML=rules.map(r=>`<tr${r.hits===0?' style="opacity:.45"':''}><td class="mono dim">${r.index}</td><td><span style="color:${col(r.outbound)};font-weight:600">${esc(r.outbound)}</span></td><td class="r mono">${(r.hits||0).toLocaleString()}</td></tr>`).join('')+
-        `<tr style="border-top:1px solid var(--border-strong)"><td class="dim">def</td><td class="dim">${esc(def.outbound)}</td><td class="r mono">${(def.hits||0).toLocaleString()}</td></tr>`;
+        `<tr style="border-top:1px solid var(--border-strong)"><td class="dim">${t('rule.default')}</td><td class="dim">${esc(def.outbound)}</td><td class="r mono">${(def.hits||0).toLocaleString()}</td></tr>`;
     }
   }
 
@@ -428,7 +491,7 @@
   async function fetchProxies(){
     let d;try{d=await(await fetch('/api/proxies')).json();}catch(e){return;}
     const c=document.getElementById('proxiesContainer');
-    if(!d.proxies||!d.proxies.length){c.innerHTML='<div class="empty">No Selector / UrlTest groups.</div>';return;}
+    if(!d.proxies||!d.proxies.length){c.innerHTML=`<div class="empty">${t('empty.noGroups')}</div>`;return;}
     c.innerHTML=d.proxies.map(p=>`<div class="proxy-group"><div class="proxy-group-title">${esc(p.tag)} <span class="badge direct">${esc(p.type)}</span></div><div class="node-list">`+
       p.children.map(ch=>{
         const act=ch.tag===p.selected?'active':'';
@@ -458,32 +521,35 @@
   window.removeRule=i=>{currentRules.splice(i,1);renderRules();};
   window.updateRuleOutbound=(i,v)=>{currentRules[i].outbound=v;};
   window.moveRule=(i,dir)=>{const j=i+dir;if(j<0||j>=currentRules.length)return;[currentRules[i],currentRules[j]]=[currentRules[j],currentRules[i]];renderRules();};
-  window.addRuleItem=(ri,key)=>{const inp=document.getElementById(`input_${ri}_${key}`);let v=inp.value.trim();if(!v)return;if(key==='port'){const n=parseInt(v,10);if(!Number.isInteger(n)||n<1||n>65535){alert('Port 必须是 1–65535 的整数');return;}v=n;}if(!currentRules[ri][key])currentRules[ri][key]=[];currentRules[ri][key].push(v);renderRules();};
+  window.addRuleItem=(ri,key)=>{const inp=document.getElementById(`input_${ri}_${key}`);let v=inp.value.trim();if(!v)return;if(key==='port'){const n=parseInt(v,10);if(!Number.isInteger(n)||n<1||n>65535){alert(t('save.portErr'));return;}v=n;}if(!currentRules[ri][key])currentRules[ri][key]=[];currentRules[ri][key].push(v);renderRules();};
   window.removeRuleItem=(ri,key,ii)=>{currentRules[ri][key].splice(ii,1);if(currentRules[ri][key].length===0)delete currentRules[ri][key];renderRules();};
   async function fetchRules(){try{const d=await(await fetch('/api/rules')).json();if(d.status==='success'){currentRules=d.rules||[];availableOutbounds=d.outbounds||[];renderRules();}}catch(e){}}
   const RF=[['domain_suffix','Domain Suffix'],['domain_keyword','Domain Keyword'],['domain_regex','Domain Regex'],['geosite','Geosite'],['ip_cidr','IP CIDR'],['geoip','GeoIP'],['source_ip_cidr','Source IP'],['process_name','Process Name'],['inbound','Inbound'],['protocol','Protocol'],['port','Port']];
   function renderRules(){
     const c=document.getElementById('visualRulesContainer');
-    if(!currentRules.length){c.innerHTML='<div class="empty">No rules. Add one above.</div>';return;}
+    if(!currentRules.length){c.innerHTML=`<div class="empty">${t('empty.noRules')}</div>`;return;}
     const dl=`<datalist id="outboundOptions">${availableOutbounds.map(t=>`<option value="${esc(t)}"></option>`).join('')}</datalist>`;
     const field=(idx,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span onclick="removeRuleItem(${idx},'${key}',${vi})">×</span></div>`).join('');
-      return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="input_${idx}_${key}" placeholder="Add" onkeypress="if(event.key==='Enter')addRuleItem(${idx},'${key}')"><button class="btn-add" onclick="addRuleItem(${idx},'${key}')">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
+      return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="input_${idx}_${key}" placeholder="${t('fld.add')}" onkeypress="if(event.key==='Enter')addRuleItem(${idx},'${key}')"><button class="btn-add" onclick="addRuleItem(${idx},'${key}')">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
     c.innerHTML=dl+currentRules.map((rule,idx)=>{
       const up=idx>0?`<button class="btn-add" title="Up" onclick="moveRule(${idx},-1)">↑</button>`:'';
       const dn=idx<currentRules.length-1?`<button class="btn-add" title="Down" onclick="moveRule(${idx},1)">↓</button>`:'';
-      return `<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(idx+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<div style="margin-left:auto;display:flex;gap:6px">${up}${dn}<button class="btn-remove" onclick="removeRule(${idx})">Delete</button></div></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="outboundOptions" value="${esc(rule.outbound||'')}" onchange="updateRuleOutbound(${idx},this.value)" placeholder="e.g. proxy, direct"></div>${RF.map(([k,l])=>field(idx,rule,k,l)).join('')}</div></div>`;
+      return `<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(idx+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<div style="margin-left:auto;display:flex;gap:6px">${up}${dn}<button class="btn-remove" onclick="removeRule(${idx})">${t('btn.delete')}</button></div></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="outboundOptions" value="${esc(rule.outbound||'')}" onchange="updateRuleOutbound(${idx},this.value)" placeholder="e.g. proxy, direct"></div>${RF.map(([k,l])=>field(idx,rule,k,l)).join('')}</div></div>`;
     }).join('');
   }
   async function postRules(dry){const r=await fetch('/api/rules'+(dry?'?dry_run=1':''),{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({rules:currentRules})});return r.json();}
   window.saveRules=async()=>{try{
     const dry=await postRules(true);
-    if(dry.status!=='success'){alert('校验未通过, 未保存:\n'+(dry.message||'未知错误'));return;}
+    if(dry.status!=='success'){alert(t('save.invalid')+'\n'+(dry.message||''));return;}
     const issues=dry.issues||[];
-    if(issues.length&&!confirm('规则有以下告警 (不阻断):\n\n• '+issues.join('\n• ')+'\n\n仍要保存并应用?'))return;
+    if(issues.length&&!confirm(t('save.warnHead')+'\n\n• '+issues.join('\n• ')+'\n\n'+t('save.warnTail')))return;
     const d=await postRules(false);
-    if(d.status==='success'){const b=document.getElementById('saveBtn'),o=b.textContent;b.textContent='Saved & applied';setTimeout(()=>b.textContent=o,2000);fetchRules();}
-    else alert('Error: '+(d.message||'未知错误'));
-  }catch(e){alert('Failed to save rules');}};
+    if(d.status==='success'){const b=document.getElementById('saveBtn'),o=b.textContent;b.textContent=t('saved');setTimeout(()=>b.textContent=o,2000);fetchRules();}
+    else alert((d.message||''));
+  }catch(e){alert(t('save.failed'));}};
+
+  // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}}
 
   // ── polling ──
   setInterval(fetchOverview,1000);
@@ -491,6 +557,7 @@
   setInterval(()=>{if(view==='overview'||view==='routing')fetchStats();},2000);
   setInterval(()=>{if(view==='logs')fetchLogs();},2000);
   setInterval(()=>{if(view==='routing')fetchProxies();},5000);
+  applyI18n();
   fetchOverview();fetchStats();
 })();
 </script>

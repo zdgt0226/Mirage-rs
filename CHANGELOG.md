@@ -17,6 +17,9 @@ WebUI 视觉与信息架构整体重构: 从霓虹玻璃拟态 (glassmorphism + 
   色盲可辨 + 对比达标)。
 - 全部既有能力保留: overview/history/connections/stats/proxies(选点)/rules(dry_run预检+进程分流
   维度+拖排)/bpf-tunnels/logs 全接线, 真机 smoke 7 端点 200 + 字段对齐。
+- **多语言 (i18n)**: 简体中文 / English 双语, 侧栏 `中/EN` 一键切 (存 localStorage; 首访按浏览器
+  语言默认 zh/en)。自包含字典 `{en,zh}` + `t(key)`, 静态元素 `data-i18n` + 动态串走 `t()`;
+  72 处文案两语对称 (脚本校验无缺译)。可再加语言只需补字典一列。
 
 ## [v0.9.6] - WebUI 重构 (连接可视化 + 规则编辑器 + 分流统计) + fake-IP ICMP 反射 (2026-08-19)
 
