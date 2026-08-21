@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(webui): 屏蔽客户端 (服务端, T2-a)
+
+多模式 WebUI T2 首块: 服务端可屏蔽客户端 IP。自包含, 无协议改无数据面。
+
+- 新 `blocklist` 模块 (crate 级全局单例, 内存版): `block/unblock/is_blocked/list`。
+- **accept 处拒**: `mirage_server` 收到连接后**第一步**查屏蔽名单, 命中即立刻关连接 (drop
+  stream + continue), 省掉握手/BPF/brutal 全部开销。
+- API: `GET /api/clients` (连接的客户端 = device_stats 源 IP + 屏蔽标记 + 当前名单)、
+  `POST /api/clients/block` `{ip, blocked}` (鉴权+CSRF 走 auth_mw)。
+- 前端: 服务端 Clients「Connected clients」真表 (客户端 IP·连接数·↑↓·空闲) + 每行 **Block /
+  Unblock** 按钮 (屏蔽二次确认); 被屏蔽的半透明标记。i18n 补键 (中/英两语对称)。
+- **边界**: 内存版, **重启清零** (真持久化需写 config, 后续)。blocklist 单测锁行为。
+- 真机 smoke: 屏蔽 127.0.0.1 → 客户端连服务端 curl exit 000 (被拒) → 解除恢复。clippy 0 +
+  全测试绿。T2 剩: 限速 (流量整形数据面) · 客户端版本识别 (握手加字段)。
+
 ### feat(webui): 连接历史 (轻量内存版, T1 收尾)
 
 服务端 Clients 视图「连接历史」从占位变真表 —— 轻量内存版, 不加持久化依赖。

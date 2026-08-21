@@ -237,6 +237,8 @@ pub async fn start_server(
         .route("/api/stats", get(handlers::stats::get_stats))
         .route("/api/domains", get(handlers::domains::get_domains))
         .route("/api/devices", get(handlers::devices::get_devices))
+        .route("/api/clients", get(handlers::clients::get_clients))
+        .route("/api/clients/block", post(handlers::clients::post_block))
         .route("/api/history", get(handlers::history::get_history))
         .route("/api/logs", get(handlers::logs::get_logs))
         .route("/api/proxies", get(handlers::proxies::get_proxies))

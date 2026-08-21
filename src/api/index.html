@@ -298,14 +298,10 @@
           <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.connHistory">Connection history</div><span class="hint" id="histN"></span></div>
             <div style="overflow-x:auto;max-height:360px"><table class="tbl"><thead><tr><th data-i18n="th.target">Target</th><th data-i18n="th.route">Route</th><th data-i18n="th.proto">Proto</th><th class="r" data-i18n="th.age">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="histBody"><tr><td colspan="5" class="empty" data-i18n="empty.nothing">Nothing yet.</td></tr></tbody></table></div></div>
         </div>
-        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="srv.clientMgmt">Connected clients</div><span class="soon" data-i18n="soon">planned</span></div>
-          <div class="card-pad"><div class="stub" data-i18n="srv.clientMgmtDesc">Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.</div></div></div>
-        <div class="grid cols-2">
-          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.block">Block client</div><span class="soon" data-i18n="soon">planned</span></div>
-            <div class="card-pad"><div class="stub" data-i18n="srv.blockDesc">Reject a client IP / identity at accept. Medium; backend blacklist at the listener.</div></div></div>
-          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.rateLimit">Per-client rate limit</div><span class="soon" data-i18n="soon">planned</span></div>
-            <div class="card-pad"><div class="stub" data-i18n="srv.rateLimitDesc">Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.</div></div></div>
-        </div>
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="srv.clientMgmt">Connected clients</div><span class="hint" id="cliN"></span></div>
+          <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.client">Client</th><th class="r" data-i18n="th.conns">Conns</th><th class="r">↑ / ↓</th><th class="r" data-i18n="th.idle">Idle</th><th class="r" data-i18n="srv.block">Block</th></tr></thead><tbody id="cliBody"><tr><td colspan="5" class="empty" data-i18n="srv.noClients">No connected clients.</td></tr></tbody></table></div></div>
+        <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.rateLimit">Per-client rate limit</div><span class="soon" data-i18n="soon">planned</span></div>
+          <div class="card-pad"><div class="stub" data-i18n="srv.rateLimitDesc">Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.</div></div></div>
       </section>
     </div>
   </main>
@@ -351,7 +347,7 @@
       'dev.lanDevices':'LAN devices','dev.byActivity':'by recent activity','th.device':'Device','th.idle':'Idle','dev.route':'Route','dev.none':'No devices seen yet.','dev.routed':'Routed via ','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
       'dev.perDeviceRule':'Per-device rules','dev.perDeviceRuleDesc':'Scope routing rules to a device / subnet. Backend source_ip_cidr already routes per source — this surfaces it per discovered device.',
       'dev.perDeviceSpeed':'Per-device speed limit','dev.perDeviceSpeedDesc':'Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.',
-      'srv.domainRank':'Top domains','srv.domainRankDesc':'Ranked target domains across clients. Needs server-side connection registration + top-N aggregation.',
+      'srv.domainRank':'Top domains','th.client':'Client','srv.noClients':'No connected clients.','srv.unblock':'Unblock','srv.blockedTag':'blocked','srv.domainRankDesc':'Ranked target domains across clients. Needs server-side connection registration + top-N aggregation.',
       'srv.connHistory':'Connection history','srv.connHistoryDesc':'Past connections beyond the live/recent window. Needs persistence (embedded store).',
       'srv.clientMgmt':'Connected clients','srv.clientMgmtDesc':'Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.',
       'srv.block':'Block client','srv.blockDesc':'Reject a client IP / identity at accept. Medium; backend blacklist at the listener.',
@@ -384,7 +380,7 @@
       'dev.lanDevices':'局域网设备','dev.byActivity':'按最近活跃','th.device':'设备','th.idle':'空闲','dev.route':'路由','dev.none':'暂无设备。','dev.routed':'已路由到 ','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
       'dev.perDeviceRule':'按设备规则','dev.perDeviceRuleDesc':'把路由规则限定到某设备/网段。后端 source_ip_cidr 已能按来源分流 —— 这里按发现的设备可视化配置。',
       'dev.perDeviceSpeed':'按设备限速','dev.perDeviceSpeedDesc':'按设备限带宽。需新建流量整形数据面（tc / eBPF token bucket）—— 最大一块，单独跟踪。',
-      'srv.domainRank':'域名排行','srv.domainRankDesc':'跨客户端的目标域名排行。需服务端连接登记 + top-N 聚合。',
+      'srv.domainRank':'域名排行','th.client':'客户端','srv.noClients':'无连接的客户端。','srv.unblock':'解除','srv.blockedTag':'已屏蔽','srv.domainRankDesc':'跨客户端的目标域名排行。需服务端连接登记 + top-N 聚合。',
       'srv.connHistory':'连接历史','srv.connHistoryDesc':'live/最近窗口之外的历史连接。需持久化（内嵌存储）。',
       'srv.clientMgmt':'连接的客户端','srv.clientMgmtDesc':'每客户端视图：来源 IP、版本、流量。版本需握手加字段（两端）。之后按客户端屏蔽 + 限速在此操作。',
       'srv.block':'屏蔽客户端','srv.blockDesc':'在 accept 处按客户端 IP/身份拒绝。中等量；监听侧加黑名单。',
@@ -433,7 +429,7 @@
     document.getElementById('vSub').textContent=t('sub.'+view);
     if(view==='routing'){fetchProxies();fetchRules();}
     if(view==='connections')fetchConnections();
-    if(view==='clients'){fetchDomains();fetchConnHistory();}
+    if(view==='clients'){fetchDomains();fetchConnHistory();fetchClients();}
     if(view==='devices')fetchDevices();
     if(view==='logs')fetchLogs();
     if(view==='overview')drawChart();
@@ -566,6 +562,25 @@
       :`<tr><td colspan="3" class="empty">${t('empty.noTraffic')}</td></tr>`;
   }
 
+  // ── connected clients + block (server Admin) ──
+  async function fetchClients(){
+    let d;try{d=await(await fetch('/api/clients')).json();}catch(e){return;}
+    const rows=d.clients||[];
+    document.getElementById('cliN').textContent=rows.length+(d.blocked&&d.blocked.length?(' · '+d.blocked.length+' '+t('srv.blockedTag')):'');
+    document.getElementById('cliBody').innerHTML=rows.length?rows.map(x=>{
+      const btn=x.blocked
+        ?`<button class="btn-add" style="color:var(--ok);border-color:var(--ok)" onclick="blockClient('${esc(x.ip)}',false)">${t('srv.unblock')}</button>`
+        :`<button class="btn-add" style="color:var(--crit);border-color:var(--crit)" onclick="blockClient('${esc(x.ip)}',true)">${t('srv.block')}</button>`;
+      return `<tr${x.blocked?' style="opacity:.5"':''}><td class="target mono">${esc(x.ip)}${x.blocked?' <span class="badge block">'+t('srv.blockedTag')+'</span>':''}</td><td class="r mono dim">${x.conns.toLocaleString()}</td><td class="r mono">↑${fmtB(x.up)} <span class="dim">/</span> ↓${fmtB(x.down)}</td><td class="r mono dim">${fmtIdle(x.idle_ms)}</td><td class="r">${btn}</td></tr>`;
+    }).join(''):`<tr><td colspan="5" class="empty">${t('srv.noClients')}</td></tr>`;
+  }
+  window.blockClient=async(ip,blocked)=>{
+    if(blocked&&!confirm(t('srv.block')+' '+ip+' ?'))return;
+    try{const r=await(await fetch('/api/clients/block',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({ip,blocked})})).json();
+      if(r.status!=='success')alert(r.message||'error');fetchClients();
+    }catch(e){alert('failed');}
+  };
+
   // ── connection history (server Admin, 轻量内存版 = recent-closed 环) ──
   async function fetchConnHistory(){
     let d;try{d=await(await fetch('/api/connections')).json();}catch(e){return;}
@@ -666,7 +681,7 @@
   }catch(e){alert(t('save.failed'));}};
 
   // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
-  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients'){fetchDomains();fetchConnHistory();}if(view==='devices')fetchDevices();}
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients'){fetchDomains();fetchConnHistory();fetchClients();}if(view==='devices')fetchDevices();}
 
   // ── polling ──
   setInterval(fetchOverview,1000);
@@ -674,7 +689,7 @@
   setInterval(()=>{if(view==='overview'||view==='routing')fetchStats();},2000);
   setInterval(()=>{if(view==='logs')fetchLogs();},2000);
   setInterval(()=>{if(view==='routing')fetchProxies();},5000);
-  setInterval(()=>{if(view==='clients'){fetchDomains();fetchConnHistory();}if(view==='devices')fetchDevices();},3000);
+  setInterval(()=>{if(view==='clients'){fetchDomains();fetchConnHistory();fetchClients();}if(view==='devices')fetchDevices();},3000);
   setInterval(()=>{if(view==='devices')fetchDevices();},4000);
   applyI18n();
   fetchOverview();fetchStats();
