@@ -2,6 +2,51 @@
 
 ## [Unreleased]
 
+### feat(webui): 连接历史 (轻量内存版, T1 收尾)
+
+服务端 Clients 视图「连接历史」从占位变真表 —— 轻量内存版, 不加持久化依赖。
+
+- 最近关闭连接环 `CLOSED_RING_CAP` 100→300 (≈数十 KB, 够看"最近谁连过哪")。
+- 前端: 服务端 Clients「Connection history」卡渲染 `/api/connections` 的 `recent_closed`
+  (倒序 top-150, 目标·走向·协议·时长·↑↓), 3s 轮询。复用现有连接快照, 零新后端。
+- **明确边界**: 内存版, **重启清零**; 真跨重启历史需内嵌存储 (评估后暂不加 sqlite/sled 依赖,
+  违背轻量网关气质)。至此 T1 三块 (域名排行 · LAN 设备规则 · 连接历史) 齐, 限速/版本/屏蔽
+  留 T2 (占位卡标注)。
+
+### feat(webui): LAN 设备列表 + 按设备一键路由 (T1-b)
+
+多模式 WebUI T1 客户端块: 客户端 Devices 视图从占位变真功能。
+
+- **设备/来源聚合**: monitor 连接登记加 `source` 维度 (发起方 IP); 新 per-设备累计
+  (连接数 + 上下行字节 + 最近活跃)。客户端 transparent/SOCKS 的源 IP = LAN 设备; 服务端的
+  源 IP = 连接的客户端 (同一聚合两用)。register 各调用点透传 source (handler 的 source_ip /
+  transparent_udp 的 client / 服务端 relay 的 client_ip)。
+- 新 `GET /api/devices` 出设备列表 (按最近活跃排序)。
+- **前端**: 客户端 Devices 视图「LAN devices」真表 (设备 IP·连接数·↑↓·空闲) + **按设备一键路由**:
+  每行选出站 + Route → 前插一条 `source_ip_cidr:[ip/32]` 规则 (首命中即用, 设备规则优先) 并经
+  dry_run 预检落盘。复用现有 `/api/rules` 后端, 零新数据面。
+- 「Per-device speed limit」仍 planned (需流量整形数据面, T2)。「连接历史」仍 planned (需持久化,
+  不擅自加内嵌存储依赖)。i18n 补 6 键 (中/英, 105 处两语对称)。
+- 真机 smoke: `/api/devices` 正确聚合 (ip/conns/字节/idle) + 按设备路由规则 dry_run 校验通过。
+  clippy 0 + 全测试绿。
+
+### feat(webui): 服务端连接登记 + 域名排行 (T1-a)
+
+多模式 WebUI T1 首块: 服务端也登记连接 + 域名排行, 点亮服务端 Admin/Clients 的「Top domains」+
+让服务端 Connections 视图有数据。
+
+- **服务端连接登记**: `mirage_server` 的 `handle_tcp_relay` 在收到 target 后登记进 monitor
+  `{目标, 客户端 IP(inbound), 出站(direct/ss-upstream/wg-upstream), tcp}`, 覆盖 direct + ss/wg
+  全路径; 字节在 direct relay 双向循环累加 (ss/wg 子路径仅登记可见, 同客户端 splice 限制)。
+  客户端 IP 从 `dispatch_authenticated` 的 stream peer 取, 透传进 relay。UDP 服务端 relay 先接
+  住 client_ip 参数, per-datagram 域名登记留后续。
+- **域名排行聚合**: monitor 加 per-域名累计 (连接数 + 上下行字节, key=target 去 :port, IPv6 剥
+  `[..]`)。`register` 计连接数, 断连补字节。新 `GET /api/domains` 出 top-30 (按流量降序)。
+- **前端**: 服务端 Clients 视图「Top domains」占位卡 → 真表 (域名·连接数·↑↓, 3s 轮询); 服务端
+  Connections 视图现有服务端连接数据。i18n 补 3 键 (中/英, 99 处两语对称)。
+- 真机 e2e smoke: client→隧道→server→direct→目标, 服务端 `/api/domains` + `/api/connections`
+  正确登记 (target/客户端 IP/出站)。349 lib + 全集成 + clippy 0。
+
 ### feat(webui): 服务端/客户端模式分视图 + Admin 入口脚手架 (T0)
 
 多模式 WebUI 地基: 看板按运行模式 (server / client) 展示不同功能。

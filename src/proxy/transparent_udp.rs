@@ -541,7 +541,7 @@ async fn setup_flow(
         Some(UdpTarget::Ip(ip)) => format!("{ip}:{port}"),
         None => format!("{fake_ip}:{port}"),
     };
-    let _conn = crate::monitor::register(target_str, inbound_tag.to_string(), tag.clone(), "udp", None);
+    let _conn = crate::monitor::register(target_str, inbound_tag.to_string(), tag.clone(), "udp", None, Some(client.ip().to_string()));
     _conn.counter().up(first_payload.len() as u64);
     let conn_ctr = _conn.counter();
 

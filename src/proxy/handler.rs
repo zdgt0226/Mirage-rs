@@ -223,6 +223,7 @@ pub async fn proxy_tcp_target(
         outbound_tag.to_string(),
         "tcp",
         process_name.clone(),
+        source_ip.map(|ip| ip.to_string()), // LAN 设备 IP (WebUI 设备视图)
     );
 
     let outbound = match current_state.outbounds.get(&outbound_tag) {
