@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(webui): 客户端版本识别 (T2-b)
+
+服务端 WebUI「连接的客户端」显示各客户端版本 (便于知道谁该升级)。走项目既有的**两端 opt-in
+config 门控**模式 (同 pfs/cipher_agility/tls_padding), **零指纹影响**。
+
+- 新 `tuning.client_info` (默认 false)。两端同开时: 客户端握手后 (TIME_SYNC/agility 之后、target
+  之前) 于**加密信道内**发一帧 `CLIENT_INFO`(自身版本); 服务端读到即记 `客户端 IP → 版本`。
+- **兼容**: 默认关 → 不发不读, 老客户端/老服务端零影响。单边开 = fail-closed (同 agility 约束,
+  README/模板已注明"两端必须同开")。ClientHello 一字不改 —— 帧在加密信道内, 不上明文握手。
+- 新 `client_info` 模块 (crate 级: enabled 门控 + 帧 build/parse + IP→版本内存表); `startup` 从
+  `tuning.client_info` 设全局; `pool` (客户端发) + `control` (服务端读) 各接一处。
+- `GET /api/clients` 加 `version` 字段; 前端 Clients 表加版本列 (未上报=—)。config 模板补 `client_info`。
+- 真机双端 smoke: 两端开 → 隧道 200 + `/api/clients` 显示 `version=0.9.6`。frame_roundtrip 单测 +
+  clippy 0 + 全测试绿。T2 剩: 限速 (流量整形数据面, 最大)。
+
 ### feat(webui): 屏蔽客户端 (服务端, T2-a)
 
 多模式 WebUI T2 首块: 服务端可屏蔽客户端 IP。自包含, 无协议改无数据面。

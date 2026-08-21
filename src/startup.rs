@@ -146,6 +146,11 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                 crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
                 // TLS record padding 开关 (设进全局, CryptoWriter::new 读)。收端恒剥零无需开关。
                 crate::crypto::cipher::set_tls_padding(tuning.tls_padding);
+                // 客户端版本识别 (两端同开: 客户端发 / 服务端读)。
+                crate::client_info::set_enabled(tuning.client_info);
+                if tuning.client_info {
+                    warn!("已开启 client_info: 要求两端同开 (单边开会多发/漏读一帧致该连接失败)。");
+                }
                 if tuning.tls_padding {
                     warn!(
                         "已开启 tls_padding: 要求两端都升到支持剥零的版本。老对端不剥零, 会把填充零\

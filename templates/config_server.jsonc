@@ -85,7 +85,12 @@
         // 抹掉"包长序列"指纹 (抗 GFW 对握手后前几包长度的 ML 识别)。收端恒剥零, 故也在客户端
         // 配置里各自开。⚠️ 仅在**两端都已升到支持剥零的版本**时开 —— 老对端不剥零, 会把填充零
         // 当 content type 解析失败断连 (同 cipher_agility 约束)。ClientHello 不受影响。
-        "tls_padding": false
+        "tls_padding": false,
+
+        // 【客户端版本识别, 默认 false】两端同开时, 客户端在加密信道内上报自身版本, 服务端 WebUI
+        // 「连接的客户端」显示各客户端版本 (便于知道谁该升级)。⚠️ 两端必须同开 (单边开会多发/漏读
+        // 一帧致该连接失败, 同 cipher_agility 约束)。ClientHello 一字不改, 零指纹影响。
+        "client_info": false
 
         // ebpf_mode 默认 auto: 服务端自动跳过 eBPF (入站是加密流, sockmap/XDP/sk_lookup
         // 对服务端都无价值)。调试才设 "force"。

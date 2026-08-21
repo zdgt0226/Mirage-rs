@@ -627,6 +627,15 @@ impl WarmPool {
             }
         }
 
+        // 7. 客户端版本识别 (两端 tuning.client_info 同开时): 在加密信道内、target 之前发一帧
+        //    CLIENT_INFO(本机版本)。服务端读到即记 IP→版本。ClientHello 未动, 零指纹影响。
+        if crate::client_info::enabled() {
+            let frame = crate::client_info::build_frame(crate::client_info::own_version());
+            if let Err(e) = crypto_writer.send_data(&frame).await {
+                tracing::debug!("client_info: 发送版本帧失败 (不影响连接): {:?}", e);
+            }
+        }
+
         Ok(Tunnel::new(crypto_reader, crypto_writer))
     }
 

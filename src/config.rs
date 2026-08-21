@@ -734,6 +734,12 @@ pub struct TuningConfig {
     /// content_type 解析失败断连) —— 与 cipher_agility 同类约束。ClientHello 不受影响。
     #[serde(default)]
     pub tls_padding: bool,
+    /// 客户端版本识别 (默认 false)。两端同开时, 客户端在握手后于加密信道内上报自身版本, 服务端
+    /// WebUI「连接的客户端」显示各客户端版本 (便于运维知道谁该升级)。**两端必须同开** —— 与
+    /// cipher_agility/tls_padding 同类约束 (单边开会多发/漏读一帧致该连接失败)。ClientHello 一字
+    /// 不改, 帧在加密信道内, 零指纹影响。
+    #[serde(default)]
+    pub client_info: bool,
     /// **客户端** UDP 多路复用开关 (默认 false)。开了则透明 UDP 的 Mirage 流不再一流一隧道,
     /// 而是按 flowkey 散列到少量 (udp_mux_tunnels) 长命共享隧道复用, 拿掉"并发 UDP 流 ≤ pool_size"
     /// 的带机量硬伤。**仅在服务端也已升到支持 mux 的版本时开** (老服务端不认 0x01 sentinel, 那些

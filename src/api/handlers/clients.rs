@@ -17,6 +17,8 @@ pub async fn get_clients() -> Json<Value> {
         "down": d.down,
         "idle_ms": d.idle_ms,
         "blocked": blocked_set.contains(&d.ip),
+        // 客户端上报的版本 (两端 client_info 同开才有; 否则 null = 未知/未上报)。
+        "version": crate::client_info::version_of(&d.ip),
     })).collect();
     Json(json!({ "clients": clients, "blocked": crate::blocklist::list() }))
 }
