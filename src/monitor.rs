@@ -36,6 +36,7 @@ pub struct ConnInfo {
     pub outbound: String,      // 路由选中的出站 tag
     pub proto: &'static str,   // "tcp" / "udp"
     pub process: Option<String>,
+    pub source: Option<String>, // 发起方 IP (LAN 设备 / 连接的客户端); None=不适用
     pub start: Instant,
     pub up: AtomicU64,
     pub down: AtomicU64,
@@ -50,6 +51,7 @@ pub struct ConnSnapshot {
     pub outbound: String,
     pub proto: &'static str,
     pub process: Option<String>,
+    pub source: Option<String>,
     pub age_ms: u128,
     pub up: u64,
     pub down: u64,
@@ -64,6 +66,7 @@ fn snapshot(c: &ConnInfo, closed: bool) -> ConnSnapshot {
         outbound: c.outbound.clone(),
         proto: c.proto,
         process: c.process.clone(),
+        source: c.source.clone(),
         age_ms: c.start.elapsed().as_millis(),
         up: c.up.load(Ordering::Relaxed),
         down: c.down.load(Ordering::Relaxed),
@@ -120,6 +123,26 @@ pub struct DomainStat {
     pub conns: u64,
     pub up: u64,
     pub down: u64,
+}
+
+/// per-设备/来源统计 (WebUI 客户端「LAN 设备」/ 服务端「连接的客户端」)。按发起方 IP 聚合。
+struct DeviceAgg {
+    conns: u64,
+    up: u64,
+    down: u64,
+    last: Instant,
+}
+static DEVICE_STATS: LazyLock<Mutex<HashMap<String, DeviceAgg>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 单个设备/来源快照。
+#[derive(Clone, serde::Serialize)]
+pub struct DeviceStat {
+    pub ip: String,
+    pub conns: u64,
+    pub up: u64,
+    pub down: u64,
+    pub idle_ms: u128, // 距上次新建连接 (越小越活跃)
 }
 
 /// "host:port" 取 host (剥 :port; IPv6 字面量 "[::1]:443" → "[::1]")。
@@ -179,16 +202,27 @@ impl Drop for ConnGuard {
         let d = ds.entry(target_host(&self.0.target)).or_default();
         d.up += up;
         d.down += down;
+        drop(ds);
+        // per-设备/来源累计字节。
+        if let Some(src) = &self.0.source {
+            let mut dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(e) = dev.get_mut(src) {
+                e.up += up;
+                e.down += down;
+            }
+        }
     }
 }
 
 /// 登记一条新连接, 返回生命周期句柄 (drop 即注销)。
+/// `source` = 发起方 IP (客户端: LAN 设备; 服务端: 连接的客户端); None = 不适用/未知。
 pub fn register(
     target: String,
     inbound: String,
     outbound: String,
     proto: &'static str,
     process: Option<String>,
+    source: Option<String>,
 ) -> ConnGuard {
     let id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
     let info = Arc::new(ConnInfo {
@@ -198,6 +232,7 @@ pub fn register(
         outbound,
         proto,
         process,
+        source,
         start: Instant::now(),
         up: AtomicU64::new(0),
         down: AtomicU64::new(0),
@@ -208,8 +243,25 @@ pub fn register(
     // per-域名累计连接数 +1 (域名排行)。
     DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner())
         .entry(target_host(&info.target)).or_default().conns += 1;
+    // per-设备/来源累计连接数 +1 + 刷新 last (LAN 设备 / 连接的客户端)。
+    if let Some(src) = &info.source {
+        let mut dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = dev.entry(src.clone()).or_insert(DeviceAgg { conns: 0, up: 0, down: 0, last: Instant::now() });
+        e.conns += 1;
+        e.last = Instant::now();
+    }
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).live.insert(id, info.clone());
     ConnGuard(info)
+}
+
+/// 设备/来源统计快照: 按活跃度 (idle 升序 = 最近活跃在前)。
+pub fn device_stats() -> Vec<DeviceStat> {
+    let dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<DeviceStat> = dev.iter().map(|(ip, a)| DeviceStat {
+        ip: ip.clone(), conns: a.conns, up: a.up, down: a.down, idle_ms: a.last.elapsed().as_millis(),
+    }).collect();
+    out.sort_by_key(|d| d.idle_ms);
+    out
 }
 
 /// 域名排行快照: 按累计流量降序 top-N (n<=0 = 全部)。
@@ -619,8 +671,8 @@ mod conn_registry_tests {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base_live = live_conn_count();
 
-        let g1 = register("example.com:443".into(), "socks".into(), "proxy".into(), "tcp", Some("curl".into()));
-        let g2 = register("1.1.1.1:80".into(), "tproxy".into(), "direct".into(), "tcp", None);
+        let g1 = register("example.com:443".into(), "socks".into(), "proxy".into(), "tcp", Some("curl".into()), Some("192.168.1.5".into()));
+        let g2 = register("1.1.1.1:80".into(), "tproxy".into(), "direct".into(), "tcp", None, None);
         assert_eq!(live_conn_count(), base_live + 2);
 
         // 无锁累加
@@ -659,7 +711,7 @@ mod conn_registry_tests {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 连开连关多于容量, 环长不超过 CLOSED_RING_CAP。
         for i in 0..(CLOSED_RING_CAP + 20) {
-            let g = register(format!("h{i}:1"), "in".into(), "out".into(), "tcp", None);
+            let g = register(format!("h{i}:1"), "in".into(), "out".into(), "tcp", None, None);
             drop(g);
         }
         let (_, closed) = conn_snapshots();

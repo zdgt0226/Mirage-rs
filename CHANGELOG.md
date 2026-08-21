@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### feat(webui): LAN 设备列表 + 按设备一键路由 (T1-b)
+
+多模式 WebUI T1 客户端块: 客户端 Devices 视图从占位变真功能。
+
+- **设备/来源聚合**: monitor 连接登记加 `source` 维度 (发起方 IP); 新 per-设备累计
+  (连接数 + 上下行字节 + 最近活跃)。客户端 transparent/SOCKS 的源 IP = LAN 设备; 服务端的
+  源 IP = 连接的客户端 (同一聚合两用)。register 各调用点透传 source (handler 的 source_ip /
+  transparent_udp 的 client / 服务端 relay 的 client_ip)。
+- 新 `GET /api/devices` 出设备列表 (按最近活跃排序)。
+- **前端**: 客户端 Devices 视图「LAN devices」真表 (设备 IP·连接数·↑↓·空闲) + **按设备一键路由**:
+  每行选出站 + Route → 前插一条 `source_ip_cidr:[ip/32]` 规则 (首命中即用, 设备规则优先) 并经
+  dry_run 预检落盘。复用现有 `/api/rules` 后端, 零新数据面。
+- 「Per-device speed limit」仍 planned (需流量整形数据面, T2)。「连接历史」仍 planned (需持久化,
+  不擅自加内嵌存储依赖)。i18n 补 6 键 (中/英, 105 处两语对称)。
+- 真机 smoke: `/api/devices` 正确聚合 (ip/conns/字节/idle) + 按设备路由规则 dry_run 校验通过。
+  clippy 0 + 全测试绿。
+
 ### feat(webui): 服务端连接登记 + 域名排行 (T1-a)
 
 多模式 WebUI T1 首块: 服务端也登记连接 + 域名排行, 点亮服务端 Admin/Clients 的「Top domains」+

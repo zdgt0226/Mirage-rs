@@ -121,6 +121,8 @@
   .badge.udp{color:var(--down);background:color-mix(in srgb,var(--down) 14%,transparent);}
   .badge.tcp{color:var(--faint);background:var(--surface-2);}
   .dim{color:var(--faint);}
+  .devsel{background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:7px;padding:5px 7px;font-family:inherit;font-size:12px;outline:none;}
+  .devsel:focus{border-color:var(--accent);}
   .empty{color:var(--faint);text-align:center;padding:26px;font-size:13px;}
   .soon{font-size:10.5px;font-weight:600;letter-spacing:.5px;text-transform:uppercase;color:var(--warn);background:var(--warn-soft);padding:3px 8px;border-radius:6px;}
   .stub{color:var(--muted);font-size:13px;line-height:1.65;}
@@ -282,14 +284,10 @@
 
       <!-- DEVICES (client-mode admin) -->
       <section class="view" id="devices">
-        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="dev.lanDevices">LAN devices</div></div>
-          <div class="card-pad"><div class="empty" data-i18n="dev.discoverSoon">LAN device discovery — planned (needs eBPF per-source monitor).</div></div></div>
-        <div class="grid cols-2">
-          <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceRule">Per-device rules</div><span class="soon" data-i18n="soon">planned</span></div>
-            <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceRuleDesc">Scope routing rules to a device / subnet. Backend `source_ip_cidr` already routes per source — this surfaces it per discovered device.</div></div></div>
-          <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceSpeed">Per-device speed limit</div><span class="soon" data-i18n="soon">planned</span></div>
-            <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceSpeedDesc">Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.</div></div></div>
-        </div>
+        <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="dev.lanDevices">LAN devices</div><span class="hint" data-i18n="dev.byActivity">by recent activity</span></div>
+          <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.device">Device</th><th class="r" data-i18n="th.conns">Conns</th><th class="r">↑ / ↓</th><th class="r" data-i18n="th.idle">Idle</th><th class="r" data-i18n="dev.route">Route</th></tr></thead><tbody id="devBody"><tr><td colspan="5" class="empty" data-i18n="dev.none">No devices seen yet.</td></tr></tbody></table></div></div>
+        <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceSpeed">Per-device speed limit</div><span class="soon" data-i18n="soon">planned</span></div>
+          <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceSpeedDesc">Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.</div></div></div>
       </section>
 
       <!-- CLIENTS (server-mode admin) -->
@@ -350,7 +348,7 @@
       'nav.admin':'Admin','nav.devices':'Devices','nav.clients':'Clients',
       'sub.devices':'LAN devices & per-device policy','sub.clients':'Connected clients & server controls',
       'brand.sub.server':'proxy server','soon':'planned',
-      'dev.lanDevices':'LAN devices','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
+      'dev.lanDevices':'LAN devices','dev.byActivity':'by recent activity','th.device':'Device','th.idle':'Idle','dev.route':'Route','dev.none':'No devices seen yet.','dev.routed':'Routed via ','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
       'dev.perDeviceRule':'Per-device rules','dev.perDeviceRuleDesc':'Scope routing rules to a device / subnet. Backend source_ip_cidr already routes per source — this surfaces it per discovered device.',
       'dev.perDeviceSpeed':'Per-device speed limit','dev.perDeviceSpeedDesc':'Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.',
       'srv.domainRank':'Top domains','srv.domainRankDesc':'Ranked target domains across clients. Needs server-side connection registration + top-N aggregation.',
@@ -383,7 +381,7 @@
       'nav.admin':'管理','nav.devices':'设备','nav.clients':'客户端',
       'sub.devices':'局域网设备与按设备策略','sub.clients':'连接的客户端与服务端管控',
       'brand.sub.server':'代理服务端','soon':'计划中',
-      'dev.lanDevices':'局域网设备','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
+      'dev.lanDevices':'局域网设备','dev.byActivity':'按最近活跃','th.device':'设备','th.idle':'空闲','dev.route':'路由','dev.none':'暂无设备。','dev.routed':'已路由到 ','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
       'dev.perDeviceRule':'按设备规则','dev.perDeviceRuleDesc':'把路由规则限定到某设备/网段。后端 source_ip_cidr 已能按来源分流 —— 这里按发现的设备可视化配置。',
       'dev.perDeviceSpeed':'按设备限速','dev.perDeviceSpeedDesc':'按设备限带宽。需新建流量整形数据面（tc / eBPF token bucket）—— 最大一块，单独跟踪。',
       'srv.domainRank':'域名排行','srv.domainRankDesc':'跨客户端的目标域名排行。需服务端连接登记 + top-N 聚合。',
@@ -436,6 +434,7 @@
     if(view==='routing'){fetchProxies();fetchRules();}
     if(view==='connections')fetchConnections();
     if(view==='clients')fetchDomains();
+    if(view==='devices')fetchDevices();
     if(view==='logs')fetchLogs();
     if(view==='overview')drawChart();
   });
@@ -567,6 +566,36 @@
       :`<tr><td colspan="3" class="empty">${t('empty.noTraffic')}</td></tr>`;
   }
 
+  // ── devices (client Admin: LAN 设备 + 按设备路由) ──
+  function fmtIdle(ms){const s=Math.floor((Number(ms)||0)/1000);if(s<60)return s+'s';const m=Math.floor(s/60);if(m<60)return m+'m';return Math.floor(m/60)+'h';}
+  async function fetchDevices(){
+    let d;try{d=await(await fetch('/api/devices')).json();}catch(e){return;}
+    // 顺带拿出站列表 (给按设备路由的下拉)。
+    try{const r=await(await fetch('/api/rules')).json();if(r.status==='success')availableOutbounds=r.outbounds||[];}catch(e){}
+    const rows=d.devices||[];
+    const opts=availableOutbounds.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('');
+    document.getElementById('devBody').innerHTML=rows.length?rows.map(x=>
+      `<tr><td class="target mono">${esc(x.ip)}</td><td class="r mono dim">${x.conns.toLocaleString()}</td><td class="r mono">↑${fmtB(x.up)} <span class="dim">/</span> ↓${fmtB(x.down)}</td><td class="r mono dim">${fmtIdle(x.idle_ms)}</td>`+
+      `<td class="r"><span style="display:inline-flex;gap:5px;justify-content:flex-end"><select id="devob_${esc(x.ip)}" class="devsel">${opts}</select><button class="btn-add" onclick="routeDevice('${esc(x.ip)}')">${t('dev.route')}</button></span></td></tr>`).join('')
+      :`<tr><td colspan="5" class="empty">${t('dev.none')}</td></tr>`;
+  }
+  window.routeDevice=async(ip)=>{
+    const sel=document.getElementById('devob_'+ip);const ob=sel?sel.value:'';
+    if(!ob){alert('No outbound');return;}
+    try{
+      const cur=await(await fetch('/api/rules')).json();
+      if(cur.status!=='success'){alert(t('save.failed'));return;}
+      const rules=(cur.rules||[]).slice();
+      rules.unshift({source_ip_cidr:[ip+'/32'],outbound:ob}); // 前插: 首命中即用, 设备规则优先
+      const body=JSON.stringify({rules});
+      const dry=await(await fetch('/api/rules?dry_run=1',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body})).json();
+      if(dry.status!=='success'){alert(t('save.invalid')+'\n'+(dry.message||''));return;}
+      const res=await(await fetch('/api/rules',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body})).json();
+      if(res.status==='success')alert(t('dev.routed')+ob+' ('+ip+'/32)');
+      else alert(res.message||t('save.failed'));
+    }catch(e){alert(t('save.failed'));}
+  };
+
   // ── proxies ──
   async function fetchProxies(){
     let d;try{d=await(await fetch('/api/proxies')).json();}catch(e){return;}
@@ -629,7 +658,7 @@
   }catch(e){alert(t('save.failed'));}};
 
   // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
-  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients')fetchDomains();}
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients')fetchDomains();if(view==='devices')fetchDevices();}
 
   // ── polling ──
   setInterval(fetchOverview,1000);
@@ -637,7 +666,8 @@
   setInterval(()=>{if(view==='overview'||view==='routing')fetchStats();},2000);
   setInterval(()=>{if(view==='logs')fetchLogs();},2000);
   setInterval(()=>{if(view==='routing')fetchProxies();},5000);
-  setInterval(()=>{if(view==='clients')fetchDomains();},3000);
+  setInterval(()=>{if(view==='clients')fetchDomains();if(view==='devices')fetchDevices();},3000);
+  setInterval(()=>{if(view==='devices')fetchDevices();},4000);
   applyI18n();
   fetchOverview();fetchStats();
 })();

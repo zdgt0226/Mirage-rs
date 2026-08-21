@@ -34,7 +34,7 @@ pub(super) async fn handle_tcp_relay(
         None => "direct",
     };
     let inbound_label = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "client".into());
-    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None);
+    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None, client_ip.map(|ip| ip.to_string()));
 
     // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
     if let Some(outlet) = upstream_cfg {
