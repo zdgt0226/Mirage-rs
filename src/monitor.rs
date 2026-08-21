@@ -25,7 +25,9 @@ pub fn add_down(bytes: u64) {
 // 全用户态、与 eBPF 无关, lite/网关模式都有数据 (区别于仅 eBPF 的 bpf/tunnels)。
 // ============================================================================
 
-const CLOSED_RING_CAP: usize = 100;
+// 最近关闭连接环 (WebUI「连接历史」轻量内存版, 无持久化 → 重启清零)。300 条 ≈ 数十 KB,
+// 够看"最近谁连过哪"; 真跨重启历史需内嵌存储 (评估后暂不加依赖)。
+const CLOSED_RING_CAP: usize = 300;
 static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 单条连接的活跃状态。up/down 是原子, relay 侧无锁累加。

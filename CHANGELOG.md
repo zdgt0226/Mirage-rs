@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(webui): 连接历史 (轻量内存版, T1 收尾)
+
+服务端 Clients 视图「连接历史」从占位变真表 —— 轻量内存版, 不加持久化依赖。
+
+- 最近关闭连接环 `CLOSED_RING_CAP` 100→300 (≈数十 KB, 够看"最近谁连过哪")。
+- 前端: 服务端 Clients「Connection history」卡渲染 `/api/connections` 的 `recent_closed`
+  (倒序 top-150, 目标·走向·协议·时长·↑↓), 3s 轮询。复用现有连接快照, 零新后端。
+- **明确边界**: 内存版, **重启清零**; 真跨重启历史需内嵌存储 (评估后暂不加 sqlite/sled 依赖,
+  违背轻量网关气质)。至此 T1 三块 (域名排行 · LAN 设备规则 · 连接历史) 齐, 限速/版本/屏蔽
+  留 T2 (占位卡标注)。
+
 ### feat(webui): LAN 设备列表 + 按设备一键路由 (T1-b)
 
 多模式 WebUI T1 客户端块: 客户端 Devices 视图从占位变真功能。

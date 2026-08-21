@@ -295,8 +295,8 @@
         <div class="grid cols-2" style="margin-bottom:16px">
           <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.domainRank">Top domains</div><span class="hint" data-i18n="srv.byTraffic">by traffic</span></div>
             <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.domain">Domain</th><th class="r" data-i18n="th.conns">Conns</th><th class="r">↑ / ↓</th></tr></thead><tbody id="domBody"><tr><td colspan="3" class="empty" data-i18n="empty.noTraffic">No traffic yet.</td></tr></tbody></table></div></div>
-          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.connHistory">Connection history</div><span class="soon" data-i18n="soon">planned</span></div>
-            <div class="card-pad"><div class="stub" data-i18n="srv.connHistoryDesc">Past connections beyond the live/recent window. Needs persistence (embedded store).</div></div></div>
+          <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.connHistory">Connection history</div><span class="hint" id="histN"></span></div>
+            <div style="overflow-x:auto;max-height:360px"><table class="tbl"><thead><tr><th data-i18n="th.target">Target</th><th data-i18n="th.route">Route</th><th data-i18n="th.proto">Proto</th><th class="r" data-i18n="th.age">Age</th><th class="r">↑ / ↓</th></tr></thead><tbody id="histBody"><tr><td colspan="5" class="empty" data-i18n="empty.nothing">Nothing yet.</td></tr></tbody></table></div></div>
         </div>
         <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="srv.clientMgmt">Connected clients</div><span class="soon" data-i18n="soon">planned</span></div>
           <div class="card-pad"><div class="stub" data-i18n="srv.clientMgmtDesc">Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.</div></div></div>
@@ -433,7 +433,7 @@
     document.getElementById('vSub').textContent=t('sub.'+view);
     if(view==='routing'){fetchProxies();fetchRules();}
     if(view==='connections')fetchConnections();
-    if(view==='clients')fetchDomains();
+    if(view==='clients'){fetchDomains();fetchConnHistory();}
     if(view==='devices')fetchDevices();
     if(view==='logs')fetchLogs();
     if(view==='overview')drawChart();
@@ -566,6 +566,14 @@
       :`<tr><td colspan="3" class="empty">${t('empty.noTraffic')}</td></tr>`;
   }
 
+  // ── connection history (server Admin, 轻量内存版 = recent-closed 环) ──
+  async function fetchConnHistory(){
+    let d;try{d=await(await fetch('/api/connections')).json();}catch(e){return;}
+    const rc=(d.recent_closed||[]).slice().reverse().slice(0,150);
+    document.getElementById('histN').textContent=(d.recent_closed||[]).length;
+    document.getElementById('histBody').innerHTML=rc.length?rc.map(c=>connRow(c,true)).join(''):`<tr><td colspan="5" class="empty">${t('empty.nothing')}</td></tr>`;
+  }
+
   // ── devices (client Admin: LAN 设备 + 按设备路由) ──
   function fmtIdle(ms){const s=Math.floor((Number(ms)||0)/1000);if(s<60)return s+'s';const m=Math.floor(s/60);if(m<60)return m+'m';return Math.floor(m/60)+'h';}
   async function fetchDevices(){
@@ -658,7 +666,7 @@
   }catch(e){alert(t('save.failed'));}};
 
   // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
-  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients')fetchDomains();if(view==='devices')fetchDevices();}
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients'){fetchDomains();fetchConnHistory();}if(view==='devices')fetchDevices();}
 
   // ── polling ──
   setInterval(fetchOverview,1000);
@@ -666,7 +674,7 @@
   setInterval(()=>{if(view==='overview'||view==='routing')fetchStats();},2000);
   setInterval(()=>{if(view==='logs')fetchLogs();},2000);
   setInterval(()=>{if(view==='routing')fetchProxies();},5000);
-  setInterval(()=>{if(view==='clients')fetchDomains();if(view==='devices')fetchDevices();},3000);
+  setInterval(()=>{if(view==='clients'){fetchDomains();fetchConnHistory();}if(view==='devices')fetchDevices();},3000);
   setInterval(()=>{if(view==='devices')fetchDevices();},4000);
   applyI18n();
   fetchOverview();fetchStats();
