@@ -7,6 +7,7 @@ pub mod connections;
 pub mod stats;
 pub mod domains;
 pub mod devices;
+pub mod clients;
 pub mod bpf_tunnels;
 pub mod history;
 pub mod logs;

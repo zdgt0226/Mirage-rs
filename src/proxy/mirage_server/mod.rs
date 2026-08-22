@@ -22,7 +22,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 // UNAUTH 限流 (整个 mirage_server 子模块共用). handshake.rs 在 auth 失败时
 // 增 count, IpSlotGuard 在 drop 时回收.
@@ -93,6 +93,12 @@ pub async fn start_server(
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                // 屏蔽名单 (WebUI 管理): 被屏蔽的客户端 IP 立即关连接, 省掉握手/BPF/brutal 全部开销。
+                if crate::blocklist::is_blocked(&peer_addr.ip()) {
+                    debug!("Mirage Server: 拒绝被屏蔽客户端 {}", peer_addr.ip());
+                    drop(stream);
+                    continue;
+                }
                 // 把客户端 IP 登记到 BPF mirage_target_ips 白名单, 让 sockops
                 // RTT_CB 收集这条连接的 RTT/cwnd/重传 (没登记的连接 BPF 直接
                 // return 0 不写 map). 用 try_lock 避免阻塞 accept 循环.

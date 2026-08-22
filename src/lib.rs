@@ -22,6 +22,8 @@ pub mod time_sync;
 pub mod config_watcher;
 pub mod ebpf;
 pub mod monitor;
+pub mod blocklist;
+pub mod client_info;
 pub mod net_monitor;
 pub mod net_util;
 pub mod node_uri;

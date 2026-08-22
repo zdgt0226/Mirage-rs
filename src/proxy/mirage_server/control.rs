@@ -135,6 +135,24 @@ pub(super) async fn dispatch_authenticated(
         first_chunk
     };
 
+    // 客户端版本识别 (两端 client_info 同开时): agility 之后这一帧可能是 CLIENT_INFO。读到即记
+    // 客户端 IP → 版本, 再读**真**首帧 (target)。默认关 → 不读, 老客户端不发, 零兼容影响。
+    let first_chunk = if crate::client_info::enabled() {
+        if let Some(ver) = crate::client_info::parse_frame(&first_chunk) {
+            if let Some(ip) = client_ip {
+                crate::client_info::record_version(ip.to_string(), ver);
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(60), reader.recv_data()).await {
+                Ok(Ok(d)) => d,
+                _ => return,
+            }
+        } else {
+            first_chunk
+        }
+    } else {
+        first_chunk
+    };
+
     info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
     if first_chunk.len() == 1 && first_chunk[0] == 0x00 {
