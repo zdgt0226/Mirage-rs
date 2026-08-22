@@ -244,6 +244,7 @@ pub async fn start_server(
         .route("/api/proxies", get(handlers::proxies::get_proxies))
         .route("/api/proxies/select", post(handlers::proxies::select_proxy))
         .route("/api/rules", get(handlers::rules::get_rules).post(handlers::rules::update_rules))
+        .route("/api/profiles", get(handlers::profiles::get_profiles).post(handlers::profiles::update_profiles))
         .route("/api/bpf/tunnels", get(handlers::bpf_tunnels::get_bpf_tunnels))
         .route("/", get(serve_root))
         .route_layer(middleware::from_fn_with_state(app_state.clone(), auth_mw))

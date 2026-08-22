@@ -39,7 +39,7 @@ pub struct UpdateRulesQuery {
     pub dry_run: bool,
 }
 
-fn de_flexible_bool<'de, D>(d: D) -> Result<bool, D::Error>
+pub(crate) fn de_flexible_bool<'de, D>(d: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

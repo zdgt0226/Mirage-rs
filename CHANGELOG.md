@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(routing): 用户策略 —— 不同用户匹配不同规则 (device profiles)
+
+给不同设备/用户绑不同的命名规则组。复用现有扁平 router (profile 是 config 糖, 编译展开)。
+
+- **config 模型**: `routing.profiles` (名 → 一组规则, 不写 source_ip_cidr) + `routing.device_profiles`
+  (设备网段 → profile + 可选别名)。`build_state` 展开: 每个设备分配把其 profile 的规则注入
+  `source_ip_cidr`(设备网段) **前插**到全局 rules 之前 (设备规则首命中优先; 未命中落全局 → default)。
+- **校验**: profile 规则的出站必须存在 · device_profiles 引用的 profile 必须存在 (否则静默不生效),
+  纳入 `semantic_issues` + dry_run 预检。3 个校验单测。
+- **API**: `GET/POST /api/profiles` (与 /api/rules 同款 dry_run 预检 + 结构/语义校验 + 原子写 + 热重载)。
+- **WebUI**: Routing 视图「用户策略」卡 —— 定义命名 profile (每个 = 一组规则, 复用规则字段编辑器,
+  无 source_ip_cidr) + 设备分配表 (名称·源网段·profile 下拉)。i18n 中/英。
+- 真机 smoke: 设备 127.0.0.1 分配到 "kids"(block example.com) → 该设备访 example.com 被 block +
+  规则命中计数确认; API GET/POST/dry_run/坏校验 全过。clippy 0 + 全测试绿。
+
 ## [v0.10.0] - Mirage Console 全新看板 (界面重构 + 中/英双语 + 服务端/客户端多模式管控) (2026-08-22)
 
 WebUI 一整轮重做: 从 NEON PULSE 换成简洁现代的 **Mirage Console** (侧栏切视图 + 暗/亮双主题 +

@@ -116,7 +116,20 @@ impl ConfigWatcher {
         };
         
         let mut rules = Vec::new();
-        for (i, r) in config.routing.rules.into_iter().enumerate() {
+        // 「不同用户匹配不同规则」: 展开 device_profiles —— 每个设备分配把其 profile 的规则注入
+        // source_ip_cidr(设备网段), 前插到全局规则之前 (设备规则首命中优先; 未命中落全局 → default)。
+        let mut all_rule_cfgs: Vec<crate::config::RuleConfig> = Vec::new();
+        for dp in &config.routing.device_profiles {
+            if let Some(profile_rules) = config.routing.profiles.get(&dp.profile) {
+                for pr in profile_rules {
+                    let mut rc = pr.clone();
+                    rc.source_ip_cidr = dp.source_ip_cidr.clone(); // 注入设备作用域
+                    all_rule_cfgs.push(rc);
+                }
+            }
+        }
+        all_rule_cfgs.extend(config.routing.rules); // 全局规则在设备规则之后
+        for (i, r) in all_rule_cfgs.into_iter().enumerate() {
             let mut ip_cidr = Vec::new();
             for cidr_str in r.ip_cidr {
                 if let Ok(net) = cidr_str.parse() {
