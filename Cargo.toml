@@ -12,7 +12,7 @@ path = "src/lib.rs"
 aho-corasick = "1.1.4"
 anyhow = "1.0.102"
 arc-swap = "1.9.1"
-axum = "0.8.9"
+axum = { version = "0.8.9", optional = true }
 aya = { version = "0.13.1", optional = true }
 ring = "0.17"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -33,7 +33,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["full", "net", "rt", "rt-multi-thread"] }
-tower-http = { version = "0.6.11", features = ["fs"] }
+tower-http = { version = "0.6.11", features = ["fs"], optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
@@ -46,8 +46,9 @@ boringtun = "0.7"
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
 
 [features]
-default = []
+default = ["gui"]
 ebpf = ["dep:aya"]
+gui = ["dep:axum", "dep:tower-http"]
 
 # Debug examples (require ebpf feature so they don't break default cargo check)
 [[example]]

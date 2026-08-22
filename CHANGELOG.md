@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### build(gui): Web 看板改 `gui` 编译特性 (headless 可剔除)
+
+WebUI 从"永远编进二进制"改成 `gui` cargo 特性 (默认开, 行为不变)。纯服务端/无面板部署可
+`--no-default-features` **编译期整个剔掉 WebUI**。
+
+- `axum` + `tower-http` 设 `optional`, 归入 `gui` 特性; `default = ["gui"]` (默认构建仍含看板)。
+- `src/api` 模块 + `lib.rs` 的 GUI 启动块按 `#[cfg(feature = "gui")]` 门控; headless 下若 config 配了
+  `gui.enabled` 启动 WARN 提示面板不可用。
+- **收益**: headless 无 axum/HTTP 监听面、无 config 写/日志读接口 → **更小攻击面 + 更小二进制**
+  (debug 实测 180→165 MB, 二进制 0 个 axum 符号)。看板对 core 是"core 写全局登记表 / WebUI 只读"
+  的松耦合, 故剔除只去掉读取侧, 不影响 core。
+- **不做进程隔离**: 评估后 WebUI 不拆独立进程 —— 它需高频读 in-process 活状态 (eBPF map/atomics/
+  config), 单机网关场景进程隔离收益边际、成本 (控制面协议+状态同步) 高; 编译期可分离 (本特性) 已够。
+- default + headless (`--no-default-features`) 双构建 + clippy 均绿; 349 lib 全测试绿 (default)。
+
 ### feat(routing): 用户策略 —— 不同用户匹配不同规则 (device profiles)
 
 给不同设备/用户绑不同的命名规则组。复用现有扁平 router (profile 是 config 糖, 编译展开)。

@@ -91,9 +91,15 @@ cosign verify ghcr.io/zdgt0226/mirage-rs:latest \
 ### 从源码构建
 
 ```bash
-cargo build --release                 # 纯用户态版 (默认, 无需 clang)
-cargo build --release --features ebpf # 含 eBPF 透明网关 (需 clang + llvm)
+cargo build --release                             # 纯用户态版 (默认, 含 Web 看板, 无需 clang)
+cargo build --release --features ebpf             # 含 eBPF 透明网关 (需 clang + llvm)
+cargo build --release --no-default-features        # headless: 剔掉整个 Web 看板 (无 axum/HTTP 面)
+# headless + ebpf: cargo build --release --no-default-features --features ebpf
 ```
+
+> **Web 看板走 `gui` 编译特性 (默认开)。** 纯服务端/无面板部署可 `--no-default-features` 把整个
+> WebUI 编译剔除 —— 无 HTTP 监听面、无 config 写/日志读接口, **更小二进制 + 更小攻击面**。
+> (剔掉后 config 若配了 `gui.enabled` 会启动 WARN 提示面板不可用。)
 
 > ⚠️ **`--features ebpf` 必须装 clang/llvm** (`apt install clang llvm libbpf-dev`) —— 要编译内核
 > BPF 程序。缺 clang 时构建会**明确报错提示装 clang**, 而非神秘失败 (eBPF 目标文件不入库, 不会

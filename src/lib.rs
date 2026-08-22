@@ -28,6 +28,7 @@ pub mod net_monitor;
 pub mod net_util;
 pub mod node_uri;
 pub mod lite;
+#[cfg(feature = "gui")]
 pub mod api;
 mod startup;
 
@@ -307,15 +308,28 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
 
 
     if gui_enabled {
-        let gui_state = watcher.state.clone();
-        let ebp = ebpf_engine.clone();
-        let xdp = xdp_engine.clone();
-        let listen = gui_listen.clone();
-        let cfg_path = config_path.to_string();
-        let token = gui_token.clone();
-        tokio::spawn(async move {
-            crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token, is_server).await;
-        });
+        // WebUI 走 `gui` 编译特性 (默认开)。headless/纯服务端可 `--no-default-features` 剔掉整个
+        // api 模块 (无 axum/tower-http、无 HTTP 面/config 写/日志读, 更小二进制 + 更小攻击面)。
+        #[cfg(feature = "gui")]
+        {
+            let gui_state = watcher.state.clone();
+            let ebp = ebpf_engine.clone();
+            let xdp = xdp_engine.clone();
+            let listen = gui_listen.clone();
+            let cfg_path = config_path.to_string();
+            let token = gui_token.clone();
+            tokio::spawn(async move {
+                crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token, is_server).await;
+            });
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            let _ = (&gui_listen, &gui_token); // 抑制未用告警 (headless 构建)
+            warn!(
+                "config 配了 gui.enabled 但本二进制未编译 WebUI (未启用 `gui` feature) —— 面板不可用。\
+                 要面板请用默认构建 (含 gui)。"
+            );
+        }
     }
 
     if inbounds.is_empty() {
