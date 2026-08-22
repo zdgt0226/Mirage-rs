@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [v0.10.0] - Mirage Console 全新看板 (界面重构 + 中/英双语 + 服务端/客户端多模式管控) (2026-08-22)
+
+WebUI 一整轮重做: 从 NEON PULSE 换成简洁现代的 **Mirage Console** (侧栏切视图 + 暗/亮双主题 +
+Canvas 流量图), 加**中/英双语**, 按运行模式 (server/client) 分视图 + 「特定入口」Admin 区。Admin
+落地: 客户端 **LAN 设备 + 按设备一键路由**; 服务端 **域名排行 · 连接历史 · 连接的客户端 (版本 +
+屏蔽)**。客户端版本识别走两端 opt-in `tuning.client_info` (加密信道内, 零指纹)。
+
 ### feat(webui): 客户端版本识别 (T2-b)
 
 服务端 WebUI「连接的客户端」显示各客户端版本 (便于知道谁该升级)。走项目既有的**两端 opt-in

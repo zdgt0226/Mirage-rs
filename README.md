@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.9.6-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.10.0-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -33,7 +33,7 @@
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
-* **内置 Web 看板**: Mirage Console —— 简洁现代的监控台（侧栏切视图 + 暗/亮双主题），实时流量图、域名连接表、per-出站分流量/规则命中统计、结构化规则编辑器（dry_run 预检 + 进程分流维度 + 拖排）、eBPF 健康、日志。
+* **内置 Web 看板**: Mirage Console —— 简洁现代的监控台（侧栏切视图 + 暗/亮双主题 + **中/英双语**），实时流量图、域名连接表、per-出站分流量/规则命中统计、结构化规则编辑器（dry_run 预检 + 进程分流维度 + 拖排）。**按运行模式分视图**：客户端管 LAN 设备（列表 + 按设备一键路由），服务端管连接的客户端（域名排行、连接历史、客户端版本、一键屏蔽）。
 * **供应链完整性**: Release 产物 (SHA256SUMS) 与多架构容器镜像 (`ghcr.io`) 均经 **cosign keyless** 签名 (Sigstore OIDC + Rekor 透明日志，零密钥可公开审计)。
 
 ---
