@@ -274,6 +274,12 @@
             <div style="display:flex;gap:8px"><button class="btn" onclick="addRule()" data-i18n="btn.addRule">+ Add rule</button><button class="btn primary" id="saveBtn" onclick="saveRules()" data-i18n="btn.save">Save &amp; apply</button></div></div>
           <div class="card-pad" id="visualRulesContainer"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
         </div>
+
+        <div class="card" style="margin-top:20px">
+          <div class="card-head"><div class="card-title"><span data-i18n="prof.title">User profiles</span><span class="hint" data-i18n="prof.hint">不同用户匹配不同规则</span></div>
+            <div style="display:flex;gap:8px"><button class="btn" onclick="addProfile()" data-i18n="prof.addProfile">+ Profile</button><button class="btn primary" id="profSaveBtn" onclick="saveProfiles()" data-i18n="btn.save">Save &amp; apply</button></div></div>
+          <div class="card-pad" id="profilesContainer2"><div class="empty" data-i18n="empty.loading">Loading…</div></div>
+        </div>
       </section>
 
       <!-- LOGS -->
@@ -341,7 +347,7 @@
       'empty.noTun':'No tunnels. Needs eBPF sockops + live traffic.','empty.noGroups':'No Selector / UrlTest groups.','empty.noRules':'No rules. Add one above.',
       'rule.default':'default','fld.add':'Add',
       'save.invalid':'Validation failed — not saved:','save.warnHead':'Pre-check (dry_run) warnings — non-blocking:','save.warnTail':'Save and apply anyway?','save.failed':'Failed to save rules','save.portErr':'Port must be an integer 1–65535',
-      'nav.admin':'Admin','nav.devices':'Devices','nav.clients':'Clients',
+      'nav.admin':'Admin','prof.title':'User profiles','prof.hint':'different users → different rules','prof.addProfile':'+ Profile','prof.noProfiles':'No profiles. Add one.','prof.assignments':'Device assignments','prof.devName':'Name','prof.devCidr':'Source IP / CIDR','prof.devProfile':'Profile','prof.noAssign':'No devices assigned.','nav.devices':'Devices','nav.clients':'Clients',
       'sub.devices':'LAN devices & per-device policy','sub.clients':'Connected clients & server controls',
       'brand.sub.server':'proxy server','soon':'planned',
       'dev.lanDevices':'LAN devices','dev.byActivity':'by recent activity','th.device':'Device','th.idle':'Idle','dev.route':'Route','dev.none':'No devices seen yet.','dev.routed':'Routed via ','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
@@ -374,7 +380,7 @@
       'empty.noTun':'无隧道，需 eBPF sockops + 实时流量。','empty.noGroups':'无 Selector / UrlTest 组。','empty.noRules':'无规则，点上方添加。',
       'rule.default':'默认','fld.add':'添加',
       'save.invalid':'校验未通过，未保存：','save.warnHead':'保存前预检 (dry_run) 发现告警（不阻断）：','save.warnTail':'仍要保存并应用？','save.failed':'保存失败','save.portErr':'端口必须是 1–65535 的整数',
-      'nav.admin':'管理','nav.devices':'设备','nav.clients':'客户端',
+      'nav.admin':'管理','prof.title':'用户策略','prof.hint':'不同用户匹配不同规则','prof.addProfile':'+ 策略','prof.noProfiles':'暂无策略，点上方添加。','prof.assignments':'设备分配','prof.devName':'名称','prof.devCidr':'源 IP / 网段','prof.devProfile':'策略','prof.noAssign':'暂无设备分配。','nav.devices':'设备','nav.clients':'客户端',
       'sub.devices':'局域网设备与按设备策略','sub.clients':'连接的客户端与服务端管控',
       'brand.sub.server':'代理服务端','soon':'计划中',
       'dev.lanDevices':'局域网设备','dev.byActivity':'按最近活跃','th.device':'设备','th.idle':'空闲','dev.route':'路由','dev.none':'暂无设备。','dev.routed':'已路由到 ','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
@@ -427,7 +433,7 @@
     document.getElementById(view).classList.add('active');
     document.getElementById('vTitle').textContent=t('nav.'+view);
     document.getElementById('vSub').textContent=t('sub.'+view);
-    if(view==='routing'){fetchProxies();fetchRules();}
+    if(view==='routing'){fetchProxies();fetchRules();fetchProfiles();}
     if(view==='connections')fetchConnections();
     if(view==='clients'){fetchDomains();fetchConnHistory();fetchClients();}
     if(view==='devices')fetchDevices();
@@ -682,7 +688,59 @@
   }catch(e){alert(t('save.failed'));}};
 
   // 语言切换后重渲染当前视图的动态内容 (轮询之外立即刷新)
-  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients'){fetchDomains();fetchConnHistory();fetchClients();}if(view==='devices')fetchDevices();}
+  function refreshAll(){fetchOverview();if(view==='connections'){fetchConnections();fetchTunnels();}if(view==='overview'||view==='routing')fetchStats();if(view==='routing'){fetchProxies();renderRules();renderProfiles();}if(view==='logs'){lastLog=-1;fetchLogs();}if(view==='clients'){fetchDomains();fetchConnHistory();fetchClients();}if(view==='devices')fetchDevices();}
+
+  // ── user profiles (不同用户匹配不同规则) ──
+  let profiles={}, deviceProfiles=[], profOutbounds=[];
+  // profile 规则字段 = 通用维度 (无 source_ip_cidr, 由设备分配注入)。
+  const PRF=RF.filter(([k])=>k!=='source_ip_cidr');
+  async function fetchProfiles(){
+    try{const d=await(await fetch('/api/profiles')).json();if(d.status==='success'){profiles=d.profiles||{};deviceProfiles=d.device_profiles||[];profOutbounds=d.outbounds||[];renderProfiles();}}catch(e){}
+  }
+  window.addProfile=()=>{let n='profile'+(Object.keys(profiles).length+1);while(profiles[n])n+='_';profiles[n]=[{outbound:'direct'}];renderProfiles();};
+  window.removeProfile=(name)=>{delete profiles[name];deviceProfiles=deviceProfiles.filter(d=>d.profile!==name);renderProfiles();};
+  window.renameProfile=(oldn,el)=>{const nn=el.value.trim();if(!nn||nn===oldn)return;if(profiles[nn]){alert('名称已存在');el.value=oldn;return;}profiles[nn]=profiles[oldn];delete profiles[oldn];deviceProfiles.forEach(d=>{if(d.profile===oldn)d.profile=nn;});renderProfiles();};
+  window.addProfileRule=(name)=>{profiles[name].push({outbound:'direct'});renderProfiles();};
+  window.removeProfileRule=(name,i)=>{profiles[name].splice(i,1);renderProfiles();};
+  window.setProfRuleOb=(name,i,v)=>{profiles[name][i].outbound=v;};
+  window.addProfItem=(name,i,key)=>{const inp=document.getElementById(`pin_${name}_${i}_${key}`);let v=inp.value.trim();if(!v)return;if(key==='port'){const n=parseInt(v,10);if(!Number.isInteger(n)||n<1||n>65535){alert(t('save.portErr'));return;}v=n;}if(!profiles[name][i][key])profiles[name][i][key]=[];profiles[name][i][key].push(v);renderProfiles();};
+  window.rmProfItem=(name,i,key,ii)=>{profiles[name][i][key].splice(ii,1);if(!profiles[name][i][key].length)delete profiles[name][i][key];renderProfiles();};
+  window.addDeviceAssign=()=>{deviceProfiles.push({source_ip_cidr:[''],profile:Object.keys(profiles)[0]||'',name:''});renderProfiles();};
+  window.rmDeviceAssign=(i)=>{deviceProfiles.splice(i,1);renderProfiles();};
+  window.setDevCidr=(i,v)=>{deviceProfiles[i].source_ip_cidr=v.split(',').map(s=>s.trim()).filter(Boolean);};
+  window.setDevProfile=(i,v)=>{deviceProfiles[i].profile=v;};
+  window.setDevName=(i,v)=>{deviceProfiles[i].name=v;};
+  function renderProfiles(){
+    const c=document.getElementById('profilesContainer2');
+    const obOpts=profOutbounds.map(o=>`<option value="${esc(o)}"></option>`).join('');
+    let html=`<datalist id="profObOpts">${obOpts}</datalist>`;
+    // profiles
+    const names=Object.keys(profiles);
+    html+=names.length?names.map(name=>{
+      const rules=profiles[name]||[];
+      const field=(i,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span onclick="rmProfItem('${esc(name)}',${i},'${key}',${vi})">×</span></div>`).join('');
+        return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="pin_${esc(name)}_${i}_${key}" placeholder="${t('fld.add')}" onkeypress="if(event.key==='Enter')addProfItem('${esc(name)}',${i},'${key}')"><button class="btn-add" onclick="addProfItem('${esc(name)}',${i},'${key}')">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
+      const rulesHtml=rules.map((rule,i)=>`<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(i+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<button class="btn-remove" style="margin-left:auto" onclick="removeProfileRule('${esc(name)}',${i})">${t('btn.delete')}</button></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="profObOpts" value="${esc(rule.outbound||'')}" onchange="setProfRuleOb('${esc(name)}',${i},this.value)"></div>${PRF.map(([k,l])=>field(i,rule,k,l)).join('')}</div></div>`).join('');
+      return `<div class="rule-card" style="border-color:var(--accent);"><div class="rule-top"><span class="rule-n" style="color:var(--accent)">▣</span><input value="${esc(name)}" onchange="renameProfile('${esc(name)}',this)" style="max-width:180px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:inherit;font-weight:600"><div style="margin-left:auto;display:flex;gap:6px"><button class="btn-add" onclick="addProfileRule('${esc(name)}')">+ rule</button><button class="btn-remove" onclick="removeProfile('${esc(name)}')">${t('btn.delete')}</button></div></div>${rulesHtml||`<div class="dim" style="font-size:12px">no rules</div>`}</div>`;
+    }).join(''):`<div class="empty">${t('prof.noProfiles')}</div>`;
+    // device assignments
+    const psel=(cur)=>`<option value="">—</option>`+names.map(n=>`<option value="${esc(n)}"${n===cur?' selected':''}>${esc(n)}</option>`).join('');
+    html+=`<div class="sub-head" style="margin-top:20px">${t('prof.assignments')} <button class="btn-add" style="margin-left:8px" onclick="addDeviceAssign()">+</button></div>`;
+    html+=deviceProfiles.length?`<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>${t('prof.devName')}</th><th>${t('prof.devCidr')}</th><th>${t('prof.devProfile')}</th><th class="r"></th></tr></thead><tbody>`+
+      deviceProfiles.map((d,i)=>`<tr><td><input value="${esc(d.name||'')}" placeholder="—" oninput="setDevName(${i},this.value)" class="devsel" style="width:120px"></td><td><input value="${esc((d.source_ip_cidr||[]).join(', '))}" placeholder="192.168.1.20/32" oninput="setDevCidr(${i},this.value)" class="devsel mono" style="width:180px"></td><td><select class="devsel" onchange="setDevProfile(${i},this.value)">${psel(d.profile)}</select></td><td class="r"><button class="btn-remove" onclick="rmDeviceAssign(${i})">${t('btn.delete')}</button></td></tr>`).join('')+
+      `</tbody></table></div>`:`<div class="empty">${t('prof.noAssign')}</div>`;
+    c.innerHTML=html;
+  }
+  async function postProfiles(dry){const r=await fetch('/api/profiles'+(dry?'?dry_run=1':''),{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({profiles,device_profiles:deviceProfiles})});return r.json();}
+  window.saveProfiles=async()=>{try{
+    const dry=await postProfiles(true);
+    if(dry.status!=='success'){alert(t('save.invalid')+'\n'+(dry.message||''));return;}
+    const issues=dry.issues||[];
+    if(issues.length&&!confirm(t('save.warnHead')+'\n\n• '+issues.join('\n• ')+'\n\n'+t('save.warnTail')))return;
+    const d=await postProfiles(false);
+    if(d.status==='success'){const b=document.getElementById('profSaveBtn'),o=b.textContent;b.textContent=t('saved');setTimeout(()=>b.textContent=o,2000);fetchProfiles();}
+    else alert(d.message||t('save.failed'));
+  }catch(e){alert(t('save.failed'));}};
 
   // ── polling ──
   setInterval(fetchOverview,1000);

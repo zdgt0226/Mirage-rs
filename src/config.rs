@@ -402,6 +402,27 @@ pub struct RoutingConfig {
     #[serde(default)]
     pub geo_alias: std::collections::HashMap<String, String>,
     pub rules: Vec<RuleConfig>,
+    /// 命名策略 (「不同用户匹配不同规则」): profile 名 → 一组规则 (各规则不写 source_ip_cidr,
+    /// 由分配到该 profile 的设备网段注入)。见 device_profiles。build 时展开成扁平 source_ip_cidr
+    /// 规则前插 (设备规则首命中优先于全局 rules)。
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, Vec<RuleConfig>>,
+    /// 设备 (源网段) → profile 分配。命中的连接先走该 profile 的规则, 未命中再落全局 rules → default。
+    #[serde(default)]
+    pub device_profiles: Vec<DeviceProfile>,
+}
+
+/// 把一组设备/源网段绑定到某命名 profile。
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct DeviceProfile {
+    /// 该 profile 作用的源网段 (设备)。支持单值或数组; 裸 IP 自动补 /32 (v4) / /128 (v6)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub source_ip_cidr: Vec<String>,
+    /// 引用 routing.profiles 里的 profile 名。
+    pub profile: String,
+    /// 可选设备别名 (WebUI 展示; 不影响路由)。
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// 规则内**多类条件**的组合方式。
@@ -418,7 +439,7 @@ pub enum RuleMode {
     Or,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, Clone)]
 pub struct RuleConfig {
     #[serde(default)]
     pub mode: Option<RuleMode>,
@@ -979,6 +1000,27 @@ impl Config {
                         "routing.rules[{i}].inbound = `{t}` 不存在于 inbounds (该规则永远不会命中)"
                     ));
                 }
+            }
+        }
+
+        // 命名 profile ("不同用户匹配不同规则"): 每条 profile 规则的出站必须存在。
+        for (pname, prules) in &self.routing.profiles {
+            for (i, rule) in prules.iter().enumerate() {
+                if !known(&rule.outbound) {
+                    issues.push(format!(
+                        "routing.profiles[{pname}][{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
+                        rule.outbound
+                    ));
+                }
+            }
+        }
+        // 设备分配引用的 profile 必须存在, 否则该设备的分配形同虚设 (静默不生效)。
+        for (i, dp) in self.routing.device_profiles.iter().enumerate() {
+            if !self.routing.profiles.contains_key(&dp.profile) {
+                issues.push(format!(
+                    "routing.device_profiles[{i}].profile = `{}` 不存在于 routing.profiles (该设备分配不生效)",
+                    dp.profile
+                ));
             }
         }
 
@@ -1825,6 +1867,54 @@ mod inbound_rule_tests {
     fn known_inbound_tag_passes_single_or_array() {
         assert!(cfg(r#""in-a""#).semantic_issues().is_empty(), "单值应通过");
         assert!(cfg(r#"["in-a"]"#).semantic_issues().is_empty(), "数组应通过");
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    fn cfg(profiles: &str, device_profiles: &str) -> Config {
+        let s = format!(r#"{{
+          "inbounds": [{{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "port": 1080 }}],
+          "outbounds": [{{ "type": "direct", "tag": "direct" }}, {{ "type": "block", "tag": "block" }}],
+          "routing": {{ "default_outbound": "direct", "rules": [],
+            "profiles": {profiles}, "device_profiles": {device_profiles} }}
+        }}"#);
+        serde_json::from_str(&s).expect("配置应能解析")
+    }
+
+    /// 合法 profile + 设备分配: 无 issue。
+    #[test]
+    fn valid_profile_passes() {
+        let c = cfg(
+            r#"{ "kids": [{ "domain_suffix": "ads.com", "outbound": "block" }] }"#,
+            r#"[{ "source_ip_cidr": "192.168.1.20/32", "profile": "kids", "name": "iPad" }]"#,
+        );
+        assert!(c.semantic_issues().is_empty(), "合法 profile 不该报错: {:?}", c.semantic_issues());
+    }
+
+    /// 设备分配引用不存在的 profile → 拦下。
+    #[test]
+    fn unknown_profile_ref_is_caught() {
+        let c = cfg(r#"{}"#, r#"[{ "source_ip_cidr": "10.0.0.5/32", "profile": "ghost" }]"#);
+        assert!(
+            c.semantic_issues().iter().any(|i| i.contains("ghost") && i.contains("profiles")),
+            "未知 profile 引用未被拦: {:?}", c.semantic_issues()
+        );
+    }
+
+    /// profile 规则引用不存在的出站 → 拦下。
+    #[test]
+    fn profile_rule_unknown_outbound_is_caught() {
+        let c = cfg(
+            r#"{ "kids": [{ "domain_suffix": "x.com", "outbound": "nope" }] }"#,
+            r#"[]"#,
+        );
+        assert!(
+            c.semantic_issues().iter().any(|i| i.contains("nope") && i.contains("profiles")),
+            "profile 规则未知出站未被拦: {:?}", c.semantic_issues()
+        );
     }
 }
 
