@@ -429,7 +429,7 @@ impl OutboundManager {
             underlying,
             pfs: *pfs,
             transport: *transport,
-            quic_window_mb: quic_window_mb.unwrap_or(4),
+            quic_window_mb: quic_window_mb.unwrap_or(2),
             quic_erasure_cc: quic_erasure_cc.unwrap_or(true),
             // SNI 默认 = camouflage_host (良性域名, 与 TCP fake-TLS 一致)。
             quic_sni: quic_sni.clone().unwrap_or_else(|| camouflage_host.clone()),
