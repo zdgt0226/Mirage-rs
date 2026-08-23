@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v0.10.1] - 用户策略 (不同用户匹配不同规则) + gui 编译特性 (2026-08-23)
+
+- **用户策略 (device profiles)**: `routing.profiles` 命名策略 + `routing.device_profiles` 设备→策略,
+  build 时展开成带 `source_ip_cidr` 的规则前插 (设备规则首命中优先)。WebUI Routing「用户策略」卡
+  可视化管理 + `GET/POST /api/profiles`。
+- **gui 编译特性**: Web 看板改 `gui` cargo 特性 (默认开); headless 服务端 `--no-default-features`
+  编译期剔掉整个 WebUI (更小攻击面 + 体积)。不拆独立进程 (评估后)。
+
 ### build(gui): Web 看板改 `gui` 编译特性 (headless 可剔除)
 
 WebUI 从"永远编进二进制"改成 `gui` cargo 特性 (默认开, 行为不变)。纯服务端/无面板部署可
