@@ -24,6 +24,9 @@ pub struct PoolConfig {
     pub pfs: bool,
     /// 底层传输 (tcp 默认 / quic 实验)。quic 时忽略 underlying/brutal (QUIC 自带 UDP 传输 + CC)。
     pub transport: crate::config::Transport,
+    /// QUIC 流控窗口 (MB, 默认 16); erasure CC 开关 (默认 true)。仅 transport=quic 生效。
+    pub quic_window_mb: u64,
+    pub quic_erasure_cc: bool,
 }
 
 /**
@@ -733,7 +736,7 @@ impl WarmPool {
     ) -> Result<(CryptoReader<TunnelRead>, CryptoWriter<TunnelWrite>)> {
         let (mut write_half, mut read_half) = timeout(
             Duration::from_secs(15),
-            crate::proxy::quic::dial(&cfg.server_host, cfg.server_port),
+            crate::proxy::quic::dial(&cfg.server_host, cfg.server_port, cfg.quic_window_mb, cfg.quic_erasure_cc),
         )
         .await
         .map_err(|_| {

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC 窗口/CC 进 config (免手动 env)
+
+真机调参 (见 docs §5.3) 确定的最优旋钮写进配置, 不再依赖 `MIRAGE_QUIC_*` 环境变量:
+
+- `mirage`/`mirage_server` 新增 `quic_window_mb` (默认 16, 长肥独占场景调 64 榨单流吞吐; 过大
+  128+ 在并发+丢包下过冲反崩) + `quic_erasure_cc` (默认 true)。仅 `transport=quic` 生效, 两端各配。
+- 环境变量 `MIRAGE_QUIC_WND` / `MIRAGE_QUIC_CC=off` 仍优先覆盖 (供真机 A/B 快速调参)。
+
 ### fix(transport): QUIC 流控窗口调大 (长肥管道单流不再被卡死)
 
 海外 US↔JP 真机 (111ms RTT / 0% 丢包 / 干净高带宽) 暴露: quinn 默认流控窗口 (~1MB 级) 在长肥

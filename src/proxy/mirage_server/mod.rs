@@ -144,6 +144,7 @@ pub async fn start_server(
 /// 握手/鉴权/中继逻辑 (经 handle_connection_quic → run_handshake 泛型)。brutal/eBPF sockops RTT
 /// 是 TCP 内核特性, QUIC 不适用故不接。⚠️ 指纹不隐蔽, 见 docs/quic-transport-design.md。
 #[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_quic_server(
     listen_addr: &str,
     password: &str,
@@ -151,6 +152,8 @@ pub async fn start_quic_server(
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
+    quic_window_mb: u64,
+    quic_erasure_cc: bool,
 ) {
     let addr: std::net::SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
@@ -159,7 +162,7 @@ pub async fn start_quic_server(
             return;
         }
     };
-    let endpoint = match crate::proxy::quic::server_endpoint(addr) {
+    let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_erasure_cc) {
         Ok(ep) => ep,
         Err(e) => {
             error!("Mirage QUIC Server: 绑定失败 {}: {:#}", listen_addr, e);

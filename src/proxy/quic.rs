@@ -17,29 +17,31 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// P0 占位 ALPN。P1 换成目标浏览器的真 ALPN (h3) 以配合指纹仿真。
 const ALPN: &[u8] = b"mirage-p0";
 
-/// QUIC TransportConfig: 默认挂 erasure-aware CC (P3, 见 quic_cc.rs)。
-/// `MIRAGE_QUIC_CC=off` (或 bbr/default) 回退 quinn 原生 CC —— 供真机 A/B 对照。
-fn transport_config() -> Arc<quinn::TransportConfig> {
+/// QUIC TransportConfig。`window_mb`/`erasure` 来自 config (见 tuning), 环境变量 `MIRAGE_QUIC_WND`
+/// (MB) / `MIRAGE_QUIC_CC=off` 优先覆盖 (供真机 A/B 调参)。
+fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
 
     // 流控窗口: quinn 默认偏小 (~1MB 级), 高 BDP 长肥路径上单流被窗口卡死 (实测 JP↔US 111ms 仅
-    // ~9MB/s, 而 TCP 自动调窗到 48MB/s)。放大到能容 ~16MB 单流在途 (16MB/0.111s≈144MB/s 上限),
-    // 连接级更大 (多流)。可 MIRAGE_QUIC_WND (MB) 覆盖调优。
-    let wnd_mb: u64 = std::env::var("MIRAGE_QUIC_WND").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-    let stream_wnd = wnd_mb * 1024 * 1024;
+    // ~9MB/s, 而 TCP 自动调窗到 48MB/s)。默认 16MB (安全, 并发不崩); 长肥独占场景调到 64 榨单流,
+    // 但过大 (128+) 在并发+丢包下过冲反崩 (见 docs/quic-transport-design.md §5.3)。
+    let wnd_mb: u64 = std::env::var("MIRAGE_QUIC_WND").ok().and_then(|v| v.parse().ok()).unwrap_or(window_mb);
+    let stream_wnd = wnd_mb.max(1) * 1024 * 1024;
     let conn_wnd = stream_wnd.saturating_mul(4);
     tc.stream_receive_window(quinn::VarInt::from_u64(stream_wnd).unwrap_or(quinn::VarInt::MAX));
     tc.receive_window(quinn::VarInt::from_u64(conn_wnd).unwrap_or(quinn::VarInt::MAX));
     tc.send_window(conn_wnd);
 
-    let off = std::env::var("MIRAGE_QUIC_CC")
-        .map(|v| matches!(v.as_str(), "off" | "bbr" | "default" | "stock"))
-        .unwrap_or(false);
-    if off {
-        tracing::info!("QUIC: CC = quinn 原生 (erasure 已由 MIRAGE_QUIC_CC 关闭)");
-    } else {
+    let erasure = match std::env::var("MIRAGE_QUIC_CC").ok().as_deref() {
+        Some("off" | "bbr" | "default" | "stock") => false,
+        Some("erasure" | "on") => true,
+        _ => erasure,
+    };
+    if erasure {
         tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::ErasureConfig::default()));
-        tracing::info!("QUIC: erasure-aware CC 启用 (MIRAGE_QUIC_CC=off 可回退原生)");
+        tracing::info!("QUIC: erasure-aware CC 启用 (窗口 {}MB)", wnd_mb);
+    } else {
+        tracing::info!("QUIC: CC = quinn 原生 (erasure 关, 窗口 {}MB)", wnd_mb);
     }
     Arc::new(tc)
 }
@@ -49,12 +51,12 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
 /// 建一个 QUIC 客户端 endpoint (绑临时本地 UDP 口) + 拨号 server:port, 开一条双向流。
 /// 返回 (send, recv 带 endpoint)。read 半程 `OwnedRecv` 持有 endpoint, 让它活到隧道结束
 /// (endpoint 一旦 drop 会关闭其上所有连接; 挂在 read 半程上生命周期与隧道对齐, 不泄漏)。
-pub async fn dial(host: &str, port: u16) -> Result<(quinn::SendStream, OwnedRecv)> {
+pub async fn dial(host: &str, port: u16, window_mb: u64, erasure: bool) -> Result<(quinn::SendStream, OwnedRecv)> {
     let addr = resolve(host, port).await?;
     // 绑定与目标同族的通配地址 (v6 目标绑 [::], v4 目标绑 0.0.0.0)。
     let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
     let mut endpoint = quinn::Endpoint::client(bind).context("QUIC: 建客户端 endpoint 失败")?;
-    endpoint.set_default_client_config(client_config()?);
+    endpoint.set_default_client_config(client_config(window_mb, erasure)?);
 
     // server_name 用配置的 host (SNI)。P0 证书不校验, 值不影响握手成败。
     let conn = endpoint
@@ -78,7 +80,7 @@ impl AsyncRead for OwnedRecv {
     }
 }
 
-fn client_config() -> Result<quinn::ClientConfig> {
+fn client_config(window_mb: u64, erasure: bool) -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
     )
@@ -91,14 +93,14 @@ fn client_config() -> Result<quinn::ClientConfig> {
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .context("QUIC: rustls→quinn 客户端配置转换失败")?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(transport_config());
+    cfg.transport_config(transport_config(window_mb, erasure));
     Ok(cfg)
 }
 
 // ───────────────────────── 服务端 ─────────────────────────
 
 /// 建一个 QUIC 服务端 endpoint, 监听 UDP `listen_addr`。证书自签 (P0, 认证在内层 Mirage)。
-pub fn server_endpoint(listen_addr: SocketAddr) -> Result<quinn::Endpoint> {
+pub fn server_endpoint(listen_addr: SocketAddr, window_mb: u64, erasure: bool) -> Result<quinn::Endpoint> {
     let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .context("QUIC: 生成自签证书失败")?;
@@ -118,7 +120,7 @@ pub fn server_endpoint(listen_addr: SocketAddr) -> Result<quinn::Endpoint> {
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("QUIC: rustls→quinn 服务端配置转换失败")?;
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    server_cfg.transport_config(transport_config());
+    server_cfg.transport_config(transport_config(window_mb, erasure));
     quinn::Endpoint::server(server_cfg, listen_addr).context("QUIC: 绑定服务端 endpoint 失败")
 }
 
