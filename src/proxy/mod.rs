@@ -1,4 +1,6 @@
 pub mod brutal;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod pool;
 pub mod tunnel;
 pub mod mirage_stream;

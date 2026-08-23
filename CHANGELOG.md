@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC 传输 P0 (实验, `--features quic`, 默认关)
+
+给 Mirage 隧道加**可选 QUIC 底层传输**, 运行时开关 `transport: "quic"` (两端同设), 与默认
+TCP fake-TLS 主链路**并存不替代**。对应 roadmap「UDP mux → QUIC Datagram」epic 的 P0 骨架
+(吸收 queqiao, 见 `docs/quic-transport-design.md`)。
+
+- **Model Y (P0 抄近路)**: QUIC 只做底层字节管道, 上面照跑 Mirage 现有 fake-TLS 握手 + AEAD +
+  TCP/UDP relay。一条 QUIC 双向流 = 一条隧道, 语义等价一条 TCP。**协议逻辑零改动**。
+- 新模块 `src/proxy/quic.rs`: 客户端 `dial` (quinn Endpoint + open_bi, read 半程锚定 endpoint
+  生命周期) · 服务端 `server_endpoint` (rcgen 自签, P0 客户端不校验证书——认证在内层 Mirage) ·
+  `QuicBiStream` 适配器 (合 send/recv 成 AsyncRead+AsyncWrite, 供握手阶段)。
+- **服务端数据面泛型化**: `handle_connection` 抽出传输无关的 `run_handshake<S>` (握手/鉴权/模板
+  回放/tail 泛型), TCP 入口走 `into_split`→`TunnelRead::Tcp` (静态分发+无锁, **TCP 热路径零回归**),
+  QUIC 入口走 `QuicBiStream::into_halves`→`Boxed`。dispatch + relay 签名由 `OwnedReadHalf/WriteHalf`
+  改 `TunnelRead/TunnelWrite` enum (复用客户端已有抽象); camouflage auth-fail 路径泛型化。
+- **cargo 特性 `quic`** (默认关): quinn 0.11 + rustls 0.23 (复用树内版本, `rustls-ring` 保持纯 Rust
+  交叉编译) + rcgen 自签。release 二进制**暂不含** (P0 实验, 隐蔽性未做, 见下)。
+- ⚠️ **P0 不隐蔽**: quinn 默认 QUIC 指纹裸奔, 证书自签不校验。**勿用于敌对网络。** 指纹仿真
+  (path A: patch rustls 对齐浏览器 QUIC) 是 P1 的活。走 UDP 的理由是烂链路性能, 非隐蔽。
+- 端到端测试 `tests/test_quic_e2e.rs` (feature-gated): SOCKS5 → mirage-over-QUIC → direct → echo
+  真实往返 (本地 camouflage 免外网)。default + quic 双构建 clippy 绿, 354 lib 全测试绿。
+
 ## [v0.10.1] - 用户策略 (不同用户匹配不同规则) + gui 编译特性 (2026-08-23)
 
 - **用户策略 (device profiles)**: `routing.profiles` 命名策略 + `routing.device_profiles` 设备→策略,

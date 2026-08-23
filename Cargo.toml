@@ -44,11 +44,18 @@ base64 = "0.22.1"
 subtle = "2.6"
 boringtun = "0.7"
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
+# QUIC 传输 (P0 实验, 默认关; 见 docs/quic-transport-design.md)。rustls 0.23 已在树 (reqwest),
+# 无版本冲突。rustls-ring 复用已有 ring, 保持纯 Rust 交叉编译。
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", optional = true }
 
 [features]
 default = ["gui"]
 ebpf = ["dep:aya"]
 gui = ["dep:axum", "dep:tower-http"]
+# QUIC 传输 (实验, 默认关)。开启需 --features quic; release 二进制暂不含, 见 quic-transport-design.md P0。
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 
 # Debug examples (require ebpf feature so they don't break default cargo check)
 [[example]]

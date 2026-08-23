@@ -538,7 +538,11 @@ mod tests {
         // 服务端: OwnedReadHalf/WriteHalf crypto (非 initiator) → handle_udp_mux_relay
         let (sr, sw) = {
             let (r, w) = srv.into_split();
-            crate::crypto::aead::create_crypto_pair(r, w, "pw", b"salt1234", false)
+            crate::crypto::aead::create_crypto_pair(
+                crate::proxy::tunnel::TunnelRead::Tcp(r),
+                crate::proxy::tunnel::TunnelWrite::Tcp(w),
+                "pw", b"salt1234", false,
+            )
         };
         let server = tokio::spawn(async move {
             crate::proxy::mirage_server::udp_relay::handle_udp_mux_relay(sr, sw, None, None).await;

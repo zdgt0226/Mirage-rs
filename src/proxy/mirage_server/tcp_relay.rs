@@ -21,8 +21,8 @@ use tracing::{debug, warn};
 pub(super) async fn handle_tcp_relay(
     target: String,
     initial_payload: Option<Vec<u8>>,
-    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    mut writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
 ) {
@@ -166,8 +166,8 @@ pub(super) async fn handle_tcp_relay(
 async fn relay_via_shadowsocks(
     target: String,
     initial_payload: Option<Vec<u8>>,
-    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    mut writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     ss: &crate::proxy::shadowsocks::SsConfig,
 ) {
     debug!("Mirage Server: 经 SS 上游 {} 转发到 {}", ss.addr(), target);
@@ -244,8 +244,8 @@ async fn relay_via_shadowsocks(
 async fn relay_via_wireguard(
     target: String,
     initial_payload: Option<Vec<u8>>,
-    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    mut writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    mut writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     wg: &crate::proxy::upstream::WgUpstream,
 ) {
     debug!("Mirage Server: 经 WireGuard 上游 {} 转发到 {}", wg.cfg.endpoint, target);

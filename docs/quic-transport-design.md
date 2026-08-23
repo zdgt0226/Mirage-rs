@@ -103,14 +103,29 @@ Mirage 现有反识别是 **TCP-fake-TLS**。三条路，需真机 + 威胁模�
    **自定义数据报传输**复用 Mirage fake-TLS 握手派生的密钥。← **可能是最契合 Mirage 的路**：
    要的是 queqiao 的**算法**（erasure CC/FEC/共享模型），不是 QUIC 协议本身。
 
-> **倾向**：先不追 QUIC 协议，而是把 **erasure-aware CC + FEC + 共享瓶颈模型移植到 Mirage 自有的
-> UDP 数据报 mux 上**（保留 Mirage fake-TLS 反识别、避免 QUIC 指纹新面）。"QUIC" 是路线图的名字，
-> 真正的营养是**烂链路传输算法**，与是否用 QUIC 线协议正交。待真机与威胁模型复核后定。
+### 3.2 实现路径决定 (2026-08-23, 用户拍板)
+
+先前草案倾向"自研数据报、避开 QUIC 指纹面"。复核抗检测轴时**修正**: 那个理由漏了**掩护人群**维度——
+GFW 抓两类流量靠不同机制:
+
+- **标准 QUIC**: 有正指纹 (线格式 + Initial 明文 ClientHello/SNI 可读 + JA4-QUIC), 一眼归类; 但躲进
+  全网浏览器 QUIC 的**巨大人群**, 封你连带误伤 Chrome。
+- **自研随机 UDP**: 无正指纹, 但"高熵无结构无 SNI 的 UDP"正是全加密流量检测盯的信号, 且**零掩护人群**。
+
+→ 结论: **做对了的标准 QUIC (浏览器仿真 ClientHello + 真 SNI fronting) 比自研随机 UDP 更难封**。
+故走**真 QUIC (quinn/rustls, 纯 Rust, 保 16 目标交叉编译) + 后续指纹仿真 (path A: patch rustls)**。
+反识别层的定位随之调整: **QUIC 路径的抗检测靠"仿真真浏览器 QUIC + fronting", 不是内层 fake-TLS**
+(fake-TLS 仍是 TCP 主链路的抗检测)。
+
+分步落地: **P0 先上裸 quinn 打通测性能 (Model Y, 不隐蔽) → 真机验 UDP443 在目标链路是否可用/更快 →
+再投 P1 指纹仿真的重工** (若 UDP443 被封则整条路无意义, 先证再投)。这也解释为何 P0 用 Model Y (内层
+仍套 fake-TLS): P0 抄近路复用现有协议零改动, P1 转 Model X (QUIC 即混淆, 内层瘦认证) 时再精简。
 
 ## 4. 分阶段（大 epic，逐块真机验）
 
-1. **P0 数据报传输骨架**：Mirage 自有 UDP 数据报 mux（复用 fake-TLS 握手密钥），带序号 + 有序重组
-   （吸收 2.4 的共享内存预算、非阻塞、fail-one-flow）。
+1. **P0 传输骨架** ✅ **已实现** (未发版, `--features quic` 默认关)：走**真 QUIC (quinn)** 而非自研
+   数据报 —— 决策见下「实现路径决定」。Model Y: QUIC 做底层字节管道, 上面照跑 Mirage fake-TLS+AEAD,
+   运行时开关 `transport: "quic"` 两端同设, 与 TCP 主链路并存。见 `src/proxy/quic.rs` + `tests/test_quic_e2e.rs`。
 2. **P1 erasure-aware 自动 CC**：移植 2.1（erasure floor 测量 + 超出部分喂 CC + pacing 除 (1-p)）。
    **真机中美路径验**（对照现 Brutal：目标 = 免手填达到同吞吐）。这是最大价值块。
 3. **P2 选择性 FEC**：移植 2.2（Reed-Solomon，Class bulk/interactive，block 受 RTT 上界，residual 非
@@ -126,6 +141,27 @@ Mirage 现有反识别是 **TCP-fake-TLS**。三条路，需真机 + 威胁模�
 - **erasure 模型不是"高丢包就套"**：队列溢出 vs 独立 erasure 要区分（erasure floor 测量正为此）。
 - QUIC/UDP 在部分网络被限速/封（UDP 443）；作为 TCP 的补充而非替代。
 - 大工程 + 用户态数据面重写，回归风险高；每块真机验（Mirage 无中美真机时无法本地证）。
+
+## 5.1 真机实测 (2026-08-23, china-us P0)
+
+China 客户端 → US VPS, P0 二进制 (`--features quic`), QUIC(UDP) vs TCP 同密码 A/B。
+
+- **路径**: RTT 157ms, **27% 丢包, mdev 1ms** —— RTT 极稳说明丢包非拥塞、是**独立 erasure**
+  (正是本设计针对的路径)。
+- **UDP 端口 China→US 未被封** (go/no-go 通过): QUIC 隧道功能通, 出口 IP 正确。
+- **吞吐 (50MB, target=VPS 自身 http, 排除第三方抖动)**:
+
+  | 传输 | 结果 |
+  |---|---|
+  | QUIC (P0, quinn 默认 CC) | **~20-25 KB/s** (120s 超时只下 2-3MB) |
+  | TCP (默认 CC) | 1.6-2.9 MB/s |
+
+  **P0 QUIC 比 TCP 慢约 100 倍** —— quinn 默认 loss-responsive CC 在 27% erasure 上环路自我归零
+  (= §1 表里 BBR 0.39 Mbit/s 现象)。
+
+- **结论**: P0 证"管道通 + UDP 可达", 同时证 **裸 QUIC (无 erasure CC) 在真实烂链路不可用**。
+  → **erasure-aware CC (P3, queqiao ErasureSender) 是 QUIC 有价值的前提, 非可选; 若目标是"更快",
+  P3 关键、甚至应先于 P1 指纹仿真。**
 
 ## 6. 结论
 

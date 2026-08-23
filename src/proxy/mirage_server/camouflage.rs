@@ -11,14 +11,18 @@
 //! 换一条即时新建的连接重试; 都不行才回落 HandshakeCache 合成模板.
 
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::CamouflagePool;
 
 /// 尝试用一条 camouflage 连接转发探针握手. 成功发出 client_hello (证明连接活着)
 /// 就接着双向转发到底, 返回 Ok; 发送即失败 (死连接) 返回 Err 让上层换连接.
-async fn try_forward(probe: &mut TcpStream, mut cam: TcpStream, client_hello: &[u8]) -> Result<(), ()> {
+/// probe 泛型 (TCP=TcpStream, QUIC=QuicBiStream): auth 失败路径对任意传输一致伪装。
+async fn try_forward<S>(probe: &mut S, mut cam: TcpStream, client_hello: &[u8]) -> Result<(), ()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if cam.write_all(client_hello).await.is_err() {
         return Err(());
     }
@@ -30,12 +34,14 @@ async fn try_forward(probe: &mut TcpStream, mut cam: TcpStream, client_hello: &[
     Ok(())
 }
 
-pub(super) async fn run_camouflage_forward(
-    mut stream: TcpStream,
+pub(super) async fn run_camouflage_forward<S>(
+    mut stream: S,
     client_hello: &[u8],
     camouflage_host: &str,
     cam_pool: &Arc<CamouflagePool>,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // 1. Fast path: pool 里的 pre-warmed 连接 (已探活). 写失败 (TOCTOU 死连接)
     //    则 fall through 换即时新建.
     if let Some(cam) = cam_pool.acquire().await {

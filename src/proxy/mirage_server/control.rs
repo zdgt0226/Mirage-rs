@@ -4,23 +4,23 @@
 //! 调用方: `handshake::handle_connection` 在 ClientHello 鉴权 + 63B tail 消费
 //! 通过后进入这里. 不再退回 handshake — 这之后所有流量都是加密的.
 
-use tokio::net::TcpStream;
 use tracing::info;
 
 use super::tcp_relay;
 use super::udp_relay;
 
 pub(super) async fn dispatch_authenticated(
-    stream: TcpStream,
+    read_half: crate::proxy::tunnel::TunnelRead,
+    write_half: crate::proxy::tunnel::TunnelWrite,
+    client_ip: Option<std::net::IpAddr>,
     password: String,
     client_random: [u8; 32],
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     ecdh: Option<[u8; 32]>,
 ) {
     // 3. Setup Crypto Stream。PFS 开时 (ecdh=Some) 走混入 ecdh 的 master 派生。
-    // 客户端来源 IP (供 WebUI 服务端连接登记 / 域名排行的 inbound 维度)。
-    let client_ip = stream.peer_addr().ok().map(|a| a.ip());
-    let (read_half, write_half) = stream.into_split();
+    // read_half/write_half 已是传输无关的 TunnelRead/Write (TCP=Tcp 变体, QUIC=Boxed);
+    // client_ip 由握手层从底层连接的 peer 地址传入。
     let (mut reader, mut writer) = match ecdh {
         Some(ecdh) => crate::crypto::aead::create_crypto_pair_pfs(
             read_half,

@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
 
@@ -42,18 +42,21 @@ fn rate_limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
-pub(super) async fn handle_connection(
-    mut stream: TcpStream,
+/// 传输无关的服务端握手核心 (ClientHello 鉴权 + 模板回放 + tail 消费)。返回 `Some((stream,
+/// client_random, ecdh))` 表示鉴权通过、可进 dispatch; `None` = 已按 auth-fail 走 camouflage
+/// 或出错 (调用方直接结束)。TCP/QUIC 各自的 `handle_connection*` 包一层做 split + dispatch。
+async fn run_handshake<S>(
+    mut stream: S,
     peer_addr: SocketAddr,
-    password: String,
-    camouflage_host: String,
-    cam_pool: Arc<CamouflagePool>,
+    password: &str,
+    camouflage_host: &str,
+    cam_pool: &Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
-    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
-) {
-    stream.set_nodelay(true).unwrap_or_default();
-
+) -> Option<(S, [u8; 32], Option<[u8; 32]>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     // 1. Read TLS record header (5 bytes exact)
     let mut header = [0u8; TLS_RECORD_HEADER_LEN];
     if tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut header))
@@ -61,7 +64,7 @@ pub(super) async fn handle_connection(
         .map(|r| r.is_err())
         .unwrap_or(true)
     {
-        return;
+        return None;
     }
 
     let content_type = header[0];
@@ -70,14 +73,14 @@ pub(super) async fn handle_connection(
     // Malformed / oversized record: 静默丢. 不走 camouflage 是因为攻击者发的
     // 前 5B 已经不像 TLS, 转到 camouflage_host:443 只会浪费对面的连接.
     if record_len == 0 || record_len > TLS_RECORD_MAX_BODY {
-        return;
+        return None;
     }
 
     // 2. Read record body exact
     let mut body = vec![0u8; record_len];
     match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut body)).await {
         Ok(Ok(_)) => {}
-        _ => return,
+        _ => return None,
     }
 
     // Reconstruct full ClientHello record for camouflage forwarding
@@ -103,7 +106,7 @@ pub(super) async fn handle_connection(
             let session_id = &body[39..39 + sid_len];
             let mut sid_array = [0u8; 32];
             sid_array.copy_from_slice(session_id);
-            if crate::crypto::hello_auth::verify_session_token(&password, &sid_array, auth_ts_tolerance_secs) {
+            if crate::crypto::hello_auth::verify_session_token(password, &sid_array, auth_ts_tolerance_secs) {
                 authenticated = true;
                 client_random.copy_from_slice(&body[6..38]);
             }
@@ -116,7 +119,7 @@ pub(super) async fn handle_connection(
         let global_count = GLOBAL_UNAUTH.fetch_add(1, Ordering::SeqCst);
         if global_count >= 5000 {
             GLOBAL_UNAUTH.fetch_sub(1, Ordering::SeqCst);
-            return;
+            return None;
         }
 
         // v0.4.5-alpha.10: 限流 key 用 /64 归一后的 IP, 防攻击者用 /64 段造
@@ -132,16 +135,16 @@ pub(super) async fn handle_connection(
             let count = map.entry(ip).or_insert(0);
             if *count >= 100 {
                 GLOBAL_UNAUTH.fetch_sub(1, Ordering::SeqCst);
-                return;
+                return None;
             }
             *count += 1;
             IpSlotGuard(ip)
         };
 
-        camouflage::run_camouflage_forward(stream, &client_hello, &camouflage_host, &cam_pool)
+        camouflage::run_camouflage_forward(stream, &client_hello, camouflage_host, cam_pool)
             .await;
 
-        return;
+        return None;
     }
 
     // PFS: 生成服务端一次性 X25519 对。公钥注入回放模板的 ServerHello.random 发给客户端,
@@ -151,7 +154,7 @@ pub(super) async fn handle_connection(
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::error!("Mirage Server: PFS 临时密钥生成失败: {e}");
-                return;
+                return None;
             }
         }
     } else {
@@ -160,7 +163,7 @@ pub(super) async fn handle_connection(
 
     // 2.5 Send ServerHello template back to satisfy Mirage Client's TLS state machine
     let template = crate::crypto::handshake_cache::get_server_hello_pfs(
-        &camouflage_host,
+        camouflage_host,
         &client_hello,
         server_ephemeral.as_ref().map(|e| &e.public),
     )
@@ -182,7 +185,7 @@ pub(super) async fn handle_connection(
 
     if let Err(e) = stream.write_all(&template).await {
         tracing::error!("Mirage Server: write_all template failed: {}", e);
-        return;
+        return None;
     }
 
     // 2.7 Consume Fake Client Tail (64 bytes: 6B CCS + 5B record header + 53B fake finished body)
@@ -190,11 +193,11 @@ pub(super) async fn handle_connection(
     match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut tail)).await {
         Ok(Err(e)) => {
             tracing::error!("Mirage Server: read_exact tail failed: {}", e);
-            return;
+            return None;
         }
         Err(_) => {
             tracing::error!("Mirage Server: read_exact tail timed out!");
-            return;
+            return None;
         }
         Ok(Ok(_)) => {
             tracing::info!("Mirage Server: Successfully consumed 64 bytes tail");
@@ -207,12 +210,76 @@ pub(super) async fn handle_connection(
             Ok(s) => Some(s),
             Err(err) => {
                 tracing::error!("Mirage Server: PFS ECDH 协商失败: {err}");
-                return;
+                return None;
             }
         },
         None => None,
     };
 
     // Hand off to control plane (crypto setup + TIME_SYNC + dispatch)
-    control::dispatch_authenticated(stream, password, client_random, upstream, ecdh).await;
+    Some((stream, client_random, ecdh))
+}
+
+/// TCP 传输入口: 握手 → into_split (Tcp 变体, 保留静态分发 + 无锁) → dispatch。
+pub(super) async fn handle_connection(
+    stream: TcpStream,
+    peer_addr: SocketAddr,
+    password: String,
+    camouflage_host: String,
+    cam_pool: Arc<CamouflagePool>,
+    auth_ts_tolerance_secs: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    pfs: bool,
+) {
+    stream.set_nodelay(true).unwrap_or_default();
+    let client_ip = peer_addr.ip();
+    if let Some((stream, client_random, ecdh)) = run_handshake(
+        stream, peer_addr, &password, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
+    )
+    .await
+    {
+        let (rh, wh) = stream.into_split();
+        control::dispatch_authenticated(
+            crate::proxy::tunnel::TunnelRead::Tcp(rh),
+            crate::proxy::tunnel::TunnelWrite::Tcp(wh),
+            Some(client_ip),
+            password,
+            client_random,
+            upstream,
+            ecdh,
+        )
+        .await;
+    }
+}
+
+/// QUIC 传输入口 (P0 实验): 握手 → into_halves (Boxed 变体) → dispatch。
+#[cfg(feature = "quic")]
+pub(super) async fn handle_connection_quic(
+    stream: crate::proxy::quic::QuicBiStream,
+    peer_addr: SocketAddr,
+    password: String,
+    camouflage_host: String,
+    cam_pool: Arc<CamouflagePool>,
+    auth_ts_tolerance_secs: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    pfs: bool,
+) {
+    let client_ip = peer_addr.ip();
+    if let Some((stream, client_random, ecdh)) = run_handshake(
+        stream, peer_addr, &password, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
+    )
+    .await
+    {
+        let (send, recv) = stream.into_halves();
+        control::dispatch_authenticated(
+            crate::proxy::tunnel::TunnelRead::Boxed(Box::new(recv)),
+            crate::proxy::tunnel::TunnelWrite::Boxed(Box::new(send)),
+            Some(client_ip),
+            password,
+            client_random,
+            upstream,
+            ecdh,
+        )
+        .await;
+    }
 }

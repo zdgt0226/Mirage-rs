@@ -22,6 +22,8 @@ pub struct PoolConfig {
     pub underlying: Option<Arc<OutboundNode>>,
     /// 前向保密: 握手做一次性 X25519 ECDH (见 crypto::pfs)。须与服务端 pfs 同开。默认 false。
     pub pfs: bool,
+    /// 底层传输 (tcp 默认 / quic 实验)。quic 时忽略 underlying/brutal (QUIC 自带 UDP 传输 + CC)。
+    pub transport: crate::config::Transport,
 }
 
 /**
@@ -556,10 +558,19 @@ impl WarmPool {
 
     /// 核心握手逻辑：建立 TCP 并包装 AEAD Crypto 层
     async fn connect_upstream(cfg: &PoolConfig, brutal_state: &BrutalState) -> Result<Tunnel> {
-        // 建连 + 伪装握手 + 派生密钥: 默认物理 TCP; 配了 underlying 则经该出站拨号 (Mirage-over-X)。
-        let (mut crypto_reader, mut crypto_writer) = match &cfg.underlying {
-            Some(u) => Self::handshake_over_underlying(cfg, u).await?,
-            None => Self::handshake_over_tcp(cfg, brutal_state).await?,
+        // 建连 + 伪装握手 + 派生密钥: 默认物理 TCP; 配了 underlying 则经该出站拨号 (Mirage-over-X);
+        // transport=quic 则走 QUIC (实验, 忽略 underlying/brutal)。
+        let (mut crypto_reader, mut crypto_writer) = match cfg.transport {
+            crate::config::Transport::Quic => {
+                #[cfg(feature = "quic")]
+                { Self::handshake_over_quic(cfg).await? }
+                #[cfg(not(feature = "quic"))]
+                { anyhow::bail!("transport=quic 需以 `--features quic` 编译 (见 docs/quic-transport-design.md)") }
+            }
+            crate::config::Transport::Tcp => match &cfg.underlying {
+                Some(u) => Self::handshake_over_underlying(cfg, u).await?,
+                None => Self::handshake_over_tcp(cfg, brutal_state).await?,
+            },
         };
 
         // 5. v0.4 协议: 收 server 主动下发的 TIME_SYNC 帧, 写入全局 TIME_OFFSET.
@@ -694,6 +705,40 @@ impl WarmPool {
                 anyhow::anyhow!("经 underlying 连 {}:{} 超时 (15s)", cfg.server_host, cfg.server_port)
             })??;
         let (mut read_half, mut write_half) = tokio::io::split(out);
+        let hs = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
+        Ok(match hs.ecdh {
+            Some(ecdh) => create_crypto_pair_pfs(
+                TunnelRead::Boxed(Box::new(read_half)),
+                TunnelWrite::Boxed(Box::new(write_half)),
+                &cfg.password,
+                &hs.client_random,
+                &ecdh,
+                true,
+            ),
+            None => create_crypto_pair(
+                TunnelRead::Boxed(Box::new(read_half)),
+                TunnelWrite::Boxed(Box::new(write_half)),
+                &cfg.password,
+                &hs.client_random,
+                true,
+            ),
+        })
+    }
+
+    /// QUIC 传输握手 (P0 实验): 拨号 QUIC + 开双向流, 上面照跑 fake-TLS 握手 (Model Y)。
+    /// 无裸 fd → 无 brutal/nodelay (QUIC 自带 CC); 返回 Boxed 变体隧道。
+    #[cfg(feature = "quic")]
+    async fn handshake_over_quic(
+        cfg: &PoolConfig,
+    ) -> Result<(CryptoReader<TunnelRead>, CryptoWriter<TunnelWrite>)> {
+        let (mut write_half, mut read_half) = timeout(
+            Duration::from_secs(15),
+            crate::proxy::quic::dial(&cfg.server_host, cfg.server_port),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("QUIC connect to {}:{} timed out (15s)", cfg.server_host, cfg.server_port)
+        })??;
         let hs = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
         Ok(match hs.ecdh {
             Some(ecdh) => create_crypto_pair_pfs(

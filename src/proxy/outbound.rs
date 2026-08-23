@@ -417,7 +417,7 @@ impl OutboundManager {
     fn build_mirage(oc: &OutboundConfig, underlying: Option<Arc<OutboundNode>>) -> Arc<OutboundNode> {
         let OutboundConfig::Mirage {
             tag, server, server_port, password, camouflage_host, pool_size,
-            brutal_rate_mbps, brutal_base_rtt_ms, pfs, ..
+            brutal_rate_mbps, brutal_base_rtt_ms, pfs, transport, ..
         } = oc else { unreachable!("build_mirage 只接受 Mirage 配置") };
         let pool_cfg = Arc::new(PoolConfig {
             server_host: server.clone(),
@@ -427,6 +427,7 @@ impl OutboundManager {
             pool_size: *pool_size,
             underlying,
             pfs: *pfs,
+            transport: *transport,
         });
         let bytes_per_sec = brutal_rate_mbps.map(|m| m * 125_000);
         let brutal_state = Arc::new(crate::proxy::pool::BrutalState {
