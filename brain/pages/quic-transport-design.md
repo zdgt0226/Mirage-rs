@@ -61,6 +61,12 @@ China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features 
 **10 并发 (US↔JP)**: QUIC 聚合中位 ~55MB/s (峰92.6=740Mbps) ≥ TCP ~43 且更稳; 非CPU(服务端12%)/非内存(客户端130MB)。
 撞链路容量+方差。P0=一隧道一QUIC连接(10并发=10独立CC), 未来 mux(多流骑一连接)省开销+共享CC(P4)。
 
+## 调参找最大吞吐 (2026-08-23, CN2→US 167ms, 丢包5%→20%波动)
+**窗口是长肥路径主杠杆**: 单流随 MIRAGE_QUIC_WND 线性涨 16→32→64MB = 15.8→27.7→37.7 MB/s。
+**WND=64 甜点** (10并发稳定~50); **128MB 过大→10流叠加丢包路径巨量过冲→崩溃~0** (需 P4 共享瓶颈协调)。
+**丢包越高优势越大**: 5%时 QUIC~2x TCP (erasure≈stock), **20%时 QUIC~47 vs TCP~6.6 = ~7-8x** (erasure关键)。
+**最大吞吐配方 = WND=64 + ~10并发 + erasure**。默认16MB安全(并发不崩), 高BDP独占手动调64榨单流。⚠️大窗口吃内存。
+
 ## How to apply
 接此 epic 时先读 `docs/quic-transport-design.md`, 直接研读 queqiao `internal/congestion/erasure.go` +
 `internal/fec/rate.go`. 与 Mirage 现 TCP-Brutal 并存不替换 (TCP 仍抗封锁主力, UDP 传输是链路好时更快选项).
