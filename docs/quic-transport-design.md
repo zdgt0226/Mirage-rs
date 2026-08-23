@@ -241,11 +241,27 @@ USENIX Security 2025《揭示并绕过 GFW 基于 SNI 的 QUIC 封锁》: GFW (2
 不需 fork。** (佐证: queqiao/Hysteria 也走 SNI 层, 不做 QUIC ClientHello 仿真。)
 
 ### 7.1 已做 (SNI 层, 不 fork)
-- **良性 SNI (默认)**: QUIC ClientHello SNI 用 camouflage_host (良性域名) 非 server 真身 → 即使被解密
-  查看, 不在黑名单即过。**这是主防御, 已覆盖当前 GFW SNI-based QUIC 封锁。**
+- **良性 SNI (默认)**: QUIC ClientHello SNI 用 camouflage_host (良性域名) 非 server 真身。
 - **ALPN `mirage-p0` → `h3`**: 去掉活靶子 ALPN。
 - **源端口 ≤ dst (opt-in)**: 利用"仅 src>dst 才查"规则让 GFW 干脆不查。best-effort, dst≤1024 需 root。
 - **pre-packet (opt-in)**: 握手前发随机 UDP 包 desync 四元组追踪。
+
+### 7.1a ⚠️ 真机验证 (2026-08-23, CN2→US, 晚高峰): SNI 层不足以救 QUIC
+tshark 抓包**确认线上 QUIC Initial SNI = www.apple.com (良性) + ALPN = h3** —— 代码坐实。**但**:
+
+| 传输 (同路径/同时段/同 benign SNI) | 20MB 下载 |
+|---|---|
+| **QUIC (UDP 443, 也试了 8443)** | 恒被切在 **≤1.5MB / 失败** (5 轮: 1.5/0/1.1/0/0.8MB) |
+| **TCP fake-TLS (同 US 服务端)** | 大多满 **20MB** (5 轮: 20/20/6.8/20/2.7MB) |
+
+- **源端口 ≤443 (src=134) 没救回; 8443 也一样被切; pre-packet 未测但同路径 QUIC 全废。**
+- TCP 满速 = 路径健康; 之前 JP↔US QUIC 满速 = US 服务端 QUIC 正常 → **干扰在 China→US 路径、针对
+  QUIC, 且切在 ~1MB (像 volume/启发式触发), 超出"SNI 黑名单"机制** —— 良性 SNI 规避不了它。
+- **结论: 当前 GFW/线路对 QUIC 的干扰不止 SNI 层 (至少在 CN2 晚高峰); SNI 层 P1 (①②) 不足以让 QUIC
+  过这条路。Mirage 的 TCP fake-TLS 仍是可靠抗审查路径 (同路径满速)。** ⚠️ 单路径单时段, 非普适;
+  但强化"QUIC = 好链路/受控时的性能腿, 抗审查靠 TCP fake-TLS"的定位。
+
+### 7.2 评估后不做 / 阻塞
 
 ### 7.2 评估后不做 / 阻塞
 - **ECH**: rustls 0.23 **无服务端 ECH**, 自建 server 解不了内层 ClientHello; 良性 SNI 已覆盖, 冗余。
