@@ -337,6 +337,10 @@ pub enum OutboundConfig {
         /// dst≤1024 需特权口, 无 root 回落临时口。默认 false (良性 SNI 已是主防御)。仅 transport=quic。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_low_src_port: Option<bool>,
+        /// QUIC 握手前先发随机 UDP 包, desync GFW 的 UDP 四元组追踪 (USENIX Security 2025 规避法)。
+        /// 默认 false。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_pre_packet: Option<bool>,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。

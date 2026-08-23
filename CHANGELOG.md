@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC 抗审查 P1-② —— pre-packet (ECH 评估后不做)
+
+- **pre-packet (opt-in `quic_pre_packet`, 默认关)**: QUIC 握手前先在同一 4-tuple 上发一个随机 UDP 包
+  (8~64B), desync GFW 的 UDP 四元组追踪 (USENIX Security 2025 规避法之一)。到达服务端被当无效包丢弃,
+  无副作用。客户端 endpoint 改为自建 socket + `Endpoint::new` (统一承载源端口规避 + pre-packet)。
+- **ECH 评估后不做**: rustls 0.23 **无服务端 ECH 支持** (只客户端连真 ECH 站), 自建 QUIC 服务端解不了
+  内层 ClientHello; 且**良性 SNI (①) 已覆盖当前 SNI-based 封锁**, ECH 冗余。记此结论, 不硬凑。
+
 ### feat(transport): QUIC 抗审查 P1-① —— 良性 SNI + 源端口规避
 
 据 USENIX Security 2025 (揭示 GFW 基于 SNI 的 QUIC 封锁): GFW 解密 QUIC Initial 读 **SNI** 按黑名单封,
