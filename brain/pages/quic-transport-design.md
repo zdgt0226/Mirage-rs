@@ -67,6 +67,14 @@ China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features 
 **丢包越高优势越大**: 5%时 QUIC~2x TCP (erasure≈stock), **20%时 QUIC~47 vs TCP~6.6 = ~7-8x** (erasure关键)。
 **最大吞吐配方 = WND=64 + ~10并发 + erasure**。默认16MB安全(并发不崩), 高BDP独占手动调64榨单流。⚠️大窗口吃内存。
 
+## sysctl rmem 调优 = 这些路径上无效 (2026-08-23, US↔CN2 负结果)
+调 CN2(收端) rmem_max/default 8MB/208KB → 64MB, 单流 30→30.6、10并发 43→45 MB/s = **噪声内, 无效**。
+根因: 链路/CC限速(~45MB/s)非缓冲限速; **BDP=45MB/s×167ms≈7.5MB ≈ 旧buffer 8MB 已够**。
+规则: **rmem 只在 BDP(带宽×RTT) > socket buffer 时才起作用** —— 这些 VPS(~500Mbps/150ms, BDP~7-9MB)
+默认 8-48MB buffer 已覆盖。1Gbps+ 或超长RTT 才需调。⚠️也证早先 50MB/s 结果非被 rmem 隐藏限速。
+线路类型(163/CN2GT/GIA)无需不同参数: erasure CC 自测floor自适应(GIA→纯BBR, 163高丢包→激进补偿,
+floor/excess拆分正好对上线路差异)。TCP fake-TLS主链路则吃 bbr+fq(未测,已知)。
+
 ## How to apply
 接此 epic 时先读 `docs/quic-transport-design.md`, 直接研读 queqiao `internal/congestion/erasure.go` +
 `internal/fec/rate.go`. 与 Mirage 现 TCP-Brutal 并存不替换 (TCP 仍抗封锁主力, UDP 传输是链路好时更快选项).
