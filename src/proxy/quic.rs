@@ -17,6 +17,22 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// P0 占位 ALPN。P1 换成目标浏览器的真 ALPN (h3) 以配合指纹仿真。
 const ALPN: &[u8] = b"mirage-p0";
 
+/// QUIC TransportConfig: 默认挂 erasure-aware CC (P3, 见 quic_cc.rs)。
+/// `MIRAGE_QUIC_CC=off` (或 bbr/default) 回退 quinn 原生 CC —— 供真机 A/B 对照。
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    let off = std::env::var("MIRAGE_QUIC_CC")
+        .map(|v| matches!(v.as_str(), "off" | "bbr" | "default" | "stock"))
+        .unwrap_or(false);
+    if off {
+        tracing::info!("QUIC: CC = quinn 原生 (erasure 已由 MIRAGE_QUIC_CC 关闭)");
+    } else {
+        tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::ErasureConfig::default()));
+        tracing::info!("QUIC: erasure-aware CC 启用 (MIRAGE_QUIC_CC=off 可回退原生)");
+    }
+    Arc::new(tc)
+}
+
 // ───────────────────────── 客户端 ─────────────────────────
 
 /// 建一个 QUIC 客户端 endpoint (绑临时本地 UDP 口) + 拨号 server:port, 开一条双向流。
@@ -63,7 +79,9 @@ fn client_config() -> Result<quinn::ClientConfig> {
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .context("QUIC: rustls→quinn 客户端配置转换失败")?;
-    Ok(quinn::ClientConfig::new(Arc::new(qcc)))
+    let mut cfg = quinn::ClientConfig::new(Arc::new(qcc));
+    cfg.transport_config(transport_config());
+    Ok(cfg)
 }
 
 // ───────────────────────── 服务端 ─────────────────────────
@@ -88,7 +106,8 @@ pub fn server_endpoint(listen_addr: SocketAddr) -> Result<quinn::Endpoint> {
 
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("QUIC: rustls→quinn 服务端配置转换失败")?;
-    let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
+    server_cfg.transport_config(transport_config());
     quinn::Endpoint::server(server_cfg, listen_addr).context("QUIC: 绑定服务端 endpoint 失败")
 }
 

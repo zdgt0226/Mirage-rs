@@ -44,8 +44,13 @@ China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features 
   **P0 QUIC 比 TCP 慢 ~100 倍**。印证预测: quinn 默认 loss-responsive CC 在 erasure 上环路自我归零
   (= queqiao 表里 BBR 0.39 Mbit/s 现象)。
 - **结论**: P0 证"管道通 + UDP 可达", 但也证 **QUIC 无 erasure CC 在真实烂链路上不可用**。
-  **erasure-aware CC (P3, queqiao ErasureSender) 是 QUIC 有价值的前提, 非可选**。指纹仿真 (P1) 与
-  性能 (P3) 都要做; 若只想要"更快", P3 才是关键, 甚至可先于 P1。
+
+## P3 erasure CC 首版 (2026-08-23, 同路径 A/B)
+`src/proxy/quic_cc.rs` `ErasureController` 包 quinn 内置 BBR: 测 floor + 吞纯 erasure 退避 + 窗口
+1/(1-floor) 补偿。挂 `TransportConfig::congestion_controller_factory`, 默认开, `MIRAGE_QUIC_CC=off` 回退。
+**同 27% 丢包路径 A/B: stock quinn 28KB/s → erasure 2.1MB/s (~75-100x), 追平 TCP 且更稳** (TCP 0.5-2.9 波动)。
+首版仅窗口层补偿 (未做 pacing /(1-p) 与共享瓶颈), 已足以把 quinn 从崩溃拉回瓶颈。**erasure CC 有效性坐实。**
+剩: P1 指纹仿真 (抗检测) · P2 FEC · 补 pacing 层 · 共享瓶颈模型。
 
 ## How to apply
 接此 epic 时先读 `docs/quic-transport-design.md`, 直接研读 queqiao `internal/congestion/erasure.go` +

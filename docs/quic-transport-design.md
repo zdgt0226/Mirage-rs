@@ -128,10 +128,14 @@ GFW 抓两类流量靠不同机制:
    运行时开关 `transport: "quic"` 两端同设, 与 TCP 主链路并存。见 `src/proxy/quic.rs` + `tests/test_quic_e2e.rs`。
 2. **P1 erasure-aware 自动 CC**：移植 2.1（erasure floor 测量 + 超出部分喂 CC + pacing 除 (1-p)）。
    **真机中美路径验**（对照现 Brutal：目标 = 免手填达到同吞吐）。这是最大价值块。
-3. **P2 选择性 FEC**：移植 2.2（Reed-Solomon，Class bulk/interactive，block 受 RTT 上界，residual 非
+3. **P3 erasure-aware CC** ✅ **首版已实现** (未发版)：`src/proxy/quic_cc.rs` `ErasureController` 包 quinn
+   内置 BBR, 测 erasure floor + 吞纯 erasure 退避 + 窗口 1/(1-floor) 补偿 (2.1)。挂 quinn
+   `TransportConfig::congestion_controller_factory`。**真机 A/B 见 §5.1: stock 28KB/s → erasure 2.1MB/s (~75-100x)**。
+   首版仅做窗口层补偿, 未做 pacing 层 /(1-p) 与共享瓶颈模型, 后续细化。
+4. **P2 选择性 FEC**：移植 2.2（Reed-Solomon，Class bulk/interactive，block 受 RTT 上界，residual 非
    零留给重传）。真机烂链路验恢复率 vs 额外 parity 开销。
-4. **P3 共享瓶颈模型**：2.3，多流共享 CC/floor，新 lane seed。
-5. **P4 保护交互流**：queqiao 的 cross-flow scheduling（控制/新交互流优先于 bulk）。
+5. **P4 共享瓶颈模型 + 保护交互流**：2.3 多流共享 CC/floor + queqiao cross-flow scheduling。
+6. **P1 指纹仿真** (path A: patch rustls)：抗检测。真机已证 UDP 可达 + erasure CC 有价值后再投。
 
 ## 5. 风险 / 边界
 
@@ -159,9 +163,19 @@ China 客户端 → US VPS, P0 二进制 (`--features quic`), QUIC(UDP) vs TCP �
   **P0 QUIC 比 TCP 慢约 100 倍** —— quinn 默认 loss-responsive CC 在 27% erasure 上环路自我归零
   (= §1 表里 BBR 0.39 Mbit/s 现象)。
 
-- **结论**: P0 证"管道通 + UDP 可达", 同时证 **裸 QUIC (无 erasure CC) 在真实烂链路不可用**。
-  → **erasure-aware CC (P3, queqiao ErasureSender) 是 QUIC 有价值的前提, 非可选; 若目标是"更快",
-  P3 关键、甚至应先于 P1 指纹仿真。**
+- **P3 erasure CC 加入后同路径 A/B** (2026-08-23, 同一 27% 丢包路径):
+
+  | CC | 50MB 下载吞吐 |
+  |---|---|
+  | stock quinn (P0) | ~28 KB/s |
+  | **erasure (P3, ErasureController)** | **~2.1 MB/s (两跑稳定一致)** |
+  | TCP 基线 | 0.5–2.9 MB/s (波动大) |
+
+  **erasure CC ≈ 75-100x 提升, QUIC 追平 TCP 且更稳。** 首版仅窗口层补偿 (未做 pacing /(1-p)),
+  已足以把 quinn 从崩溃拉回瓶颈。
+
+- **结论**: P0 证"管道通 + UDP 可达"; P3 证 **erasure-aware CC 是 QUIC 有价值的前提且首版即有效**。
+  后续: P1 指纹仿真 (抗检测) + P2 FEC + 补 pacing 层。
 
 ## 6. 结论
 

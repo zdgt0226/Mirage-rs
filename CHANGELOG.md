@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC erasure-aware 拥塞控制 P3 (实验, `--features quic`)
+
+给 QUIC 传输加 **erasure-aware CC** (吸收 queqiao ErasureSender), 解 P0 真机暴露的致命问题:
+quinn 默认 CC 在独立 erasure 丢包上把信道底噪当拥塞、环路自我归零。
+
+- `src/proxy/quic_cc.rs`: `ErasureController` 包 quinn 内置 BBR, 两处修正 (见 `docs/quic-transport-design.md §2.1`):
+  ① 测 **erasure floor** (丢包率 p 的下包络), 纯 erasure (p≈floor) 的 congestion event **吞掉不传 BBR**;
+  ② 窗口按 **1/(1-floor)** 补偿 erasure 损耗 (封顶 3.3x)。校准前 (样本<20 间隔) 透传=纯 BBR。
+- 挂到 quinn `TransportConfig::congestion_controller_factory` (client+server 双向)。默认启用;
+  `MIRAGE_QUIC_CC=off` 回退原生 CC (供 A/B)。加 `quinn-proto` dep (RttEstimator 类型)。
+- **真机 A/B (china-us, 27% 独立丢包 / RTT 157ms)**:
+
+  | CC | 50MB 下载吞吐 |
+  |---|---|
+  | stock quinn (P0) | ~28 KB/s |
+  | **erasure (P3)** | **~2.1 MB/s (稳定)** |
+  | TCP 基线 | 0.5–2.9 MB/s (波动大) |
+
+  **erasure CC ≈ 75-100x 提升**, QUIC 追平 TCP 且更稳。P3a 首版验证成立。
+- ⚠️ 仍是 P0/P3 实验层: 指纹不隐蔽 (P1 未做)。窗口补偿是首版近似 (未做 queqiao 的 pacing 层 /(1-p)),
+  后续可细化。
+
 ### feat(transport): QUIC 传输 P0 (实验, `--features quic`, 默认关)
 
 给 Mirage 隧道加**可选 QUIC 底层传输**, 运行时开关 `transport: "quic"` (两端同设), 与默认
