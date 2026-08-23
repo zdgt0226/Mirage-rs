@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC ALPN → h3 + P1 指纹仿真方案 (P1 首步)
+
+- **ALPN `mirage-p0` → `h3`**: QUIC Initial 的 ClientHello 明文可读, "mirage-p0" 是活靶子; 改真 h3
+  ALPN 混进浏览器 QUIC 人群。**必要但远不充分**。
+- **P1 完整指纹仿真仍未做** (见 `docs/quic-transport-design.md §7`): 核心是 Initial 内 TLS1.3
+  ClientHello 的扩展顺序/GREASE 字节级仿真, 卡在 **rustls 不暴露该控制 + Rust 无成熟 uQUIC/uTLS**。
+  三条路 (patch rustls[倾向] / quiche-BoringSSL / 等 Rust-uTLS), 均非小工程, 列为独立 epic。
+- ⚠️ **QUIC 路径当前不隐蔽, 勿用于敌对网络** —— 直到 ClientHello 字节级仿真 (P1) 落地。
+
 ### feat(transport): QUIC erasure CC 抗过冲 damping (P4a)
 
 erasure 控制器加**拥塞压力 damping**: 拥塞信号 (excess = p−floor) 出现时把窗口补偿从满 inflation

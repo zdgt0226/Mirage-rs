@@ -14,8 +14,11 @@ use std::task::{Context, Poll};
 use anyhow::{Context as _, Result};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// P0 占位 ALPN。P1 换成目标浏览器的真 ALPN (h3) 以配合指纹仿真。
-const ALPN: &[u8] = b"mirage-p0";
+/// ALPN = `h3` (HTTP/3): QUIC Initial 的 ClientHello 明文可读, 用真 h3 ALPN 混进浏览器 QUIC 人群
+/// (P0 曾用 "mirage-p0" 是活靶子)。⚠️ **仅 ALPN 不够** —— rustls 的 ClientHello 扩展顺序/GREASE
+/// 仍是 rustls 指纹, JA4-QUIC 可辨。完整仿真 (patch rustls / Rust-uTLS) 是 P1 未竟部分, 见
+/// docs/quic-transport-design.md §3.1 + §7。
+const ALPN: &[u8] = b"h3";
 
 /// QUIC TransportConfig。`window_mb`/`erasure` 来自 config (见 tuning), 环境变量 `MIRAGE_QUIC_WND`
 /// (MB) / `MIRAGE_QUIC_CC=off` 优先覆盖 (供真机 A/B 调参)。

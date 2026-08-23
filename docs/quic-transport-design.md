@@ -228,6 +228,38 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 - **最大吞吐配方**: `MIRAGE_QUIC_WND=64` + **~10 并发** + erasure CC。再大窗口在并发+丢包下过冲反伤。
   默认 16MB 是安全值 (并发下不崩); 高 BDP 独占场景手动调到 64 榨单流。⚠️ 大窗口吃内存 (每连接)。
 
+## 7. P1 指纹仿真 (抗检测, 未竟 —— 独立 epic)
+
+**现状: 未完成。QUIC 路径当前不隐蔽, 勿用于敌对网络。**
+
+### 已做 (便宜的第一步)
+- **ALPN `mirage-p0` → `h3`**: QUIC Initial 的 ClientHello 明文可读 (公开 salt 派生), "mirage-p0"
+  是活靶子; 改真 h3 ALPN 至少混进浏览器 QUIC 人群。**必要但远不充分**。
+
+### 未做 (硬骨头, 阻塞点)
+GFW 匹配的 QUIC 指纹 = ①Initial 包结构 ②quic_transport_parameters 集合/顺序/值 ③**Initial 内的
+TLS1.3 ClientHello (cipher/扩展顺序/GREASE/key_share)** ④SNI (需真 fronting)。第③项是主战场。
+
+**阻塞: rustls 不暴露 ClientHello 扩展顺序/GREASE 控制** (uTLS 之所以存在正为此), 且 **Rust 生态
+无成熟 uQUIC/uTLS 等价物**。故 quinn+rustls 出来的是"rustls 指纹", JA4-QUIC 可辨, 与真浏览器不同。
+
+### 选项 (需选一条投入, 均非小工程)
+| 路 | 做法 | 代价 |
+|---|---|---|
+| **A. patch rustls** (倾向) | fork/改 rustls 让其按目标 Chrome 精确排布 ClientHello 字节 + GREASE | 啃 rustls 内部, 多周; 但保纯 Rust + 16 目标交叉编译 |
+| B. quiche/BoringSSL | 换 Cloudflare quiche (底层 BoringSSL=Chrome 的 TLS 栈), 指纹近似白送 | **炸纯 Rust 16 目标交叉编译** (C 依赖 × musl×8), 与项目定位冲突 |
+| C. 贡献/等 Rust-uTLS | 推动社区做 Rust 版 uTLS, 再接入 | 不可控时程 |
+
+### 配套 (P1 落地时一并)
+- **服务端也要像被 front 的真站** (h3 响应 / 认证失败转发真站) —— 复用 TCP 侧已有的 REALITY 式逻辑。
+- **JA4-QUIC harness**: 扩现有 JA4 对照工具到 QUIC, 拿真 Chrome QUIC 当基线校验字节级一致。
+- SNI 指向真 fronting 站 (Initial 明文暴露 SNI)。
+
+### 决策依据 (真机已证)
+UDP 端口 China→US **未被封** (P0 三台真机), erasure CC + 大窗口在丢包/长肥路径**已证有价值** —— 
+即"先证 UDP 可达 + 传输值得, 再投指纹重工"的 gate 已过。**P1 是让 QUIC 能扛主动检测/封锁的前提,
+建议作为独立 epic 立项** (path A)。在它落地前, QUIC 传输只作"链路好且不担心指纹时更快"的 opt-in。
+
 ## 6. 结论
 
 queqiao ≈ Mirage「UDP mux → QUIC」epic 的**参考实现**，且解决 Mirage 最大痛点（Brutal 手填速率
