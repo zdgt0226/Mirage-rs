@@ -232,16 +232,33 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 - **最大吞吐配方**: `MIRAGE_QUIC_WND=64` + **~10 并发** + erasure CC。再大窗口在并发+丢包下过冲反伤。
   默认 16MB 是安全值 (并发下不崩); 高 BDP 独占场景手动调到 64 榨单流。⚠️ 大窗口吃内存 (每连接)。
 
-## 7. P1 指纹仿真 (抗检测, 未竟 —— 独立 epic)
+## 7. P1 抗审查 —— **重定向为 SNI 层** (据 USENIX Security 2025)
 
-**现状: 未完成。QUIC 路径当前不隐蔽, 勿用于敌对网络。**
+### 7.0 关键 reframe: GFW 查的是 SNI, 不是 ClientHello 指纹
+USENIX Security 2025《揭示并绕过 GFW 基于 SNI 的 QUIC 封锁》: GFW (2024-04 起) **解密 QUIC Initial
+读 SNI 按黑名单封**, **不**按 ClientHello 形状指纹 (JA4)。细节: 仅当 src_port>dst_port 才查; 良性 SNI
+即过; >90% 1 秒内被封。**→ 原计划"fork rustls 做 JA4 字节仿真"防错了威胁; 有效规避在 SNI 层, 且大多
+不需 fork。** (佐证: queqiao/Hysteria 也走 SNI 层, 不做 QUIC ClientHello 仿真。)
 
-### 已做 (便宜的第一步)
-- **ALPN `mirage-p0` → `h3`**: QUIC Initial 的 ClientHello 明文可读 (公开 salt 派生), "mirage-p0"
-  是活靶子; 改真 h3 ALPN 至少混进浏览器 QUIC 人群。**必要但远不充分**。
+### 7.1 已做 (SNI 层, 不 fork)
+- **良性 SNI (默认)**: QUIC ClientHello SNI 用 camouflage_host (良性域名) 非 server 真身 → 即使被解密
+  查看, 不在黑名单即过。**这是主防御, 已覆盖当前 GFW SNI-based QUIC 封锁。**
+- **ALPN `mirage-p0` → `h3`**: 去掉活靶子 ALPN。
+- **源端口 ≤ dst (opt-in)**: 利用"仅 src>dst 才查"规则让 GFW 干脆不查。best-effort, dst≤1024 需 root。
+- **pre-packet (opt-in)**: 握手前发随机 UDP 包 desync 四元组追踪。
 
-### 未做 (硬骨头, 阻塞点)
-GFW 匹配的 QUIC 指纹 = ①Initial 包结构 ②quic_transport_parameters 集合/顺序/值 ③**Initial 内的
+### 7.2 评估后不做 / 阻塞
+- **ECH**: rustls 0.23 **无服务端 ECH**, 自建 server 解不了内层 ClientHello; 良性 SNI 已覆盖, 冗余。
+- **Initial 分片 / SNI 切片**: 最鲁棒 (对齐 Chrome v124+/quic-go/Hysteria), 但 **quinn 公开 API 无分片
+  控制** (ClientHello ~400B 装一个 Initial 包不会拆, initial_mtu/max_udp_payload 都强制不了), **需 fork
+  quinn-proto 手动拆 CRYPTO 帧** —— 维护债。良性 SNI 已防当前威胁, 故**暂缓**; 若 GFW 硬化 SNI 封锁
+  (超出黑名单, 如封未知 SNI / SNI-IP 不符) 再投。
+
+### 7.3 残留: ClientHello 形状指纹 (JA4) —— 仍是独立 epic (低优先)
+若 GFW **未来**改用 QUIC ClientHello 指纹 (像对其他协议那样), 才需下面的字节级仿真。当前 GFW 不这么做,
+故**不为假想威胁先付 fork 代价**。真要做时的路 (均非小工程):
+
+GFW (未来若) 匹配的 QUIC 指纹 = ①Initial 包结构 ②quic_transport_parameters 集合/顺序/值 ③**Initial 内的
 TLS1.3 ClientHello (cipher/扩展顺序/GREASE/key_share)** ④SNI (需真 fronting)。第③项是主战场。
 
 **阻塞: rustls 不暴露 ClientHello 扩展顺序/GREASE 控制** (uTLS 之所以存在正为此), 且 **Rust 生态
