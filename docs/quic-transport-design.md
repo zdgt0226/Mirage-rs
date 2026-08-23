@@ -246,20 +246,10 @@ USENIX Security 2025《揭示并绕过 GFW 基于 SNI 的 QUIC 封锁》: GFW (2
 - **源端口 ≤ dst (opt-in)**: 利用"仅 src>dst 才查"规则让 GFW 干脆不查。best-effort, dst≤1024 需 root。
 - **pre-packet (opt-in)**: 握手前发随机 UDP 包 desync 四元组追踪。
 
-### 7.1a ⚠️ 真机验证 (2026-08-23, CN2→US, 晚高峰): SNI 层不足以救 QUIC
-tshark 抓包**确认线上 QUIC Initial SNI = www.apple.com (良性) + ALPN = h3** —— 代码坐实。**但**:
-
-| 传输 (同路径/同时段/同 benign SNI) | 20MB 下载 |
-|---|---|
-| **QUIC (UDP 443, 也试了 8443)** | 恒被切在 **≤1.5MB / 失败** (5 轮: 1.5/0/1.1/0/0.8MB) |
-| **TCP fake-TLS (同 US 服务端)** | 大多满 **20MB** (5 轮: 20/20/6.8/20/2.7MB) |
-
-- **源端口 ≤443 (src=134) 没救回; 8443 也一样被切; pre-packet 未测但同路径 QUIC 全废。**
-- TCP 满速 = 路径健康; 之前 JP↔US QUIC 满速 = US 服务端 QUIC 正常 → **干扰在 China→US 路径、针对
-  QUIC, 且切在 ~1MB (像 volume/启发式触发), 超出"SNI 黑名单"机制** —— 良性 SNI 规避不了它。
-- **结论: 当前 GFW/线路对 QUIC 的干扰不止 SNI 层 (至少在 CN2 晚高峰); SNI 层 P1 (①②) 不足以让 QUIC
-  过这条路。Mirage 的 TCP fake-TLS 仍是可靠抗审查路径 (同路径满速)。** ⚠️ 单路径单时段, 非普适;
-  但强化"QUIC = 好链路/受控时的性能腿, 抗审查靠 TCP fake-TLS"的定位。
+### 7.1a 真机验证 (2026-08-23, CN2→US): SNI 层代码坐实
+tshark 抓包**确认线上 QUIC Initial SNI = www.apple.com (良性) + ALPN = h3** —— ①② 代码坐实上线。
+(初测时 QUIC 传输被切、TCP 满速, 一度误判"GFW 针对 QUIC"; **深挖后证实是 quinn 的 gap 上限 bug, 非
+GFW —— 见 §5.5**。修掉窗口后 QUIC 正常传输, SNI 层规避与传输功能两回事、都不受 GFW 影响。)
 
 ### 7.2 评估后不做 / 阻塞
 
@@ -312,6 +302,29 @@ UDP 端口 China→US **未被封** (P0 三台真机), erasure CC + 大窗口在
   上下文所限、需 mux 才能干净实现"的兑现 —— **mux 用架构解决了 P4 独立控制器解决不了的问题**。
 - 权衡: 单 CC 比 N 条独立连接抢带宽略保守 (WND64 43 vs 50); 一个连接是单点 (断则齐掉, 靠重拨+池
   stale/handler 重试恢复)。换来无过冲崩溃 + 高并发省 per-conn 开销 + 天然共享瓶颈。
+
+### 5.5 ⚠️ quinn gap 上限 vs 重排序线路 (2026-08-24, 深挖"~1MB 切断")
+
+**现象**: CN2→US 上 QUIC 传输恒被切在 ~1MB (TCP 同路径满速), 一度误判"GFW 针对 QUIC"。
+
+**深挖 (client debug 日志)**: `quinn_proto: closing connection due to transport error: too many gaps in
+stream buffer`。根因 = **quinn-proto 0.11.17 的 `MAX_CHUNKS=1024` 硬界** (乱序流重组的并发 chunk 上限,
+正是 RUSTSEC-2026-0185 修复引入的界; 0.11.14 无界能下完但有内存漏洞)。
+
+**机理**: 抓包显示 1MB≈833 包却触发 1024 gap = **接近每包乱序 → CN2 是重排序线路** (CN2 优化线路多用
+多路径/负载均衡, 天然重排序)。并发乱序 chunk 数 ≈ 在途包数, 大窗口 (16MB=万级在途包) 必超 1024 → 关连接。
+**非 GFW** —— TCP 无此界故满速; 之前 china-us 27% 丢包能下完是因为用的 0.11.14 (无界)。
+
+**验证**: 同路径 `MIRAGE_QUIC_WND=2` (小窗口→在途少) **3×50MB 全下完, 零 gap 错误**; 4/8/16MB 均切。
+
+**修复**:
+1. **默认窗口 16→4MB** (更稳的通用默认; 重排序线路仍需手动 `quic_window_mb: 2`; 干净长肥可调大 16-64)。
+2. **erasure CC 加 gap-safety 封顶** (`quic_cc.rs` GAP_SAFE_CHUNKS): 按测到的丢包率封顶 cwnd 使 gap < 界
+   —— 但只治**丢包驱动**的 gap 且校准后才生效; 纯重排序 (gap≈在途包数, 与丢包率无关) 主要靠小窗口治。
+3. ⚠️ **本质无免费午餐**: MAX_CHUNKS 硬界 = QUIC 在重排序路径上须小窗口 (限单流吞吐); 干净路径可大。
+   这是 quinn 0.11.17 的已知局限, 不 fork quinn 无法根治。文档标明重排序线路调小窗口。
+
+**教训**: 升级依赖 (为修 RUSTSEC) 可能引入行为回归; 且"传输被切"先排查自己的传输栈, 别急着归因 GFW。
 
 ## 6. 结论
 

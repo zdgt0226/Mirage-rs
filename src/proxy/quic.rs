@@ -62,8 +62,9 @@ fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig
     let mut tc = quinn::TransportConfig::default();
 
     // 流控窗口: quinn 默认偏小 (~1MB 级), 高 BDP 长肥路径上单流被窗口卡死 (实测 JP↔US 111ms 仅
-    // ~9MB/s, 而 TCP 自动调窗到 48MB/s)。默认 16MB (安全, 并发不崩); 长肥独占场景调到 64 榨单流,
-    // 但过大 (128+) 在并发+丢包下过冲反崩 (见 docs/quic-transport-design.md §5.3)。
+    // ~9MB/s, 而 TCP 自动调窗到 48MB/s)。默认 4MB —— ⚠️ 重排序线路 (部分 CN2) 大窗口会因乱序 gap 超
+    // quinn MAX_CHUNKS(1024) 被关连接 (真机实证, 见 quic_cc.rs GAP_SAFE_CHUNKS + docs §5.5); 干净长肥
+    // 路径可调大 (16-64) 榨单流吞吐。过大 (128+) 在并发+丢包下还会过冲。
     let wnd_mb: u64 = std::env::var("MIRAGE_QUIC_WND").ok().and_then(|v| v.parse().ok()).unwrap_or(window_mb);
     let stream_wnd = wnd_mb.max(1) * 1024 * 1024;
     let conn_wnd = stream_wnd.saturating_mul(4);

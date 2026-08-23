@@ -34,6 +34,10 @@ const MIN_INTERVAL: Duration = Duration::from_millis(20);
 // 一个 CC)。真正的跨连接共享瓶颈 (queqiao PathModel) 受 quinn Controller API 无 peer 上下文所限,
 // 也需 mux 才能干净实现。
 const CONGEST_KNEE: f64 = 0.10; // excess 达此值, inflation 完全退回 1x
+// gap-safety: quinn-proto 0.11.17 (RUSTSEC-2026-0185 修复) 给乱序流重组加了 MAX_CHUNKS=1024 硬界,
+// 超了就关连接 ("too many gaps in stream buffer")。在途包 × 丢包率 ≈ 待补 gap 数, 故按测到的丢包率
+// 封顶 cwnd 使 gap 稳在界下 (真机实证: 16MB 窗口 ×13% 丢包 → gap 超限 ~1MB 就断; 加此封顶后下完)。
+const GAP_SAFE_CHUNKS: f64 = 800.0; // MAX_CHUNKS=1024 的安全余量
 
 /// erasure-aware CC 工厂。挂到 quinn `TransportConfig::congestion_controller_factory`。
 #[derive(Debug, Default)]
@@ -53,6 +57,7 @@ impl ControllerFactory for ErasureConfig {
             lost_acc: 0,
             interval_start: now,
             last_rtt: Duration::from_millis(100),
+            mtu: current_mtu.max(1200) as u64,
         })
     }
 }
@@ -67,6 +72,7 @@ struct ErasureController {
     lost_acc: u64,
     interval_start: Instant,
     last_rtt: Duration,
+    mtu: u64, // 当前 MTU, 用于 gap-safety 封顶换算包数
 }
 
 impl ErasureController {
@@ -131,21 +137,27 @@ impl Controller for ErasureController {
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = (new_mtu as u64).max(1200);
         self.inner.on_mtu_update(new_mtu);
     }
 
     fn window(&self) -> u64 {
-        let w = self.inner.window();
+        let mut w = self.inner.window();
+        // erasure 补偿 (校准后): 无视纯 erasure、按 1/(1-floor) 补窗口, 拥塞压力 damp。
         if self.calibrated() {
             let f = self.floor.min(FLOOR_CAP);
-            let full_inflation = 1.0 / (1.0 - f); // 纯 erasure 时的满补偿
-            // 抗过冲: 拥塞压力越大, 越收敛回 1x (纯 BBR)。excess 达 CONGEST_KNEE 时完全不补偿。
+            let full_inflation = 1.0 / (1.0 - f);
             let damp = (1.0 - (self.recent_excess / CONGEST_KNEE).min(1.0)).max(0.0);
             let inflation = 1.0 + (full_inflation - 1.0) * damp;
-            ((w as f64) * inflation) as u64
-        } else {
-            w
+            w = ((w as f64) * inflation) as u64;
         }
+        // gap-safety 封顶: 按测到的丢包率封顶在途, 使接收端乱序 gap < quinn MAX_CHUNKS(1024)。
+        // 干净路径 (p≈0) 无封顶; 丢包路径自动收窄防"too many gaps"关连接。见 GAP_SAFE_CHUNKS 注释。
+        if self.samples > 0 && self.p_ewma > 0.02 {
+            let gap_cap = (GAP_SAFE_CHUNKS * self.mtu as f64 / self.p_ewma) as u64;
+            w = w.min(gap_cap.max(self.mtu * 8)); // 别低于最小窗口
+        }
+        w
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
@@ -159,6 +171,7 @@ impl Controller for ErasureController {
             lost_acc: self.lost_acc,
             interval_start: self.interval_start,
             last_rtt: self.last_rtt,
+            mtu: self.mtu,
         })
     }
 
