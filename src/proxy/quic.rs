@@ -21,6 +21,17 @@ const ALPN: &[u8] = b"mirage-p0";
 /// `MIRAGE_QUIC_CC=off` (或 bbr/default) 回退 quinn 原生 CC —— 供真机 A/B 对照。
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
+
+    // 流控窗口: quinn 默认偏小 (~1MB 级), 高 BDP 长肥路径上单流被窗口卡死 (实测 JP↔US 111ms 仅
+    // ~9MB/s, 而 TCP 自动调窗到 48MB/s)。放大到能容 ~16MB 单流在途 (16MB/0.111s≈144MB/s 上限),
+    // 连接级更大 (多流)。可 MIRAGE_QUIC_WND (MB) 覆盖调优。
+    let wnd_mb: u64 = std::env::var("MIRAGE_QUIC_WND").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let stream_wnd = wnd_mb * 1024 * 1024;
+    let conn_wnd = stream_wnd.saturating_mul(4);
+    tc.stream_receive_window(quinn::VarInt::from_u64(stream_wnd).unwrap_or(quinn::VarInt::MAX));
+    tc.receive_window(quinn::VarInt::from_u64(conn_wnd).unwrap_or(quinn::VarInt::MAX));
+    tc.send_window(conn_wnd);
+
     let off = std::env::var("MIRAGE_QUIC_CC")
         .map(|v| matches!(v.as_str(), "off" | "bbr" | "default" | "stock"))
         .unwrap_or(false);

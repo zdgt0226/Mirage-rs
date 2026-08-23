@@ -177,6 +177,23 @@ China 客户端 → US VPS, P0 二进制 (`--features quic`), QUIC(UDP) vs TCP �
 - **结论**: P0 证"管道通 + UDP 可达"; P3 证 **erasure-aware CC 是 QUIC 有价值的前提且首版即有效**。
   后续: P1 指纹仿真 (抗检测) + P2 FEC + 补 pacing 层。
 
+### 5.2 真机实测 (2026-08-23, US↔JP 干净高带宽路径)
+
+US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, mdev 0.16ms** (干净, 对照 china-us 烂链路)。
+
+| 场景 | QUIC | TCP |
+|---|---|---|
+| quinn 默认小窗口·单流 | 7.5–9 MB/s (**窗口卡死**) | 48 MB/s |
+| 16MB 窗口·单流 | **37 MB/s** | 36–51 MB/s |
+| 4 并发聚合 | **52 MB/s** | 50 MB/s |
+
+- **根因**: quinn 默认流控窗口 (~1MB 级) 太小, 长肥管道 (111ms) 单流被窗口卡死 (窗口/RTT 天花板)。
+  TCP 内核自动调窗填满管道。→ `transport_config` 显式放大 `stream_receive_window` 默认 16MB
+  (`MIRAGE_QUIC_WND` 可调), 单流即追平 TCP; 4 并发聚合双双撞 **链路/CPU 上限 ~50MB/s (~400Mbps)**, 非隧道瓶颈。
+- **erasure CC 在干净路径 floor≈0 自动退化纯 BBR, 不伤性能**。
+- **两路径合看**: 烂链路 (china-us 27% 丢包) 靠 **erasure CC** (28KB/s→2.1MB/s); 干净长肥路径 (US↔JP)
+  靠 **大流控窗口** (9→37MB/s)。两项都需要, QUIC 才在两种 regime 都不输 TCP。⚠️ 大窗口更吃内存。
+
 ## 6. 结论
 
 queqiao ≈ Mirage「UDP mux → QUIC」epic 的**参考实现**，且解决 Mirage 最大痛点（Brutal 手填速率

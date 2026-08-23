@@ -52,6 +52,13 @@ China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features 
 首版仅窗口层补偿 (未做 pacing /(1-p) 与共享瓶颈), 已足以把 quinn 从崩溃拉回瓶颈。**erasure CC 有效性坐实。**
 剩: P1 指纹仿真 (抗检测) · P2 FEC · 补 pacing 层 · 共享瓶颈模型。
 
+## 流控窗口调优 (2026-08-23, US↔JP 干净路径)
+海外 US↔JP (111ms RTT/0%丢包) 暴露第二个瓶颈: **quinn 默认流控窗口 ~1MB 太小, 长肥管道单流卡死**
+(QUIC 7.5-9MB/s vs TCP 48MB/s)。`transport_config` 放大 `stream_receive_window` 默认 16MB
+(MIRAGE_QUIC_WND 可调) + receive/send ×4 → **单流 37MB/s 追平 TCP; 4并发聚合 52MB/s = 链路/CPU 上限**。
+**两路径合看**: 烂链路靠 erasure CC (china-us 28KB→2.1MB), 干净长肥靠大窗口 (US↔JP 9→37MB)。两项都需要。
+⚠️ 大窗口吃内存 (每连接), 受限设备调小。
+
 ## How to apply
 接此 epic 时先读 `docs/quic-transport-design.md`, 直接研读 queqiao `internal/congestion/erasure.go` +
 `internal/fec/rate.go`. 与 Mirage 现 TCP-Brutal 并存不替换 (TCP 仍抗封锁主力, UDP 传输是链路好时更快选项).

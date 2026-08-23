@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### fix(transport): QUIC 流控窗口调大 (长肥管道单流不再被卡死)
+
+海外 US↔JP 真机 (111ms RTT / 0% 丢包 / 干净高带宽) 暴露: quinn 默认流控窗口 (~1MB 级) 在长肥
+管道上把**单流**卡死。`transport_config` 显式放大 `stream_receive_window` (默认 16MB) +
+`receive_window`/`send_window` (×4), 可 `MIRAGE_QUIC_WND` (MB) 覆盖。
+
+- **真机 A/B (US↔JP, 500MB 下载)**:
+
+  | 场景 | QUIC | TCP |
+  |---|---|---|
+  | 默认小窗口·单流 | 7.5–9 MB/s (窗口卡死) | 48 MB/s |
+  | **16MB 窗口·单流** | **37 MB/s** | 36–51 MB/s |
+  | 4 并发聚合 | **52 MB/s** | 50 MB/s |
+
+  调窗后 **QUIC 追平 TCP**, 双双撞链路/CPU 上限 (~400Mbps)。erasure CC 在干净路径 floor≈0 自动
+  退化纯 BBR、不伤性能。⚠️ 大窗口更吃内存 (每连接), 受限设备可 `MIRAGE_QUIC_WND` 调小。
+
 ### feat(transport): QUIC erasure-aware 拥塞控制 P3 (实验, `--features quic`)
 
 给 QUIC 传输加 **erasure-aware CC** (吸收 queqiao ErasureSender), 解 P0 真机暴露的致命问题:
