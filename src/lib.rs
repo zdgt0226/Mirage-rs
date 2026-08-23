@@ -417,7 +417,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     crate::config::Transport::Quic => {
                         #[cfg(feature = "quic")]
                         tokio::spawn(async move {
-                            crate::proxy::mirage_server::start_quic_server(&listen_addr, &password, &cam_host, auth_ts_tolerance_secs, ss_upstream, pfs, quic_window_mb.unwrap_or(16), quic_erasure_cc.unwrap_or(true)).await;
+                            crate::proxy::mirage_server::start_quic_server(&listen_addr, &password, &cam_host, auth_ts_tolerance_secs, ss_upstream, pfs, quic_window_mb.unwrap_or(2), quic_erasure_cc.unwrap_or(true)).await;
                         });
                         #[cfg(not(feature = "quic"))]
                         error!("MirageServer transport=quic 需以 `--features quic` 编译, 该入站未启动 (见 docs/quic-transport-design.md)");

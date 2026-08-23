@@ -232,16 +232,39 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 - **最大吞吐配方**: `MIRAGE_QUIC_WND=64` + **~10 并发** + erasure CC。再大窗口在并发+丢包下过冲反伤。
   默认 16MB 是安全值 (并发下不崩); 高 BDP 独占场景手动调到 64 榨单流。⚠️ 大窗口吃内存 (每连接)。
 
-## 7. P1 指纹仿真 (抗检测, 未竟 —— 独立 epic)
+## 7. P1 抗审查 —— **重定向为 SNI 层** (据 USENIX Security 2025)
 
-**现状: 未完成。QUIC 路径当前不隐蔽, 勿用于敌对网络。**
+### 7.0 关键 reframe: GFW 查的是 SNI, 不是 ClientHello 指纹
+USENIX Security 2025《揭示并绕过 GFW 基于 SNI 的 QUIC 封锁》: GFW (2024-04 起) **解密 QUIC Initial
+读 SNI 按黑名单封**, **不**按 ClientHello 形状指纹 (JA4)。细节: 仅当 src_port>dst_port 才查; 良性 SNI
+即过; >90% 1 秒内被封。**→ 原计划"fork rustls 做 JA4 字节仿真"防错了威胁; 有效规避在 SNI 层, 且大多
+不需 fork。** (佐证: queqiao/Hysteria 也走 SNI 层, 不做 QUIC ClientHello 仿真。)
 
-### 已做 (便宜的第一步)
-- **ALPN `mirage-p0` → `h3`**: QUIC Initial 的 ClientHello 明文可读 (公开 salt 派生), "mirage-p0"
-  是活靶子; 改真 h3 ALPN 至少混进浏览器 QUIC 人群。**必要但远不充分**。
+### 7.1 已做 (SNI 层, 不 fork)
+- **良性 SNI (默认)**: QUIC ClientHello SNI 用 camouflage_host (良性域名) 非 server 真身。
+- **ALPN `mirage-p0` → `h3`**: 去掉活靶子 ALPN。
+- **源端口 ≤ dst (opt-in)**: 利用"仅 src>dst 才查"规则让 GFW 干脆不查。best-effort, dst≤1024 需 root。
+- **pre-packet (opt-in)**: 握手前发随机 UDP 包 desync 四元组追踪。
 
-### 未做 (硬骨头, 阻塞点)
-GFW 匹配的 QUIC 指纹 = ①Initial 包结构 ②quic_transport_parameters 集合/顺序/值 ③**Initial 内的
+### 7.1a 真机验证 (2026-08-23, CN2→US): SNI 层代码坐实
+tshark 抓包**确认线上 QUIC Initial SNI = www.apple.com (良性) + ALPN = h3** —— ①② 代码坐实上线。
+(初测时 QUIC 传输被切、TCP 满速, 一度误判"GFW 针对 QUIC"; **深挖后证实是 quinn 的 gap 上限 bug, 非
+GFW —— 见 §5.5**。修掉窗口后 QUIC 正常传输, SNI 层规避与传输功能两回事、都不受 GFW 影响。)
+
+### 7.2 评估后不做 / 阻塞
+
+### 7.2 评估后不做 / 阻塞
+- **ECH**: rustls 0.23 **无服务端 ECH**, 自建 server 解不了内层 ClientHello; 良性 SNI 已覆盖, 冗余。
+- **Initial 分片 / SNI 切片**: 最鲁棒 (对齐 Chrome v124+/quic-go/Hysteria), 但 **quinn 公开 API 无分片
+  控制** (ClientHello ~400B 装一个 Initial 包不会拆, initial_mtu/max_udp_payload 都强制不了), **需 fork
+  quinn-proto 手动拆 CRYPTO 帧** —— 维护债。良性 SNI 已防当前威胁, 故**暂缓**; 若 GFW 硬化 SNI 封锁
+  (超出黑名单, 如封未知 SNI / SNI-IP 不符) 再投。
+
+### 7.3 残留: ClientHello 形状指纹 (JA4) —— 仍是独立 epic (低优先)
+若 GFW **未来**改用 QUIC ClientHello 指纹 (像对其他协议那样), 才需下面的字节级仿真。当前 GFW 不这么做,
+故**不为假想威胁先付 fork 代价**。真要做时的路 (均非小工程):
+
+GFW (未来若) 匹配的 QUIC 指纹 = ①Initial 包结构 ②quic_transport_parameters 集合/顺序/值 ③**Initial 内的
 TLS1.3 ClientHello (cipher/扩展顺序/GREASE/key_share)** ④SNI (需真 fronting)。第③项是主战场。
 
 **阻塞: rustls 不暴露 ClientHello 扩展顺序/GREASE 控制** (uTLS 之所以存在正为此), 且 **Rust 生态
@@ -279,6 +302,30 @@ UDP 端口 China→US **未被封** (P0 三台真机), erasure CC + 大窗口在
   上下文所限、需 mux 才能干净实现"的兑现 —— **mux 用架构解决了 P4 独立控制器解决不了的问题**。
 - 权衡: 单 CC 比 N 条独立连接抢带宽略保守 (WND64 43 vs 50); 一个连接是单点 (断则齐掉, 靠重拨+池
   stale/handler 重试恢复)。换来无过冲崩溃 + 高并发省 per-conn 开销 + 天然共享瓶颈。
+
+### 5.5 ⚠️ quinn gap 上限 vs 重排序线路 (2026-08-24, 深挖"~1MB 切断")
+
+**现象**: CN2→US 上 QUIC 传输恒被切在 ~1MB (TCP 同路径满速), 一度误判"GFW 针对 QUIC"。
+
+**深挖 (client debug 日志)**: `quinn_proto: closing connection due to transport error: too many gaps in
+stream buffer`。根因 = **quinn-proto 0.11.17 的 `MAX_CHUNKS=1024` 硬界** (乱序流重组的并发 chunk 上限,
+正是 RUSTSEC-2026-0185 修复引入的界; 0.11.14 无界能下完但有内存漏洞)。
+
+**机理**: 抓包显示 1MB≈833 包却触发 1024 gap = **接近每包乱序 → CN2 是重排序线路** (CN2 优化线路多用
+多路径/负载均衡, 天然重排序)。并发乱序 chunk 数 ≈ 在途包数, 大窗口 (16MB=万级在途包) 必超 1024 → 关连接。
+**非 GFW** —— TCP 无此界故满速; 之前 china-us 27% 丢包能下完是因为用的 0.11.14 (无界)。
+
+**验证**: 同路径 `MIRAGE_QUIC_WND=2` (小窗口→在途少) **3×50MB 全下完, 零 gap 错误**; 4/8/16MB 均切。
+
+**修复**:
+1. **默认窗口 16→2MB** (真机确认: **4MB 在 CN2 仍切、2MB 稳** —— 即使 0% 丢包下 4MB 也切、2MB 完整
+   下完 3×50MB @ ~11MB/s, 证实是重排序驱动非丢包)。面向中国重排序线路取安全默认; 干净长肥可调大 16-64。
+2. **erasure CC 加 gap-safety 封顶** (`quic_cc.rs` GAP_SAFE_CHUNKS): 按测到的丢包率封顶 cwnd 使 gap < 界
+   —— 但只治**丢包驱动**的 gap 且校准后才生效; 纯重排序 (gap≈在途包数, 与丢包率无关) 主要靠小窗口治。
+3. ⚠️ **本质无免费午餐**: MAX_CHUNKS 硬界 = QUIC 在重排序路径上须小窗口 (限单流吞吐); 干净路径可大。
+   这是 quinn 0.11.17 的已知局限, 不 fork quinn 无法根治。文档标明重排序线路调小窗口。
+
+**教训**: 升级依赖 (为修 RUSTSEC) 可能引入行为回归; 且"传输被切"先排查自己的传输栈, 别急着归因 GFW。
 
 ## 6. 结论
 

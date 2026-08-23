@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### fix(transport): QUIC 默认窗口 16→2MB + gap-safety 封顶 (治重排序线路断连)
+
+深挖真机"QUIC ~1MB 就断" (曾误判 GFW): client debug 日志锁定 **quinn-proto 0.11.17 的
+`MAX_CHUNKS=1024` 硬界** ("too many gaps in stream buffer", 正是修 RUSTSEC-2026-0185 引入的界)。
+根因 = **重排序线路** (部分 CN2 优化线路多路径) + 大窗口 → 在途包多 → 并发乱序 chunk 超界 → quinn
+关连接。**非 GFW** (TCP 同路径满速)。
+
+- **默认 `quic_window_mb` 16→2MB**: 真机确认默认 16/8/4MB 在 CN2 均切、2MB 稳 (3×50MB @ ~11MB/s,
+  即使 0% 丢包也是 4 切 2 稳 = 重排序驱动)。面向中国重排序线路取安全默认; 干净长肥路径可调大 16-64。
+- **erasure CC 加 gap-safety cwnd 封顶** (`quic_cc.rs` GAP_SAFE_CHUNKS=800): 按测到的丢包率封顶在途,
+  治丢包驱动的 gap; 纯重排序主要靠小窗口。
+- 教训记入 `docs §5.5`: 传输被切先查自己的栈, 别急归因 GFW; 升级依赖可能引入行为回归。
+
+### feat(transport): QUIC 抗审查 P1-② —— pre-packet (ECH 评估后不做)
+
+- **pre-packet (opt-in `quic_pre_packet`, 默认关)**: QUIC 握手前先在同一 4-tuple 上发一个随机 UDP 包
+  (8~64B), desync GFW 的 UDP 四元组追踪 (USENIX Security 2025 规避法之一)。到达服务端被当无效包丢弃,
+  无副作用。客户端 endpoint 改为自建 socket + `Endpoint::new` (统一承载源端口规避 + pre-packet)。
+- **ECH 评估后不做**: rustls 0.23 **无服务端 ECH 支持** (只客户端连真 ECH 站), 自建 QUIC 服务端解不了
+  内层 ClientHello; 且**良性 SNI (①) 已覆盖当前 SNI-based 封锁**, ECH 冗余。记此结论, 不硬凑。
+
+### feat(transport): QUIC 抗审查 P1-① —— 良性 SNI + 源端口规避
+
+据 USENIX Security 2025 (揭示 GFW 基于 SNI 的 QUIC 封锁): GFW 解密 QUIC Initial 读 **SNI** 按黑名单封,
+**不是**按 ClientHello 指纹 (JA4)。故有效规避在 SNI 层, 不需 fork rustls 做字节级指纹仿真。
+
+- **良性 SNI (默认开)**: QUIC ClientHello 的 SNI 改用 **camouflage_host** (良性域名) 而非 server 真身。
+  即使被 GFW 解密查看, SNI 不在黑名单即过。可 `quic_sni` 覆盖。(P0 证书不校验, SNI 不影响握手。)
+- **源端口 ≤ 目标端口 (opt-in `quic_low_src_port`, 默认关)**: 利用 GFW "仅 src>dst 才查 QUIC" 规则,
+  best-effort 绑 ≤dst 的源口让 GFW 干脆不查。dst≤1024 需特权口, 无 root 回落临时口。默认关 (良性 SNI
+  已是主防御, 低源口本身略反常)。
+- ⚠️ 防的是**当前 (2024-25) GFW 的 SNI-based QUIC 封锁**; 后续 ②pre-packet+ECH ③Initial 分片 更鲁棒。
+
 ### feat(transport): QUIC mux 架构 —— 一个连接多流 (治过冲崩溃 + 真共享瓶颈)
 
 把 P0 的"一条 Mirage 隧道 = 一条 QUIC 连接"改成 **所有隧道共享一个 QUIC 连接、各占一条 bi-stream**。

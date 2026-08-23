@@ -417,7 +417,8 @@ impl OutboundManager {
     fn build_mirage(oc: &OutboundConfig, underlying: Option<Arc<OutboundNode>>) -> Arc<OutboundNode> {
         let OutboundConfig::Mirage {
             tag, server, server_port, password, camouflage_host, pool_size,
-            brutal_rate_mbps, brutal_base_rtt_ms, pfs, transport, quic_window_mb, quic_erasure_cc, ..
+            brutal_rate_mbps, brutal_base_rtt_ms, pfs, transport, quic_window_mb, quic_erasure_cc,
+            quic_sni, quic_low_src_port, quic_pre_packet, ..
         } = oc else { unreachable!("build_mirage 只接受 Mirage 配置") };
         let pool_cfg = Arc::new(PoolConfig {
             server_host: server.clone(),
@@ -428,8 +429,12 @@ impl OutboundManager {
             underlying,
             pfs: *pfs,
             transport: *transport,
-            quic_window_mb: quic_window_mb.unwrap_or(16),
+            quic_window_mb: quic_window_mb.unwrap_or(2),
             quic_erasure_cc: quic_erasure_cc.unwrap_or(true),
+            // SNI 默认 = camouflage_host (良性域名, 与 TCP fake-TLS 一致)。
+            quic_sni: quic_sni.clone().unwrap_or_else(|| camouflage_host.clone()),
+            quic_low_src_port: quic_low_src_port.unwrap_or(false),
+            quic_pre_packet: quic_pre_packet.unwrap_or(false),
         });
         let bytes_per_sec = brutal_rate_mbps.map(|m| m * 125_000);
         let brutal_state = Arc::new(crate::proxy::pool::BrutalState {

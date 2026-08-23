@@ -253,8 +253,9 @@ pub enum InboundConfig {
         /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
         #[serde(default)]
         transport: Transport,
-        /// QUIC 流控窗口 (MB, 默认 16)。长肥路径 (高 RTT) 上调大提升单流吞吐 (实测 64 为甜点);
-        /// 过大 (128+) 在并发+丢包下过冲反崩。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
+        /// QUIC 流控窗口 (MB, 默认 2)。⚠️ **重排序线路 (部分 CN2 优化线路) 要小窗口** —— 大窗口在途包
+        /// 多、并发乱序 gap 超 quinn MAX_CHUNKS(1024) 会被关连接 (真机: 16MB×重排序→~1MB 就断; 2MB 下完)。
+        /// 干净长肥路径可调大 (16-64) 榨单流吞吐。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_window_mb: Option<u64>,
         /// QUIC erasure-aware 拥塞控制 (默认开)。丢包路径上无视信道 erasure、补偿窗口 (实测 27% 丢包
@@ -322,13 +323,25 @@ pub enum OutboundConfig {
         /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
         #[serde(default)]
         transport: Transport,
-        /// QUIC 流控窗口 (MB, 默认 16)。长肥路径调大提升单流吞吐 (64 甜点); 过大并发+丢包下过冲反崩。
-        /// 仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
+        /// QUIC 流控窗口 (MB, 默认 2)。⚠️ 重排序线路要小 (2); 大窗口在途多、乱序 gap 超 quinn
+        /// MAX_CHUNKS 会断连。干净长肥可调大 (16-64)。仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_window_mb: Option<u64>,
         /// QUIC erasure-aware CC (默认开)。仅 transport=quic。`MIRAGE_QUIC_CC=off` 可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_erasure_cc: Option<bool>,
+        /// QUIC ClientHello 的 SNI (良性域名)。GFW 解密 QUIC Initial 读 SNI 按黑名单封
+        /// (USENIX Security 2025); 用良性 SNI 规避。默认 = camouflage_host。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_sni: Option<String>,
+        /// 尝试把源端口绑到 ≤ 目标端口 (GFW "仅 src>dst 才查 QUIC" 规则的规避, best-effort)。
+        /// dst≤1024 需特权口, 无 root 回落临时口。默认 false (良性 SNI 已是主防御)。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_low_src_port: Option<bool>,
+        /// QUIC 握手前先发随机 UDP 包, desync GFW 的 UDP 四元组追踪 (USENIX Security 2025 规避法)。
+        /// 默认 false。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_pre_packet: Option<bool>,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。
