@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### fix(transport): QUIC 默认窗口 16→2MB + gap-safety 封顶 (治重排序线路断连)
+
+深挖真机"QUIC ~1MB 就断" (曾误判 GFW): client debug 日志锁定 **quinn-proto 0.11.17 的
+`MAX_CHUNKS=1024` 硬界** ("too many gaps in stream buffer", 正是修 RUSTSEC-2026-0185 引入的界)。
+根因 = **重排序线路** (部分 CN2 优化线路多路径) + 大窗口 → 在途包多 → 并发乱序 chunk 超界 → quinn
+关连接。**非 GFW** (TCP 同路径满速)。
+
+- **默认 `quic_window_mb` 16→2MB**: 真机确认默认 16/8/4MB 在 CN2 均切、2MB 稳 (3×50MB @ ~11MB/s,
+  即使 0% 丢包也是 4 切 2 稳 = 重排序驱动)。面向中国重排序线路取安全默认; 干净长肥路径可调大 16-64。
+- **erasure CC 加 gap-safety cwnd 封顶** (`quic_cc.rs` GAP_SAFE_CHUNKS=800): 按测到的丢包率封顶在途,
+  治丢包驱动的 gap; 纯重排序主要靠小窗口。
+- 教训记入 `docs §5.5`: 传输被切先查自己的栈, 别急归因 GFW; 升级依赖可能引入行为回归。
+
 ### feat(transport): QUIC 抗审查 P1-② —— pre-packet (ECH 评估后不做)
 
 - **pre-packet (opt-in `quic_pre_packet`, 默认关)**: QUIC 握手前先在同一 4-tuple 上发一个随机 UDP 包
