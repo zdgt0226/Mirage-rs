@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC 抗审查 P1-① —— 良性 SNI + 源端口规避
+
+据 USENIX Security 2025 (揭示 GFW 基于 SNI 的 QUIC 封锁): GFW 解密 QUIC Initial 读 **SNI** 按黑名单封,
+**不是**按 ClientHello 指纹 (JA4)。故有效规避在 SNI 层, 不需 fork rustls 做字节级指纹仿真。
+
+- **良性 SNI (默认开)**: QUIC ClientHello 的 SNI 改用 **camouflage_host** (良性域名) 而非 server 真身。
+  即使被 GFW 解密查看, SNI 不在黑名单即过。可 `quic_sni` 覆盖。(P0 证书不校验, SNI 不影响握手。)
+- **源端口 ≤ 目标端口 (opt-in `quic_low_src_port`, 默认关)**: 利用 GFW "仅 src>dst 才查 QUIC" 规则,
+  best-effort 绑 ≤dst 的源口让 GFW 干脆不查。dst≤1024 需特权口, 无 root 回落临时口。默认关 (良性 SNI
+  已是主防御, 低源口本身略反常)。
+- ⚠️ 防的是**当前 (2024-25) GFW 的 SNI-based QUIC 封锁**; 后续 ②pre-packet+ECH ③Initial 分片 更鲁棒。
+
 ### feat(transport): QUIC mux 架构 —— 一个连接多流 (治过冲崩溃 + 真共享瓶颈)
 
 把 P0 的"一条 Mirage 隧道 = 一条 QUIC 连接"改成 **所有隧道共享一个 QUIC 连接、各占一条 bi-stream**。

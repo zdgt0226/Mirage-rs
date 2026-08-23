@@ -329,6 +329,14 @@ pub enum OutboundConfig {
         /// QUIC erasure-aware CC (默认开)。仅 transport=quic。`MIRAGE_QUIC_CC=off` 可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_erasure_cc: Option<bool>,
+        /// QUIC ClientHello 的 SNI (良性域名)。GFW 解密 QUIC Initial 读 SNI 按黑名单封
+        /// (USENIX Security 2025); 用良性 SNI 规避。默认 = camouflage_host。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_sni: Option<String>,
+        /// 尝试把源端口绑到 ≤ 目标端口 (GFW "仅 src>dst 才查 QUIC" 规则的规避, best-effort)。
+        /// dst≤1024 需特权口, 无 root 回落临时口。默认 false (良性 SNI 已是主防御)。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_low_src_port: Option<bool>,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。

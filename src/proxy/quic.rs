@@ -20,6 +20,27 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// docs/quic-transport-design.md §3.1 + §7。
 const ALPN: &[u8] = b"h3";
 
+/// 建客户端 endpoint。`low_src_port` 时尝试把源端口绑到 ≤ 目标端口 (GFW "仅 src>dst 才查 QUIC"
+/// 规避, USENIX Security 2025)。优先非特权范围 [1024, dst_port); dst≤1024 需特权口, 失败回落临时口。
+fn make_client_endpoint(is_ipv6: bool, dst_port: u16, low_src_port: bool) -> Result<quinn::Endpoint> {
+    let any = if is_ipv6 { "::" } else { "0.0.0.0" };
+    if low_src_port && dst_port > 1 {
+        let (lo, hi) = if dst_port > 1024 { (1024u16, dst_port) } else { (1u16, dst_port) };
+        for _ in 0..8 {
+            let sp = lo + fastrand::u16(0..(hi - lo).max(1));
+            if let Ok(bind) = format!("{any}:{sp}").parse::<SocketAddr>() {
+                if let Ok(ep) = quinn::Endpoint::client(bind) {
+                    tracing::debug!("QUIC: 源端口 {} ≤ 目标 {} (GFW src-port 规避)", sp, dst_port);
+                    return Ok(ep);
+                }
+            }
+        }
+        tracing::warn!("QUIC: 无法绑 ≤{} 的源端口 (需 root? 占用?), 回落临时口 —— src-port 规避降级", dst_port);
+    }
+    let bind: SocketAddr = format!("{any}:0").parse()?;
+    quinn::Endpoint::client(bind).context("QUIC: 建客户端 endpoint 失败")
+}
+
 /// QUIC TransportConfig。`window_mb`/`erasure` 来自 config (见 tuning), 环境变量 `MIRAGE_QUIC_WND`
 /// (MB) / `MIRAGE_QUIC_CC=off` 优先覆盖 (供真机 A/B 调参)。
 fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig> {
@@ -63,6 +84,13 @@ pub struct QuicMux {
     inner: tokio::sync::Mutex<MuxInner>,
     host: String,
     port: u16,
+    /// QUIC ClientHello 里发的 SNI —— **良性域名 (camouflage_host)**, 而非 server 的真 IP/域名。
+    /// GFW 解密 QUIC Initial 读 SNI 按黑名单封 (USENIX Security 2025); 用良性 SNI 即使被查也过。
+    /// P0 证书不校验, SNI 值不影响握手成败。
+    sni: String,
+    /// 尝试把源端口绑到 ≤ 目标端口 (GFW "仅 src>dst 才查 QUIC" 规则的规避)。best-effort:
+    /// dst≤1024 需特权端口, 无 root 会回落临时口。默认关 (良性 SNI 已是主防御, 低源口本身略反常)。
+    low_src_port: bool,
     window_mb: u64,
     erasure: bool,
 }
@@ -74,11 +102,13 @@ struct MuxInner {
 }
 
 impl QuicMux {
-    pub fn new(host: &str, port: u16, window_mb: u64, erasure: bool) -> Arc<Self> {
+    pub fn new(host: &str, port: u16, sni: &str, low_src_port: bool, window_mb: u64, erasure: bool) -> Arc<Self> {
         Arc::new(Self {
             inner: tokio::sync::Mutex::new(MuxInner::default()),
             host: host.to_string(),
             port,
+            sni: sni.to_string(),
+            low_src_port,
             window_mb,
             erasure,
         })
@@ -88,11 +118,10 @@ impl QuicMux {
     pub async fn open_stream(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
         let conn = {
             let mut g = self.inner.lock().await;
-            // 惰性建 endpoint (绑与目标同族的通配口)。
+            // 惰性建 endpoint。默认绑通配临时口; low_src_port 时尝试绑 ≤ 目标端口的源口。
             if g.endpoint.is_none() {
                 let addr = resolve(&self.host, self.port).await?;
-                let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
-                let mut ep = quinn::Endpoint::client(bind).context("QUIC: 建客户端 endpoint 失败")?;
+                let mut ep = make_client_endpoint(addr.is_ipv6(), self.port, self.low_src_port)?;
                 ep.set_default_client_config(client_config(self.window_mb, self.erasure)?);
                 g.endpoint = Some(ep);
             }
@@ -105,7 +134,7 @@ impl QuicMux {
                 let addr = resolve(&self.host, self.port).await?;
                 let ep = g.endpoint.as_ref().unwrap();
                 let conn = ep
-                    .connect(addr, &self.host)
+                    .connect(addr, &self.sni) // SNI = 良性 camouflage_host, 非 server 真身
                     .context("QUIC: connect 配置无效")?
                     .await
                     .context("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)")?;

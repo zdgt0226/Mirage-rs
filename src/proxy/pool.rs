@@ -27,6 +27,10 @@ pub struct PoolConfig {
     /// QUIC 流控窗口 (MB, 默认 16); erasure CC 开关 (默认 true)。仅 transport=quic 生效。
     pub quic_window_mb: u64,
     pub quic_erasure_cc: bool,
+    /// QUIC ClientHello SNI (良性域名, 默认 = camouflage_host)。GFW 按 SNI 封 QUIC, 用良性 SNI 规避。
+    pub quic_sni: String,
+    /// 尝试源端口 ≤ 目标端口 (GFW src-port QUIC 规避, best-effort, 默认 false)。
+    pub quic_low_src_port: bool,
 }
 
 /**
@@ -372,7 +376,7 @@ impl WarmPool {
         // mux 架构: transport=quic 时建一个共享 QUIC mux (一个连接开多流)。TCP 路径无。
         #[cfg(feature = "quic")]
         let quic_mux = if cfg.transport == crate::config::Transport::Quic {
-            Some(crate::proxy::quic::QuicMux::new(&cfg.server_host, cfg.server_port, cfg.quic_window_mb, cfg.quic_erasure_cc))
+            Some(crate::proxy::quic::QuicMux::new(&cfg.server_host, cfg.server_port, &cfg.quic_sni, cfg.quic_low_src_port, cfg.quic_window_mb, cfg.quic_erasure_cc))
         } else {
             None
         };
