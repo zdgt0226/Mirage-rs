@@ -49,8 +49,8 @@ impl UdpEgress {
 }
 
 pub(super) async fn handle_udp_relay(
-    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     _client_ip: Option<std::net::IpAddr>,
 ) {
@@ -323,8 +323,8 @@ fn lock_mux(s: &MuxSessions) -> std::sync::MutexGuard<'_, std::collections::Hash
 }
 
 pub(crate) async fn handle_udp_mux_relay(
-    mut reader: crate::crypto::aead::CryptoReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: crate::crypto::aead::CryptoWriter<tokio::net::tcp::OwnedWriteHalf>,
+    mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     _client_ip: Option<std::net::IpAddr>,
 ) {
@@ -506,7 +506,11 @@ mod mux_tests {
         };
         let (sr, sw) = {
             let (r, w) = srv.into_split();
-            crate::crypto::aead::create_crypto_pair(r, w, "pw", b"salt1234", false)
+            crate::crypto::aead::create_crypto_pair(
+                crate::proxy::tunnel::TunnelRead::Tcp(r),
+                crate::proxy::tunnel::TunnelWrite::Tcp(w),
+                "pw", b"salt1234", false,
+            )
         };
 
         // 4. 起服务端 mux relay (upstream=None → Direct egress)

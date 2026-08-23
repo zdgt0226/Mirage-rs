@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-08-19T14:33:58.695Z._
+_Auto-generated. Last updated 2026-08-23T03:48:58.415Z._
 
 - [auth-ts-bootstrap-deadlock](pages/auth-ts-bootstrap-deadlock.md) — category: decision | **故障**:两端时钟偏差 >10s 时,客户端**永久**连不上 —— 服务端刷 `auth failed`,客户端刷
 - [camouflage-forward-on-auth-fail](pages/camouflage-forward-on-auth-fail.md) — category: decision | **决定**:服务端握手认证失败时**不返回任何错误**,而是把该 TCP 连接**转发到真实的伪装站**
@@ -41,6 +41,8 @@ _Auto-generated. Last updated 2026-08-19T14:33:58.695Z._
 - [perf-roadmap-v070](pages/perf-roadmap-v070.md) — category: decision | status: draft | tags: [roadmap, performance] | ## 背景
 - [poc-vs-rust-feature-diff](pages/poc-vs-rust-feature-diff.md) — category: reference | tags: [poc, comparison, architecture, ebpf, tradeoff] | POC 源: `/opt/claude/mirage/` (~15k 行 Python; `pyrealiy-*` 是同源旧名副本)。
 - [process-name-routing](pages/process-name-routing.md) — category: decision | tags: [routing, process-name, proc, loopback] | ## 决定
+- [quic-transport-design](pages/quic-transport-design.md) — category: decision | tags: [transport, congestion, fec, quic, performance, queqiao, roadmap] | Mirage「UDP mux → QUIC Datagram」epic 设计, 吸收 queqiao erasure-aware 自动 CC 解 Brutal 手填痛点。
+- [reference-projects-analysis](pages/reference-projects-analysis.md) — category: reference | tags: [reference, performance, congestion, fec, quic, anti-detection] | /opt/reference 三个 clone 项目分析 (2026-08-23), 找反识别 + 高负载营养。
 - [relay-cpu-bound-not-syscall](pages/relay-cpu-bound-not-syscall.md) — category: reference | tags: [perf, relay, io-uring, benchmark] | 2026-08-19 loopback 吞吐 bench (release, nproc=4) 数据:
 - [ring-for-aead](pages/ring-for-aead.md) — category: decision | **决定**:隧道载荷加密用 **`ring`** 的 ChaCha20-Poly1305(`LessSafeKey` + 显式 nonce 管理);
 - [roadmap-dependencies](pages/roadmap-dependencies.md) — category: reference | tags: [roadmap, planning, dependencies] | 计划池各项的依赖关系与建议开发序 (2026-07-29 整理)。

@@ -1,0 +1,80 @@
+---
+id: quic-transport-design
+title: "QUIC 传输设计 (吸收 queqiao): erasure-aware 自动 CC 解 Brutal 手填痛点, 反识别层不变"
+category: decision
+status: active
+tags: [transport, congestion, fec, quic, performance, queqiao, roadmap]
+created: "2026-08-23T12:10:00"
+updated: "2026-08-23T12:10:00"
+---
+
+## compiled_truth
+
+Mirage roadmap「UDP mux → QUIC Datagram」epic 的设计. 完整文档 `docs/quic-transport-design.md`
+(repo 内, 与 queqiao 源码对照). 参考 [[reference-projects-analysis]] (queqiao=高负载金矿).
+
+## 核心营养 (来自 queqiao internal/)
+- **ErasureSender (erasure.go) ⭐ 最高价值** = 包在 BBR 外两处修正: (1) 测 erasure floor (降速也不减的
+  独立丢包, 取下包络, ≥100 包前透传) 只把超 floor 部分当拥塞喂 BBR; (2) pacing 除以到达率 (1-p) 防
+  BBR 环路自我归零. **免手填达到 Brutal 效果** = 解 Mirage 最大痛点 `tuning.brutal_rate_mbps` 人肉估速.
+- **选择性 FEC (fec/rate.go)**: Reed-Solomon, 参数全测量 (Class bulk/interactive, block 受 RTT 上界,
+  TargetResidual 故意非零留尾给重传). 仅数据报传输适用, TCP 无意义. Mirage 现无 FEC.
+- **共享瓶颈模型 (pathmodel)**: 多 lane 共享 delivery/loss/floor, 新 lane seed 不重付 ramp. 拓扑吻合
+  Mirage client→server. UDP mux 现共享隧道但不共享 CC 状态, 应共享.
+- **重组+共享内存预算 (multipath/reassembly.go)**: overload 只挂一条流不死锁全部. UDP mux HoL 参考.
+
+## 关键决策: 反识别层不变
+queqiao **只做传输性能, 混淆委托 sing-box + 用真 TLS PKI, 明确非匿名网络无 DPI 规避**. Mirage 相反:
+**反识别 (fake-TLS) 仍用 Mirage 自己的**, 只搬 queqiao 传输性能内核.
+
+## 硬问题: QUIC 指纹
+QUIC 自带 TLS1.3 ClientHello 指纹 (uQUIC 存在正为此), 与 Mirage 现 TCP-fake-TLS 不统一. **倾向: 吸收
+算法 (erasure CC/FEC/共享模型) 用在 Mirage 自有 UDP 数据报 mux 上, 不必绑 QUIC 线协议** (避免新指纹面).
+"QUIC" 只是路线图名字, 真营养是烂链路传输算法, 与是否用 QUIC 线协议正交. 待真机+威胁模型定.
+
+## 分阶段
+P0 数据报 mux 骨架 (复用 fake-TLS 密钥+有序重组) → P1 erasure 自动 CC (最大价值, 真机中美验对照
+Brutal) → P2 FEC → P3 共享瓶颈 → P4 保护交互流. 每块真机验 (无中美真机无法本地证).
+
+## 真机实测 (2026-08-23, china-us P0)
+China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features quic`), QUIC UDP8443 vs TCP8444 同密码 A/B。
+- **路径**: RTT 157ms, **27% 丢包, mdev 1ms** (RTT 极稳 → 独立 erasure 非拥塞, 正是 queqiao 模型路径)。
+- **UDP8443 China→US 未被封** (go/no-go 过): QUIC 隧道功能通, 出口 IP 正确 = VPS。
+- **吞吐 (50MB, target=VPS 自身 http)**: **QUIC ~20-25 KB/s (120s 超时只下 2-3MB) vs TCP 1.6-2.9 MB/s** ——
+  **P0 QUIC 比 TCP 慢 ~100 倍**。印证预测: quinn 默认 loss-responsive CC 在 erasure 上环路自我归零
+  (= queqiao 表里 BBR 0.39 Mbit/s 现象)。
+- **结论**: P0 证"管道通 + UDP 可达", 但也证 **QUIC 无 erasure CC 在真实烂链路上不可用**。
+
+## P3 erasure CC 首版 (2026-08-23, 同路径 A/B)
+`src/proxy/quic_cc.rs` `ErasureController` 包 quinn 内置 BBR: 测 floor + 吞纯 erasure 退避 + 窗口
+1/(1-floor) 补偿。挂 `TransportConfig::congestion_controller_factory`, 默认开, `MIRAGE_QUIC_CC=off` 回退。
+**同 27% 丢包路径 A/B: stock quinn 28KB/s → erasure 2.1MB/s (~75-100x), 追平 TCP 且更稳** (TCP 0.5-2.9 波动)。
+首版仅窗口层补偿 (未做 pacing /(1-p) 与共享瓶颈), 已足以把 quinn 从崩溃拉回瓶颈。**erasure CC 有效性坐实。**
+剩: P1 指纹仿真 (抗检测) · P2 FEC · 补 pacing 层 · 共享瓶颈模型。
+
+## 流控窗口调优 (2026-08-23, US↔JP 干净路径)
+海外 US↔JP (111ms RTT/0%丢包) 暴露第二个瓶颈: **quinn 默认流控窗口 ~1MB 太小, 长肥管道单流卡死**
+(QUIC 7.5-9MB/s vs TCP 48MB/s)。`transport_config` 放大 `stream_receive_window` 默认 16MB
+(MIRAGE_QUIC_WND 可调) + receive/send ×4 → **单流 37MB/s 追平 TCP; 4并发聚合 52MB/s = 链路/CPU 上限**。
+**两路径合看**: 烂链路靠 erasure CC (china-us 28KB→2.1MB), 干净长肥靠大窗口 (US↔JP 9→37MB)。两项都需要。
+⚠️ 大窗口吃内存 (每连接), 受限设备调小。
+**10 并发 (US↔JP)**: QUIC 聚合中位 ~55MB/s (峰92.6=740Mbps) ≥ TCP ~43 且更稳; 非CPU(服务端12%)/非内存(客户端130MB)。
+撞链路容量+方差。P0=一隧道一QUIC连接(10并发=10独立CC), 未来 mux(多流骑一连接)省开销+共享CC(P4)。
+
+## 调参找最大吞吐 (2026-08-23, CN2→US 167ms, 丢包5%→20%波动)
+**窗口是长肥路径主杠杆**: 单流随 MIRAGE_QUIC_WND 线性涨 16→32→64MB = 15.8→27.7→37.7 MB/s。
+**WND=64 甜点** (10并发稳定~50); **128MB 过大→10流叠加丢包路径巨量过冲→崩溃~0** (需 P4 共享瓶颈协调)。
+**丢包越高优势越大**: 5%时 QUIC~2x TCP (erasure≈stock), **20%时 QUIC~47 vs TCP~6.6 = ~7-8x** (erasure关键)。
+**最大吞吐配方 = WND=64 + ~10并发 + erasure**。默认16MB安全(并发不崩), 高BDP独占手动调64榨单流。⚠️大窗口吃内存。
+
+## sysctl rmem 调优 = 这些路径上无效 (2026-08-23, US↔CN2 负结果)
+调 CN2(收端) rmem_max/default 8MB/208KB → 64MB, 单流 30→30.6、10并发 43→45 MB/s = **噪声内, 无效**。
+根因: 链路/CC限速(~45MB/s)非缓冲限速; **BDP=45MB/s×167ms≈7.5MB ≈ 旧buffer 8MB 已够**。
+规则: **rmem 只在 BDP(带宽×RTT) > socket buffer 时才起作用** —— 这些 VPS(~500Mbps/150ms, BDP~7-9MB)
+默认 8-48MB buffer 已覆盖。1Gbps+ 或超长RTT 才需调。⚠️也证早先 50MB/s 结果非被 rmem 隐藏限速。
+线路类型(163/CN2GT/GIA)无需不同参数: erasure CC 自测floor自适应(GIA→纯BBR, 163高丢包→激进补偿,
+floor/excess拆分正好对上线路差异)。TCP fake-TLS主链路则吃 bbr+fq(未测,已知)。
+
+## How to apply
+接此 epic 时先读 `docs/quic-transport-design.md`, 直接研读 queqiao `internal/congestion/erasure.go` +
+`internal/fec/rate.go`. 与 Mirage 现 TCP-Brutal 并存不替换 (TCP 仍抗封锁主力, UDP 传输是链路好时更快选项).

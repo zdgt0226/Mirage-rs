@@ -95,6 +95,7 @@ cargo build --release                             # 纯用户态版 (默认, 含
 cargo build --release --features ebpf             # 含 eBPF 透明网关 (需 clang + llvm)
 cargo build --release --no-default-features        # headless: 剔掉整个 Web 看板 (无 axum/HTTP 面)
 # headless + ebpf: cargo build --release --no-default-features --features ebpf
+cargo build --release --features quic              # 含 QUIC 实验传输 (transport:"quic"; ⚠️ P0 不隐蔽)
 ```
 
 > **Web 看板走 `gui` 编译特性 (默认开)。** 纯服务端/无面板部署可 `--no-default-features` 把整个
@@ -381,7 +382,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)
 - [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道
 - [~] **链式代理 / WG·SS 双向** —— SS 双向 (入站+出站) · Mirage 套娃 · SS-over-Mirage 已做 (v0.8.1); **WG 入站**改用"干净设备"落地 (内核 WG 服务端 + 现有 eBPF 透明网关, install.sh 选项 7, 非 boringtun responder) —— 见上方「干净设备接入」。剩自定义转发编排增强
-- [ ] **UDP mux → QUIC Datagram** —— TCP-mux 已解带机量 (v0.9.0); QUIC 版解跨流队头阻塞 + 实时质量, 大工程
+- [~] **UDP mux → QUIC Datagram** —— TCP-mux 已解带机量 (v0.9.0); QUIC 版解跨流队头阻塞 + 实时质量, 大工程 (吸收 queqiao, 见 `docs/quic-transport-design.md`)。**P0 骨架 + P3 erasure CC 首版已做** (未发版, `--features quic` 默认关): 运行时开关 `transport: "quic"` 两端同设, QUIC 承载 Mirage fake-TLS+AEAD (Model Y), 与 TCP 主链路并存。**erasure-aware CC** (`ErasureController` 包 BBR, 测 floor + 忽略纯 erasure + 窗口补偿) —— **真机 china-us (27% 丢包) A/B: stock quinn 28KB/s → erasure 2.1MB/s (~75-100x), 追平 TCP 且更稳**。⚠️ 指纹仿真 (P1) 未做, 勿用于敌对网络; FEC (P2) + pacing 层后续。release 二进制暂不含
 - [~] **ICMP 处理** —— ①fake-IP echo **本地反射已做** (未发版): LAN 客户端 `ping` 被代理域名可通 —— `tc_divert` 就地把 fake-IP 段的 Echo Request 翻成 Echo Reply 弹回 (RTT 是本机假值, 对齐 Clash/sing-box fake-ip ping)。②真隧道 ICMP (端到端真 RTT) **评估后暂不做**: 捕获路径 (AF_PACKET / TUN / 无) 均需真机验证, TUN 违背 TUN-free eBPF 定位, 边际价值低 (应用走 TCP)。本机自身 ping fake-IP 不经 tc ingress, 暂不覆盖。
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
 - [x] **隧道 relay 缓冲/合帧再调** —— 客户端**上行**已对称服务端 download 加 64KB heap buf + greedy `try_read` 收割 (修上下行不对称的上传碎片, 未发版)。**BufWriter/全局 read 灌大 (256KB) 评估后不做**: loopback bench 证明 relay 是 crypto CPU-bound 非 syscall-bound (见下 io_uring 条), 灌大不解瓶颈反增 warm 池空闲内存

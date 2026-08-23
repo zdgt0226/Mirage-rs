@@ -189,6 +189,16 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// 解析 —— 校验器在有 transparent 开启 dns_hijack 时会把它登记为已知 tag。
 pub const DNS_HIJACK_INBOUND_TAG: &str = "dns-hijack";
 
+/// Mirage 隧道的底层传输。默认 `tcp` (fake-TLS-over-TCP, 主链路)。`quic` 为实验传输
+/// (P0, 需 `--features quic` 编译; 见 docs/quic-transport-design.md)。两端须同设。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    #[default]
+    Tcp,
+    Quic,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundConfig {
@@ -240,6 +250,17 @@ pub enum InboundConfig {
         /// **两端必须同开** (改了会话密钥派生, 一端开一端没开会解密失败)。默认关 (向后兼容)。
         #[serde(default)]
         pfs: bool,
+        /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
+        #[serde(default)]
+        transport: Transport,
+        /// QUIC 流控窗口 (MB, 默认 16)。长肥路径 (高 RTT) 上调大提升单流吞吐 (实测 64 为甜点);
+        /// 过大 (128+) 在并发+丢包下过冲反崩。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_window_mb: Option<u64>,
+        /// QUIC erasure-aware 拥塞控制 (默认开)。丢包路径上无视信道 erasure、补偿窗口 (实测 27% 丢包
+        /// 75x)。仅 transport=quic 生效。`MIRAGE_QUIC_CC=off` 环境变量可覆盖。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_erasure_cc: Option<bool>,
     },
     Mixed {
         tag: String,
@@ -298,6 +319,16 @@ pub enum OutboundConfig {
         /// 会话密钥派生, 失配会解密失败)。默认关 (向后兼容)。
         #[serde(default)]
         pfs: bool,
+        /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
+        #[serde(default)]
+        transport: Transport,
+        /// QUIC 流控窗口 (MB, 默认 16)。长肥路径调大提升单流吞吐 (64 甜点); 过大并发+丢包下过冲反崩。
+        /// 仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_window_mb: Option<u64>,
+        /// QUIC erasure-aware CC (默认开)。仅 transport=quic。`MIRAGE_QUIC_CC=off` 可覆盖。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_erasure_cc: Option<bool>,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。

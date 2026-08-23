@@ -139,3 +139,76 @@ pub async fn start_server(
         }
     }
 }
+
+/// QUIC 服务端 (P0 实验, `--features quic`)。监听 UDP, 每条双向流当一条隧道, 复用 TCP 路径的
+/// 握手/鉴权/中继逻辑 (经 handle_connection_quic → run_handshake 泛型)。brutal/eBPF sockops RTT
+/// 是 TCP 内核特性, QUIC 不适用故不接。⚠️ 指纹不隐蔽, 见 docs/quic-transport-design.md。
+#[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
+pub async fn start_quic_server(
+    listen_addr: &str,
+    password: &str,
+    camouflage_host: &str,
+    auth_ts_tolerance_secs: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    pfs: bool,
+    quic_window_mb: u64,
+    quic_erasure_cc: bool,
+) {
+    let addr: std::net::SocketAddr = match listen_addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            error!("Mirage QUIC Server: listen 地址须为 IP:port ({}): {}", listen_addr, e);
+            return;
+        }
+    };
+    let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_erasure_cc) {
+        Ok(ep) => ep,
+        Err(e) => {
+            error!("Mirage QUIC Server: 绑定失败 {}: {:#}", listen_addr, e);
+            return;
+        }
+    };
+    info!("Mirage QUIC Server listening on {} (UDP, 实验传输 · auth 容差 ±{}s)", listen_addr, auth_ts_tolerance_secs);
+
+    let cam_pool = CamouflagePool::new(camouflage_host.to_string());
+    crate::crypto::handshake_cache::prewarm(camouflage_host).await;
+    let password = password.to_string();
+
+    while let Some(incoming) = endpoint.accept().await {
+        let pwd = password.clone();
+        let cam = camouflage_host.to_string();
+        let pool = cam_pool.clone();
+        let up = upstream.clone();
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(_) => return, // QUIC 握手失败 (对端非法/超时)
+            };
+            let peer = conn.remote_address();
+            if crate::blocklist::is_blocked(&peer.ip()) {
+                debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {}", peer.ip());
+                return;
+            }
+            // 一条 QUIC 连接可承载多条双向流 (每条 = 一条隧道)。逐条 accept_bi, 各自成 task。
+            loop {
+                match conn.accept_bi().await {
+                    Ok((send, recv)) => {
+                        let pwd2 = pwd.clone();
+                        let cam2 = cam.clone();
+                        let pool2 = pool.clone();
+                        let up2 = up.clone();
+                        tokio::spawn(async move {
+                            let stream = crate::proxy::quic::QuicBiStream::new(send, recv);
+                            handshake::handle_connection_quic(
+                                stream, peer, pwd2, cam2, pool2, auth_ts_tolerance_secs, up2, pfs,
+                            )
+                            .await;
+                        });
+                    }
+                    Err(_) => break, // 连接关闭
+                }
+            }
+        });
+    }
+}

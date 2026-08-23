@@ -2,6 +2,111 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC mux 架构 —— 一个连接多流 (治过冲崩溃 + 真共享瓶颈)
+
+把 P0 的"一条 Mirage 隧道 = 一条 QUIC 连接"改成 **所有隧道共享一个 QUIC 连接、各占一条 bi-stream**。
+这是「UDP mux → QUIC」epic 的核心, 也是 P4 想要而独立控制器做不到的真·共享瓶颈。
+
+- `QuicMux` (`src/proxy/quic.rs`): 持有 endpoint + 当前连接, 跨 `open_stream` 复用; 连接断了下次
+  `open_stream` 重拨。`WarmPool` 每个 quic 出站建一个 QuicMux; warming 照常预建隧道进队列, 但都是
+  同一连接上的流 (`handshake_over_quic` 用 `mux.open_stream()` 取代每次 dial 新连接)。
+- **服务端零改动** —— `start_quic_server` 早已 `accept_bi` 循环 (一条流一 handler)。
+- `max_concurrent_bidi_streams` 提到 2048 (默认 ~100 不够高并发代理)。
+- **真机验证 (CN2→US)**: **WND=128 从崩溃 (~0) 变稳定 ~41MB/s** —— 10/20 流共享一个连接的连接级
+  `receive_window` + **一个 CC**, 无 N× 过冲; 20 并发扩展平坦 ~41MB/s。WND=64 mux ~43 (vs pre-mux 独立
+  连接 ~50, 单 CC 略保守, 换来鲁棒 + 无过冲 + 省 per-conn 开销)。
+- 权衡: 一个连接 = 单点 (断则该服务器所有隧道齐掉, 靠 `open_stream` 重拨 + 池 stale 检测/handler
+  重试恢复)。Model X (QUIC 即混淆、内层瘦认证) 与 per-stream fake-TLS 精简是后续。
+
+### feat(transport): QUIC ALPN → h3 + P1 指纹仿真方案 (P1 首步)
+
+- **ALPN `mirage-p0` → `h3`**: QUIC Initial 的 ClientHello 明文可读, "mirage-p0" 是活靶子; 改真 h3
+  ALPN 混进浏览器 QUIC 人群。**必要但远不充分**。
+- **P1 完整指纹仿真仍未做** (见 `docs/quic-transport-design.md §7`): 核心是 Initial 内 TLS1.3
+  ClientHello 的扩展顺序/GREASE 字节级仿真, 卡在 **rustls 不暴露该控制 + Rust 无成熟 uQUIC/uTLS**。
+  三条路 (patch rustls[倾向] / quiche-BoringSSL / 等 Rust-uTLS), 均非小工程, 列为独立 epic。
+- ⚠️ **QUIC 路径当前不隐蔽, 勿用于敌对网络** —— 直到 ClientHello 字节级仿真 (P1) 落地。
+
+### feat(transport): QUIC erasure CC 抗过冲 damping (P4a)
+
+erasure 控制器加**拥塞压力 damping**: 拥塞信号 (excess = p−floor) 出现时把窗口补偿从满 inflation
+收敛回 1x (纯 BBR)。纯 erasure 路径 (excess≈0, 如 china-us 27% 独立丢包) 满补偿不变、75x 保住;
+队列建立时退补偿, 减少单控制器过冲。**加法安全, 不回归已验路径**。
+
+- ⚠️ **不解决超大窗口 (128MB+) 崩溃** —— 真机实测 128MB×10 流仍崩, 因巨大流控窗口在 CC 反应前就
+  允许远超 BDP 的在途量。治本靠"别设超大窗口"(默认 16, 荐 ≤64) + 未来 **mux 架构** (多流骑一 QUIC
+  连接、一个 CC)。真正的**跨连接共享瓶颈** (queqiao PathModel) 受 quinn Controller API 无 peer 上下文
+  所限, 也需 mux 才能干净实现 —— 列为后续 epic。
+
+### feat(transport): QUIC 窗口/CC 进 config (免手动 env)
+
+真机调参 (见 docs §5.3) 确定的最优旋钮写进配置, 不再依赖 `MIRAGE_QUIC_*` 环境变量:
+
+- `mirage`/`mirage_server` 新增 `quic_window_mb` (默认 16, 长肥独占场景调 64 榨单流吞吐; 过大
+  128+ 在并发+丢包下过冲反崩) + `quic_erasure_cc` (默认 true)。仅 `transport=quic` 生效, 两端各配。
+- 环境变量 `MIRAGE_QUIC_WND` / `MIRAGE_QUIC_CC=off` 仍优先覆盖 (供真机 A/B 快速调参)。
+
+### fix(transport): QUIC 流控窗口调大 (长肥管道单流不再被卡死)
+
+海外 US↔JP 真机 (111ms RTT / 0% 丢包 / 干净高带宽) 暴露: quinn 默认流控窗口 (~1MB 级) 在长肥
+管道上把**单流**卡死。`transport_config` 显式放大 `stream_receive_window` (默认 16MB) +
+`receive_window`/`send_window` (×4), 可 `MIRAGE_QUIC_WND` (MB) 覆盖。
+
+- **真机 A/B (US↔JP, 500MB 下载)**:
+
+  | 场景 | QUIC | TCP |
+  |---|---|---|
+  | 默认小窗口·单流 | 7.5–9 MB/s (窗口卡死) | 48 MB/s |
+  | **16MB 窗口·单流** | **37 MB/s** | 36–51 MB/s |
+  | 4 并发聚合 | **52 MB/s** | 50 MB/s |
+
+  调窗后 **QUIC 追平 TCP**, 双双撞链路/CPU 上限 (~400Mbps)。erasure CC 在干净路径 floor≈0 自动
+  退化纯 BBR、不伤性能。⚠️ 大窗口更吃内存 (每连接), 受限设备可 `MIRAGE_QUIC_WND` 调小。
+
+### feat(transport): QUIC erasure-aware 拥塞控制 P3 (实验, `--features quic`)
+
+给 QUIC 传输加 **erasure-aware CC** (吸收 queqiao ErasureSender), 解 P0 真机暴露的致命问题:
+quinn 默认 CC 在独立 erasure 丢包上把信道底噪当拥塞、环路自我归零。
+
+- `src/proxy/quic_cc.rs`: `ErasureController` 包 quinn 内置 BBR, 两处修正 (见 `docs/quic-transport-design.md §2.1`):
+  ① 测 **erasure floor** (丢包率 p 的下包络), 纯 erasure (p≈floor) 的 congestion event **吞掉不传 BBR**;
+  ② 窗口按 **1/(1-floor)** 补偿 erasure 损耗 (封顶 3.3x)。校准前 (样本<20 间隔) 透传=纯 BBR。
+- 挂到 quinn `TransportConfig::congestion_controller_factory` (client+server 双向)。默认启用;
+  `MIRAGE_QUIC_CC=off` 回退原生 CC (供 A/B)。加 `quinn-proto` dep (RttEstimator 类型)。
+- **真机 A/B (china-us, 27% 独立丢包 / RTT 157ms)**:
+
+  | CC | 50MB 下载吞吐 |
+  |---|---|
+  | stock quinn (P0) | ~28 KB/s |
+  | **erasure (P3)** | **~2.1 MB/s (稳定)** |
+  | TCP 基线 | 0.5–2.9 MB/s (波动大) |
+
+  **erasure CC ≈ 75-100x 提升**, QUIC 追平 TCP 且更稳。P3a 首版验证成立。
+- ⚠️ 仍是 P0/P3 实验层: 指纹不隐蔽 (P1 未做)。窗口补偿是首版近似 (未做 queqiao 的 pacing 层 /(1-p)),
+  后续可细化。
+
+### feat(transport): QUIC 传输 P0 (实验, `--features quic`, 默认关)
+
+给 Mirage 隧道加**可选 QUIC 底层传输**, 运行时开关 `transport: "quic"` (两端同设), 与默认
+TCP fake-TLS 主链路**并存不替代**。对应 roadmap「UDP mux → QUIC Datagram」epic 的 P0 骨架
+(吸收 queqiao, 见 `docs/quic-transport-design.md`)。
+
+- **Model Y (P0 抄近路)**: QUIC 只做底层字节管道, 上面照跑 Mirage 现有 fake-TLS 握手 + AEAD +
+  TCP/UDP relay。一条 QUIC 双向流 = 一条隧道, 语义等价一条 TCP。**协议逻辑零改动**。
+- 新模块 `src/proxy/quic.rs`: 客户端 `dial` (quinn Endpoint + open_bi, read 半程锚定 endpoint
+  生命周期) · 服务端 `server_endpoint` (rcgen 自签, P0 客户端不校验证书——认证在内层 Mirage) ·
+  `QuicBiStream` 适配器 (合 send/recv 成 AsyncRead+AsyncWrite, 供握手阶段)。
+- **服务端数据面泛型化**: `handle_connection` 抽出传输无关的 `run_handshake<S>` (握手/鉴权/模板
+  回放/tail 泛型), TCP 入口走 `into_split`→`TunnelRead::Tcp` (静态分发+无锁, **TCP 热路径零回归**),
+  QUIC 入口走 `QuicBiStream::into_halves`→`Boxed`。dispatch + relay 签名由 `OwnedReadHalf/WriteHalf`
+  改 `TunnelRead/TunnelWrite` enum (复用客户端已有抽象); camouflage auth-fail 路径泛型化。
+- **cargo 特性 `quic`** (默认关): quinn 0.11 + rustls 0.23 (复用树内版本, `rustls-ring` 保持纯 Rust
+  交叉编译) + rcgen 自签。release 二进制**暂不含** (P0 实验, 隐蔽性未做, 见下)。
+- ⚠️ **P0 不隐蔽**: quinn 默认 QUIC 指纹裸奔, 证书自签不校验。**勿用于敌对网络。** 指纹仿真
+  (path A: patch rustls 对齐浏览器 QUIC) 是 P1 的活。走 UDP 的理由是烂链路性能, 非隐蔽。
+- 端到端测试 `tests/test_quic_e2e.rs` (feature-gated): SOCKS5 → mirage-over-QUIC → direct → echo
+  真实往返 (本地 camouflage 免外网)。default + quic 双构建 clippy 绿, 354 lib 全测试绿。
+
 ## [v0.10.1] - 用户策略 (不同用户匹配不同规则) + gui 编译特性 (2026-08-23)
 
 - **用户策略 (device profiles)**: `routing.profiles` 命名策略 + `routing.device_profiles` 设备→策略,
