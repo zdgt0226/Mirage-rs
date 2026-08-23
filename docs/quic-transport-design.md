@@ -194,6 +194,12 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 - **两路径合看**: 烂链路 (china-us 27% 丢包) 靠 **erasure CC** (28KB/s→2.1MB/s); 干净长肥路径 (US↔JP)
   靠 **大流控窗口** (9→37MB/s)。两项都需要, QUIC 才在两种 regime 都不输 TCP。⚠️ 大窗口更吃内存。
 
+- **高并发 (10 并发, US↔JP, 200MB×10)**: 聚合多轮 QUIC 54.9/92.6/52.8 (中位~55) vs TCP 42.8/43.5/18.4
+  (中位~43) MB/s。**QUIC 10 并发扩展良好、中位 ≥ TCP 且更稳** (TCP 有 18.4 低谷; QUIC 低谷 52.8, 峰
+  92.6≈740Mbps)。**非 CPU 瓶颈** (单核服务端 mirage 峰值 12%)、非窗口、非内存 (客户端 10 连接 VmRSS
+  峰 130MB)。撞共享链路容量 + 自然方差。**注**: P0 是"一 Mirage 隧道=一 QUIC 连接" (10 并发=10 独立
+  连接/CC/crypto); 未来 mux 版 (多流骑一 QUIC 连接) 可省 per-conn 开销 + 共享 CC (P4)。
+
 ## 6. 结论
 
 queqiao ≈ Mirage「UDP mux → QUIC」epic 的**参考实现**，且解决 Mirage 最大痛点（Brutal 手填速率

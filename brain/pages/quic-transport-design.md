@@ -58,6 +58,8 @@ China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features 
 (MIRAGE_QUIC_WND 可调) + receive/send ×4 → **单流 37MB/s 追平 TCP; 4并发聚合 52MB/s = 链路/CPU 上限**。
 **两路径合看**: 烂链路靠 erasure CC (china-us 28KB→2.1MB), 干净长肥靠大窗口 (US↔JP 9→37MB)。两项都需要。
 ⚠️ 大窗口吃内存 (每连接), 受限设备调小。
+**10 并发 (US↔JP)**: QUIC 聚合中位 ~55MB/s (峰92.6=740Mbps) ≥ TCP ~43 且更稳; 非CPU(服务端12%)/非内存(客户端130MB)。
+撞链路容量+方差。P0=一隧道一QUIC连接(10并发=10独立CC), 未来 mux(多流骑一连接)省开销+共享CC(P4)。
 
 ## How to apply
 接此 epic 时先读 `docs/quic-transport-design.md`, 直接研读 queqiao `internal/congestion/erasure.go` +
