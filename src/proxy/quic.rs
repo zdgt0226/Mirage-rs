@@ -34,6 +34,9 @@ fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig
     tc.stream_receive_window(quinn::VarInt::from_u64(stream_wnd).unwrap_or(quinn::VarInt::MAX));
     tc.receive_window(quinn::VarInt::from_u64(conn_wnd).unwrap_or(quinn::VarInt::MAX));
     tc.send_window(conn_wnd);
+    // mux 架构: 一个连接承载多条流 (每条=一条隧道), 服务端须允许客户端开足够多的并发双向流
+    // (quinn 默认 ~100, 高并发代理不够)。这是对端向本端advertise的上限, 故 client+server 都设。
+    tc.max_concurrent_bidi_streams(quinn::VarInt::from_u32(2048));
 
     let erasure = match std::env::var("MIRAGE_QUIC_CC").ok().as_deref() {
         Some("off" | "bbr" | "default" | "stock") => false,
@@ -51,35 +54,77 @@ fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig
 
 // ───────────────────────── 客户端 ─────────────────────────
 
-/// 建一个 QUIC 客户端 endpoint (绑临时本地 UDP 口) + 拨号 server:port, 开一条双向流。
-/// 返回 (send, recv 带 endpoint)。read 半程 `OwnedRecv` 持有 endpoint, 让它活到隧道结束
-/// (endpoint 一旦 drop 会关闭其上所有连接; 挂在 read 半程上生命周期与隧道对齐, 不泄漏)。
-pub async fn dial(host: &str, port: u16, window_mb: u64, erasure: bool) -> Result<(quinn::SendStream, OwnedRecv)> {
-    let addr = resolve(host, port).await?;
-    // 绑定与目标同族的通配地址 (v6 目标绑 [::], v4 目标绑 0.0.0.0)。
-    let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
-    let mut endpoint = quinn::Endpoint::client(bind).context("QUIC: 建客户端 endpoint 失败")?;
-    endpoint.set_default_client_config(client_config(window_mb, erasure)?);
-
-    // server_name 用配置的 host (SNI)。P0 证书不校验, 值不影响握手成败。
-    let conn = endpoint
-        .connect(addr, host)
-        .context("QUIC: connect 配置无效")?
-        .await
-        .context("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)")?;
-    let (send, recv) = conn.open_bi().await.context("QUIC: open_bi 失败")?;
-    Ok((send, OwnedRecv { recv, _endpoint: endpoint }))
+/// QUIC mux (P4/mux 架构): **一个共享 QUIC 连接承载多条 bi-stream** (每条 = 一条 Mirage 隧道),
+/// 取代 P0 的"一隧道一连接"。收益: 服务端每客户端只见一个连接 = 一个 CC = 天然共享瓶颈, 连接级
+/// receive_window 封顶聚合在途量 (治多连接过冲/128MB 崩溃); 省 per-conn crypto/CC/UDP-flow 开销。
+///
+/// endpoint + 当前连接存在内部, 跨 open_stream 复用; 连接死了 (close_reason) 下次 open_stream 重拨。
+pub struct QuicMux {
+    inner: tokio::sync::Mutex<MuxInner>,
+    host: String,
+    port: u16,
+    window_mb: u64,
+    erasure: bool,
 }
 
-/// QUIC 客户端读半程 + 持有 endpoint (生命周期锚)。仅委托 AsyncRead。
-pub struct OwnedRecv {
-    recv: quinn::RecvStream,
-    _endpoint: quinn::Endpoint,
+#[derive(Default)]
+struct MuxInner {
+    endpoint: Option<quinn::Endpoint>,
+    conn: Option<quinn::Connection>,
 }
 
-impl AsyncRead for OwnedRecv {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.recv).poll_read(cx, buf)
+impl QuicMux {
+    pub fn new(host: &str, port: u16, window_mb: u64, erasure: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: tokio::sync::Mutex::new(MuxInner::default()),
+            host: host.to_string(),
+            port,
+            window_mb,
+            erasure,
+        })
+    }
+
+    /// 在共享连接上开一条 bi-stream。首次/断线时惰性建 endpoint + 拨号。
+    pub async fn open_stream(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+        let conn = {
+            let mut g = self.inner.lock().await;
+            // 惰性建 endpoint (绑与目标同族的通配口)。
+            if g.endpoint.is_none() {
+                let addr = resolve(&self.host, self.port).await?;
+                let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
+                let mut ep = quinn::Endpoint::client(bind).context("QUIC: 建客户端 endpoint 失败")?;
+                ep.set_default_client_config(client_config(self.window_mb, self.erasure)?);
+                g.endpoint = Some(ep);
+            }
+            // 连接不存在或已关 → 重拨。
+            let need_dial = match &g.conn {
+                None => true,
+                Some(c) => c.close_reason().is_some(),
+            };
+            if need_dial {
+                let addr = resolve(&self.host, self.port).await?;
+                let ep = g.endpoint.as_ref().unwrap();
+                let conn = ep
+                    .connect(addr, &self.host)
+                    .context("QUIC: connect 配置无效")?
+                    .await
+                    .context("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)")?;
+                g.conn = Some(conn);
+            }
+            g.conn.as_ref().unwrap().clone() // Connection 是 Arc, clone 廉价
+        }; // 释放锁再 await open_bi (可能因对端 MAX_STREAMS 挂起, 不能占锁)
+
+        match conn.open_bi().await {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                // 连接死了 → 清掉, 下次 open_stream 重拨。
+                let mut g = self.inner.lock().await;
+                if g.conn.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+                    g.conn = None;
+                }
+                Err(anyhow::anyhow!("QUIC: open_bi 失败 (连接已断): {e}"))
+            }
+        }
     }
 }
 

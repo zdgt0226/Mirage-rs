@@ -369,6 +369,14 @@ impl WarmPool {
         let stats = Arc::new(RwLock::new(PoolStats::new()));
         let metrics = Arc::new(PoolMetrics::new());
 
+        // mux 架构: transport=quic 时建一个共享 QUIC mux (一个连接开多流)。TCP 路径无。
+        #[cfg(feature = "quic")]
+        let quic_mux = if cfg.transport == crate::config::Transport::Quic {
+            Some(crate::proxy::quic::QuicMux::new(&cfg.server_host, cfg.server_port, cfg.quic_window_mb, cfg.quic_erasure_cc))
+        } else {
+            None
+        };
+
         let pool = Self {
             queue: queue.clone(),
             notify: notify.clone(),
@@ -498,7 +506,9 @@ impl WarmPool {
         let target_clone_builder = target_size.clone();
         let stats_builder = stats.clone();
         let brutal_state_builder = brutal_state.clone();
-        
+        #[cfg(feature = "quic")]
+        let quic_mux_builder = quic_mux.clone();
+
         tokio::spawn(async move {
             info!("WarmPool (Elastic) initialized. Max capacity: {}", cfg_clone.pool_size);
             let mut next_build_at = Instant::now();
@@ -532,10 +542,16 @@ impl WarmPool {
                 let in_flight_task = in_flight_clone.clone();
                 let stats_task = stats_builder.clone();
                 let bs_task = brutal_state_builder.clone();
+                #[cfg(feature = "quic")]
+                let mux_task = quic_mux_builder.clone();
 
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    match Self::connect_upstream(&cfg_task, &bs_task).await {
+                    #[cfg(feature = "quic")]
+                    let conn_res = Self::connect_upstream(&cfg_task, &bs_task, mux_task.as_ref()).await;
+                    #[cfg(not(feature = "quic"))]
+                    let conn_res = Self::connect_upstream(&cfg_task, &bs_task).await;
+                    match conn_res {
                         Ok(tunnel) => {
                             let elapsed = start.elapsed().as_millis() as u64;
                             stats_task.write().unwrap_or_else(|e| e.into_inner()).record_latency(elapsed);
@@ -560,13 +576,20 @@ impl WarmPool {
     }
 
     /// 核心握手逻辑：建立 TCP 并包装 AEAD Crypto 层
-    async fn connect_upstream(cfg: &PoolConfig, brutal_state: &BrutalState) -> Result<Tunnel> {
+    async fn connect_upstream(
+        cfg: &PoolConfig,
+        brutal_state: &BrutalState,
+        #[cfg(feature = "quic")] quic_mux: Option<&Arc<crate::proxy::quic::QuicMux>>,
+    ) -> Result<Tunnel> {
         // 建连 + 伪装握手 + 派生密钥: 默认物理 TCP; 配了 underlying 则经该出站拨号 (Mirage-over-X);
         // transport=quic 则走 QUIC (实验, 忽略 underlying/brutal)。
         let (mut crypto_reader, mut crypto_writer) = match cfg.transport {
             crate::config::Transport::Quic => {
                 #[cfg(feature = "quic")]
-                { Self::handshake_over_quic(cfg).await? }
+                {
+                    let mux = quic_mux.ok_or_else(|| anyhow::anyhow!("transport=quic 但 QuicMux 未初始化"))?;
+                    Self::handshake_over_quic(cfg, mux).await?
+                }
                 #[cfg(not(feature = "quic"))]
                 { anyhow::bail!("transport=quic 需以 `--features quic` 编译 (见 docs/quic-transport-design.md)") }
             }
@@ -728,19 +751,21 @@ impl WarmPool {
         })
     }
 
-    /// QUIC 传输握手 (P0 实验): 拨号 QUIC + 开双向流, 上面照跑 fake-TLS 握手 (Model Y)。
-    /// 无裸 fd → 无 brutal/nodelay (QUIC 自带 CC); 返回 Boxed 变体隧道。
+    /// QUIC 传输握手 (mux 架构): 在共享 QUIC 连接上开一条 bi-stream, 上面照跑 fake-TLS 握手 (Model Y)。
+    /// 无裸 fd → 无 brutal/nodelay (QUIC 自带 CC); 返回 Boxed 变体隧道。endpoint/连接由 QuicMux 持有,
+    /// 故半程直接 Box (无需 OwnedRecv 锚定)。
     #[cfg(feature = "quic")]
     async fn handshake_over_quic(
         cfg: &PoolConfig,
+        mux: &Arc<crate::proxy::quic::QuicMux>,
     ) -> Result<(CryptoReader<TunnelRead>, CryptoWriter<TunnelWrite>)> {
         let (mut write_half, mut read_half) = timeout(
             Duration::from_secs(15),
-            crate::proxy::quic::dial(&cfg.server_host, cfg.server_port, cfg.quic_window_mb, cfg.quic_erasure_cc),
+            mux.open_stream(),
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("QUIC connect to {}:{} timed out (15s)", cfg.server_host, cfg.server_port)
+            anyhow::anyhow!("QUIC open_stream to {}:{} timed out (15s)", cfg.server_host, cfg.server_port)
         })??;
         let hs = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
         Ok(match hs.ecdh {

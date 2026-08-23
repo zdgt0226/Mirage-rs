@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC mux 架构 —— 一个连接多流 (治过冲崩溃 + 真共享瓶颈)
+
+把 P0 的"一条 Mirage 隧道 = 一条 QUIC 连接"改成 **所有隧道共享一个 QUIC 连接、各占一条 bi-stream**。
+这是「UDP mux → QUIC」epic 的核心, 也是 P4 想要而独立控制器做不到的真·共享瓶颈。
+
+- `QuicMux` (`src/proxy/quic.rs`): 持有 endpoint + 当前连接, 跨 `open_stream` 复用; 连接断了下次
+  `open_stream` 重拨。`WarmPool` 每个 quic 出站建一个 QuicMux; warming 照常预建隧道进队列, 但都是
+  同一连接上的流 (`handshake_over_quic` 用 `mux.open_stream()` 取代每次 dial 新连接)。
+- **服务端零改动** —— `start_quic_server` 早已 `accept_bi` 循环 (一条流一 handler)。
+- `max_concurrent_bidi_streams` 提到 2048 (默认 ~100 不够高并发代理)。
+- **真机验证 (CN2→US)**: **WND=128 从崩溃 (~0) 变稳定 ~41MB/s** —— 10/20 流共享一个连接的连接级
+  `receive_window` + **一个 CC**, 无 N× 过冲; 20 并发扩展平坦 ~41MB/s。WND=64 mux ~43 (vs pre-mux 独立
+  连接 ~50, 单 CC 略保守, 换来鲁棒 + 无过冲 + 省 per-conn 开销)。
+- 权衡: 一个连接 = 单点 (断则该服务器所有隧道齐掉, 靠 `open_stream` 重拨 + 池 stale 检测/handler
+  重试恢复)。Model X (QUIC 即混淆、内层瘦认证) 与 per-stream fake-TLS 精简是后续。
+
 ### feat(transport): QUIC ALPN → h3 + P1 指纹仿真方案 (P1 首步)
 
 - **ALPN `mirage-p0` → `h3`**: QUIC Initial 的 ClientHello 明文可读, "mirage-p0" 是活靶子; 改真 h3

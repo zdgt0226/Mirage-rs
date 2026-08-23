@@ -134,7 +134,11 @@ GFW 抓两类流量靠不同机制:
    首版仅做窗口层补偿, 未做 pacing 层 /(1-p) 与共享瓶颈模型, 后续细化。
 4. **P2 选择性 FEC**：移植 2.2（Reed-Solomon，Class bulk/interactive，block 受 RTT 上界，residual 非
    零留给重传）。真机烂链路验恢复率 vs 额外 parity 开销。
-5. **P4 共享瓶颈模型 + 保护交互流**：2.3 多流共享 CC/floor + queqiao cross-flow scheduling。
+5. **mux 架构** ✅ **已实现** (未发版)：一个共享 QUIC 连接承载多条 bi-stream (每条=一条隧道), 取代
+   "一隧道一连接"。**服务端每客户端就一个连接 = 一个 CC = 天然共享瓶颈** (P4 想要而独立控制器做不到
+   的), 连接级 receive_window 封顶聚合在途量。**真机治好 128MB 过冲崩溃** (WND128 从 ~0 变稳定 ~41MB/s,
+   20 并发扩展平坦)。`QuicMux` + WarmPool 集成, 服务端零改动 (早已 accept_bi 多流)。见 §5.4。
+5b. **P4 保护交互流**：queqiao cross-flow scheduling (控制/新交互流优先于 bulk) —— mux 之上做流优先级。
 6. **P1 指纹仿真** (path A: patch rustls)：抗检测。真机已证 UDP 可达 + erasure CC 有价值后再投。
 
 ## 5. 风险 / 边界
@@ -259,6 +263,22 @@ TLS1.3 ClientHello (cipher/扩展顺序/GREASE/key_share)** ④SNI (需真 front
 UDP 端口 China→US **未被封** (P0 三台真机), erasure CC + 大窗口在丢包/长肥路径**已证有价值** —— 
 即"先证 UDP 可达 + 传输值得, 再投指纹重工"的 gate 已过。**P1 是让 QUIC 能扛主动检测/封锁的前提,
 建议作为独立 epic 立项** (path A)。在它落地前, QUIC 传输只作"链路好且不担心指纹时更快"的 opt-in。
+
+### 5.4 mux 架构真机验证 (2026-08-23, CN2→US)
+
+把"一隧道一 QUIC 连接"改为"多流骑一共享连接"后, 同 CN2→US 路径:
+
+| 场景 | pre-mux (独立连接) | mux (共享连接) |
+|---|---|---|
+| WND=64 10 并发 | ~50 MB/s | ~43 MB/s (单 CC 略保守) |
+| **WND=128 10 并发** | **崩溃 ~0** (10×窗口过冲) | **~41 MB/s 稳定** ✅ |
+| 20 并发 | (未测, 预期更崩) | ~41 MB/s 平坦扩展 |
+
+- **根因治愈**: 服务端每客户端只见一个 QUIC 连接 → **一个 CC + 一个连接级 receive_window** 封顶所有流
+  的聚合在途量, 不再是 N 条独立连接各自过冲。这正是 §7 里说"真共享瓶颈受 quinn Controller API 无 peer
+  上下文所限、需 mux 才能干净实现"的兑现 —— **mux 用架构解决了 P4 独立控制器解决不了的问题**。
+- 权衡: 单 CC 比 N 条独立连接抢带宽略保守 (WND64 43 vs 50); 一个连接是单点 (断则齐掉, 靠重拨+池
+  stale/handler 重试恢复)。换来无过冲崩溃 + 高并发省 per-conn 开销 + 天然共享瓶颈。
 
 ## 6. 结论
 
