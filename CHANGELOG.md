@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC erasure CC 抗过冲 damping (P4a)
+
+erasure 控制器加**拥塞压力 damping**: 拥塞信号 (excess = p−floor) 出现时把窗口补偿从满 inflation
+收敛回 1x (纯 BBR)。纯 erasure 路径 (excess≈0, 如 china-us 27% 独立丢包) 满补偿不变、75x 保住;
+队列建立时退补偿, 减少单控制器过冲。**加法安全, 不回归已验路径**。
+
+- ⚠️ **不解决超大窗口 (128MB+) 崩溃** —— 真机实测 128MB×10 流仍崩, 因巨大流控窗口在 CC 反应前就
+  允许远超 BDP 的在途量。治本靠"别设超大窗口"(默认 16, 荐 ≤64) + 未来 **mux 架构** (多流骑一 QUIC
+  连接、一个 CC)。真正的**跨连接共享瓶颈** (queqiao PathModel) 受 quinn Controller API 无 peer 上下文
+  所限, 也需 mux 才能干净实现 —— 列为后续 epic。
+
 ### feat(transport): QUIC 窗口/CC 进 config (免手动 env)
 
 真机调参 (见 docs §5.3) 确定的最优旋钮写进配置, 不再依赖 `MIRAGE_QUIC_*` 环境变量:

@@ -23,8 +23,17 @@ const MIN_SAMPLES: u32 = 20; // 校准前透传 (≈20 个 RTT 间隔, china-us 
 const ALPHA: f64 = 0.25; // p 的 EWMA 系数
 const LEAK: f64 = 0.003; // floor 每间隔的上漏 (路径变好时慢慢遗忘旧低点)
 const MARGIN: f64 = 0.05; // p 超 floor 多少才算真拥塞
-const FLOOR_CAP: f64 = 0.7; // 补偿封顶 (1/(1-0.7)=3.3x); queqiao minArrival 0.15≈6.6x, 这里保守
+const FLOOR_CAP: f64 = 0.7; // 补偿封顶 (1/(1-0.7)=3.3x)。真机 27% 丢包 75x 靠此激进补偿, 勿降
+                            // (过冲防护交给下面的 damping, 纯 erasure 路径不受影响)
 const MIN_INTERVAL: Duration = Duration::from_millis(20);
+// P4a 抗过冲 (加法安全, 不改纯 erasure 路径): 拥塞信号 (excess = p-floor) 出现时把窗口补偿从满
+// inflation 收敛回 1x (纯 BBR)。纯 erasure (excess≈0, 如 china-us 27% 独立丢包) 满补偿不变、75x 保住;
+// 队列建立 (excess>0) 时退补偿, 减少单控制器过冲。
+// ⚠️ 不解决超大窗口 (128MB+) 的崩溃 —— 那是巨大流控窗口本身在 CC 反应前就允许远超 BDP 的在途量
+// (真机实测 128MB×10 流仍崩), 治本靠"别设超大窗口"(默认 16, 荐 ≤64) + 未来 mux 架构 (多流骑一连接、
+// 一个 CC)。真正的跨连接共享瓶颈 (queqiao PathModel) 受 quinn Controller API 无 peer 上下文所限,
+// 也需 mux 才能干净实现。
+const CONGEST_KNEE: f64 = 0.10; // excess 达此值, inflation 完全退回 1x
 
 /// erasure-aware CC 工厂。挂到 quinn `TransportConfig::congestion_controller_factory`。
 #[derive(Debug, Default)]
@@ -38,6 +47,7 @@ impl ControllerFactory for ErasureConfig {
             inner: self.bbr.clone().build(now, current_mtu),
             p_ewma: 0.0,
             floor: 1.0, // 未知: 先高, 由首批下包络拉下来
+            recent_excess: 0.0,
             samples: 0,
             acked_acc: 0,
             lost_acc: 0,
@@ -51,6 +61,7 @@ struct ErasureController {
     inner: Box<dyn Controller>,
     p_ewma: f64,
     floor: f64,
+    recent_excess: f64, // EWMA of max(p-floor,0): 拥塞压力信号, 抑制过冲
     samples: u32,
     acked_acc: u64,
     lost_acc: u64,
@@ -75,6 +86,9 @@ impl ErasureController {
             } else {
                 self.floor = (self.floor + LEAK).min(self.p_ewma);
             }
+            // 拥塞压力 = 超出 floor 的丢包 (纯 erasure 时≈0, 队列建立时>0)。EWMA 平滑。
+            let excess = (self.p_ewma - self.floor).max(0.0);
+            self.recent_excess = (1.0 - ALPHA) * self.recent_excess + ALPHA * excess;
             self.samples = self.samples.saturating_add(1);
         }
         self.acked_acc = 0;
@@ -124,7 +138,11 @@ impl Controller for ErasureController {
         let w = self.inner.window();
         if self.calibrated() {
             let f = self.floor.min(FLOOR_CAP);
-            ((w as f64) / (1.0 - f)) as u64
+            let full_inflation = 1.0 / (1.0 - f); // 纯 erasure 时的满补偿
+            // 抗过冲: 拥塞压力越大, 越收敛回 1x (纯 BBR)。excess 达 CONGEST_KNEE 时完全不补偿。
+            let damp = (1.0 - (self.recent_excess / CONGEST_KNEE).min(1.0)).max(0.0);
+            let inflation = 1.0 + (full_inflation - 1.0) * damp;
+            ((w as f64) * inflation) as u64
         } else {
             w
         }
@@ -135,6 +153,7 @@ impl Controller for ErasureController {
             inner: self.inner.clone_box(),
             p_ewma: self.p_ewma,
             floor: self.floor,
+            recent_excess: self.recent_excess,
             samples: self.samples,
             acked_acc: self.acked_acc,
             lost_acc: self.lost_acc,
