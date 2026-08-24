@@ -154,6 +154,7 @@ pub async fn start_quic_server(
     pfs: bool,
     quic_window_mb: u64,
     quic_erasure_cc: bool,
+    quic_obfs: Option<String>,
 ) {
     let addr: std::net::SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
@@ -162,7 +163,7 @@ pub async fn start_quic_server(
             return;
         }
     };
-    let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_erasure_cc) {
+    let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_erasure_cc, quic_obfs.as_deref()) {
         Ok(ep) => ep,
         Err(e) => {
             error!("Mirage QUIC Server: 绑定失败 {}: {:#}", listen_addr, e);

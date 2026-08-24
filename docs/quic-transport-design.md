@@ -342,6 +342,24 @@ stream buffer`。根因 = **quinn-proto 0.11.17 的 `MAX_CHUNKS=1024` 硬界** (
   SS/WG 中继 lean 路暂不支持。QUIC 实验默认关, 破坏性协议改动无兼容负担。
 - **收益**: 流建立零握手往返 (e2e 从 ~4s 降到 ~2s), 高并发省 per-stream 开销, 去双重加密省 CPU。
 
+### 5.7 Salamander 混淆 ✅ 已实现 (2026-08-24)
+
+§7.0 说 GFW 解 QUIC Initial 读 SNI 封。**良性 SNI (§7.1) 让 GFW 读到"好域名"过关**, 但 SNI 明文暴露、
+仍是"能被认出的 QUIC"。**Salamander 更进一步: 把 QUIC 整个藏成随机 UDP, GFW 连 Initial 都解不出。**
+
+- **参考 Hysteria2 Salamander**: UDP socket 层对每个 QUIC 包做 XOR 混淆 —— 每包 `[salt(8B 随机)]
+  [原包 XOR keystream(blake3-XOF(key,salt))]`, key = blake3(obfs 密码)。GFW 看到的是纯随机字节、
+  无 QUIC Initial 结构可解 → 直接废掉 §7.0 的 SNI 封锁路。
+- **不 fork rustls/quinn**: 靠 quinn `AsyncUdpSocket` + `Endpoint::new_with_abstract_socket` 包一层
+  `ObfsSocket` (`src/proxy/quic_obfs.rs`)。避开 §7.3 的 JA4 fork 重工 —— 混淆后**根本没有 QUIC 指纹可查**。
+- **关 GSO/GRO** (`max_*_segments=1`): 每报文单独 salt+XOR, 不能合并段。
+- **payload 留头余量**: `max_udp_payload_size=1444` (EndpointConfig, 非 TransportConfig), 保 +8B salt 后
+  仍 ≤ 1500 MTU 不分片。
+- **配置**: `quic_obfs` (两端须一致); 与 pre-packet 二选一 (裸 pre-packet 不混淆, obfs 下反常)。默认关。
+- **定位不变**: Salamander = 给性能腿 (QUIC) 补一层抗审查, **非取代 TCP fake-TLS 主链路**。混淆非加密
+  (QUIC 自己已加密), 只反 DPI; "全随机 UDP"无掩护人群 (可被全加密流量启发式盯上), 配端口跳跃缓解 (后续)。
+- **验证**: 两端同密码 e2e 2MB 全传; 不匹配 (一端 obfs 一端不) 连不通 (http=000) —— 反证混淆真在生效。
+
 ## 6. 结论
 
 queqiao ≈ Mirage「UDP mux → QUIC」epic 的**参考实现**，且解决 Mirage 最大痛点（Brutal 手填速率
