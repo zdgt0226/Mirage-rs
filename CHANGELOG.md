@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### ci: Android 内核 (mirage-core → .so) 交叉编译门禁 + 治 vendored 漂移
+
+`build.yml` 加 `android-core` job: checkout Mirage-android → 把**本仓库当前 commit** 的协议核
+`vendor-sync` 进 `native/mirage-core` → cargo-ndk 交叉编译 mirage-jni 到 **arm64-v8a + x86_64**
+(16KB 页对齐校验 = Android 15+ 合规) → 跑 core 单测 → 传 .so 产物。
+- **治漂移**: 用当前协议核构建, 上游一改动破坏移动端裁剪边界当场红灯 (Android 客户端 vendored 核
+  长期靠手工 vendor-sync 易滞后, 之前落后上游多 commit)。漂移时步骤内 `::warning::` 提示 android 仓
+  需重跑 sync。
+- 本地实测: cargo-ndk 出双 ABI 均 16KB 对齐 (LOAD align=0x4000); 当前上游 sync 进移动端核后
+  host check + aarch64 交叉编译均绿。
+- ⚠️ Mirage-android 若私有: 需在本仓库 Secrets 加 `ANDROID_REPO_PAT` (对 android 仓 read 权)。
+
 ### fix(transport): QUIC Salamander 混淆两个吞吐 bug (实机才暴露) —— GRO 腐化 + recv buffer 截断
 
 Salamander (#69) 沙箱 loopback 功能测过, 但**真机 CN2→US 暴露吞吐比 plain QUIC 崩 8-40x** (obfs

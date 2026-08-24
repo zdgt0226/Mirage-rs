@@ -91,3 +91,71 @@ jobs:
       uses: EmbarkStudios/cargo-deny-action@v2
       with:
         command: check advisories bans licenses sources
+
+  # Android 内核 (mirage-core → mirage-jni .so) 交叉编译门禁。
+  #
+  # 为什么在这里: Android 客户端 (github.com/zdgt0226/Mirage-android) 把本仓库的协议核
+  # vendored 进 native/mirage-core (crypto/pool/outbound/tunnel/…), 由 mirage-jni 包成 .so。
+  # 此 job 把**本仓库当前 commit** 的协议核 vendor-sync 进去再交叉编译 → 保证"当前协议永远
+  # 是 Android 可编译的", 上游一改动破坏移动端裁剪边界当场红灯 (治 vendored 漂移的核心手段)。
+  # 产出 arm64-v8a + x86_64 的 .so (16KB 页对齐 = Android 15+ 合规) + 跑 core 单测。
+  #
+  # ⚠️ Mirage-android 若为私有仓库: 在本仓库 Settings→Secrets→Actions 加 ANDROID_REPO_PAT
+  #    (对 android 仓有 read 的 PAT 或 deploy token)。公开仓库则该 token 行可留空/删除。
+  android-core:
+    name: Android 内核交叉编译 (mirage-core → .so)
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout Mirage-rs (协议核上游)
+      uses: actions/checkout@v4
+    - name: Checkout Mirage-android (客户端 + vendored 核)
+      uses: actions/checkout@v4
+      with:
+        repository: zdgt0226/Mirage-android
+        path: mirage-android
+        token: ${{ secrets.ANDROID_REPO_PAT }}
+    - name: Rust toolchain + Android targets
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-linux-android, x86_64-linux-android
+    - name: Setup Android NDK (r26d = 26.3.11579264)
+      id: ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r26d
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk --version "^3" --locked
+    - name: Vendor-sync 协议核 (对齐本仓库当前 commit) + 漂移预警
+      working-directory: mirage-android
+      run: |
+        ./native/vendor-sync.sh "$GITHUB_WORKSPACE"
+        drift=$(git status --porcelain native/mirage-core/src/vendor | grep -v 'SYNC.md' || true)
+        if [ -n "$drift" ]; then
+          echo "::warning::Mirage-android 里 vendored 核落后本仓库当前 commit —— 建议在 android 仓重跑 native/vendor-sync.sh 并提交。CI 已用最新协议核继续构建 (下面若红说明裁剪边界需调整)。"
+          git --no-pager diff --stat -- native/mirage-core/src/vendor ':!*SYNC.md' || true
+        else
+          echo "vendored 核已与本仓库当前 commit 一致 ✓"
+        fi
+    - name: 交叉编译 mirage-jni (arm64-v8a + x86_64, 16KB 对齐)
+      working-directory: mirage-android/native/mirage-jni
+      env:
+        ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+      run: cargo ndk -t arm64-v8a -t x86_64 -o "$GITHUB_WORKSPACE/jniLibs" build --release
+    - name: 验 16KB 页对齐 (每个 .so 的 LOAD 段须 align=0x4000)
+      run: |
+        fail=0
+        for so in $(find "$GITHUB_WORKSPACE/jniLibs" -name '*.so'); do
+          aligns=$(readelf -lW "$so" | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')
+          echo "$so: LOAD align = $aligns"
+          echo "$aligns" | grep -qw '0x4000' || { echo "::error::$so 非 16KB 页对齐 (Android 15+ 会拒装)"; fail=1; }
+        done
+        exit $fail
+    - name: mirage-core 单元测试
+      working-directory: mirage-android/native/mirage-core
+      run: cargo test --release
+    - name: 上传 jniLibs (.so 产物)
+      uses: actions/upload-artifact@v4
+      with:
+        name: mirage-jni-so
+        path: jniLibs/**/*.so
+        if-no-files-found: error
