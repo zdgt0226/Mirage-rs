@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### fix(transport): QUIC Salamander 混淆两个吞吐 bug (实机才暴露) —— GRO 腐化 + recv buffer 截断
+
+Salamander (#69) 沙箱 loopback 功能测过, 但**真机 CN2→US 暴露吞吐比 plain QUIC 崩 8-40x** (obfs
+~0.1-0.4MB/s vs plain ~2.3MB/s)。定位到两个收端 bug (loopback 因不走真 NIC/GRO、包不满 MTU 而测不出):
+- **GRO 合并腐化**: inner socket 被 quinn-udp 恒开 UDP_GRO, 会把多个独立 datagram 合并进一个 buffer
+  (小包如 ACK 尤甚)。原 poll_recv 把整块当单包、用**首段 salt** 解全部 → 除首段外全腐化 → 下载方向
+  ACK 大面积失效 → CC 饿死。修: **GRO-aware 逐段解** (按 `meta.stride` 拆段, 每段用各自 salt, 剥 salt
+  后压实, 新 stride = 原 stride − 8)。
+- **recv buffer 截断**: quinn 按 `max_udp_payload_size(1444) × max_receive_segments` 定 buffer。obfs
+  线上包 = QUIC(≤1444) + salt(8) = 最多 1452 > 1444 → 满包被**截尾 8B** → 解出腐化 QUIC 包被丢 →
+  bulk 下载大面积丢包。修: `max_receive_segments` 1→**2** (buffer 2888 容得下 1452)。
+- **真机验证 (CN2→US, 165ms/丢包波动线)**: 修后 obfs 中位 ~1.5MB/s vs plain ~2.05MB/s (≈73%, ~27%
+  开销 = 发端关 GSO + 每包 blake3/salt, 属全流量混淆合理代价)。抓包复核: 线上仍纯随机 (无 QUIC 长头/
+  version, 对照 plain 首字节 0xc8+version 0x00000001)。见 docs/quic-transport-design.md §5.7。
+
 ### feat(transport): QUIC Salamander 混淆 —— 把 QUIC 藏成随机 UDP (抗审查)
 
 给 QUIC 性能腿补一层 Hysteria2 式 Salamander 混淆, 直接废掉 GFW 基于 SNI 的 QUIC 封锁

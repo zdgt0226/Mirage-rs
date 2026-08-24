@@ -360,6 +360,38 @@ stream buffer`。根因 = **quinn-proto 0.11.17 的 `MAX_CHUNKS=1024` 硬界** (
   (QUIC 自己已加密), 只反 DPI; "全随机 UDP"无掩护人群 (可被全加密流量启发式盯上), 配端口跳跃缓解 (后续)。
 - **验证**: 两端同密码 e2e 2MB 全传; 不匹配 (一端 obfs 一端不) 连不通 (http=000) —— 反证混淆真在生效。
 
+### 5.7a ⚠️ 实机暴露两个吞吐 bug (2026-08-24, CN2→US) —— 沙箱 loopback 测不出
+
+Salamander 沙箱 loopback 功能过 (数据传 + 不匹配反证), 但**真机吞吐比 plain QUIC 崩 8-40x**
+(obfs ~0.1-0.4MB/s vs plain ~2.3MB/s)。loopback 测不出因为: 不走真 NIC、无 UDP_GRO 合并、包不满 MTU
+故无 buffer 截断。两个 bug 都在收端:
+
+1. **GRO 合并腐化**: quinn-udp 给 inner socket **恒开 UDP_GRO** (unix.rs `set_socket_option(UDP_GRO,ON)`),
+   会把多个独立 datagram 合并进一个 recv buffer (小包如 ACK 尤甚, 一个 buffer 塞几十个)。原 poll_recv
+   把整块当单 datagram、用**首段 salt** XOR 解全部 → 除首段外全腐化。下载方向 (US→CN2 data) 的 ACK
+   走 CN2→US, 在 US 收端被 GRO 合并 → US 解坏几乎所有 ACK → 服务端 CC 拿不到 ACK 反馈 → 饿死。
+   **修**: poll_recv **GRO-aware 逐段解** —— 按 `meta.stride` 把 buffer 拆成 N 段 (末段可能短), 每段
+   `[salt(8)][payload]` 用各自 salt 解、剥 salt 前移压实, 报 `meta.len=Σpayload`、`stride=原stride−8`。
+   单 datagram 时 `stride==len` 循环只跑一次 (退化回原逻辑)。
+2. **recv buffer 截断**: quinn 按 `max_udp_payload_size × max_receive_segments × BATCH` 定 buffer
+   (endpoint.rs)。obfs 设 `max_udp_payload_size=1444` (MTU 余量), 但线上包 = QUIC(≤1444)+salt(8) = 最多
+   **1452 > 1444** → 满 data 包被 recvmsg **截尾 8B** → 解出短/腐化 QUIC 包被 quinn 丢 → bulk 下载大面积
+   丢包。plain 无 salt 正好贴合故没事。**修**: `max_receive_segments` 1→**2** (buffer 2888 容得下 1452)。
+
+**修后真机 (CN2→US, 165ms, 丢包波动线)**: obfs 中位 **~1.5MB/s** vs plain **~2.05MB/s** (≈73%)。
+残留 ~27% 开销 = 发端关 GSO (`max_transmit_segments=1`, 每包单独 syscall) + 每包 blake3 keystream/salt,
+属全流量混淆的合理代价 (Hysteria Salamander 同量级)。**后续可优化**: 发端恢复 GSO —— 把 GSO batch 每段
+单独 salt (段变 s+8 仍等长, GSO segment_size=s+8; 收端 GRO 由已有逐段解处理), 可回收大部分开销。
+
+**抓包复核 (tcpdump, US 收端)**: obfs 流每包 payload 首字节随机 (首包 UDP 1208 = padded Initial, 首 8B
+随机 salt 后全 XOR 乱码), 扫 400 包 `apple` SNI 明文 0 命中、QUIC version `0x00000001` 0 命中。对照
+plain QUIC 首包首字节 **0xc8** (QUIC v1 长头 Initial) + `0000 0001` version 命中 —— 坐实 obfs 抹掉了
+GFW 识别 QUIC 所需的长头+版本号 (注: QUIC 的 SNI 本在 Initial 加密里非明文, GFW 靠解密读, 前提是先认出
+是 QUIC; obfs 让这步就失败)。
+
+**教训**: 混淆这类**改 socket 收发语义**的东西, loopback 功能测远不够 —— GRO/GSO/MTU/丢包全不触发,
+必须真机真 NIC 验吞吐。
+
 ## 6. 结论
 
 queqiao ≈ Mirage「UDP mux → QUIC」epic 的**参考实现**，且解决 Mirage 最大痛点（Brutal 手填速率
