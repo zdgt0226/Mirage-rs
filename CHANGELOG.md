@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### feat(config): QUIC 配置 check 阶段 fail-fast
+
+`mirage`/`mirage_server` 的 QUIC 配置在 `check` 阶段就校验, 别等运行时才报错:
+- **transport=quic 但未 `--features quic` 编译** → check 直接报 (之前每连接运行时才 bail)。
+- **quic_window_mb 越界** (0 或 >256) → 报不合理 (荐 2~64; 重排序线路 2, 干净长肥 16-64)。
+- **transport=quic + upstream (SS/WG)** → 报 lean 路暂不支持中转 (提示改 tcp 或去 upstream)。
+
 ### fix(transport): QUIC Model X 中继加固 —— 空闲超时 + 字节计数
 
 Model X 首版用裸 `copy_bidirectional` 转发, 丢了 Model-Y 路径的两样, 补回:

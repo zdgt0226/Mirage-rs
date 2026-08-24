@@ -1100,9 +1100,21 @@ impl Config {
 
         // Mirage 出站的必填项非空
         for ob in &self.outbounds {
-            if let OutboundConfig::Mirage { tag, server, server_port, password, underlying, .. } = ob {
+            if let OutboundConfig::Mirage { tag, server, server_port, password, underlying, transport, quic_window_mb, .. } = ob {
                 if server.trim().is_empty() {
                     issues.push(format!("mirage 出站 `{tag}` 的 server 为空"));
+                }
+                // transport=quic fail-fast: 没编 quic 特性 → check 阶段就拦, 别等运行时每连接报错。
+                #[cfg(not(feature = "quic"))]
+                if *transport == Transport::Quic {
+                    issues.push(format!("mirage 出站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"));
+                }
+                if *transport == Transport::Quic {
+                    if let Some(mb) = quic_window_mb {
+                        if *mb == 0 || *mb > 256 {
+                            issues.push(format!("mirage 出站 `{tag}` 的 quic_window_mb={mb} 不合理 (荐 2~64; 重排序线路用 2, 干净长肥用 16-64)"));
+                        }
+                    }
                 }
                 if *server_port == 0 {
                     issues.push(format!("mirage 出站 `{tag}` 的 server_port 为 0"));
@@ -1171,9 +1183,17 @@ impl Config {
                     Err(e) => issues.push(format!("shadowsocks 入站 `{tag}` 的 method 非法: {e}")),
                 }
             }
-            if let InboundConfig::MirageServer { tag, password, upstream, .. } = ib {
+            if let InboundConfig::MirageServer { tag, password, upstream, transport, .. } = ib {
                 if password.is_empty() {
                     issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
+                }
+                #[cfg(not(feature = "quic"))]
+                if *transport == Transport::Quic {
+                    issues.push(format!("mirage_server 入站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"));
+                }
+                // Model X 精简路 (quic) 只支持直连出口; 配了 SS/WG 上游会被拒 → check 阶段就提示。
+                if *transport == Transport::Quic && upstream.is_some() {
+                    issues.push(format!("mirage_server 入站 `{tag}` transport=quic 暂不支持 upstream 中继 (SS/WG); 用 transport=tcp 或去掉 upstream"));
                 }
                 // 上游出口配错会让服务端**拒绝启动**, 必须在 check 阶段就拦住 ——
                 // 否则 `check && systemctl restart` 这个闸门对这条路径形同虚设。
