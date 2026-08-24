@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### fix(transport): QUIC Model X 中继加固 —— 空闲超时 + 字节计数
+
+Model X 首版用裸 `copy_bidirectional` 转发, 丢了 Model-Y 路径的两样, 补回:
+- **空闲超时** (`MIRAGE_RELAY_IDLE` 1800s): 半开/卡死的流按方向超时收掉, 不再无限挂着。
+- **字节计数** (`_conn.counter().up/down`): 上/下行字节喂进 monitor → WebUI 域名排行/流量统计对 QUIC
+  连接也有数 (之前只登记不计字节)。
+- 上行结束 `send.finish()` 半关让对端 EOF, 下行结束 `lw.shutdown()` —— 优雅关闭。
+default+quic 双构建 clippy 绿; 354 lib + 全集成 + quic e2e 绿。
+
 ### feat(transport): QUIC Model X 精简 —— 去掉 per-stream fake-TLS + 内层 AEAD
 
 QUIC 路径从 Model Y (每流跑完整 fake-TLS 握手 + AEAD) 改为 **Model X 精简**: 每流首部
