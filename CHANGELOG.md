@@ -13,6 +13,14 @@
 - 本地实测: cargo-ndk 出双 ABI 均 16KB 对齐 (LOAD align=0x4000); 当前上游 sync 进移动端核后
   host check + aarch64 交叉编译均绿。
 - ⚠️ Mirage-android 若私有: 需在本仓库 Secrets 加 `ANDROID_REPO_PAT` (对 android 仓 read 权)。
+### feat(relay): TCP relay 空闲超时 env 可调 (`MIRAGE_RELAY_IDLE`)
+
+TCP 隧道 relay 的空闲超时从硬编码 1800s 改为 env `MIRAGE_RELAY_IDLE` (秒) 可调, 默认仍 1800s
+(行为不变)。资源受限 / 高频短连接场景 (软路由 · 低配 VPS · 移动端) 可调小防僵尸连接钉住 task+缓冲
+—— 此需求由 Android 客户端实战验证 (它把该值降到 300s 治 FD 泄露)。
+- 统一到 `crate::proxy::relay_idle()` (OnceLock 读一次 env, 解析失败/非数字回落 1800, 下限 5s 防病态 0)。
+- 客户端 `handler.rs` (4 处) + 服务端 `mirage_server/tcp_relay.rs` (6 处) 共用此值, **两端须同设**
+  才保持"一致不互相早关"。UDP 侧 idle (300s/60s) 是另一套已调好的, 不动。
 
 ### fix(transport): QUIC Salamander 混淆两个吞吐 bug (实机才暴露) —— GRO 腐化 + recv buffer 截断
 

@@ -10,11 +10,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info};
 
-/// Mirage 隧道 relay 的**空闲**超时 (每次 read/recv 无数据满此值才断)。
-/// 与服务端 mirage_server/tcp_relay.rs 的 1800s 对齐, 两端一致不互相早关。
+/// Mirage 隧道 relay 的**空闲**超时: 见 `crate::proxy::relay_idle()` (默认 1800s, env
+/// `MIRAGE_RELAY_IDLE` 秒可调; 与服务端 tcp_relay.rs 共用此值, 两端须同设)。
 /// ⚠️ 必须包在每次 read **内层** —— 包在整个 loop 外层会变成绝对墙钟寿命,
-/// 满 300s 无条件斩断 SSH/视频/大下载/长连接 (曾经的 bug)。
-const MIRAGE_RELAY_IDLE: std::time::Duration = std::time::Duration::from_secs(1800);
+/// 满超时无条件斩断 SSH/视频/大下载/长连接 (曾经的 bug)。
+#[inline]
+fn relay_idle() -> std::time::Duration {
+    crate::proxy::relay_idle()
+}
 
 /// 人类可读字节数 (日志用): 1536 → "1.5K", 3145728 → "3.0M"。
 pub(crate) fn human_bytes(n: u64) -> String {
@@ -271,7 +274,7 @@ pub async fn proxy_tcp_target(
                     use tokio::io::AsyncReadExt;
                     let mut buf = vec![0u8; 65536];
                     loop {
-                        match tokio::time::timeout(MIRAGE_RELAY_IDLE, lr.read(&mut buf)).await {
+                        match tokio::time::timeout(relay_idle(), lr.read(&mut buf)).await {
                             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                             Ok(Ok(n)) => {
                                 if AsyncWriteExt::write_all(&mut send, &buf[..n]).await.is_err() { break; }
@@ -285,7 +288,7 @@ pub async fn proxy_tcp_target(
                     use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
                     let mut buf = vec![0u8; 65536];
                     loop {
-                        match tokio::time::timeout(MIRAGE_RELAY_IDLE, AsyncReadExt::read(&mut recv, &mut buf)).await {
+                        match tokio::time::timeout(relay_idle(), AsyncReadExt::read(&mut recv, &mut buf)).await {
                             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                             Ok(Ok(n)) => {
                                 if lw.write_all(&buf[..n]).await.is_err() { break; }
@@ -357,7 +360,7 @@ pub async fn proxy_tcp_target(
                 let mut up_bytes: u64 = 0;
                 loop {
                     // 空闲超时包在每次 read 内层 (非整个 loop 外层, 见 MIRAGE_RELAY_IDLE 注释)
-                    match tokio::time::timeout(MIRAGE_RELAY_IDLE, local_read.read(&mut buf)).await {
+                    match tokio::time::timeout(relay_idle(), local_read.read(&mut buf)).await {
                         Ok(Ok(0)) => {
                             let _ = tunnel_writer.send_close_notify().await;
                             break;
@@ -418,7 +421,7 @@ pub async fn proxy_tcp_target(
 
                 loop {
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
-                    match tokio::time::timeout(MIRAGE_RELAY_IDLE, tunnel_reader.recv_data()).await {
+                    match tokio::time::timeout(relay_idle(), tunnel_reader.recv_data()).await {
                         Ok(Ok(data)) => {
                             if local_write.write_all(&data).await.is_err() {
                                 break;
