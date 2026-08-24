@@ -379,9 +379,20 @@ Salamander 沙箱 loopback 功能过 (数据传 + 不匹配反证), 但**真机�
    丢包。plain 无 salt 正好贴合故没事。**修**: `max_receive_segments` 1→**2** (buffer 2888 容得下 1452)。
 
 **修后真机 (CN2→US, 165ms, 丢包波动线)**: obfs 中位 **~1.5MB/s** vs plain **~2.05MB/s** (≈73%)。
-残留 ~27% 开销 = 发端关 GSO (`max_transmit_segments=1`, 每包单独 syscall) + 每包 blake3 keystream/salt,
-属全流量混淆的合理代价 (Hysteria Salamander 同量级)。**后续可优化**: 发端恢复 GSO —— 把 GSO batch 每段
-单独 salt (段变 s+8 仍等长, GSO segment_size=s+8; 收端 GRO 由已有逐段解处理), 可回收大部分开销。
+残留开销 = 发端关 GSO (`max_transmit_segments=1`, 每包单独 syscall) + 每包 blake3 keystream/salt/Vec。
+
+### 5.7b GSO 优化: 试过, 实测更慢, 弃 (2026-08-24 晚高峰, JP↔CN2)
+
+好线 (JP↔CN2, 100ms/12.5%丢包) 上 obfs 只有 plain ~52% (obfs ~4.5 vs plain ~8.8MB/s), 开销比烂线更大
+(好线吞吐高 → 每包固定开销占比放大), 一度以为发端关 GSO 是主因, 遂实现"GSO batch 每段单独 salt (段变
+s+8 等长, segment_size=s+8; 收端 GRO 逐段解已支持)"。**受控 A/B (env `MIRAGE_OBFS_GSO` 翻转, 两端每轮
+重启同线路交错) 证明 GSO 反而慢 ~1.5x**: GSO-ON 中位 ~2.78 vs GSO-OFF ~4.35MB/s。**已回退**。
+- **为什么没用**: obfs 瓶颈不是 syscall 数, 是**每段 blake3/salt/copy 挤在单线程 endpoint 驱动**的
+  userspace CPU。GSO 只合并 syscall, 省不掉 per-segment 的 userspace 开销 (逐段仍要各自 blake3); 反而
+  加了大 buffer/batch 分配 + 12% 丢包线上 GRO 重组不划算。
+- 真要提速的方向应是**降 per-packet userspace 成本** (如 keystream 缓存/更便宜的流密码/减 Vec 分配) 或
+  把 obfs 挪出 endpoint 驱动线程 —— 均非小工程, 当前 4.5MB/s 够"性能腿补抗审查"用, 暂不投。
+- **教训**: 优化先 A/B 实测再合, 别凭直觉 ("GSO 一定更快") 就上 —— 这次直觉是错的。
 
 **抓包复核 (tcpdump, US 收端)**: obfs 流每包 payload 首字节随机 (首包 UDP 1208 = padded Initial, 首 8B
 随机 salt 后全 XOR 乱码), 扫 400 包 `apple` SNI 明文 0 命中、QUIC version `0x00000001` 0 命中。对照
