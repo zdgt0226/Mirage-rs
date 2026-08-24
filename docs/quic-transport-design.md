@@ -327,6 +327,21 @@ stream buffer`。根因 = **quinn-proto 0.11.17 的 `MAX_CHUNKS=1024` 硬界** (
 
 **教训**: 升级依赖 (为修 RUSTSEC) 可能引入行为回归; 且"传输被切"先排查自己的传输栈, 别急着归因 GFW。
 
+### 5.6 Model X 精简 ✅ 已实现 (2026-08-24)
+
+从 Model Y (每流跑完整 fake-TLS 握手 + 内层 AEAD) 改为 **Model X**: 每流首部
+`[token(32B)][2B len][host:port]`, 之后裸转发。
+
+- **去掉 per-stream fake-TLS 握手**: fake-TLS 在 QUIC 里被 QUIC 自己的 TLS 包住、GFW 看不到, 抗检测
+  价值为零, 纯是每流 ~1RTT + 模板 + tail 开销。mux 下高并发 N× 浪费。
+- **去掉内层 AEAD**: QUIC 自己的 TLS1.3 已加密所有流, 内层 Mirage AEAD 对被动观察冗余 (还是之前
+  crypto CPU 瓶颈之一)。
+- **认证**: 无状态每流 token (HMAC 密码+时间, 32B 无往返, 防开放代理)。机密性靠 QUIC TLS; 主动 MITM
+  弱于密码绑定 AEAD —— 抗审查威胁模型 (被动 GFW + 主动探测) 下够用, 且 QUIC 本就是性能腿非抗审查主力。
+- 实现: 客户端 `handler.rs`/`outbound.rs::connect` 精简路; 服务端 `handle_quic_stream_lean`。上游
+  SS/WG 中继 lean 路暂不支持。QUIC 实验默认关, 破坏性协议改动无兼容负担。
+- **收益**: 流建立零握手往返 (e2e 从 ~4s 降到 ~2s), 高并发省 per-stream 开销, 去双重加密省 CPU。
+
 ## 6. 结论
 
 queqiao ≈ Mirage「UDP mux → QUIC」epic 的**参考实现**，且解决 Mirage 最大痛点（Brutal 手填速率

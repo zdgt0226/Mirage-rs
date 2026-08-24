@@ -171,14 +171,11 @@ pub async fn start_quic_server(
     };
     info!("Mirage QUIC Server listening on {} (UDP, 实验传输 · auth 容差 ±{}s)", listen_addr, auth_ts_tolerance_secs);
 
-    let cam_pool = CamouflagePool::new(camouflage_host.to_string());
-    crate::crypto::handshake_cache::prewarm(camouflage_host).await;
+    let _ = (camouflage_host, pfs); // Model X 精简: QUIC 路径不用 camouflage/fake-TLS/pfs
     let password = password.to_string();
 
     while let Some(incoming) = endpoint.accept().await {
         let pwd = password.clone();
-        let cam = camouflage_host.to_string();
-        let pool = cam_pool.clone();
         let up = upstream.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
@@ -191,19 +188,14 @@ pub async fn start_quic_server(
                 return;
             }
             // 一条 QUIC 连接可承载多条双向流 (每条 = 一条隧道)。逐条 accept_bi, 各自成 task。
+            // Model X 精简: 每流 [token][target][data], 无 per-stream fake-TLS、无内层 AEAD (QUIC 自加密)。
             loop {
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         let pwd2 = pwd.clone();
-                        let cam2 = cam.clone();
-                        let pool2 = pool.clone();
                         let up2 = up.clone();
                         tokio::spawn(async move {
-                            let stream = crate::proxy::quic::QuicBiStream::new(send, recv);
-                            handshake::handle_connection_quic(
-                                stream, peer, pwd2, cam2, pool2, auth_ts_tolerance_secs, up2, pfs,
-                            )
-                            .await;
+                            handle_quic_stream_lean(send, recv, peer.ip(), pwd2, auth_ts_tolerance_secs, up2).await;
                         });
                     }
                     Err(_) => break, // 连接关闭
@@ -211,4 +203,62 @@ pub async fn start_quic_server(
             }
         });
     }
+}
+
+/// Model X 精简 QUIC 流处理: `[token(32B)][2B target_len][target][data...]`, 无 per-stream fake-TLS、
+/// 无内层 AEAD (QUIC 自己的 TLS1.3 已加密所有流)。token 为无状态每流认证 (HMAC 密码+时间, 32B 无往返)。
+/// 直连出口 (upstream=SS/WG 的 lean 路径暂不支持, 有则拒)。
+#[cfg(feature = "quic")]
+async fn handle_quic_stream_lean(
+    send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    peer_ip: IpAddr,
+    password: String,
+    tol: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+) {
+    if upstream.is_some() {
+        debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
+        return;
+    }
+    // 1. token (32B) — 无状态每流认证。
+    let mut token = [0u8; 32];
+    match tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_exact(&mut token)).await {
+        Ok(Ok(_)) => {}
+        _ => return,
+    }
+    if !crate::crypto::hello_auth::verify_session_token(&password, &token, tol) {
+        static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !HINTED.swap(true, Ordering::Relaxed) {
+            tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
+                crate::crypto::hello_auth::session_decrypt_failure_hint());
+        }
+        return;
+    }
+    // 2. target: [2B len][host:port]
+    let mut lenb = [0u8; 2];
+    if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut lenb)).await.map(|r| r.is_err()).unwrap_or(true) {
+        return;
+    }
+    let n = u16::from_be_bytes(lenb) as usize;
+    if n == 0 || n > 512 { return; }
+    let mut tb = vec![0u8; n];
+    if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut tb)).await.map(|r| r.is_err()).unwrap_or(true) {
+        return;
+    }
+    let target = match String::from_utf8(tb) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    // 3. 直连出口
+    let mut up = match crate::proxy::resolver::connect_smart(&target).await {
+        Ok(s) => s,
+        Err(e) => { tracing::warn!("Mirage QUIC(lean): 连 {} 失败: {}", target, e); return; }
+    };
+    let _conn = crate::monitor::register(
+        target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()),
+    );
+    // 4. 裸转发 (QUIC 加密, 无内层 AEAD)。
+    let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut up).await;
 }
