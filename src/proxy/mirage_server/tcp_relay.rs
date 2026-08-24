@@ -1,6 +1,8 @@
 //! 服务端 TCP 上游转发. 收到 target 后建立 TCP 连接, 双向 copy.
 //!
-//! 1800s = 30min 双向超时 - 给长连接 (WebSocket / 大文件下载) 留余量.
+//! 空闲超时默认 1800s = 30min 双向 - 给长连接 (WebSocket / 大文件下载) 留余量; 由
+//! `crate::proxy::relay_idle()` 提供 (env `MIRAGE_RELAY_IDLE` 秒可调, 与客户端 handler 共用,
+//! 两端须同设). 资源受限/高频短连接可调小防僵尸连接泄露.
 //!
 //! 半关闭联动 (修 bug: 30 分钟僵尸泄露):
 //! 单纯 `join!(upload, download)` 在一方先 Err 后会让另一方挂在阻塞读上
@@ -94,7 +96,7 @@ pub(super) async fn handle_tcp_relay(
     let up_conn = _conn.counter();
     let upload = async move {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
                 Ok(Ok(data)) => {
                     if up_write.write_all(&data).await.is_err() {
                         break;
@@ -121,7 +123,7 @@ pub(super) async fn handle_tcp_relay(
         // 把多帧 syscall 合成一个大 write. 打破"读一片写一片"串行的碎片.
         let mut buf = vec![0u8; 65536];
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1800), up_read.read(&mut buf)).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
                     let mut total = n;
@@ -197,7 +199,7 @@ async fn relay_via_shadowsocks(
 
     let upload = async move {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
                 Ok(Ok(data)) => {
                     if up_write.write_all(&data).await.is_err() {
                         break;
@@ -211,7 +213,7 @@ async fn relay_via_shadowsocks(
 
     let download = async move {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1800), up_read.read_chunk()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read_chunk()).await {
                 Ok(Ok(chunk)) if chunk.is_empty() => break, // 上游 EOF
                 Ok(Ok(chunk)) => {
                     if writer.send_data(&chunk).await.is_err() {
@@ -295,7 +297,7 @@ async fn relay_via_wireguard(
 
     let upload = async move {
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(1800), reader.recv_data()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
                 Ok(Ok(data)) => {
                     if up_write.write_all(&data).await.is_err() {
                         break;
@@ -312,7 +314,7 @@ async fn relay_via_wireguard(
         let mut buf = vec![0u8; 32 * 1024];
         loop {
             match tokio::time::timeout(
-                std::time::Duration::from_secs(1800),
+                crate::proxy::relay_idle(),
                 up_read.read(&mut buf),
             )
             .await
