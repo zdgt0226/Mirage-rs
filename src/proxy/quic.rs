@@ -1,10 +1,12 @@
-//! QUIC 传输 (P0 实验, `--features quic`)。见 docs/quic-transport-design.md。
+//! QUIC 传输 (实验, `--features quic`)。见 docs/quic-transport-design.md。
 //!
-//! **Model Y (P0 抄近路)**: QUIC 只做底层字节管道, 上面照跑 Mirage 现有 fake-TLS 握手 + AEAD。
-//! 一条 QUIC 连接开一条双向流 (open_bi/accept_bi) 承载一条隧道, 语义等价一条 TCP。
+//! **Model X (精简)**: 一个共享 QUIC 连接 (QuicMux) 承载多条双向流, 每条 = 一条隧道。每流首部
+//! `[token(32B)][2B target_len][host:port]`, 之后裸转发 —— **无 per-stream fake-TLS 握手、无内层
+//! AEAD** (QUIC 自己的 TLS1.3 已加密所有流; fake-TLS 在 QUIC 里不可见故抗检测价值为零)。token 为
+//! 无状态每流认证 (HMAC 密码+时间), 防开放代理。SNI 用良性 camouflage_host (抗 GFW SNI 封锁, 见 §7)。
 //!
-//! ⚠️ P0 **不隐蔽**: quinn 默认 QUIC 指纹裸奔, 且 TLS 证书自签+客户端不校验 (认证靠内层 Mirage
-//! 协议, 与 TCP 路径一致)。勿用于敌对网络。指纹仿真是 P1 的活 (path A: patch rustls)。
+//! ⚠️ **不隐蔽**: quinn 默认 QUIC 指纹裸奔, 证书自签+客户端不校验 (机密性靠 QUIC 自身 TLS, 认证靠
+//! token; 主动 MITM 弱于密码绑定 AEAD)。勿用于敌对网络。抗审查主力是 TCP fake-TLS 主链路。
 
 use std::net::SocketAddr;
 use std::pin::Pin;

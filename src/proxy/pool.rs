@@ -366,9 +366,21 @@ pub struct WarmPool {
     pub stats: Arc<RwLock<PoolStats>>,        // 连接池的延迟统计和健康检查
     pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
     metrics: Arc<PoolMetrics>,                // 反馈式弹性算法的运行时指标
+    cfg: Arc<PoolConfig>,                     // 保留 config (transport/password/quic_sni 等, 供 Model X)
+    // Model X: transport=quic 时的共享 QUIC mux。connect() 直接在其上开精简流 (绕过 fake-TLS Tunnel)。
+    #[cfg(feature = "quic")]
+    quic_mux: Option<Arc<crate::proxy::quic::QuicMux>>,
 }
 
 impl WarmPool {
+    /// transport=quic 走 Model X (connect() 直接开精简流, 不经 fake-TLS 暖池)。
+    pub fn is_quic(&self) -> bool {
+        self.cfg.transport == crate::config::Transport::Quic
+    }
+    pub fn password(&self) -> &str { &self.cfg.password }
+    #[cfg(feature = "quic")]
+    pub fn quic_mux(&self) -> Option<&Arc<crate::proxy::quic::QuicMux>> { self.quic_mux.as_ref() }
+
     pub fn new(cfg: Arc<PoolConfig>, brutal_state: Arc<BrutalState>) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
         let notify = Arc::new(Notify::new());
@@ -389,6 +401,9 @@ impl WarmPool {
             stats: stats.clone(),
             brutal_state: brutal_state.clone(),
             metrics: metrics.clone(),
+            cfg: cfg.clone(),
+            #[cfg(feature = "quic")]
+            quic_mux: quic_mux.clone(),
         };
 
         // 链路自愈: 启动 netlink 网络变更监听 (幂等, 仅首个 WarmPool 真正启动线程;
@@ -512,11 +527,14 @@ impl WarmPool {
         let target_clone_builder = target_size.clone();
         let stats_builder = stats.clone();
         let brutal_state_builder = brutal_state.clone();
-        #[cfg(feature = "quic")]
-        let quic_mux_builder = quic_mux.clone();
 
         tokio::spawn(async move {
             info!("WarmPool (Elastic) initialized. Max capacity: {}", cfg_clone.pool_size);
+            // Model X: QUIC 走精简路 (connect() 直接开流), 不预热 fake-TLS 隧道。
+            if cfg_clone.transport == crate::config::Transport::Quic {
+                info!("WarmPool: transport=quic (Model X), 跳过 fake-TLS 暖池");
+                return;
+            }
             let mut next_build_at = Instant::now();
 
             loop {
@@ -548,14 +566,9 @@ impl WarmPool {
                 let in_flight_task = in_flight_clone.clone();
                 let stats_task = stats_builder.clone();
                 let bs_task = brutal_state_builder.clone();
-                #[cfg(feature = "quic")]
-                let mux_task = quic_mux_builder.clone();
 
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    #[cfg(feature = "quic")]
-                    let conn_res = Self::connect_upstream(&cfg_task, &bs_task, mux_task.as_ref()).await;
-                    #[cfg(not(feature = "quic"))]
                     let conn_res = Self::connect_upstream(&cfg_task, &bs_task).await;
                     match conn_res {
                         Ok(tunnel) => {
@@ -585,19 +598,12 @@ impl WarmPool {
     async fn connect_upstream(
         cfg: &PoolConfig,
         brutal_state: &BrutalState,
-        #[cfg(feature = "quic")] quic_mux: Option<&Arc<crate::proxy::quic::QuicMux>>,
     ) -> Result<Tunnel> {
-        // 建连 + 伪装握手 + 派生密钥: 默认物理 TCP; 配了 underlying 则经该出站拨号 (Mirage-over-X);
-        // transport=quic 则走 QUIC (实验, 忽略 underlying/brutal)。
+        // 建连 + 伪装握手 + 派生密钥: 默认物理 TCP; 配了 underlying 则经该出站拨号 (Mirage-over-X)。
+        // transport=quic 走 Model X 精简路 (OutboundNode::connect 直接开流), 不经暖池 → 不到这里。
         let (mut crypto_reader, mut crypto_writer) = match cfg.transport {
             crate::config::Transport::Quic => {
-                #[cfg(feature = "quic")]
-                {
-                    let mux = quic_mux.ok_or_else(|| anyhow::anyhow!("transport=quic 但 QuicMux 未初始化"))?;
-                    Self::handshake_over_quic(cfg, mux).await?
-                }
-                #[cfg(not(feature = "quic"))]
-                { anyhow::bail!("transport=quic 需以 `--features quic` 编译 (见 docs/quic-transport-design.md)") }
+                anyhow::bail!("transport=quic 走 Model X 精简路 (connect 直连开流), 不应进 connect_upstream")
             }
             crate::config::Transport::Tcp => match &cfg.underlying {
                 Some(u) => Self::handshake_over_underlying(cfg, u).await?,
@@ -757,41 +763,6 @@ impl WarmPool {
         })
     }
 
-    /// QUIC 传输握手 (mux 架构): 在共享 QUIC 连接上开一条 bi-stream, 上面照跑 fake-TLS 握手 (Model Y)。
-    /// 无裸 fd → 无 brutal/nodelay (QUIC 自带 CC); 返回 Boxed 变体隧道。endpoint/连接由 QuicMux 持有,
-    /// 故半程直接 Box (无需 OwnedRecv 锚定)。
-    #[cfg(feature = "quic")]
-    async fn handshake_over_quic(
-        cfg: &PoolConfig,
-        mux: &Arc<crate::proxy::quic::QuicMux>,
-    ) -> Result<(CryptoReader<TunnelRead>, CryptoWriter<TunnelWrite>)> {
-        let (mut write_half, mut read_half) = timeout(
-            Duration::from_secs(15),
-            mux.open_stream(),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!("QUIC open_stream to {}:{} timed out (15s)", cfg.server_host, cfg.server_port)
-        })??;
-        let hs = Self::do_fake_tls(&mut read_half, &mut write_half, cfg).await?;
-        Ok(match hs.ecdh {
-            Some(ecdh) => create_crypto_pair_pfs(
-                TunnelRead::Boxed(Box::new(read_half)),
-                TunnelWrite::Boxed(Box::new(write_half)),
-                &cfg.password,
-                &hs.client_random,
-                &ecdh,
-                true,
-            ),
-            None => create_crypto_pair(
-                TunnelRead::Boxed(Box::new(read_half)),
-                TunnelWrite::Boxed(Box::new(write_half)),
-                &cfg.password,
-                &hs.client_random,
-                true,
-            ),
-        })
-    }
 
     /// 伪装 TLS 握手 (发带 token 的 ClientHello / 读 server flight / 发假 Finished tail)。
     /// 返回 client_random (会话密钥派生的 salt) + 可选 ecdh (PFS 开时)。

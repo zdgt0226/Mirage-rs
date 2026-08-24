@@ -252,34 +252,3 @@ pub(super) async fn handle_connection(
     }
 }
 
-/// QUIC 传输入口 (P0 实验): 握手 → into_halves (Boxed 变体) → dispatch。
-#[cfg(feature = "quic")]
-pub(super) async fn handle_connection_quic(
-    stream: crate::proxy::quic::QuicBiStream,
-    peer_addr: SocketAddr,
-    password: String,
-    camouflage_host: String,
-    cam_pool: Arc<CamouflagePool>,
-    auth_ts_tolerance_secs: u64,
-    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
-    pfs: bool,
-) {
-    let client_ip = peer_addr.ip();
-    if let Some((stream, client_random, ecdh)) = run_handshake(
-        stream, peer_addr, &password, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
-    )
-    .await
-    {
-        let (send, recv) = stream.into_halves();
-        control::dispatch_authenticated(
-            crate::proxy::tunnel::TunnelRead::Boxed(Box::new(recv)),
-            crate::proxy::tunnel::TunnelWrite::Boxed(Box::new(send)),
-            Some(client_ip),
-            password,
-            client_random,
-            upstream,
-            ecdh,
-        )
-        .await;
-    }
-}

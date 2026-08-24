@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC Model X 精简 —— 去掉 per-stream fake-TLS + 内层 AEAD
+
+QUIC 路径从 Model Y (每流跑完整 fake-TLS 握手 + AEAD) 改为 **Model X 精简**: 每流首部
+`[token(32B)][2B target_len][host:port]`, 之后裸转发。**去掉 per-stream fake-TLS 握手 (省往返/模板/tail)
++ 内层 AEAD** (QUIC 自己的 TLS1.3 已加密所有流; 且 fake-TLS 在 QUIC 里不可见、抗检测价值为零; 双重
+加密还是之前的 crypto CPU 瓶颈之一)。
+
+- **客户端** (`handler.rs` 主路径 + `outbound.rs::connect` 链式路径): transport=quic 时走精简路 ——
+  `mux.open_stream()` + 写 token+target + 裸 `copy_bidirectional`, 不经 fake-TLS 暖池 (暖池对 quic 跳过)。
+- **服务端** (`handle_quic_stream_lean`): 读 token (无状态每流认证, HMAC 密码+时间) → 校验 → 读 target
+  → 直连 → 裸转发。替换原 Model-Y 的 fake-TLS+AEAD 路 (`handle_connection_quic` 删除)。
+- 认证: 无状态每流 token (32B, 无往返, 防开放代理)。机密性靠 QUIC TLS1.3; 主动 MITM 弱于密码绑定 AEAD
+  (抗审查威胁模型下够用, QUIC 本就不是抗审查主力)。上游 SS/WG 中继 lean 路暂不支持 (有则拒)。
+- QUIC 实验默认关, 破坏性协议改动无兼容负担。default+quic 双构建 clippy 绿; 354 lib + 全集成 + quic e2e 绿。
+
 ### fix(transport): QUIC 默认窗口 16→2MB + gap-safety 封顶 (治重排序线路断连)
 
 深挖真机"QUIC ~1MB 就断" (曾误判 GFW): client debug 日志锁定 **quinn-proto 0.11.17 的

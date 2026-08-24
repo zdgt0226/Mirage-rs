@@ -238,6 +238,33 @@ pub async fn proxy_tcp_target(
     drop(current_state);
     match &*leaf {
         OutboundNode::Mirage { pool, .. } => {
+            // Model X 精简 (transport=quic): 共享连接开一条流, 写 [token(32B)][2B len][host:port]
+            // [initial_payload], 之后裸转发 (QUIC 自加密, 无内层 fake-TLS/AEAD)。
+            #[cfg(feature = "quic")]
+            if pool.is_quic() {
+                use tokio::io::AsyncWriteExt;
+                let mux = match pool.quic_mux() {
+                    Some(m) => m,
+                    None => { error!("Mirage QUIC: mux 未初始化 {}", target); return; }
+                };
+                let (send, recv) = match mux.open_stream().await {
+                    Ok(s) => s,
+                    Err(e) => { error!("Mirage QUIC open_stream {}: {}", target, e); return; }
+                };
+                let token = crate::crypto::hello_auth::make_session_token(pool.password());
+                let tb = target.as_bytes();
+                let mut hdr = Vec::with_capacity(32 + 2 + tb.len());
+                hdr.extend_from_slice(&token);
+                hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());
+                hdr.extend_from_slice(tb);
+                let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);
+                if stream.write_all(&hdr).await.is_err() { return; }
+                if !initial_payload.is_empty() && stream.write_all(&initial_payload).await.is_err() { return; }
+                let mut local = local;
+                let _ = tokio::io::copy_bidirectional(&mut local, &mut stream).await;
+                return;
+            }
+
             let target_bytes = target.as_bytes();
             let mut target_header = Vec::with_capacity(2 + target_bytes.len());
             target_header.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
