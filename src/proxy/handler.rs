@@ -257,11 +257,45 @@ pub async fn proxy_tcp_target(
                 hdr.extend_from_slice(&token);
                 hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());
                 hdr.extend_from_slice(tb);
-                let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);
-                if stream.write_all(&hdr).await.is_err() { return; }
-                if !initial_payload.is_empty() && stream.write_all(&initial_payload).await.is_err() { return; }
-                let mut local = local;
-                let _ = tokio::io::copy_bidirectional(&mut local, &mut stream).await;
+                let (mut send, mut recv) = (send, recv);
+                if AsyncWriteExt::write_all(&mut send, &hdr).await.is_err() { return; }
+                if !initial_payload.is_empty() {
+                    if AsyncWriteExt::write_all(&mut send, &initial_payload).await.is_err() { return; }
+                    _conn.counter().up(initial_payload.len() as u64);
+                }
+                // 双向裸转发 (QUIC 加密), 带空闲超时 + 字节计数 (WebUI 统计), 对齐 Model-Y 路径的健壮性。
+                let (mut lr, mut lw) = local.into_split();
+                let up_c = _conn.counter();
+                let dn_c = _conn.counter();
+                let upload = async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match tokio::time::timeout(MIRAGE_RELAY_IDLE, lr.read(&mut buf)).await {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => {
+                                if AsyncWriteExt::write_all(&mut send, &buf[..n]).await.is_err() { break; }
+                                up_c.up(n as u64);
+                            }
+                        }
+                    }
+                    let _ = send.finish(); // 半关上行, 让对端 EOF
+                };
+                let download = async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match tokio::time::timeout(MIRAGE_RELAY_IDLE, AsyncReadExt::read(&mut recv, &mut buf)).await {
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(n)) => {
+                                if lw.write_all(&buf[..n]).await.is_err() { break; }
+                                dn_c.down(n as u64);
+                            }
+                        }
+                    }
+                    let _ = lw.shutdown().await;
+                };
+                tokio::join!(upload, download);
                 return;
             }
 
