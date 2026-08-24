@@ -394,6 +394,20 @@ s+8 等长, segment_size=s+8; 收端 GRO 逐段解已支持)"。**受控 A/B (en
   把 obfs 挪出 endpoint 驱动线程 —— 均非小工程, 当前 4.5MB/s 够"性能腿补抗审查"用, 暂不投。
 - **教训**: 优化先 A/B 实测再合, 别凭直觉 ("GSO 一定更快") 就上 —— 这次直觉是错的。
 
+### 5.7c keystream 换 ChaCha8: 也试过, 实测无收益, 弃 (2026-08-24, JP↔CN2)
+
+顺着"降 per-packet 成本"想 keystream: blake3-XOF 每包 new_keyed+finalize 有固定开销, 换 ChaCha8
+(4 double-round, 抗 DPI 非机密性够用) 理应更便宜。加 env `MIRAGE_OBFS_CIPHER` 受控 A/B (两端同算法每轮
+重启交错): **ChaCha8 中位 ~3.1 vs blake3 ~3.97MB/s —— 没更快, blake3 反而略胜/持平**。**已回退** (blake3
+本就在树、无新依赖)。
+- **为什么没用**: 中国线 (2MB 窗口/100-165ms/丢包) 吞吐才 3-4MB/s ≈ 3000 pkt/s, **keystream 计算根本
+  不是瓶颈** —— 每包那点 blake3/chacha 都是零头, 限速在单线程 driver 调度/Vec churn/窗口。keystream 只
+  在几十 MB/s (driver CPU 打满) 才显形, 而那种速率在 obfs 目标线上达不到。且 musl 静态 build 可能没开
+  chacha20 SIMD → soft 后端反比 blake3 SIMD 慢。
+- **合并教训 (GSO + ChaCha8 两次)**: obfs 在真实中国线上的限速**不在 per-packet CPU** (keystream/syscall),
+  在传输栈本身 (单 CC 单线程 driver + 小窗口 + 丢包 stall)。要提 obfs 吞吐得从**传输架构**下手 (多 socket
+  分片 / obfs 出驱动线程), 不是抠 per-packet 常数。抠常数的两条路 (GSO/换 cipher) 均已实测证伪。
+
 **抓包复核 (tcpdump, US 收端)**: obfs 流每包 payload 首字节随机 (首包 UDP 1208 = padded Initial, 首 8B
 随机 salt 后全 XOR 乱码), 扫 400 包 `apple` SNI 明文 0 命中、QUIC version `0x00000001` 0 命中。对照
 plain QUIC 首包首字节 **0xc8** (QUIC v1 长头 Initial) + `0000 0001` version 命中 —— 坐实 obfs 抹掉了
