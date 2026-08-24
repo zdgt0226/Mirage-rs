@@ -179,8 +179,61 @@ jobs:
             mirage-rs-${{ matrix.arch }}
             mirage-rs-${{ matrix.arch }}.sha256
 
+  # Android 内核 (mirage-core → mirage-jni .so) —— 随协议版本附到 Release, 与客户端 App **独立发布**:
+  # 本仓库随每个 tag 发内核 .so (arm64-v8a + x86_64); Android 客户端 App 在 Mirage-android 仓自行
+  # 发版、引用对应版本的 .so。用**本 tag commit** vendor-sync 协议核再交叉编译 → 发出的 .so 与服务端
+  # 协议严格同版。(Mirage-android 公开仓, 无需 PAT。)
+  android-core:
+    name: Android 内核 .so (arm64-v8a + x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Mirage-rs (协议核上游)
+        uses: actions/checkout@v4
+      - name: Checkout Mirage-android (客户端 + vendored 核)
+        uses: actions/checkout@v4
+        with:
+          repository: zdgt0226/Mirage-android
+          path: mirage-android
+      - name: Rust toolchain + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - name: Setup Android NDK (r26d = 26.3.11579264)
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "^3" --locked
+      - name: Vendor-sync 协议核 (对齐本 tag commit)
+        working-directory: mirage-android
+        run: ./native/vendor-sync.sh "$GITHUB_WORKSPACE"
+      - name: 交叉编译 mirage-jni (arm64-v8a + x86_64, 16KB 对齐)
+        working-directory: mirage-android/native/mirage-jni
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a -t x86_64 -o "$GITHUB_WORKSPACE/jniLibs" build --release
+      - name: 16KB 对齐校验 + ABI 后缀命名
+        run: |
+          set -euo pipefail
+          mkdir -p android-out
+          for abi in arm64-v8a x86_64; do
+            so="jniLibs/$abi/libmirage_jni.so"
+            aligns=$(readelf -lW "$so" | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')
+            echo "$abi: LOAD align = $aligns"
+            echo "$aligns" | grep -qw '0x4000' || { echo "::error::$abi .so 非 16KB 页对齐 (Android 15+ 会拒装)"; exit 1; }
+            cp "$so" "android-out/libmirage_jni-$abi.so"
+          done
+          ls -l android-out
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-core-so
+          path: android-out/libmirage_jni-*.so
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, android-core]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -194,20 +247,22 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
-      # 把 8 个 target 的二进制拍平到一层, 便于聚合 SHA256SUMS 与后续引用。
+      # 把 8 个 target 的二进制 + Android 内核 .so 拍平到一层, 便于聚合 SHA256SUMS 与后续引用。
       - name: Flatten artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
           find artifacts -type f -name 'mirage-rs-*' ! -name '*.sha256' -exec cp {} dist/ \;
+          find artifacts -type f -name 'libmirage_jni-*.so' -exec cp {} dist/ \;
           ls -l dist
 
-      # 聚合校验和到单文件 SHA256SUMS (basename 相对, 用户下载后同目录 `sha256sum -c` 可校验)。
+      # 聚合校验和到单文件 SHA256SUMS (二进制 + Android .so; basename 相对, 用户下载后同目录
+      # `sha256sum -c` 可校验)。.so 一并纳入 → 经下面 cosign keyless 签名覆盖。
       - name: Aggregate SHA256SUMS
         run: |
           set -euo pipefail
           cd dist
-          sha256sum mirage-rs-* > SHA256SUMS
+          sha256sum mirage-rs-* libmirage_jni-*.so > SHA256SUMS
           echo "=== SHA256SUMS ==="; cat SHA256SUMS
 
       - name: Install cosign
@@ -229,10 +284,18 @@ jobs:
         with:
           files: |
             dist/mirage-rs-*
+            dist/libmirage_jni-*.so
             dist/SHA256SUMS
             dist/SHA256SUMS.cosign.bundle
           generate_release_notes: true
           body: |
+            ## Android 内核 (`.so`)
+
+            `libmirage_jni-arm64-v8a.so` / `libmirage_jni-x86_64.so` = Android 客户端用的协议内核
+            (mirage-core + JNI, 16KB 页对齐, Android 15+ 兼容), 与本 tag 服务端协议**严格同版**。
+            内核随本仓库发, **Android 客户端 App 独立在 [Mirage-android](https://github.com/zdgt0226/Mirage-android)
+            仓发版**并引用对应 .so。哈希已纳入下方签名的 `SHA256SUMS`。
+
             ## 校验产物 (cosign keyless, 无需密钥)
 
             ```bash

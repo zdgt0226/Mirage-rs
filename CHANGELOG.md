@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### release: Android 内核 .so 随 Release 发布 (与客户端 App 独立)
+
+`release.yml` 加 `android-core` job: tag 发版时用**本 tag commit** vendor-sync 协议核 → cargo-ndk
+交叉编译 `libmirage_jni-{arm64-v8a,x86_64}.so` (16KB 对齐) → 附到 GitHub Release, 哈希纳入 cosign
+keyless 签名的 `SHA256SUMS`。
+- **内核与客户端独立**: 本仓库随协议版本发内核 .so; Android 客户端 App 在 Mirage-android 仓自行发版
+  并引用对应 .so。发出的 .so 与服务端协议严格同版 (同 commit sync)。
+- 构建步骤与已在 runner 跑绿的 CI `android-core` job 一致 (双 ABI + 16KB 校验)。
+
 ### ci: Android 内核 (mirage-core → .so) 交叉编译门禁 + 治 vendored 漂移
 
 `build.yml` 加 `android-core` job: checkout Mirage-android → 把**本仓库当前 commit** 的协议核
