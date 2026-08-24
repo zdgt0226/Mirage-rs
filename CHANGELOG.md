@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.10.2] - QUIC Salamander 混淆 (实验) + Android 内核工程化 (CI 交叉编译·.so 随 release) + TCP relay idle env 化 (2026-08-25)
+
 ### release: Android 内核 .so 随 Release 发布 (与客户端 App 独立)
 
 `release.yml` 加 `android-core` job: tag 发版时用**本 tag commit** vendor-sync 协议核 → cargo-ndk
