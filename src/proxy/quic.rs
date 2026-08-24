@@ -42,20 +42,39 @@ fn bind_client_socket(is_ipv6: bool, dst_port: u16, low_src_port: bool) -> std::
 
 /// 建客户端 endpoint (自建 socket, 支持源端口规避 + pre-packet)。`pre_packet` 时在 QUIC 握手前
 /// 先发一个随机 UDP 包到 server, desync GFW 的 UDP 四元组追踪 (USENIX Security 2025 规避法之一)。
-fn make_client_endpoint(server_addr: SocketAddr, low_src_port: bool, pre_packet: bool) -> Result<quinn::Endpoint> {
+fn make_client_endpoint(server_addr: SocketAddr, low_src_port: bool, pre_packet: bool, obfs: Option<&str>) -> Result<quinn::Endpoint> {
     let sock = bind_client_socket(server_addr.is_ipv6(), server_addr.port(), low_src_port)
         .context("QUIC: 绑客户端 UDP socket 失败")?;
     if pre_packet {
         // 随机长度 (8~64B) 随机内容, 在同一 4-tuple 上先发, 让 GFW 对该四元组的 QUIC 追踪失准。
-        // 到达我们的 QUIC 服务端会被当无效包丢弃, 无副作用。
+        // 到达我们的 QUIC 服务端会被当无效包丢弃, 无副作用。⚠️ obfs 开时这个裸包不混淆, 会被服务端
+        // obfs socket 去混淆后丢 (无副作用); 但也别在 obfs 下用 pre_packet (裸包本身反常), 二选一。
         let n = 8 + fastrand::usize(0..=56);
         let junk: Vec<u8> = (0..n).map(|_| fastrand::u8(..)).collect();
         let _ = sock.send_to(&junk, server_addr);
         tracing::debug!("QUIC: 发 {}B pre-packet 到 {} (GFW 四元组 desync)", n, server_addr);
     }
     let runtime = quinn::default_runtime().context("QUIC: 无 tokio runtime")?;
-    quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)
-        .context("QUIC: 建客户端 endpoint 失败")
+    match obfs {
+        Some(pw) => {
+            tracing::info!("QUIC: Salamander 混淆已启用 (客户端)");
+            let inner = runtime.wrap_udp_socket(sock).context("QUIC: wrap socket 失败")?;
+            let obf = crate::proxy::quic_obfs::ObfsSocket::wrap(inner, pw);
+            quinn::Endpoint::new_with_abstract_socket(endpoint_config(true), None, obf, runtime)
+                .context("QUIC: 建客户端 endpoint (obfs) 失败")
+        }
+        None => quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)
+            .context("QUIC: 建客户端 endpoint 失败"),
+    }
+}
+
+/// EndpointConfig。obfs 开时缩小 max_udp_payload_size, 让 +8B salt 后的包仍 ≤ MTU 不分片。
+fn endpoint_config(obfs: bool) -> quinn::EndpointConfig {
+    let mut ec = quinn::EndpointConfig::default();
+    if obfs {
+        let _ = ec.max_udp_payload_size(crate::proxy::quic_obfs::OBFS_MAX_UDP_PAYLOAD);
+    }
+    ec
 }
 
 /// QUIC TransportConfig。`window_mb`/`erasure` 来自 config (见 tuning), 环境变量 `MIRAGE_QUIC_WND`
@@ -111,6 +130,8 @@ pub struct QuicMux {
     low_src_port: bool,
     /// QUIC 握手前先发随机 UDP 包 desync GFW 四元组追踪 (USENIX Security 2025)。默认关。
     pre_packet: bool,
+    /// Salamander 混淆密码 (Some = 开混淆, 把 QUIC 藏成随机 UDP; 两端须一致)。默认关。见 quic_obfs。
+    obfs: Option<String>,
     window_mb: u64,
     erasure: bool,
 }
@@ -123,7 +144,7 @@ struct MuxInner {
 
 impl QuicMux {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(host: &str, port: u16, sni: &str, low_src_port: bool, pre_packet: bool, window_mb: u64, erasure: bool) -> Arc<Self> {
+    pub fn new(host: &str, port: u16, sni: &str, low_src_port: bool, pre_packet: bool, obfs: Option<String>, window_mb: u64, erasure: bool) -> Arc<Self> {
         Arc::new(Self {
             inner: tokio::sync::Mutex::new(MuxInner::default()),
             host: host.to_string(),
@@ -131,6 +152,7 @@ impl QuicMux {
             sni: sni.to_string(),
             low_src_port,
             pre_packet,
+            obfs,
             window_mb,
             erasure,
         })
@@ -143,7 +165,7 @@ impl QuicMux {
             // 惰性建 endpoint。默认绑通配临时口; low_src_port 时尝试绑 ≤ 目标端口的源口。
             if g.endpoint.is_none() {
                 let addr = resolve(&self.host, self.port).await?;
-                let mut ep = make_client_endpoint(addr, self.low_src_port, self.pre_packet)?;
+                let mut ep = make_client_endpoint(addr, self.low_src_port, self.pre_packet, self.obfs.as_deref())?;
                 ep.set_default_client_config(client_config(self.window_mb, self.erasure)?);
                 g.endpoint = Some(ep);
             }
@@ -199,7 +221,7 @@ fn client_config(window_mb: u64, erasure: bool) -> Result<quinn::ClientConfig> {
 // ───────────────────────── 服务端 ─────────────────────────
 
 /// 建一个 QUIC 服务端 endpoint, 监听 UDP `listen_addr`。证书自签 (P0, 认证在内层 Mirage)。
-pub fn server_endpoint(listen_addr: SocketAddr, window_mb: u64, erasure: bool) -> Result<quinn::Endpoint> {
+pub fn server_endpoint(listen_addr: SocketAddr, window_mb: u64, erasure: bool, obfs: Option<&str>) -> Result<quinn::Endpoint> {
     let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .context("QUIC: 生成自签证书失败")?;
@@ -220,7 +242,19 @@ pub fn server_endpoint(listen_addr: SocketAddr, window_mb: u64, erasure: bool) -
         .context("QUIC: rustls→quinn 服务端配置转换失败")?;
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
     server_cfg.transport_config(transport_config(window_mb, erasure));
-    quinn::Endpoint::server(server_cfg, listen_addr).context("QUIC: 绑定服务端 endpoint 失败")
+    match obfs {
+        Some(pw) => {
+            tracing::info!("QUIC: Salamander 混淆已启用 (服务端)");
+            // 混淆开: 自建 socket + 包 ObfsSocket + new_with_abstract_socket。
+            let sock = std::net::UdpSocket::bind(listen_addr).context("QUIC: 绑定服务端 UDP socket 失败")?;
+            let runtime = quinn::default_runtime().context("QUIC: 无 tokio runtime")?;
+            let inner = runtime.wrap_udp_socket(sock).context("QUIC: wrap socket 失败")?;
+            let obf = crate::proxy::quic_obfs::ObfsSocket::wrap(inner, pw);
+            quinn::Endpoint::new_with_abstract_socket(endpoint_config(true), Some(server_cfg), obf, runtime)
+                .context("QUIC: 绑定服务端 endpoint (obfs) 失败")
+        }
+        None => quinn::Endpoint::server(server_cfg, listen_addr).context("QUIC: 绑定服务端 endpoint 失败"),
+    }
 }
 
 // ───────────────────────── 双向流适配器 ─────────────────────────

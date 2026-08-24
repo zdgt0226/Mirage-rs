@@ -262,6 +262,10 @@ pub enum InboundConfig {
         /// 75x)。仅 transport=quic 生效。`MIRAGE_QUIC_CC=off` 环境变量可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_erasure_cc: Option<bool>,
+        /// QUIC Salamander 混淆密码 (藏成随机 UDP, 抗 GFW QUIC/SNI 封锁)。**须与客户端出站的 quic_obfs
+        /// 一致**。默认关。仅 transport=quic。见 docs §7。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_obfs: Option<String>,
     },
     Mixed {
         tag: String,
@@ -342,6 +346,10 @@ pub enum OutboundConfig {
         /// 默认 false。仅 transport=quic。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_pre_packet: Option<bool>,
+        /// QUIC Salamander 混淆密码 (设了则把 QUIC 藏成随机 UDP, 抗 GFW 的 QUIC/SNI 封锁)。**两端须一致**
+        /// (客户端出站 + 服务端入站同填)。默认关。仅 transport=quic。见 docs §7。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_obfs: Option<String>,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。

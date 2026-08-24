@@ -33,6 +33,8 @@ pub struct PoolConfig {
     pub quic_low_src_port: bool,
     /// QUIC 握手前发随机 UDP 包 (GFW 四元组 desync, 默认 false)。
     pub quic_pre_packet: bool,
+    /// QUIC Salamander 混淆密码 (Some=藏成随机 UDP, 两端须一致)。默认 None。
+    pub quic_obfs: Option<String>,
 }
 
 /**
@@ -390,7 +392,7 @@ impl WarmPool {
         // mux 架构: transport=quic 时建一个共享 QUIC mux (一个连接开多流)。TCP 路径无。
         #[cfg(feature = "quic")]
         let quic_mux = if cfg.transport == crate::config::Transport::Quic {
-            Some(crate::proxy::quic::QuicMux::new(&cfg.server_host, cfg.server_port, &cfg.quic_sni, cfg.quic_low_src_port, cfg.quic_pre_packet, cfg.quic_window_mb, cfg.quic_erasure_cc))
+            Some(crate::proxy::quic::QuicMux::new(&cfg.server_host, cfg.server_port, &cfg.quic_sni, cfg.quic_low_src_port, cfg.quic_pre_packet, cfg.quic_obfs.clone(), cfg.quic_window_mb, cfg.quic_erasure_cc))
         } else {
             None
         };

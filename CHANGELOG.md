@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### feat(transport): QUIC Salamander 混淆 —— 把 QUIC 藏成随机 UDP (抗审查)
+
+给 QUIC 性能腿补一层 Hysteria2 式 Salamander 混淆, 直接废掉 GFW 基于 SNI 的 QUIC 封锁
+(GFW 解 QUIC Initial 读 SNI 封, USENIX Security 2025)。**定位: 补强性能腿的抗审查, 非取代 TCP
+fake-TLS 主链路。**
+- **做法**: UDP socket 层对每包 XOR —— `[salt(8B 随机)][原包 XOR keystream(blake3-XOF(key,salt))]`,
+  key = blake3(obfs 密码)。GFW 看到纯随机字节、连"这是 QUIC"都认不出, 更读不到 Initial 里的 SNI。
+- **不 fork rustls/quinn**: 靠 quinn `AsyncUdpSocket` + `new_with_abstract_socket` 包 `ObfsSocket`
+  (新 `src/proxy/quic_obfs.rs`)。避开 JA4 字节仿真的 fork 重工 —— 混淆后根本无 QUIC 指纹可查。
+- **配置**: `quic_obfs` 密码 (MirageServer 入站 + Mirage 出站两端须一致); 默认关。与 pre-packet 二选一。
+- 关 GSO/GRO (每报文单独混淆); `max_udp_payload_size=1444` 留 +8B salt 头余量保不分片。
+- **验证**: 两端同密码 e2e 2MB 全传; 不匹配 (一端 obfs 一端不) http=000 连不通, 反证混淆真生效。
+  default+quic 双构建 clippy 绿; 354 lib + 全集成 + quic e2e 绿。见 docs/quic-transport-design.md §5.7。
+
 ### feat(config): QUIC 配置 check 阶段 fail-fast
 
 `mirage`/`mirage_server` 的 QUIC 配置在 `check` 阶段就校验, 别等运行时才报错:

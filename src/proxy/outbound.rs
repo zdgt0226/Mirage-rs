@@ -444,7 +444,7 @@ impl OutboundManager {
         let OutboundConfig::Mirage {
             tag, server, server_port, password, camouflage_host, pool_size,
             brutal_rate_mbps, brutal_base_rtt_ms, pfs, transport, quic_window_mb, quic_erasure_cc,
-            quic_sni, quic_low_src_port, quic_pre_packet, ..
+            quic_sni, quic_low_src_port, quic_pre_packet, quic_obfs, ..
         } = oc else { unreachable!("build_mirage 只接受 Mirage 配置") };
         let pool_cfg = Arc::new(PoolConfig {
             server_host: server.clone(),
@@ -461,6 +461,7 @@ impl OutboundManager {
             quic_sni: quic_sni.clone().unwrap_or_else(|| camouflage_host.clone()),
             quic_low_src_port: quic_low_src_port.unwrap_or(false),
             quic_pre_packet: quic_pre_packet.unwrap_or(false),
+            quic_obfs: quic_obfs.clone(),
         });
         let bytes_per_sec = brutal_rate_mbps.map(|m| m * 125_000);
         let brutal_state = Arc::new(crate::proxy::pool::BrutalState {

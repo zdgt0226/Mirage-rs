@@ -399,9 +399,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     }
                 });
             }
-            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, pfs, transport, quic_window_mb, quic_erasure_cc, .. } => {
+            crate::config::InboundConfig::MirageServer { listen, port, password, camouflage_host, brutal_rate_mbps, auth_ts_tolerance_secs, upstream, pfs, transport, quic_window_mb, quic_erasure_cc, quic_obfs, .. } => {
                 #[cfg(not(feature = "quic"))]
-                let _ = (&quic_window_mb, &quic_erasure_cc); // 仅 quic 特性下使用
+                let _ = (&quic_window_mb, &quic_erasure_cc, &quic_obfs); // 仅 quic 特性下使用
                 let listen_addr = crate::net_util::join_host_port(&listen, port);
                 let cam_host = camouflage_host.unwrap_or_else(|| "www.apple.com".to_string());
                 let ebp = ebpf_clone.clone();
@@ -417,7 +417,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     crate::config::Transport::Quic => {
                         #[cfg(feature = "quic")]
                         tokio::spawn(async move {
-                            crate::proxy::mirage_server::start_quic_server(&listen_addr, &password, &cam_host, auth_ts_tolerance_secs, ss_upstream, pfs, quic_window_mb.unwrap_or(2), quic_erasure_cc.unwrap_or(true)).await;
+                            crate::proxy::mirage_server::start_quic_server(&listen_addr, &password, &cam_host, auth_ts_tolerance_secs, ss_upstream, pfs, quic_window_mb.unwrap_or(2), quic_erasure_cc.unwrap_or(true), quic_obfs.clone()).await;
                         });
                         #[cfg(not(feature = "quic"))]
                         error!("MirageServer transport=quic 需以 `--features quic` 编译, 该入站未启动 (见 docs/quic-transport-design.md)");
