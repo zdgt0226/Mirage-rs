@@ -104,7 +104,7 @@ ask_port() {
 # 暴露到 0.0.0.0 时自动生成随机 API token —— 否则任何可达者可读日志/配置+改路由规则。
 ask_gui() {
     local default_port=${1:-9090}
-    if ! ask_yn "启用 Web GUI 管理面板 (Neon Dashboard)" y; then
+    if ! ask_yn "启用 Web GUI 管理面板 (Mirage Console)" y; then
         echo "false 127.0.0.1:9090 -"
         return
     fi
@@ -1921,11 +1921,14 @@ EOF
     fi
     title "客户端部署完成"
     echo -e "  代理入站:   $(_c 36 "${inbound_listen}:${inbound_port}") (mixed: SOCKS5/HTTP)" >&2
-    echo -e "  Web 看板:   $(_c 36 "${gui_url}")" >&2
+    echo -e "  Web 看板:   $(_c 36 "${gui_url}") (Mirage Console)" >&2
     echo -e "  配置文件:   $(_c 36 "${ETC_DIR}/config_client.json")" >&2
     echo -e "  日志目录:   $(_c 36 "${LOG_DIR}")" >&2
     echo -e "  日志命令:   $(_c 36 "$(svc_log_hint client)")" >&2
     echo -e "  启动命令:   $(_c 36 "$(svc_start_hint client)")" >&2
+    if [[ "$client_gui_enabled" == "true" ]]; then
+        echo -e "  $(_c 33 "提示"): 按设备限速 / 用户策略 (不同设备走不同规则) 在 Web 看板 Admin 区管理 —— 无需改配置文件。" >&2
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

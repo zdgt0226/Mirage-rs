@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### chore(install): install.sh 品牌名对齐 + 新功能指引
+
+- 面板名 "Neon Dashboard" → **Mirage Console** (v0.10.0 已改名, 向导提示 + 客户端汇总统一)。
+- 客户端部署完成汇总加一句 (GUI 开时): 按设备限速 / 用户策略在 Web 看板 Admin 区管理, 无需改配置。
+- 审查确认 install.sh 生成的 config schema 当前有效, 核心流程 (server/client/lite/透明网关/brutal/PFS/
+  上游中转/GUI/systemd) 均在。限速/用户策略是 WebUI 运行时管理 (非安装期); QUIC 不入向导 (release
+  二进制不含 `--features quic`)。
+
 ## [v0.10.3] - TCP 带宽限速 (按设备/按客户端) + WarmPool 优雅停机 (Android 反哺) (2026-08-25)
 
 ### feat(pool): WarmPool 优雅停机 + 资源回收 (Android 反哺)
