@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.10.3] - TCP 带宽限速 (按设备/按客户端) + WarmPool 优雅停机 (Android 反哺) (2026-08-25)
+
 ### feat(pool): WarmPool 优雅停机 + 资源回收 (Android 反哺)
 
 WarmPool 加 `shutdown: Arc<AtomicBool>` + `impl Drop`: 池销毁/重置时置位 shutdown、`notify_waiters`
