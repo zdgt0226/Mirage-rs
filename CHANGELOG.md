@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(pool): WarmPool 优雅停机 + 资源回收 (Android 反哺)
+
+WarmPool 加 `shutdown: Arc<AtomicBool>` + `impl Drop`: 池销毁/重置时置位 shutdown、`notify_waiters`
+唤醒阻塞协程、`try_lock` 清空闲置 Tunnel。Manager/Builder/net_rx 三后台协程加退出信号检查; `get()`
+加 fast-fail (对已停机池不空等, 返回类型内部改 `Option<Tunnel>` 区分停机 vs 超时)。
+- 来源: Android 客户端引擎重建 (node 切换/切网 arc-swap) 时 drop 池, 无此则后台协程 + FD 泄漏。
+  Mirage-rs 侧池热重载保留、进程退出才 drop, 价值有限但好习惯。net_rx 协程仅下次网络变更才看到
+  shutdown 退出 (阻塞非自旋, 无害)。
+- 评审剔除原提案另两项: `.cargo/config.toml` (Mirage-rs 不交叉编译 Android = 死配置) 与
+  `dns/server.rs` 源校验 (与 known_issues "anycast/NAT 异源故意不加"决策冲突, 已反馈 Mirage-android)。
+
 ### feat(relay): TCP 带宽限速 (按设备/按客户端, 用户态 token bucket)
 
 T2 剩项旗舰 —— 客户端**按 LAN 设备** / 服务端**按连接的客户端**限 TCP 带宽。用户态 token bucket

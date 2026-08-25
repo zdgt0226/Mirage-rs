@@ -4,7 +4,7 @@ use crate::proxy::outbound::{Address, OutboundNode};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use std::sync::RwLock;
@@ -353,8 +353,6 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
     Ok(server_random)
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 /// [弹性预热连接池 (WarmPool)]
 /// Mirage 的核心性能组件，用于零延迟转发。
 /// 
@@ -369,6 +367,7 @@ pub struct WarmPool {
     pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
     metrics: Arc<PoolMetrics>,                // 反馈式弹性算法的运行时指标
     cfg: Arc<PoolConfig>,                     // 保留 config (transport/password/quic_sni 等, 供 Model X)
+    shutdown: Arc<AtomicBool>,                // 停机标志位 (Drop / 关闭时优雅停止后台协程)
     // Model X: transport=quic 时的共享 QUIC mux。connect() 直接在其上开精简流 (绕过 fake-TLS Tunnel)。
     #[cfg(feature = "quic")]
     quic_mux: Option<Arc<crate::proxy::quic::QuicMux>>,
@@ -388,6 +387,7 @@ impl WarmPool {
         let notify = Arc::new(Notify::new());
         let stats = Arc::new(RwLock::new(PoolStats::new()));
         let metrics = Arc::new(PoolMetrics::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // mux 架构: transport=quic 时建一个共享 QUIC mux (一个连接开多流)。TCP 路径无。
         #[cfg(feature = "quic")]
@@ -404,6 +404,7 @@ impl WarmPool {
             brutal_state: brutal_state.clone(),
             metrics: metrics.clone(),
             cfg: cfg.clone(),
+            shutdown: shutdown.clone(),
             #[cfg(feature = "quic")]
             quic_mux: quic_mux.clone(),
         };
@@ -416,9 +417,13 @@ impl WarmPool {
         {
             let flush_q = queue.clone();
             let mut net_rx = crate::net_monitor::subscribe();
+            let shutdown_net = shutdown.clone();
             tokio::spawn(async move {
                 // changed() 只对订阅后的未来变更就绪, 启动瞬间不会误 flush。
                 while net_rx.changed().await.is_ok() {
+                    if shutdown_net.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let mut q = flush_q.lock().await;
                     let n = q.len();
                     q.clear();
@@ -446,9 +451,13 @@ impl WarmPool {
         let q_clone = queue.clone();
         let in_flight_clone_mgr = in_flight.clone();
         let max_size = cfg.pool_size;
+        let shutdown_mgr = shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                if shutdown_mgr.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 // 读三个计数器并归零, 进入下一周期
                 let wait = metrics_clone.wait_events.swap(0, Ordering::Relaxed);
@@ -529,6 +538,7 @@ impl WarmPool {
         let target_clone_builder = target_size.clone();
         let stats_builder = stats.clone();
         let brutal_state_builder = brutal_state.clone();
+        let shutdown_builder = shutdown.clone();
 
         tokio::spawn(async move {
             info!("WarmPool (Elastic) initialized. Max capacity: {}", cfg_clone.pool_size);
@@ -540,6 +550,9 @@ impl WarmPool {
             let mut next_build_at = Instant::now();
 
             loop {
+                if shutdown_builder.load(Ordering::Relaxed) {
+                    break;
+                }
                 let current_target = target_clone_builder.load(Ordering::Relaxed);
                 let current_idle = q_clone_builder.lock().await.len();
                 let current_in_flight = in_flight_clone.load(Ordering::Relaxed);
@@ -830,11 +843,17 @@ impl WarmPool {
     /// 反馈式弹性 (v0.4.2+) 仪表化: 入口记录开始时间, 拿到 tunnel 后若总耗时
     /// > 50ms 计一次 wait_event. Manager task 用此比率决定下周期 target 调整.
     pub async fn get(&self) -> Result<Tunnel> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            anyhow::bail!("WarmPool has been shut down");
+        }
         self.metrics.total_gets.fetch_add(1, Ordering::Relaxed);
         let wait_start = Instant::now();
 
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
+                if self.shutdown.load(Ordering::Relaxed) {
+                    return None;
+                }
                 // 先获取通知句柄（关键：避免检查队列为空和发生通知之间的竞态条件 Race Condition）
                 let notified = self.notify.notified();
 
@@ -866,7 +885,7 @@ impl WarmPool {
                     if wait_start.elapsed() > Duration::from_millis(50) {
                         self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
                     }
-                    return tunnel;
+                    return Some(tunnel);
                 }
 
                 // 队列真的空了，挂起当前协程等待补货
@@ -878,10 +897,14 @@ impl WarmPool {
         // 池饿死 100 个请求全 10s timeout → total=100 wait=0 → wait_ratio=0.0
         // → Manager 认为"供给完美"甚至触发缩容, 反馈算法逻辑倒挂. timeout 到
         // 这里意味着确实等了 10s 全被阻塞过, 显式计一次.
-        result.map_err(|_| {
-            self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
-            anyhow::anyhow!("pool.get() timed out after 10s — upstream likely unreachable")
-        })
+        match result {
+            Ok(Some(tunnel)) => Ok(tunnel),
+            Ok(None) => anyhow::bail!("WarmPool was shut down while waiting for tunnel"),
+            Err(_) => {
+                self.metrics.wait_events.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("pool.get() timed out after 10s — upstream likely unreachable");
+            }
+        }
     }
 
     pub async fn update_brutal_rate(&self, new_rate: u64) {
@@ -925,6 +948,16 @@ impl WarmPool {
         ActiveFdGuard {
             state: self.brutal_state.clone(),
             fd,
+        }
+    }
+}
+
+impl Drop for WarmPool {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+        if let Ok(mut q) = self.queue.try_lock() {
+            q.clear();
         }
     }
 }
