@@ -16,6 +16,8 @@ pub struct CoreState {
     pub advanced_dns: Option<crate::config::AdvancedDnsConfig>,
     /// 未分类域名自适应分类 (auto_classify)。None = 关闭 / geoip 缺失。热重载会重建 (学习缓存重置)。
     pub auto_classify: Option<Arc<crate::dns::server::AutoClassify>>,
+    /// 按源 IP 的带宽限速器 (device_profiles 的 rate_limit_kbps)。空 = 无限速 (热路径直接跳过)。
+    pub rate_limiter: Arc<crate::proxy::rate_limit::RateLimiter>,
 }
 
 impl CoreState {
@@ -227,11 +229,19 @@ impl ConfigWatcher {
             geodata_dir,
         );
 
+        let rate_limiter = Arc::new(
+            crate::proxy::rate_limit::RateLimiter::from_device_profiles(&config.routing.device_profiles),
+        );
+        if !rate_limiter.is_empty() {
+            info!("限速: device_profiles 已配置带宽上限 (按源 IP TCP 整形)");
+        }
+
         Ok(CoreState {
             router: Arc::new(router),
             outbounds,
             advanced_dns,
             auto_classify,
+            rate_limiter,
         })
     }
 

@@ -351,6 +351,11 @@ pub async fn proxy_tcp_target(
             let tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
 
+            // 限速 (device_profiles rate_limit_kbps): 按本连接源 IP (LAN 设备) 取共享桶, 上/下行各整形。
+            // 无配置/未命中 → None, 热路径零开销。up_bkt/dn_bkt 各持一份 Arc 供两个泵分别 move。
+            let dev_buckets = source_ip.and_then(|ip| state.load().rate_limiter.buckets_for(ip));
+            let up_bkt = dev_buckets.clone();
+
             let up_conn = _conn.counter();
             let upload = async {
                 // 64KB 堆 buf (非 16KB 栈): 与服务端 download 对称, 配下方 greedy
@@ -378,6 +383,9 @@ pub async fn proxy_tcp_target(
                                     Err(_) => break,
                                 }
                             }
+                            if let Some(b) = &up_bkt {
+                                b.up.consume(total).await; // 限速整形: 令牌不足则等 → 停 read → 背压
+                            }
                             if tunnel_writer.send_data(&buf[..total]).await.is_err() {
                                 break;
                             }
@@ -403,6 +411,7 @@ pub async fn proxy_tcp_target(
                 (tunnel_writer, up_bytes)
             };
 
+            let dn_bkt = dev_buckets;
             let dn_conn = _conn.counter();
             let download = async {
                 // alpha.21 曾尝试 mpsc(32) producer/consumer 批量, 但外部审计
@@ -423,6 +432,9 @@ pub async fn proxy_tcp_target(
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
                     match tokio::time::timeout(relay_idle(), tunnel_reader.recv_data()).await {
                         Ok(Ok(data)) => {
+                            if let Some(b) = &dn_bkt {
+                                b.down.consume(data.len()).await; // 限速整形 (下行)
+                            }
                             if local_write.write_all(&data).await.is_err() {
                                 break;
                             }

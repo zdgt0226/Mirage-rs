@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### feat(relay): TCP 带宽限速 (按设备/按客户端, 用户态 token bucket)
+
+T2 剩项旗舰 —— 客户端**按 LAN 设备** / 服务端**按连接的客户端**限 TCP 带宽。用户态 token bucket
+整形 relay 字节流 (无 eBPF 依赖), 复用 `routing.device_profiles`: 给设备分配加 `rate_limit_kbps`
+(kbps), 命中源 IP 的上/下行各独立整形、按源 IP 聚合跨该 IP 全部连接共享。
+- **两侧同一套 device_profiles 配置**: 客户端按 LAN 设备源 IP (走 `CoreState.rate_limiter`, 随 config
+  热重载); 服务端按连接的客户端 IP (进程级 limiter, 仿 blocklist 全局模式, 启动/热重载装)。
+- **整形非丢包**: 令牌不足则 `await` 到够 → 停 read/recv → TCP 背压自然减速。桶容量 = 0.5s 量 (下限
+  64KB)。新 `src/proxy/rate_limit.rs` (TokenBucket + 按源 IP 的 CIDR→rate registry)。
+- **实机验证**: 本地两侧各限 1MB/s → 1.00-1.01MB/s (误差<1%), 无限速对照 79MB/s; CN2→US 服务端限
+  250KB/s (线路可跑 4.25MB/s) → 249/240KB/s, 17x 低于线路率证 cap 无疑生效。3 单测 (整形/解析/空)。
+- UDP 后续 (无背压, 需丢/缓冲策略); WebUI Admin 占位入口待接后端。仅 TCP relay 路径 (direct 出站)。
+
 ## [v0.10.2] - QUIC Salamander 混淆 (实验) + Android 内核工程化 (CI 交叉编译·.so 随 release) + TCP relay idle env 化 (2026-08-25)
 
 ### release: Android 内核 .so 随 Release 发布 (与客户端 App 独立)
