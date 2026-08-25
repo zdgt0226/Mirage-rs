@@ -53,6 +53,9 @@ pub fn set_offset_from_server_time(server_time: u64) {
     // 只在 |Δ| ≥ SIGNIFICANT_DELTA 时打 INFO. 系统时钟正常 jitter 通常 ≤ 1s,
     // 每条 WarmPool tunnel 建立就 flip ±1s 会淹没 log. 真正的时钟不同步 (NTP
     // 缺失 / VM 时钟漂移) 通常一次性纠 ≥ 3s, 用户需要看到.
+    // ⚠️ TIME_SYNC 每条 pool 连接握手都跑一次 → 池频繁补货时"没变化/微抖动"两种情况
+    // 会刷屏。它们无诊断价值 (Δ==0 啥也没变; <3s 是正常系统 jitter), 故降到 trace,
+    // debug 级也清爽; 真时钟跳变 (≥3s, 值得关注) 仍走 INFO。
     const SIGNIFICANT_DELTA: i64 = 3;
     if delta.abs() >= SIGNIFICANT_DELTA {
         tracing::info!(
@@ -60,12 +63,12 @@ pub fn set_offset_from_server_time(server_time: u64) {
             old, offset, delta
         );
     } else if delta != 0 {
-        tracing::debug!(
+        tracing::trace!(
             "TIME_SYNC: minor drift {}s → {}s (Δ {}s, < {}s threshold)",
             old, offset, delta, SIGNIFICANT_DELTA
         );
     } else {
-        tracing::debug!("TIME_SYNC: offset maintained at {}s", offset);
+        tracing::trace!("TIME_SYNC: offset maintained at {}s", offset);
     }
 }
 
