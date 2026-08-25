@@ -415,6 +415,7 @@ mod tests {
                 outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg).unwrap()),
                 advanced_dns: None,
                 auto_classify: None,
+                rate_limiter: Arc::new(crate::proxy::rate_limit::RateLimiter::from_device_profiles(&[])),
             },
         ))
     }

@@ -139,6 +139,8 @@ fn build_core_state(cfg: &LiteClientConfig) -> Result<crate::config_watcher::Cor
         outbounds,
         advanced_dns: None,
         auto_classify: None,
+        // 轻量模式无 device_profiles → 无限速。
+        rate_limiter: Arc::new(crate::proxy::rate_limit::RateLimiter::from_device_profiles(&[])),
     })
 }
 

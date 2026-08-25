@@ -376,7 +376,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 
 ### ⏳ 未完成 (计划池)
 
-- [ ] 🔥 **限速 (优先)** —— 客户端**按设备** / 服务端**按客户端**限带宽。WebUI Admin 已留占位入口 (v0.10.0)。需**流量整形数据面**: 用户态 token bucket 包住 relay 字节流 (先起, 无 eBPF 依赖) 或 tc/eBPF。唯一要真数据面的 T2 剩项, 定为下一步优先
+- [~] **限速** —— 客户端**按设备** / 服务端**按客户端**限带宽。**TCP 已做**: 用户态 token bucket 整形 relay 字节流 (无 eBPF 依赖), 复用 `routing.device_profiles` —— 给设备分配加 `rate_limit_kbps` (源 IP 命中→上/下行各独立整形, 按源 IP 聚合跨连接共享)。客户端按 LAN 设备源 IP、服务端按连接的客户端 IP, 同一套配置。实机验证: 本地两侧各限 1MB/s 误差<1%; CN2→US 服务端限 250KB/s (线路 4.25MB/s) 精准生效。**UDP 后续** (无背压需丢/缓冲)。WebUI Admin 占位入口待接后端
 - [x] **WebUI 全新看板 Mirage Console** (v0.10.0) —— 界面重构 (侧栏切视图 + 暗/亮双主题 + Canvas 流量图, 对标 Linear/shadcn) + i18n 中/英双语 + **服务端/客户端多模式分视图 + Admin 区**。客户端: LAN 设备表 + 按设备一键路由; 服务端: 域名排行 · 连接历史 · 连接的客户端 (版本 `tuning.client_info` 两端 opt-in 零指纹 + 一键屏蔽)。规则编辑器 dry_run 预检/进程分流维度/拖排。前身 v0.9.6 五阶段 (连接登记/面板/统计/透明 UDP 登记)。⚠️ 域名排行/历史/版本/屏蔽名单均内存版重启清零
 - [~] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① **设备规则已生效**: `source_ip_cidr` 现对透明 TCP + SOCKS-UDP + 透明 UDP 全路径匹配。**「不同用户匹配不同规则」已做** (未发版): `routing.profiles` 命名策略 + `routing.device_profiles` 设备→策略分配, build 时展开成带 `source_ip_cidr` 的规则前插 (设备规则首命中优先); WebUI Routing「用户策略」卡可视化管理 + `GET/POST /api/profiles`。DNS 查询维度暂 None (每主机 DNS 策略未实现)。② **每主机用量**: 用户态版**已做** (v0.10.0 Admin/Devices 设备表 = per-源 IP 连接数/字节/活跃, `/api/devices`)。剩 **eBPF 精确计数** (tc 看得到含 splice 直连全部流量, 用户态计数会漏直连) + 可选设备别名
 - [ ] **rule-set 远程规则集自动更新** —— 免手动放 geo 文件 (须先定安全模型: 规则决定流量去向, 更新失败必须保留旧规则)

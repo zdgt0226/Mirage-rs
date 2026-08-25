@@ -263,6 +263,18 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             inbounds = config.inbounds;
+            // 服务端限速: 按 config.routing.device_profiles 装进程级 limiter (mirage_server relay 泵按
+            // 连接的客户端 IP 取桶整形)。客户端侧限速走 CoreState.rate_limiter (config_watcher), 互不影响;
+            // 纯客户端无 MirageServer 入站时这个全局装了也不会被读, 无副作用。
+            {
+                let rl = std::sync::Arc::new(
+                    crate::proxy::rate_limit::RateLimiter::from_device_profiles(&config.routing.device_profiles),
+                );
+                if !rl.is_empty() {
+                    info!("限速(服务端): device_profiles 已配置带宽上限 (按客户端 IP TCP 整形)");
+                }
+                crate::proxy::rate_limit::set_server_limiter(rl);
+            }
             // 废弃 stub 字段告警: 这些字段解析了但从不被使用, 设了它们的用户会误以为生效。
             if config.api.is_some() {
                 warn!(

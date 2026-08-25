@@ -475,6 +475,12 @@ pub struct DeviceProfile {
     /// 可选设备别名 (WebUI 展示; 不影响路由)。
     #[serde(default)]
     pub name: Option<String>,
+    /// 可选带宽上限 (kbps, 1 kbps = 1000 bit/s)。设了则对该设备/源网段的 TCP relay 字节流做
+    /// 用户态 token bucket 整形 (上/下行各独立此上限, 按源 IP 聚合、跨该 IP 全部连接共享)。
+    /// 客户端侧 = 按 LAN 设备限速; 服务端侧 = 按连接的客户端 IP 限速 (device_profiles 同一套配置,
+    /// 服务端的"设备"= 连来的客户端)。None/0 = 不限速。仅 TCP (UDP 后续)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_kbps: Option<u64>,
 }
 
 /// 规则内**多类条件**的组合方式。

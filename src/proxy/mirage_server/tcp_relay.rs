@@ -93,11 +93,20 @@ pub(super) async fn handle_tcp_relay(
         }
     };
 
+    // 限速 (device_profiles rate_limit_kbps): 服务端按连接的客户端 IP 取共享桶, 上/下行各整形。
+    // 全局 limiter (server_buckets_for, 见 rate_limit.rs) 在 server 启动时按 config.routing 装。
+    let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
+    let up_bkt = dev_buckets.clone();
+    let dn_bkt = dev_buckets;
+
     let up_conn = _conn.counter();
     let upload = async move {
         loop {
             match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
                 Ok(Ok(data)) => {
+                    if let Some(b) = &up_bkt {
+                        b.up.consume(data.len()).await; // 客户端上行限速整形
+                    }
                     if up_write.write_all(&data).await.is_err() {
                         break;
                     }
@@ -137,6 +146,9 @@ pub(super) async fn handle_tcp_relay(
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(_) => break,
                         }
+                    }
+                    if let Some(b) = &dn_bkt {
+                        b.down.consume(total).await; // 客户端下行限速整形
                     }
                     if writer.send_data(&buf[..total]).await.is_err() {
                         break;
