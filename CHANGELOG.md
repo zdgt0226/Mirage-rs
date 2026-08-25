@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### chore(log): TIME_SYNC "无变化/微抖动" 降 trace, 消 debug 级刷屏
+
+TIME_SYNC 每条 pool 连接握手都跑一次 (设计: 服务端下发时间帧, 0 外部依赖 0 指纹), 池频繁补货时
+`Δ==0` "offset maintained" 与 `<3s` "minor drift" 两条 debug 会淹没日志 —— 它们无诊断价值 (啥也没变 /
+正常系统 jitter)。降到 **trace**, debug 级清爽; 真时钟跳变 (`≥3s`, 值得关注) 仍走 **INFO** 不变。
+(注: 这非"同步间隔"—— TIME_SYNC 是每连接握手帧非定时器; 日志量随连接频率, 不是间隔短。)
+
 ### chore(install): install.sh 品牌名对齐 + 新功能指引
 
 - 面板名 "Neon Dashboard" → **Mirage Console** (v0.10.0 已改名, 向导提示 + 客户端汇总统一)。
