@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(relay): transparent UDP 限速 (网关 LAN 设备, policing)
+
+限速覆盖到透明网关 UDP —— LAN 设备走 tc_divert/TPROXY 的 UDP 流按设备源 IP policing (令牌不足丢包)。
+补齐 SOCKS UDP (#82) 之后的另一条 UDP 路。复用同一 `device_profiles` + `TokenBucket::try_consume`。
+- `transparent_udp.rs`: 上行主循环逐包 policing (转 sink 前, 未配限速时 buckets_for 早返廉价);
+  下行 Direct/WireGuard/Mirage 三条回包循环各 policing (setup_flow 按 client IP 解析桶一次, Mirage
+  下行 async move 用 clone)。只计已投递字节; got_downlink 按收到下行置位 (拆流节奏不受 policing 影响)。
+- ⚠️ **验证边界 (诚实标注)**: compile + clippy(-D warnings) + 全 test 绿; policing 机制 (`try_consume`)
+  已由 SOCKS UDP 路**实机验** (#82, flood 114MB/s → recv 245KB/s cap) + 单测证, transparent 接入是
+  同款 pattern。但 transparent 路**本身未独立实机验** —— 需 eBPF TPROXY + LAN 设备环境 (本地无从搭),
+  留待 CI netns 验证器 (`verify_udp_transparent.sh`) 扩限速断言, 或真机网关部署验。
+
 ### feat(relay): UDP 带宽限速 (SOCKS/mixed UDP relay, policing 丢包)
 
 限速补上 UDP 半边 (TCP 见 v0.10.3)。UDP **无背压** —— 不能像 TCP 那样 await 整形 (会加延迟/乱序),

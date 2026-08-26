@@ -395,6 +395,16 @@ pub async fn start_transparent_udp(
         }
 
         if let Some(sink) = forward {
+            // 上行限速 (policing): 令牌不足丢本包 (UDP 无背压)。per-packet 解析 —— 未配限速时
+            // buckets_for 在 cidrs 空即早返 (不加锁), 热路径廉价。
+            if state
+                .load()
+                .rate_limiter
+                .buckets_for(std::net::IpAddr::V4(*client.ip()))
+                .is_some_and(|b| !b.up.try_consume(size))
+            {
+                continue;
+            }
             match sink {
                 FlowSink::Direct(out) => {
                     let _ = out.send(&buf[..size]).await;
@@ -545,6 +555,13 @@ async fn setup_flow(
     _conn.counter().up(first_payload.len() as u64);
     let conn_ctr = _conn.counter();
 
+    // 下行限速 (device_profiles rate_limit_kbps): 按 LAN 设备源 IP 取桶, policing (令牌不足丢包)。
+    // 每流解析一次 (跨该 IP 全部流共享同一桶)。上行在主循环逐包 policing (见 start_transparent_udp)。
+    let dev_buckets = state
+        .load()
+        .rate_limiter
+        .buckets_for(std::net::IpAddr::V4(*client.ip()));
+
     match route {
         // ── Direct 腿: 本地解析 + 直发 UDP socket ──
         Route::Direct => {
@@ -594,9 +611,12 @@ async fn setup_flow(
             loop {
                 match tokio::time::timeout(IDLE_TIMEOUT, out.recv(&mut dbuf)).await {
                     Ok(Ok(n)) => {
-                        let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
-                        down_ctr.fetch_add(n as u64, Ordering::Relaxed);
-                        conn_ctr.down(n as u64);
+                        // 下行限速 (policing): 令牌不足丢本报文; 只计已投递字节。
+                        if dev_buckets.as_ref().is_none_or(|b| b.down.try_consume(n)) {
+                            let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
+                            down_ctr.fetch_add(n as u64, Ordering::Relaxed);
+                            conn_ctr.down(n as u64);
+                        }
                     }
                     _ => break,
                 }
@@ -660,9 +680,12 @@ async fn setup_flow(
             loop {
                 match tokio::time::timeout(IDLE_TIMEOUT, sock.recv_from(&mut dbuf)).await {
                     Ok(Ok((n, _from))) => {
-                        let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
-                        down_ctr.fetch_add(n as u64, Ordering::Relaxed);
-                        conn_ctr.down(n as u64);
+                        // 下行限速 (policing): 令牌不足丢本报文; 只计已投递字节。
+                        if dev_buckets.as_ref().is_none_or(|b| b.down.try_consume(n)) {
+                            let _ = reply.send_to(&dbuf[..n], SocketAddr::V4(client)).await;
+                            down_ctr.fetch_add(n as u64, Ordering::Relaxed);
+                            conn_ctr.down(n as u64);
+                        }
                     }
                     _ => break,
                 }
@@ -859,6 +882,7 @@ async fn setup_flow(
             // downlink: 隧道 → 解帧取 payload → reply_socket 发回客户端 (伪源 orig_dst)
             let dl_ctr = down_ctr.clone();
             let dl_conn = conn_ctr.clone();
+            let dn_buckets = dev_buckets.clone();
             let downlink = async move {
                 let mut acc: Vec<u8> = Vec::new();
                 let mut got_downlink = false;
@@ -872,10 +896,13 @@ async fn setup_flow(
                     acc.extend_from_slice(&chunk);
                     while let Some((payload, consumed)) = parse_udp_frame_payload(&acc) {
                         if !payload.is_empty() {
-                            let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
-                            dl_ctr.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                            dl_conn.down(payload.len() as u64);
-                            got_downlink = true;
+                            got_downlink = true; // 收到下行 (拆流节奏), 与是否 policing 丢无关
+                            // 下行限速 (policing): 令牌不足丢本报文; 只计已投递字节。
+                            if dn_buckets.as_ref().is_none_or(|b| b.down.try_consume(payload.len())) {
+                                let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
+                                dl_ctr.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                                dl_conn.down(payload.len() as u64);
+                            }
                         }
                         acc.drain(0..consumed);
                     }
