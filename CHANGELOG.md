@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(relay): UDP 带宽限速 (SOCKS/mixed UDP relay, policing 丢包)
+
+限速补上 UDP 半边 (TCP 见 v0.10.3)。UDP **无背压** —— 不能像 TCP 那样 await 整形 (会加延迟/乱序),
+故用 **policing**: 令牌不足即**丢本报文** (同 tc police)。`TokenBucket::try_consume(n)->bool` 非阻塞消费,
+复用 `device_profiles` 的 `rate_limit_kbps`, 按源 IP 上/下行各独立。
+- 接入 SOCKS/mixed UDP relay (`udp_relay.rs`): 上行 (设备→目标) sink 分发前 policing; 下行
+  (目标→设备) 各 sink 下行任务发回客户端前 policing。按 payload/帧体字节计。
+- **实机验证**: 本地 flood 26MB/s → recv **245KB/s** (cap 250, 误差<2%), 无限速对照 14.6MB/s;
+  CN2 真机 flood 114MB/s → recv **245KB/s**, 无限速 56MB/s (230x)。+1 单测 (try_consume policing)。
+- **范围**: 仅 SOCKS/mixed UDP relay。**transparent UDP (网关 LAN 设备) + 服务端 UDP + udp_mux
+  后续** —— 同 policing 机制, 但 transparent 需 eBPF LAN 环境才能实机验, 未在本次一并接入。
+
 ### chore(log): TIME_SYNC "无变化/微抖动" 降 trace, 消 debug 级刷屏
 
 TIME_SYNC 每条 pool 连接握手都跑一次 (设计: 服务端下发时间帧, 0 外部依赖 0 指纹), 池频繁补货时

@@ -55,6 +55,10 @@ pub async fn handle_udp_associate_routed(
     let relay = async {
         let mut buf = vec![0u8; 65536];
         let mut client_addr: Option<SocketAddr> = None;
+        // 限速 (device_profiles rate_limit_kbps): 按客户端源 IP 取共享桶。UDP 无背压 → policing
+        // (令牌不足丢包, 见 rate_limit::TokenBucket::try_consume)。client 固定后解析一次 (免每包锁)。
+        let mut dev_buckets: Option<Arc<crate::proxy::rate_limit::DeviceBuckets>> = None;
+        let mut buckets_resolved = false;
 
         loop {
             let (size, from) = match uplink_sock.recv_from(&mut buf).await {
@@ -65,6 +69,11 @@ pub async fn handle_udp_associate_routed(
             let client = *client_addr.get_or_insert(from);
             if from != client {
                 continue;
+            }
+            if !buckets_resolved {
+                let src = crate::proxy::handler::normalize_peer_ip(client.ip());
+                dev_buckets = state.load().rate_limiter.buckets_for(src);
+                buckets_resolved = true;
             }
 
             let data = &buf[..size];
@@ -108,7 +117,7 @@ pub async fn handle_udp_associate_routed(
                     }
                 };
                 drop(snap);
-                match build_sink(&node, client_socket.clone(), client).await {
+                match build_sink(&node, client_socket.clone(), client, dev_buckets.clone()).await {
                     Some((sink, ah)) => {
                         if let Some(ah) = ah {
                             // 弱网下同一关联可反复重建 sink → 旧下行任务已退出但 AbortHandle 仍
@@ -127,6 +136,13 @@ pub async fn handle_udp_associate_routed(
                 }
             } else {
                 drop(snap);
+            }
+
+            // 上行限速 (policing): 令牌不足丢本报文 (UDP 无背压)。按 payload 字节数计。
+            if let Some(b) = &dev_buckets {
+                if !b.up.try_consume(payload.len()) {
+                    continue;
+                }
             }
 
             match sinks.get(&tag) {
@@ -208,6 +224,8 @@ async fn build_sink(
     node: &Arc<crate::proxy::outbound::OutboundNode>,
     client_socket: Arc<UdpSocket>,
     client: SocketAddr,
+    // 下行限速桶 (policing); None = 该源 IP 不限速。
+    dev_buckets: Option<Arc<crate::proxy::rate_limit::DeviceBuckets>>,
 ) -> Option<(Sink, Option<tokio::task::AbortHandle>)> {
     use crate::proxy::outbound::OutboundNode;
     match &**node {
@@ -215,6 +233,7 @@ async fn build_sink(
         OutboundNode::Direct { .. } => {
             let out = Arc::new(UdpSocket::bind("0.0.0.0:0").await.ok()?);
             let dn_out = out.clone();
+            let dn_buckets = dev_buckets.clone();
             let h = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65536];
                 loop {
@@ -222,6 +241,12 @@ async fn build_sink(
                         Ok(v) => v,
                         Err(_) => break,
                     };
+                    // 下行限速 (policing): 令牌不足丢本报文。按 payload 字节计。
+                    if let Some(b) = &dn_buckets {
+                        if !b.down.try_consume(n) {
+                            continue;
+                        }
+                    }
                     let mut resp = vec![0u8, 0, 0]; // RSV + FRAG
                     resp.extend_from_slice(&encode_socks_udp_addr(src));
                     resp.extend_from_slice(&buf[..n]);
@@ -236,6 +261,7 @@ async fn build_sink(
             tunnel.writer.send_data(&[0x00]).await.ok()?;
             let mut reader = tunnel.reader;
             let writer = Arc::new(tokio::sync::Mutex::new(tunnel.writer));
+            let dn_buckets = dev_buckets.clone();
             let h = tokio::spawn(async move {
                 let mut buffer = Vec::new();
                 loop {
@@ -249,9 +275,14 @@ async fn build_sink(
                         if buffer.len() < 2 + flen {
                             break;
                         }
-                        let mut resp = vec![0u8, 0, 0]; // RSV + FRAG
-                        resp.extend_from_slice(&buffer[2..2 + flen]);
-                        let _ = client_socket.send_to(&resp, client).await;
+                        // 下行限速 (policing): 令牌不足丢本报文 (仍消费掉 buffer 里这帧, 别卡住)。
+                        // 按帧体字节计 (含 SOCKS 地址头, 近似设备下行字节)。
+                        let pass = dn_buckets.as_ref().is_none_or(|b| b.down.try_consume(flen));
+                        if pass {
+                            let mut resp = vec![0u8, 0, 0]; // RSV + FRAG
+                            resp.extend_from_slice(&buffer[2..2 + flen]);
+                            let _ = client_socket.send_to(&resp, client).await;
+                        }
                         buffer.drain(0..2 + flen);
                     }
                 }
