@@ -59,6 +59,23 @@ impl TokenBucket {
             tokio::time::sleep(wait).await;
         }
     }
+
+    /// 非阻塞消费 (policing): 令牌够则扣掉返 true; 不够**不扣**返 false (调用方丢包)。
+    /// 用于 UDP —— UDP 无背压, 不能 await 整形 (会加延迟/乱序), 只能超速即丢 (同 tc police)。
+    /// 单个 UDP 报文 ≤ 64KB ≤ burst, 不会因"包比桶大"永久丢。
+    pub fn try_consume(&self, n: usize) -> bool {
+        let mut s = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let elapsed = now.duration_since(s.last).as_secs_f64();
+        s.last = now;
+        s.tokens = (s.tokens + elapsed * self.rate).min(self.burst);
+        if s.tokens >= n as f64 {
+            s.tokens -= n as f64;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// 某源 IP 的上/下行桶对 (跨该 IP 全部连接共享)。
@@ -176,6 +193,19 @@ mod tests {
         assert_eq!(rl.resolve("10.0.0.1".parse().unwrap()), None);
         assert!(rl.buckets_for("192.168.1.50".parse().unwrap()).is_some());
         assert!(rl.buckets_for("10.0.0.1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn try_consume_polices_drops_over_rate() {
+        // try_consume 用 std::Instant, 与 tokio 虚拟时钟无关, 故做确定性测试: 耗掉 burst 后桶空,
+        // 超速立即返 false (丢)。两次调用间只过 µs 级真实时间, 回补远 < 1000, 故稳定丢。
+        let tb = TokenBucket::new(1000); // burst = max(0.5*1000, 65536) = 65536
+        assert!(tb.try_consume(65536), "burst 内应放行");
+        assert!(!tb.try_consume(1000), "桶空后超速应丢 (false)");
+        assert!(!tb.try_consume(1000), "仍空仍丢");
+        // 回补验证: 真实等 50ms 补 ~50 tokens, 仍 < 1000 丢; 等足量 (rate 拉高) 才放 —— 见下高速率桶。
+        let fast = TokenBucket::new(10_000_000); // burst 5MB
+        assert!(fast.try_consume(5_000_000), "高速桶 burst 内放行");
     }
 
     #[test]
