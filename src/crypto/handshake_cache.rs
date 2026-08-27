@@ -332,8 +332,10 @@ fn pick_cipher(client_hello: &[u8]) -> [u8; 2] {
     let cl = u16::from_be_bytes([client_hello[off], client_hello[off + 1]]) as usize;
     let end = (off + 2 + cl).min(client_hello.len());
     let ciphers = &client_hello[off + 2..end];
+    // as_chunks::<2> 而非 chunks_exact(2): 常量块大小, 新 clippy 要求前者 (语义同, 丢末尾奇数字节)。
+    let (pairs, _rem) = ciphers.as_chunks::<2>();
     for pref in [[0x13u8, 0x02], [0x13, 0x01], [0x13, 0x03]] {
-        if ciphers.chunks_exact(2).any(|c| c == pref) {
+        if pairs.contains(&pref) {
             return pref;
         }
     }
