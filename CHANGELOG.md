@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.10.4] - UDP 带宽限速 (SOCKS + transparent 两路, policing) + TIME_SYNC 降噪 + install.sh 对齐 (2026-08-28)
+
 ### feat(relay): transparent UDP 限速 (网关 LAN 设备, policing)
 
 限速覆盖到透明网关 UDP —— LAN 设备走 tc_divert/TPROXY 的 UDP 流按设备源 IP policing (令牌不足丢包)。
