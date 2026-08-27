@@ -9,10 +9,11 @@
 - `transparent_udp.rs`: 上行主循环逐包 policing (转 sink 前, 未配限速时 buckets_for 早返廉价);
   下行 Direct/WireGuard/Mirage 三条回包循环各 policing (setup_flow 按 client IP 解析桶一次, Mirage
   下行 async move 用 clone)。只计已投递字节; got_downlink 按收到下行置位 (拆流节奏不受 policing 影响)。
-- ⚠️ **验证边界 (诚实标注)**: compile + clippy(-D warnings) + 全 test 绿; policing 机制 (`try_consume`)
-  已由 SOCKS UDP 路**实机验** (#82, flood 114MB/s → recv 245KB/s cap) + 单测证, transparent 接入是
-  同款 pattern。但 transparent 路**本身未独立实机验** —— 需 eBPF TPROXY + LAN 设备环境 (本地无从搭),
-  留待 CI netns 验证器 (`verify_udp_transparent.sh`) 扩限速断言, 或真机网关部署验。
+- **实机验证 (netns eBPF 网关, TPROXY)**: 搭 3-netns (LAN 客户端 → 网关跑完整 mirage transparent
+  入站 + sk_lookup 引擎 + fake-IP + iptables TPROXY → echo 后端) 端到端验: 限 2000kbps → flood
+  26MB/s → recv **246KB/s** (cap 精准), 无限速对照 **15.7MB/s** (64x)。transparent 路 policing 坐实。
+  (另: SOCKS UDP 路 #82 已 CN2 真机验 245KB/s; 两条 UDP 路各有实机凭据。) compile + clippy(-D warnings)
+  + 全 test 绿。
 
 ### feat(relay): UDP 带宽限速 (SOCKS/mixed UDP relay, policing 丢包)
 
