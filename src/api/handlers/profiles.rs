@@ -48,6 +48,9 @@ pub async fn update_profiles(
     Query(q): Query<DryQuery>,
     Json(req): Json<UpdateReq>,
 ) -> Json<Value> {
+    // 读改写全程持锁, 与 rules 端点串行 (共用 config.json + .tmp), 防撕裂/丢更新。
+    let _wlock = super::CONFIG_WRITE_LOCK.lock().await;
+
     let Ok(content) = tokio::fs::read_to_string(&app_state.config_path).await else {
         return Json(json!({"status": "error", "stage": "read", "message": "无法读取当前配置文件"}));
     };

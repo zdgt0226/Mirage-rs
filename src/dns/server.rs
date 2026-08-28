@@ -20,6 +20,13 @@ const DNS_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(800);
 const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(3);
 // 隧道 DNS 响应重组的总时限: 逐帧各 TCP_TIMEOUT 时最坏 5s×64 帧, 恶意对端可拖住任务, 用整体封顶。
 const DNS_TUNNEL_REASSEMBLE_TIMEOUT: Duration = Duration::from_secs(10);
+// UDP DNS 缓冲: EDNS(0) 默认 4096, 旧 1500 会静默截断大响应 (DNSSEC/EDNS) 且不置 TC 位。
+const DNS_UDP_BUF: usize = 4096;
+// DNS 入站并发查询封顶: 每查询 spawn 一个任务且向上游多发+重传, 无封顶时 LAN 洪水/伪源可
+// 无界 spawn + 放大上游流量。满了丢本查询 (客户端会重试)。
+const DNS_MAX_CONCURRENT: usize = 256;
+static DNS_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(DNS_MAX_CONCURRENT));
 
 fn extract_domain(data: &[u8]) -> Option<String> {
     if data.len() < 12 {
@@ -428,7 +435,7 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
         return None;
     }
     let sock = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    let mut buf = vec![0u8; 1500];
+    let mut buf = vec![0u8; DNS_UDP_BUF];
 
     for _round in 0..DNS_QUERY_ROUNDS {
         // 本轮向所有上游各发一份 (并行竞速 + 单上游丢包由其他上游兜底)
@@ -778,13 +785,16 @@ impl DnsForwarder {
     }
 
     async fn run_loop(self: Arc<Self>) {
-        let mut buf = vec![0u8; 1500];
+        let mut buf = vec![0u8; DNS_UDP_BUF];
         loop {
             match self.socket.recv_from(&mut buf).await {
                 Ok((size, addr)) => {
+                    // 并发封顶: 满了丢本查询 (客户端会重试), 防无界 spawn + 上游放大。
+                    let Ok(permit) = DNS_INFLIGHT.try_acquire() else { continue };
                     let req = buf[..size].to_vec();
                     let f = self.clone();
                     tokio::spawn(async move {
+                        let _permit = permit; // 持到查询结束再释放名额
                         if let Some(resp) = f.process_query(&req).await {
                             let _ = f.socket.send_to(&resp, addr).await;
                         }

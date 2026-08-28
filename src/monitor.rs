@@ -28,6 +28,10 @@ pub fn add_down(bytes: u64) {
 // 最近关闭连接环 (WebUI「连接历史」轻量内存版, 无持久化 → 重启清零)。300 条 ≈ 数十 KB,
 // 够看"最近谁连过哪"; 真跨重启历史需内嵌存储 (评估后暂不加依赖)。
 const CLOSED_RING_CAP: usize = 300;
+// 域名/设备统计上限: 满且遇新键时淘汰一条 (域名淘最小流量、设备淘最久未活跃), 防长跑网关
+// (数周) 无界增长到数十 MB。与 CLOSED_RING_CAP / fake-ip / DNS 缓存的有界风格一致。
+const DOMAIN_STATS_CAP: usize = 4096;
+const DEVICE_STATS_CAP: usize = 4096;
 static CONN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 单条连接的活跃状态。up/down 是原子, relay 侧无锁累加。
@@ -201,7 +205,14 @@ impl Drop for ConnGuard {
         drop(os);
         // per-域名累计字节 (域名排行)。
         let mut ds = DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner());
-        let d = ds.entry(target_host(&self.0.target)).or_default();
+        let host = target_host(&self.0.target);
+        if !ds.contains_key(&host) && ds.len() >= DOMAIN_STATS_CAP {
+            // 满 + 新域名: 淘汰流量最小的一条 (保留头部排行)。
+            if let Some(k) = ds.iter().min_by_key(|(_, a)| a.up + a.down).map(|(k, _)| k.clone()) {
+                ds.remove(&k);
+            }
+        }
+        let d = ds.entry(host).or_default();
         d.up += up;
         d.down += down;
         drop(ds);
@@ -248,6 +259,12 @@ pub fn register(
     // per-设备/来源累计连接数 +1 + 刷新 last (LAN 设备 / 连接的客户端)。
     if let Some(src) = &info.source {
         let mut dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        if !dev.contains_key(src) && dev.len() >= DEVICE_STATS_CAP {
+            // 满 + 新设备/源: 淘汰最久未活跃的一条。
+            if let Some(k) = dev.iter().min_by_key(|(_, a)| a.last).map(|(k, _)| k.clone()) {
+                dev.remove(&k);
+            }
+        }
         let e = dev.entry(src.clone()).or_insert(DeviceAgg { conns: 0, up: 0, down: 0, last: Instant::now() });
         e.conns += 1;
         e.last = Instant::now();

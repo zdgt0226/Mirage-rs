@@ -1203,9 +1203,14 @@ impl Config {
                     Err(e) => issues.push(format!("shadowsocks 入站 `{tag}` 的 method 非法: {e}")),
                 }
             }
-            if let InboundConfig::MirageServer { tag, password, upstream, transport, .. } = ib {
+            if let InboundConfig::MirageServer { tag, password, upstream, transport, auth_ts_tolerance_secs, .. } = ib {
                 if password.is_empty() {
                     issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
+                }
+                // 容忍窗口直接推导 replay 去重桶数, 极大值会放大内存。3600s (1h) 已远超时钟漂移
+                // 与 TIME_SYNC bootstrap 所需, 上不封顶等于给配置错留个内存放大口。
+                if *auth_ts_tolerance_secs > 3600 {
+                    issues.push(format!("mirage_server 入站 `{tag}` 的 auth_ts_tolerance_secs={auth_ts_tolerance_secs} 过大 (上限 3600s; 越大 replay 去重桶越占内存)"));
                 }
                 #[cfg(not(feature = "quic"))]
                 if *transport == Transport::Quic {
@@ -1914,6 +1919,22 @@ mod wg_upstream_tests {
         assert!(
             issues.iter().any(|i| i.contains("pool_size")),
             "pool_size=0 应被拦下: {issues:?}"
+        );
+    }
+
+    /// auth_ts_tolerance_secs 过大 (推导 replay 去重桶数) 必须 check 阶段拦下, 防内存放大。
+    #[test]
+    fn auth_ts_tolerance_over_cap_is_caught() {
+        let s = r#"{
+          "inbounds": [{ "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0",
+                          "port": 443, "password": "pw", "auth_ts_tolerance_secs": 99999 }],
+          "outbounds": [{ "type": "direct", "tag": "direct" }],
+          "routing": { "default_outbound": "direct", "rules": [] }
+        }"#;
+        let cfg: Config = serde_json::from_str(s).expect("配置应能解析");
+        assert!(
+            cfg.semantic_issues().iter().any(|i| i.contains("auth_ts_tolerance_secs")),
+            "auth_ts_tolerance_secs 过大应被拦: {:?}", cfg.semantic_issues()
         );
     }
 
