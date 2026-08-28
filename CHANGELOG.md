@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(server): 认证失败反射 flood 守卫 (按源 IP 窗口速率, 防被当反射工具惹 abuse)
+
+REALITY 式 fallback (认证失败转发真 `camouflage_host`) 的固有残余风险: 攻击者狂发认证失败连接 →
+服务器反复连 `camouflage_host:443` → 本机 IP 被当反射源惹 VPS abuse 单。已有并发上限 (单 IP 100
+concurrent + 全局 5000) 只挡"同时挂着"的反射, **挡不住"快速开-失败-关"的高频反射** (每条短命 →
+并发低但速率高)。
+- 补按源 IP(/64 归一, 复用现有 `rate_limit_key`) 的**窗口速率上限**: 默认 30 次 / 10s, 超限直接 drop
+  不再反射。阈值远超 GFW 低频主动探测 (探测一次一两条), 只掐 flood 滥用; 表有界 (8192, 满淘汰最旧)。
+- **注**: Mirage fallback 转发目标是 config 写死的单个 `camouflage_host` (不跟客户端 SNI), 故本就
+  **不是任意主机开放反代** —— 本守卫只收紧"反射到固定站"的高频滥用面。+2 单测。
+
 ### feat(transparent): 透明 UDP 支持 IPv6 目标出口 (Direct 腿)
 
 原透明 UDP 对解析出 IPv6 的目标直接 `dropping` (`unsupported in v1`)。客户端始终是 IPv4 LAN
