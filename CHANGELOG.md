@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(relay): 服务端 UDP + udp_mux 限速 (按客户端 IP, policing)
+
+补齐限速最后一条 UDP 路 —— 服务端按连接的客户端 IP policing (令牌不足丢包)。此前限速 UDP 只覆盖
+客户端 SOCKS (v0.10.4) + transparent 网关 (v0.10.4), 服务端 `mirage_server/udp_relay.rs` 未接 →
+运营者设 `rate_limit_kbps` 时 TCP 生效、**UDP 逃逸**。
+- `handle_udp_relay` + `handle_udp_mux_relay`: 复用 `rate_limit::server_buckets_for(client_ip)` (同
+  `tcp_relay` 的全局 limiter), 上行 (客户端→目标) send 前、下行 (目标→客户端) 回发前各 policing。
+  mux 多 sid 共享同一客户端 IP 的桶。
+- **实机验证**: 完整 server+client 隧道, 服务端限 2000kbps → flood → recv **247KB/s** (cap 精准),
+  无限速对照 **9.6MB/s** (39x)。clippy + 全 test 绿。
+- 至此限速全覆盖: TCP (两侧整形) + UDP (SOCKS/transparent/服务端/mux 四路 policing)。
+
 ## [v0.10.5] - 隧道 DNS 全链修复 (帧格式/重组) + 第三方审计加固 (2026-08-28)
 
 ### fix: 审计遗留中/低危批量加固 (6 项)

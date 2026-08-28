@@ -52,9 +52,13 @@ pub(super) async fn handle_udp_relay(
     mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
     writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
-    _client_ip: Option<std::net::IpAddr>,
+    client_ip: Option<std::net::IpAddr>,
 ) {
     debug!("Mirage Server: Started UDP relay session");
+
+    // 服务端按连接的客户端 IP 限速 (device_profiles rate_limit_kbps): UDP 无背压 → policing
+    // (令牌不足丢包), 与 SOCKS/transparent UDP 一致; 全局 limiter 同 tcp_relay::server_buckets_for。
+    let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
 
     // 上游是 WG 且策略为 tunnel → UDP 也走隧道, 出口与 TCP 一致。否则从本机直发。
     let egress = match upstream.as_deref() {
@@ -92,11 +96,16 @@ pub(super) async fn handle_udp_relay(
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     let writer_clone = writer.clone();
 
+    let dn_buckets = dev_buckets.clone();
     let downlink = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match tokio::time::timeout(UDP_IDLE_TIMEOUT, udp_clone.recv_from(&mut buf)).await {
                 Ok(Ok((size, addr))) => {
+                    // 下行限速 (policing): 令牌不足丢本报文 (按 payload 字节计)
+                    if dn_buckets.as_ref().is_some_and(|b| !b.down.try_consume(size)) {
+                        continue;
+                    }
                     // Frame format: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
                     let atyp: u8; // Declared but assigned in match
                     let mut addr_bytes = Vec::new();
@@ -226,6 +235,11 @@ pub(super) async fn handle_udp_relay(
 
                 let payload = &frame[offset..];
 
+                // 上行限速 (policing): 令牌不足丢本报文 (按 payload 字节计)
+                if dev_buckets.as_ref().is_some_and(|b| !b.up.try_consume(payload.len())) {
+                    continue;
+                }
+
                 // v0.4.5-alpha.16: 走 resolver::resolve_first (60s 缓存 + IPv4 优先 +
                 // 并发限流), 不再每 UDP 包裸调 lookup_host 打满阻塞池 (高频 QUIC /
                 // 唯一域名洪泛防护). IP 字面量 (ATYP 1/4) 直接构造不解析.
@@ -326,9 +340,13 @@ pub(crate) async fn handle_udp_mux_relay(
     mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
     writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
-    _client_ip: Option<std::net::IpAddr>,
+    client_ip: Option<std::net::IpAddr>,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
+
+    // 服务端按客户端 IP 限速 (device_profiles): mux 复用一条隧道多 sid, 但都同一客户端 IP →
+    // 共享同一对桶, policing (令牌不足丢包)。同 handle_udp_relay。
+    let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
 
     // 上游是否 WG-tunnel 出口 (与 TCP 同出口 IP)。是则各 sid 在同一 WG 隧道内绑独立端口。
     let wg_tunnel = match upstream.as_deref() {
@@ -368,6 +386,11 @@ pub(crate) async fn handle_udp_mux_relay(
             {
                 buffer.drain(0..consumed);
                 let Some(uf) = frame_opt else { continue }; // 畸形帧, 跳过重同步
+
+                // 上行限速 (policing): 令牌不足丢本报文 (choke point, 覆盖已有/新 sid 两路)
+                if dev_buckets.as_ref().is_some_and(|b| !b.up.try_consume(uf.payload.len())) {
+                    continue;
+                }
 
                 // 已有 sid → 直接发 (锁内只取 egress Arc, await 在锁外, 避免 guard 跨 await)。
                 let existing = lock_mux(&up_sessions).get(&uf.sid).map(|s| s.egress.clone());
@@ -417,6 +440,7 @@ pub(crate) async fn handle_udp_mux_relay(
                 let pump_egress = egress.clone();
                 let pump_tx = up_tx.clone();
                 let pump_sessions = up_sessions.clone();
+                let pump_buckets = dev_buckets.clone();
                 let sid = uf.sid;
                 let pump = tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
@@ -425,6 +449,10 @@ pub(crate) async fn handle_udp_mux_relay(
                             .await
                         {
                             Ok(Ok(n)) => {
+                                // 下行限速 (policing): 令牌不足丢本报文
+                                if pump_buckets.as_ref().is_some_and(|b| !b.down.try_consume(n)) {
+                                    continue;
+                                }
                                 if let Some(f) = crate::proxy::udp_mux::frame_mux_addr(
                                     sid,
                                     target_sa,
