@@ -18,6 +18,8 @@ const DNS_RETRANSMIT_INTERVAL: Duration = Duration::from_millis(800);
 /// TCP 上游查询超时: 既是单个 tcp_query_one 的上限, 也是 tcp_query 并行竞速的整体上限。
 /// 3s 宽于正常 TCP DNS 往返; 并行竞速故总延迟与上游数无关 (不像顺序 failover 会堆叠)。
 const DNS_TCP_TIMEOUT: Duration = Duration::from_secs(3);
+// 隧道 DNS 响应重组的总时限: 逐帧各 TCP_TIMEOUT 时最坏 5s×64 帧, 恶意对端可拖住任务, 用整体封顶。
+const DNS_TUNNEL_REASSEMBLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn extract_domain(data: &[u8]) -> Option<String> {
     if data.len() < 12 {
@@ -242,6 +244,32 @@ fn tunnel_target_header(host: &str, port: u16) -> Vec<u8> {
     buf.extend_from_slice(&(target.len() as u16).to_be_bytes());
     buf.extend_from_slice(target.as_bytes());
     buf
+}
+
+/// 隧道 DNS 响应重组状态: 从累积字节按 TCP-DNS 帧 `[2B len][报文体]` 判定。抽成纯函数便于
+/// 单测覆盖各分支 (前缀单独成帧 / 跨帧大响应 / len 非法 / 超上限), 免逐帧逻辑只有代码审查兜底。
+#[derive(Debug, PartialEq)]
+enum Reassembled {
+    Need,        // 还需更多帧
+    Done(usize), // 报文体完整, 长度 = usize (报文体在 acc[2..2+len])
+    Malformed,   // len 不合理 / 超上限
+}
+
+fn reassemble_tcp_dns(acc: &[u8]) -> Reassembled {
+    if acc.len() < 2 {
+        return Reassembled::Need;
+    }
+    let want = u16::from_be_bytes([acc[0], acc[1]]) as usize;
+    if want < 12 {
+        return Reassembled::Malformed; // DNS 报文至少 12B 报头, 更短不合理
+    }
+    if acc.len() >= 2 + want {
+        return Reassembled::Done(want);
+    }
+    if acc.len() > 2 + u16::MAX as usize {
+        return Reassembled::Malformed; // 理论不可达
+    }
+    Reassembled::Need
 }
 
 fn get_qtype(data: &[u8]) -> Option<u16> {
@@ -996,19 +1024,21 @@ impl DnsForwarder {
         // TCP-DNS 响应 = [2B len][报文体]。服务端逐 read 逐帧转发, 上游可能把长度前缀与体分成
         // 两个 TCP 段 → 客户端收到两条加密帧。必须循环 recv_data 重组到 2+len 字节, 别只读一帧:
         // 只读一帧时首帧可能仅含 2B 前缀 → resp[2..] 空 → 空响应; 大响应 (DNSSEC/EDNS) 跨帧同理。
+        let deadline = std::time::Instant::now() + DNS_TUNNEL_REASSEMBLE_TIMEOUT;
         let mut acc = Vec::new();
         let mut frames = 0u32;
         let dns_len = loop {
-            let chunk = timeout(TCP_TIMEOUT, tunnel.reader.recv_data()).await.ok()?.ok()?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return None; } // 总时限到, 别再逐帧等
+            let chunk = timeout(remaining.min(TCP_TIMEOUT), tunnel.reader.recv_data()).await.ok()?.ok()?;
             frames += 1;
-            if frames > 64 { return None; } // 防空帧/碎片流跑飞
+            if frames > 64 { return None; } // 防碎片流跑飞
             acc.extend_from_slice(&chunk);
-            if acc.len() >= 2 {
-                let want = u16::from_be_bytes([acc[0], acc[1]]) as usize;
-                if want < 2 { return None; } // DNS 报文至少含 tx_id, 长度不合理
-                if acc.len() >= 2 + want { break want; }
+            match reassemble_tcp_dns(&acc) {
+                Reassembled::Done(len) => break len,
+                Reassembled::Malformed => return None,
+                Reassembled::Need => {}
             }
-            if acc.len() > 2 + u16::MAX as usize { return None; } // 理论不可达
         };
 
         let mut resp_buf = acc[2..2 + dns_len].to_vec();
@@ -1057,6 +1087,30 @@ mod tests {
             // ATYP 回归护栏: 首字节不得是 SOCKS5 ATYP IPv4(0x01) 被误当长度高位
             assert_ne!(hdr[0], 0x01, "首字节像 SOCKS5 ATYP IPv4 = 回归");
         }
+    }
+
+    // 隧道 DNS 响应重组: 覆盖前缀单独成帧 / 跨帧大响应 / len 非法 / 多余尾字节。
+    #[test]
+    fn reassemble_tcp_dns_states() {
+        // 不足 2B 前缀 → Need
+        assert_eq!(reassemble_tcp_dns(&[]), Reassembled::Need);
+        assert_eq!(reassemble_tcp_dns(&[0x00]), Reassembled::Need);
+        // len<12 → Malformed (DNS 报文至少 12B 报头)
+        assert_eq!(reassemble_tcp_dns(&[0x00, 0x00]), Reassembled::Malformed);
+        assert_eq!(reassemble_tcp_dns(&[0x00, 0x0B]), Reassembled::Malformed);
+        // 前缀单独成帧 (want=12, 体未到) → Need
+        assert_eq!(reassemble_tcp_dns(&[0x00, 0x0C]), Reassembled::Need);
+        // 跨帧: 前缀 + 部分体 → Need; 补齐 → Done(12)
+        let mut acc = vec![0x00, 0x0C];
+        acc.extend_from_slice(&[0u8; 5]);
+        assert_eq!(reassemble_tcp_dns(&acc), Reassembled::Need);
+        acc.extend_from_slice(&[0u8; 7]);
+        assert_eq!(reassemble_tcp_dns(&acc), Reassembled::Done(12));
+        // 一帧到齐 + 多余尾字节 → Done(12) 精确, 尾字节不计入
+        let mut one = vec![0x00, 0x0C];
+        one.extend_from_slice(&[0xAA; 12]);
+        one.extend_from_slice(&[0xFF, 0xFF]);
+        assert_eq!(reassemble_tcp_dns(&one), Reassembled::Done(12));
     }
 
     #[test]
