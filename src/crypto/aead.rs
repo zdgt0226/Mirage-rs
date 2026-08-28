@@ -210,6 +210,11 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         self.buffer.extend_from_slice(b"\x01\x00"); // Alert: warning(1), close_notify(0)
         self.buffer.push(0x15); // inner content type = alert (21)
 
+        // nonce 用尽守卫 (与 send_data 一致): (key,nonce) 复用会毁 AEAD 安全。2^64 帧物理不可达,
+        // 仅一致性 —— 关闭帧也不例外。
+        if self.nonce == u64::MAX {
+            return Err(anyhow!("AEAD nonce 耗尽, 拒绝复用"));
+        }
         let nonce_bytes = format_nonce(self.nonce);
         self.nonce += 1;
 

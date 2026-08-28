@@ -54,6 +54,9 @@ pub async fn update_rules(
 ) -> Json<Value> {
     // 鉴权 + CSRF 由 auth_mw 中间件统一处理 (方案 B), 此处不再重复启发式检查。
 
+    // 读改写全程持锁, 与 profiles 端点串行 (共用 config.json + .tmp), 防撕裂/丢更新。
+    let _wlock = super::CONFIG_WRITE_LOCK.lock().await;
+
     // 1. 读当前配置, 把新 rules 拼进 routing.rules 得到候选整份 config。
     let Ok(content) = tokio::fs::read_to_string(&app_state.config_path).await else {
         return Json(json!({"status": "error", "stage": "read", "message": "无法读取当前配置文件"}));

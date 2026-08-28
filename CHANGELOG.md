@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### fix: 审计遗留中/低危批量加固 (6 项)
+
+清掉审计列的其余未修项:
+- **monitor 统计无界** (`DOMAIN_STATS`/`DEVICE_STATS`): 原按域名/源 IP 永久累积无上限, 长跑网关
+  (数周) 增长到数十 MB。加 4096 上限 + 满时淘汰 (域名淘最小流量、设备淘最久未活跃), 与
+  `CLOSED_RING_CAP`/fake-ip/DNS 缓存的有界风格对齐。
+- **DNS 入站无并发封顶** (`run_loop`): 原每查询无信号量 `spawn` + 向上游多发/3 轮重传 → LAN
+  洪水/伪源可无界 spawn + 放大上游流量。加 `DNS_MAX_CONCURRENT=256` 信号量, 满则丢本查询 (客户端重试)。
+- **udp_query EDNS 截断**: UDP DNS 缓冲 1500→4096 (EDNS(0) 默认), 免大响应 (DNSSEC/EDNS) 静默截断。
+- **API 写配置竞态** (`rules`/`profiles` 端点): 两端点共用 `config.json` + 同名 `.tmp`, 并发/交错 POST
+  会撕裂 `.tmp` 或丢更新。加共享 `CONFIG_WRITE_LOCK`, 读改写全程串行。
+- **auth_ts_tolerance_secs 无上限**: 容忍窗口推导 replay 去重桶数, 极大值放大内存。`semantic_issues`
+  加 3600s 上限校验 + 单测。
+- **send_close_notify 缺 nonce 守卫**: 补 `nonce==u64::MAX` 拒绝 (与 `send_data` 一致; 2^64 不可达, 仅一致性)。
+
+(审计另列的 "CLI unwrap 43 处 panic" 复核为误报: 全部 unwrap 上游均有 outbounds/geo_sources
+数组守卫, 无 panic 路径, 未改。)
+
 ### fix(dns): 隧道 DNS 重组三处收紧 (want 守卫/总时限/纯函数可测)
 
 复审上条重组逻辑, 补三处小纰漏:
