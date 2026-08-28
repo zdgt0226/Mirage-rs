@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.10.6] - 服务端 UDP 限速 + 透明 UDP IPv6 目标出口 + 反射 flood 守卫 (2026-08-29)
+
 ### feat(server): 认证失败反射 flood 守卫 (按源 IP 窗口速率, 防被当反射工具惹 abuse)
 
 REALITY 式 fallback (认证失败转发真 `camouflage_host`) 的固有残余风险: 攻击者狂发认证失败连接 →
