@@ -15,6 +15,10 @@ mod control;
 mod tcp_relay;
 pub(crate) mod udp_relay;
 
+// 供隧道 DNS 目标头回归测试直接调服务端真解析 (dns::server 测试用)。
+#[cfg(test)]
+pub(crate) use control::parse_tcp_target;
+
 use camouflage_pool::CamouflagePool;
 
 use std::collections::HashMap;
