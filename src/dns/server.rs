@@ -983,18 +983,35 @@ impl DnsForwarder {
             }
         };
 
+        // u16 长度守卫 (对齐 outbound.rs): host:port 超 u16::MAX 会静默截断长度字段。DNS 上游
+        // 主机名远短于此 (≤253), 实际不可达, 仅防配置怪值 + 与主线一致。
+        if remote_host.len() >= u16::MAX as usize { return None; }
+
         let mut payload = tunnel_target_header(remote_host, remote_port);
         payload.extend_from_slice(&(req.len() as u16).to_be_bytes());
         payload.extend_from_slice(req);
-        
+
         tunnel.writer.send_data(&payload).await.ok()?;
-        
-        // Read response block
-        let resp_payload = timeout(TCP_TIMEOUT, tunnel.reader.recv_data()).await.ok()?.ok()?;
-        
-        if resp_payload.len() < 2 { return None; }
-        
-        let mut resp_buf = resp_payload[2..].to_vec();
+
+        // TCP-DNS 响应 = [2B len][报文体]。服务端逐 read 逐帧转发, 上游可能把长度前缀与体分成
+        // 两个 TCP 段 → 客户端收到两条加密帧。必须循环 recv_data 重组到 2+len 字节, 别只读一帧:
+        // 只读一帧时首帧可能仅含 2B 前缀 → resp[2..] 空 → 空响应; 大响应 (DNSSEC/EDNS) 跨帧同理。
+        let mut acc = Vec::new();
+        let mut frames = 0u32;
+        let dns_len = loop {
+            let chunk = timeout(TCP_TIMEOUT, tunnel.reader.recv_data()).await.ok()?.ok()?;
+            frames += 1;
+            if frames > 64 { return None; } // 防空帧/碎片流跑飞
+            acc.extend_from_slice(&chunk);
+            if acc.len() >= 2 {
+                let want = u16::from_be_bytes([acc[0], acc[1]]) as usize;
+                if want < 2 { return None; } // DNS 报文至少含 tx_id, 长度不合理
+                if acc.len() >= 2 + want { break want; }
+            }
+            if acc.len() > 2 + u16::MAX as usize { return None; } // 理论不可达
+        };
+
+        let mut resp_buf = acc[2..2 + dns_len].to_vec();
         
         // Override tx_id just in case
         if resp_buf.len() >= 2 && req.len() >= 2 {
@@ -1021,22 +1038,23 @@ mod tests {
         q
     }
 
-    // 回归: 隧道 DNS 目标头必须是 [2B len][host:port], 被服务端 (control.rs) 同款解析。
-    // 曾用 SOCKS5 ATYP → 服务端把首字节当 target_len 高位 → 丢弃 → 隧道 DNS 全失败。
+    // 回归: 客户端隧道目标头必须能被服务端**真解析函数**认出 (直接调 control::parse_tcp_target,
+    // 非内联复述 —— 改了分派逻辑这测试才会跟着红)。曾用 SOCKS5 ATYP → 服务端把首字节当 target_len
+    // 高位 → 丢弃 → 隧道 DNS 全失败。
     #[test]
     fn tunnel_target_header_matches_server_parse() {
+        use crate::proxy::mirage_server::parse_tcp_target;
         for (host, port, want) in [
             ("8.8.8.8", 53u16, "8.8.8.8:53"),
             ("dns.google", 53, "dns.google:53"),
         ] {
-            let hdr = tunnel_target_header(host, port);
-            // 服务端 control.rs TCP 分派逻辑: 前 2B = target_len, 随后 target_len 字节 = host:port
-            let target_len = u16::from_be_bytes([hdr[0], hdr[1]]) as usize;
-            assert_eq!(target_len, want.len(), "target_len 必须是 host:port 字节数, 不是 ATYP 首字节");
-            assert!(hdr.len() >= 2 + target_len, "服务端会判 first_chunk too short 而丢弃");
-            let target = std::str::from_utf8(&hdr[2..2 + target_len]).unwrap();
+            let mut hdr = tunnel_target_header(host, port);
+            // 追加一段假 piggyback body, 验证服务端 target/payload 切分也对
+            hdr.extend_from_slice(&[0xAB, 0xCD]);
+            let (target, payload) = parse_tcp_target(&hdr).expect("服务端应能解析客户端目标头");
             assert_eq!(target, want);
-            // ATYP 回归护栏: 首字节不得是 SOCKS5 ATYP (01/03/04) 被误当长度
+            assert_eq!(payload.as_deref(), Some(&[0xAB, 0xCD][..]), "piggyback payload 切分错");
+            // ATYP 回归护栏: 首字节不得是 SOCKS5 ATYP IPv4(0x01) 被误当长度高位
             assert_ne!(hdr[0], 0x01, "首字节像 SOCKS5 ATYP IPv4 = 回归");
         }
     }

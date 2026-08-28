@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### fix(dns): 隧道 DNS 响应跨帧重组 + u16 长度守卫 + 测试改调真解析 (审计遗留)
+
+紧接上一条隧道 DNS 帧格式修复, 补该路径三处遗留纰漏 (非新引入):
+- **响应重组 (潜在截断)**: `dns_over_tunnel` 原只读一条 `recv_data` 就当完整响应。服务端逐 read
+  逐帧转发, 上游若把 TCP-DNS `[2B len]` 前缀与体分两个 TCP 段发 (段间有延迟时服务端 greedy
+  try_read 也收不全), 客户端首帧只拿 2B → `resp[2..]` 空 → 空响应; 大响应 (DNSSEC/EDNS) 跨帧
+  同理。改为循环 `recv_data` 重组到 `2+len` 字节 (64 帧上限防跑飞), 按 len 精确切分。
+- **u16 长度守卫**: `tunnel_target_header` 补 `remote_host` 超长拦截 (对齐 `outbound.rs`; DNS 主机名
+  ≤253 实际不可达, 仅防配置怪值 + 一致性)。
+- **测试端到端化**: 抽服务端 `control::parse_tcp_target` 共享解析函数, 回归测试直接调它 (而非内联
+  复述解析逻辑) —— 改了服务端分派这测试才会跟着红。dispatch 分派同步改用该函数。
+
 ### fix(dns): 隧道 DNS 目标头帧格式修正 (SOCKS5 ATYP → [2B len][host:port]) —— 隧道 DNS 曾全失败
 
 审计发现: `dns_over_tunnel` 客户端发送侧用 SOCKS5 ATYP 头 (`pack_address`), 服务端 (`control.rs`

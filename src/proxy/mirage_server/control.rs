@@ -9,6 +9,27 @@ use tracing::info;
 use super::tcp_relay;
 use super::udp_relay;
 
+/// 解析 TCP 目标头 `[2B len][host:port 字符串][可选 piggyback payload]`。客户端
+/// `outbound.rs::connect` / `dns::server::tunnel_target_header` 构造, 必须与此保持一致 ——
+/// 抽成共享函数, 让回归测试直接调它 (而非内联复述解析逻辑, 那样改了分派也测不出)。
+pub(crate) fn parse_tcp_target(first_chunk: &[u8]) -> Result<(String, Option<Vec<u8>>), &'static str> {
+    if first_chunk.len() < 2 {
+        return Err("first_chunk too short to be valid");
+    }
+    let target_len = u16::from_be_bytes([first_chunk[0], first_chunk[1]]) as usize;
+    if first_chunk.len() < 2 + target_len {
+        return Err("first_chunk too short for target_len");
+    }
+    let target = String::from_utf8(first_chunk[2..2 + target_len].to_vec())
+        .map_err(|_| "target UTF-8 parsing failed")?;
+    let payload = if first_chunk.len() > 2 + target_len {
+        Some(first_chunk[2 + target_len..].to_vec())
+    } else {
+        None
+    };
+    Ok((target, payload))
+}
+
 pub(super) async fn dispatch_authenticated(
     read_half: crate::proxy::tunnel::TunnelRead,
     write_half: crate::proxy::tunnel::TunnelWrite,
@@ -190,30 +211,12 @@ pub(super) async fn dispatch_authenticated(
         udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
-        let target_len = u16::from_be_bytes([first_chunk[0], first_chunk[1]]) as usize;
-        info!("Mirage Server: Parsed target_len = {}", target_len);
-
-        if first_chunk.len() >= 2 + target_len {
-            let target = match String::from_utf8(first_chunk[2..2+target_len].to_vec()) {
-                Ok(t) => t,
-                Err(_) => {
-                    tracing::error!("Mirage Server: Target UTF-8 parsing failed!");
-                    return;
-                }
-            };
-
-            info!("Mirage Server: Target resolved to {}", target);
-
-            // Check if there's any piggybacked payload after the target string
-            let payload = if first_chunk.len() > 2 + target_len {
-                Some(first_chunk[2+target_len..].to_vec())
-            } else {
-                None
-            };
-
-            tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip).await;
-        } else {
-            tracing::error!("Mirage Server: first_chunk too short for target_len!");
+        match parse_tcp_target(&first_chunk) {
+            Ok((target, payload)) => {
+                info!("Mirage Server: Target resolved to {}", target);
+                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip).await;
+            }
+            Err(e) => tracing::error!("Mirage Server: {}", e),
         }
     } else {
         tracing::error!("Mirage Server: first_chunk too short to be valid!");
