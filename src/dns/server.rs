@@ -233,25 +233,14 @@ fn make_nxdomain(query: &[u8]) -> Vec<u8> {
     result
 }
 
-fn pack_address(host: &str, port: u16) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => {
-                buf.push(0x01);
-                buf.extend_from_slice(&v4.octets());
-            }
-            IpAddr::V6(v6) => {
-                buf.push(0x04);
-                buf.extend_from_slice(&v6.octets());
-            }
-        }
-    } else {
-        buf.push(0x03);
-        buf.push(host.len() as u8);
-        buf.extend_from_slice(host.as_bytes());
-    }
-    buf.extend_from_slice(&port.to_be_bytes());
+/// 隧道目标头: [2B len][host:port 字符串]。必须与服务端 control.rs TCP 分派 / outbound.rs::connect
+/// 解析一致。历史上此处曾发 SOCKS5 ATYP 头, 服务端把 ATYP 首字节当 target_len 高位 →
+/// first_chunk too short 丢弃 → 隧道 DNS 全静默失败 (无测试覆盖)。本 helper + 单测锁死格式。
+fn tunnel_target_header(host: &str, port: u16) -> Vec<u8> {
+    let target = format!("{host}:{port}");
+    let mut buf = Vec::with_capacity(2 + target.len());
+    buf.extend_from_slice(&(target.len() as u16).to_be_bytes());
+    buf.extend_from_slice(target.as_bytes());
     buf
 }
 
@@ -994,9 +983,7 @@ impl DnsForwarder {
             }
         };
 
-        let target_addr = pack_address(remote_host, remote_port);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&target_addr);
+        let mut payload = tunnel_target_header(remote_host, remote_port);
         payload.extend_from_slice(&(req.len() as u16).to_be_bytes());
         payload.extend_from_slice(req);
         
@@ -1032,6 +1019,26 @@ mod tests {
         q.extend_from_slice(&[0x00, 0x1C]); // QTYPE = AAAA(28)
         q.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
         q
+    }
+
+    // 回归: 隧道 DNS 目标头必须是 [2B len][host:port], 被服务端 (control.rs) 同款解析。
+    // 曾用 SOCKS5 ATYP → 服务端把首字节当 target_len 高位 → 丢弃 → 隧道 DNS 全失败。
+    #[test]
+    fn tunnel_target_header_matches_server_parse() {
+        for (host, port, want) in [
+            ("8.8.8.8", 53u16, "8.8.8.8:53"),
+            ("dns.google", 53, "dns.google:53"),
+        ] {
+            let hdr = tunnel_target_header(host, port);
+            // 服务端 control.rs TCP 分派逻辑: 前 2B = target_len, 随后 target_len 字节 = host:port
+            let target_len = u16::from_be_bytes([hdr[0], hdr[1]]) as usize;
+            assert_eq!(target_len, want.len(), "target_len 必须是 host:port 字节数, 不是 ATYP 首字节");
+            assert!(hdr.len() >= 2 + target_len, "服务端会判 first_chunk too short 而丢弃");
+            let target = std::str::from_utf8(&hdr[2..2 + target_len]).unwrap();
+            assert_eq!(target, want);
+            // ATYP 回归护栏: 首字节不得是 SOCKS5 ATYP (01/03/04) 被误当长度
+            assert_ne!(hdr[0], 0x01, "首字节像 SOCKS5 ATYP IPv4 = 回归");
+        }
     }
 
     #[test]

@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### fix(dns): 隧道 DNS 目标头帧格式修正 (SOCKS5 ATYP → [2B len][host:port]) —— 隧道 DNS 曾全失败
+
+审计发现: `dns_over_tunnel` 客户端发送侧用 SOCKS5 ATYP 头 (`pack_address`), 服务端 (`control.rs`
+TCP 分派) 只认 `[2B len][host:port 字符串]` (同 `outbound.rs::connect`)。`8.8.8.8:53` 被编成
+`01 08080808 0035`, 服务端读前 2B `0x0108=264` 当 target_len → `first_chunk too short` 丢弃 →
+**所有隧道 DNS 查询静默失败** (客户端 5s 超时回 NXDOMAIN)。可达路径: fakeip 关时被代理域名
+A/AAAA、fakeip 开时非 A/AAAA (AAAA 等)、auto_classify 后台校验。原路径零测试覆盖。
+- 修: 抽 `tunnel_target_header` 发 `[2B len][host:port]`; 删死掉的 `pack_address`; 收包侧 `resp[2..]`
+  剥 TCP-DNS 长度前缀本就自洽, 不动。+ 回归单测锁死帧格式 (含 ATYP 首字节护栏)。
+
+### fix(config): mirage 出站 `pool_size=0` check 阶段拦下
+
+`semantic_issues` 未校验 `pool_size>0`。设 0 → 暖池永不建货, `pool.get()` 恒 10s 超时, 全部代理
+连接静默失败 ("服务看着在跑、全连不上")。与 WG 密钥 / SS PSK 等 fail-fast 标准对齐。+ 单测。
+
 ## [v0.10.4] - UDP 带宽限速 (SOCKS + transparent 两路, policing) + TIME_SYNC 降噪 + install.sh 对齐 (2026-08-28)
 
 ### feat(relay): transparent UDP 限速 (网关 LAN 设备, policing)

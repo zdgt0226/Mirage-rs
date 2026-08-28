@@ -968,6 +968,12 @@ impl Config {
         // 这些错配的共同特征是**不会让进程起不来, 而是让每条连接静默失败** —— 服务看着健康,
         // 却什么都代理不了, 错误信息也指不到根因。所以必须在 check/启动阶段变成明确报错。
         for ob in &self.outbounds {
+            // pool_size=0 → 暖池永不建货, pool.get() 恒 10s 超时, 每条连接静默失败 (服务看着在跑, 全连不上)。
+            if let OutboundConfig::Mirage { tag, pool_size, .. } = ob {
+                if *pool_size == 0 {
+                    issues.push(format!("outbound `{tag}`: pool_size 不能为 0 (暖池会永远建不出连接, 全部代理静默超时)"));
+                }
+            }
             if let OutboundConfig::Wireguard {
                 tag, private_key, peer_public_key, preshared_key, endpoint, address, mtu, dns, ..
             } = ob
@@ -1891,6 +1897,23 @@ mod wg_upstream_tests {
         assert!(
             issues.iter().any(|i| i.contains("tunnel")),
             "SS 上游配 udp=tunnel 应被拦下: {issues:?}"
+        );
+    }
+
+    /// mirage 出站 pool_size=0 必须 check 阶段拦下: 否则暖池永不建货, 每条连接静默 10s 超时。
+    #[test]
+    fn mirage_outbound_pool_size_zero_is_caught() {
+        let s = r#"{
+          "inbounds": [{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "port": 1080 }],
+          "outbounds": [{ "type": "mirage", "tag": "proxy", "server": "h", "server_port": 443,
+                          "password": "pw", "camouflage_host": "www.apple.com", "pool_size": 0 }],
+          "routing": { "default_outbound": "proxy", "rules": [] }
+        }"#;
+        let cfg: Config = serde_json::from_str(s).expect("配置应能解析");
+        let issues = cfg.semantic_issues();
+        assert!(
+            issues.iter().any(|i| i.contains("pool_size")),
+            "pool_size=0 应被拦下: {issues:?}"
         );
     }
 
