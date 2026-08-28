@@ -579,11 +579,11 @@ async fn setup_flow(
                     return;
                 }
             };
-            if real.is_ipv6() {
-                warn!("[TPROXY-UDP] IPv6 target {} unsupported in v1, dropping", real);
-                return;
-            }
-            let out = match UdpSocket::bind("0.0.0.0:0").await {
+            // V6 出口: 客户端仍是 V4 LAN, 但解析出的目标可能是 V6 (AAAA-only 域名, resolve_first
+            // V4 优先但无 A 时返 V6)。egress socket 按目标族绑 ([::] vs 0.0.0.0), 回包仍发回 V4
+            // 客户端 (reply 路径不变)。WG 腿的 V6 出口待后续。
+            let bind_addr = if real.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let out = match UdpSocket::bind(bind_addr).await {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
                     error!("[TPROXY-UDP] bind outbound failed: {}", e);
