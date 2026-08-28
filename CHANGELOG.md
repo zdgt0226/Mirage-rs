@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(transparent): 透明 UDP 支持 IPv6 目标出口 (Direct 腿)
+
+原透明 UDP 对解析出 IPv6 的目标直接 `dropping` (`unsupported in v1`)。客户端始终是 IPv4 LAN
+(fake-IP/tc_divert 都 V4), 但域名可能 AAAA-only → 解析成 V6 → 被静默丢。现按目标族绑 egress
+socket (`[::]:0` vs `0.0.0.0:0`), 回包仍发回 V4 客户端 (reply 路径不变), 让 IPv4 LAN 客户端能
+访问 AAAA-only/双栈目标的 UDP (QUIC/HTTP3 等)。
+- **范围**: Direct 出口腿。V6 fake-IP + V6 LAN 客户端 (需 V6 tc_divert/sk_lookup/flow key 大重构)
+  与 WG 腿 V6 出口仍未做, 列后续。
+- **验证**: V6 UDP egress 机制 sanity (`[::]:0` 绑 + connect V6 + roundtrip) 通过; V4 回包路径
+  earlier netns 网关测试已证; compile + clippy + 现有 transparent 测试 (8) 绿。
+
 ### feat(relay): 服务端 UDP + udp_mux 限速 (按客户端 IP, policing)
 
 补齐限速最后一条 UDP 路 —— 服务端按连接的客户端 IP policing (令牌不足丢包)。此前限速 UDP 只覆盖
