@@ -11,10 +11,10 @@
 //! TLS 1.3 Client Finished 尺寸.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
@@ -40,6 +40,37 @@ fn rate_limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
         }
     }
+}
+
+// 反射 flood 速率守卫: 已有并发上限 (UNAUTH_CONNS 100/IP + GLOBAL_UNAUTH 5000) 只挡"同时挂着"
+// 的反射, 挡不住"快速开-失败-关"的高频反射 (每条短命 → 并发低但反复砸 camouflage_host, 让本机
+// IP 惹 abuse)。按源 IP(/64) 补窗口速率上限: 阈值远超 GFW 低频主动探测 (探测一次一两条), 只掐
+// flood 滥用。超限直接 drop (与并发超限的 return None 行为一致)。
+const UNAUTH_RATE_WINDOW: Duration = Duration::from_secs(10);
+const UNAUTH_RATE_MAX: u32 = 30; // 每源 IP(/64) 每窗口最多反射次数
+const UNAUTH_RATE_MAP_CAP: usize = 8192; // 表上限, 满淘汰窗口最旧的一条 (有界)
+static UNAUTH_RATE: LazyLock<Mutex<HashMap<IpAddr, (Instant, u32)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 认证失败反射的按源 IP 窗口速率: 超 `UNAUTH_RATE_MAX`/`UNAUTH_RATE_WINDOW` 返 true (该丢)。
+fn unauth_reflect_rate_exceeded(ip: IpAddr) -> bool {
+    let now = Instant::now();
+    let mut m = match UNAUTH_RATE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if !m.contains_key(&ip) && m.len() >= UNAUTH_RATE_MAP_CAP {
+        // 满 + 新 IP: 淘汰窗口起点最旧的一条, 防表无界增长。
+        if let Some(k) = m.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| *k) {
+            m.remove(&k);
+        }
+    }
+    let e = m.entry(ip).or_insert((now, 0));
+    if now.duration_since(e.0) > UNAUTH_RATE_WINDOW {
+        *e = (now, 0); // 窗口过期, 重置
+    }
+    e.1 += 1;
+    e.1 > UNAUTH_RATE_MAX
 }
 
 /// 传输无关的服务端握手核心 (ClientHello 鉴权 + 模板回放 + tail 消费)。返回 `Some((stream,
@@ -125,6 +156,14 @@ where
         // v0.4.5-alpha.10: 限流 key 用 /64 归一后的 IP, 防攻击者用 /64 段造
         // 2^64 独立 IPv6 地址逃逸限流. IPv4 保持单地址 (已是最细粒度).
         let ip = rate_limit_key(peer_addr.ip());
+
+        // 反射速率守卫 (补并发上限盲区: 快速开-失败-关的高频反射)。超限直接 drop, 不再反射砸
+        // camouflage_host —— GFW 低频探测远达不到阈值, 只掐滥用 flood。
+        if unauth_reflect_rate_exceeded(ip) {
+            GLOBAL_UNAUTH.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+
         let _slot_guard = {
             // 锁中毒容忍 (into_inner), 不 unwrap panic —— 跟 IpSlotGuard::drop 同锁
             // 同原则. HashMap 数据没被破坏 (临界区无 panic 源).
@@ -252,3 +291,26 @@ pub(super) async fn handle_connection(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unauth_reflect_rate_trips_after_max() {
+        // 测试专用 IP, 免与其它测试共享 static 状态干扰。
+        let ip: IpAddr = "203.0.113.77".parse().unwrap();
+        for i in 1..=UNAUTH_RATE_MAX {
+            assert!(!unauth_reflect_rate_exceeded(ip), "第 {i} 次不该超限");
+        }
+        assert!(unauth_reflect_rate_exceeded(ip), "超过 MAX 应触发丢弃");
+    }
+
+    #[test]
+    fn reflect_rate_key_normalizes_ipv6_to_64() {
+        // 同 /64 段不同低位 → 归一为同一限流 key, 共享速率窗口 (防 /64 造 2^64 IP 逃逸)。
+        let a = rate_limit_key("2001:db8::1".parse().unwrap());
+        let b = rate_limit_key("2001:db8::dead:beef".parse().unwrap());
+        assert_eq!(a, b, "同 /64 应归一为同 key");
+    }
+}
