@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.10.7] - API CORS + /api/v1 版本化 + 统计持久化 (为 UI 独立成项目铺路) (2026-08-30)
+
 ### feat(api): CORS (gui.cors_origins) + /api/v1 版本前缀 —— 为 UI 独立成项目铺路
 
 独立前端 (跨 origin) 对接后端的两块基建:
