@@ -43,6 +43,11 @@ pub struct GuiConfig {
     /// install.sh 网关模式可默认填 /var/lib/mirage-rs/stats.json。
     #[serde(default)]
     pub stats_persist_path: Option<String>,
+    /// 可选: 允许跨源 (CORS) 调用 API 的前端 origin 列表 (如 `["https://ui.example.com"]`)。
+    /// 供 UI 独立成项目后跨 origin 对接。默认空 = 不加 CORS 头 (仅同源, 向后兼容)。`["*"]` = 允许
+    /// 任意 origin (API 用 Bearer 鉴权非 cookie, 故 `*` 不配 credentials, 无 cookie 泄露面)。
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 fn default_gui_listen() -> String {

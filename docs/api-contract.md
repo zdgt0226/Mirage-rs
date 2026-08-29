@@ -16,9 +16,9 @@
   - **CSRF**: `Bearer` header 天然抗 CSRF; cookie 会被浏览器跨站自动携带故需防护。**独立前端 (跨 origin) 一律用 `Authorization: Bearer`。**
 - **响应约定**: 监控类直接返数据对象; 控制/读写类带 `status: "success"|"error"` 信封 (见各 endpoint)。HTTP 状态码目前基本恒 200, 成败看 body 的 `status` (改进点见 §5)。
 
-### ⚠️ 拆独立前端前必须补的后端缺口 (当前没有)
-1. **CORS 未配置** 🔴 —— 独立前端是不同 origin, 浏览器会拦所有跨域请求 (含预检 OPTIONS)。**阻塞项**: 后端需按前端 origin 放行 `Access-Control-Allow-Origin` + 允许 `Authorization` header + 处理预检。用 Bearer 则**不需要** `Allow-Credentials` (无 cookie)。
-2. **无版本前缀** 🟡 —— 现为裸 `/api/*`。建议引入 `/api/v1/*` 冻结契约, 让前后端各自演进。**现在加便宜, 以后回填疼。**
+### 独立前端对接现状
+1. **CORS** ✅ 已支持 (v0.10.7) —— 配 `gui.cors_origins`: `[]` 默认不发 ACAO (仅同源, 向后兼容); `["https://ui.example.com", ...]` 精确白名单; `["*"]` 任意 origin。放行 `GET/POST/OPTIONS` + `Authorization`/`Content-Type` 头, 预检 OPTIONS 由后端在鉴权前直接应答。Bearer 鉴权非 cookie 故不配 `Allow-Credentials`。
+2. **版本前缀** ✅ 已加 (v0.10.7) —— 所有 endpoint 同时挂在 `/api/*` (向后兼容内置 WebUI) 与 **`/api/v1/*`** (独立前端用此冻结契约)。鉴权中间件对两前缀一致生效。
 3. **契约无机读格式** 🟡 —— 无 OpenAPI/JSON Schema。本文档是人读契约; 若前端要生成类型, 后续可补 OpenAPI。
 
 ---
@@ -96,11 +96,9 @@
 - **实时数据**: 现无 WebSocket/SSE, 前端**轮询**。建议节奏: `/api/overview` `/api/connections` ~2s; `/api/history` ~1-2s (它本身是每秒采样的窗口); `/api/stats` `/api/domains` `/api/devices` ~5s; `/api/logs` 按需。想更顺再上 **SSE** (单向、CORS 友好、比 WS 简单) —— v1 不必。
 - **鉴权**: 统一 `Authorization: Bearer <gui.token>`。别用 cookie/query。
 - **模式分支**: 读 `/api/overview.mode` 决定渲染服务端视图 (clients/domains/history) 还是客户端视图 (devices/LAN)。
-- **后端改造清单** (拆分前的一个小 PR):
-  1. 加 CORS (放行前端 origin + `Authorization` header + 预检)
-  2. 引入 `/api/v1/*` 前缀 (冻结契约)
-  3. (可选) 让 HTTP 状态码反映成败 (4xx/5xx), 而非恒 200 看 body `status`
-  4. (可选) 补 OpenAPI 供前端生成类型
+- **后端改造** (拆分前): ✅ CORS (`gui.cors_origins`) + ✅ `/api/v1/*` 前缀 已在 v0.10.7 完成。剩余可选:
+  1. (可选) 让 HTTP 状态码反映成败 (4xx/5xx), 而非恒 200 看 body `status`
+  2. (可选) 补 OpenAPI 供前端生成类型
 
 ## 6. 端点速查
 ```

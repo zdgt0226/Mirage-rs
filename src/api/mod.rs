@@ -197,6 +197,43 @@ async fn serve_root(State(app): State<AppState>, uri: Uri) -> Response {
     html.into_response()
 }
 
+/// API 路由 (相对路径)。挂到 `/api` (向后兼容内置 WebUI) 与 `/api/v1` (给独立前端冻契约) 两前缀。
+fn api_routes() -> Router<AppState> {
+    Router::new()
+        .route("/overview", get(handlers::overview::get_overview))
+        .route("/connections", get(handlers::connections::get_connections))
+        .route("/stats", get(handlers::stats::get_stats))
+        .route("/domains", get(handlers::domains::get_domains))
+        .route("/devices", get(handlers::devices::get_devices))
+        .route("/clients", get(handlers::clients::get_clients))
+        .route("/clients/block", post(handlers::clients::post_block))
+        .route("/history", get(handlers::history::get_history))
+        .route("/logs", get(handlers::logs::get_logs))
+        .route("/proxies", get(handlers::proxies::get_proxies))
+        .route("/proxies/select", post(handlers::proxies::select_proxy))
+        .route("/rules", get(handlers::rules::get_rules).post(handlers::rules::update_rules))
+        .route("/profiles", get(handlers::profiles::get_profiles).post(handlers::profiles::update_profiles))
+        .route("/bpf/tunnels", get(handlers::bpf_tunnels::get_bpf_tunnels))
+}
+
+/// CORS 层。空 origins = 不发 ACAO (仅同源, 向后兼容); `["*"]` = 任意 origin; 否则精确白名单。
+/// 只放行 GET/POST/OPTIONS + Authorization/Content-Type 头。Bearer 鉴权 (非 cookie) 故不配 credentials。
+fn build_cors(origins: &[String]) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+    let base = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+    if origins.iter().any(|o| o == "*") {
+        base.allow_origin(AllowOrigin::any())
+    } else if origins.is_empty() {
+        base
+    } else {
+        let list: Vec<axum::http::HeaderValue> =
+            origins.iter().filter_map(|o| o.parse().ok()).collect();
+        base.allow_origin(list)
+    }
+}
+
 pub async fn start_server(
     listen_addr: &str,
     state: Arc<ArcSwap<CoreState>>,
@@ -205,6 +242,7 @@ pub async fn start_server(
     config_path: String,
     token: Option<String>,
     is_server: bool,
+    cors_origins: Vec<String>,
 ) {
     // 1. 初始化历史数据结构，窗口大小设定为 120 (即记录过去 120 秒 / 2分钟 的数据)
     // 预先填充 0 以避免前端在数据不足时渲染异常
@@ -230,24 +268,15 @@ pub async fn start_server(
     // 2. 启动 1Hz 采样后台 task
     sampler::spawn(app_state.clone());
 
-    // 3. 装配 axum 路由 + 鉴权中间件 (route_layer: 只对已匹配路由跑, 不含 404)
+    // 3. 装配 axum 路由 + 鉴权中间件 (route_layer: 只对已匹配路由跑, 不含 404)。
+    // 路由挂在 /api 与 /api/v1 两个前缀 (裸 /api 保内置 WebUI 向后兼容; /api/v1 给独立前端冻契约)。
+    // CorsLayer 在最外层: 预检 OPTIONS 由它直接应答 (在 auth 之前), 跨源实际请求过它再进 auth。
     let app = Router::new()
-        .route("/api/overview", get(handlers::overview::get_overview))
-        .route("/api/connections", get(handlers::connections::get_connections))
-        .route("/api/stats", get(handlers::stats::get_stats))
-        .route("/api/domains", get(handlers::domains::get_domains))
-        .route("/api/devices", get(handlers::devices::get_devices))
-        .route("/api/clients", get(handlers::clients::get_clients))
-        .route("/api/clients/block", post(handlers::clients::post_block))
-        .route("/api/history", get(handlers::history::get_history))
-        .route("/api/logs", get(handlers::logs::get_logs))
-        .route("/api/proxies", get(handlers::proxies::get_proxies))
-        .route("/api/proxies/select", post(handlers::proxies::select_proxy))
-        .route("/api/rules", get(handlers::rules::get_rules).post(handlers::rules::update_rules))
-        .route("/api/profiles", get(handlers::profiles::get_profiles).post(handlers::profiles::update_profiles))
-        .route("/api/bpf/tunnels", get(handlers::bpf_tunnels::get_bpf_tunnels))
+        .nest("/api", api_routes())
+        .nest("/api/v1", api_routes())
         .route("/", get(serve_root))
         .route_layer(middleware::from_fn_with_state(app_state.clone(), auth_mw))
+        .layer(build_cors(&cors_origins))
         .with_state(app_state);
 
     let addr: SocketAddr = match listen_addr.parse() {

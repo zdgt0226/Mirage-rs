@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### feat(api): CORS (gui.cors_origins) + /api/v1 版本前缀 —— 为 UI 独立成项目铺路
+
+独立前端 (跨 origin) 对接后端的两块基建:
+- **CORS**: 配 `gui.cors_origins` —— `[]` 默认不发 ACAO (仅同源, 向后兼容); 精确白名单
+  `["https://ui.example.com"]`; `["*"]` 任意 origin。放行 GET/POST/OPTIONS + Authorization/
+  Content-Type 头; CorsLayer 在最外层, 预检 OPTIONS 在鉴权前直接应答。Bearer 鉴权非 cookie 故
+  不配 Allow-Credentials (无 cookie 泄露面)。
+- **/api/v1 版本前缀**: 15 个 endpoint 同时挂 `/api/*` (向后兼容内置 WebUI) 与 `/api/v1/*` (独立前端
+  冻契约)。路由抽 `api_routes()` builder nest 到两前缀。
+- **实机验证**: 鉴权中间件对 `/api` 与 `/api/v1` 一致生效 (无 token 均 401, nest+route_layer 覆盖新
+  前缀确认); CORS 预检 OPTIONS 应答正确 ACAO, 白名单 origin 带 ACAO、非白名单不带。
+- docs/api-contract.md 同步 (CORS/v1 缺口标为已补)。
+
 ### feat(monitor): 统计持久化 (gui.stats_persist_path) —— 重启不丢 WebUI 排行/总量
 
 原 monitor 三张聚合表 (域名/设备/出站流量) 纯内存, 网关重启后 WebUI 排行/总量清零。补可选持久化:
