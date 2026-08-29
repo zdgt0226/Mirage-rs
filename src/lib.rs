@@ -260,6 +260,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     let mut gui_listen = "127.0.0.1:9090".to_string();
     let mut gui_token: Option<String> = None;
     let mut stats_persist_path: Option<String> = None;
+    let mut gui_cors_origins: Vec<String> = Vec::new();
 
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
@@ -288,6 +289,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 gui_listen = gui.listen;
                 gui_token = gui.token;
                 stats_persist_path = gui.stats_persist_path;
+                gui_cors_origins = gui.cors_origins;
             }
             // 统计持久化: 启动即加载 (在流量累积前), 再挂 60s 周期落盘任务。退出落盘见 shutdown。
             if let Some(path) = stats_persist_path.clone() {
@@ -344,8 +346,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
             let listen = gui_listen.clone();
             let cfg_path = config_path.to_string();
             let token = gui_token.clone();
+            let cors_origins = gui_cors_origins.clone();
             tokio::spawn(async move {
-                crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token, is_server).await;
+                crate::api::start_server(&listen, gui_state, ebp, xdp, cfg_path, token, is_server, cors_origins).await;
             });
         }
         #[cfg(not(feature = "gui"))]
