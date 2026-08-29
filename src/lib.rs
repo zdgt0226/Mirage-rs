@@ -259,6 +259,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     let mut gui_enabled = false;
     let mut gui_listen = "127.0.0.1:9090".to_string();
     let mut gui_token: Option<String> = None;
+    let mut stats_persist_path: Option<String> = None;
 
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
@@ -286,6 +287,19 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 gui_enabled = gui.enabled;
                 gui_listen = gui.listen;
                 gui_token = gui.token;
+                stats_persist_path = gui.stats_persist_path;
+            }
+            // 统计持久化: 启动即加载 (在流量累积前), 再挂 60s 周期落盘任务。退出落盘见 shutdown。
+            if let Some(path) = stats_persist_path.clone() {
+                crate::monitor::load_stats(&path);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tick.tick().await; // 跳过 interval 的立即首触
+                    loop {
+                        tick.tick().await;
+                        crate::monitor::flush_stats(&path);
+                    }
+                });
             }
             if let Some(adv) = config.advanced_dns {
                 if let Some(iface) = &adv.xdp_interface {
@@ -594,6 +608,10 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     // 退出前最终落盘 fake-IP 映射 (周期 flush 之外, 保住最近 <60s 的新分配)。
     if let Some(m) = &fake_ip_mapper {
         m.flush();
+    }
+    // 退出前最终落盘统计 (周期 flush 之外, 保住最近 <60s 的增量)。
+    if let Some(path) = &stats_persist_path {
+        crate::monitor::flush_stats(path);
     }
     // 清理透明代理 fake-IP 本地路由 (若装过). best-effort, 失败无害.
     crate::proxy::transparent_net::cleanup().await;

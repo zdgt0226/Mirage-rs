@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### feat(monitor): 统计持久化 (gui.stats_persist_path) —— 重启不丢 WebUI 排行/总量
+
+原 monitor 三张聚合表 (域名/设备/出站流量) 纯内存, 网关重启后 WebUI 排行/总量清零。补可选持久化:
+- 配 `gui.stats_persist_path` (如 `/var/lib/mirage-rs/stats.json`) → 启动加载 + 60s 周期落盘 + 退出前
+  最终落盘 (原子 .tmp+rename, 镜像 fake-IP persist 模式)。不配 = 纯内存 (向后兼容)。
+- **范围**: 只持久化三张聚合表 (跨连接存活的累计量); live 连接 + 最近关闭环是瞬态, 不存。
+  `DeviceAgg.last` (Instant 不可序列化) 落盘丢弃、load 重置为 now (仅影响"最近活跃"相对排序)。
+- **限速桶不持久化**: 令牌桶秒级回填自愈, 重启丢了无感, 存了没意义 (刻意不做)。
+- **实机验证**: 3 连接累积 → SIGTERM 落盘 stats.json (三表齐) → 重启 `[STATS] 从…恢复` 生效。+2 单测。
+
 ## [v0.10.6] - 服务端 UDP 限速 + 透明 UDP IPv6 目标出口 + 反射 flood 守卫 (2026-08-29)
 
 ### feat(server): 认证失败反射 flood 守卫 (按源 IP 窗口速率, 防被当反射工具惹 abuse)
