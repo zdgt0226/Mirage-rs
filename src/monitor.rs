@@ -91,7 +91,7 @@ static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
 
 /// per-出站累计统计 (WebUI「分流量」)。up/down/conns 累计, 跨连接生命周期存活 ——
 /// 连接进登记环会被淘汰, 但累计量不丢。live 数在快照时从 REGISTRY 现算 (不在此存)。
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct OutboundAgg {
     up: u64,
     down: u64,
@@ -113,7 +113,7 @@ pub struct OutboundStat {
 
 /// 域名累计统计 (WebUI「域名排行」, 服务端 Admin)。按目标域名/IP 聚合连接数 + 上下行字节,
 /// 跨连接生命周期存活。key = target 去掉 :port (IPv6 `[..]` 亦剥)。
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct DomainAgg {
     conns: u64,
     up: u64,
@@ -140,6 +140,82 @@ struct DeviceAgg {
 }
 static DEVICE_STATS: LazyLock<Mutex<HashMap<String, DeviceAgg>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// ── 统计持久化 (gui.stats_persist_path): 重启保住 WebUI 排行/总量 ──────────────────
+// 只持久化三张聚合表 (域名/设备/出站); live 连接与 closed 环是瞬态, 不存。DeviceAgg.last
+// (Instant) 不可序列化, 落盘丢弃、load 时重置为 now (只影响"最近活跃"排序的相对时刻)。
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DevicePersist {
+    conns: u64,
+    up: u64,
+    down: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PersistedStats {
+    outbound: HashMap<String, OutboundAgg>,
+    domain: HashMap<String, DomainAgg>,
+    device: HashMap<String, DevicePersist>,
+}
+
+/// 启动时从持久化文件恢复三张聚合表。best-effort: 文件缺失/损坏则空启动 (仅 warn)。
+pub fn load_stats(path: &str) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return, // 首次运行无文件, 正常
+    };
+    let parsed: PersistedStats = match serde_json::from_str(&content) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("[STATS] 持久化文件 {} 解析失败 ({}), 空启动", path, e);
+            return;
+        }
+    };
+    let now = Instant::now();
+    *OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()) = parsed.outbound;
+    *DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()) = parsed.domain;
+    let mut dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    *dev = parsed
+        .device
+        .into_iter()
+        .map(|(k, v)| (k, DeviceAgg { conns: v.conns, up: v.up, down: v.down, last: now }))
+        .collect();
+    tracing::info!("[STATS] 从 {} 恢复统计 (域名/设备/出站聚合表)", path);
+}
+
+/// 落盘三张聚合表。先写 .tmp 再原子 rename。best-effort, 失败仅 warn (下轮重试)。
+pub fn flush_stats(path: &str) {
+    let snap = PersistedStats {
+        outbound: OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        domain: DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        device: DEVICE_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), DevicePersist { conns: v.conns, up: v.up, down: v.down }))
+            .collect(),
+    };
+    let json = match serde_json::to_string(&snap) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!("[STATS] 序列化失败: {}", e);
+            return;
+        }
+    };
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, json.as_bytes()).is_err() {
+        tracing::warn!("[STATS] 写临时文件 {} 失败", tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!("[STATS] rename {} 失败: {}", path, e);
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
 
 /// 单个设备/来源快照。
 #[derive(Clone, serde::Serialize)]
@@ -735,5 +811,43 @@ mod conn_registry_tests {
         }
         let (_, closed) = conn_snapshots();
         assert!(closed.len() <= CLOSED_RING_CAP, "closed ring 超容量: {}", closed.len());
+    }
+}
+
+#[cfg(test)]
+mod stats_persist_tests {
+    use super::*;
+
+    // 纯 serde roundtrip (不碰全局态, 并行安全): 验证持久化数据模型自洽, 尤其 DevicePersist
+    // 绕开 DeviceAgg 的 Instant。
+    #[test]
+    fn persisted_stats_serde_roundtrip() {
+        let mut s = PersistedStats::default();
+        s.outbound.insert("ob".into(), OutboundAgg { up: 1, down: 2, conns: 3 });
+        s.domain.insert("d".into(), DomainAgg { conns: 4, up: 5, down: 6 });
+        s.device.insert("dev".into(), DevicePersist { conns: 7, up: 8, down: 9 });
+        let json = serde_json::to_string(&s).unwrap();
+        let back: PersistedStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.outbound["ob"].up, 1);
+        assert_eq!(back.outbound["ob"].conns, 3);
+        assert_eq!(back.domain["d"].conns, 4);
+        assert_eq!(back.device["dev"].down, 9);
+    }
+
+    // flush 落盘: 塞唯一 key 到全局表, flush, 读回文件断言含该 key (对并行加的其它 key 稳健)。
+    #[test]
+    fn flush_stats_writes_file() {
+        DOMAIN_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("persist-test.example".into(), DomainAgg { conns: 11, up: 22, down: 33 });
+        let path = std::env::temp_dir().join("mirage_stats_flush_test.json");
+        let path = path.to_str().unwrap();
+        flush_stats(path);
+        let content = std::fs::read_to_string(path).unwrap();
+        let parsed: PersistedStats = serde_json::from_str(&content).unwrap();
+        let d = parsed.domain.get("persist-test.example").expect("落盘应含该域名");
+        assert_eq!((d.conns, d.up, d.down), (11, 22, 33));
+        let _ = std::fs::remove_file(path);
     }
 }

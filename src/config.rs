@@ -38,6 +38,11 @@ pub struct GuiConfig {
     /// 日志/配置、改路由规则。浏览器访问 http://host:9090/?token=XXX 一次即种 cookie。
     #[serde(default)]
     pub token: Option<String>,
+    /// 可选: 统计 (域名/设备/出站 聚合流量) 持久化文件路径。设了则启动加载 + 周期/退出落盘,
+    /// 网关重启后 WebUI 排行/总量不清零。不设 = 纯内存 (重启清零, 向后兼容)。
+    /// install.sh 网关模式可默认填 /var/lib/mirage-rs/stats.json。
+    #[serde(default)]
+    pub stats_persist_path: Option<String>,
 }
 
 fn default_gui_listen() -> String {
