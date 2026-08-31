@@ -7,10 +7,16 @@
 use axum::Json;
 use serde_json::{json, Value};
 
+/// 单次返回 active 上限 (契约 §05): 大规模下不封顶响应体会失控。真实数在 active_total。
+const ACTIVE_CAP: usize = 500;
+
 pub async fn get_connections() -> Json<Value> {
-    let (active, recent_closed) = crate::monitor::conn_snapshots();
+    let (mut active, recent_closed) = crate::monitor::conn_snapshots();
+    let active_total = active.len();
+    active.truncate(ACTIVE_CAP);
     Json(json!({
-        "active": serde_json::to_value(active).unwrap_or(Value::Null),
+        "active": serde_json::to_value(&active).unwrap_or(Value::Null),
+        "active_total": active_total,
         "recent_closed": serde_json::to_value(recent_closed).unwrap_or(Value::Null),
     }))
 }

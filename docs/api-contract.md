@@ -17,7 +17,7 @@
 - **响应约定**: 监控类直接返数据对象; 控制/读写类带 `status: "success"|"error"` 信封 (见各 endpoint)。HTTP 状态码目前基本恒 200, 成败看 body 的 `status` (改进点见 §5)。
 
 ### 独立前端对接现状
-1. **CORS** ✅ 已支持 (v0.10.7) —— 配 `gui.cors_origins`: `[]` 默认不发 ACAO (仅同源, 向后兼容); `["https://ui.example.com", ...]` 精确白名单; `["*"]` 任意 origin。放行 `GET/POST/OPTIONS` + `Authorization`/`Content-Type` 头, 预检 OPTIONS 由后端在鉴权前直接应答。Bearer 鉴权非 cookie 故不配 `Allow-Credentials`。
+1. **CORS** ✅ 已支持 (v0.10.7) —— 配 `gui.cors_origins`: `[]` 默认不发 ACAO (仅同源, 向后兼容); `["https://ui.example.com", ...]` 精确白名单; `["*"]` 任意 origin。放行 `GET/POST/OPTIONS` + `Authorization`/`Content-Type`/`X-Requested-With` 头 (前端 POST 带 `X-Requested-With`, 预检必须放行), 预检 OPTIONS 由后端在鉴权前直接应答。Bearer 鉴权非 cookie 故不配 `Allow-Credentials`。
 2. **版本前缀** ✅ 已加 (v0.10.7) —— 所有 endpoint 同时挂在 `/api/*` (向后兼容内置 WebUI) 与 **`/api/v1/*`** (独立前端用此冻结契约)。鉴权中间件对两前缀一致生效。
 3. **契约无机读格式** 🟡 —— 无 OpenAPI/JSON Schema。本文档是人读契约; 若前端要生成类型, 后续可补 OpenAPI。
 
@@ -49,7 +49,7 @@
 | # | Path | 响应 schema |
 |---|---|---|
 | 1 | `/api/overview` | `{ up, down, connections, bpf_success, bpf_fallback, xdp_attached, engine_online, tunnel_count, brutal_cc_active, mode: "server"\|"client" }` — 顶部汇总卡 + 运行模式 (前端据此分服务端/客户端视图) |
-| 2 | `/api/connections` | `{ active: [ConnSnapshot], recent_closed: [ConnSnapshot] }` — 活跃 + 最近关闭 (环形, ≤300) |
+| 2 | `/api/connections` | `{ active: [ConnSnapshot] (≤500), active_total: N, recent_closed: [ConnSnapshot] }` — 活跃 (封顶 500, 真实数看 active_total) + 最近关闭 (环形, ≤300) |
 | 3 | `/api/stats` | `{ outbounds: [OutboundStat], rules: [{index, outbound, hits}], default: {outbound, hits} }` — per-出站流量 + per-规则命中 |
 | 4 | `/api/domains` | `{ domains: [DomainStat] }` — top-30 by 流量 |
 | 5 | `/api/devices` | `{ devices: [DeviceStat] }` — 客户端=LAN 设备 / 服务端=连接的客户端 |
@@ -102,7 +102,8 @@
 
 ## 6. 端点速查
 ```
-GET  /api/overview          GET  /api/connections     GET  /api/stats
+GET  /api/version           GET  /api/overview        GET  /api/connections
+GET  /api/stats
 GET  /api/domains           GET  /api/devices         GET  /api/history
 GET  /api/logs              GET  /api/bpf/tunnels
 GET  /api/clients           POST /api/clients/block
