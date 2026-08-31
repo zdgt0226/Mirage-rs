@@ -21,7 +21,7 @@ mod ratelimit;
 
 use axum::{
     routing::{get, post},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     http::{header, HeaderMap, Method, StatusCode, Uri},
     middleware::{self, Next},
     extract::{Request, State},
@@ -181,20 +181,15 @@ async fn auth_mw(
 
 /// 根路由: 服务 SPA。若带合法 ?token= 则顺手种 HttpOnly cookie, 之后 SPA 的 fetch 自动带,
 /// 无需改前端。(能走到这里说明 auth_mw 已放行, 即 token 合法或未启用鉴权。)
-async fn serve_root(State(app): State<AppState>, uri: Uri) -> Response {
-    let html = Html(include_str!("index.html"));
-    if let (Some(expected), Some(q)) = (app.gui_token.as_ref(), uri.query()) {
-        for kv in q.split('&') {
-            if let Some(t) = kv.strip_prefix("token=") {
-                if ct_eq(t.as_bytes(), expected.as_bytes()) {
-                    // SameSite=Strict + HttpOnly: 防 CSRF 自动带 cookie 到跨站 + 防 JS 读取。
-                    let cookie = format!("mirage_token={t}; HttpOnly; SameSite=Strict; Path=/");
-                    return ([(header::SET_COOKIE, cookie)], html).into_response();
-                }
-            }
-        }
-    }
-    html.into_response()
+/// 公开根信息 (无鉴权): 后端已不内嵌 UI (前端独立为 Mirage-console), 返回 API 版本前缀 +
+/// 前端指引, 免访问者打开裸后端见空白/404。不含任何敏感数据。
+async fn root_info() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "service": "mirage-rs",
+        "api": "/api/v1",
+        "ui": "https://github.com/zdgt0226/Mirage-console",
+        "note": "backend is API-only; deploy Mirage-console as the frontend (see docs/api-contract.md)"
+    }))
 }
 
 /// API 路由 (相对路径)。挂到 `/api` (向后兼容内置 WebUI) 与 `/api/v1` (给独立前端冻契约) 两前缀。
@@ -274,8 +269,9 @@ pub async fn start_server(
     let app = Router::new()
         .nest("/api", api_routes())
         .nest("/api/v1", api_routes())
-        .route("/", get(serve_root))
         .route_layer(middleware::from_fn_with_state(app_state.clone(), auth_mw))
+        // `/` 加在 route_layer 之后 = 不走鉴权 (仅公开 API 指引信息, 无敏感数据)。
+        .route("/", get(root_info))
         .layer(build_cors(&cors_origins))
         .with_state(app_state);
 

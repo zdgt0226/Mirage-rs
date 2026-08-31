@@ -10,6 +10,7 @@
 ## 1. 传输 / 鉴权 / 现状缺口
 
 - **传输**: HTTP/1.1, JSON。由 mirage 内置 axum 服务 (`gui.enabled=true`, 默认 `127.0.0.1:9090`)。仅在 `gui` 编译特性 (默认开) 下存在。
+- **后端为纯 API** (v0.10.8+): 已**不再内嵌前端页面** —— UI 独立为 [Mirage-console](https://github.com/zdgt0226/Mirage-console), 经 `/api/v1` + Bearer + CORS 对接。裸后端根路径 `/` 返回**公开指引 JSON** (`{service, api, ui, note}`, 无鉴权、无敏感数据), 而非页面。
 - **鉴权** (`gui.token` 配了才启用; 不配 = 无鉴权, 仅适合 localhost):
   - Token 三种载体, 按优先级: `Authorization: Bearer <token>` → `mirage_token` cookie → `?token=`(**仅 `/` 根路径接受**, `/api/*` 不接受 —— token 进 URL 会落历史/Referer/反代日志)。
   - 常量时间比较 (防时序侧信道) + 认证失败按源 IP 限流 (防字典爆破)。

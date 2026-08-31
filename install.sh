@@ -122,9 +122,10 @@ ask_gui() {
         # url-safe 32 位随机 token; /dev/urandom 不可用时退回时间戳哈希
         token=$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 32)
         [[ ${#token} -lt 16 ]] && token=$(date +%s%N | sha256sum | head -c 32)
-        info "GUI 开放到 0.0.0.0 —— 已自动生成 API token: ${token}"
-        info "  浏览器首次访问 http://<本机IP>:${port}/?token=${token} 即种 cookie, 之后免带"
-        info "  CLI: curl -H 'Authorization: Bearer ${token}' http://<本机IP>:${port}/api/overview"
+        info "API 开放到 0.0.0.0 —— 已自动生成 API token: ${token}"
+        info "  看板前端: 部署 Mirage Console (https://github.com/zdgt0226/Mirage-console), 填后端地址 + 上面的 token"
+        info "  后端已不内嵌页面; 前端/CLI 统一用 Authorization: Bearer ${token} 调 /api/v1"
+        info "  CLI 例: curl -H 'Authorization: Bearer ${token}' http://<本机IP>:${port}/api/v1/overview"
     fi
     echo "true ${listen_addr}:${port} ${token}"
 }

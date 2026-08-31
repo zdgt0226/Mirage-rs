@@ -2,7 +2,7 @@
 
 ![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.10.7-10b981.svg)
 
-基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
+基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web API (看板前端已独立为 [Mirage Console](https://github.com/zdgt0226/Mirage-console))。
 
 > **定位**: 面向**自建跨境线路的个人/小团队** —— 有一台墙外 VPS + 一台能当网关的 Linux 机器。
 > 主打「零配置 eBPF 透明网关」+ 抗被动识别。
@@ -33,7 +33,7 @@
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
-* **内置 Web 看板**: Mirage Console —— 简洁现代的监控台（侧栏切视图 + 暗/亮双主题 + **中/英双语**），实时流量图、域名连接表、per-出站分流量/规则命中统计、结构化规则编辑器（dry_run 预检 + 进程分流维度 + 拖排）。**按运行模式分视图**：客户端管 LAN 设备（列表 + 按设备一键路由），服务端管连接的客户端（域名排行、连接历史、客户端版本、一键屏蔽）。
+* **Web API + 独立看板**: 后端内置 axum Web API (`/api/v1/*`, Bearer 鉴权, 可配 CORS 跨源); 监控/控制界面 **[Mirage Console](https://github.com/zdgt0226/Mirage-console)** 已独立成项目 (可独立部署/演进)。API 覆盖实时流量、域名/连接/设备表、per-出站分流量+规则命中、路由/策略读写 (dry_run 预检)、客户端屏蔽; 按运行模式 (`overview.mode`) 分服务端/客户端视图。契约见 [`docs/api-contract.md`](docs/api-contract.md)。
 * **供应链完整性**: Release 产物 (SHA256SUMS) 与多架构容器镜像 (`ghcr.io`) 均经 **cosign keyless** 签名 (Sigstore OIDC + Rekor 透明日志，零密钥可公开审计)。
 
 ---
@@ -91,15 +91,15 @@ cosign verify ghcr.io/zdgt0226/mirage-rs:latest \
 ### 从源码构建
 
 ```bash
-cargo build --release                             # 纯用户态版 (默认, 含 Web 看板, 无需 clang)
+cargo build --release                             # 纯用户态版 (默认, 含 Web API, 无需 clang)
 cargo build --release --features ebpf             # 含 eBPF 透明网关 (需 clang + llvm)
-cargo build --release --no-default-features        # headless: 剔掉整个 Web 看板 (无 axum/HTTP 面)
+cargo build --release --no-default-features        # headless: 剔掉整个 Web API (无 axum/HTTP 面)
 # headless + ebpf: cargo build --release --no-default-features --features ebpf
 cargo build --release --features quic              # 含 QUIC 实验传输 (transport:"quic"; ⚠️ P0 不隐蔽)
 ```
 
-> **Web 看板走 `gui` 编译特性 (默认开)。** 纯服务端/无面板部署可 `--no-default-features` 把整个
-> WebUI 编译剔除 —— 无 HTTP 监听面、无 config 写/日志读接口, **更小二进制 + 更小攻击面**。
+> **Web API 走 `gui` 编译特性 (默认开)。** 纯服务端/无面板部署可 `--no-default-features` 把整个
+> Web API 编译剔除 —— 无 HTTP 监听面、无 config 写/日志读接口, **更小二进制 + 更小攻击面**。
 > (剔掉后 config 若配了 `gui.enabled` 会启动 WARN 提示面板不可用。)
 
 > ⚠️ **`--features ebpf` 必须装 clang/llvm** (`apt install clang llvm libbpf-dev`) —— 要编译内核

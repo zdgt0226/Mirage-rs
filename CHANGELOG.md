@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### refactor(api)!: 移除内嵌 WebUI, 后端转为纯 API (前端独立为 Mirage Console)
+
+**破坏性变更**: UI 拆成独立项目 [Mirage Console](https://github.com/zdgt0226/Mirage-console) 后, 后端不再内嵌
+前端页面。
+- 删 `src/api/index.html` (72KB 内嵌看板) + `serve_root` handler + `/?token=` 种 cookie 流。
+- 根路径 `/` 改为**公开指引 JSON** (`{service, api, ui, note}`, 无鉴权无敏感数据), 免裸后端见空白/404。
+- API 路径不变 (`/api/*` + `/api/v1/*`), 鉴权仍走 `Authorization: Bearer`; `/` 移到 route_layer 之后
+  故公开, api 路由仍受鉴权 (实测: `/` 200 无需 token, `/api/v1/*` 无 token 401)。
+- **迁移**: 原来直接浏览器开 `:9090` 看看板的用户, 改为部署 Mirage Console (填后端地址 + token)。
+  `gui` 编译特性/`gui.enabled` 语义不变 (现指 Web API 服务)。docs/README/install.sh/config 注释同步。
+
 ## [v0.10.7] - API CORS + /api/v1 版本化 + 统计持久化 (为 UI 独立成项目铺路) (2026-08-30)
 
 ### feat(api): CORS (gui.cors_origins) + /api/v1 版本前缀 —— 为 UI 独立成项目铺路
