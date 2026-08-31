@@ -197,9 +197,20 @@ async fn serve_root(State(app): State<AppState>, uri: Uri) -> Response {
     html.into_response()
 }
 
+/// GET /api/v1/version —— 内核版本, 供前端替换硬编码版本号 (契约 §08)。build 时间由构建脚本
+/// 经 MIRAGE_BUILD_TIME 注入 (没注入则 null)。
+async fn get_version() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "api_version": "v1",
+        "build": option_env!("MIRAGE_BUILD_TIME"),
+    }))
+}
+
 /// API 路由 (相对路径)。挂到 `/api` (向后兼容内置 WebUI) 与 `/api/v1` (给独立前端冻契约) 两前缀。
 fn api_routes() -> Router<AppState> {
     Router::new()
+        .route("/version", get(get_version))
         .route("/overview", get(handlers::overview::get_overview))
         .route("/connections", get(handlers::connections::get_connections))
         .route("/stats", get(handlers::stats::get_stats))
@@ -222,7 +233,12 @@ fn build_cors(origins: &[String]) -> tower_http::cors::CorsLayer {
     use tower_http::cors::{AllowOrigin, CorsLayer};
     let base = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        // X-Requested-With: 前端所有 POST 都带 (跨源 <form> 伪造不出), 预检必须放行否则写接口跨源不可用。
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static("x-requested-with"),
+        ]);
     if origins.iter().any(|o| o == "*") {
         base.allow_origin(AllowOrigin::any())
     } else if origins.is_empty() {

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(api): 对接契约 P0/P1 一致性 (X-Requested-With CORS + /version + connections 封顶)
+
+按前端「Mirage 内核对接契约 v1」的 §10 优先级对齐后端 (第一批):
+- **P0 CORS 放行 `X-Requested-With`**: 前端所有 POST 带此头 (跨源 `<form>` 伪造不出, 作 CSRF 信号),
+  预检必须放行 —— 否则跨源写接口全不可用。加进 CorsLayer allow_headers。
+- **P1 `GET /api/v1/version`**: 返 `{version, api_version:"v1", build}`, 干掉前端硬编码版本号。
+- **P1 `/connections` 封顶**: `active` 单次上限 500 + 加 `active_total` (真实数), 防大规模响应体失控。
+- 实机验证 (预检放行 x-requested-with / /version=0.10.7 / connections 带 active_total)。docs 同步。
+- 后续批次: P0 统一错误体+正确状态码, P1 配置乐观锁 (409), P2 日志游标/xdp bool/devices hostname, P3 SSE。
+
+
 ## [v0.10.7] - API CORS + /api/v1 版本化 + 统计持久化 (为 UI 独立成项目铺路) (2026-08-30)
 
 ### feat(api): CORS (gui.cors_origins) + /api/v1 版本前缀 —— 为 UI 独立成项目铺路
