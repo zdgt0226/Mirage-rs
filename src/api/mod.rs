@@ -139,8 +139,10 @@ async fn auth_mw(
                 )
                     .into_response();
             }
-            // ?token= 仅根路径认 (首访种 cookie); /api/* 只认 header/cookie, 避免 token 进 URL 日志。
-            let allow_query = req.uri().path() == "/";
+            // ?token= 仅根路径 + SSE /events 认 (EventSource 无法设 header, 只能查询鉴权; ⚠️ token
+            // 会进访问日志, 属该端点取舍)。其余 /api/* 只认 header/cookie, 避免 token 进 URL 日志。
+            let path = req.uri().path();
+            let allow_query = path == "/" || path.ends_with("/events");
             match extract_token_src(req.headers(), req.uri(), allow_query) {
                 Some((t, src)) if ct_eq(t.as_bytes(), expected.as_bytes()) => {
                     // 认证成功 → 清该 IP 失败记录。
@@ -232,10 +234,28 @@ async fn get_version() -> axum::Json<serde_json::Value> {
     }))
 }
 
+/// GET /api/v1/events —— SSE 推流 (契约 §08 P3): 每秒推 overview 快照, 替代前端 1s 轮询。
+/// EventSource 无法设 header, 故此端点经 `?token=` 查询鉴权 (auth_mw 对 /events 放行 query)。
+async fn get_events(State(app): State<AppState>) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let stream = async_stream::stream! {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let ov = handlers::overview::build_overview(&app).await;
+            yield Ok::<_, std::convert::Infallible>(
+                Event::default().event("overview").data(ov.to_string())
+            );
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
 /// API 路由 (相对路径)。挂到 `/api` (向后兼容内置 WebUI) 与 `/api/v1` (给独立前端冻契约) 两前缀。
 fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/version", get(get_version))
+        .route("/events", get(get_events))
         .route("/overview", get(handlers::overview::get_overview))
         .route("/connections", get(handlers::connections::get_connections))
         .route("/stats", get(handlers::stats::get_stats))

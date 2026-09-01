@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### feat(api): 对接契约 P3 SSE 推流 (GET /events, 替代 1s 轮询)
+
+按前端对接契约 v1 §08/§10 P3 (最后一批, 契约全对齐):
+- **`GET /api/v1/events`**: SSE 流, 每秒推 `event: overview` + `data: <overview JSON>`, 前端 EventSource
+  订阅替代 1s 轮询。EventSource 无法设 header, 故此端点经 `?token=` 查询鉴权 (auth_mw 对 `/events`
+  放行 query; ⚠️ token 会进访问日志, 属该端点取舍)。
+- overview 数据体抽 `build_overview()` 供 GET /overview 与 SSE 复用。async-stream 依赖 (gui 特性下)。
+- 实机验证 (每秒 overview event; 无 token 401)。docs 同步。**契约 §10 全部完成** (P0/P1/P2/P3)。
+
+
 ### feat(api): 对接契约 P0/P1 (正确 HTTP 状态码/错误体 + 配置乐观锁)
 
 按前端对接契约 v1 对齐后端 (第三批, 契约剩余 P0+P1):
