@@ -36,7 +36,8 @@ pub async fn get_overview(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
-    let xdp_attached = state.xdp_engine.as_ref().map(|e| e.attached.load(Ordering::Relaxed)).unwrap_or(0);
+    // 契约 §10 P2: 返回 bool (是否 attach), 而非计数 —— 前端只关心"XDP 挂没挂"。
+    let xdp_attached = state.xdp_engine.as_ref().map(|e| e.attached.load(Ordering::Relaxed)).unwrap_or(0) > 0;
 
     Json(json!({
         "up": up,

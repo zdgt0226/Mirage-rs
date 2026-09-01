@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(api): 对接契约 P2 一致性 (xdp_attached bool + logs 游标 + devices mac/hostname)
+
+按前端对接契约 v1 §10 P2 对齐后端 (第二批):
+- **`overview.xdp_attached` 改 bool**: 原返 attach 计数, 前端只关心挂没挂 → 返 `true/false`。
+- **`/logs` 游标增量**: MemoryWriter 每行带单调 seq; `GET /logs?after=<cursor>&limit=<n>` 只回 seq>after
+  的新行 + 新 `cursor`。免每 2s 全量传日志。不带 after=首次全量 (向后兼容内置 WebUI)。
+- **`/devices` 补 `mac`/`hostname`**: `mac` best-effort 读 `/proc/net/arp` (LAN 设备可得); `hostname` 暂 null
+  (无免费可靠源: DHCP 租约/mDNS/PTR 需额外机制, 前端 null 时回落显 IP)。
+- 实机验证 (xdp=bool · 游标 5→10 增量 · devices 字段)。docs 同步。
+- 契约剩余: P0 统一错误体+状态码, P1 配置乐观锁 (409), P3 SSE。
+
+
 ### feat(api): 对接契约 P0/P1 一致性 (X-Requested-With CORS + /version + connections 封顶)
 
 按前端「Mirage 内核对接契约 v1」的 §10 优先级对齐后端 (第一批):
