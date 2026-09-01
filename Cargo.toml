@@ -34,6 +34,7 @@ serde_json = { version = "1.0.150", features = ["preserve_order"] }
 sha2 = "0.11.0"
 tokio = { version = "1.52.3", features = ["full", "net", "rt", "rt-multi-thread"] }
 tower-http = { version = "0.6.11", features = ["fs", "cors"], optional = true }
+async-stream = { version = "0.3", optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
@@ -54,7 +55,7 @@ rcgen = { version = "0.13", optional = true }
 [features]
 default = ["gui"]
 ebpf = ["dep:aya"]
-gui = ["dep:axum", "dep:tower-http"]
+gui = ["dep:axum", "dep:tower-http", "dep:async-stream"]
 # QUIC 传输 (实验, 默认关)。开启需 --features quic; release 二进制暂不含, 见 quic-transport-design.md P0。
 quic = ["dep:quinn", "dep:quinn-proto", "dep:rustls", "dep:rcgen"]
 

@@ -56,6 +56,7 @@
 | 6 | `/api/history` | `{ up: [n...], down: [n...], bpf_success: [n...] }` — 过去 120s 每秒采样的速率数组 |
 | 7 | `/api/logs?after=<cursor>&limit=<n>` | `{ logs: [string...], cursor: N }` — 游标增量; 不带 after=首次全量 |
 | 8 | `/api/bpf/tunnels` | `{ tunnels: [{ cookie: "str", remote: "host:port", rtt_ms, cwnd, retrans, data_segs }] }` — eBPF sockops TCP 指标 (仅 eBPF 客户端有; 服务端/lite 空) |
+| 9 | `/api/events?token=<t>` | **SSE 流**: 每秒 `event: overview` + `data: <overview JSON>`。替代 1s 轮询。EventSource 无法设 header 故用 `?token=` 查询鉴权 (token 会进访问日志) |
 
 ---
 
@@ -93,7 +94,7 @@
 
 ## 5. 独立前端落地建议
 
-- **实时数据**: 现无 WebSocket/SSE, 前端**轮询**。建议节奏: `/api/overview` `/api/connections` ~2s; `/api/history` ~1-2s (它本身是每秒采样的窗口); `/api/stats` `/api/domains` `/api/devices` ~5s; `/api/logs` 按需。想更顺再上 **SSE** (单向、CORS 友好、比 WS 简单) —— v1 不必。
+- **实时数据**: ✅ `GET /api/v1/events` SSE 每秒推 overview (替代 1s 轮询, `?token=` 鉴权); 其余仍**轮询**。建议节奏: `/api/overview` `/api/connections` ~2s; `/api/history` ~1-2s (它本身是每秒采样的窗口); `/api/stats` `/api/domains` `/api/devices` ~5s; `/api/logs` 按需。想更顺再上 **SSE** (单向、CORS 友好、比 WS 简单) —— v1 不必。
 - **鉴权**: 统一 `Authorization: Bearer <gui.token>`。别用 cookie/query。
 - **模式分支**: 读 `/api/overview.mode` 决定渲染服务端视图 (clients/domains/history) 还是客户端视图 (devices/LAN)。
 - **后端契约对齐** (v0.10.7+): ✅ CORS + `/api/v1` + `X-Requested-With` + `/version` + connections 封顶 + logs 游标 + devices mac + xdp bool + **正确 HTTP 状态码/错误体** (400/401/403/404/409/422/500) + **配置乐观锁** (`version` → 409 `stale_version`)。剩: OpenAPI (可选) · SSE 推流。
