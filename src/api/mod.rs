@@ -197,6 +197,31 @@ async fn serve_root(State(app): State<AppState>, uri: Uri) -> Response {
     html.into_response()
 }
 
+/// 标准错误响应 (契约 §03): `{status:"error", code, message, issues}` + 正确 HTTP 状态码。
+/// 前端把 `message` 直接弹给用户, 故文案要写成人能看懂的话。
+pub(crate) fn err_resp(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    issues: Vec<String>,
+) -> Response {
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "status": "error", "code": code, "message": message.into(), "issues": issues,
+        })),
+    )
+        .into_response()
+}
+
+/// 配置版本指纹 (契约 §07 乐观锁): 内容变即变。仅用于变更检测 (非安全), DefaultHasher 足够。
+pub(crate) fn config_version(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    format!("cfg-{:x}", h.finish())
+}
+
 /// GET /api/v1/version —— 内核版本, 供前端替换硬编码版本号 (契约 §08)。build 时间由构建脚本
 /// 经 MIRAGE_BUILD_TIME 注入 (没注入则 null)。
 async fn get_version() -> axum::Json<serde_json::Value> {

@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(api): 对接契约 P0/P1 (正确 HTTP 状态码/错误体 + 配置乐观锁)
+
+按前端对接契约 v1 对齐后端 (第三批, 契约剩余 P0+P1):
+- **P0 统一错误体 + 正确状态码**: 写端点 (rules/profiles/clients/proxies) 失败改返 `{status:"error",
+  code, message, issues}` + 正确 HTTP 码 —— 400 (非法输入) · 404 (找不到) · 409 (乐观锁) · 422 (语义
+  校验失败) · 500 (内部)。前端把 `message` 直接弹用户。
+- **P1 配置乐观锁** (契约 §07): `GET /rules|/profiles` 返配置指纹 `version`; `POST` 带 `version`, 与
+  当前不符 → **409 `stale_version`** (防多端编辑静默覆盖)。不带 version = 不检查 (兼容)。写成功也返新
+  `version` 供前端更新本地锁值。
+- 实机验证 (version · 409 stale · 422 · 400 · 404, 错误体标准)。docs 同步。剩 P3 SSE。
+
+
 ### feat(api): 对接契约 P2 一致性 (xdp_attached bool + logs 游标 + devices mac/hostname)
 
 按前端对接契约 v1 §10 P2 对齐后端 (第二批):

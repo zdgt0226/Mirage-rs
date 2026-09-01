@@ -47,7 +47,8 @@ pub struct SelectReq {
     pub target: String,
 }
 
-pub async fn select_proxy(State(app_state): State<AppState>, Json(req): Json<SelectReq>) -> Json<Value> {
+pub async fn select_proxy(State(app_state): State<AppState>, Json(req): Json<SelectReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
     // 鉴权 + CSRF 由 auth_mw 中间件统一处理 (方案 B), 此处不再重复启发式检查。
     let st = app_state.state.load();
 
@@ -56,10 +57,15 @@ pub async fn select_proxy(State(app_state): State<AppState>, Json(req): Json<Sel
             if let Some(target_node) = children.iter().find(|c| c.tag() == req.target) {
                 let mut curr = current.write().unwrap_or_else(|e| e.into_inner());
                 *curr = Some(target_node.clone());
-                return Json(json!({"status": "success", "message": format!("Switched {} to {}", req.group, req.target)}));
+                return Json(json!({"status": "success", "message": format!("Switched {} to {}", req.group, req.target)})).into_response();
             }
         }
     }
 
-    Json(json!({"status": "error", "message": "Group or target not found"}))
+    super::super::err_resp(
+        axum::http::StatusCode::NOT_FOUND,
+        "not_found",
+        "找不到该出站组或目标节点",
+        vec![],
+    )
 }

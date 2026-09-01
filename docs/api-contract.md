@@ -96,9 +96,9 @@
 - **实时数据**: 现无 WebSocket/SSE, 前端**轮询**。建议节奏: `/api/overview` `/api/connections` ~2s; `/api/history` ~1-2s (它本身是每秒采样的窗口); `/api/stats` `/api/domains` `/api/devices` ~5s; `/api/logs` 按需。想更顺再上 **SSE** (单向、CORS 友好、比 WS 简单) —— v1 不必。
 - **鉴权**: 统一 `Authorization: Bearer <gui.token>`。别用 cookie/query。
 - **模式分支**: 读 `/api/overview.mode` 决定渲染服务端视图 (clients/domains/history) 还是客户端视图 (devices/LAN)。
-- **后端改造** (拆分前): ✅ CORS (`gui.cors_origins`) + ✅ `/api/v1/*` 前缀 已在 v0.10.7 完成。剩余可选:
-  1. (可选) 让 HTTP 状态码反映成败 (4xx/5xx), 而非恒 200 看 body `status`
-  2. (可选) 补 OpenAPI 供前端生成类型
+- **后端契约对齐** (v0.10.7+): ✅ CORS + `/api/v1` + `X-Requested-With` + `/version` + connections 封顶 + logs 游标 + devices mac + xdp bool + **正确 HTTP 状态码/错误体** (400/401/403/404/409/422/500) + **配置乐观锁** (`version` → 409 `stale_version`)。剩: OpenAPI (可选) · SSE 推流。
+- **错误体** (契约 §03): 失败返 `{status:"error", code, message, issues}` + 正确 4xx/5xx。前端把 `message` 直接弹用户。
+- **配置乐观锁**: `GET /rules|/profiles` 返 `version`; `POST` 带 `version`, 与当前不符 → 409 `stale_version`。不带 version = 不检查 (兼容)。
 
 ## 6. 端点速查
 ```

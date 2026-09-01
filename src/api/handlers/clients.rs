@@ -29,7 +29,8 @@ pub struct BlockReq {
     pub blocked: bool,
 }
 
-pub async fn post_block(Json(req): Json<BlockReq>) -> Json<Value> {
+pub async fn post_block(Json(req): Json<BlockReq>) -> axum::response::Response {
+    use axum::response::IntoResponse;
     match req.ip.parse::<std::net::IpAddr>() {
         Ok(ip) => {
             if req.blocked {
@@ -37,8 +38,13 @@ pub async fn post_block(Json(req): Json<BlockReq>) -> Json<Value> {
             } else {
                 crate::blocklist::unblock(&ip);
             }
-            Json(json!({"status": "success", "ip": req.ip, "blocked": req.blocked}))
+            Json(json!({"status": "success", "ip": req.ip, "blocked": req.blocked})).into_response()
         }
-        Err(_) => Json(json!({"status": "error", "message": "invalid IP"})),
+        Err(_) => super::super::err_resp(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_ip",
+            "IP 地址格式非法",
+            vec![],
+        ),
     }
 }
