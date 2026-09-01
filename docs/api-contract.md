@@ -52,9 +52,9 @@
 | 2 | `/api/connections` | `{ active: [ConnSnapshot] (≤500), active_total: N, recent_closed: [ConnSnapshot] }` — 活跃 (封顶 500, 真实数看 active_total) + 最近关闭 (环形, ≤300) |
 | 3 | `/api/stats` | `{ outbounds: [OutboundStat], rules: [{index, outbound, hits}], default: {outbound, hits} }` — per-出站流量 + per-规则命中 |
 | 4 | `/api/domains` | `{ domains: [DomainStat] }` — top-30 by 流量 |
-| 5 | `/api/devices` | `{ devices: [DeviceStat] }` — 客户端=LAN 设备 / 服务端=连接的客户端 |
+| 5 | `/api/devices` | `{ devices: [DeviceStat + mac:"..."\|null, hostname:null] }` — mac 读 /proc/net/arp best-effort; hostname 待 DHCP/mDNS 源 |
 | 6 | `/api/history` | `{ up: [n...], down: [n...], bpf_success: [n...] }` — 过去 120s 每秒采样的速率数组 |
-| 7 | `/api/logs` | `{ logs: [string...] }` — 内存日志缓冲 (Terminal 面板) |
+| 7 | `/api/logs?after=<cursor>&limit=<n>` | `{ logs: [string...], cursor: N }` — 游标增量; 不带 after=首次全量 |
 | 8 | `/api/bpf/tunnels` | `{ tunnels: [{ cookie: "str", remote: "host:port", rtt_ms, cwnd, retrans, data_segs }] }` — eBPF sockops TCP 指标 (仅 eBPF 客户端有; 服务端/lite 空) |
 
 ---

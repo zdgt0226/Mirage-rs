@@ -410,7 +410,7 @@ pub fn live_conn_count() -> usize {
 #[derive(Clone)]
 pub struct MemoryWriter {
     tx: std::sync::mpsc::SyncSender<String>,
-    buffer: Arc<Mutex<VecDeque<String>>>,
+    buffer: Arc<Mutex<VecDeque<(u64, String)>>>,
 }
 
 impl Default for MemoryWriter {
@@ -422,28 +422,55 @@ impl Default for MemoryWriter {
 impl MemoryWriter {
     pub fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel(1000);
-        let buffer = Arc::new(Mutex::new(VecDeque::with_capacity(500)));
+        // (seq, line): seq 单调递增, 供游标增量拉取 (契约 §10 P2, 免每 2s 全量传日志)。
+        let buffer = Arc::new(Mutex::new(VecDeque::<(u64, String)>::with_capacity(500)));
         let bg_buf = buffer.clone();
-        
+
         std::thread::spawn(move || {
+            let mut seq: u64 = 0;
             while let Ok(s) = rx.recv() {
                 let mut q = bg_buf.lock().unwrap_or_else(|e| e.into_inner());
                 if q.len() >= 500 {
                     q.pop_front();
                 }
-                q.push_back(s);
+                seq += 1;
+                q.push_back((seq, s));
             }
         });
-        
+
         Self {
             tx,
             buffer,
         }
     }
 
+    /// 全量当前缓冲 (向后兼容; 内置 WebUI 用)。
     pub fn get_logs(&self) -> Vec<String> {
         let q = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-        q.iter().cloned().collect()
+        q.iter().map(|(_, s)| s.clone()).collect()
+    }
+
+    /// 游标增量: 返回 seq > `after` 的行 (至多 `limit` 条) + 新游标 (末行 seq)。无新行则游标推到
+    /// 当前 max (让客户端越过已被 500-cap 淘汰的旧行, 不卡死)。首次传 after=0 即拿最近全量。
+    pub fn get_logs_after(&self, after: u64, limit: usize) -> (Vec<String>, u64) {
+        let q = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        let mut cursor = after;
+        for (seq, line) in q.iter() {
+            if *seq > after {
+                out.push(line.clone());
+                cursor = *seq;
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some((max, _)) = q.back() {
+                cursor = (*max).max(after);
+            }
+        }
+        (out, cursor)
     }
 }
 
