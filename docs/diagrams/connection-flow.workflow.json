@@ -1,0 +1,65 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Mirage-rs 连接处理与路由判定",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    { "id": "ingress", "label": "接入 Ingress" },
+    { "id": "routing", "label": "路由判定 Routing" },
+    { "id": "egress", "label": "限速与出站 Egress" }
+  ],
+  "phases": [
+    { "id": "accept", "label": "接入 + 取目标", "fromCol": 0, "toCol": 2 },
+    { "id": "decide", "label": "判定", "fromCol": 3, "toCol": 4, "variant": "emphasis" },
+    { "id": "out", "label": "限速 + 出站", "fromCol": 5, "toCol": 5, "variant": "dashed" }
+  ],
+  "mainPath": ["src", "inbound", "resolve", "rules", "ratelimit", "dispatch"],
+  "nodes": [
+    { "id": "src", "lane": "ingress", "col": 0, "type": "external", "label": "来源", "sublabel": "LAN 设备 / 本地应用", "width": 138 },
+    { "id": "inbound", "lane": "ingress", "col": 1, "type": "frontend", "label": "入站接入", "sublabel": "transparent(eBPF) / SOCKS·mixed", "tag": "sk_lookup·tc_divert", "width": 150 },
+    { "id": "resolve", "lane": "ingress", "col": 2, "type": "backend", "label": "取目标", "sublabel": "fake-IP 反查 / SNI 嗅探", "width": 138 },
+    { "id": "devprof", "lane": "routing", "col": 2, "type": "security", "label": "device_profile", "sublabel": "源 IP → 策略档 + 限速", "width": 140 },
+    { "id": "rules", "lane": "routing", "col": 3, "type": "backend", "label": "规则引擎", "sublabel": "domain·geo·ip·process·source", "tag": "首个命中 (config 顺序)", "width": 156 },
+    { "id": "classify", "lane": "routing", "col": 4, "type": "backend", "label": "auto_classify", "sublabel": "CN 直连 / 海外 fake-IP 代理", "width": 148 },
+    { "id": "block", "lane": "routing", "col": 5, "type": "security", "label": "Block", "sublabel": "命中黑名单 → 丢弃", "width": 132 },
+    { "id": "ratelimit", "lane": "egress", "col": 4, "type": "messagebus", "label": "限速", "sublabel": "TCP 整形 / UDP policing", "tag": "device_profiles kbps", "width": 144 },
+    { "id": "dispatch", "lane": "egress", "col": 5, "type": "cloud", "label": "出站分派", "sublabel": "direct·mirage·WG·SS", "width": 144 }
+  ],
+  "edges": [
+    { "id": "e-src", "from": "src", "to": "inbound", "variant": "default" },
+    { "id": "e-in-res", "from": "inbound", "to": "resolve", "variant": "default" },
+    { "id": "e-in-dev", "from": "inbound", "to": "devprof", "label": "源 IP", "variant": "dashed", "role": "branch" },
+    { "id": "e-res-rules", "from": "resolve", "to": "rules", "label": "目标域名/IP", "variant": "emphasis" },
+    { "id": "e-dev-rules", "from": "devprof", "to": "rules", "label": "策略档规则", "variant": "dashed", "role": "branch" },
+    { "id": "e-rules-rl", "from": "rules", "to": "ratelimit", "label": "选定出站 tag", "variant": "emphasis" },
+    { "id": "e-dev-rl", "from": "devprof", "to": "ratelimit", "label": "rate_limit_kbps", "variant": "dashed", "role": "branch" },
+    { "id": "e-rl-out", "from": "ratelimit", "to": "dispatch", "variant": "emphasis" },
+    { "id": "e-rules-cls", "from": "rules", "to": "classify", "label": "未命中", "variant": "default", "role": "branch" },
+    { "id": "e-cls-out", "from": "classify", "to": "dispatch", "label": "回落出站", "variant": "dashed", "role": "branch" },
+    { "id": "e-rules-block", "from": "rules", "to": "block", "label": "block 规则", "variant": "security", "role": "error" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "判定优先级",
+      "items": [
+        "device_profile: 源 IP → 选策略档 + 限速档",
+        "规则引擎: domain/geosite/IP/geoip/process/source 维度, config 顺序首个命中",
+        "未命中 → auto_classify (CN 直连 / 海外 fake-IP) → default_outbound 兜底"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "出站与限速",
+      "items": [
+        "direct: splice(2) 零拷贝直连快路径",
+        "mirage: fake-TLS ClientHello 仿真 + ChaCha20/AES-GCM AEAD 暖池隧道",
+        "WireGuard / Shadowsocks 上游中转; block 丢弃",
+        "限速复用 device_profiles: TCP 整形(背压) / UDP policing(丢包)"
+      ]
+    }
+  ]
+}
