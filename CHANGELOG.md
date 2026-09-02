@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.10.8] - 前端对接契约 v1 全对齐 (P0/P1/P2/P3) + 架构原理图 (2026-09-03)
+
 ### docs: 架构图 + 连接处理/判定原理图 (archify, docs/diagrams/)
 
 用 archify 生成两张独立交互 HTML (基于真实代码核对): `architecture.html` (组件拓扑: 客户端/网关
