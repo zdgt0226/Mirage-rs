@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### docs: 架构图 + 连接处理/判定原理图 (archify, docs/diagrams/)
+
+用 archify 生成两张独立交互 HTML (基于真实代码核对): `architecture.html` (组件拓扑: 客户端/网关
+eBPF·入站·DNS/fake-IP·路由·出站 + 墙外服务端握手鉴权·camouflage) + `connection-flow.html`
+(连接处理+判定管线: 入站→取目标→规则引擎首个命中→限速→出站)。附源 spec 可复现。
+
+
 ### feat(api): 对接契约 P3 SSE 推流 (GET /events, 替代 1s 轮询)
 
 按前端对接契约 v1 §08/§10 P3 (最后一批, 契约全对齐):

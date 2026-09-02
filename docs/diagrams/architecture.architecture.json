@@ -1,0 +1,334 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Mirage-rs 架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "lan",
+      "type": "external",
+      "label": "LAN 设备 / 本地应用",
+      "sublabel": "透明网关 / SOCKS",
+      "pos": [
+        24,
+        300
+      ],
+      "size": [
+        128,
+        64
+      ]
+    },
+    {
+      "id": "ebpf",
+      "type": "security",
+      "label": "eBPF 内核层",
+      "sublabel": "sk_lookup·tc_divert·sockops·XDP",
+      "pos": [
+        180,
+        128
+      ],
+      "size": [
+        196,
+        66
+      ]
+    },
+    {
+      "id": "inbound",
+      "type": "frontend",
+      "label": "入站层",
+      "sublabel": "transparent / SOCKS·mixed",
+      "pos": [
+        190,
+        300
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "fakeip",
+      "type": "database",
+      "label": "DNS + fake-IP",
+      "sublabel": "fake-IP + auto_classify",
+      "pos": [
+        180,
+        472
+      ],
+      "size": [
+        196,
+        62
+      ]
+    },
+    {
+      "id": "router",
+      "type": "backend",
+      "label": "路由引擎",
+      "sublabel": "规则 + device_profiles + 限速",
+      "pos": [
+        392,
+        300
+      ],
+      "size": [
+        156,
+        74
+      ],
+      "tag": "首个命中判定"
+    },
+    {
+      "id": "direct",
+      "type": "cloud",
+      "label": "直连出站",
+      "sublabel": "splice 零拷贝",
+      "pos": [
+        600,
+        156
+      ],
+      "size": [
+        146,
+        60
+      ]
+    },
+    {
+      "id": "mirage_out",
+      "type": "backend",
+      "label": "Mirage 出站",
+      "sublabel": "fake-TLS 暖池隧道",
+      "pos": [
+        600,
+        300
+      ],
+      "size": [
+        146,
+        64
+      ]
+    },
+    {
+      "id": "upstream",
+      "type": "cloud",
+      "label": "WG / SS 上游",
+      "sublabel": "WireGuard / Shadowsocks",
+      "pos": [
+        600,
+        470
+      ],
+      "size": [
+        146,
+        60
+      ]
+    },
+    {
+      "id": "camouflage",
+      "type": "external",
+      "label": "camouflage_host",
+      "sublabel": "认证失败转发真站",
+      "pos": [
+        798,
+        156
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "server",
+      "type": "backend",
+      "label": "Mirage 服务端",
+      "sublabel": "握手鉴权 + 中继",
+      "pos": [
+        798,
+        300
+      ],
+      "size": [
+        150,
+        74
+      ],
+      "tag": "PFS · flood 守卫"
+    },
+    {
+      "id": "target",
+      "type": "external",
+      "label": "目标",
+      "sublabel": "网站/服务",
+      "pos": [
+        1000,
+        300
+      ],
+      "size": [
+        96,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "客户端 / 网关 (Linux + eBPF)",
+      "wraps": [
+        "ebpf",
+        "inbound",
+        "fakeip",
+        "router",
+        "direct",
+        "mirage_out",
+        "upstream"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "墙外 VPS 服务端",
+      "wraps": [
+        "camouflage",
+        "server"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "lan-in",
+      "from": "lan",
+      "to": "inbound",
+      "label": "流量接入",
+      "variant": "emphasis",
+      "labelAt": [
+        130,
+        270
+      ]
+    },
+    {
+      "id": "ebpf-in",
+      "from": "ebpf",
+      "to": "inbound",
+      "label": "内核拦截",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 66
+    },
+    {
+      "id": "in-fakeip",
+      "from": "inbound",
+      "to": "fakeip",
+      "label": "DNS / fake-IP",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 58
+    },
+    {
+      "id": "in-router",
+      "from": "inbound",
+      "to": "router",
+      "label": "取目标",
+      "variant": "emphasis"
+    },
+    {
+      "id": "fakeip-router",
+      "from": "fakeip",
+      "to": "router",
+      "label": "域名反查",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "bottom"
+    },
+    {
+      "id": "r-direct",
+      "from": "router",
+      "to": "direct",
+      "label": "直连",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "r-mirage",
+      "from": "router",
+      "to": "mirage_out",
+      "label": "代理"
+    },
+    {
+      "id": "r-up",
+      "from": "router",
+      "to": "upstream",
+      "label": "上游",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "mirage-server",
+      "from": "mirage_out",
+      "to": "server",
+      "label": "fake-TLS + AEAD 隧道",
+      "variant": "security",
+      "labelDy": -56
+    },
+    {
+      "id": "server-cam",
+      "from": "server",
+      "to": "camouflage",
+      "label": "鉴权失败→转真站",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "direct-target",
+      "from": "direct",
+      "to": "target",
+      "label": "直连出口",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          673,
+          64
+        ],
+        [
+          1048,
+          64
+        ]
+      ]
+    },
+    {
+      "id": "server-target",
+      "from": "server",
+      "to": "target",
+      "label": "中继"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "抗审查",
+      "items": [
+        "fake-TLS ClientHello 字节级仿真 (多浏览器 profile)",
+        "认证失败转发 camouflage_host 真站 (REALITY 式抗探测)",
+        "可选 PFS (X25519 ECDH) + TLS record padding + flood 守卫"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "eBPF 内核路径",
+      "items": [
+        "sk_lookup: 透明代理 TCP/UDP 拦截",
+        "tc_divert: 裸-IP 转发流量接管",
+        "sockops: Brutal RTT 反馈 · XDP: 抗风暴 DNS"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "判定与出站",
+      "items": [
+        "路由: domain/geo/ip/process/source 维度, config 顺序首个命中",
+        "device_profiles: 按源 IP 分策略 + 限速 (TCP 整形 / UDP policing)",
+        "出站: direct(splice) · mirage(隧道) · WireGuard · Shadowsocks · block"
+      ]
+    }
+  ]
+}
