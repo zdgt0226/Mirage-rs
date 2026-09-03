@@ -7,6 +7,7 @@ pub mod quic_cc;
 pub mod quic_obfs;
 pub mod pool;
 pub mod tunnel;
+pub mod tls_capture;
 pub mod mirage_stream;
 pub mod internal_socks;
 pub mod ss_inbound;

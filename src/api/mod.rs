@@ -270,6 +270,7 @@ fn api_routes() -> Router<AppState> {
         .route("/rules", get(handlers::rules::get_rules).post(handlers::rules::update_rules))
         .route("/profiles", get(handlers::profiles::get_profiles).post(handlers::profiles::update_profiles))
         .route("/bpf/tunnels", get(handlers::bpf_tunnels::get_bpf_tunnels))
+        .route("/tls/capture", get(handlers::tls_capture::get_capture).post(handlers::tls_capture::post_capture))
 }
 
 /// CORS 层。空 origins = 不发 ACAO (仅同源, 向后兼容); `["*"]` = 任意 origin; 否则精确白名单。

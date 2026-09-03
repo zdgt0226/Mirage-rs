@@ -187,6 +187,9 @@ pub async fn start_transparent(
                             // 一致, 直接用, **不再阻塞 sniff**(省掉每条网页连接的一次嗅探)。
                             // sniff 只对**裸-IP**(无 fake-IP 映射)才做: 嗅 SNI 拿域名交服务端
                             // 在干净网络解析(抗污染), 拿不到才退回裸 IP。
+                            // TLS 指纹捕获 (armed 时): 独立于 sniff (fake-IP 命中时不 sniff), 故常规网页连接也能抓。
+                            crate::proxy::tls_capture::maybe_capture(&stream).await;
+
                             let target_host = match fake_ip_mapper_clone.lookup_domain(&dst_v4) {
                                 Some(d) => format!("{}:{}", d, dst_addr.port()),
                                 None => match sniff_first_kb(&stream).await {
