@@ -28,7 +28,7 @@
 
 ## 🌟 核心特性概览
 
-* **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），供自定义指纹。
+* **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），配 `client_hello_template` 即让出站握手复刻其 JA3/JA4（仅替换 SNI/session_id/random）。
 * **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关（向后兼容），认证仍靠口令、与加密解耦（对标 REALITY）。
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。

@@ -436,6 +436,23 @@ pub(crate) fn spawn_ebpf_monitor_tasks(
     }
 }
 
+/// 启动装载自定义 fake-TLS 指纹模板 (config `client_hello_template`)。装入 tls_raw 全局后,
+/// 出站握手复刻该真实 ClientHello 的 JA3/JA4。文件缺失/非法只 WARN 并落回内置轮换, 不阻断启动。
+pub fn load_tls_fingerprint_template(config_path: &str) {
+    let Ok(content) = std::fs::read_to_string(config_path) else { return };
+    let Ok(cfg) = serde_json::from_str::<crate::config::Config>(&content) else { return };
+    let Some(path) = cfg.client_hello_template else { return };
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes.len() >= 44 && bytes[0] == 0x16 => {
+            let n = bytes.len();
+            crate::crypto::tls_raw::set_custom_template(bytes);
+            info!("已装载自定义 fake-TLS 指纹模板 {} ({}B), 出站握手将复刻其 JA3/JA4", path, n);
+        }
+        Ok(_) => warn!("client_hello_template {} 非法 (非 TLS ClientHello), 落回内置指纹轮换", path),
+        Err(e) => warn!("client_hello_template {} 读取失败: {}, 落回内置指纹轮换", path, e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::decide_enable_ebpf;

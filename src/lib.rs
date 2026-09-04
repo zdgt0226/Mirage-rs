@@ -201,6 +201,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         info!("No geosite/geoip rules configured — geo updater running but idle (no sources).");
     }
     
+    // 自定义 fake-TLS 指纹模板 (client_hello_template): 装入 tls_raw 全局, 出站握手复刻其 JA3/JA4。
+    crate::startup::load_tls_fingerprint_template(config_path);
+
     // 如果 config.json 不存在，我们先写一个基础模板，避免启动直接崩溃
     if !std::path::Path::new(config_path).exists() {
         info!("config.json not found, creating a default template...");
