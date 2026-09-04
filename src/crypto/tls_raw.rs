@@ -21,6 +21,17 @@
 //! OkHttp CH (曲线 = 所有 profile 交集), 得 X25519 模板, 对 Chrome/FF/OkHttp 全部一致。
 
 use rand::RngExt;
+use std::sync::OnceLock;
+
+/// 自定义 ClientHello 模板 (捕获的真实浏览器指纹, 见 `mirage tls-capture` / API)。
+/// 启动时若配置 `client_hello_template` 则装入; 之后 [`build_client_hello_with_random`]
+/// 用它替代内置 Chrome/FF/OkHttp 轮换 (仍替换 random/session_id/SNI 三处动态字段)。
+static CUSTOM_TEMPLATE: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// 装入自定义模板. 启动调一次; 幂等 (重复设置忽略)。
+pub fn set_custom_template(bytes: Vec<u8>) {
+    let _ = CUSTOM_TEMPLATE.set(bytes);
+}
 
 const GREASE_VALUES: &[u16] = &[
     0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
@@ -552,11 +563,103 @@ pub fn build_client_hello_with_random(
     session_id: &[u8; 32],
     client_random: &[u8; 32],
 ) -> Vec<u8> {
+    // 配了自定义模板 -> 复刻真实抓包指纹 (替换 SNI/session_id/random)。模板异常时落回内置轮换保连通。
+    if let Some(tpl) = CUSTOM_TEMPLATE.get() {
+        if let Some(ch) = build_from_template(tpl, server_name.as_bytes(), session_id, client_random) {
+            return ch;
+        }
+    }
     match pick_profile() {
         Profile::Chromium => build_chromium(server_name.as_bytes(), session_id, client_random),
         Profile::Firefox => build_firefox(server_name.as_bytes(), session_id, client_random),
         Profile::OkHttp => build_okhttp(server_name.as_bytes(), session_id, client_random),
     }
+}
+
+fn u16be(b: &[u8], off: usize) -> Option<usize> {
+    Some(u16::from_be_bytes([*b.get(off)?, *b.get(off + 1)?]) as usize)
+}
+
+/// 就地把 `off` 处大端 u16 长度字段加上 `delta` (SNI 变长后修外层长度用)。
+fn patch_u16(b: &mut [u8], off: usize, delta: isize) {
+    let v = (u16::from_be_bytes([b[off], b[off + 1]]) as isize + delta) as u16;
+    b[off..off + 2].copy_from_slice(&v.to_be_bytes());
+}
+
+/// 同 [`patch_u16`] 但目标是 24-bit 长度 (handshake body len)。
+fn patch_u24(b: &mut [u8], off: usize, delta: isize) {
+    let cur = ((b[off] as isize) << 16) | ((b[off + 1] as isize) << 8) | b[off + 2] as isize;
+    let v = (cur + delta) as u32;
+    b[off] = (v >> 16) as u8;
+    b[off + 1] = (v >> 8) as u8;
+    b[off + 2] = v as u8;
+}
+
+/// 用捕获的真实 ClientHello 模板 `tpl` 构造出站握手, 只替换三处动态字段:
+/// - random  (偏移 11, 32B) ← PFS 一次性 X25519 公钥 (`client_random`)
+/// - session_id (偏移 44, 32B) ← Mirage Poly1305 认证 token (`session_id`)
+/// - SNI ← `server_name` (camouflage_host; 变长 -> 重编 server_name 扩展 + 修 record/handshake/extensions 三层长度)
+///
+/// 其余字节 (cipher_suites / 扩展顺序 / GREASE / key_share / ECH) 原样保留 -> JA3/JA4 与真实抓包完全一致。
+/// 模板非法 (非 TLS1.3 CH / session_id≠32 / 无 SNI 扩展 / 长度越界) 返 `None`, 调用方落回内置轮换。
+pub fn build_from_template(
+    tpl: &[u8],
+    server_name: &[u8],
+    session_id: &[u8; 32],
+    client_random: &[u8; 32],
+) -> Option<Vec<u8>> {
+    // record: 0x16 ... ; handshake: 0x01 ; session_id_len 在偏移 43
+    if tpl.len() < 44 || tpl[0] != 0x16 || tpl[5] != 0x01 {
+        return None;
+    }
+    if tpl[43] as usize != 32 {
+        return None; // Mirage token 必须占满 32B session_id
+    }
+    let mut p = 44 + 32; // 跳过 session_id, 到 cipher_suites
+    let cs_len = u16be(tpl, p)?;
+    p += 2 + cs_len;
+    let comp_len = *tpl.get(p)? as usize;
+    p += 1 + comp_len;
+    let ext_total_off = p;
+    let ext_total = u16be(tpl, p)?;
+    p += 2;
+    let ext_end = p.checked_add(ext_total)?;
+    if ext_end > tpl.len() {
+        return None;
+    }
+    // 走扩展链找 server_name (0x0000)
+    let (mut sni_off, mut sni_total) = (0usize, 0usize);
+    while p + 4 <= ext_end {
+        let etype = u16be(tpl, p)?;
+        let elen = u16be(tpl, p + 2)?;
+        if etype == 0x0000 {
+            sni_off = p;
+            sni_total = 4 + elen;
+            break;
+        }
+        p += 4 + elen;
+    }
+    if sni_total == 0 || sni_off + sni_total > ext_end {
+        return None; // 模板无 SNI 或越界, 无法替换
+    }
+
+    // 拼接: [..sni_off] + 新 server_name 扩展 + [sni_off+sni_total..]
+    let new_ext = sni_ext(server_name);
+    let delta = new_ext.len() as isize - sni_total as isize;
+    let mut out = Vec::with_capacity((tpl.len() as isize + delta).max(0) as usize);
+    out.extend_from_slice(&tpl[..sni_off]);
+    out.extend_from_slice(&new_ext);
+    out.extend_from_slice(&tpl[sni_off + sni_total..]);
+
+    // 覆写固定偏移动态字段 (均在 SNI 之前, 不受 delta 影响)
+    out[11..43].copy_from_slice(client_random);
+    out[44..76].copy_from_slice(session_id);
+
+    // 修三层长度 (SNI 扩展在三者内部, 各加 delta)
+    patch_u16(&mut out, 3, delta); // record length
+    patch_u24(&mut out, 6, delta); // handshake body length (uint24)
+    patch_u16(&mut out, ext_total_off, delta); // extensions total length
+    Some(out)
 }
 
 /// 指定 profile 构造 (供 dump/测试用, 不轮换)。
@@ -702,4 +805,70 @@ pub fn build_fake_client_tail() -> Vec<u8> {
     record.extend_from_slice(&(finished_body.len() as u16).to_be_bytes());
     record.extend_from_slice(&finished_body);
     record
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    /// 从 out 里解析 SNI host (走扩展链找 0x0000)。
+    fn sni_of(ch: &[u8]) -> Option<String> {
+        let mut p = 44 + ch[43] as usize;
+        let cs = u16be(ch, p)?;
+        p += 2 + cs;
+        let comp = ch[p] as usize;
+        p += 1 + comp;
+        let total = u16be(ch, p)?;
+        p += 2;
+        let end = p + total;
+        while p + 4 <= end {
+            let t = u16be(ch, p)?;
+            let l = u16be(ch, p + 2)?;
+            if t == 0x0000 {
+                // data: list_len(2) name_type(1) host_len(2) host
+                let host_len = u16be(ch, p + 4 + 3)?;
+                let s = p + 4 + 5;
+                return Some(String::from_utf8_lossy(&ch[s..s + host_len]).into_owned());
+            }
+            p += 4 + l;
+        }
+        None
+    }
+
+    #[test]
+    fn template_replay_preserves_ja4_and_swaps_dynamic_fields() {
+        let sid0 = [0x11u8; 32];
+        let rnd0 = [0x22u8; 32];
+        // 用内置 Chromium CH 当"捕获模板" (真实结构, 含变长 SNI)
+        let tpl = build_chromium(b"www.cloudflare.com", &sid0, &rnd0);
+
+        let sid1 = [0xABu8; 32];
+        let rnd1 = [0xCDu8; 32];
+        let out = build_from_template(&tpl, b"apple.com", &sid1, &rnd1)
+            .expect("template should replay");
+
+        // 指纹不因 SNI/token/random 变化而变 (JA4 排除 SNI 内容/random)
+        assert_eq!(ja4(&tpl), ja4(&out), "JA4 must survive substitution");
+        // 动态字段替换到位
+        assert_eq!(&out[11..43], &rnd1, "random swapped");
+        assert_eq!(&out[44..76], &sid1, "session_id swapped");
+        assert_eq!(sni_of(&out).as_deref(), Some("apple.com"), "SNI swapped");
+        // 三层长度自洽 (SNI 从 18B 缩到 9B)
+        assert_eq!(u16be(&out, 3).unwrap(), out.len() - 5, "record len");
+        let hs = ((out[6] as usize) << 16) | ((out[7] as usize) << 8) | out[8] as usize;
+        assert_eq!(hs, out.len() - 9, "handshake body len");
+        assert!(out.len() < tpl.len(), "shorter SNI -> shorter record");
+    }
+
+    #[test]
+    fn template_rejects_bad_input() {
+        let sid = [0u8; 32];
+        let rnd = [0u8; 32];
+        assert!(build_from_template(b"\x16\x03\x01", b"x", &sid, &rnd).is_none()); // 截断
+        assert!(build_from_template(&[0u8; 80], b"x", &sid, &rnd).is_none()); // 非 CH
+        // session_id 非 32B: 造个短 sid 的合法头
+        let mut bad = build_chromium(b"a.com", &sid, &rnd);
+        bad[43] = 31;
+        assert!(build_from_template(&bad, b"x", &sid, &rnd).is_none());
+    }
 }

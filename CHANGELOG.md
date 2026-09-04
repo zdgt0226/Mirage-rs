@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(tls): 出站复刻捕获指纹 —— `client_hello_template` (B, 依赖 D 的捕获)
+
+配 `client_hello_template: "<path>"` (指向 `tls-capture` 抓的 `.bin`), 出站 fake-TLS 握手即**复刻该真实
+ClientHello 的 JA3/JA4**, 只替换三处动态字段: **SNI**(→camouflage_host) / **session_id**(Poly1305 token) /
+**random**(PFS 一次性公钥); 其余字节 (cipher / 扩展顺序 / GREASE / key_share / ECH) 原样保留。变长 SNI 会重编
+server_name 扩展并修正 record / handshake / extensions 三层长度。不配 = 内置 Chrome/FF/OkHttp 加权轮换 (保留)。
+装载失败 (文件缺失 / 非 ClientHello / session_id≠32B) 只 WARN 并落回内置轮换, 不阻断启动。
+- `tls_raw::build_from_template` (启动装入 `OnceLock` 全局, `build_client_hello_with_random` 命中即用) + 2 单测
+  (真 Chromium 150 模板回放: JA4 不变 + SNI/token/random 替换到位 + 三层长度自洽; 拒非法/截断/session_id≠32)。
+- 实机验证: `tls-capture` 抓 517B 真 ClientHello → 配 `client_hello_template` 启动装载成功。
+
 ### feat(tls): 指纹捕获 —— CLI `tls-capture` + API (抓真浏览器 ClientHello 作模板)
 
 抓本机真浏览器的 ClientHello 当 fake-TLS 指纹模板, **不 phone-home** (用实时真握手, 非联网拉取)。

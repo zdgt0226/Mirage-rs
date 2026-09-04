@@ -79,6 +79,11 @@ pub struct Config {
     pub tuning: Option<TuningConfig>,
     #[serde(default)]
     pub gui: Option<GuiConfig>,
+    /// 自定义出站 fake-TLS 指纹模板路径 (捕获的真实浏览器 ClientHello, 见 `mirage tls-capture`)。
+    /// 设了则出站握手复刻该模板的 JA3/JA4, 仅替换 SNI(→camouflage_host)/session_id(token)/random(PFS 公钥);
+    /// 不设 = 内置 Chrome/FF/OkHttp 加权轮换。装载失败 (文件缺失/非法) 只 WARN 并落回轮换, 不阻断启动。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hello_template: Option<String>,
 }
 
 /// 服务端的**上游出口**配置 —— 配了它, Mirage 服务端就不再直连目标, 而是把流量
