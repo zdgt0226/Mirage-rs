@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.11.0] - TLS 指纹捕获 + 回放 (D + B): `tls-capture` / API + `client_hello_template` (2026-09-04)
+
 ### feat(tls): 出站复刻捕获指纹 —— `client_hello_template` (B, 依赖 D 的捕获)
 
 配 `client_hello_template: "<path>"` (指向 `tls-capture` 抓的 `.bin`), 出站 fake-TLS 握手即**复刻该真实
