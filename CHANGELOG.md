@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### feat(tls): 指纹捕获 —— CLI `tls-capture` + API (抓真浏览器 ClientHello 作模板)
+
+抓本机真浏览器的 ClientHello 当 fake-TLS 指纹模板, **不 phone-home** (用实时真握手, 非联网拉取)。
+两种触发, 不走 config:
+- **CLI `mirage tls-capture --listen --out`**: 起一次性 SOCKS5 抓取代理, 把浏览器 SOCKS5 指向它、
+  访问一次 HTTPS, 其 ClientHello 即被抓存 (原始字节 + `.json` 偏移 sidecar) 并自动退出。无需 config/重启。
+- **API `POST /api/v1/tls/capture`** (arm, 仅内存) + **`GET`** (取回 base64 + 偏移): 给已运行的透明网关
+  免重启抓取 / WebUI 按钮。
+机制: relay 入口 (`handler.rs` SOCKS/mixed + `transparent.rs` 透明) 各 `maybe_capture`, armed 时 peek 首包
+抓合法 TLS1.3 ClientHello (32B session_id) 一次; 未 arm 近零开销。⚠️ 落盘/取回含那次访问的明文 SNI。
+- 实机验证 (CLI 抓 517B 自动退出码 0; API arm→curl→取回 b64+sni) + 2 单测。现有多 Profile 轮换保留; 回放 (B) 后续。
+
 ## [v0.10.8] - 前端对接契约 v1 全对齐 (P0/P1/P2/P3) + 架构原理图 (2026-09-03)
 
 ### docs: 架构图 + 连接处理/判定原理图 (archify, docs/diagrams/)

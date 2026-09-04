@@ -145,6 +145,10 @@ pub async fn proxy_tcp_target(
     // 客户端明确要连 1.2.3.4:443, 若把目的地换成域名, direct 出站会重新解析 —— 可能落到
     // 另一个 IP (CDN/多 A 记录), 等于擅自改了客户端指定的目的地; 域名解析不出来时更是直接
     // 连不上。sing-box 同样把两者分开 (override_destination 默认关)。
+    // TLS 指纹捕获 (armed 时): peek 客户端首包抓 ClientHello。独立于路由 sniff (那个只在裸 IP 时跑),
+    // 故 socks5h 送域名也能抓。未 arm 立即返回。
+    crate::proxy::tls_capture::maybe_capture(&local).await;
+
     let mut sniffed_domain: Option<String> = None;
     if !already_sniffed && initial_payload.is_empty() && final_host.parse::<IpAddr>().is_ok() {
         if let Some(sniffed) = crate::proxy::sniff::sniff_with_timeout(

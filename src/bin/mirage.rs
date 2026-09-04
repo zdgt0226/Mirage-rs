@@ -172,6 +172,23 @@ enum Mode {
         #[arg(short, long)]
         out: Option<String>,
     },
+    /// 抓取真浏览器 ClientHello 作 fake-TLS 指纹模板 (一次性 SOCKS 抓取代理, 不 phone-home)
+    ///
+    /// 起个临时 SOCKS5 代理并 arm 抓取: 把浏览器/系统 SOCKS5 指向它, 访问任意 HTTPS 一次,
+    /// 其 ClientHello 即被抓存 (+ .json 偏移), 然后自动退出。无需 config、无需重启。
+    ///   mirage-rs tls-capture                       # 默认 127.0.0.1:11080 → ./captured-ch.bin
+    ///   mirage-rs tls-capture --listen 127.0.0.1:1080 --out ~/ch.bin
+    TlsCapture {
+        /// 临时 SOCKS5 监听地址
+        #[arg(long, default_value = "127.0.0.1:11080")]
+        listen: String,
+        /// 输出路径 (原始 ClientHello; 同名 .json 存字段偏移)
+        #[arg(long, default_value = "./captured-ch.bin")]
+        out: String,
+        /// 等待超时秒 (超时未抓到即退出 1)
+        #[arg(long, default_value_t = 180)]
+        timeout: u64,
+    },
 }
 
 /// 校验配置。返回进程退出码: 0 = 干净, 1 = 有问题 / 读不了 / 解析失败。
@@ -1446,6 +1463,9 @@ async fn main() -> anyhow::Result<()> {
         };
         std::process::exit(run_subscribe(config, source, g, &opts, *routing, *timeout).await);
     }
+    if let Mode::TlsCapture { listen, out, timeout } = &args.mode {
+        std::process::exit(run_tls_capture(listen, out, *timeout).await);
+    }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
     match &args.mode {
@@ -1467,6 +1487,46 @@ async fn main() -> anyhow::Result<()> {
     };
 
     mirage_rs::start_proxy(config_path, is_server).await
+}
+
+/// `mirage tls-capture`: 起一次性 SOCKS5 抓取代理, 抓到浏览器 ClientHello 即退。返回退出码。
+async fn run_tls_capture(listen: &str, out: &str, timeout_secs: u64) -> i32 {
+    let Some((host, port)) = listen.rsplit_once(':') else {
+        eprintln!("✗ --listen 需为 host:port (如 127.0.0.1:11080)");
+        return 1;
+    };
+    if port.parse::<u16>().is_err() {
+        eprintln!("✗ --listen 端口非法: {port}");
+        return 1;
+    }
+    // arm 抓取 (写文件) + 最小配置 (mixed 入站 + direct 出站) 写临时文件供 start_proxy。
+    mirage_rs::proxy::tls_capture::arm(Some(out.to_string()));
+    let cfg = format!(
+        r#"{{"log_level":"warn","inbounds":[{{"type":"mixed","tag":"cap","listen":"{host}","port":{port}}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+    );
+    let tmp = std::env::temp_dir().join(format!("mirage-tlscap-{}.json", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, cfg) {
+        eprintln!("✗ 写临时配置失败: {e}");
+        return 1;
+    }
+    let tmp_path = tmp.to_string_lossy().to_string();
+    eprintln!("把浏览器 / 系统的 SOCKS5 代理指向 {listen}, 访问任意 HTTPS 网站一次即可抓取 (超时 {timeout_secs}s)…");
+    let code = tokio::select! {
+        _ = mirage_rs::proxy::tls_capture::wait_captured() => {
+            eprintln!("✓ 已抓取真浏览器 ClientHello → {out} (+ {out}.json 偏移)");
+            0
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+            eprintln!("✗ {timeout_secs}s 内未抓到 ClientHello —— 浏览器是否确实经该 SOCKS 访问了 HTTPS?");
+            1
+        }
+        r = mirage_rs::start_proxy(&tmp_path, false) => {
+            eprintln!("✗ 抓取代理启动失败: {r:?}");
+            1
+        }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    code
 }
 
 #[cfg(test)]
