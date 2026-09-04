@@ -1833,6 +1833,21 @@ EOM
         info "已开启 PFS —— 服务端配置也必须设 \"pfs\": true, 否则连不上。"
     fi
 
+    # 自定义 fake-TLS 指纹: 可选, 指向 `mirage tls-capture` 抓的真浏览器 ClientHello 模板。
+    # 留空 = 内置 Chrome/FF/OkHttp 加权轮换 (绝大多数场景够用)。
+    local cht_line=""
+    local cht_path
+    cht_path=$(ask "自定义 fake-TLS 指纹模板路径 (mirage tls-capture 抓的 .bin; 留空=内置轮换)" "")
+    if [[ -n "$cht_path" ]]; then
+        if [[ -f "$cht_path" ]] && [[ "$(head -c1 "$cht_path" | od -An -tx1 | tr -d ' ')" == "16" ]]; then
+            cht_line='
+    "client_hello_template": "'"$(json_escape "$cht_path")"'",'
+            ok "出站握手将复刻该模板指纹 JA3/JA4 (仅替换 SNI/session_id/random)"
+        else
+            warn "模板 $cht_path 不存在或非 TLS ClientHello —— 忽略, 用内置轮换。先跑 mirage tls-capture 抓一个。"
+        fi
+    fi
+
     # 日志滚动: 默认按 10MB 滚动 + gzip 保留 10 份 (磁盘约 10MB 封顶), 已足够绝大多数场景。
     # 只在用户想调时才问, 不加噪。
     local log_rotate_line=""
@@ -1856,7 +1871,7 @@ EOM
 {
     "schema_version": 1,
     "log_level": "${log_str}",
-    "log_file": "${LOG_DIR}/client.log",${log_rotate_line}
+    "log_file": "${LOG_DIR}/client.log",${log_rotate_line}${cht_line}
     "inbounds": [
         ${inbounds_json}
     ],
@@ -1908,6 +1923,7 @@ EOM
 EOF
 
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
+    [[ -z "$cht_line" ]] && info "想让指纹贴合本机真浏览器? 跑 mirage tls-capture 抓个模板, 填进 config 的 client_hello_template。"
     setup_service "client"
 
     # ── 部署汇总 ── 一屏看清关键信息, 免得用户回翻日志找端口/地址

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### docs: README + install.sh 对齐 v0.11.0
+
+- README 版本表补 **v0.11.0** (指纹捕获+回放) + **v0.10.0** (WebUI Console) 两行 (此前停在 v0.9.4); roadmap 加"指纹捕获+回放"已完成项。
+- install.sh 完整客户端配置生成加**可选** `client_hello_template` 提示 (仿 PFS 开关, 留空=内置轮换); 未配时装后提示可跑 `mirage tls-capture`。生成配置经 `mirage check` 校验通过。
+
 ## [v0.11.0] - TLS 指纹捕获 + 回放 (D + B): `tls-capture` / API + `client_hello_template` (2026-09-04)
 
 ### feat(tls): 出站复刻捕获指纹 —— `client_hello_template` (B, 依赖 D 的捕获)

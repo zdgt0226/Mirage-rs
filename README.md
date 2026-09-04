@@ -352,6 +352,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 
 - [x] 透明网关整链路真机跑通 (TCP + UDP + 隧道 + 回源)
 - [x] TLS ClientHello 字节级仿真 (三 profile 轮换 + JA4 对照 harness + 后量子 key_share)
+- [x] **指纹捕获 + 回放** (v0.11.0) —— `mirage tls-capture` / API 抓本机真浏览器 ClientHello 存模板 (不 phone-home), `client_hello_template` 让出站复刻其 JA3/JA4 (仅替换 SNI/session_id/random)
 - [x] 轻量模式 (`lite-server` / `lite-client`)
 - [x] 中转站: Shadowsocks 上游 (SIP004 + SIP022) & WireGuard 上游
 - [x] WireGuard 出站 (客户端) + 上游 (服务端), TCP/UDP/隧道内 DNS, 真实 peer 五层验证
@@ -402,6 +403,8 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.11.0** | 2026-09-04 | **TLS 指纹捕获 + 回放**: `mirage tls-capture` CLI (一次性 SOCKS5 抓取代理) + `POST/GET /api/v1/tls/capture` 抓本机真浏览器 ClientHello 存成模板 (**不 phone-home**, 用实时真握手非联网拉取)。配 `client_hello_template` 让出站 fake-TLS **复刻该模板 JA3/JA4**, 仅替换 SNI(→camouflage_host)/session_id(token)/random(PFS 公钥) 三处动态字段, 变长 SNI 重编 server_name 扩展 + 修三层长度; 不配 = 内置 Chrome/FF/OkHttp 加权轮换 (保留)。移动端 (mirage-core) tokio 去 `full` 精简传递依赖。 |
+| **v0.10.0** | 2026-08-22 | **WebUI 全新看板 Mirage Console**: 界面重构 (侧栏切视图 + 暗/亮双主题 + Canvas 流量图, 对标 Linear/shadcn) + i18n 中/英 + 服务端/客户端分视图 + Admin 区。客户端 LAN 设备表按设备一键路由; 服务端域名排行·连接历史·已连客户端 (版本两端 opt-in 零指纹 + 一键屏蔽)。规则编辑器 dry_run 预检/进程分流/拖排。前端独立仓 Mirage-console (Vue3+TS+Vite)。后续 v0.10.1–0.10.8 补: 用户策略 device profiles · QUIC Salamander 混淆实验 · Android 内核 CI 交叉编译 · 前端对接契约 v1 全对齐 (P0–P3, 含 SSE 推流) · 架构原理图 (archify)。 |
 | **v0.9.4** | 2026-08-16 | **CI 回归哨兵**: 给"没人看的相对性能特征"补确定性/相对哨兵 —— UDP mux 容量不变量 (N 流散布到全 K 槽 + `MAX_FLOWS` 下限, 防 22.5× 带机量静默回归) · crypto AES/ChaCha 吞吐**比值** ≥1.3× (CI 实测 4.22×, 比值抗计时噪声) · brutal 收敛轨迹 (拥塞收敛 BDP±20% + 恢复回 ≥90% 满速)。均相对/行为门, 不上共享 runner 假报警。camouflage 模板拉取失败回落降 WARN (无外网服务端不再满屏 ERROR)。 |
 | **v0.9.3** | 2026-08-14 | **可选前向保密 (PFS)** + **供应链签名/容器**: 一次性 X25519 ECDH (公钥搭 fake-TLS random 字段交换, 零指纹变化 + 高位随机化抗指纹; `password‖ecdh` 混进 master; opt-in 两端同开, 失配 fail-closed) 补外部审计 #2 最大真安全缺口, install.sh 一键开关。cosign **keyless** 签 SHA256SUMS (bundle) + ghcr **多架构容器镜像** (buildx amd64/arm64, GITHUB_TOKEN, 镜像亦签名), 零密钥。审计尾单: start_proxy 巨石拆分 (753→400) · config 模板防漂移测试 (#7) · 版本歪斜诊断 (#8) · WG connect 同步失败 socket 泄漏修复。 |
 | **v0.9.2** | 2026-08-14 | **握手模板完整性修复**: 服务端只缓存含齐 `0x16+0x14+0x17` 三型的 camouflage 模板 (残模板回落恒完整 fallback), 修完整服务端↔客户端 (含轻量模式) 偶发 `read_exact tail timed out` 握手卡死。**外部审计便宜纯赚**: API 认证失败 per-IP 限流 (#3) · cargo-deny 供应链门禁 (#11, 抓出 anyhow RUSTSEC) · README 安全声明 (#1)。RTT/brutal 监控去阻塞 (spawn_blocking) + 调速抽纯函数 (#5) · 解析器 proptest (#12)。 |
