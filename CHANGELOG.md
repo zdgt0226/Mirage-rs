@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(crypto): 填充整形升级 —— paddingScheme 抗 TLS-in-TLS 统计指纹 (A)
+
+`tls_padding` 开启后的填充从"前 4 条记录追加 ≤256B 零"升级为 **paddingScheme 定长整形** (借鉴
+AnyTLS / XTLS Vision): 握手后**前 8 条记录**按区间表**切分 + 零填充成定长小记录**, 记录大小与真实
+数据量解耦, 抹掉"封装 TLS 握手"的 burst 长度序列 (USENIX Sec 2024 Xue et al. 主检测向量)。第 8 条
+之后回落吞吐分桶。
+- **纯发端改动, wire 向后兼容**: 收端本就恒剥尾零 + 逐记录重组, 无需 bump 协议, 与开 `tls_padding`
+  的对端集合一致。仍受 `tuning.tls_padding` 两端开关门控 (对端须已具剥零逻辑)。
+- 新增 2 单测 (大 payload 跨整形+分桶精确重组; 前 3 条定长整形+切分断言), 全套 aead 14 测通过。
+- 静态方案 = A; 动态可更新下发 (复用加密控制通道) = B 后续。
+
 ### docs: README + install.sh 对齐 v0.11.0
 
 - README 版本表补 **v0.11.0** (指纹捕获+回放) + **v0.10.0** (WebUI Console) 两行 (此前停在 v0.9.4); roadmap 加"指纹捕获+回放"已完成项。
