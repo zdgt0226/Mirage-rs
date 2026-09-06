@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.12.0] - 填充整形抗 TLS-in-TLS 统计指纹 (A/B') + install/文档对齐 (2026-09-06)
+
 ### feat(crypto): 填充整形升级 —— paddingScheme 抗 TLS-in-TLS 统计指纹 (A)
 
 `tls_padding` 开启后的填充从"前 4 条记录追加 ≤256B 零"升级为 **paddingScheme 定长整形** (借鉴
