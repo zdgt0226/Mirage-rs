@@ -107,6 +107,55 @@ pub fn tls_padding_enabled() -> bool {
     TLS_PADDING.load(Ordering::Relaxed)
 }
 
+/// 内置默认填充整形方案: 握手后前 N 条记录的目标 plaintext 大小区间 (含 content_type + 零填充)。
+/// 把一大条 inner TLS 握手记录切分+填充成一串定长小记录, 抹掉封装 TLS 握手的 burst 长度序列。
+pub const DEFAULT_PAD_SCHEME: &[(usize, usize)] = &[
+    (64, 256),
+    (256, 800),
+    (100, 1400),
+    (600, 1200),
+    (128, 512),
+    (900, 1400),
+    (64, 700),
+    (400, 1400),
+];
+
+/// 生效中的填充方案 (B': 可由 config `tls_padding_scheme` 覆盖 + 热重载)。CryptoWriter::new 快照它,
+/// 故换方案对**新连接**生效 (池子持续换连接)。默认 = [`DEFAULT_PAD_SCHEME`]。
+static PADDING_SCHEME: std::sync::LazyLock<arc_swap::ArcSwap<Vec<(usize, usize)>>> =
+    std::sync::LazyLock::new(|| arc_swap::ArcSwap::from_pointee(DEFAULT_PAD_SCHEME.to_vec()));
+
+/// 设置生效填充方案 (启动/热重载从 config 解析后调; 空 vec 视为回落默认)。
+pub fn set_padding_scheme(scheme: Vec<(usize, usize)>) {
+    let v = if scheme.is_empty() { DEFAULT_PAD_SCHEME.to_vec() } else { scheme };
+    PADDING_SCHEME.store(std::sync::Arc::new(v));
+}
+
+/// 取当前生效填充方案 (CryptoWriter::new 快照)。
+pub fn padding_scheme() -> std::sync::Arc<Vec<(usize, usize)>> {
+    PADDING_SCHEME.load_full()
+}
+
+/// 串行化会改动全局 PADDING_SCHEME 的测试 (跨模块共享: cipher + aead 整形断言)。
+#[cfg(test)]
+pub(crate) static PAD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 解析 config 的填充方案串: `;` 分隔的 `lo-hi` 区间 (如 `64-256;256-800;100-1400`)。
+/// 校验 1 ≤ lo ≤ hi ≤ MAX_RECORD_SIZE。任一项非法/为空 → None (调用方回落默认 + WARN)。
+pub fn parse_padding_scheme(s: &str) -> Option<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    for part in s.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let (lo, hi) = part.split_once('-')?;
+        let lo: usize = lo.trim().parse().ok()?;
+        let hi: usize = hi.trim().parse().ok()?;
+        if lo < 1 || lo > hi || hi > crate::crypto::aead::MAX_RECORD_SIZE {
+            return None;
+        }
+        out.push((lo, hi));
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// TIME_SYNC 帧 proto_ver: 0x01=仅 ChaCha20 (老/默认), 0x02=支持 agility 协商。
 pub const PROTO_VER_LEGACY: u8 = 0x01;
 pub const PROTO_VER_AGILITY: u8 = 0x02;
@@ -220,5 +269,35 @@ mod tests {
             Cipher::ChaCha20Poly1305.hkdf_suffix(),
             Cipher::Aes256Gcm.hkdf_suffix()
         );
+    }
+
+    #[test]
+    fn parse_padding_scheme_valid() {
+        assert_eq!(
+            parse_padding_scheme("64-256;256-800;100-1400"),
+            Some(vec![(64, 256), (256, 800), (100, 1400)])
+        );
+        // 容忍空白 + 尾分号
+        assert_eq!(parse_padding_scheme(" 1-1 ; 10-20 ;"), Some(vec![(1, 1), (10, 20)]));
+    }
+
+    #[test]
+    fn parse_padding_scheme_rejects_bad() {
+        assert!(parse_padding_scheme("").is_none()); // 空
+        assert!(parse_padding_scheme("100-50").is_none()); // lo>hi
+        assert!(parse_padding_scheme("0-100").is_none()); // lo<1
+        assert!(parse_padding_scheme("1-99999").is_none()); // hi>MAX_RECORD_SIZE
+        assert!(parse_padding_scheme("abc").is_none()); // 无 '-'
+        assert!(parse_padding_scheme("1-x").is_none()); // 非数字
+        assert!(parse_padding_scheme("64-256;bad").is_none()); // 一项坏则整串废
+    }
+
+    #[test]
+    fn set_padding_scheme_empty_falls_back_default() {
+        let _g = super::PAD_TEST_LOCK.lock().unwrap(); // 与 aead 整形测试互斥 (共享全局)
+        set_padding_scheme(vec![(70, 70)]);
+        assert_eq!(&**padding_scheme(), &[(70, 70)]);
+        set_padding_scheme(vec![]); // 空 = 回落默认
+        assert_eq!(&**padding_scheme(), DEFAULT_PAD_SCHEME);
     }
 }

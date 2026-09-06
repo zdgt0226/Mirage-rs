@@ -146,6 +146,19 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                 crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
                 // TLS record padding 开关 (设进全局, CryptoWriter::new 读)。收端恒剥零无需开关。
                 crate::crypto::cipher::set_tls_padding(tuning.tls_padding);
+                // B': 可选自定义填充方案 (换特征不重编)。非法整串回落默认 + WARN。
+                if let Some(ref s) = tuning.tls_padding_scheme {
+                    match crate::crypto::cipher::parse_padding_scheme(s) {
+                        Some(scheme) => {
+                            let n = scheme.len();
+                            crate::crypto::cipher::set_padding_scheme(scheme);
+                            info!("已加载自定义 tls_padding_scheme ({} 条整形记录)", n);
+                        }
+                        None => warn!("tls_padding_scheme 非法 (格式 `lo-hi;lo-hi;...`, 1≤lo≤hi≤16384), 回落默认方案"),
+                    }
+                } else {
+                    crate::crypto::cipher::set_padding_scheme(crate::crypto::cipher::DEFAULT_PAD_SCHEME.to_vec());
+                }
                 // 客户端版本识别 (两端同开: 客户端发 / 服务端读)。
                 crate::client_info::set_enabled(tuning.client_info);
                 if tuning.client_info {
