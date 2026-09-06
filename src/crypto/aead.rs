@@ -81,14 +81,27 @@ pub struct CryptoWriter<W: AsyncWrite + Unpin> {
     rng: fastrand::Rng,
     /// TLS record padding 开关 (从全局 cipher::tls_padding_enabled() 取)。
     padding: bool,
-    /// 已发记录数, 用于只填握手后前 PAD_FIRST_N 条 (跨 rekey 不重置, 表流内位置)。
+    /// 已发记录数, 用于只整形握手后前 PAD_SCHEME.len() 条 (跨 rekey 不重置, 表流内位置)。
     records_sent: u32,
 }
 
-/// TLS padding: 只填握手后前 N 条记录 (GFW ML 主要认前几包长度序列)。
-const PAD_FIRST_N: u32 = 4;
-/// 每条最多追加的零字节数 (均匀随机 [0, PAD_MAX])。
-const PAD_MAX: usize = 256;
+/// 填充整形方案 (paddingScheme, 借鉴 AnyTLS / XTLS Vision): 握手后**前 N 条记录**的
+/// 目标 plaintext 大小 (含 inner content_type + 零填充) 取自对应区间 —— 把一大条 inner TLS
+/// 握手记录**切分 + 填充**成一串定长小记录, 抹掉 "封装 TLS 握手" 的 burst 长度序列
+/// (USENIX Sec 2024 Xue et al. 的主检测向量)。第 N 条之后回落吞吐分桶、不填充。
+///
+/// 收端恒剥尾零 + 逐记录重组, 故本方案纯发端生效、wire 向后兼容 (与开 `tls_padding` 的
+/// 对端集合一致, 无需 bump 协议)。方案静态编译 = A; 动态可更新下发 = B (后续)。
+const PAD_SCHEME: &[(usize, usize)] = &[
+    (64, 256),
+    (256, 800),
+    (100, 1400),
+    (600, 1200),
+    (128, 512),
+    (900, 1400),
+    (64, 700),
+    (400, 1400),
+];
 
 impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
     pub fn new(writer: W, master_key: &[u8; 32], is_initiator: bool) -> Self {
@@ -143,35 +156,37 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         let mut offset = 0;
 
         while offset < plaintext.len() {
-            // 分桶随机化帧大小，模拟真实 HTTPS 碎片特征
-            let r: f64 = self.rng.f64();
-            let limit = if r <= 0.50 {
-                16384
-            } else if r <= 0.85 {
-                8192
-            } else {
-                4096
-            };
+            let remaining = plaintext.len() - offset;
+            self.buffer.clear(); // 复用 Buffer, 零分配
 
-            let end = std::cmp::min(offset + limit, plaintext.len());
-            let chunk = &plaintext[offset..end];
-            offset = end;
-
-            // 复用 Buffer，零分配 (Zero-Allocation)
-            self.buffer.clear();
-            self.buffer.extend_from_slice(chunk);
-            self.buffer.push(0x17); // inner content type = application_data
-
-            // TLS 1.3 原生零填充: 握手后前 N 条记录在 content_type 之后追加随机数量的零,
-            // 抹掉包长序列指纹。收端恒剥零 (见 recv_data)。content 自身尾零在 0x17 之前不受影响。
-            if self.padding && self.records_sent < PAD_FIRST_N {
-                // 保证 chunk + 0x17 + pad ≤ MAX_RECORD_SIZE (buffer 此刻 = chunk+1)。
-                let room = MAX_RECORD_SIZE.saturating_sub(self.buffer.len());
-                let cap = PAD_MAX.min(room);
-                if cap > 0 {
-                    let pad = self.rng.usize(0..=cap);
-                    self.buffer.resize(self.buffer.len() + pad, 0);
+            let scheme_idx = self.records_sent as usize;
+            if self.padding && scheme_idx < PAD_SCHEME.len() {
+                // paddingScheme 整形: 本记录 plaintext (含 content_type + 零填充) 定长 = rng[lo,hi]。
+                // 取 target-1 字节数据 (留 1B content_type), 不足则纯零填充补满 → 记录大小恒 = target,
+                // 与真实数据量无关, 切断 inner TLS 握手 burst 的长度关联。
+                let (lo, hi) = PAD_SCHEME[scheme_idx];
+                let target = self.rng.usize(lo..=hi);
+                let take = target.saturating_sub(1).min(remaining);
+                self.buffer.extend_from_slice(&plaintext[offset..offset + take]);
+                offset += take;
+                self.buffer.push(0x17); // inner content type = application_data
+                if self.buffer.len() < target {
+                    self.buffer.resize(target, 0); // 零填充补满至 target (收端恒剥尾零)
                 }
+            } else {
+                // 第 N 条之后 (或未开 padding): 吞吐分桶随机化帧大小, 不填充。
+                let r: f64 = self.rng.f64();
+                let limit = if r <= 0.50 {
+                    16384
+                } else if r <= 0.85 {
+                    8192
+                } else {
+                    4096
+                };
+                let end = std::cmp::min(offset + limit, plaintext.len());
+                self.buffer.extend_from_slice(&plaintext[offset..end]);
+                offset = end;
+                self.buffer.push(0x17); // inner content type = application_data
             }
             self.records_sent = self.records_sent.saturating_add(1);
 
@@ -577,7 +592,7 @@ mod cipher_bench {
 #[cfg(test)]
 mod padding_tests {
     use super::*;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncReadExt};
 
     async fn roundtrip_with_padding(payloads: &[&[u8]]) {
         let (a, b) = duplex(256 * 1024);
@@ -617,5 +632,47 @@ mod padding_tests {
         let msg = b"no padding here\x00";
         w.send_data(msg).await.unwrap();
         assert_eq!(&r.recv_data().await.unwrap(), msg);
+    }
+
+    /// 大 payload (跨 paddingScheme 整形段 + 之后吞吐分桶) 必须逐记录重组后精确还原。
+    #[tokio::test]
+    async fn padding_large_payload_reassembles_exact() {
+        let (a, b) = duplex(512 * 1024);
+        let master = [11u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        let mut r = CryptoReader::new(b, &master, false);
+        w.set_padding(true);
+        let big: Vec<u8> = (0..40_000u32).map(|i| (i * 7 + 3) as u8).collect();
+        w.send_data(&big).await.unwrap();
+        let mut got = Vec::new();
+        while got.len() < big.len() {
+            got.extend_from_slice(&r.recv_data().await.unwrap());
+        }
+        assert_eq!(got, big, "大 payload 逐记录重组必须精确还原");
+    }
+
+    /// paddingScheme: 前 N 条记录被**定长整形** (body ∈ 区间+tag) 且大 payload 被**切分**
+    /// 成小记录 (远小于原始 40KB), 抹掉 inner TLS 握手 burst 长度序列。
+    #[tokio::test]
+    async fn scheme_shapes_first_records_and_splits() {
+        let (a, mut b) = duplex(512 * 1024);
+        let master = [12u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        w.set_padding(true);
+        let big = vec![0xABu8; 40_000];
+        w.send_data(&big).await.unwrap();
+        // 原始读前 3 条记录头, 断言定长整形 + 切分 (每条 ≤ 区间上限+tag, 远小于 40000)。
+        for (i, &(lo, hi)) in PAD_SCHEME.iter().take(3).enumerate() {
+            let mut h = [0u8; 5];
+            b.read_exact(&mut h).await.unwrap();
+            assert_eq!([h[0], h[1], h[2]], [0x17, 0x03, 0x03]);
+            let body = u16::from_be_bytes([h[3], h[4]]) as usize;
+            assert!(
+                body >= lo + TAG_SIZE && body <= hi + TAG_SIZE,
+                "记录 {i} body {body} 不在方案 [{lo},{hi}]+tag 内"
+            );
+            let mut skip = vec![0u8; body];
+            b.read_exact(&mut skip).await.unwrap(); // 跳到下一条头
+        }
     }
 }
