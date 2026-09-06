@@ -81,27 +81,17 @@ pub struct CryptoWriter<W: AsyncWrite + Unpin> {
     rng: fastrand::Rng,
     /// TLS record padding 开关 (从全局 cipher::tls_padding_enabled() 取)。
     padding: bool,
-    /// 已发记录数, 用于只整形握手后前 PAD_SCHEME.len() 条 (跨 rekey 不重置, 表流内位置)。
+    /// 已发记录数, 用于只整形握手后前 scheme.len() 条 (跨 rekey 不重置, 表流内位置)。
     records_sent: u32,
+    /// 本连接生效的填充整形方案 (new() 时从全局快照; config 换方案对新连接生效)。
+    scheme: std::sync::Arc<Vec<(usize, usize)>>,
 }
 
-/// 填充整形方案 (paddingScheme, 借鉴 AnyTLS / XTLS Vision): 握手后**前 N 条记录**的
-/// 目标 plaintext 大小 (含 inner content_type + 零填充) 取自对应区间 —— 把一大条 inner TLS
-/// 握手记录**切分 + 填充**成一串定长小记录, 抹掉 "封装 TLS 握手" 的 burst 长度序列
-/// (USENIX Sec 2024 Xue et al. 的主检测向量)。第 N 条之后回落吞吐分桶、不填充。
-///
-/// 收端恒剥尾零 + 逐记录重组, 故本方案纯发端生效、wire 向后兼容 (与开 `tls_padding` 的
-/// 对端集合一致, 无需 bump 协议)。方案静态编译 = A; 动态可更新下发 = B (后续)。
-const PAD_SCHEME: &[(usize, usize)] = &[
-    (64, 256),
-    (256, 800),
-    (100, 1400),
-    (600, 1200),
-    (128, 512),
-    (900, 1400),
-    (64, 700),
-    (400, 1400),
-];
+// 填充整形方案 (paddingScheme, 借鉴 AnyTLS / XTLS Vision): 握手后前 N 条记录的目标 plaintext
+// 大小取自对应区间, 把一大条 inner TLS 握手记录切分+填充成一串定长小记录, 抹掉封装 TLS 握手的
+// burst 长度序列 (USENIX Sec 2024 Xue et al. 主检测向量)。第 N 条后回落吞吐分桶、不填充。收端恒剥
+// 尾零 + 逐记录重组, 故纯发端生效、wire 向后兼容。默认方案见 cipher::DEFAULT_PAD_SCHEME; B' 起可由
+// config `tls_padding_scheme` 覆盖 + 热重载 (CryptoWriter::new 快照 cipher::padding_scheme())。
 
 impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
     pub fn new(writer: W, master_key: &[u8; 32], is_initiator: bool) -> Self {
@@ -121,6 +111,7 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             rng: fastrand::Rng::new(),
             padding: crate::crypto::cipher::tls_padding_enabled(),
             records_sent: 0,
+            scheme: crate::crypto::cipher::padding_scheme(),
         }
     }
 
@@ -160,11 +151,11 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             self.buffer.clear(); // 复用 Buffer, 零分配
 
             let scheme_idx = self.records_sent as usize;
-            if self.padding && scheme_idx < PAD_SCHEME.len() {
+            if self.padding && scheme_idx < self.scheme.len() {
                 // paddingScheme 整形: 本记录 plaintext (含 content_type + 零填充) 定长 = rng[lo,hi]。
                 // 取 target-1 字节数据 (留 1B content_type), 不足则纯零填充补满 → 记录大小恒 = target,
                 // 与真实数据量无关, 切断 inner TLS 握手 burst 的长度关联。
-                let (lo, hi) = PAD_SCHEME[scheme_idx];
+                let (lo, hi) = self.scheme[scheme_idx];
                 let target = self.rng.usize(lo..=hi);
                 let take = target.saturating_sub(1).min(remaining);
                 self.buffer.extend_from_slice(&plaintext[offset..offset + take]);
@@ -657,12 +648,17 @@ mod padding_tests {
     async fn scheme_shapes_first_records_and_splits() {
         let (a, mut b) = duplex(512 * 1024);
         let master = [12u8; 32];
-        let mut w = CryptoWriter::new(a, &master, true);
+        // 锁只护 "设默认 + new() 快照" (不跨 await); writer 快照后与全局解耦, 故读取阶段可释锁。
+        let mut w = {
+            let _g = crate::crypto::cipher::PAD_TEST_LOCK.lock().unwrap();
+            crate::crypto::cipher::set_padding_scheme(crate::crypto::cipher::DEFAULT_PAD_SCHEME.to_vec());
+            CryptoWriter::new(a, &master, true)
+        };
         w.set_padding(true);
         let big = vec![0xABu8; 40_000];
         w.send_data(&big).await.unwrap();
         // 原始读前 3 条记录头, 断言定长整形 + 切分 (每条 ≤ 区间上限+tag, 远小于 40000)。
-        for (i, &(lo, hi)) in PAD_SCHEME.iter().take(3).enumerate() {
+        for (i, &(lo, hi)) in crate::crypto::cipher::DEFAULT_PAD_SCHEME.iter().take(3).enumerate() {
             let mut h = [0u8; 5];
             b.read_exact(&mut h).await.unwrap();
             assert_eq!([h[0], h[1], h[2]], [0x17, 0x03, 0x03]);

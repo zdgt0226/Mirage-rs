@@ -828,6 +828,12 @@ pub struct TuningConfig {
     /// content_type 解析失败断连) —— 与 cipher_agility 同类约束。ClientHello 不受影响。
     #[serde(default)]
     pub tls_padding: bool,
+    /// 可选自定义填充整形方案 (仅在 `tls_padding` 开启时生效)。格式: `;` 分隔的 `lo-hi` 区间, 每项
+    /// 对应握手后第 i 条记录的目标 plaintext 大小 (含 content_type + 零填充), 如 `64-256;256-800;100-1400`。
+    /// 不设 = 内置默认方案。改它 + 热重载即可**换填充特征而不重编** (当默认方案被指纹化时); 两端各自
+    /// 从 config 读, 发端-only 生效、无需协议协商。非法/越界项整串忽略并回落默认 (仅 WARN)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_padding_scheme: Option<String>,
     /// 客户端版本识别 (默认 false)。两端同开时, 客户端在握手后于加密信道内上报自身版本, 服务端
     /// WebUI「连接的客户端」显示各客户端版本 (便于运维知道谁该升级)。**两端必须同开** —— 与
     /// cipher_agility/tls_padding 同类约束 (单边开会多发/漏读一帧致该连接失败)。ClientHello 一字

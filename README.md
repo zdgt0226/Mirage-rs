@@ -353,6 +353,8 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] 透明网关整链路真机跑通 (TCP + UDP + 隧道 + 回源)
 - [x] TLS ClientHello 字节级仿真 (三 profile 轮换 + JA4 对照 harness + 后量子 key_share)
 - [x] **指纹捕获 + 回放** (v0.11.0) —— `mirage tls-capture` / API 抓本机真浏览器 ClientHello 存模板 (不 phone-home), `client_hello_template` 让出站复刻其 JA3/JA4 (仅替换 SNI/session_id/random)
+- [x] **填充整形升级 (A/B')** —— `tls_padding` 从"前 4 条 ≤256B 零"升级为 **paddingScheme 定长整形** (切分+填充抹掉封装 TLS 握手 burst 长度序列, 抗 USENIX Sec 2024 Xue et al.); 方案可经 `tuning.tls_padding_scheme` config 换 + 热重载, 发端-only、零协议改动
+- [ ] **QUIC 腿 ECH GREASE (D, 暂缓)** —— 蹭 GFW 2025 初"不封带 ECH 的 QUIC"盲区。卡点: rustls ECH 的 HPKE 只在 aws-lc-rs provider (Mirage 用 ring, 换 provider 毁 Android/musl 交叉编译); 且 rustls QUIC ClientHello 本就非 Chrome 形状 (Rust 无 uTLS), 单加 ECH 收益有限; QUIC 腿尚未进 release。待手写最小 HPKE (ring 原语) 或 QUIC 腿转正后再评
 - [x] 轻量模式 (`lite-server` / `lite-client`)
 - [x] 中转站: Shadowsocks 上游 (SIP004 + SIP022) & WireGuard 上游
 - [x] WireGuard 出站 (客户端) + 上游 (服务端), TCP/UDP/隧道内 DNS, 真实 peer 五层验证
