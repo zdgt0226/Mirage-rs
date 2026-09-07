@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### feat(dns): 域名匹配增强 —— fakeip.exclude 支持 suffix/keyword/regex/full
+
+`fakeip.exclude` 从纯后缀升级为**类型化规则匹配** (Clash 风格前缀, 大小写不敏感):
+- `suffix:` (裸串默认, 兼容 `*.` / `.` 写法) · `keyword:` 子串 · `regex:` 正则整串 (RegexSet, 忽略大小写,
+  非法项跳过 WARN) · `full:`/`domain:` 精确整域。
+- 抽出可复用 `dns::domain_match::DomainMatcher` (供后续 DNS 规则层复用); `FakeIpMapper` 委托它。
+- 复用已依赖的 `regex` crate; 空名单零开销。
+- 6 项匹配器单测 + 9 项 fake_ip 单测 (委托后仍通过) + `mirage check` 类型前缀校验通过。
+
 ### feat(dns): fake-ip 排除域名 (`advanced_dns.fakeip.exclude`)
 
 fake-ip 开启后默认接管全部代理域名解析。新增 `fakeip.exclude` 域名列表: 命中的域名**不分配
