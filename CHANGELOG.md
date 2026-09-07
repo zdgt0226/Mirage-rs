@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.12.1] - tcp-brutal 2.0 groups 适配 (服务端按客户端分组) + 多模型审计加固 (2026-09-07)
+
 ### feat(brutal): 适配 tcp-brutal 2.0 groups —— 服务端按客户端分组共享总速率
 
 install.sh 现装的 tcp-brutal 已是 2.0。适配其 **groups** 特性: **服务端按客户端 IP 分 group**
