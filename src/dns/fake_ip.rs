@@ -19,6 +19,8 @@ pub struct FakeIpMapper {
     /// 关服 flush 又过了 dirty.swap"这种两个 flush 同写一个 .tmp 的窄竞态 → 文件交错损坏。
     /// 落盘全程持此锁, 两个 flush 各自完整写+rename, 不交错。
     flush_lock: std::sync::Mutex<()>,
+    /// fake-ip 排除域名 (已规整: 小写、去首点)。命中者不分配 fake-IP, DNS 走真实解析 (见 dns::server)。
+    exclude: Vec<String>,
 }
 
 impl FakeIpMapper {
@@ -57,6 +59,7 @@ impl FakeIpMapper {
             persist_path: persist_path.map(PathBuf::from),
             dirty: AtomicBool::new(false),
             flush_lock: std::sync::Mutex::new(()),
+            exclude: Vec::new(),
         };
 
         if let Some(p) = &mapper.persist_path {
@@ -67,6 +70,35 @@ impl FakeIpMapper {
             }
         }
         Ok(mapper)
+    }
+
+    /// 链式设排除名单 (config `fakeip.exclude`)。规整: 去空白/首点、小写、去空项。
+    pub fn with_exclude(mut self, exclude: Vec<String>) -> Self {
+        // 规整: 小写、去空白, 去掉常见前缀写法 `*.` / `.` (如 `*.lan`、`.example.org` 都等价于其根域)。
+        self.exclude = exclude
+            .into_iter()
+            .map(|s| {
+                s.trim()
+                    .to_lowercase()
+                    .trim_start_matches("*.")
+                    .trim_start_matches('.')
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        self
+    }
+
+    /// 域名是否在 fake-ip 排除名单: 精确匹配或**子域后缀**匹配 (如 `apple.com` 排除
+    /// `apple.com` 与 `*.apple.com`), 大小写不敏感。命中者不给 fake-IP, DNS 返真实解析。
+    pub fn is_excluded(&self, domain: &str) -> bool {
+        if self.exclude.is_empty() {
+            return false;
+        }
+        let d = domain.trim_end_matches('.').to_lowercase();
+        self.exclude
+            .iter()
+            .any(|e| d == *e || d.ends_with(&format!(".{e}")))
     }
 
     /// 从持久化文件恢复映射 + next_ip。行格式: `next_ip=<u32>` 或 `<ip> <domain>`。
@@ -374,5 +406,34 @@ mod persist_tests {
         let m = FakeIpMapper::with_persist("198.18.0.0/16", None).unwrap();
         m.lookup_or_assign("x.com");
         m.flush(); // 无路径 → no-op, 不 panic
+    }
+}
+
+#[cfg(test)]
+mod exclude_tests {
+    use super::FakeIpMapper;
+
+    #[test]
+    fn exclude_exact_and_subdomain_ci() {
+        let m = FakeIpMapper::new("198.18.0.0/16").unwrap()
+            .with_exclude(vec!["Apple.com".into(), ".example.org".into(), "*.lan".into(), "  ".into()]);
+        // `*.lan` 通配前缀规整为根域 `lan` → 匹配 lan 及其子域
+        assert!(m.is_excluded("nas.lan"));
+        assert!(m.is_excluded("lan"));
+        // 精确 + 大小写不敏感
+        assert!(m.is_excluded("apple.com"));
+        assert!(m.is_excluded("APPLE.COM"));
+        // 子域后缀
+        assert!(m.is_excluded("gateway.icloud.apple.com"));
+        assert!(m.is_excluded("www.example.org")); // 首点已规整
+        // 尾点 (FQDN) 也匹配
+        assert!(m.is_excluded("apple.com."));
+        // 非命中: 不同域 / 仅子串不算 (必须点边界)
+        assert!(!m.is_excluded("apple.com.evil.net"));
+        assert!(!m.is_excluded("notapple.com"));
+        assert!(!m.is_excluded("google.com"));
+        // 空项被过滤, 空名单不误伤
+        let empty = FakeIpMapper::new("198.18.0.0/16").unwrap();
+        assert!(!empty.is_excluded("apple.com"));
     }
 }

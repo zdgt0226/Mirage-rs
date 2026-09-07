@@ -320,10 +320,12 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     if fakeip.enabled {
                         match crate::dns::fake_ip::FakeIpMapper::with_persist(&fakeip.inet4_range, fakeip.persist_path.clone()) {
                             Ok(mapper) => {
+                                let mapper = mapper.with_exclude(fakeip.exclude.clone());
                                 info!(
-                                    "Fake-IP Mapper initialized with range {} (persist: {})",
+                                    "Fake-IP Mapper initialized with range {} (persist: {}, exclude: {})",
                                     fakeip.inet4_range,
-                                    fakeip.persist_path.as_deref().unwrap_or("off")
+                                    fakeip.persist_path.as_deref().unwrap_or("off"),
+                                    fakeip.exclude.len()
                                 );
                                 let m = Arc::new(mapper);
                                 m.clone().spawn_flusher(); // 持久化启用时周期落盘

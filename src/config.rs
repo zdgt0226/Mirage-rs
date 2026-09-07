@@ -761,6 +761,12 @@ pub struct FakeIpConfig {
     /// 不设 = 纯内存 (向后兼容)。install.sh 网关模式默认填 /var/lib/mirage-rs/fakeip.cache。
     #[serde(default)]
     pub persist_path: Option<String>,
+    /// fake-ip 排除域名列表。fake-ip 开启后默认接管全部代理域名解析; 列在此的域名 (精确或
+    /// **子域后缀**匹配, 如 `"apple.com"` 覆盖 `apple.com` 与 `*.apple.com`) **不分配 fake-IP**,
+    /// DNS 改走真实解析 (cn/direct resolver) → 客户端直连真实 IP, 绕过代理隧道。用于把某些
+    /// 域名/服务排除在代理之外 (如内网服务、想直连的 CDN、fake-IP 下行为异常的站点)。大小写不敏感。
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

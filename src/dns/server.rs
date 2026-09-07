@@ -858,6 +858,29 @@ impl DnsForwarder {
             ];
         }
 
+        // fake-ip 排除名单 (config `fakeip.exclude`): 命中的域名**不分配 fake-IP**, 直接走真实解析
+        // (cn/direct resolver), 客户端拿真 IP 直连、绕过代理隧道。在路由前统一拦, 覆盖 Mirage/
+        // auto_classify 等所有会给 fake-IP 的分支。与 Direct 分支同样尊重 IP 策略硬抑制 + DNS 缓存。
+        if self.fake_ip_mapper.as_ref().is_some_and(|m| m.is_excluded(&domain)) {
+            if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
+                debug!("[DNS] fakeip-excl [{}] → qtype {} 被 IP 策略 {:?} 抑制 (NODATA)", domain, qtype, ip_strategy);
+                return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+            }
+            let dk = domain.to_lowercase();
+            if let Some(cache) = &self.cache {
+                if let Some(hit) = cache.get(&dk, qtype, req) {
+                    debug!("[DNS] fakeip-excl [{}] → cache hit", domain);
+                    return Some(hit);
+                }
+            }
+            debug!("[DNS] fakeip-excl [{}] → 真实解析 (排除名单) via {:?}", domain, cn_dns);
+            let resp = direct_query(req, &cn_dns).await;
+            if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+                cache.put(&dk, qtype, r);
+            }
+            return resp.or_else(|| Some(make_nxdomain(req)));
+        }
+
         let routing_req = RoutingRequest {
             domain: Some(&domain),
             ip: None,

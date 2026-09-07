@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(dns): fake-ip 排除域名 (`advanced_dns.fakeip.exclude`)
+
+fake-ip 开启后默认接管全部代理域名解析。新增 `fakeip.exclude` 域名列表: 命中的域名**不分配
+fake-IP**, DNS 改走真实解析 (cn/direct resolver) → 客户端拿真实 IP 直连、绕过代理隧道。
+- 匹配: 精确 or **子域后缀**, 大小写不敏感; 接受 `apple.com` / `.apple.com` / `*.apple.com`
+  三种写法 (均等价于覆盖 `apple.com` 及其子域)。
+- 用途: 把内网服务、想直连的 CDN、fake-IP 下行为异常的站点排除在代理外。
+- 实现: `FakeIpMapper::is_excluded`; DNS `process_query` 在路由前统一拦截 (覆盖 Mirage /
+  auto_classify 等所有会给 fake-IP 的分支), 命中即真实解析 (尊重 IP 策略 + DNS 缓存)。
+- 单测 (精确/子域/大小写/通配前缀/边界不误伤); `mirage check` 校验通过。
+
 ### feat(webui): 限速旋钮接后端 —— 设备分配加 rate_limit_kbps 列 + 清过时 stub
 
 限速数据面 (用户态令牌桶: TCP 整形 · UDP policing 全路径含 SOCKS/transparent/服务端/mux) 早已做,
