@@ -122,7 +122,10 @@ pub async fn start_server(
                 // opt-in 高级选项, 默认不调用.
                 if let Some(rate) = brutal_rate_bytes_per_sec {
                     use std::os::unix::io::AsRawFd;
-                    crate::proxy::brutal::set_brutal_rate(stream.as_raw_fd(), rate);
+                    // tcp-brutal 2.0: 按客户端 IP 分 group, 该客户端所有连接共享一个总速率
+                    // (v1 模块自动回落 per-socket)。修多连接并发聚合 N× 超发。
+                    let gid = crate::proxy::brutal::group_id_for_ip(peer_addr.ip());
+                    crate::proxy::brutal::set_brutal_rate(stream.as_raw_fd(), rate, gid);
                 }
 
                 // alpha.25 撤回 alpha.21 加的显式 SO_SNDBUF/SO_RCVBUF. 手动

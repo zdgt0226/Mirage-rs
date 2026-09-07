@@ -927,14 +927,16 @@ impl WarmPool {
                 // 物理 TCP 隧道 → Some(fd) 调 brutal。嵌套 (Mirage-over-X, Boxed) 隧道也在池里但
                 // 无裸 fd → None → 跳过 brutal (其拥塞控制由 underlying 出站的物理层负责)。
                 if let Some(fd) = t.get_raw_fd() {
-                    crate::proxy::brutal::set_brutal_rate(fd, new_rate);
+                    // 客户端出站不分组 (group_id=0, per-socket)。brutal 只在服务端部署,
+                    // 分组是服务端按客户端归一组的事; 客户端侧保持 v1 per-socket 语义。
+                    crate::proxy::brutal::set_brutal_rate(fd, new_rate, 0);
                 }
                 total += 1;
             }
         }
         if let Ok(actives) = self.brutal_state.active_fds.lock() {
             for &fd in actives.iter() {
-                crate::proxy::brutal::set_brutal_rate(fd, new_rate);
+                crate::proxy::brutal::set_brutal_rate(fd, new_rate, 0); // 客户端出站不分组
                 total += 1;
             }
         }
