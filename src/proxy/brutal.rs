@@ -59,33 +59,83 @@ pub fn set_brutal_on_listener(fd: i32) {
     }
 }
 
-/// 在已 accept 的 TCP socket 上只设 TCP_BRUTAL_PARAMS (速率 + cwnd_gain).
+/// tcp-brutal 内核模块版本 (getsockopt TCP_BRUTAL_VERSION=23302 → major<<16|minor<<8|patch)。
+/// 全局探测一次并缓存。返回 0 = 探测失败 / v1 模块无此 getsockopt (即无 groups 支持)。
+fn brutal_module_version(fd: i32) -> u32 {
+    static VER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    const TCP_BRUTAL_VERSION: libc::c_int = 23302;
+    let cached = VER.load(Ordering::Relaxed);
+    if cached != u32::MAX {
+        return cached;
+    }
+    let mut v: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_BRUTAL_VERSION,
+            &mut v as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    let ver = if r == 0 { v } else { 0 }; // getsockopt 失败 = v1 (无 23302) = 无 groups
+    VER.store(ver, Ordering::Relaxed);
+    ver
+}
+
+/// 客户端身份 → brutal group_id (源 IP hash, 非零)。tcp-brutal 2.0: 同 group_id 的连接
+/// **共享一个总速率**, 故服务端把一个客户端的所有连接归一组 → 该客户端下载总量 = brutal_rate
+/// (而非每连接各 rate 并发聚合 N× 超发)。见 tcp-brutal 2.0 README「groups」。
+pub fn group_id_for_ip(ip: std::net::IpAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ip.hash(&mut h);
+    let id = h.finish();
+    if id == 0 { 1 } else { id } // group_id 必须非零 (0 = per-socket v1 语义)
+}
+
+/// 在已 accept 的 TCP socket 上只设 TCP_BRUTAL_PARAMS (速率 + cwnd_gain [+ group_id]).
 /// 不再重设 TCP_CONGESTION — 算法名通过 listener 继承.
 ///
 /// `rate_bytes_per_sec` = config 里 `brutal_rate_mbps * 125_000`.
-pub fn set_brutal_rate(fd: i32, rate_bytes_per_sec: u64) {
+/// `group_id`: 非零且内核模块 ≥ 2.0 时, 把本连接并入该 group (同组共享一个总速率); 0 或
+/// v1 模块 → per-socket 速率 (老行为, 发 12B v1 struct)。服务端传 [`group_id_for_ip`] 按客户端
+/// 分组; 客户端出站传 0。
+pub fn set_brutal_rate(fd: i32, rate_bytes_per_sec: u64, group_id: u64) {
     static PARAMS_WARNED: AtomicBool = AtomicBool::new(false);
     unsafe {
         const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
+        // v2 struct (20B packed): 内核 `u64 rate; u32 cwnd_gain; u64 group_id;` __packed。
+        // v1 模块只认前 12B (BRUTAL_PARAMS_V1_SIZE = offsetof(group_id)); 按版本裁 setsockopt len。
         #[repr(C, packed)]
         struct BrutalParams {
             rate: u64,
             cwnd_gain: u32,
+            group_id: u64,
         }
-        // X10 编码: 15 = 1.5× BDP. 跟 Python POC 一致 (/opt/claude/mirage
-        // /core/brutal.py::_DEFAULT_CWND_GAIN), 实测吞吐显著高于 20. 之前
-        // alpha.5 改成 20 是基于"apernet 内核默认 20"的误判.
+        const BRUTAL_PARAMS_V1_SIZE: usize = 12; // = offsetof(group_id): rate(8)+cwnd_gain(4)
+        // X10 编码: 15 = 1.5× BDP. 跟 Python POC 一致 (实测吞吐显著高于 20).
         const CWND_GAIN_X10: u32 = 15;
+
+        // group 仅在内核模块 ≥ 2.0 且给了非零 group_id 时启用; 否则回落 v1 per-socket (12B)。
+        let use_group = group_id != 0 && brutal_module_version(fd) >= 0x0002_0000;
         let params = BrutalParams {
             rate: rate_bytes_per_sec,
             cwnd_gain: CWND_GAIN_X10,
+            group_id,
+        };
+        let len = if use_group {
+            std::mem::size_of::<BrutalParams>()
+        } else {
+            BRUTAL_PARAMS_V1_SIZE
         };
         let pret = libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,
             TCP_BRUTAL_PARAMS,
             &params as *const _ as *const libc::c_void,
-            std::mem::size_of::<BrutalParams>() as libc::socklen_t,
+            len as libc::socklen_t,
         );
         if pret < 0 {
             let err = std::io::Error::last_os_error();
@@ -526,5 +576,24 @@ mod decide_tests {
             rate >= BASE_RATE * 9 / 10,
             "足够清洁 tick 后应恢复到 ≥90% 满速; got {rate} / base {BASE_RATE}"
         );
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::group_id_for_ip;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn group_id_deterministic_nonzero_distinct() {
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        // 确定性: 同 IP 同 group (该客户端所有连接归一组的前提)
+        assert_eq!(group_id_for_ip(a), group_id_for_ip(a));
+        // 非零 (0 = per-socket v1 语义, group 必须非零)
+        assert_ne!(group_id_for_ip(a), 0);
+        assert_ne!(group_id_for_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)), 0);
+        // 不同客户端不同 group (各自独享 brutal_rate 总量)
+        assert_ne!(group_id_for_ip(a), group_id_for_ip(b));
     }
 }

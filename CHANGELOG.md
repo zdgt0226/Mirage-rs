@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### feat(brutal): 适配 tcp-brutal 2.0 groups —— 服务端按客户端分组共享总速率
+
+install.sh 现装的 tcp-brutal 已是 2.0。适配其 **groups** 特性: **服务端按客户端 IP 分 group**
+(`group_id = hash(peer_ip)`), 该客户端的所有连接 (暖池 + UDP-mux) 共享**一个** brutal 总速率
+(谁发谁用, 空闲让给别的连接), 修此前**每条连接各设 `brutal_rate`** 导致并发聚合 **N× 超发**
+(brutal 无视丢包死磕设定率, N 条各全速会淹链路)。
+- `TCP_BRUTAL_PARAMS` struct 12B→20B (+`group_id: u64`); `getsockopt(TCP_BRUTAL_VERSION=23302)`
+  探测缓存, **≥2.0 才发 20B 带 group, v1/探测失败回落 12B per-socket** (老行为无损)。
+- **单一部署不变**: 只服务端装 brutal (2.0), 客户端不装照拿 server→client 下载加速; 客户端出站
+  `set_brutal_rate(.., 0)` 不分组。rules/brutalctl/`ip route proto 233` 不吸收 (透明路由用, 与 Mirage
+  userspace per-socket setsockopt 模型不匹配)。
+- 新增 group_id 单测 (确定性/非零/不同 IP 不同组); brutal 9 测 + `cargo test` 全绿。
+
 ## [v0.12.0] - 填充整形抗 TLS-in-TLS 统计指纹 (A/B') + install/文档对齐 (2026-09-06)
 
 ### feat(crypto): 填充整形升级 —— paddingScheme 抗 TLS-in-TLS 统计指纹 (A)
