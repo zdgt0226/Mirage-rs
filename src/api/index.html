@@ -292,7 +292,7 @@
       <section class="view" id="devices">
         <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="dev.lanDevices">LAN devices</div><span class="hint" data-i18n="dev.byActivity">by recent activity</span></div>
           <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.device">Device</th><th class="r" data-i18n="th.conns">Conns</th><th class="r">↑ / ↓</th><th class="r" data-i18n="th.idle">Idle</th><th class="r" data-i18n="dev.route">Route</th></tr></thead><tbody id="devBody"><tr><td colspan="5" class="empty" data-i18n="dev.none">No devices seen yet.</td></tr></tbody></table></div></div>
-        <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceSpeed">Per-device speed limit</div><span class="soon" data-i18n="soon">planned</span></div>
+        <div class="card"><div class="card-head"><div class="card-title" data-i18n="dev.perDeviceSpeed">Per-device speed limit</div><span class="hint" data-i18n="rateLive">enabled — set kbps below</span></div>
           <div class="card-pad"><div class="stub" data-i18n="dev.perDeviceSpeedDesc">Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.</div></div></div>
       </section>
 
@@ -306,7 +306,7 @@
         </div>
         <div class="card" style="margin-bottom:16px"><div class="card-head"><div class="card-title" data-i18n="srv.clientMgmt">Connected clients</div><span class="hint" id="cliN"></span></div>
           <div style="overflow-x:auto"><table class="tbl"><thead><tr><th data-i18n="th.client">Client</th><th data-i18n="th.version">Version</th><th class="r" data-i18n="th.conns">Conns</th><th class="r">↑ / ↓</th><th class="r" data-i18n="th.idle">Idle</th><th class="r" data-i18n="srv.block">Block</th></tr></thead><tbody id="cliBody"><tr><td colspan="6" class="empty" data-i18n="srv.noClients">No connected clients.</td></tr></tbody></table></div></div>
-        <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.rateLimit">Per-client rate limit</div><span class="soon" data-i18n="soon">planned</span></div>
+        <div class="card"><div class="card-head"><div class="card-title" data-i18n="srv.rateLimit">Per-client rate limit</div><span class="hint" data-i18n="rateLive">enabled — set kbps below</span></div>
           <div class="card-pad"><div class="stub" data-i18n="srv.rateLimitDesc">Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.</div></div></div>
       </section>
     </div>
@@ -352,12 +352,12 @@
       'brand.sub.server':'proxy server','soon':'planned',
       'dev.lanDevices':'LAN devices','dev.byActivity':'by recent activity','th.device':'Device','th.idle':'Idle','dev.route':'Route','dev.none':'No devices seen yet.','dev.routed':'Routed via ','dev.discoverSoon':'LAN device discovery — planned (needs eBPF per-source monitor).',
       'dev.perDeviceRule':'Per-device rules','dev.perDeviceRuleDesc':'Scope routing rules to a device / subnet. Backend source_ip_cidr already routes per source — this surfaces it per discovered device.',
-      'dev.perDeviceSpeed':'Per-device speed limit','dev.perDeviceSpeedDesc':'Bandwidth cap per device. Needs new traffic-shaping datapath (tc / eBPF token bucket) — largest piece, tracked separately.',
+      'dev.perDeviceSpeed':'Per-device speed limit','dev.perDeviceSpeedDesc':'Per-device bandwidth cap is live — set the Rate (kbps) column under User profiles → Device assignments below. Datapath: userspace token bucket (TCP shaping · UDP policing), no eBPF needed.','prof.devRate':'Rate (kbps)','prof.devRateHint':'0 / empty = unlimited. Per device (client) or per client IP (server).','rateLive':'enabled — set kbps below',
       'srv.domainRank':'Top domains','th.client':'Client','th.version':'Version','srv.noClients':'No connected clients.','srv.unblock':'Unblock','srv.blockedTag':'blocked','srv.domainRankDesc':'Ranked target domains across clients. Needs server-side connection registration + top-N aggregation.',
       'srv.connHistory':'Connection history','srv.connHistoryDesc':'Past connections beyond the live/recent window. Needs persistence (embedded store).',
       'srv.clientMgmt':'Connected clients','srv.clientMgmtDesc':'Per-client view: source IP, version, traffic. Version needs a handshake field (both ends). Then per-client block + rate limit act here.',
       'srv.block':'Block client','srv.blockDesc':'Reject a client IP / identity at accept. Medium; backend blacklist at the listener.',
-      'srv.rateLimit':'Per-client rate limit','srv.rateLimitDesc':'Bandwidth cap per client tunnel. Needs traffic-shaping datapath — large, tracked with device speed limit.',
+      'srv.rateLimit':'Per-client rate limit','srv.rateLimitDesc':'Per-client bandwidth cap is live — set the Rate (kbps) column under User profiles → Device assignments (keyed by client IP on the server). Datapath: token bucket (UDP policing), no eBPF needed.',
     },
     zh: {
       'brand.sub':'透明网关','nav.monitor':'监控','nav.control':'控制',
@@ -385,12 +385,12 @@
       'brand.sub.server':'代理服务端','soon':'计划中',
       'dev.lanDevices':'局域网设备','dev.byActivity':'按最近活跃','th.device':'设备','th.idle':'空闲','dev.route':'路由','dev.none':'暂无设备。','dev.routed':'已路由到 ','dev.discoverSoon':'局域网设备发现 —— 计划中（需 eBPF 按源监控）。',
       'dev.perDeviceRule':'按设备规则','dev.perDeviceRuleDesc':'把路由规则限定到某设备/网段。后端 source_ip_cidr 已能按来源分流 —— 这里按发现的设备可视化配置。',
-      'dev.perDeviceSpeed':'按设备限速','dev.perDeviceSpeedDesc':'按设备限带宽。需新建流量整形数据面（tc / eBPF token bucket）—— 最大一块，单独跟踪。',
+      'dev.perDeviceSpeed':'按设备限速','dev.perDeviceSpeedDesc':'按设备限带宽已可用 —— 在下方「用户策略 → 设备分配」的「限速 (kbps)」列填写。数据面：用户态令牌桶（TCP 整形 · UDP policing），无需 eBPF。','prof.devRate':'限速 (kbps)','prof.devRateHint':'0 / 留空 = 不限。客户端按设备 / 服务端按客户端 IP。','rateLive':'已启用 —— 在下方填 kbps',
       'srv.domainRank':'域名排行','th.client':'客户端','th.version':'版本','srv.noClients':'无连接的客户端。','srv.unblock':'解除','srv.blockedTag':'已屏蔽','srv.domainRankDesc':'跨客户端的目标域名排行。需服务端连接登记 + top-N 聚合。',
       'srv.connHistory':'连接历史','srv.connHistoryDesc':'live/最近窗口之外的历史连接。需持久化（内嵌存储）。',
       'srv.clientMgmt':'连接的客户端','srv.clientMgmtDesc':'每客户端视图：来源 IP、版本、流量。版本需握手加字段（两端）。之后按客户端屏蔽 + 限速在此操作。',
       'srv.block':'屏蔽客户端','srv.blockDesc':'在 accept 处按客户端 IP/身份拒绝。中等量；监听侧加黑名单。',
-      'srv.rateLimit':'按客户端限速','srv.rateLimitDesc':'按客户端隧道限带宽。需流量整形数据面 —— 大工程，与设备限速一并跟踪。',
+      'srv.rateLimit':'按客户端限速','srv.rateLimitDesc':'按客户端限带宽已可用 —— 在「用户策略 → 设备分配」的「限速 (kbps)」列填写（服务端按连接的客户端 IP 生效）。数据面：令牌桶（UDP policing），无需 eBPF。',
     },
   };
   let lang = localStorage.getItem('mirage_lang') || ((navigator.language||'').toLowerCase().startsWith('zh') ? 'zh' : 'en');
@@ -710,6 +710,7 @@
   window.setDevCidr=(i,v)=>{deviceProfiles[i].source_ip_cidr=v.split(',').map(s=>s.trim()).filter(Boolean);};
   window.setDevProfile=(i,v)=>{deviceProfiles[i].profile=v;};
   window.setDevName=(i,v)=>{deviceProfiles[i].name=v;};
+  window.setDevRate=(i,v)=>{const n=parseInt(v,10);if(Number.isInteger(n)&&n>0)deviceProfiles[i].rate_limit_kbps=n;else delete deviceProfiles[i].rate_limit_kbps;};
   function renderProfiles(){
     const c=document.getElementById('profilesContainer2');
     const obOpts=profOutbounds.map(o=>`<option value="${esc(o)}"></option>`).join('');
@@ -726,8 +727,8 @@
     // device assignments
     const psel=(cur)=>`<option value="">—</option>`+names.map(n=>`<option value="${esc(n)}"${n===cur?' selected':''}>${esc(n)}</option>`).join('');
     html+=`<div class="sub-head" style="margin-top:20px">${t('prof.assignments')} <button class="btn-add" style="margin-left:8px" onclick="addDeviceAssign()">+</button></div>`;
-    html+=deviceProfiles.length?`<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>${t('prof.devName')}</th><th>${t('prof.devCidr')}</th><th>${t('prof.devProfile')}</th><th class="r"></th></tr></thead><tbody>`+
-      deviceProfiles.map((d,i)=>`<tr><td><input value="${esc(d.name||'')}" placeholder="—" oninput="setDevName(${i},this.value)" class="devsel" style="width:120px"></td><td><input value="${esc((d.source_ip_cidr||[]).join(', '))}" placeholder="192.168.1.20/32" oninput="setDevCidr(${i},this.value)" class="devsel mono" style="width:180px"></td><td><select class="devsel" onchange="setDevProfile(${i},this.value)">${psel(d.profile)}</select></td><td class="r"><button class="btn-remove" onclick="rmDeviceAssign(${i})">${t('btn.delete')}</button></td></tr>`).join('')+
+    html+=deviceProfiles.length?`<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>${t('prof.devName')}</th><th>${t('prof.devCidr')}</th><th>${t('prof.devProfile')}</th><th>${t('prof.devRate')}</th><th class="r"></th></tr></thead><tbody>`+
+      deviceProfiles.map((d,i)=>`<tr><td><input value="${esc(d.name||'')}" placeholder="—" oninput="setDevName(${i},this.value)" class="devsel" style="width:120px"></td><td><input value="${esc((d.source_ip_cidr||[]).join(', '))}" placeholder="192.168.1.20/32" oninput="setDevCidr(${i},this.value)" class="devsel mono" style="width:180px"></td><td><select class="devsel" onchange="setDevProfile(${i},this.value)">${psel(d.profile)}</select></td><td><input type="number" min="0" value="${d.rate_limit_kbps||''}" placeholder="—" oninput="setDevRate(${i},this.value)" class="devsel" style="width:90px" title="${t('prof.devRateHint')}"></td><td class="r"><button class="btn-remove" onclick="rmDeviceAssign(${i})">${t('btn.delete')}</button></td></tr>`).join('')+
       `</tbody></table></div>`:`<div class="empty">${t('prof.noAssign')}</div>`;
     c.innerHTML=html;
   }

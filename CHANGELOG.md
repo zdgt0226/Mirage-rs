@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### feat(webui): 限速旋钮接后端 —— 设备分配加 rate_limit_kbps 列 + 清过时 stub
+
+限速数据面 (用户态令牌桶: TCP 整形 · UDP policing 全路径含 SOCKS/transparent/服务端/mux) 早已做,
+但 WebUI 只有"需新数据面/planned"的**过时 stub**、设备分配编辑器也没暴露速率旋钮。本次补齐 UX:
+- Admin → 用户策略 → 设备分配表新增 **「限速 (kbps)」** 列 (0/空=不限; 客户端按设备源 IP、服务端按
+  连接的客户端 IP), 经已有 `/api/profiles` pass-through 写 `device_profiles.rate_limit_kbps`。
+- 两张"planned"stub 卡改为"已启用 —— 在下方填 kbps", 描述订正 (数据面是用户态令牌桶, 无需 eBPF)。
+- 纯前端 (`src/api/index.html`) + i18n 中英; 后端零改动 (schema/enforce/API 均已就绪)。
+- 实测: 同源 POST rate_limit_kbps → HTTP 200 written, GET round-trip + 磁盘 config 写入确认。
+
 ## [v0.12.1] - tcp-brutal 2.0 groups 适配 (服务端按客户端分组) + 多模型审计加固 (2026-09-07)
 
 ### feat(brutal): 适配 tcp-brutal 2.0 groups —— 服务端按客户端分组共享总速率
