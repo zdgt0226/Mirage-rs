@@ -365,7 +365,6 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] 配置工具链 (`check` / `format` / `import` + urltest 建组 / `test` 节点握手测活) + 启动时配置校验
 - [x] 入站认证 (SOCKS5 / HTTP), 修默认开放代理
 - [x] DNS: 可选劫持 (接管 LAN 53/UDP+TCP, 默认关) · 静态解析 (类 dnsmasq, 精确+子域) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回) (v0.6.1)
-- [x] **DNS 规则层** (`advanced_dns.rules`, 主路由前置首匹配) —— 按域名 (`suffix`/`keyword`/`regex`/`full` 类型化匹配, 复用 `DomainMatcher`) 决定动作: `reject` (NODATA, 类广告拦截) · `block` (NXDOMAIN) · `direct` (真实解析直连绕代理) · `fakeip` (强制走代理)。`fakeip.exclude` 为其 `direct` 动作的便捷子集。不匹配落回 routing/auto_classify
 - [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
 - [x] **MSS clamp** —— 内联 `tc_divert` (`clamp_tcp_mss`), MTU 自动探测网卡下发 (`max_mss = mtu-40`, PPPoE 1492), 覆盖直连转发路径, 防小 MTU 链路 PMTU 黑洞 ("小请求通、大下载卡"); `verify_mss_clamp.sh` CI 验证
 - [x] **cipher agility** (v0.7.0) —— 两端有 AES-NI 时协商 AES-256-GCM (比 ChaCha20 快 ~2.1x), 否则回落 ChaCha20; 协商全在加密信道内 (proto_ver 0x02 + CIPHER_NEGO/ACK), ClientHello 零触碰不改指纹; 服务端 `tuning.cipher_agility` 开关 (默认关=向后兼容)
