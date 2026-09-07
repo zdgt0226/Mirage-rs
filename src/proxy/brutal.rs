@@ -14,7 +14,7 @@
 //! 当前 helper 只做静态 setsockopt; 客户端的动态速率调节 (基于 BPF RTT
 //! 反馈) 仍在 src/proxy/pool.rs 里独立维护.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 // 自适应回落参数. 服务端默认启用 brutal, 但部分链路 (国内访问跨洲 CDN 等)
@@ -62,7 +62,7 @@ pub fn set_brutal_on_listener(fd: i32) {
 /// tcp-brutal 内核模块版本 (getsockopt TCP_BRUTAL_VERSION=23302 → major<<16|minor<<8|patch)。
 /// 全局探测一次并缓存。返回 0 = 探测失败 / v1 模块无此 getsockopt (即无 groups 支持)。
 fn brutal_module_version(fd: i32) -> u32 {
-    static VER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+    static VER: AtomicU32 = AtomicU32::new(u32::MAX);
     const TCP_BRUTAL_VERSION: libc::c_int = 23302;
     let cached = VER.load(Ordering::Relaxed);
     if cached != u32::MAX {
@@ -79,14 +79,33 @@ fn brutal_module_version(fd: i32) -> u32 {
             &mut len,
         )
     };
-    let ver = if r == 0 { v } else { 0 }; // getsockopt 失败 = v1 (无 23302) = 无 groups
-    VER.store(ver, Ordering::Relaxed);
-    ver
+    if r == 0 {
+        VER.store(v, Ordering::Relaxed); // 只缓存成功探测的真实版本
+        v
+    } else {
+        // 多模型审计 (sonnet P3): **不缓存失败**。首条 accept 连接可能 CC 尚未 install →
+        // getsockopt(23302) 落到 tcp_prot 返 -ENOPROTOOPT 的瞬时失败; 若把它永久缓存成 0,
+        // 会把真 2.0 模块误钉成 v1, 整进程静默退回 per-socket (重现 N× 超发)。留 u32::MAX 让
+        // 下条连接重探; 真 v1 模块每连接各失败一次 (µs 级可忽略), 但绝不把 v2 误判成 v1。
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "brutal 版本探测失败 (getsockopt TCP_BRUTAL_VERSION), 本连接暂按 v1 per-socket, \
+                 后续连接重试。若模块确为 v1 属正常; 若为 2.0 则本条连接不分组。"
+            );
+        }
+        0 // 本次按 v1 处理, 不写缓存
+    }
 }
 
 /// 客户端身份 → brutal group_id (源 IP hash, 非零)。tcp-brutal 2.0: 同 group_id 的连接
 /// **共享一个总速率**, 故服务端把一个客户端的所有连接归一组 → 该客户端下载总量 = brutal_rate
 /// (而非每连接各 rate 并发聚合 N× 超发)。见 tcp-brutal 2.0 README「groups」。
+///
+/// ⚠️ **已知取舍 (多模型审计 sonnet P2)**: 握手前只有源 IP 可用作身份。CGNAT / 校园-办公 NAT 下
+/// 多个互不相关的真实客户端共享同一出口 IP 会被并入**同一 group**, 聚合总量被压到单份 `brutal_rate`
+/// 配额。这是"用 IP 近似身份"的固有代价, 非 bug —— Mirage 服务端 brutal_rate 本就是全局单值 (非
+/// 每客户端配置), 且 brutal 定位是好链路性能腿; 真需按真实身份分组须移到握手后按 token 分, 当前不做。
 pub fn group_id_for_ip(ip: std::net::IpAddr) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
