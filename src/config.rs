@@ -761,10 +761,15 @@ pub struct FakeIpConfig {
     /// 不设 = 纯内存 (向后兼容)。install.sh 网关模式默认填 /var/lib/mirage-rs/fakeip.cache。
     #[serde(default)]
     pub persist_path: Option<String>,
-    /// fake-ip 排除域名列表。fake-ip 开启后默认接管全部代理域名解析; 列在此的域名 (精确或
-    /// **子域后缀**匹配, 如 `"apple.com"` 覆盖 `apple.com` 与 `*.apple.com`) **不分配 fake-IP**,
-    /// DNS 改走真实解析 (cn/direct resolver) → 客户端直连真实 IP, 绕过代理隧道。用于把某些
-    /// 域名/服务排除在代理之外 (如内网服务、想直连的 CDN、fake-IP 下行为异常的站点)。大小写不敏感。
+    /// fake-ip 排除域名列表。fake-ip 开启后默认接管全部代理域名解析; 命中的域名**不分配 fake-IP**,
+    /// DNS 改走真实解析 (cn/direct resolver) → 客户端直连真实 IP, 绕过代理隧道。用于把某些域名/服务
+    /// 排除在代理之外 (如内网服务、想直连的 CDN、fake-IP 下行为异常的站点)。
+    ///
+    /// 支持 Clash 风格类型前缀 (大小写不敏感):
+    ///   - `"apple.com"` / `"suffix:apple.com"` / `"*.apple.com"` / `".apple.com"` —— 后缀 (根域 + 子域); 裸串默认此类
+    ///   - `"keyword:google"` —— 子串包含
+    ///   - `"regex:.*\\.cn$"` —— 正则整串 (忽略大小写, 非法项跳过并 WARN)
+    ///   - `"full:example.com"` / `"domain:example.com"` —— 精确整域
     #[serde(default)]
     pub exclude: Vec<String>,
 }
