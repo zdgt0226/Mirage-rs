@@ -221,6 +221,19 @@ impl ConfigWatcher {
                 tracing::info!("advanced_dns.static: 已加载 {} 条静态解析 (最长域名优先匹配)", cached_static.len());
             }
             adv.cached_static = cached_static;
+
+            // DNS 规则层预编译: 每条 rules[] 的域名列表编成 DomainMatcher (suffix/keyword/regex/full)。
+            adv.cached_dns_rules = adv
+                .rules
+                .iter()
+                .map(|r| crate::config::CompiledDnsRule {
+                    matcher: crate::dns::domain_match::DomainMatcher::from_rules(r.domains.clone()),
+                    action: r.action,
+                })
+                .collect();
+            if !adv.cached_dns_rules.is_empty() {
+                tracing::info!("advanced_dns.rules: 已加载 {} 条 DNS 规则 (首匹配生效, 主路由前置)", adv.cached_dns_rules.len());
+            }
         }
 
         let auto_classify = crate::dns::server::AutoClassify::from_config(
