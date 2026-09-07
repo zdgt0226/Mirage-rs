@@ -551,6 +551,36 @@ pub struct RuleConfig {
     pub process_name: Vec<String>,
 }
 
+/// DNS 规则动作 (advanced_dns.rules)。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsAction {
+    /// 空答复 (NODATA): 该域名不解析 (类广告拦截, 不返 IP 也不报错)。
+    Reject,
+    /// NXDOMAIN: 域名不存在。
+    Block,
+    /// 真实解析 (cn/direct resolver), 不给 fake-IP → 客户端直连真实 IP、绕过代理。
+    Direct,
+    /// 强制 fake-IP (即使会路由直连) → 走代理。
+    Fakeip,
+}
+
+/// 一条 DNS 规则 (config `advanced_dns.rules[]`)。
+#[derive(Debug, Deserialize)]
+pub struct DnsRuleConfig {
+    /// 域名规则列表, 支持类型前缀 (suffix/keyword/regex/full, 见 dns::domain_match)。单值或数组。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domains: Vec<String>,
+    pub action: DnsAction,
+}
+
+/// rules 预编译结果 (运行时): 域名匹配器 + 动作。
+#[derive(Debug)]
+pub struct CompiledDnsRule {
+    pub matcher: crate::dns::domain_match::DomainMatcher,
+    pub action: DnsAction,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdvancedDnsConfig {
 
@@ -572,6 +602,14 @@ pub struct AdvancedDnsConfig {
     /// static_hosts 预处理结果: (小写域名, IP 列表), 按域名长度降序 (最长/最具体优先)。
     #[serde(skip)]
     pub cached_static: Vec<(String, Vec<std::net::IpAddr>)>,
+    /// DNS 规则层 (有序, 首匹配生效): 按域名 (suffix/keyword/regex/full, 见 DomainMatcher) 决定
+    /// 解析动作, 作主路由**前置过滤**。不匹配任何规则则落回现有逻辑 (routing/auto_classify)。
+    /// static_hosts 优先级更高 (先于本规则层)。
+    #[serde(default)]
+    pub rules: Vec<DnsRuleConfig>,
+    /// rules 预编译结果 (DomainMatcher + action)。
+    #[serde(skip)]
+    pub cached_dns_rules: Vec<CompiledDnsRule>,
     /// DNS 应答 IP 版本策略 (见 IpStrategy)。默认 dual (A/AAAA 都应答)。
     #[serde(default)]
     pub ip_strategy: IpStrategy,

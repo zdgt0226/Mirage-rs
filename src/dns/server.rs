@@ -717,6 +717,33 @@ impl DnsForwarder {
         make_empty_response(req).or_else(|| Some(make_nxdomain(req)))
     }
 
+    /// 真实解析 (cn/direct resolver): 不给 fake-IP → 客户端拿真实 IP 直连、绕过代理。
+    /// 与 Direct 出站分支一致: 尊重 IP 策略硬抑制 + DNS 缓存。fakeip.exclude 与 rules 的 Direct 动作共用。
+    async fn resolve_direct(
+        &self,
+        req: &[u8],
+        domain: &str,
+        qtype: u16,
+        ip_strategy: crate::config::IpStrategy,
+        cn_dns: &[(SocketAddr, crate::config::DnsProtocol)],
+    ) -> Option<Vec<u8>> {
+        if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
+            debug!("[DNS] direct-real [{}] → qtype {} 被 IP 策略 {:?} 抑制 (NODATA)", domain, qtype, ip_strategy);
+            return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+        }
+        let dk = domain.to_lowercase();
+        if let Some(cache) = &self.cache {
+            if let Some(hit) = cache.get(&dk, qtype, req) {
+                return Some(hit);
+            }
+        }
+        let resp = direct_query(req, cn_dns).await;
+        if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+            cache.put(&dk, qtype, r);
+        }
+        resp.or_else(|| Some(make_nxdomain(req)))
+    }
+
     /// 后台 (非阻塞) 交叉校验: 经隧道可信解析 `query` 的域名; 若首个 A 判为**海外** (即国内那次
     /// 判 CN 是污染) → `mark_foreign`, 下次该域名走 fakeip。leaf 非 Mirage / 隧道失败 → 静默不动。
     fn spawn_cn_verify(
@@ -858,27 +885,30 @@ impl DnsForwarder {
             ];
         }
 
-        // fake-ip 排除名单 (config `fakeip.exclude`): 命中的域名**不分配 fake-IP**, 直接走真实解析
-        // (cn/direct resolver), 客户端拿真 IP 直连、绕过代理隧道。在路由前统一拦, 覆盖 Mirage/
-        // auto_classify 等所有会给 fake-IP 的分支。与 Direct 分支同样尊重 IP 策略硬抑制 + DNS 缓存。
+        // DNS 规则层 (advanced_dns.rules, 有序首匹配, 主路由前置): 按域名 (suffix/keyword/regex/full)
+        // 决定动作。命中即返回, 不落入 routing/auto_classify。static_hosts 优先级更高 (已在上方)。
+        let dns_action = st.advanced_dns.as_ref().and_then(|adv| {
+            adv.cached_dns_rules
+                .iter()
+                .find(|r| r.matcher.matches(&domain))
+                .map(|r| r.action)
+        });
+        if let Some(action) = dns_action {
+            use crate::config::DnsAction;
+            debug!("[DNS] rule    [{}] → {:?}", domain, action);
+            return match action {
+                DnsAction::Reject => make_empty_response(req).or_else(|| Some(make_nxdomain(req))),
+                DnsAction::Block => Some(make_nxdomain(req)),
+                DnsAction::Direct => self.resolve_direct(req, &domain, qtype, ip_strategy, &cn_dns).await,
+                DnsAction::Fakeip => self.answer_fakeip(req, &domain, qtype),
+            };
+        }
+
+        // fake-ip 排除名单 (config `fakeip.exclude`): 命中即真实解析 (等价于一条 Direct 规则, 保留兼容)。
+        // 覆盖所有会给 fake-IP 的分支 (Mirage/auto_classify), 在路由前统一拦。
         if self.fake_ip_mapper.as_ref().is_some_and(|m| m.is_excluded(&domain)) {
-            if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
-                debug!("[DNS] fakeip-excl [{}] → qtype {} 被 IP 策略 {:?} 抑制 (NODATA)", domain, qtype, ip_strategy);
-                return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
-            }
-            let dk = domain.to_lowercase();
-            if let Some(cache) = &self.cache {
-                if let Some(hit) = cache.get(&dk, qtype, req) {
-                    debug!("[DNS] fakeip-excl [{}] → cache hit", domain);
-                    return Some(hit);
-                }
-            }
-            debug!("[DNS] fakeip-excl [{}] → 真实解析 (排除名单) via {:?}", domain, cn_dns);
-            let resp = direct_query(req, &cn_dns).await;
-            if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                cache.put(&dk, qtype, r);
-            }
-            return resp.or_else(|| Some(make_nxdomain(req)));
+            debug!("[DNS] fakeip-excl [{}] → 真实解析 (排除名单)", domain);
+            return self.resolve_direct(req, &domain, qtype, ip_strategy, &cn_dns).await;
         }
 
         let routing_req = RoutingRequest {

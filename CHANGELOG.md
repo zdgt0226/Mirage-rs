@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### feat(dns): DNS 规则层 `advanced_dns.rules` (域名 → 动作, 主路由前置)
+
+有序 DNS 规则层 (首匹配生效, 作主路由/auto_classify 的**前置过滤**): 按域名类型化匹配
+(`suffix`/`keyword`/`regex`/`full`, 复用 [[DomainMatcher]]) → 动作:
+- `reject` —— 空答复 NODATA (不返 IP 不报错, 类广告拦截)
+- `block` —— NXDOMAIN
+- `direct` —— 真实解析 (cn/direct resolver), 不给 fake-IP → 客户端直连真实 IP、绕过代理
+- `fakeip` —— 强制 fake-IP (即使会路由直连) → 走代理
+
+`static_hosts` 优先级更高 (先于本层); 不匹配任何规则则落回现有 routing/auto_classify。
+`fakeip.exclude` 现等价于一条 `direct` 规则的便捷写法 (保留兼容, 复用同一真实解析路径)。
+- 复用 v0.6.9 移除的 `advanced_dns.rules` 键名, 这次**真正实现** (当年是未接线 stub)。
+- 实机 dig 验 5 动作 (block→NXDOMAIN · reject→NODATA · direct→真实A · fakeip→198.18.x · 默认→路由 fakeip)。
+- `config.rs` `DnsRuleConfig`/`DnsAction`/`CompiledDnsRule`; `config_watcher` 预编译; `dns::server`
+  路由前拦截 + 抽出 `resolve_direct` 助手 (exclude 与 direct 共用)。
+
 ### feat(dns): 域名匹配增强 —— fakeip.exclude 支持 suffix/keyword/regex/full
 
 `fakeip.exclude` 从纯后缀升级为**类型化规则匹配** (Clash 风格前缀, 大小写不敏感):
