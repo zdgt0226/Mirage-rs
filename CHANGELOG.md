@@ -14,6 +14,11 @@ install.sh 现装的 tcp-brutal 已是 2.0。适配其 **groups** 特性: **服�
   `set_brutal_rate(.., 0)` 不分组。rules/brutalctl/`ip route proto 233` 不吸收 (透明路由用, 与 Mirage
   userspace per-socket setsockopt 模型不匹配)。
 - 新增 group_id 单测 (确定性/非零/不同 IP 不同组); brutal 9 测 + `cargo test` 全绿。
+- **多模型审计 (opus/sonnet/haiku 独立复核, 对照内核 `brutal.h`/`brutal_sockopt.c`)**: ABI 逐字节匹配
+  (内核自带 `BUILD_BUG_ON(sizeof != 20)`)、packed 整体取引用无 UB、client group_id=0 回落无 regression,
+  一致判无阻断。采纳两项加固: ① **版本探测失败不再永久缓存** (sonnet P3: 首连接 CC 未 install 的瞬时
+  getsockopt 失败若被缓存会把真 2.0 误钉成 v1、静默退回 N× 超发 —— 改为只缓存成功探测, 失败留待下条
+  连接重探 + WARN 一次); ② 注释标注 **CGNAT/共享 IP 多客户端归一组会聚合限速**的已知取舍 (sonnet P2)。
 
 ## [v0.12.0] - 填充整形抗 TLS-in-TLS 统计指纹 (A/B') + install/文档对齐 (2026-09-06)
 
