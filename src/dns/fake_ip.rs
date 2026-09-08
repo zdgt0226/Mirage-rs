@@ -72,14 +72,14 @@ impl FakeIpMapper {
         Ok(mapper)
     }
 
-    /// 链式设排除名单 (config `fakeip.exclude`)。支持类型化规则 (suffix/keyword/regex/full,
-    /// 裸串=suffix 向后兼容), 见 [`crate::dns::domain_match::DomainMatcher`]。
-    pub fn with_exclude(mut self, exclude: Vec<String>) -> Self {
-        self.exclude = crate::dns::domain_match::DomainMatcher::from_rules(exclude);
+    /// 链式设排除名单 (config `fakeip.exclude`, 结构化 domain/suffix/keyword/regex),
+    /// 见 [`crate::dns::domain_match::DomainMatcher`]。
+    pub fn with_exclude(mut self, exclude: &crate::config::DomainRuleSet) -> Self {
+        self.exclude = crate::dns::domain_match::DomainMatcher::from_ruleset(exclude);
         self
     }
 
-    /// 域名是否在 fake-ip 排除名单 (suffix/keyword/regex/full 任一命中)。命中者不给 fake-IP,
+    /// 域名是否在 fake-ip 排除名单 (domain/suffix/keyword/regex 任一命中)。命中者不给 fake-IP,
     /// DNS 返真实解析 (见 dns::server::process_query)。
     pub fn is_excluded(&self, domain: &str) -> bool {
         self.exclude.matches(domain)
@@ -398,25 +398,28 @@ mod exclude_tests {
     use super::FakeIpMapper;
 
     #[test]
-    fn exclude_exact_and_subdomain_ci() {
-        let m = FakeIpMapper::new("198.18.0.0/16").unwrap()
-            .with_exclude(vec!["Apple.com".into(), ".example.org".into(), "*.lan".into(), "  ".into()]);
+    fn exclude_via_ruleset() {
+        let rs = crate::config::DomainRuleSet {
+            domain: vec![],
+            domain_suffix: vec!["Apple.com".into(), ".example.org".into(), "*.lan".into(), "  ".into()],
+            domain_keyword: vec![],
+            domain_regex: vec![],
+        };
+        let m = FakeIpMapper::new("198.18.0.0/16").unwrap().with_exclude(&rs);
         // `*.lan` 通配前缀规整为根域 `lan` → 匹配 lan 及其子域
         assert!(m.is_excluded("nas.lan"));
         assert!(m.is_excluded("lan"));
-        // 精确 + 大小写不敏感
+        // 后缀 + 大小写不敏感 + 子域
         assert!(m.is_excluded("apple.com"));
         assert!(m.is_excluded("APPLE.COM"));
-        // 子域后缀
         assert!(m.is_excluded("gateway.icloud.apple.com"));
-        assert!(m.is_excluded("www.example.org")); // 首点已规整
-        // 尾点 (FQDN) 也匹配
-        assert!(m.is_excluded("apple.com."));
-        // 非命中: 不同域 / 仅子串不算 (必须点边界)
+        assert!(m.is_excluded("www.example.org"));
+        assert!(m.is_excluded("apple.com.")); // FQDN 尾点
+        // 非命中
         assert!(!m.is_excluded("apple.com.evil.net"));
         assert!(!m.is_excluded("notapple.com"));
         assert!(!m.is_excluded("google.com"));
-        // 空项被过滤, 空名单不误伤
+        // 空名单不误伤
         let empty = FakeIpMapper::new("198.18.0.0/16").unwrap();
         assert!(!empty.is_excluded("apple.com"));
     }

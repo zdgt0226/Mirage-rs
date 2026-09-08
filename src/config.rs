@@ -761,17 +761,45 @@ pub struct FakeIpConfig {
     /// 不设 = 纯内存 (向后兼容)。install.sh 网关模式默认填 /var/lib/mirage-rs/fakeip.cache。
     #[serde(default)]
     pub persist_path: Option<String>,
-    /// fake-ip 排除域名列表。fake-ip 开启后默认接管全部代理域名解析; 命中的域名**不分配 fake-IP**,
+    /// fake-ip 排除域名规则。fake-ip 开启后默认接管全部代理域名解析; 命中的域名**不分配 fake-IP**,
     /// DNS 改走真实解析 (cn/direct resolver) → 客户端直连真实 IP, 绕过代理隧道。用于把某些域名/服务
     /// 排除在代理之外 (如内网服务、想直连的 CDN、fake-IP 下行为异常的站点)。
     ///
-    /// 支持 Clash 风格类型前缀 (大小写不敏感):
-    ///   - `"apple.com"` / `"suffix:apple.com"` / `"*.apple.com"` / `".apple.com"` —— 后缀 (根域 + 子域); 裸串默认此类
-    ///   - `"keyword:google"` —— 子串包含
-    ///   - `"regex:.*\\.cn$"` —— 正则整串 (忽略大小写, 非法项跳过并 WARN)
-    ///   - `"full:example.com"` / `"domain:example.com"` —— 精确整域
+    /// 结构化格式, 字段命名对齐 `routing.rules` (见 [`DomainRuleSet`]):
+    /// `domain` (精确) / `domain_suffix` (根域+子域) / `domain_keyword` (子串) / `domain_regex` (正则)。
     #[serde(default)]
-    pub exclude: Vec<String>,
+    pub exclude: DomainRuleSet,
+}
+
+/// 一组域名匹配规则 (结构化)。字段命名对齐 `routing.rules` 的域名维度, `domain` 取 sing-box 风格
+/// 精确整域 (非其他工具少见的 `domain_full`)。运行时编成 [`crate::dns::domain_match::DomainMatcher`]。
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct DomainRuleSet {
+    /// 精确整域 (如 `router.lan` 只匹配 `router.lan`, 不含子域)。单值或数组。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain: Vec<String>,
+    /// 后缀: 根域 + 子域 (如 `apple.com` 匹配 `apple.com` 与 `*.apple.com`)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain_suffix: Vec<String>,
+    /// 子串包含 (域名任意位置含该关键字)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain_keyword: Vec<String>,
+    /// 正则整串匹配 (忽略大小写; 非法项跳过并 WARN)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub domain_regex: Vec<String>,
+}
+
+impl DomainRuleSet {
+    pub fn is_empty(&self) -> bool {
+        self.domain.is_empty()
+            && self.domain_suffix.is_empty()
+            && self.domain_keyword.is_empty()
+            && self.domain_regex.is_empty()
+    }
+    /// 规则总条数 (供日志)。
+    pub fn len(&self) -> usize {
+        self.domain.len() + self.domain_suffix.len() + self.domain_keyword.len() + self.domain_regex.len()
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -320,7 +320,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     if fakeip.enabled {
                         match crate::dns::fake_ip::FakeIpMapper::with_persist(&fakeip.inet4_range, fakeip.persist_path.clone()) {
                             Ok(mapper) => {
-                                let mapper = mapper.with_exclude(fakeip.exclude.clone());
+                                let mapper = mapper.with_exclude(&fakeip.exclude);
                                 info!(
                                     "Fake-IP Mapper initialized with range {} (persist: {}, exclude: {})",
                                     fakeip.inet4_range,
