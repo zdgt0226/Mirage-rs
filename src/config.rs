@@ -572,6 +572,14 @@ pub struct AdvancedDnsConfig {
     /// static_hosts 预处理结果: (小写域名, IP 列表), 按域名长度降序 (最长/最具体优先)。
     #[serde(skip)]
     pub cached_static: Vec<(String, Vec<std::net::IpAddr>)>,
+    /// DNS 规则层 (有序首匹配): 按域名 (DomainRuleSet) 选 DNS 出口 (resolve cn/remote) /
+    /// 返静态 IP (host) / 空答复 (reject)。在 static_hosts 之后、fakeip.exclude/routing 之前。
+    /// **与 fake-ip 无关**: fakeip 关时也生效 (纯 DNS 选路/答复)。不匹配则落回现有逻辑。
+    #[serde(default)]
+    pub rules: Vec<DnsRuleConfig>,
+    /// rules 预编译结果 (matcher + action + server + host_ips)。
+    #[serde(skip)]
+    pub cached_dns_rules: Vec<CompiledDnsRule>,
     /// DNS 应答 IP 版本策略 (见 IpStrategy)。默认 dual (A/AAAA 都应答)。
     #[serde(default)]
     pub ip_strategy: IpStrategy,
@@ -769,6 +777,53 @@ pub struct FakeIpConfig {
     /// `domain` (精确) / `domain_suffix` (根域+子域) / `domain_keyword` (子串) / `domain_regex` (正则)。
     #[serde(default)]
     pub exclude: DomainRuleSet,
+}
+
+/// DNS 规则动作 (advanced_dns.rules)。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsRuleAction {
+    /// 选 DNS 出口解析 (真实 IP): 由 `server` 决定本地 cn 还是远端隧道。与 fake-ip 无关。
+    Resolve,
+    /// host 模式: 直接返回 `ip` 里的静态 IP (per-rule, 类 static_hosts 但走有序规则)。
+    Host,
+    /// 空答复 NODATA (广告拦截式, 不返 IP 也不报错)。
+    Reject,
+}
+
+/// DNS 解析出口选择 (advanced_dns.rules 的 `server`)。
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsServer {
+    /// 本地 cn/direct 上游 (114/223 等), 明文直查。
+    #[default]
+    Cn,
+    /// 远端 DNS 经隧道查 (default 出站的 Mirage 池, 防污染)。
+    Remote,
+}
+
+/// 一条 DNS 规则 (config `advanced_dns.rules[]`)。域名维度 flatten 复用 [`DomainRuleSet`]
+/// (与 routing.rules 同字段: domain/domain_suffix/domain_keyword/domain_regex)。
+#[derive(Debug, Deserialize)]
+pub struct DnsRuleConfig {
+    #[serde(flatten)]
+    pub domains: DomainRuleSet,
+    pub action: DnsRuleAction,
+    /// action=resolve 时选出口 (默认 cn)。
+    #[serde(default)]
+    pub server: DnsServer,
+    /// action=host 时返回的静态 IP (单值或数组, 混 v4/v6)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub ip: Vec<String>,
+}
+
+/// rules 预编译结果 (运行时)。
+#[derive(Debug)]
+pub struct CompiledDnsRule {
+    pub matcher: crate::dns::domain_match::DomainMatcher,
+    pub action: DnsRuleAction,
+    pub server: DnsServer,
+    pub host_ips: Vec<std::net::IpAddr>,
 }
 
 /// 一组域名匹配规则 (结构化)。字段命名对齐 `routing.rules` 的域名维度, `domain` 取 sing-box 风格

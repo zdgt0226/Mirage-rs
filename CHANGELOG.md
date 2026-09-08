@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### feat(dns): DNS 规则层 `advanced_dns.rules` (选路/host/reject, 与 fake-ip 无关)
+
+有序 DNS 规则层 (首匹配, static_hosts 之后 / routing 之前), **fakeip 关时也生效** —— 解决"不启用
+fake-ip 时也要按域名选 DNS 出口"。域名维度 flatten 复用 `DomainRuleSet` (与 routing.rules 同字段)。
+动作 (只做 routing 覆盖不到的非冗余 3 项):
+- `resolve` + `server: cn|remote` —— **选 DNS 出口**: 本地 cn_dns 明文 / 远端经隧道查 (防污染)。
+  routing 管流量出站、管不了用哪个 DNS server, 这是核心非冗余能力。
+- `host` + `ip: [...]` —— 直接返静态 IP (per-rule host 模式, 复用 static_answer, 支持混 v4/v6)。
+- `reject` —— NODATA 空答复 (广告拦截式)。
+
+实机 dig 验 (fakeip 关): resolve:cn→真实 A · host→静态 A/AAAA · reject→NODATA。remote 走现有
+dns_over_tunnel (default 出站 Mirage 池; 非 Mirage 回落 cn)。`config.rs` DnsRuleConfig/DnsRuleAction/
+DnsServer/CompiledDnsRule; `config_watcher` 预编译; `dns::server` 抽 `resolve_cn` 助手 (exclude 共用)。
+
 ### feat(dns): 域名匹配增强 —— fakeip.exclude 结构化 (对齐 routing.rules 字段命名)
 
 `fakeip.exclude` 升级为**结构化域名规则** (`DomainRuleSet`), 字段命名对齐 `routing.rules`,

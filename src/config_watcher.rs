@@ -221,6 +221,34 @@ impl ConfigWatcher {
                 tracing::info!("advanced_dns.static: 已加载 {} 条静态解析 (最长域名优先匹配)", cached_static.len());
             }
             adv.cached_static = cached_static;
+
+            // DNS 规则层预编译: 每条 rule 编 DomainMatcher + 解析 host IP。
+            adv.cached_dns_rules = adv
+                .rules
+                .iter()
+                .map(|r| {
+                    let host_ips = r
+                        .ip
+                        .iter()
+                        .filter_map(|s| match s.trim().parse::<std::net::IpAddr>() {
+                            Ok(ip) => Some(ip),
+                            Err(_) => {
+                                tracing::warn!("advanced_dns.rules: host IP `{}` 非法, 已跳过", s);
+                                None
+                            }
+                        })
+                        .collect();
+                    crate::config::CompiledDnsRule {
+                        matcher: crate::dns::domain_match::DomainMatcher::from_ruleset(&r.domains),
+                        action: r.action,
+                        server: r.server,
+                        host_ips,
+                    }
+                })
+                .collect();
+            if !adv.cached_dns_rules.is_empty() {
+                tracing::info!("advanced_dns.rules: 已加载 {} 条 DNS 规则 (首匹配, 选路/host/reject)", adv.cached_dns_rules.len());
+            }
         }
 
         let auto_classify = crate::dns::server::AutoClassify::from_config(

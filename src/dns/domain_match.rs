@@ -11,7 +11,7 @@
 use regex::RegexSet;
 use std::collections::HashSet;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct DomainMatcher {
     full: HashSet<String>,
     suffix: Vec<String>,
