@@ -563,6 +563,11 @@ pub struct AdvancedDnsConfig {
     pub cached_remote_host: Option<String>,
     #[serde(skip)]
     pub cached_remote_port: Option<u16>,
+    /// 全部 remote/proxy resolver (host, port), 供隧道-DNS **故障转移** (按序试, 失败换下一个)。
+    /// cached_remote_host/port = 其首个 (兼容 + 附带用途)。多 remote 只做 failover 不并发 race
+    /// (隧道路径 racing 每个各耗一条 WarmPool 隧道, 太贵)。
+    #[serde(skip)]
+    pub cached_remote_servers: Vec<(String, u16)>,
     /// 静态 DNS 解析 (类 dnsmasq `address=/domain/ip`): 域名 → 一个或多个 IP。
     /// 命中即直接回 A/AAAA, **绕过 fake-IP / 路由 / 上游** —— 该域名完全由本地接管。
     /// 匹配语义: 精确 + 子域 (`test.local` 同时命中 `api.test.local`), 最长键优先。

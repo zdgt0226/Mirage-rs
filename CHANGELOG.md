@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(dns): remote 多上游 failover + 境外解析 CN IP 自适应降级 cn (复用 auto_classify)
+
+- **remote 多 server**: `resolvers` 里多个 tag=remote/proxy 全收集, 隧道-DNS **故障转移** (按序试, 首成即返)。
+  非并发 race (隧道路径 racing 每个各耗一条 WarmPool 隧道, 太贵)。cn 侧多上游并发首应答早已支持。
+- **remote geoip 降级 (case ②)**: `resolve: remote` 查出的首个 A 若属 CN (geoip), 学习该域名 →
+  **后续降级走 cn 解析** (免隧道 + 就近), 本次仍返 remote 有效结果。**简化版: 不等第二个应答**
+  (remote 经隧道无污染, 单应答可信)。复用 `auto_classify` (其 `is_cn` geoip + 新增对称 `cn_learned`
+  TTL 缓存), 不另造临时表; 仅 auto_classify 开启时生效。
+- `AutoClassify` 加 `cn_learned` 缓存 (mark/is, 与 foreign 对称); `advanced_dns.cached_remote_servers`;
+  `dns_over_tunnel_ha` failover 助手 (rule + Mirage 分支共用)。cn_learned TTL/geoip 单测; cargo test 全绿。
+
 ### feat(dns): DNS 规则层 `advanced_dns.rules` (选路/host/reject, 与 fake-ip 无关)
 
 有序 DNS 规则层 (首匹配, static_hosts 之后 / routing 之前), **fakeip 关时也生效** —— 解决"不启用
