@@ -717,6 +717,32 @@ impl DnsForwarder {
         make_empty_response(req).or_else(|| Some(make_nxdomain(req)))
     }
 
+    /// 本地 cn/direct resolver 真实解析: 不给 fake-IP → 客户端拿真实 IP。尊重 IP 策略硬抑制 + DNS 缓存。
+    /// fakeip.exclude 与 rules 的 `resolve: cn` 共用。
+    async fn resolve_cn(
+        &self,
+        req: &[u8],
+        domain: &str,
+        qtype: u16,
+        ip_strategy: crate::config::IpStrategy,
+        cn_dns: &[(SocketAddr, crate::config::DnsProtocol)],
+    ) -> Option<Vec<u8>> {
+        if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
+            return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+        }
+        let dk = domain.to_lowercase();
+        if let Some(cache) = &self.cache {
+            if let Some(hit) = cache.get(&dk, qtype, req) {
+                return Some(hit);
+            }
+        }
+        let resp = direct_query(req, cn_dns).await;
+        if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+            cache.put(&dk, qtype, r);
+        }
+        resp.or_else(|| Some(make_nxdomain(req)))
+    }
+
     /// 后台 (非阻塞) 交叉校验: 经隧道可信解析 `query` 的域名; 若首个 A 判为**海外** (即国内那次
     /// 判 CN 是污染) → `mark_foreign`, 下次该域名走 fakeip。leaf 非 Mirage / 隧道失败 → 静默不动。
     fn spawn_cn_verify(
@@ -858,27 +884,73 @@ impl DnsForwarder {
             ];
         }
 
-        // fake-ip 排除名单 (config `fakeip.exclude`): 命中的域名**不分配 fake-IP**, 直接走真实解析
-        // (cn/direct resolver), 客户端拿真 IP 直连、绕过代理隧道。在路由前统一拦, 覆盖 Mirage/
-        // auto_classify 等所有会给 fake-IP 的分支。与 Direct 分支同样尊重 IP 策略硬抑制 + DNS 缓存。
-        if self.fake_ip_mapper.as_ref().is_some_and(|m| m.is_excluded(&domain)) {
-            if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
-                debug!("[DNS] fakeip-excl [{}] → qtype {} 被 IP 策略 {:?} 抑制 (NODATA)", domain, qtype, ip_strategy);
-                return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
-            }
-            let dk = domain.to_lowercase();
-            if let Some(cache) = &self.cache {
-                if let Some(hit) = cache.get(&dk, qtype, req) {
-                    debug!("[DNS] fakeip-excl [{}] → cache hit", domain);
-                    return Some(hit);
+        // DNS 规则层 (advanced_dns.rules, 有序首匹配, 与 fake-ip 无关): 选路 (cn/remote) / host / reject。
+        // 在 static_hosts 之后、fakeip.exclude/routing 之前。命中即返回, 不落入路由。
+        enum DnsRuleHit {
+            Reject,
+            Host(Vec<std::net::IpAddr>),
+            ResolveCn,
+            ResolveRemote(Arc<WarmPool>),
+        }
+        let rule_hit = st.advanced_dns.as_ref().and_then(|adv| {
+            adv.cached_dns_rules.iter().find(|r| r.matcher.matches(&domain)).map(|r| {
+                use crate::config::{DnsRuleAction, DnsServer};
+                match r.action {
+                    DnsRuleAction::Reject => DnsRuleHit::Reject,
+                    DnsRuleAction::Host => DnsRuleHit::Host(r.host_ips.clone()),
+                    DnsRuleAction::Resolve => match r.server {
+                        DnsServer::Cn => DnsRuleHit::ResolveCn,
+                        // remote: 用 default 出站的 Mirage 池经隧道查; default 非 Mirage 则回落 cn。
+                        DnsServer::Remote => st
+                            .outbounds
+                            .get(st.router.default_outbound())
+                            .map(|n| n.resolve_leaf())
+                            .and_then(|n| match &*n {
+                                OutboundNode::Mirage { pool, .. } => Some(pool.clone()),
+                                _ => None,
+                            })
+                            .map_or(DnsRuleHit::ResolveCn, DnsRuleHit::ResolveRemote),
+                    },
+                }
+            })
+        });
+        if let Some(hit) = rule_hit {
+            drop(st); // 已取出所需 (clone), 释放 guard 再 await
+            match hit {
+                DnsRuleHit::Reject => {
+                    debug!("[DNS] rule    [{}] → reject (NODATA)", domain);
+                    return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
+                }
+                DnsRuleHit::Host(ips) => {
+                    debug!("[DNS] rule    [{}] → host {:?}", domain, ips);
+                    return static_answer(req, qtype, &ips, ip_strategy).or_else(|| Some(make_nxdomain(req)));
+                }
+                DnsRuleHit::ResolveCn => {
+                    debug!("[DNS] rule    [{}] → resolve cn via {:?}", domain, cn_dns);
+                    return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
+                }
+                DnsRuleHit::ResolveRemote(pool) => {
+                    let dk = domain.to_lowercase();
+                    if let Some(cache) = &self.cache {
+                        if let Some(hit) = cache.get(&dk, qtype, req) {
+                            return Some(hit);
+                        }
+                    }
+                    debug!("[DNS] rule    [{}] → resolve remote (隧道) {}:{}", domain, remote_dns_host, remote_dns_port);
+                    let resp = Self::dns_over_tunnel(req, &pool, &remote_dns_host, remote_dns_port).await;
+                    if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+                        cache.put(&dk, qtype, r);
+                    }
+                    return Some(resp.unwrap_or_else(|| make_nxdomain(req)));
                 }
             }
-            debug!("[DNS] fakeip-excl [{}] → 真实解析 (排除名单) via {:?}", domain, cn_dns);
-            let resp = direct_query(req, &cn_dns).await;
-            if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                cache.put(&dk, qtype, r);
-            }
-            return resp.or_else(|| Some(make_nxdomain(req)));
+        }
+
+        // fake-ip 排除名单 (config `fakeip.exclude`): 命中即真实解析 (等价一条 resolve:cn 规则, 保留兼容)。
+        // 覆盖所有会给 fake-IP 的分支 (Mirage/auto_classify), 在路由前统一拦。
+        if self.fake_ip_mapper.as_ref().is_some_and(|m| m.is_excluded(&domain)) {
+            debug!("[DNS] fakeip-excl [{}] → 真实解析 (排除名单)", domain);
+            return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
         }
 
         let routing_req = RoutingRequest {
