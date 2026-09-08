@@ -133,6 +133,9 @@ pub struct AutoClassify {
     ttl: std::time::Duration,
     cn_cidrs: Vec<ipnet::IpNet>,
     foreign: std::sync::Mutex<ForeignCache>,
+    /// 学习为"应走 cn 解析"的域名 (带 TTL)。remote 选路查出首个 A 属 CN → 学此表, 后续该域名
+    /// 改用 cn 解析 (case ②: 境外解析出国内域名 → 降级 cn, 免隧道 + 就近)。与 foreign 对称。
+    cn_learned: std::sync::Mutex<ForeignCache>,
     /// 国内判 CN 时后台隧道交叉校验 (非阻塞, 污染则标记海外供下次)。
     verify_async: bool,
 }
@@ -174,6 +177,10 @@ impl AutoClassify {
                         map: std::collections::HashMap::new(),
                         cap: ac.max_entries.max(1),
                     }),
+                    cn_learned: std::sync::Mutex::new(ForeignCache {
+                        map: std::collections::HashMap::new(),
+                        cap: ac.max_entries.max(1),
+                    }),
                     verify_async: ac.verify_cn == crate::config::VerifyCn::Async,
                 }))
             }
@@ -210,6 +217,34 @@ impl AutoClassify {
     fn mark_foreign(&self, domain: &str) {
         let now = std::time::Instant::now();
         let mut g = self.foreign.lock().unwrap_or_else(|e| e.into_inner());
+        if g.map.len() >= g.cap {
+            g.map.retain(|_, exp| *exp > now);
+            if g.map.len() >= g.cap {
+                if let Some(k) = g.map.keys().next().cloned() {
+                    g.map.remove(&k);
+                }
+            }
+        }
+        g.map.insert(domain.to_string(), now + self.ttl);
+    }
+
+    /// 域名是否已学习为"应走 cn 解析"且未过 TTL (过期顺手清)。与 is_foreign_cached 对称。
+    fn is_cn_learned(&self, domain: &str) -> bool {
+        let mut g = self.cn_learned.lock().unwrap_or_else(|e| e.into_inner());
+        match g.map.get(domain) {
+            Some(&exp) if exp > std::time::Instant::now() => true,
+            Some(_) => {
+                g.map.remove(domain);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 学习标记域名走 cn 解析 (带 TTL, 软上限同 foreign)。remote 选路查出 CN IP 时调。
+    fn mark_cn_learned(&self, domain: &str) {
+        let now = std::time::Instant::now();
+        let mut g = self.cn_learned.lock().unwrap_or_else(|e| e.into_inner());
         if g.map.len() >= g.cap {
             g.map.retain(|_, exp| *exp > now);
             if g.map.len() >= g.cap {
@@ -914,6 +949,9 @@ impl DnsForwarder {
                 }
             })
         });
+        // remote 多 server (failover) + auto_classify (remote geoip 降级 cn, case ②) —— drop(st) 前取出。
+        let remote_servers = st.advanced_dns.as_ref().map(|a| a.cached_remote_servers.clone()).unwrap_or_default();
+        let auto_classify = st.auto_classify.clone();
         if let Some(hit) = rule_hit {
             drop(st); // 已取出所需 (clone), 释放 guard 再 await
             match hit {
@@ -930,14 +968,28 @@ impl DnsForwarder {
                     return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
                 }
                 DnsRuleHit::ResolveRemote(pool) => {
+                    // case ②: 已学习该域名境外解出的是 CN IP → 降级走 cn (免隧道 + 就近)。
+                    if auto_classify.as_ref().is_some_and(|ac| ac.is_cn_learned(&domain)) {
+                        debug!("[DNS] rule    [{}] → remote 但已学习属 CN, 降级 cn", domain);
+                        return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
+                    }
                     let dk = domain.to_lowercase();
                     if let Some(cache) = &self.cache {
                         if let Some(hit) = cache.get(&dk, qtype, req) {
                             return Some(hit);
                         }
                     }
-                    debug!("[DNS] rule    [{}] → resolve remote (隧道) {}:{}", domain, remote_dns_host, remote_dns_port);
-                    let resp = Self::dns_over_tunnel(req, &pool, &remote_dns_host, remote_dns_port).await;
+                    debug!("[DNS] rule    [{}] → resolve remote (隧道 failover, {} 个上游)", domain, remote_servers.len().max(1));
+                    let resp = Self::dns_over_tunnel_ha(req, &pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
+                    // remote geoip 重定向 (简化: 不等第二个): 首个 A 属 CN → 学习, 下次降级 cn。本次仍返 remote 结果。
+                    if let (Some(ac), Some(r)) = (&auto_classify, &resp) {
+                        if let Some(ip) = first_a_record(r) {
+                            if ac.is_cn(ip.into()) {
+                                debug!("[DNS] rule    [{}] → remote 解出 CN IP {}, 学习降级 cn (下次)", domain, ip);
+                                ac.mark_cn_learned(&domain);
+                            }
+                        }
+                    }
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, r);
                     }
@@ -1092,8 +1144,8 @@ impl DnsForwarder {
                             return Some(hit);
                         }
                     }
-                    debug!("[DNS] proxy   [{}] → 隧道查 {}:{} via {}", domain, remote_dns_host, remote_dns_port, n.tag());
-                    let resp = Self::dns_over_tunnel(req, pool, &remote_dns_host, remote_dns_port).await;
+                    debug!("[DNS] proxy   [{}] → 隧道查 (failover {} 上游) via {}", domain, remote_servers.len().max(1), n.tag());
+                    let resp = Self::dns_over_tunnel_ha(req, pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, r);
                     }
@@ -1107,6 +1159,26 @@ impl DnsForwarder {
     }
 
     /// 经隧道向服务端上游 DNS 发一次查询取应答 (不依赖 self, 供 auto_classify 后台校验复用)。
+    /// 多 remote 上游**故障转移**隧道-DNS: 按序试每个, 首个成功即返 (非并发 race —— 隧道路径
+    /// racing 每个各耗一条 WarmPool 隧道, 太贵)。servers 空则退回单个 fallback host/port。
+    async fn dns_over_tunnel_ha(
+        req: &[u8],
+        pool: &WarmPool,
+        servers: &[(String, u16)],
+        fb_host: &str,
+        fb_port: u16,
+    ) -> Option<Vec<u8>> {
+        if servers.is_empty() {
+            return Self::dns_over_tunnel(req, pool, fb_host, fb_port).await;
+        }
+        for (h, p) in servers {
+            if let Some(r) = Self::dns_over_tunnel(req, pool, h, *p).await {
+                return Some(r);
+            }
+        }
+        None
+    }
+
     async fn dns_over_tunnel(req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
         let mut tunnel = match pool.get().await {
             Ok(t) => t,
@@ -1579,8 +1651,27 @@ mod tests {
                 map: std::collections::HashMap::new(),
                 cap,
             }),
+            cn_learned: std::sync::Mutex::new(ForeignCache {
+                map: std::collections::HashMap::new(),
+                cap,
+            }),
             verify_async: false,
         }
+    }
+
+    #[test]
+    fn auto_classify_cn_learned_ttl_and_geoip() {
+        let ac = mk_auto(60, 8, &["1.2.3.0/24"]);
+        // geoip: is_cn 判 IP 归属
+        assert!(ac.is_cn("1.2.3.4".parse().unwrap()));
+        assert!(!ac.is_cn("8.8.8.8".parse().unwrap()));
+        // cn_learned 学习 + TTL 失效 (与 foreign 对称, 互不干扰)
+        assert!(!ac.is_cn_learned("y.com"));
+        ac.mark_cn_learned("y.com");
+        assert!(ac.is_cn_learned("y.com"), "刚学习应命中");
+        assert!(!ac.is_foreign_cached("y.com"), "cn_learned 与 foreign 独立");
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        assert!(!ac.is_cn_learned("y.com"), "过 TTL 应失效");
     }
 
     #[test]

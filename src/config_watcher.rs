@@ -181,22 +181,22 @@ impl ConfigWatcher {
         let mut advanced_dns = config.advanced_dns;
         if let Some(adv) = &mut advanced_dns {
             let mut cn_dns: Vec<(std::net::SocketAddr, crate::config::DnsProtocol)> = Vec::new();
-            let mut remote_host = None;
-            let mut remote_port = None;
+            let mut remote_servers: Vec<(String, u16)> = Vec::new();
             for r in &adv.resolvers {
                 if adv.default.as_ref() == Some(&r.tag) || r.tag == "remote" || r.tag == "proxy" {
                     // 剥可选 tcp://|udp:// 前缀 (模板就是这么写的; 旧代码把 "tcp://8.8.8.8:53" 按
                     // split(':') 拆成 host="tcp" 致隧道 DNS 查错目标)。剥后优先按 IP/[v6]:port 精确解析,
-                    // 解析不出 (域名) 再退回 host:port 粗拆, IPv6 域名场景极罕见。
+                    // 解析不出 (域名) 再退回 host:port 粗拆, IPv6 域名场景极罕见。多个 remote 全收集, failover。
                     let (raw, _proto) = crate::config::strip_dns_scheme(&r.address);
-                    if let Some(sa) = crate::config::parse_dns_upstream(raw) {
-                        remote_host = Some(sa.ip().to_string());
-                        remote_port = Some(sa.port());
+                    let (h, p) = if let Some(sa) = crate::config::parse_dns_upstream(raw) {
+                        (sa.ip().to_string(), sa.port())
                     } else if let Some((h, p)) = raw.rsplit_once(':').filter(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()) {
-                        remote_host = Some(h.to_string());
-                        remote_port = p.parse().ok();
+                        (h.to_string(), p.parse().unwrap_or(53))
                     } else {
-                        remote_host = Some(raw.to_string());
+                        (raw.to_string(), 53)
+                    };
+                    if !remote_servers.iter().any(|(rh, rp)| rh == &h && *rp == p) {
+                        remote_servers.push((h, p));
                     }
                 } else if r.tag == "direct" || r.tag == "cn" {
                     // 收集全部 cn/direct 上游 (多上游兜底), 带协议; 地址无端口默认 53; 去重。
@@ -212,8 +212,10 @@ impl ConfigWatcher {
                 }
             }
             adv.cached_cn_dns = cn_dns;
-            adv.cached_remote_host = remote_host;
-            adv.cached_remote_port = remote_port;
+            // 首个 remote 作 host/port (兼容 + 附带用途: routing_req.port / 后台校验); 全量供 failover。
+            adv.cached_remote_host = remote_servers.first().map(|(h, _)| h.clone());
+            adv.cached_remote_port = remote_servers.first().map(|(_, p)| *p);
+            adv.cached_remote_servers = remote_servers;
 
             // 静态解析归一化 (剥尾点+小写, 确定性去重, 长度降序) —— 见 normalize_static_hosts。
             let cached_static = crate::config::normalize_static_hosts(&adv.static_hosts);
