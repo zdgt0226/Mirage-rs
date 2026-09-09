@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [v0.13.0] - DNS 解析增强线 + 限速 UI + fakeip fail-fast (2026-09-10)
+
+### fix(proxy): fake-IP 反查 miss + 非 HTTP 端口不再连死地址 (fail-fast)
+
+段内 fake-IP 反查不出域名 (网关重启清内存表等) 且非 HTTP 无法嗅 SNI/Host 时, 旧逻辑回退到
+**连字面 fake-IP (198.18.x) = 不可路由死地址** → 国内非标端口服务 (DB/SSH/NAS/游戏等) 卡死。
+- `transparent.rs` + `handler.rs` 双路: 段内 fake-IP miss + 嗅不到域名 → **reset 快速失败** (客户端
+  重解析拿新 fake-IP), 不再连死地址。handler 侧若嗅到域名则用域名当目的地 (fake-IP 是合成 IP、
+  非客户端真实选择, 与"裸真实 IP 不改目的地"规则不同)。`is_fake_ip` 区分段内 fake-IP 与裸真实 IP
+  (后者仍直连)。建议配 `fakeip.persist_path` 扛重启 (根治 miss)。
+
 ### fix(install): 透明网关模板默认开 auto_classify (修全局 fakeip 下国内非标端口服务连不上)
 
 透明网关模板生成的 config 开了 fakeip 但**没带 auto_classify** → geosite:cn 未收录的国内域名
