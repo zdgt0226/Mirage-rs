@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### fix(install): 透明网关模板默认开 auto_classify (修全局 fakeip 下国内非标端口服务连不上)
+
+透明网关模板生成的 config 开了 fakeip 但**没带 auto_classify** → geosite:cn 未收录的国内域名
+落 default proxy → fakeip → 甩到境外服务器 → 国内非 web/私网/地域封锁服务 (DB/SSH/NAS/游戏等
+非标端口) 境外够不着 → 连不上。且 `geoip:cn→direct` 规则在 fakeip 下空转 (假 IP 挡在真解析前)。
+- 模板 `advanced_dns` 补 `"auto_classify": { "enabled": true }` —— geosite 未命中的域名按解析首个 A
+  的 geoip 判 CN→直连真实 IP (fakeip 兼容的 geoip 分流正解), 非标端口正常。`persist_path` 早已默认。
+- 实机验证 (172.16.0.162 透明网关): 补 auto_classify 后 CN→真实 IP 直连 / 海外→fakeip, 分流正确。
+
 ### feat(dns): remote 多上游 failover + 境外解析 CN IP 自适应降级 cn (复用 auto_classify)
 
 - **remote 多 server**: `resolvers` 里多个 tag=remote/proxy 全收集, 隧道-DNS **故障转移** (按序试, 首成即返)。
