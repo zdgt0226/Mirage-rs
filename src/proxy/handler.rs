@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Mirage 隧道 relay 的**空闲**超时: 见 `crate::proxy::relay_idle()` (默认 1800s, env
 /// `MIRAGE_RELAY_IDLE` 秒可调; 与服务端 tcp_relay.rs 共用此值, 两端须同设)。
@@ -106,7 +106,9 @@ pub async fn proxy_tcp_target(
     let mut final_target = target;
     let mut final_host = String::new();
     let mut final_port = 0;
-    
+    // 段内 fake-IP 但反查不出域名 (网关重启清表等): 目的地是死的假 IP, 需靠嗅探拿域名, 拿不到则 reset。
+    let mut unresolved_fakeip = false;
+
     let parts: Vec<&str> = final_target.rsplitn(2, ':').collect();
     if parts.len() == 2 {
         let mut host = parts[1];
@@ -123,6 +125,10 @@ pub async fn proxy_tcp_target(
                             info!("Fake-IP reverse lookup: {} -> {}", v4, domain);
                             final_host = domain.clone();
                             final_target = format!("{}:{}", domain, port);
+                        } else {
+                            // 段内 fake-IP 反查 miss → 死地址, 下方嗅到域名则改目的地为域名 (fake-IP 是
+                            // 我们合成的、非客户端真实选择, 与"裸真实 IP 不改目的地"规则不同), 嗅不到则 reset。
+                            unresolved_fakeip = true;
                         }
                     }
                 }
@@ -159,6 +165,21 @@ pub async fn proxy_tcp_target(
         {
             debug!("[SNIFF] 裸 IP {} 嗅到 SNI/Host [{}], 改按域名分流", final_host, sniffed);
             sniffed_domain = Some(sniffed);
+        }
+    }
+
+    // 未还原的段内 fake-IP: 目的地是死的假 IP。嗅到域名 → 用域名当真实目的地 (fake-IP 必须映射到
+    // 真实目标, 与裸真实 IP 不同); 嗅不到 → fail-fast reset, 客户端重解析拿新 fake-IP (勿连死地址)。
+    if unresolved_fakeip {
+        match &sniffed_domain {
+            Some(d) => {
+                final_host = d.clone();
+                final_target = format!("{}:{}", d, final_port);
+            }
+            None => {
+                warn!("fake-IP {} 反查 miss 且非 HTTP 无法嗅域名 → reset (客户端将重解析)。建议开 advanced_dns.fakeip.persist_path", final_host);
+                return;
+            }
         }
     }
 

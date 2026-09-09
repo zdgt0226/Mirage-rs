@@ -197,6 +197,13 @@ pub async fn start_transparent(
                                         debug!("[TPROXY] TCP {} 裸-IP 嗅探到 SNI/Host [{}]", peer_addr, sniffed);
                                         format!("{}:{}", sniffed, dst_addr.port())
                                     }
+                                    // 段内 fake-IP 反查 miss + 非 HTTP 嗅不到域名: 连字面 fake-IP (198.18.x) 不可
+                                    // 路由 = 死地址, 非标端口国内服务就卡在这。fail-fast reset, 客户端重解析拿新
+                                    // fake-IP (多因网关重启清内存表; 设 fakeip.persist_path 可扛)。裸真实 IP 才直连。
+                                    None if fake_ip_mapper_clone.is_fake_ip(&dst_v4) => {
+                                        warn!("[TPROXY] TCP {} → fake-IP {} 反查 miss 且非 HTTP 无法嗅域名 → reset (客户端将重解析)。建议开 advanced_dns.fakeip.persist_path", peer_addr, dst_v4);
+                                        return;
+                                    }
                                     None => format!("{}:{}", dst_v4, dst_addr.port()),
                                 },
                             };
