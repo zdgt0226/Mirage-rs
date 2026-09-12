@@ -395,27 +395,42 @@ impl ConfigWatcher {
     }
 }
 
-/// geo 数据目录载入自检: 对 `<geodata_dir>/*.dat` 每个文件数一次分类 (与 geo_updater 的
-/// validate_dat 同源)。0 分类 / 解析失败 = 空壳或损坏 (手动放错 / 半截下载 / 磁盘坏), 会让
-/// 引用它的 geosite/geoip 规则**静默全部 fall back default**。这里在启动 + 每次热重载时 WARN
-/// 提示, 避免只在翻日志时才发现规则失效。best-effort: 目录读不了直接跳过, 不阻断启动。
+/// geo 数据目录载入自检: 对 `<geodata_dir>/` 的 geo 文件各数一次条目 (与 geo_updater 校验同源)。
+/// 覆盖两类格式: **v2ray `.dat`** (geosite/geoip, count_categories 数分类) 与 **sing-box `.json`**
+/// (第三方 rule-set, 数 domain/ip_cidr 条目)。0 条目 / 解析失败 = 空壳或损坏 (手动放错 / 半截下载
+/// / 磁盘坏), 会让引用它的规则**静默全部 fall back default**。启动 + 每次热重载时 WARN 提示, 避免
+/// 只在翻日志时才发现规则失效。best-effort: 目录读不了直接跳过, 不阻断启动。
 fn validate_geodata_dir(geodata_dir: &str) {
     let Ok(entries) = std::fs::read_dir(geodata_dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("dat") {
-            continue; // 只校验 v2ray .dat (singbox .json 是另一套格式)
-        }
-        match crate::router::geo::count_categories(&path) {
-            Ok(0) => tracing::warn!(
-                "geo 数据 {:?} 载入 0 个分类 (空壳/损坏/非 v2ray 格式?) — 引用它的 geosite/geoip 规则将全部不匹配, 回落 default 出站。检查文件或删除让 geo_updater 重下。",
-                path
-            ),
-            Ok(n) => tracing::debug!("geo 数据 {:?} 自检通过 ({} 个分类)", path, n),
-            Err(e) => tracing::warn!(
-                "geo 数据 {:?} 解析失败 ({}) — 引用它的规则将不匹配。检查文件或删除重下。",
-                path, e
-            ),
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("dat") => match crate::router::geo::count_categories(&path) {
+                Ok(0) => tracing::warn!(
+                    "geo 数据 {:?} 载入 0 个分类 (空壳/损坏/非 v2ray 格式?) — 引用它的 geosite/geoip 规则将全部不匹配, 回落 default 出站。检查文件或删除让 geo_updater 重下。",
+                    path
+                ),
+                Ok(n) => tracing::debug!("geo 数据 {:?} 自检通过 ({} 个分类)", path, n),
+                Err(e) => tracing::warn!(
+                    "geo 数据 {:?} 解析失败 ({}) — 引用它的规则将不匹配。检查文件或删除重下。",
+                    path, e
+                ),
+            },
+            // updater 的元数据文件 (geodata_dir/meta.json), 非 geo 数据, 跳过免误报。
+            Some("json") if path.file_name().and_then(|n| n.to_str()) == Some("meta.json") => {}
+            // 第三方 sing-box rule-set JSON (RouterEngine 按 .json 后缀走 load_singbox_json)。
+            Some("json") => match crate::router::geo::load_singbox_json(&path) {
+                Ok((d, c)) if d.is_empty() && c.is_empty() => tracing::warn!(
+                    "sing-box geo {:?} 载入 0 条 domain/ip_cidr (空壳/损坏/非 sing-box rule-set 格式?) — 引用它的规则将全部不匹配, 回落 default。检查文件。",
+                    path
+                ),
+                Ok((d, c)) => tracing::debug!("sing-box geo {:?} 自检通过 ({} domain + {} cidr)", path, d.len(), c.len()),
+                Err(e) => tracing::warn!(
+                    "sing-box geo {:?} 解析失败 ({}) — 引用它的规则将不匹配。检查文件。",
+                    path, e
+                ),
+            },
+            _ => {} // 其它文件 (metadata.json 之类由扩展名区分不了的除外) 跳过
         }
     }
 }
