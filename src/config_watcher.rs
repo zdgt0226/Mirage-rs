@@ -172,12 +172,17 @@ impl ConfigWatcher {
         }
         
         let router = RouterEngine::new(
-            rules, 
-            config.routing.default_outbound, 
+            rules,
+            config.routing.default_outbound,
             geodata_dir,
             &config.routing.geo_alias,
         )?;
-        
+
+        // geo .dat 载入自检: geo_updater 只校验它**自己下载**的; 手动放置 / 磁盘损坏 / 半截文件
+        // 走 RouterEngine 的宽容 load 会静默返回空表 (规则全 fall back default) 且只在日志翻查才暴露。
+        // 这里对 geodata 目录里每个 .dat 数一次分类 (与 updater validate_dat 同源), 0/损坏即 WARN。
+        validate_geodata_dir(geodata_dir);
+
         let mut advanced_dns = config.advanced_dns;
         if let Some(adv) = &mut advanced_dns {
             let mut cn_dns: Vec<(std::net::SocketAddr, crate::config::DnsProtocol)> = Vec::new();
@@ -387,6 +392,31 @@ impl ConfigWatcher {
                 }
             }
         });
+    }
+}
+
+/// geo 数据目录载入自检: 对 `<geodata_dir>/*.dat` 每个文件数一次分类 (与 geo_updater 的
+/// validate_dat 同源)。0 分类 / 解析失败 = 空壳或损坏 (手动放错 / 半截下载 / 磁盘坏), 会让
+/// 引用它的 geosite/geoip 规则**静默全部 fall back default**。这里在启动 + 每次热重载时 WARN
+/// 提示, 避免只在翻日志时才发现规则失效。best-effort: 目录读不了直接跳过, 不阻断启动。
+fn validate_geodata_dir(geodata_dir: &str) {
+    let Ok(entries) = std::fs::read_dir(geodata_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("dat") {
+            continue; // 只校验 v2ray .dat (singbox .json 是另一套格式)
+        }
+        match crate::router::geo::count_categories(&path) {
+            Ok(0) => tracing::warn!(
+                "geo 数据 {:?} 载入 0 个分类 (空壳/损坏/非 v2ray 格式?) — 引用它的 geosite/geoip 规则将全部不匹配, 回落 default 出站。检查文件或删除让 geo_updater 重下。",
+                path
+            ),
+            Ok(n) => tracing::debug!("geo 数据 {:?} 自检通过 ({} 个分类)", path, n),
+            Err(e) => tracing::warn!(
+                "geo 数据 {:?} 解析失败 ({}) — 引用它的规则将不匹配。检查文件或删除重下。",
+                path, e
+            ),
+        }
     }
 }
 
