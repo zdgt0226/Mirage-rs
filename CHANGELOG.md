@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### feat(dns): geo 数据载入自检 (启动 + 热重载数分类, 空壳/损坏即 WARN)
+
+geo_updater 只校验它**自己下载**的 .dat (validate_dat); 手动放置 / 半截下载 / 磁盘损坏的
+.dat 走 RouterEngine 宽容 load 会静默返回空表 → 引用它的 geosite/geoip 规则全部 fall back
+default, 只在翻日志时才暴露。补 `validate_geodata_dir`: build_state (启动 + 每次热重载) 对
+`<geodata_dir>/*.dat` 逐个 `count_categories` (与 updater validate 同源), 0 分类 / 解析失败即
+WARN 提示。best-effort, 不阻断启动; 仅校验 v2ray `.dat` (singbox `.json` 另一套格式跳过)。
+实机验证: 空壳 geosite.dat → 载入 0 分类告警。
+
 ## [v0.13.0] - DNS 解析增强线 + 限速 UI + fakeip fail-fast (2026-09-10)
 
 ### fix(proxy): fake-IP 反查 miss + 非 HTTP 端口不再连死地址 (fail-fast)
