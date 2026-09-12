@@ -2,14 +2,16 @@
 
 ## [Unreleased]
 
-### feat(dns): geo 数据载入自检 (启动 + 热重载数分类, 空壳/损坏即 WARN)
+### feat(dns): geo 数据载入自检 (启动 + 热重载数条目, 空壳/损坏即 WARN)
 
 geo_updater 只校验它**自己下载**的 .dat (validate_dat); 手动放置 / 半截下载 / 磁盘损坏的
-.dat 走 RouterEngine 宽容 load 会静默返回空表 → 引用它的 geosite/geoip 规则全部 fall back
-default, 只在翻日志时才暴露。补 `validate_geodata_dir`: build_state (启动 + 每次热重载) 对
-`<geodata_dir>/*.dat` 逐个 `count_categories` (与 updater validate 同源), 0 分类 / 解析失败即
-WARN 提示。best-effort, 不阻断启动; 仅校验 v2ray `.dat` (singbox `.json` 另一套格式跳过)。
-实机验证: 空壳 geosite.dat → 载入 0 分类告警。
+geo 文件走 RouterEngine 宽容 load 会静默返回空表 → 引用它的规则全部 fall back default, 只在
+翻日志时才暴露。补 `validate_geodata_dir`: build_state (启动 + 每次热重载) 对 geodata 目录逐个
+自检, 0 条目 / 解析失败即 WARN。**覆盖两类格式**:
+- v2ray `.dat` (geosite/geoip) — `count_categories` 数分类
+- **sing-box `.json` rule-set** (第三方) — `load_singbox_json` 数 domain/ip_cidr 条目
+排除 updater 的 `meta.json` (元数据非 geo, 免误报)。best-effort, 不阻断启动。
+实机验证: 空壳 .dat / 空壳 sing-box .json → 载入 0 条目告警; 有效文件与 meta.json 无误报。
 
 ## [v0.13.0] - DNS 解析增强线 + 限速 UI + fakeip fail-fast (2026-09-10)
 
