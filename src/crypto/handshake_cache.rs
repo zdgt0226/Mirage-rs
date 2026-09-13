@@ -131,14 +131,7 @@ pub async fn get_server_hello_pfs(
 
     // 末尾统一覆写 ServerHello.random (若 PFS 指定了)。flight 恒以 0x16 ServerHello 记录起头,
     // random 在 [11..43] (5B record header + 4B hs header + 2B version = 11)。
-    let apply = |mut flight: Vec<u8>| -> Vec<u8> {
-        if let Some(pk) = server_random_override {
-            if flight.len() >= 43 && flight[0] == 0x16 {
-                flight[11..43].copy_from_slice(pk);
-            }
-        }
-        flight
-    };
+    let apply = |flight: Vec<u8>| -> Vec<u8> { apply_server_random(flight, server_random_override) };
 
     if cache().lock().await.is_empty() {
         // 主动预热正常应已填充; 走到这说明预热失败或未运行 —— 懒预热兜底.
@@ -270,6 +263,22 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// 覆写 ServerHello.random (flight[11..43])。真 TLS 的 ServerHello.random **每次握手全新**,
+/// 故回放模板必须逐连接改写它, 否则同模板所有连接共享一个 random = 被动可辨指纹。
+/// - PFS 开 (`override_random` = Some): 注入服务端一次性 X25519 公钥 (客户端读它做 ECDH, 见 crypto::pfs)。
+/// - PFS 关 (None): 填 32B 新随机 (与真 TLS 语义一致; 客户端此时不读 server random, 安全)。
+///
+/// flight 恒以 0x16 ServerHello 记录起头; random 在 [11..43] (5B record + 4B hs + 2B version)。
+fn apply_server_random(mut flight: Vec<u8>, override_random: Option<&[u8; 32]>) -> Vec<u8> {
+    if flight.len() >= 43 && flight[0] == 0x16 {
+        match override_random {
+            Some(pk) => flight[11..43].copy_from_slice(pk),
+            None => rand::fill(&mut flight[11..43]),
+        }
+    }
+    flight
+}
+
 fn patch_server_hello(flight: &[u8], client_session_id: &[u8]) -> Vec<u8> {
     if flight.len() < 44 || flight[0] != 0x16 {
         return flight.to_vec();
@@ -397,7 +406,30 @@ fn fallback_server_hello(client_hello: &[u8], client_session_id: &[u8]) -> Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{fallback_server_hello, pick_cipher};
+    use super::{apply_server_random, fallback_server_hello, pick_cipher};
+
+    #[test]
+    fn server_random_per_connection_and_pfs_override() {
+        // 造个最小合法起头的 flight: 0x16 + 占位到 ≥43B, random 段全 0。
+        let base = {
+            let mut v = vec![0u8; 60];
+            v[0] = 0x16;
+            v
+        };
+        // PFS 关: 两次覆写 random 应各不相同 (每连接新随机), 且都非全 0 (确实写了)。
+        let a = apply_server_random(base.clone(), None);
+        let b = apply_server_random(base.clone(), None);
+        assert_ne!(&a[11..43], &b[11..43], "PFS 关时 ServerHello.random 必须每连接不同");
+        assert_ne!(&a[11..43], &[0u8; 32], "random 必须被真正写入");
+        // PFS 开: random == 注入的公钥。
+        let pk = [0x5Au8; 32];
+        let c = apply_server_random(base.clone(), Some(&pk));
+        assert_eq!(&c[11..43], &pk, "PFS 开时 random 必须 == 注入的 X25519 公钥");
+        // 非 ServerHello (首字节非 0x16) 不动。
+        let mut not_sh = base.clone();
+        not_sh[0] = 0x17;
+        assert_eq!(apply_server_random(not_sh.clone(), None), not_sh);
+    }
 
     // 构造一个最小合法 ClientHello 骨架, cipher 列表 = [1301,1302,1303].
     fn make_client_hello() -> Vec<u8> {

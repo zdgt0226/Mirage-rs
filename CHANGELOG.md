@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### fix(crypto): ServerHello.random 每连接随机化 (PFS 关时也是, 修被动指纹)
+
+回放的 ServerHello.random 此前仅在 **PFS 开**时被覆写 (成服务端一次性公钥); **PFS 关 (默认)**
+时直接用模板里的固定 random → 同一模板的所有连接**共享一个 random**, 跨连接重复。真 TLS 的
+ServerHello.random 每次握手全新, 故这是可被动辨识的指纹 (观测者见 Mirage 出口的 ServerHello.random
+在小固定集里循环)。修: `apply_server_random` 统一处理 —— PFS 开注入公钥, **PFS 关填 32B 新随机**
+(与真 TLS 语义一致; 客户端 PFS 关时不读 server random, 安全)。session_id 回显早已逐连接处理。
+- 抽出 `apply_server_random` + 单测 (PFS 关每连接不同 / PFS 开 == 注入公钥 / 非 ServerHello 不动)。
+- 遗留 (未改, 记录): ServerHello 内 key_share 的服务端公钥同样来自固定模板、跨连接重复, 真 TLS 每
+  握手全新 —— 是另一处同类被动特征, 但需定位扩展偏移改写 (较 random 复杂), 后续单独评估。
+
 ### feat(dns): geo 数据载入自检 (启动 + 热重载数条目, 空壳/损坏即 WARN)
 
 geo_updater 只校验它**自己下载**的 .dat (validate_dat); 手动放置 / 半截下载 / 磁盘损坏的
