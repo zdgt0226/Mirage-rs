@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### docs: 修正 config.json 示例模板 + 清理跟踪矛盾
+
+- **config.json** (`mirage check/format/export` 等的默认目标, 也是新用户第一份参考): 从首提交至今
+  没动的 bare stub (纯 socks:1080 + 全 direct, **无 mirage 出站根本不代理**, 无任何现有特性) 更新为
+  **当前代表性客户端网关示例** —— mirage 出站 + fakeip + **auto_classify + persist_path** (体现全局
+  fakeip 下 CN 非标端口连不上的正解) + CN geosite/geoip/私网直连分流 + remote-via-proxy resolver。
+  `mirage check` 校验通过。(缺失时 lib.rs 仍自动写最小 stub 兜底, 那是"别崩"用途, 不受影响。)
+- **sandbox_config.json**: 之前同时被跟踪 + 被 .gitignore 列入 (矛盾) → `git rm --cached` 停止跟踪
+  (它是 sandbox_ebpf 调试 bin 的运行时文件, 只该 ignore)。
+- README: camouflage_host 补一句"选与 VPS 同 ASN/同段的真实站点, 用 tools/find_camouflage.py 扫" 的隐蔽性建议。
+
 ### fix(crypto): ServerHello.random 每连接随机化 (PFS 关时也是, 修被动指纹)
 
 回放的 ServerHello.random 此前仅在 **PFS 开**时被覆写 (成服务端一次性公钥); **PFS 关 (默认)**
