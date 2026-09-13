@@ -288,6 +288,8 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 
 密码 + `camouflage_host` 必须跟客户端完全一致。`brutal_rate_mbps` 是服务端到客户端方向 (下载) 的 brutal 目标速率, 见下方 Brutal 章节。
 
+> 💡 **camouflage_host 选域名**: 示例的 `www.cloudflare.com` 只是占位。隐蔽性最好是选**与你 VPS 同 ASN / 同 IP 段**的真实 HTTPS 站点 (SNI 与出口 IP 归属一致, 打掉 NGFW 的 SNI↔IP 一致性检查)。用 `tools/find_camouflage.py` 自动扫本机 ASN 段找候选 (零 API key)。
+
 > ⚠️ **看板安全**: `gui.listen` 默认 `127.0.0.1` (只本机, 安全)。若改 `0.0.0.0` 暴露到 LAN/公网,
 > **务必设 `gui.token`** —— 看板能读日志/配置**并可视化改路由规则**, 无鉴权暴露 = 任何可达者
 > 都能把你的流量重定向。设了之后 `/api/*` 需带 token (`Authorization: Bearer <token>` /

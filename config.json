@@ -1,25 +1,87 @@
 {
-    "log_level": "info",
-    "inbounds": [
-        {
-            "type": "socks",
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": 1080
-        }
-    ],
-    "outbounds": [
-        {
-            "type": "direct",
-            "tag": "direct"
-        },
-        {
-            "type": "block",
-            "tag": "block"
-        }
-    ],
-    "routing": {
-        "default_outbound": "direct",
-        "rules": []
+  "schema_version": 1,
+  "log_level": "info",
+  "log_file": "/var/log/mirage-rs/client.log",
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "port": 1080
+    },
+    {
+      "type": "transparent",
+      "tag": "transparent-in",
+      "listen": "0.0.0.0",
+      "port": 12345,
+      "interface": "eth0"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-in",
+      "listen": "0.0.0.0",
+      "port": 53
     }
+  ],
+  "outbounds": [
+    {
+      "type": "mirage",
+      "tag": "proxy",
+      "server": "YOUR_SERVER_IP",
+      "server_port": 443,
+      "password": "CHANGE_ME_same_as_server",
+      "camouflage_host": "www.apple.com",
+      "pool_size": 8
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "gui": {
+    "enabled": true,
+    "listen": "127.0.0.1:9090"
+  },
+  "routing": {
+    "default_outbound": "proxy",
+    "rules": [
+      {
+        "outbound": "direct",
+        "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+      },
+      {
+        "outbound": "direct",
+        "geosite": ["cn", "apple-cn", "google-cn", "microsoft-cn"]
+      },
+      {
+        "outbound": "direct",
+        "geoip": ["cn"]
+      }
+    ]
+  },
+  "advanced_dns": {
+    "resolvers": [
+      { "tag": "direct", "address": "223.5.5.5:53" },
+      { "tag": "remote", "address": "8.8.8.8", "via": "proxy" }
+    ],
+    "fakeip": {
+      "enabled": true,
+      "inet4_range": "198.18.0.0/15",
+      "persist_path": "/var/lib/mirage-rs/fakeip.cache"
+    },
+    "auto_classify": { "enabled": true },
+    "cache": { "enabled": true, "max_entries": 10000 }
+  },
+  "tuning": {
+    "ebpf_mode": "auto",
+    "geodata_dir": "/etc/mirage-rs/geosite",
+    "geo_sources": [
+      { "name": "geosite", "kind": "geosite", "url": "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat", "via": "proxy" },
+      { "name": "geoip", "kind": "geoip", "url": "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat", "via": "proxy" }
+    ]
+  }
 }
