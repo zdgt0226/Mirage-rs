@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.13.1] - 被动指纹 + geo 载入自检 + config 模板修正 (2026-09-14)
+
 ### docs: 修正 config.json 示例模板 + 清理跟踪矛盾
 
 - **config.json** (`mirage check/format/export` 等的默认目标, 也是新用户第一份参考): 从首提交至今
