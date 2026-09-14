@@ -39,7 +39,11 @@
 
     // 服务端 → 客户端 (下载) 方向的 Brutal 目标速率 (Mbps)。
     // 不设或 0 = 不启用, 走系统默认拥塞控制 (BBR/Cubic)。需内核已装 tcp-brutal 模块。
+    // 下载速度由本侧决定, 故**只需服务端部署 brutal**, 客户端不配也享加速。
     "brutal_rate_mbps": 0,
+
+    // 前向保密 (PFS): 开则握手做一次性 X25519 ECDH。⚠️ **两端必须同开** (失配即解密失败)。默认 false。
+    "pfs": false,
 
     // ── 上游出口 (可选): 把本服务端当作**中转站** ──────────────────────
     // 配了它, 服务端就不再直连目标, 而是把流量再经 Shadowsocks 发往上游 SS 服务器:
@@ -71,6 +75,11 @@
     //     "password": "ss-password",
     //     "method": "aes-256-gcm",
     //     "udp": "block"          // block(默认) | direct
+    // },
+    // 也可用 WireGuard 上游 (能承载 UDP, udp 默认 "tunnel", 出口与 TCP 一致):
+    // "upstream": {
+    //     "type": "wireguard", "private_key": "...", "peer_public_key": "...",
+    //     "endpoint": "peer:51820", "address": "10.0.0.2", "udp": "tunnel"
     // },
 
     // 日志级别: trace / debug / info / warn / error

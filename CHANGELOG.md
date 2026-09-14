@@ -16,6 +16,8 @@
   - server: **`brutal_rate_mbps` 下载加速** (单服务端部署即生效的核心)、`pfs`、`auth_ts_tolerance_secs`、
     `upstream` 中继 (SS + WG, 含 udp 策略说明)、QUIC、`cipher_agility`/`tls_padding` 两端同开约束。
   - 两份模板剥注释后均过 `mirage check` (无未知字段, 引用完整)。
+- **`templates/lite_client.jsonc` + `lite_server.jsonc`**: 补上缺失的 `pfs` 字段 (两端同开的
+  前向保密); lite_server 的 upstream 注释补一个 WireGuard 上游变体示例。lite 模板仍被测试解析。
 
 ## [v0.13.1] - 被动指纹 + geo 载入自检 + config 模板修正 (2026-09-14)
 
