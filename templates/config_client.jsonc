@@ -1,44 +1,64 @@
+// ════════════════════════════════════════════════════════════════════════
+//  Mirage-rs · 完整客户端配置模板 (透明网关形态)
+//
+//    mirage-rs client -c config_client.json
+//
+//  本模板尽量把「当前所有可用特性」列全, 核心字段保持 active、进阶特性以注释块
+//  给出并说明何时启用。按需删减即可 —— 大多数人只需要 inbounds/outbounds/routing
+//  + advanced_dns 四段。
+//
+//  ⚠️ 实际使用请存为 .json —— JSON 不支持注释, 需先去掉本文件的 // 注释
+//     (mirage-rs 用严格 JSON 解析, 不会自动剥注释)。
+// ════════════════════════════════════════════════════════════════════════
 {
+    // 日志级别: trace / debug / info / warn / error
     "log_level": "info",
 
+    // 可选: 同时写文件 (append) + stdout。不设 = 仅 stdout (journalctl 仍可抓)。
+    // "log_file": "/var/log/mirage-rs/client.log",
+    // "log_rotate_mb": 10,        // 单文件滚动阈值 MB (默认 10)
+    // "log_keep_archives": 10,    // 保留 gzip 归档数 (默认 10; 0 = 滚动即删)
+
+    // ── WebUI / 控制 API ────────────────────────────────────────────────
     "gui": {
         "enabled": true,
-        "listen": "127.0.0.1:9090" // 客户端建议只监听本地
+        "listen": "127.0.0.1:9090"  // 客户端建议只监听本地
+        // "token": "长随机串",     // listen 改 0.0.0.0 暴露公网时**必设**, 否则任何人可读日志/改路由
+        // "stats_persist_path": "/var/lib/mirage-rs/stats.json",  // 流量排行持久化, 重启不清零
+        // "cors_origins": ["https://ui.example.com"]  // 独立前端跨源对接; 默认空 = 仅同源
     },
 
+    // ── 入站 ────────────────────────────────────────────────────────────
     "inbounds": [
-        // 1. 标准 SOCKS5 入站 (适合普通浏览器插件)
-        {
-            "type": "socks",
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": 1080
-        },
-        // 2. HTTP/SOCKS 混合入站
+        // 1. HTTP/SOCKS 混合入站 (浏览器/系统代理指到这里)
         {
             "type": "mixed",
             "tag": "mixed-in",
             "listen": "127.0.0.1",
-            "port": 1081
+            "port": 1080
+            // "auth": { "username": "u", "password": "p" }  // listen 非回环时**强烈建议**开, 否则开放代理
         },
-        // 3. DNS 监听入站
+        // 2. DNS 入站 (fake-IP / 分流解析的应答口)
         {
             "type": "dns",
             "tag": "dns-in",
-            "listen": "127.0.0.1",
+            "listen": "0.0.0.0",
             "port": 53
         },
-        // 4. v0.3.0 eBPF 透明代理入站 (Linux 5.9+ 独占，基于 BPF_PROG_TYPE_SK_LOOKUP)
-        // 必须配合 advanced_dns 中的 fakeip 一起使用！
+        // 3. eBPF 透明代理入站 (Linux 5.9+, 基于 sk_lookup 拦截 fake-IP 流量)
+        //    配 interface 才接管流经网卡的裸-IP 转发流量; 必须与 advanced_dns.fakeip 一起用。
         {
             "type": "transparent",
             "tag": "transparent-in",
             "listen": "0.0.0.0",
-            "port": 7895             // eBPF 会自动将命中 FakeIP 的网卡流量塞给该端口
+            "port": 12345,
+            "interface": "eth0",        // 挂 tc_divert 的 LAN 网卡; 不设则只跑 sk_lookup 本机拦截
+            "proxy_local": false,       // true = 网关本机自身出向流量也走代理 (需本机 DNS 指向 mirage)
+            "dns_hijack": false         // true = 劫持流经 LAN 的 53 查询, LAN 设备无需改 DNS 即享 fake-IP
+                                        //        (仅在配了 interface 时有意义; 劫持查询走合成入站 tag "dns-hijack")
         }
-        // 【链式代理入站】Shadowsocks 入站: 网关接受 SS 客户端 → 经路由/隧道出。
-        // 仅 SIP004 (aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305)。可配 routing 规则
-        // {"inbound":["ss-in"],"outbound":"proxy-jp"} 实现"SS 入 → 指定出站"编排。
+        // 4. 【可选】Shadowsocks 链式入站: 网关收 SS 客户端 → 经路由/隧道出。仅 SIP004 AEAD。
+        //    配 {"inbound":["ss-in"],"outbound":"proxy"} 实现"SS 入 → 指定出站"编排。
         // {
         //     "type": "shadowsocks", "tag": "ss-in",
         //     "listen": "0.0.0.0", "port": 8388,
@@ -46,197 +66,163 @@
         // }
     ],
 
+    // ── 出站 ────────────────────────────────────────────────────────────
     "outbounds": [
-        // 1. 核心幻影协议出站 (连接远端 Mirage 服务器)
+        // 1. 核心 Mirage 隧道出站
         {
             "type": "mirage",
-            "tag": "proxy-jp",
+            "tag": "proxy",
             "server": "203.0.113.1",
             "server_port": 443,
             "password": "your-secure-password",
-            "camouflage_host": "www.apple.com", // 必须和服务端完全一致
-            
-            "pool_size": 16,                    // 多路复用连接池大小 (默认16)
-            
-            // 【硬核特性】TCP Brutal 参数 (需要服务端加载了 tcp-brutal.ko 内核模块)
-            // v0.3.0 起已移除 brutal_rate_bps 别名，强制使用 mbps 单位防溢出！
-            "brutal_rate_mbps": 100,            // 要求服务端固定发送速率为 100 Mbps
-            "brutal_base_rtt_ms": 45            // 强指定网络物理延迟(ms)，留空则自适应测算
-            // 【链式代理 Mirage-over-X】可选 "underlying": "<出站tag>" —— 本隧道对 server:port
-            // 的连接改经该出站拨号 (如经 WG 网到达 server, 或 Mirage 双跳)。所引出站须先定义、
-            // 不能成环。不写 = 直连 (默认)。嵌套路径无裸 fd → 不吃 brutal, 拥塞控制由底层出站负责。
+            "camouflage_host": "www.apple.com",  // **必须与服务端一致** (TLS SNI 伪装)
+                                                 // 选与 VPS 同 ASN/同段的真实 HTTPS 站点最佳 (见 tools/find_camouflage.py)
+            "pool_size": 8,                      // 预热隧道池 (默认 8; 调大降首包延迟, 多占服务端连接)
+
+            // 【前向保密 PFS】握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
+            // ⚠️ **两端必须同开** (改会话密钥派生, 失配即解密失败)。默认关。
+            "pfs": false
+
+            // 【Brutal 加速】客户端 = 上传方向速率上限 (Mbps)。下载速度由**服务端**那侧
+            // brutal 决定 (更重要)。故单服务端部署 brutal 即可, 客户端可不设。
+            // "brutal_rate_mbps": 0,
+            // "brutal_base_rtt_ms": 45,   // 强指定物理 RTT; 留空自适应测算
+
+            // 【链式代理 Mirage-over-X】隧道对 server:port 的连接改经该出站拨号 (套娃)。
+            // "underlying": "wg-out",     // 所引出站须先定义、不能成环; 不写 = 直连
+
+            // 【QUIC 传输, 实验】需 --features quic 编译, 两端须同设 transport。
+            // "transport": "quic",
+            // "quic_obfs": "两端一致的混淆密码",   // 藏成随机 UDP, 抗 QUIC/SNI 封锁
+            // "quic_window_mb": 2,        // 重排序线路要小 (2); 干净长肥可调大 (16-64)
+            // "quic_sni": "www.apple.com" // QUIC ClientHello SNI, 默认 = camouflage_host
         },
-        {
-            "type": "mirage",
-            "tag": "proxy-us",
-            "server": "198.51.100.1",
-            "server_port": 443,
-            "password": "your-secure-password",
-            "camouflage_host": "www.apple.com",
-            "pool_size": 16
-        },
-        // 2. Urltest 出站 (高可用性/自动优选，v0.3 后续会接入 eBPF Socket RTT)
-        {
-            "type": "urltest",
-            "tag": "auto-proxy",
-            "outbounds": ["proxy-jp", "proxy-us"], // 被测速的子出站集合
-            "url": "http://www.gstatic.com/generate_204", // 拨测地址
-            "interval": 300,                       // 拨测间隔 (秒)
-            "tolerance": 50,                       // 容忍度 (ms)：只要 RTT 差值在此范围内就不随意切换
-            "test_type": "ping"                    // 探测类型：可选 "ping", "http"
-        },
-        // 3. Selector 出站 (手动选择出站/API 切换)
-        {
-            "type": "selector",
-            "tag": "manual-proxy",
-            "outbounds": ["auto-proxy", "proxy-jp", "proxy-us", "direct-out"]
-        },
-        // 4. LoadBalance 负载均衡组 (v0.6.7): 把连接**分摊**到多个健康成员 (urltest/fallback/
-        //    selector 都是"选一个", 它是"分摊")。建议成员**同区域** (都美国/都日本), 否则出口国
-        //    不一致会影响落地解锁; `mirage-rs test` 显 [国家码]、`import --group` 会告警混区域。
-        {
-            "type": "load_balance",
-            "tag": "balance-jp",
-            "outbounds": ["proxy-jp", "proxy-us"], // 分摊连接的成员集合
-            "strategy": "round-robin",             // v1 仅支持 round-robin (每连接原子游标轮流)
-            "url": "http://www.gstatic.com/generate_204", // 健康检查拨测地址
-            "interval": 300                        // 健康检查间隔 (秒)
-            // ⚠ round-robin 下同会话多连接可能落不同节点, 查 IP 一致性的站点受影响
-        },
-        // 5. 直连与拦截
-        {
-            "type": "direct",
-            "tag": "direct-out"
-        },
-        {
-            "type": "block",
-            "tag": "block-out"
-        }
-        // 【链式代理出站】Shadowsocks 出站: 经 SS 加密连 SS 服务器。配 "underlying" 即 SS-over-X
-        // —— underlying 指向 mirage 出站 = SS 连接骑 Mirage 隧道 (类 shadow-tls+ss 嵌套):
-        // {
-        //     "type": "shadowsocks", "tag": "ss-out",
-        //     "server": "ss.example.com", "server_port": 8388,
-        //     "method": "aes-256-gcm", "password": "...",
-        //     "underlying": "proxy-jp"     // ← SS 到 ss-server 的连接经 proxy-jp(Mirage) 隧道拨号
-        // }
+        // 2. 直连 / 拦截
+        { "type": "direct", "tag": "direct" },
+        { "type": "block", "tag": "block" }
+
+        // 3. 【可选】多节点 + 出站组 (urltest 优选 / selector 手选 / load_balance 分摊)
+        // { "type": "mirage", "tag": "proxy-us", "server": "198.51.100.1", "server_port": 443,
+        //   "password": "...", "camouflage_host": "www.apple.com" },
+        // { "type": "urltest", "tag": "auto", "outbounds": ["proxy", "proxy-us"],
+        //   "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50, "test_type": "ping" },
+        // { "type": "selector", "tag": "manual", "outbounds": ["auto", "proxy", "proxy-us"] },
+        // { "type": "load_balance", "tag": "balance", "outbounds": ["proxy", "proxy-us"],
+        //   "strategy": "round-robin", "url": "http://www.gstatic.com/generate_204", "interval": 300 },
+        //   // ⚠️ 组成员建议同区域, 否则出口国不一致影响落地解锁
+
+        // 4. 【可选】Shadowsocks 出站 (SS-over-X: underlying=proxy → SS 骑 Mirage 隧道)
+        // { "type": "shadowsocks", "tag": "ss-out", "server": "ss.example.com", "server_port": 8388,
+        //   "method": "aes-256-gcm", "password": "...", "underlying": "proxy" },
+
+        // 5. 【可选】WireGuard 出站 (选中流量改走 WG, 密钥为 wg genkey 的 base64)
+        // { "type": "wireguard", "tag": "wg-out", "private_key": "...", "peer_public_key": "...",
+        //   "endpoint": "wg.example.com:51820", "address": "10.0.0.2", "mtu": 1420 }
     ],
 
+    // ── 路由分流 ────────────────────────────────────────────────────────
     "routing": {
-        "default_outbound": "manual-proxy", // 所有未匹配规则的流量全部走代理
+        "default_outbound": "proxy",     // 未命中规则的流量默认走代理
         "rules": [
-            // GEO 路由体系
-            {
-                "geosite": ["cn"],          // 大陆域名
-                "outbound": "direct-out"    // 直连
-            },
-            {
-                "geoip": ["cn", "private"], // 大陆 IP 及 局域网 IP
-                "outbound": "direct-out"
-            },
-            // 后缀/正则/关键字路由
-            {
-                "domain_suffix": ["google.com", "github.com"],
-                "outbound": "manual-proxy"
-            },
-            {
-                "domain_keyword": ["ads", "tracker"],
-                "outbound": "block-out"
-            },
-            // 多条件组合: 一条规则写多个字段默认 OR (任一命中); 显式 "mode": "and" 则**全部满足**
-            // 才命中 (下例: 既是 netflix 域名、又落在美国 IP 才走负载均衡组)。mode 只认 or/and,
-            // 拼错会被 `mirage-rs check` 拦下 (v0.6.9+ 起校验, 不再静默当 or)。
-            {
-                "mode": "and",
-                "domain_suffix": ["netflix.com"],
-                "geoip": ["us"],
-                "outbound": "balance-jp"
-            }
+            // 私网 + 国内直连
+            { "ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outbound": "direct" },
+            { "geosite": ["cn", "apple-cn", "google-cn", "microsoft-cn"], "outbound": "direct" },
+            { "geoip": ["cn"], "outbound": "direct" },
+            // 关键字拦广告
+            { "domain_keyword": ["ads", "tracker"], "outbound": "block" },
+            // 多条件组合: 默认多字段 OR; 显式 "mode":"and" 则全部满足才命中
+            { "mode": "and", "domain_suffix": ["netflix.com"], "geoip": ["us"], "outbound": "proxy" }
+
+            // 可匹配维度: domain_suffix / domain_keyword / domain_regex / geosite / ip_cidr /
+            //   geoip / source_ip_cidr / source_mac / protocol / port / inbound / process_name
+            //   (全部单值或数组; process_name 仅本机 loopback 入站可判定)
         ]
+
+        // 【可选】按设备/源网段差异化分流 (给家人一套、自己一套 + 限速)
+        // "profiles": {
+        //     "kids": [ { "geosite": ["category-porn"], "outbound": "block" } ]
+        // },
+        // "device_profiles": [
+        //     { "source_ip_cidr": ["192.168.1.20/32"], "profile": "kids", "name": "平板", "rate_limit_kbps": 20000 }
+        // ]
     },
 
+    // ── DNS / fake-IP / 自适应分类 ──────────────────────────────────────
     "advanced_dns": {
-        // eBPF XDP 零拷贝 DNS 拦截网卡绑定 (v0.2.3+)
-        // 配置后系统 DNS 查询将无需穿越 Linux 内核协议栈，直接在网卡驱动层实现毫秒级 Fake-IP 响应
-        "xdp_interface": "eth0",
-        
-        "default": "remote-dns",
+        // 解析器: tag=cn/direct 走明文直查国内; tag=remote 经隧道查防污染。
+        // 地址可带 tcp://、udp:// 前缀, 或用 protocol 字段指定 (默认 udp)。
+        "resolvers": [
+            { "tag": "direct", "address": "223.5.5.5:53", "protocol": "udp" },
+            { "tag": "remote", "address": "tcp://8.8.8.8:53", "via": "proxy" }
+        ],
 
-        // Fake-IP 透明代理引擎 (极速 DNS 响应的核心)
+        // fake-IP 引擎 (透明代理核心): 给代理域名分配无害内网 IP, 反查还原域名。
         "fakeip": {
             "enabled": true,
-            "inet4_range": "198.18.0.0/16" // 映射分配的内网无害 IP 段
-        },
-
-        // eBPF DNS 结果 LRU 缓存
-        "cache": {
-            "enabled": true,
-            "max_entries": 10000
-        },
-
-        // DNS 解析器定义
-        "resolvers": [
-            {
-                "tag": "remote-dns",
-                "address": "tcp://8.8.8.8:53",
-                "via": "manual-proxy"      // 规定发往 8.8.8.8 的查询流必须从代理出站
-            },
-            {
-                "tag": "local-dns",
-                "address": "udp://223.5.5.5:53",
-                "via": "direct-out"        // 规定发往阿里的查询流直连
+            "inet4_range": "198.18.0.0/15",
+            "persist_path": "/var/lib/mirage-rs/fakeip.cache",  // 重启后旧 fake-IP 仍可反查, 免断流
+            // 排除域名: 命中的**不分配 fake-IP**, 改真实解析直连 (内网服务 / 想直连的 CDN /
+            // fake-IP 下行为异常的站点)。字段对齐 routing.rules 域名维度:
+            "exclude": {
+                "domain": ["router.lan"],
+                "domain_suffix": ["local", "lan"],
+                "domain_keyword": [],
+                "domain_regex": []
             }
+        },
+
+        // DNS 规则层 (有序首匹配): 按域名选 DNS 出口 / 返静态 IP / 空答复。
+        // **与 fake-ip 无关** —— fakeip 关时也生效 (纯 DNS 选路/答复)。
+        // action: resolve (选出口真实解析, server=cn/remote) | host (返 ip 静态) | reject (NODATA)。
+        "rules": [
+            // 内网域名钉本地解析器
+            { "domain_suffix": ["corp.internal"], "action": "resolve", "server": "cn" },
+            // 敏感域名强制经隧道解析防污染
+            { "domain_suffix": ["google.com", "youtube.com"], "action": "resolve", "server": "remote" },
+            // host 模式静态应答 (类 dnsmasq)
+            { "domain": ["nas.home"], "action": "host", "ip": ["192.168.1.10"] },
+            // 广告域名空答复
+            { "domain_keyword": ["doubleclick"], "action": "reject" }
         ],
 
-        // 未分类域名 (未命中任何 routing.rules 规则、本会走 default_outbound 的) 的自适应分类:
-        // 先用国内 DNS 解析, 首个 A 记录经 GeoIP 判 —— 属 CN 则直连返回国内结果; 属海外则改
-        // fake-IP 代理, 并把该域名按 TTL 学习标记为海外 (后续直接 fake-IP)。国内 DNS 是最终回落。
-        // ⚠️ 仅作用于"未命中显式规则"的灰域名; 已知被封的域名请放进 routing.rules 明确代理,
-        //    否则极少数 CN 段污染会让它被误判直连。不配 = 关闭 (未命中照旧走 default_outbound)。
+        // 未命中显式 routing 规则的"灰域名"自适应分类: 国内 DNS 解出首个 A → GeoIP 判,
+        // CN 则直连、海外则改 fake-IP 并按 TTL 学习标记。是全局 fakeip 下 CN 非标端口
+        // 服务可用的正解。已知被封域名请仍写进 routing.rules 明确代理。
         "auto_classify": {
             "enabled": true,
-            "ttl": 1800,             // 学习到的"海外"标记存活秒 (默认 3600; 防 CDN geo-DNS 抖动永钉代理)
-            "max_entries": 4096,     // 学习缓存容量上限 (纯内存, 默认 8192)
-            // 国内解出 CN IP 时是否交叉校验 (防少数 CN 段污染误判直连)。off(默认)/async。
-            // async = 立即返回国内答复(零延迟), 后台经隧道可信解析确认; 若可信判海外则标记该域名,
-            //         下次走 fakeip (本次连接不受保护, 这是非阻塞的固有取舍)。
-            "verify_cn": "async"
-        }
+            "ttl": 3600,             // 学习"海外"标记存活秒 (防 CDN geo-DNS 抖动永钉代理)
+            "max_entries": 8192,     // 学习缓存上限 (纯内存 LRU)
+            "verify_cn": "off"       // off(默认) | async (国内解出 CN 时后台经隧道校验, 防 CN 段污染误判直连)
+        },
 
-        // 注: DNS 分流复用 routing.rules (direct→国内DNS / mirage→fake-IP / block→NXDOMAIN);
-        //     旧的 advanced_dns.rules (match/use) 已移除 (从未实现)。
+        // DNS 结果缓存
+        "cache": { "enabled": true, "max_entries": 10000 }
+
+        // "ip_strategy": "dual",   // dual(默认) / ipv4_only / ipv6_only / prefer_ipv4 / prefer_ipv6
+        // "static": { "test.local": "127.0.0.1" },  // 域名→IP 直答, 绕 fakeip/路由/上游 (最长键优先)
+        // "xdp_interface": "eth0"  // eBPF XDP 网卡层 DNS 拦截 (毫秒级 fake-IP 应答)
     },
 
-    // 调优 / Geo 数据 (v0.4.3+ 多源下载; v0.6.7 节点区域判定也读这里的 geoip.dat)
+    // ── 调优 / Geo 数据 ─────────────────────────────────────────────────
     "tuning": {
-        "geodata_dir": "/etc/mirage/geo",   // geo .dat 存放目录 (下载/热重载都在此)
+        "ebpf_mode": "auto",                 // auto(默认, client 启用/server 跳过) / force / off
+        "geodata_dir": "/etc/mirage-rs/geo",
 
-        // 【客户端版本识别, 默认 false】开了则本客户端在加密信道内向服务端上报自身版本, 服务端
-        // WebUI 显示。⚠️ **服务端也须开** tuning.client_info (两端同开, 单边开该连接会失败)。零指纹影响。
-        "client_info": false,
-
-        // 多源 Geo 下载: 每源独立 URL + via。下载后存为 <name>.dat, 路由规则引用
-        // 形如 "geosite": ["cn"] 用默认库, 或 "geosite": ["loyalsoldier.dat:cn"] 指名库。
-        // via: direct=直连拉 (客户端常用) / proxy=经隧道拉 (中国拉 GitHub 用)。
-        // ⚠️ via=proxy 现在**无需配置 socks/mixed 入站** —— 进程内自动起临时 SOCKS 经隧道下载
-        // (走完整路由, geo 仍受规则控制), 透明网关模式也能用。url 可写多个镜像 (数组), 逐个回退。
+        // 多源 Geo 下载: 存为 <name>.dat, 规则引用 "geosite":["cn"] 或指名库 "loyalsoldier.dat:cn"。
+        // via: direct=直连拉 (客户端常用) / proxy=经隧道拉 (进程内自动起临时 SOCKS, 无需配入站)。
+        // url 可写数组当镜像, 逐个回退。
         "geo_sources": [
-            {
-                "name": "geosite",           // 域名规则库 → geosite.dat
-                "kind": "geosite",
-                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
-                "via": "direct"
-            },
-            {
-                "name": "geoip",             // IP 段库 → geoip.dat (节点区域判定也用它)
-                "kind": "geoip",
-                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-                "via": "direct"
-            }
+            { "name": "geosite", "kind": "geosite", "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat", "via": "direct" },
+            { "name": "geoip", "kind": "geoip", "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat", "via": "direct" }
         ],
-        "geo_update_days": 7                 // 每 7 天检查更新 (默认 7)
+        "geo_update_days": 7                 // 每 N 天检查更新 (默认 7)
 
-        // 服务端专用: "dns_tcp_resolver": "1.1.1.1" —— 出向 UDP 被封的 VPS 走 DNS-over-TCP 解析
-        // 域名 (客户端通常不需要, 见 config_server.jsonc)。
+        // 【两端同开类特性 — 单边开会致连接失败】
+        // "client_info": false,     // 客户端在加密信道上报版本, 服务端 WebUI 显示
+        // "tls_padding": false,     // 握手后前几包追加零填充, 抗包长序列指纹 (收端恒剥零)
+        // "udp_mux": false,         // 透明 UDP 按 flowkey 复用少量长命隧道, 破"并发 UDP ≤ pool_size"
+        // "udp_mux_tunnels": 4,     // mux 共享隧道数
+
+        // "client_hello_template": "/etc/mirage-rs/chrome.json"  // 自定义出站 fake-TLS 指纹模板
     }
 }

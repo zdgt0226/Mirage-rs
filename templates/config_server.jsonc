@@ -1,98 +1,104 @@
+// ════════════════════════════════════════════════════════════════════════
+//  Mirage-rs · 完整服务端配置模板
+//
+//    mirage-rs server -c config_server.json
+//
+//  核心字段 active、进阶特性以注释块给出。最小可用服务端只需 inbounds +
+//  outbounds + routing 三段 (见 lite_server.jsonc 更精简)。
+//
+//  ⚠️ 实际使用请存为 .json (去掉 // 注释)。
+// ════════════════════════════════════════════════════════════════════════
 {
-    // 全局日志级别：可选 "trace", "debug", "info", "warn", "error"
     "log_level": "info",
+    // "log_file": "/var/log/mirage-rs/server.log",
 
-    // 图形化监控 / 仪表盘配置 (Neon Pulse Dashboard)
+    // ── WebUI / 控制 API ────────────────────────────────────────────────
     "gui": {
-        "enabled": true,                // 开启高逼格仪表盘
-        "listen": "0.0.0.0:9090"        // 仪表盘 Web 服务监听地址
+        "enabled": true,
+        "listen": "0.0.0.0:9090",
+        "token": "改成一段长随机串"   // ⚠️ listen=0.0.0.0 暴露公网**必设**, 否则任何人可读日志/改路由
+        // "stats_persist_path": "/var/lib/mirage-rs/stats.json"  // 流量统计重启不清零
     },
 
-    // 入站配置：定义服务端如何接收客户端流量
+    // ── 入站 (服务端专属 mirage_server) ─────────────────────────────────
     "inbounds": [
         {
-            "type": "mirage_server",    // 服务端专属的 Mirage 协议入站
+            "type": "mirage_server",
             "tag": "mirage-in",
-            "listen": "0.0.0.0",        // 绑定到所有网卡
-            "port": 443,                // 建议使用 443 伪装效果最好
-            "password": "your-secure-password", // 必须与客户端保持绝对一致
-            "camouflage_host": "www.apple.com"  // 必须与客户端一致，用于 TLS SNI 完美伪装，屏蔽主动探测
+            "listen": "0.0.0.0",
+            "port": 443,                        // 443 伪装最好但属特权口 (非 root 需 CAP_NET_BIND_SERVICE)
+            "password": "your-secure-password", // **必须与客户端完全一致**; 留空 = 任何人可连 (启动告警)
+            "camouflage_host": "www.apple.com", // **必须与客户端一致**; 认证失败的连接转发到此真站, 挡主动探测
+
+            // 【Brutal 加速 — 服务端侧最重要】服务端 → 客户端 (下载) 方向速率上限 (Mbps)。
+            // 决定客户端下载速度, 比客户端的 brutal 重要得多。故**只需服务端部署 brutal**,
+            // 客户端不配也能获得下载加速收益。需内核已装 tcp-brutal 模块 (install.sh 可装 2.0)。
+            // 不设或 0 = 走系统默认拥塞控制 (BBR/Cubic)。实测甜点约 100 (US↔CN 高丢包线路)。
+            "brutal_rate_mbps": 100,
+
+            // 握手令牌时间戳容忍窗口 (秒, 默认 60)。别设太小: 首握用未同步的裸系统时钟,
+            // TIME_SYNC 卡在此窗口无法 bootstrap → 时钟偏差大的客户端被永久锁死。
+            "auth_ts_tolerance_secs": 60,
+
+            // 【前向保密 PFS】握手做一次性 X25519 ECDH。⚠️ **两端必须同开** (失配即解密失败)。
+            "pfs": false
+
+            // 【上游中继 — 把本服务端当中转站】配了则不直连目标, 而是再经 SS/WG 发往落地。
+            //   客户端 ──(Mirage)──▶ 本机 ──(SS/WG)──▶ 落地 ──▶ 目标
+            // 典型: 本机在近你的优质线路 (香港) 只做中转, 出口落在另一台机 (解锁机)。
+            // ⚠️ SS 上游仅 TCP; udp 默认 "block" (放行则 UDP 从本机 IP 出去、与 TCP 出口不一致,
+            //    对解锁是功能性错误)。WG 上游能承载 UDP, udp 默认 "tunnel"。
+            // "upstream": {
+            //     "type": "shadowsocks", "server": "1.2.3.4", "server_port": 8388,
+            //     "password": "ss-pw", "method": "aes-256-gcm", "udp": "block"
+            //     // SIP022 (2022-blake3-*) 的 password 是 base64 密钥本身, 用 openssl rand -base64 32 生成
+            // },
+            // "upstream": {
+            //     "type": "wireguard", "private_key": "...", "peer_public_key": "...",
+            //     "endpoint": "peer:51820", "address": "10.0.0.2", "udp": "tunnel"
+            // }
+
+            // 【QUIC 传输, 实验】需 --features quic, 两端须同设。
+            // "transport": "quic",
+            // "quic_obfs": "与客户端一致的混淆密码",
+            // "quic_window_mb": 2
         }
     ],
 
-    // 出站配置：服务端接收请求后，发往真实互联网的通道
+    // ── 出站 (服务端通常直连出) ─────────────────────────────────────────
     "outbounds": [
-        {
-            "type": "direct",           // 服务端通常直接出站
-            "tag": "direct-out"
-        },
-        {
-            "type": "block",            // 用于屏蔽恶意请求的出站
-            "tag": "block-out"
-        }
+        { "type": "direct", "tag": "direct" },
+        { "type": "block", "tag": "block" }
     ],
 
-    // 路由配置：控制不同流量走向哪个出站
+    // ── 路由 (服务端侧多用于自保: 屏蔽滥用端口/类别) ────────────────────
     "routing": {
-        "default_outbound": "direct-out", // 默认放行所有流量
+        "default_outbound": "direct",
         "rules": [
-            {
-                // 可选配置：屏蔽一些高风险端口或内网 IP 扫描（防止服务端被当做跳板机）
-                "port": [25, 465, 587],   // 屏蔽发件端口，防滥用
-                "outbound": "block-out"
-            },
-            {
-                // 使用 geosite 屏蔽特定类别的流量
-                "geosite": ["category-ads", "category-porn"],
-                "outbound": "block-out"
-            }
+            { "port": [25, 465, 587], "outbound": "block" },              // 屏蔽发件口防滥用
+            { "geosite": ["category-ads"], "outbound": "block" }
         ]
     },
 
-    // 调优 / Geo 数据 / DNS 解析
+    // ── 调优 / Geo / DNS ────────────────────────────────────────────────
     "tuning": {
-        "geodata_dir": "/etc/mirage/geo",   // geo .dat 存放目录
+        // ebpf_mode 默认 auto: 服务端自动跳过 eBPF (入站是加密流, sockmap/XDP/sk_lookup 对服务端无价值)。
+        "geodata_dir": "/etc/mirage-rs/geo",
 
-        // 多源 Geo 下载 (v0.4.3 起取代旧的 geosite_url/geoip_url 单字段)。服务端拉取用
-        // via:"direct" (服务端无本地 socks 入站, 不能走 proxy)。名字即落盘 <name>.dat。
+        // 服务端拉 geo 用 via:"direct" (无本地 socks 入站, 不能走 proxy)。
         "geo_sources": [
-            {
-                "name": "geosite",
-                "kind": "geosite",
-                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
-                "via": "direct"
-            },
-            {
-                "name": "geoip",
-                "kind": "geoip",
-                "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-                "via": "direct"
-            }
+            { "name": "geosite", "kind": "geosite", "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat", "via": "direct" },
+            { "name": "geoip", "kind": "geoip", "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat", "via": "direct" }
         ],
-        "geo_update_days": 7,               // 每 7 天检查更新 (默认 7)
+        "geo_update_days": 7,
 
-        // 【服务端专用, v0.6.5】出向 UDP 被封的 VPS: 域名解析改走 DNS-over-TCP (自实现无依赖),
-        // 否则 glibc getaddrinfo 走 UDP 会解析不了代理目标域名。无端口默认 :53。不设=系统解析器。
-        "dns_tcp_resolver": "1.1.1.1",
+        // 【服务端专用】出向 UDP 被封的 VPS: 域名解析改走 DNS-over-TCP (自实现无依赖),
+        // 否则 glibc getaddrinfo 走 UDP 解析不了代理目标域名。无端口默认 :53。
+        "dns_tcp_resolver": "1.1.1.1"
 
-        // 【服务端专用, v0.7.0】cipher agility (默认 false)。开了则与客户端在加密信道内协商 AEAD:
-        // 两端都有硬件 AES 加速时切 AES-256-GCM (大流量 ~2x), 否则维持 ChaCha20-Poly1305。
-        // ⚠️ 仅在**所有客户端都已升到 v0.7.0+** 时开 —— 老客户端严格只认旧协议版本, 收到新版本会
-        // 丢时间同步。ClientHello 一字不改, TLS 指纹不受影响。客户端无需配置, 自动响应。
-        "cipher_agility": false,
-
-        // 【TLS record padding, 默认 false】开了则对握手后前几条加密记录追加 TLS 1.3 原生零填充,
-        // 抹掉"包长序列"指纹 (抗 GFW 对握手后前几包长度的 ML 识别)。收端恒剥零, 故也在客户端
-        // 配置里各自开。⚠️ 仅在**两端都已升到支持剥零的版本**时开 —— 老对端不剥零, 会把填充零
-        // 当 content type 解析失败断连 (同 cipher_agility 约束)。ClientHello 不受影响。
-        "tls_padding": false,
-
-        // 【客户端版本识别, 默认 false】两端同开时, 客户端在加密信道内上报自身版本, 服务端 WebUI
-        // 「连接的客户端」显示各客户端版本 (便于知道谁该升级)。⚠️ 两端必须同开 (单边开会多发/漏读
-        // 一帧致该连接失败, 同 cipher_agility 约束)。ClientHello 一字不改, 零指纹影响。
-        "client_info": false
-
-        // ebpf_mode 默认 auto: 服务端自动跳过 eBPF (入站是加密流, sockmap/XDP/sk_lookup
-        // 对服务端都无价值)。调试才设 "force"。
+        // 【两端同开类特性 — 仅在所有客户端都已升级后开; 单边开会致连接失败】
+        // "cipher_agility": false,  // 两端有硬件 AES 时协商切 AES-256-GCM (大流量 ~2x), 否则维持 ChaCha20
+        // "tls_padding": false,     // 握手后前几包追加零填充, 抗包长序列指纹
+        // "client_info": false      // 客户端上报版本供 WebUI 显示
     }
 }
