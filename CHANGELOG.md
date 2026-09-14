@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### chore(config): 移除废弃 `api` 段 + 全面刷新 .jsonc 模板
+
+- **移除 `api` 配置段**: 该 stub 从首版起解析了但**从不被任何代码使用**, `api.secret` 不提供
+  任何鉴权 (真鉴权走 `gui.token`)。删掉 `ApiConfig` 结构 + `Config.api` 字段 + 启动告警。
+  向后兼容: 老配置里残留的 `api` 段变成未知字段, `mirage check` 会照常提示 (不再崩)。
+- **`templates/config_client.jsonc` + `config_server.jsonc` 全面重写**: 旧模板已过时数版,
+  且 client 模板还写着"advanced_dns.rules 已移除"(本轮 #122 又加回, 注释是**错的**)。
+  按当前全部特性刷新 + 详细注释, 核心字段 active、进阶特性以注释块给出:
+  - client: transparent 的 `proxy_local`/`dns_hijack`、mirage 的 `pfs`/QUIC 全家/`underlying`、
+    fakeip 的 `exclude`/`persist_path`、**重新纳入的 `advanced_dns.rules` DNS 选路层**、
+    `auto_classify.verify_cn`、`static`/`ip_strategy`、`device_profiles` 限速、`udp_mux` 等。
+  - server: **`brutal_rate_mbps` 下载加速** (单服务端部署即生效的核心)、`pfs`、`auth_ts_tolerance_secs`、
+    `upstream` 中继 (SS + WG, 含 udp 策略说明)、QUIC、`cipher_agility`/`tls_padding` 两端同开约束。
+  - 两份模板剥注释后均过 `mirage check` (无未知字段, 引用完整)。
+
 ## [v0.13.1] - 被动指纹 + geo 载入自检 + config 模板修正 (2026-09-14)
 
 ### docs: 修正 config.json 示例模板 + 清理跟踪矛盾
