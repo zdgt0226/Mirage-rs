@@ -42,6 +42,10 @@
     // 不设或 0 = 不启用。注意下载速度由**服务端**那侧的 brutal 决定, 比这个重要。
     "brutal_rate_mbps": 0,
 
+    // 前向保密 (PFS): 开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
+    // ⚠️ **两端必须同开** (改会话密钥派生, 一端开一端没开会解密失败)。默认 false。
+    "pfs": false,
+
     // 日志级别: trace / debug / info / warn / error
     "log_level": "info"
 }
