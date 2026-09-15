@@ -6,7 +6,16 @@ set -euo pipefail
 # ──────────────────────────────────────────────────────────────────────────────
 # 基础 UI 工具
 # ──────────────────────────────────────────────────────────────────────────────
-_c() { printf "\033[%sm%s\033[0m" "$1" "$2"; }
+# 颜色门控: stderr 是 tty 且未设 NO_COLOR 才上色。输出被管道/重定向或设了 NO_COLOR
+# 时只发纯文本, 免日志里留 \033[..m 转义乱码 (遵循 no-color.org: NO_COLOR 存在即生效)。
+USE_COLOR=1
+_init_color() {
+    if [[ -t 2 && -z "${NO_COLOR+x}" ]]; then USE_COLOR=1; else USE_COLOR=0; fi
+}
+_init_color
+_c() {
+    if [[ "${USE_COLOR:-1}" == 1 ]]; then printf "\033[%sm%s\033[0m" "$1" "$2"; else printf "%s" "$2"; fi
+}
 info()  { echo "$(_c 36 "[*]") $*" >&2; }
 ok()    { echo "$(_c 32 "[✓]") $*" >&2; }
 warn()  { echo "$(_c 33 "[!]") $*" >&2; }
@@ -32,13 +41,23 @@ ask_yn() {
     [[ "$val" =~ ^[Yy] ]]
 }
 
+# 渲染带序号的选项列表到 stderr; 第 1 项 (默认项) 行尾标 (默认), 一眼可见。
+# 纯渲染无 IO, 供 ask_choice 调用 + 单测 (见 tests/install_ui_test.sh)。
+_render_choice() {
+    local prompt=$1; shift
+    local options=("$@")
+    local n=${#options[@]} i mark
+    echo "    $prompt" >&2
+    for ((i = 0; i < n; i++)); do
+        mark=""; (( i == 0 )) && mark=" (默认)"
+        printf "      %d) %s%s\n" $((i + 1)) "${options[$i]}" "$mark" >&2
+    done
+}
+
 ask_choice() {
     local prompt=$1; shift
     local options=("$@") n=${#options[@]} val
-    echo "    $prompt" >&2
-    for ((i = 0; i < n; i++)); do
-        printf "      %d) %s\n" $((i + 1)) "${options[$i]}" >&2
-    done
+    _render_choice "$prompt" "${options[@]}"
     while :; do
         read -rp "    选择 [1-$n] (默认 1): " val </dev/tty
         val="${val:-1}"
@@ -1080,11 +1099,8 @@ generate_password() {
 # 提示与告警走 stderr, 不污染返回值。
 # 上游出口引导。返回一段 JSON (不配则返回空串)。
 ask_upstream() {
+    title "上游出口 (可选) —— 把本机当作中转站"
     cat >&2 <<'EOM'
-
-═══════════════════════════════════════════════════
-  上游出口 (可选) —— 把本机当作中转站
-═══════════════════════════════════════════════════
   默认: 服务端直接连目标 (绝大多数人要的就是这个)。
 
   配了上游后, 服务端不再直连, 而是把流量再发往上游出口:
@@ -1759,11 +1775,11 @@ EOM
     fi
 
     local routing_preset
-    routing_preset=$(ask_choice "客户端路由（分流）策略" \
-        "国内直连 / 局域网直连，其余走代理（经典中国分流，推荐）" \
-        "全部流量走代理（全局代理）" \
-        "自定义分流（通过交互选配常用 Geo Tag 去向）" \
-        "留空规则，全部走默认出口")
+    routing_preset=$(ask_choice "客户端路由 (分流) 策略" \
+        "国内直连 / 局域网直连, 其余走代理 (经典中国分流, 推荐)" \
+        "全部流量走代理 (全局代理)" \
+        "自定义分流 (交互选配常用 Geo Tag 去向)" \
+        "留空规则, 全部走默认出口")
         
     local routing_json=""
     case $routing_preset in
@@ -2386,12 +2402,12 @@ main() {
     fi
 
     local mode=$(ask_choice "请选择操作" \
-        "部署服务端 (Server)" \
-        "部署客户端 (Client)" \
-        "同时部署服务端与客户端" \
-        "更新二进制 (Update binary)" \
-        "显示服务端节点配置 (Show node info)" \
-        "卸载 (Uninstall)" \
+        "部署服务端" \
+        "部署客户端" \
+        "服务端 + 客户端 (同机部署)" \
+        "更新二进制到最新版" \
+        "查看服务端节点信息 (导入串 / 二维码)" \
+        "卸载 Mirage-rs" \
         "家庭 WireGuard 服务端 (干净设备接入)")
 
     case "$mode" in
@@ -2402,11 +2418,8 @@ main() {
     esac
 
     # 部署路径 (1/2/3): 先选形态 —— 完整版还是轻量版
+    title "部署形态"
     cat >&2 <<'EOM'
-
-═══════════════════════════════════════════════════
-  部署形态
-═══════════════════════════════════════════════════
   完整版: 分流 (国内直连/国外走代理) + fake-IP DNS + 可选透明网关 +
           Web 看板 + UDP 支持。功能齐全, 配置项也多。
 
@@ -2459,4 +2472,8 @@ EOM
     echo -e "\n  感谢使用 Mirage-rs，极致性能尽在掌握。"
 }
 
-main "$@"
+# source-guard: 直接执行 (`bash install.sh`) 时跑 main; 被 `source` 时不自动跑,
+# 供测试脚本 source 后单独调 UI helper 函数 (见 tests/install_ui_test.sh)。
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

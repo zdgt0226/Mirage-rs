@@ -9,6 +9,21 @@ rustls 0.23.40 存在 TLS 1.3 握手消息跨加密层被错误接受的漏洞 (
 (连带 aws-lc-rs 1.18.1 / aws-lc-sys 0.45.0 / rustls-webpki 0.103.15)。纯 lockfile,
 无 Cargo.toml/API 改动; 全量 cargo test 通过, cargo-deny advisories 恢复 PASS。
 
+### style(install): install.sh 颜色/排版/选项 微调 (old-coder 流程)
+
+- **颜色自动关闭**: `_c` 现按 `_init_color` 门控 —— stderr 非 tty (管道/重定向) 或设了 `NO_COLOR`
+  时只发纯文本, 免日志里留 `\033[..m` 转义乱码 (遵循 no-color.org)。**配色值不变** (info=36/ok=32/
+  warn=33/err=31/title=1;35)。
+- **ask_choice 默认项标记**: 抽出 `_render_choice`, 默认项 (第 1 项) 行尾标 `(默认)`, 一眼可见;
+  读入/校验逻辑不变。
+- **章节框统一**: `ask_upstream`、`部署形态` 两处手写 ═ 框改用 `title()`, 与其余章节头同一视觉。
+- **选项措辞一致化**: 主操作菜单去混杂英文括注 (简洁 CN + 简短澄清); routing 策略选项半角括号对齐。
+- **source-guard**: 末行 `main "$@"` 加 `[[ BASH_SOURCE == $0 ]]` 守卫 —— 直接执行行为逐字不变,
+  被 `source` 时不跑 main, 使 UI helper 可单测。
+- 验证 (安装逻辑逐字不变): `tests/install_ui_test.sh` 25 断言全过 · `tests/mutate_install_ui.sh`
+  5/5 变异被杀 · shellcheck install.sh 零新增 (基线 49) · 一键 `tests/gauntlet_install_ui.sh`。
+  SPEC/EVIDENCE 见 `SPEC-install-ui.md` / `EVIDENCE-install-ui.md`。
+
 ## [v0.13.2] - 移除废弃 api 段 + 全面刷新配置模板 (2026-09-14)
 
 ### chore(config): 移除废弃 `api` 段 + 全面刷新 .jsonc 模板
