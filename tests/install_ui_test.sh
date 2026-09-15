@@ -14,6 +14,9 @@ bad_()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n     want: %q\n   
 eq_()   { if [[ "$2" == "$3" ]]; then ok_ "$1"; else bad_ "$1" "$3" "$2"; fi; }   # name expected actual
 has_()  { if [[ "$2" == *"$3"* ]]; then ok_ "$1"; else bad_ "$1" "*$3*" "$2"; fi; }
 no_()   { if [[ "$2" != *"$3"* ]]; then ok_ "$1"; else bad_ "$1" "NOT *$3*" "$2"; fi; }
+# 在 pty 下 (即 -t 2 为真) 取 _init_color 算出的 USE_COLOR, 使 NO_COLOR 成为唯一变量。
+# 非 tty 环境下 USE_COLOR 恒 0, NO_COLOR 分支测不出真伪, 故必须借 pty 隔离。
+pty_color() { script -qec "bash -c 'source \"$INSTALL_SH\"; printf %s \"\$USE_COLOR\"'" /dev/null 2>/dev/null | tr -d '\r\n'; }
 
 # ── B3: source-guard (先验, 因为其余测试都靠 source 安全性) ──────────────
 # 安全: 绝不 source 会跑真 main 的东西。用中和 main 的临时副本证明 guard 效果 + 控制可红。
@@ -63,12 +66,12 @@ section_b1() {
     eq_ "B1.1  USE_COLOR=1 → _c 加 ANSI"        "$(USE_COLOR=1 _c 32 hi)" "${ESC}[32mhi${ESC}[0m"
     eq_ "B1.2  USE_COLOR=0 → _c 纯文本"          "$(USE_COLOR=0 _c 32 hi)" "hi"
     no_ "B1.2b USE_COLOR=0 → 无 ESC 字节"        "$(USE_COLOR=0 _c 31 X)"  "$ESC"
-    # B1.3 NO_COLOR 存在即关 (含空串)。子 shell 继承 sourced 的 _init_color; NO_COLOR 供其读取。
-    # shellcheck disable=SC2034
-    if ( NO_COLOR=1;  _init_color; [[ "${USE_COLOR:-x}" == 0 ]] ); then ok_ "B1.3  NO_COLOR=1 → USE_COLOR=0"; else bad_ "B1.3  NO_COLOR=1 → USE_COLOR=0" 0 "?"; fi
-    # shellcheck disable=SC2034
-    if ( NO_COLOR=""; _init_color; [[ "${USE_COLOR:-x}" == 0 ]] ); then ok_ "B1.3b NO_COLOR='' (空串) → USE_COLOR=0"; else bad_ "B1.3b NO_COLOR='' → USE_COLOR=0" 0 "?"; fi
-    # B1.4 stderr 非 tty → 关 (fd2 指到 /dev/null 即非 tty)
+    # B1.3 NO_COLOR 存在即关 (pty 下 -t 2 为真, 隔离出 NO_COLOR 是唯一决定因素)
+    eq_ "B1.3  pty + NO_COLOR=1 → 0"      "$(NO_COLOR=1  pty_color)" "0"
+    eq_ "B1.3b pty + NO_COLOR='' → 0"     "$(NO_COLOR="" pty_color)" "0"
+    # B1.6 pty + 未设 NO_COLOR → 1 (开色正路的正向检测)
+    eq_ "B1.6  pty + 未设 NO_COLOR → 1"   "$(unset NO_COLOR; pty_color)" "1"
+    # B1.4 stderr 非 tty → 关 (fd2 指到 /dev/null 即非 tty; 本测试进程本身即非 tty)
     if ( unset NO_COLOR; _init_color 2>/dev/null; [[ "${USE_COLOR:-x}" == 0 ]] ); then ok_ "B1.4  stderr 非 tty → USE_COLOR=0"; else bad_ "B1.4  stderr 非 tty → USE_COLOR=0" 0 "?"; fi
     # B1.5 配色值不变
     eq_ "B1.5a info=36"  "$(USE_COLOR=1 info X 2>&1)"  "${ESC}[36m[*]${ESC}[0m X"
