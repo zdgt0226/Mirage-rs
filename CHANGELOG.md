@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### fix(deps): 修 RUSTSEC-2026-0285 (rustls 0.23.40 → 0.23.45)
+
+rustls 0.23.40 存在 TLS 1.3 握手消息跨加密层被错误接受的漏洞 (GHSA-2mjx-qc3c-rqvc)。
+经 reqwest (geo/更新下载 + 实验 QUIC 腿) 引入。`cargo update -p rustls --precise 0.23.45`
+(连带 aws-lc-rs 1.18.1 / aws-lc-sys 0.45.0 / rustls-webpki 0.103.15)。纯 lockfile,
+无 Cargo.toml/API 改动; 全量 cargo test 通过, cargo-deny advisories 恢复 PASS。
+
 ## [v0.13.2] - 移除废弃 api 段 + 全面刷新配置模板 (2026-09-14)
 
 ### chore(config): 移除废弃 `api` 段 + 全面刷新 .jsonc 模板
