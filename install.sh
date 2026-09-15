@@ -6,7 +6,16 @@ set -euo pipefail
 # ──────────────────────────────────────────────────────────────────────────────
 # 基础 UI 工具
 # ──────────────────────────────────────────────────────────────────────────────
-_c() { printf "\033[%sm%s\033[0m" "$1" "$2"; }
+# 颜色门控: stderr 是 tty 且未设 NO_COLOR 才上色。输出被管道/重定向或设了 NO_COLOR
+# 时只发纯文本, 免日志里留 \033[..m 转义乱码 (遵循 no-color.org: NO_COLOR 存在即生效)。
+USE_COLOR=1
+_init_color() {
+    if [[ -t 2 && -z "${NO_COLOR+x}" ]]; then USE_COLOR=1; else USE_COLOR=0; fi
+}
+_init_color
+_c() {
+    if [[ "${USE_COLOR:-1}" == 1 ]]; then printf "\033[%sm%s\033[0m" "$1" "$2"; else printf "%s" "$2"; fi
+}
 info()  { echo "$(_c 36 "[*]") $*" >&2; }
 ok()    { echo "$(_c 32 "[✓]") $*" >&2; }
 warn()  { echo "$(_c 33 "[!]") $*" >&2; }
@@ -32,13 +41,23 @@ ask_yn() {
     [[ "$val" =~ ^[Yy] ]]
 }
 
+# 渲染带序号的选项列表到 stderr; 第 1 项 (默认项) 行尾标 (默认), 一眼可见。
+# 纯渲染无 IO, 供 ask_choice 调用 + 单测 (见 tests/install_ui_test.sh)。
+_render_choice() {
+    local prompt=$1; shift
+    local options=("$@")
+    local n=${#options[@]} i mark
+    echo "    $prompt" >&2
+    for ((i = 0; i < n; i++)); do
+        mark=""; (( i == 0 )) && mark=" (默认)"
+        printf "      %d) %s%s\n" $((i + 1)) "${options[$i]}" "$mark" >&2
+    done
+}
+
 ask_choice() {
     local prompt=$1; shift
     local options=("$@") n=${#options[@]} val
-    echo "    $prompt" >&2
-    for ((i = 0; i < n; i++)); do
-        printf "      %d) %s\n" $((i + 1)) "${options[$i]}" >&2
-    done
+    _render_choice "$prompt" "${options[@]}"
     while :; do
         read -rp "    选择 [1-$n] (默认 1): " val </dev/tty
         val="${val:-1}"
@@ -2459,4 +2478,8 @@ EOM
     echo -e "\n  感谢使用 Mirage-rs，极致性能尽在掌握。"
 }
 
-main "$@"
+# source-guard: 直接执行 (`bash install.sh`) 时跑 main; 被 `source` 时不自动跑,
+# 供测试脚本 source 后单独调 UI helper 函数 (见 tests/install_ui_test.sh)。
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
