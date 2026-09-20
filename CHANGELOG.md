@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### perf(crypto): send 写路径去 framed 双拷贝 (header/body 分写 BufWriter)
+
+`CryptoWriter` 此前每帧把 sealed body (≤16KB) 先 `extend` 进 `framed` Vec 再 `write_all`
+→ buffer→framed→BufWriter 内部**双拷贝**。但 `writer` 本就是 BufWriter (自动合帧),`framed`
+拼接冗余。改: 删 `framed` 字段, header(5B) 与 body 分两次写进 BufWriter (它合进同一内部缓冲,
+flush 一次 syscall 送出) —— **wire 字节与旧法完全一致**, 省掉每帧一次 ≤16KB memcpy。
+- **bench (release, 隔离 framing 层, `examples/bench_recv.rs`)**: framing 环节 2896 → 9208 MB/s
+  (**+218%**); 真实路径被 AES seal 稀释, 全路径写增益约数个百分点 (framing 约占写路径 ~9%)。
+- 逐字节等价: 既有 aead roundtrip + 新 `frame_wire_contract` (锁 `[0x17,03,03,len_be,body]` 格式)
+  全过; 全 `cargo test` 18 组 + clippy `--all-targets` 0。
+
 ### perf(crypto): recv 解密热路径去每帧 alloc + zero-fill (借用式)
 
 `CryptoReader::recv_data` 此前每帧 `vec![0u8; len]` (分配 + 清零 ≤16401B, 而 `read_exact` 随即

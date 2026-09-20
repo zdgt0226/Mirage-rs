@@ -74,9 +74,6 @@ pub struct CryptoWriter<W: AsyncWrite + Unpin> {
     cipher_kind: Cipher,
     /// 加密临时区: [chunk_bytes, content_type=0x17] → seal_in_place 后附 tag
     buffer: Vec<u8>,
-    /// 出线组帧区: [5B TLS header, encrypted_buffer]. 单次 write_all 送出,
-    /// 修 alpha.21 之前的两次 write_all + flush 碎片化问题.
-    framed: Vec<u8>,
     is_initiator: bool,
     rng: fastrand::Rng,
     /// TLS record padding 开关 (从全局 cipher::tls_padding_enabled() 取)。
@@ -106,7 +103,6 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             cipher_kind: Cipher::ChaCha20Poly1305,
             // 预分配最大容量，杜绝运行时内存分配开销
             buffer: Vec::with_capacity(MAX_RECORD_SIZE + TAG_SIZE),
-            framed: Vec::with_capacity(5 + MAX_RECORD_SIZE + TAG_SIZE),
             is_initiator,
             rng: fastrand::Rng::new(),
             padding: crate::crypto::cipher::tls_padding_enabled(),
@@ -193,17 +189,14 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
                 .seal_in_place_append_tag(nonce_bytes, aead::Aad::empty(), &mut self.buffer)
                 .map_err(|e| anyhow!("encryption failed: {:?}", e))?;
 
-            // 单次 write_all 送出 [5B header + encrypted body], 避免:
-            // - 分成两次 write_all 每次都在 TCP_NODELAY=on 下变成独立小包
-            // - 帧间 flush 让 kernel 立刻 send 每一小片, 网络碎片化
-            // 老代码 (alpha.21 之前) 每帧 3 次 syscall (header/body/flush),
-            // 新代码 1 次 write_all, syscall 数量 3× 降.
-            let body_len = self.buffer.len() as u16;
-            self.framed.clear();
-            self.framed.extend_from_slice(&[0x17, 0x03, 0x03]);
-            self.framed.extend_from_slice(&body_len.to_be_bytes());
-            self.framed.extend_from_slice(&self.buffer);
-            self.writer.write_all(&self.framed).await?;
+            // header + body 分两次写进内嵌 BufWriter —— BufWriter 把两者合进同一内部缓冲,
+            // flush 时一次 syscall 送出, wire 字节与旧的"先拼 framed 再单次 write_all"完全一致。
+            // 省掉每帧把 sealed body (≤16KB) 拷进 framed 的那次 memcpy (buffer→framed→BufWriter 的双拷贝
+            // 减为单拷贝)。不碎片化: coalescing 由 BufWriter 负责, 非靠调用方预拼。
+            let bl = (self.buffer.len() as u16).to_be_bytes();
+            let header = [0x17, 0x03, 0x03, bl[0], bl[1]];
+            self.writer.write_all(&header).await?;
+            self.writer.write_all(&self.buffer).await?;
         }
         // 显式 flush 保证数据推向 OS 网络层
         self.writer.flush().await?;
@@ -228,13 +221,11 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
             .seal_in_place_append_tag(nonce_bytes, aead::Aad::empty(), &mut self.buffer)
             .map_err(|e| anyhow!("encryption failed: {:?}", e))?;
 
-        // 单次 write_all + flush (关闭是终态, 必须立即刷到网络层保证对端 EOF)
-        let body_len = self.buffer.len() as u16;
-        self.framed.clear();
-        self.framed.extend_from_slice(&[0x17, 0x03, 0x03]);
-        self.framed.extend_from_slice(&body_len.to_be_bytes());
-        self.framed.extend_from_slice(&self.buffer);
-        self.writer.write_all(&self.framed).await?;
+        // header + body 分写进 BufWriter (合并同 send_data), 随后 flush (关闭是终态, 立即刷保证对端 EOF)。
+        let bl = (self.buffer.len() as u16).to_be_bytes();
+        let header = [0x17, 0x03, 0x03, bl[0], bl[1]];
+        self.writer.write_all(&header).await?;
+        self.writer.write_all(&self.buffer).await?;
         self.writer.flush().await?;
         Ok(())
     }
@@ -781,5 +772,23 @@ mod recv_borrow_tests {
         a.write_all(&[0x16, 0x03, 0x03, 0x00, 0x05]).await.unwrap(); // 0x16 非 0x17
         a.write_all(&[0u8; 5]).await.unwrap();
         assert!(r.recv_data_borrowed().await.is_err(), "bad magic 必报错");
+    }
+
+    // P1 wire 契约: header/body 分写 BufWriter 后, 出线字节必须是 [0x17,0x03,0x03, len_be(2), body...]。
+    // 锁死组帧格式 (防 header 顺序/字节被误改, 独立于收端)。
+    #[tokio::test]
+    async fn frame_wire_contract() {
+        let mut sink: Vec<u8> = Vec::new();
+        let m = [7u8; 32];
+        {
+            let mut w = CryptoWriter::new(&mut sink, &m, true);
+            w.set_padding(false);
+            w.send_data(b"hello").await.unwrap();
+        }
+        assert_eq!(&sink[0..3], &[0x17, 0x03, 0x03], "TLS record header magic");
+        let body_len = u16::from_be_bytes([sink[3], sink[4]]) as usize;
+        assert_eq!(sink.len(), 5 + body_len, "总长 = 5B header + body_len");
+        // 未 padding: body = plaintext(5) + inner_type(1) + tag(16) = 22
+        assert_eq!(body_len, 5 + 1 + TAG_SIZE, "无 padding body 长度");
     }
 }
