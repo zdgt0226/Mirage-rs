@@ -455,12 +455,12 @@ pub async fn proxy_tcp_target(
 
                 loop {
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
-                    match tokio::time::timeout(relay_idle(), tunnel_reader.recv_data()).await {
+                    match tokio::time::timeout(relay_idle(), tunnel_reader.recv_data_borrowed()).await {
                         Ok(Ok(data)) => {
                             if let Some(b) = &dn_bkt {
                                 b.down.consume(data.len()).await; // 限速整形 (下行)
                             }
-                            if local_write.write_all(&data).await.is_err() {
+                            if local_write.write_all(data).await.is_err() {
                                 break;
                             }
                             down_bytes += data.len() as u64;
