@@ -339,7 +339,7 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         }
         // 从尾剥零, end 指向第一个非零字节(inner_type)之后
         let mut end = pt.len();
-        while false && pt[end - 1] == 0 {
+        while end > 0 && pt[end - 1] == 0 {
             end -= 1;
         }
         // 剥零后若空 = 整帧全零, 畸形。
@@ -720,16 +720,15 @@ mod recv_borrow_tests {
     }
 
     async fn borrowed_stream_eq(msgs: &[&[u8]], padding: bool) {
-        crate::crypto::cipher::set_tls_padding(padding);
         let (a, b) = duplex(256 * 1024);
         let master = [5u8; 32];
         let mut w = CryptoWriter::new(a, &master, true);
+        w.set_padding(padding); // per-writer 开关, 不碰全局 (避免与并行测试撞全局 padding flag)
         let mut r = CryptoReader::new(b, &master, false);
         let want = concat(msgs);
         for m in msgs { w.send_data(m).await.unwrap(); }
         let got = read_borrowed(&mut r, want.len()).await;
         assert_eq!(got, want, "borrowed 流内容不符 (padding={padding})");
-        crate::crypto::cipher::set_tls_padding(false);
     }
 
     #[tokio::test]
@@ -750,7 +749,6 @@ mod recv_borrow_tests {
     // INV5: 同一 msg 集, owned 流与 borrowed 流逐字节相等 (且都 == 原文拼接)。
     #[tokio::test]
     async fn owned_and_borrowed_byte_equal() {
-        crate::crypto::cipher::set_tls_padding(false);
         let big = vec![0x5Au8; 40000];
         let msgs: Vec<&[u8]> = vec![b"one", &big, b"three", b"f\x00\x00".as_slice()];
         let want = concat(&msgs);
@@ -758,12 +756,14 @@ mod recv_borrow_tests {
 
         let (a1, b1) = duplex(256 * 1024);
         let mut w1 = CryptoWriter::new(a1, &m, true);
+        w1.set_padding(false); // 显式关 padding, 不读racy全局
         let mut r1 = CryptoReader::new(b1, &m, false);
         for x in &msgs { w1.send_data(x).await.unwrap(); }
         let owned = owned_stream(&mut r1, want.len()).await;
 
         let (a2, b2) = duplex(256 * 1024);
         let mut w2 = CryptoWriter::new(a2, &m, true);
+        w2.set_padding(false);
         let mut r2 = CryptoReader::new(b2, &m, false);
         for x in &msgs { w2.send_data(x).await.unwrap(); }
         let borrowed = read_borrowed(&mut r2, want.len()).await;
