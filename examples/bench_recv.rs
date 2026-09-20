@@ -89,4 +89,48 @@ async fn main() {
         (dt_owned / dt_bor - 1.0) * 100.0,
         alloc_owned as f64 / frames_total as f64,
         alloc_bor as f64 / frames_total as f64);
+
+    bench_framing();
+}
+
+/// P1: 隔离 framing 拷贝开销 (无 AES) —— 旧法 buffer→framed 拼接 vs 新法 header/body 两次写。
+/// **只量被改的那一步**; 真实路径里 AES seal 远大于此, 故这是 P1 改动的上界, 非全路径提速。
+fn bench_framing() {
+    use std::io::Write;
+    let body = vec![0xC3u8; 16384 + 16]; // 满 16KB record + tag
+    let n = 2_000_000usize;
+    let cap = 68 * 1024;
+
+    // 旧法: 每帧 clear + 拼 header + 拼 body 进 framed, 再写 BufWriter
+    let mut framed: Vec<u8> = Vec::with_capacity(5 + body.len());
+    let t0 = Instant::now();
+    let mut sink_o = std::io::BufWriter::with_capacity(cap, std::io::sink());
+    for _ in 0..n {
+        let bl = (body.len() as u16).to_be_bytes();
+        framed.clear();
+        framed.extend_from_slice(&[0x17, 0x03, 0x03, bl[0], bl[1]]);
+        framed.extend_from_slice(&body);
+        sink_o.write_all(&framed).unwrap();
+    }
+    sink_o.flush().unwrap();
+    let dt_old = t0.elapsed().as_secs_f64();
+
+    // 新法: header + body 分两次写 BufWriter (省掉拼 framed 的 memcpy)
+    let t1 = Instant::now();
+    let mut sink_n = std::io::BufWriter::with_capacity(cap, std::io::sink());
+    for _ in 0..n {
+        let bl = (body.len() as u16).to_be_bytes();
+        let header = [0x17, 0x03, 0x03, bl[0], bl[1]];
+        sink_n.write_all(&header).unwrap();
+        sink_n.write_all(&body).unwrap();
+    }
+    sink_n.flush().unwrap();
+    let dt_new = t1.elapsed().as_secs_f64();
+
+    let gb = (n * body.len()) as f64;
+    println!("\n== P1 framing 隔离 bench (无 AES, {} 帧 × 16KB) ==", n);
+    println!("旧 buffer→framed 拼接写 : {:>7.1} MB/s | {:.3}s", gb / dt_old / 1e6, dt_old);
+    println!("新 header/body 分写     : {:>7.1} MB/s | {:.3}s", gb / dt_new / 1e6, dt_new);
+    println!("framing 环节提速 {:.1}% (真实路径里被 AES seal 稀释, 全路径增益远小于此)",
+        (dt_old / dt_new - 1.0) * 100.0);
 }
