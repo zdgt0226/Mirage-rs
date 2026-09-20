@@ -208,6 +208,14 @@ jobs:
       - name: Vendor-sync 协议核 (对齐本 tag commit)
         working-directory: mirage-android
         run: ./native/vendor-sync.sh "$GITHUB_WORKSPACE"
+      # 根治 rustup 1.28 构建时 auto-install flake (E0463 can't find crate for core) —— 同 build.yml #138。
+      # mirage-android/rust-toolchain.toml 钉 1.95.0 且 targets 只列 aarch64; dtolnay@stable 装的是 stable
+      # 的 target (交叉编译不用)。显式给 toml 钉住的工具链装齐两个 android target, 消除构建时懒下载。
+      - name: 装 mirage-android 钉住工具链的两个 Android target (防 rustup 懒下载 flake)
+        working-directory: mirage-android
+        run: |
+          rustup show
+          rustup target add aarch64-linux-android x86_64-linux-android
       - name: 交叉编译 mirage-jni (arm64-v8a + x86_64, 16KB 对齐)
         working-directory: mirage-android/native/mirage-jni
         env:
