@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.13.3] - recv/send 热路径压榨 (借用式解密 + 去 framed 拷贝) + rustls 安全修复 (2026-09-21)
+
 ### perf(crypto): send 写路径去 framed 双拷贝 (header/body 分写 BufWriter)
 
 `CryptoWriter` 此前每帧把 sealed body (≤16KB) 先 `extend` 进 `framed` Vec 再 `write_all`
