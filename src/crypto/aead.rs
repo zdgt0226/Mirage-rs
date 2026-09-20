@@ -251,6 +251,9 @@ pub struct CryptoReader<R> {
     master: [u8; 32],
     cipher_kind: Cipher,
     is_initiator: bool,
+    /// 解密复用缓冲: 构造时一次性分配到最大记录尺寸, 之后每帧 read+open_in_place 都复用它,
+    /// 杜绝 recv 热路径的每帧 alloc + zero-fill (见 recv_data_borrowed)。
+    scratch: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> CryptoReader<R> {
@@ -264,6 +267,8 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
             master: *master_key,
             cipher_kind: Cipher::ChaCha20Poly1305,
             is_initiator,
+            // 一次性预分配到最大记录尺寸; 之后每帧解密复用, 热路径零 alloc/zero-fill。
+            scratch: vec![0u8; MAX_RECORD_SIZE + 1 + TAG_SIZE],
         }
     }
 
@@ -284,8 +289,10 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         self.cipher_kind
     }
 
-    /// 接收并解密 TLS 1.3 格式的加密数据块
-    pub async fn recv_data(&mut self) -> Result<Vec<u8>> {
+    /// 接收并解密一帧, 返回**借用**内部复用缓冲的明文切片 (零 alloc / 零 zero-fill / 零 copy-out)。
+    /// 热路径 (纯"读隧道→写目标"的 relay 循环) 用它: 切片借用到下次 recv 前有效, 期间不碰 reader。
+    /// 需 owned 明文 (跨 channel / 需留存) 的调用方用 [`recv_data`] (薄 wrapper, 多一次 to_vec)。
+    pub async fn recv_data_borrowed(&mut self) -> Result<&[u8]> {
         let mut header = [0u8; 5];
         self.reader.read_exact(&mut header).await?;
 
@@ -299,9 +306,8 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
             return Err(anyhow!("TLS record exceeds max size"));
         }
 
-        // 读取密文
-        let mut buffer = vec![0u8; len];
-        self.reader.read_exact(&mut buffer).await?;
+        // 读入复用缓冲的前 len 字节 —— scratch 构造时已按最大尺寸分配, 此处无每帧 alloc/zero-fill。
+        self.reader.read_exact(&mut self.scratch[..len]).await?;
 
         if self.nonce == u64::MAX {
             return Err(anyhow!("AEAD nonce 耗尽, 拒绝复用"));
@@ -309,41 +315,49 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         let nonce_bytes = format_nonce(self.nonce);
         self.nonce += 1;
 
-        // In-place 极速解密
+        // In-place 极速解密 (就地在 scratch 上)
         let plaintext_slice = self.cipher
-            .open_in_place(nonce_bytes, aead::Aad::empty(), &mut buffer)
+            .open_in_place(nonce_bytes, aead::Aad::empty(), &mut self.scratch[..len])
             .map_err(|e| anyhow!("decryption failed: {:?}", e))?;
-        
-        let plaintext_len = plaintext_slice.len();
-        buffer.truncate(plaintext_len);
 
-        if buffer.is_empty() {
+        // 剥零 + 取 inner_type + monitor 计数, 返回 content 长度 (切片索引, 不搬字节)。
+        let content_len = Self::process_plaintext(self.is_initiator, plaintext_slice)?;
+        Ok(&self.scratch[..content_len])
+    }
+
+    /// 接收并解密一帧, 返回 owned 明文 (兼容既有调用方; 内部走 [`recv_data_borrowed`] + 一次 to_vec)。
+    pub async fn recv_data(&mut self) -> Result<Vec<u8>> {
+        Ok(self.recv_data_borrowed().await?.to_vec())
+    }
+
+    /// open_in_place 后的明文处理 (剥尾零 + 取 inner_content_type + 流量计数)。
+    /// 返回 content 长度 (0x17); 0x15=close_notify / 其它=非法, 均报错。**逐字节等价于旧 recv_data**。
+    /// 布局: `[content...][inner_type=0x17][zero padding...]` —— 剥尾零停在 0x17, content 自身尾零在其前不误剥。
+    fn process_plaintext(is_initiator: bool, pt: &[u8]) -> Result<usize> {
+        if pt.is_empty() {
             return Err(anyhow!("empty plaintext received"));
         }
-
-        // TLS 1.3 原生 padding: content_type 后可能跟任意数量的零填充。从尾剥零, 第一个非零
-        // 字节即 content_type。content 自身的尾零在 content_type **之前**, 不会被误剥。
-        // 收端恒剥零 (与是否开启发端 padding 无关) —— 这是两阶段上线的兼容基座: 老发端不发零,
-        // 剥零对其无影响; 新发端发零, 老收端(无此逻辑)才会解析失败, 故收端须先普及。
-        while buffer.last() == Some(&0) {
-            buffer.pop();
+        // 从尾剥零, end 指向第一个非零字节(inner_type)之后
+        let mut end = pt.len();
+        while end > 0 && pt[end - 1] == 0 {
+            end -= 1;
         }
         // 剥零后若空 = 整帧全零, 畸形。
-        if buffer.is_empty() {
+        if end == 0 {
             return Err(anyhow!("padding-only record (no content type)"));
         }
-        // 提取 inner_content_type
-        let inner_type = buffer.pop().unwrap();
+        let inner_type = pt[end - 1];
+        let content_len = end - 1;
 
-        let payload_len = buffer.len() as u64;
-        if self.is_initiator {
+        let payload_len = content_len as u64;
+        if is_initiator {
             crate::monitor::add_down(payload_len);
         } else {
             crate::monitor::add_up(payload_len);
         }
 
         if inner_type == 0x17 {
-            Ok(buffer)
+            Ok(content_len)
         } else if inner_type == 0x15 {
             Err(anyhow!("peer sent TLS alert (close_notify)"))
         } else {
@@ -670,5 +684,102 @@ mod padding_tests {
             let mut skip = vec![0u8; body];
             b.read_exact(&mut skip).await.unwrap(); // 跳到下一条头
         }
+    }
+}
+
+#[cfg(test)]
+mod recv_borrow_tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    // Mirage 是字节流: writer 按分桶/padding 自由切记录 (一次 send_data 可能出多条记录),
+    // 故正确性断言 = **拼接所有 recv 帧 == 拼接所有发送明文**, 而非逐帧 1:1。
+
+    fn concat(msgs: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for m in msgs { v.extend_from_slice(m); }
+        v
+    }
+
+    // 借用式读满 total 字节 (每帧复制进 acc 后才 recv 下一帧, 借用不跨调用)。
+    async fn read_borrowed<R: AsyncRead + Unpin>(r: &mut CryptoReader<R>, total: usize) -> Vec<u8> {
+        let mut acc = Vec::new();
+        while acc.len() < total {
+            let f = r.recv_data_borrowed().await.unwrap();
+            acc.extend_from_slice(f);
+        }
+        acc
+    }
+
+    async fn owned_stream<R: AsyncRead + Unpin>(r: &mut CryptoReader<R>, total: usize) -> Vec<u8> {
+        let mut acc = Vec::new();
+        while acc.len() < total {
+            acc.extend_from_slice(&r.recv_data().await.unwrap());
+        }
+        acc
+    }
+
+    async fn borrowed_stream_eq(msgs: &[&[u8]], padding: bool) {
+        let (a, b) = duplex(256 * 1024);
+        let master = [5u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        w.set_padding(padding); // per-writer 开关, 不碰全局 (避免与并行测试撞全局 padding flag)
+        let mut r = CryptoReader::new(b, &master, false);
+        let want = concat(msgs);
+        for m in msgs { w.send_data(m).await.unwrap(); }
+        let got = read_borrowed(&mut r, want.len()).await;
+        assert_eq!(got, want, "borrowed 流内容不符 (padding={padding})");
+    }
+
+    #[tokio::test]
+    async fn borrowed_various_sizes_no_pad() {
+        let big = vec![0xABu8; MAX_RECORD_SIZE + 5000]; // 跨记录 (>16KB, 必拆多条)
+        let msgs: Vec<&[u8]> = vec![b"a", b"hello world", &big, b"x", b"trailing-zero\x00\x00".as_slice()];
+        borrowed_stream_eq(&msgs, false).await;
+    }
+
+    #[tokio::test]
+    async fn borrowed_various_sizes_padded() {
+        // padding on → 剥零路径; content 自身尾零不得误剥。
+        let big = vec![0xCDu8; 9000];
+        let msgs: Vec<&[u8]> = vec![b"a", b"payload-1234567890", &big, b"end-with-zero\x00".as_slice(), b"z"];
+        borrowed_stream_eq(&msgs, true).await;
+    }
+
+    // INV5: 同一 msg 集, owned 流与 borrowed 流逐字节相等 (且都 == 原文拼接)。
+    #[tokio::test]
+    async fn owned_and_borrowed_byte_equal() {
+        let big = vec![0x5Au8; 40000];
+        let msgs: Vec<&[u8]> = vec![b"one", &big, b"three", b"f\x00\x00".as_slice()];
+        let want = concat(&msgs);
+        let m = [8u8; 32];
+
+        let (a1, b1) = duplex(256 * 1024);
+        let mut w1 = CryptoWriter::new(a1, &m, true);
+        w1.set_padding(false); // 显式关 padding, 不读racy全局
+        let mut r1 = CryptoReader::new(b1, &m, false);
+        for x in &msgs { w1.send_data(x).await.unwrap(); }
+        let owned = owned_stream(&mut r1, want.len()).await;
+
+        let (a2, b2) = duplex(256 * 1024);
+        let mut w2 = CryptoWriter::new(a2, &m, true);
+        w2.set_padding(false);
+        let mut r2 = CryptoReader::new(b2, &m, false);
+        for x in &msgs { w2.send_data(x).await.unwrap(); }
+        let borrowed = read_borrowed(&mut r2, want.len()).await;
+
+        assert_eq!(owned, want, "owned 流 ≠ 原文");
+        assert_eq!(borrowed, owned, "borrowed 流 ≠ owned 流");
+    }
+
+    // 错误行为不变: bad magic 直接测 borrowed。
+    #[tokio::test]
+    async fn borrowed_bad_magic_errors() {
+        let (mut a, b) = duplex(1024);
+        let m = [1u8; 32];
+        let mut r = CryptoReader::new(b, &m, false);
+        a.write_all(&[0x16, 0x03, 0x03, 0x00, 0x05]).await.unwrap(); // 0x16 非 0x17
+        a.write_all(&[0u8; 5]).await.unwrap();
+        assert!(r.recv_data_borrowed().await.is_err(), "bad magic 必报错");
     }
 }

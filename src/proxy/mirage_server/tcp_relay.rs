@@ -102,12 +102,12 @@ pub(super) async fn handle_tcp_relay(
     let up_conn = _conn.counter();
     let upload = async move {
         loop {
-            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
                     if let Some(b) = &up_bkt {
                         b.up.consume(data.len()).await; // 客户端上行限速整形
                     }
-                    if up_write.write_all(&data).await.is_err() {
+                    if up_write.write_all(data).await.is_err() {
                         break;
                     }
                     up_conn.up(data.len() as u64);
@@ -211,9 +211,9 @@ async fn relay_via_shadowsocks(
 
     let upload = async move {
         loop {
-            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
-                    if up_write.write_all(&data).await.is_err() {
+                    if up_write.write_all(data).await.is_err() {
                         break;
                     }
                 }
@@ -309,9 +309,9 @@ async fn relay_via_wireguard(
 
     let upload = async move {
         loop {
-            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data()).await {
+            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
-                    if up_write.write_all(&data).await.is_err() {
+                    if up_write.write_all(data).await.is_err() {
                         break;
                     }
                 }

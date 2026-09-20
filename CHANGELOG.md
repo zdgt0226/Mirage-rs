@@ -2,7 +2,18 @@
 
 ## [Unreleased]
 
-### fix(deps): 修 RUSTSEC-2026-0285 (rustls 0.23.40 → 0.23.45)
+### perf(crypto): recv 解密热路径去每帧 alloc + zero-fill (借用式)
+
+`CryptoReader::recv_data` 此前每帧 `vec![0u8; len]` (分配 + 清零 ≤16401B, 而 `read_exact` 随即
+全覆盖 → 清零纯浪费) 再返 owned Vec。137MB/s 下 ~8400 帧/s/隧道全在 alloc+zero+free。
+改: `CryptoReader` 加**构造时一次性**分配的 `scratch` 缓冲, 新 `recv_data_borrowed()->&[u8]`
+就地读+解密+剥零, **零 alloc / 零 zero-fill / 零 copy-out**; `recv_data()` 变薄 wrapper
+(`to_vec`, 18 个 owned 调用方零改动)。热 TCP relay 循环 (server `tcp_relay` ×3 + client
+`handler` 下行, 均只读 `data`) 转 `recv_data_borrowed`。
+- **bench (release, 纯解密热路径, `examples/bench_recv.rs`)**: 每帧 alloc **1.00 → 0**,
+  吞吐 295.7 → 309.1 MB/s (**+4.5%**)。alloc 归零在高并发 allocator 争用 / 低端 CPU 上收益更大。
+- 逐字节等价旧实现 (剥零/nonce/错误行为不变): 4 新单测 (流语义 owned==borrowed==原文 / padding 剥零 /
+  bad magic) + 既有 14 aead 测试全过; 4 变异 (不剥零/含inner_type/放行错magic/返回原始len) 全被杀。
 
 rustls 0.23.40 存在 TLS 1.3 握手消息跨加密层被错误接受的漏洞 (GHSA-2mjx-qc3c-rqvc)。
 经 reqwest (geo/更新下载 + 实验 QUIC 腿) 引入。`cargo update -p rustls --precise 0.23.45`
