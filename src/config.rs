@@ -213,6 +213,14 @@ pub enum Transport {
     Quic,
 }
 
+/// 多用户凭据 (mirage_server `users[]`)。每个 user 一个独立 password —— 握手按 token tag 认出
+/// 是哪个用户。password 是秘密, **绝不出 API/日志** (GET /api/users 只返 name + 用量)。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MirageUser {
+    pub name: String,
+    pub password: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundConfig {
@@ -245,6 +253,12 @@ pub enum InboundConfig {
         listen: String,
         port: u16,
         password: String,
+        /// 多用户凭据 (P1)。每个 user 一个独立 password, 握手时按 tag 认出是哪个用户 → per-user
+        /// 密钥隔离 + 统计。**协议零改动**: token 格式不变, 客户端仍只配自己那个 password。
+        /// 主 `password` 恒为凭据 "default" (向后兼容); users 追加。不配 = 单用户 (原行为)。
+        /// name 非空且唯一, password 非空 (校验见 check)。
+        #[serde(default)]
+        users: Vec<MirageUser>,
         camouflage_host: Option<String>,
         // 服务端 → 客户端 (下载) 方向的 brutal 速率上限, 单位 Mbps.
         // 不设 (或 = 0) 则不启用 brutal, 走系统默认 CC (BBR/Cubic).
@@ -1310,9 +1324,22 @@ impl Config {
                     Err(e) => issues.push(format!("shadowsocks 入站 `{tag}` 的 method 非法: {e}")),
                 }
             }
-            if let InboundConfig::MirageServer { tag, password, upstream, transport, auth_ts_tolerance_secs, .. } = ib {
+            if let InboundConfig::MirageServer { tag, password, users, upstream, transport, auth_ts_tolerance_secs, .. } = ib {
                 if password.is_empty() {
                     issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
+                }
+                // 多用户校验: name 非空且唯一 (含不撞保留名 "default")、password 非空。
+                let mut seen_names = std::collections::HashSet::new();
+                seen_names.insert("default".to_string());
+                for u in users {
+                    if u.name.trim().is_empty() {
+                        issues.push(format!("mirage_server 入站 `{tag}` 有 user 的 name 为空"));
+                    } else if !seen_names.insert(u.name.clone()) {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 user name `{}` 重复 (或撞保留名 default)", u.name));
+                    }
+                    if u.password.is_empty() {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name));
+                    }
                 }
                 // 容忍窗口直接推导 replay 去重桶数, 极大值会放大内存。3600s (1h) 已远超时钟漂移
                 // 与 TIME_SYNC bootstrap 所需, 上不封顶等于给配置错留个内存放大口。
@@ -2144,6 +2171,35 @@ mod profile_tests {
             c.semantic_issues().iter().any(|i| i.contains("nope") && i.contains("profiles")),
             "profile 规则未知出站未被拦: {:?}", c.semantic_issues()
         );
+    }
+
+    // 多用户凭据 (P1) 校验。
+    fn srv_with_users(users_json: &str) -> super::Config {
+        let s = format!(r#"{{
+            "schema_version":1,
+            "inbounds":[{{"type":"mirage_server","tag":"in","listen":"0.0.0.0","port":443,"password":"mainpw","users":{users_json}}}],
+            "outbounds":[{{"type":"direct","tag":"direct"}}],
+            "routing":{{"default_outbound":"direct","rules":[]}}
+        }}"#);
+        super::Config::parse_with_diagnostics(&s).expect("应解析").0
+    }
+
+    #[test]
+    fn users_valid_parses_no_issue() {
+        let c = srv_with_users(r#"[{"name":"alice","password":"a"},{"name":"bob","password":"b"}]"#);
+        assert!(!c.semantic_issues().iter().any(|i| i.contains("user")), "合法 users 不该报: {:?}", c.semantic_issues());
+    }
+
+    #[test]
+    fn users_empty_name_dup_and_empty_pw_caught() {
+        // 空名
+        assert!(srv_with_users(r#"[{"name":"","password":"x"}]"#).semantic_issues().iter().any(|i| i.contains("name 为空")), "空名未拦");
+        // 重名
+        assert!(srv_with_users(r#"[{"name":"u","password":"x"},{"name":"u","password":"y"}]"#).semantic_issues().iter().any(|i| i.contains("重复")), "重名未拦");
+        // 撞保留名 default
+        assert!(srv_with_users(r#"[{"name":"default","password":"x"}]"#).semantic_issues().iter().any(|i| i.contains("重复")), "撞 default 未拦");
+        // 空密码
+        assert!(srv_with_users(r#"[{"name":"u","password":""}]"#).semantic_issues().iter().any(|i| i.contains("password 为空")), "空密码未拦");
     }
 }
 

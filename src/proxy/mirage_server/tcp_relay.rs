@@ -27,6 +27,7 @@ pub(super) async fn handle_tcp_relay(
     mut writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
+    user: String, // 命中的用户名 (多用户统计); 单用户恒 "default"
 ) {
     // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径;
     // 字节在下方 direct 路径 relay 循环累加 (ss/wg 子路径仅登记可见, 字节暂不计, 同客户端 splice 限制)。
@@ -36,7 +37,7 @@ pub(super) async fn handle_tcp_relay(
         None => "direct",
     };
     let inbound_label = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "client".into());
-    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None, client_ip.map(|ip| ip.to_string()));
+    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None, client_ip.map(|ip| ip.to_string()), Some(user));
 
     // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
     if let Some(outlet) = upstream_cfg {

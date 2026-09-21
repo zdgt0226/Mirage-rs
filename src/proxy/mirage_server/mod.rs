@@ -57,7 +57,8 @@ impl Drop for IpSlotGuard {
 
 pub async fn start_server(
     listen_addr: &str,
-    password: &str,
+    // 凭据列表 (name, password): [0]=("default", 主密码), 其余=多用户 users。握手按 token 认出是哪个。
+    creds: Arc<Vec<(String, String)>>,
     camouflage_host: &str,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     brutal_rate_bytes_per_sec: Option<u64>,
@@ -93,7 +94,6 @@ pub async fn start_server(
     // 时最多阻塞 ~5s 后放行 (懒路径兜底), 不长期挂起启动.
     crate::crypto::handshake_cache::prewarm(camouflage_host).await;
 
-    let password = password.to_string();
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
@@ -132,12 +132,12 @@ pub async fn start_server(
                 // 固定 8MB 反而 disable TCP auto-tune 拖垮吞吐 (7× 回归),
                 // 让 kernel 自适应 BDP+丢包动态调节. 详见 tcp_relay.rs 注释.
 
-                let pwd = password.clone();
+                let creds_c = creds.clone();
                 let cam = camouflage_host.to_string();
                 let pool = cam_pool.clone();
                 let up = upstream.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, pwd, cam, pool, auth_ts_tolerance_secs, up, pfs).await;
+                    handshake::handle_connection(stream, peer_addr, creds_c, cam, pool, auth_ts_tolerance_secs, up, pfs).await;
                 });
             }
             Err(e) => {
@@ -154,7 +154,7 @@ pub async fn start_server(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_quic_server(
     listen_addr: &str,
-    password: &str,
+    creds: Arc<Vec<(String, String)>>,
     camouflage_host: &str,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
@@ -180,10 +180,9 @@ pub async fn start_quic_server(
     info!("Mirage QUIC Server listening on {} (UDP, 实验传输 · auth 容差 ±{}s)", listen_addr, auth_ts_tolerance_secs);
 
     let _ = (camouflage_host, pfs); // Model X 精简: QUIC 路径不用 camouflage/fake-TLS/pfs
-    let password = password.to_string();
 
     while let Some(incoming) = endpoint.accept().await {
-        let pwd = password.clone();
+        let creds_c = creds.clone();
         let up = upstream.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
@@ -200,10 +199,10 @@ pub async fn start_quic_server(
             loop {
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
-                        let pwd2 = pwd.clone();
+                        let creds2 = creds_c.clone();
                         let up2 = up.clone();
                         tokio::spawn(async move {
-                            handle_quic_stream_lean(send, recv, peer.ip(), pwd2, auth_ts_tolerance_secs, up2).await;
+                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2).await;
                         });
                     }
                     Err(_) => break, // 连接关闭
@@ -221,7 +220,7 @@ async fn handle_quic_stream_lean(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     peer_ip: IpAddr,
-    password: String,
+    creds: Arc<Vec<(String, String)>>,
     tol: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) {
@@ -229,20 +228,23 @@ async fn handle_quic_stream_lean(
         debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
         return;
     }
-    // 1. token (32B) — 无状态每流认证。
+    // 1. token (32B) — 无状态每流认证 (多用户: 认出是哪个凭据)。
     let mut token = [0u8; 32];
     match tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_exact(&mut token)).await {
         Ok(Ok(_)) => {}
         _ => return,
     }
-    if !crate::crypto::hello_auth::verify_session_token(&password, &token, tol) {
-        static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !HINTED.swap(true, Ordering::Relaxed) {
-            tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
-                crate::crypto::hello_auth::session_decrypt_failure_hint());
+    let user = match creds.iter().position(|(_, pw)| crate::crypto::hello_auth::verify_session_token(pw, &token, tol)) {
+        Some(idx) => creds[idx].0.clone(),
+        None => {
+            static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !HINTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
+                    crate::crypto::hello_auth::session_decrypt_failure_hint());
+            }
+            return;
         }
-        return;
-    }
+    };
     // 2. target: [2B len][host:port]
     let mut lenb = [0u8; 2];
     if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut lenb)).await.map(|r| r.is_err()).unwrap_or(true) {
@@ -264,7 +266,7 @@ async fn handle_quic_stream_lean(
         Err(e) => { tracing::warn!("Mirage QUIC(lean): 连 {} 失败: {}", target, e); return; }
     };
     let _conn = crate::monitor::register(
-        target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()),
+        target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()), Some(user),
     );
     // 4. 裸转发 (QUIC 加密, 无内层 AEAD)。
     let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);

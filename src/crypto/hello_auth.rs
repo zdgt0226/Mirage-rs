@@ -163,6 +163,17 @@ pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u6
     true
 }
 
+/// 多用户认证 (P1): 对一组 password 逐个试, 返回**首个 token tag 命中** (且 ts/replay 通过) 的索引。
+///
+/// 关键正确性: `verify_session_token` 内含 replay `check_and_insert`, 但**非匹配的 password 在
+/// tag 常量时间比对处就返回 false, 根本走不到 replay 插入** —— 故本循环里 replay 对同一 token
+/// **只在命中那次插一次**, 与单用户语义完全一致 (无双插、无跨凭据误报)。tag 由 poly1305(password_key,
+/// ts, prefix) 生成, 不同 password 命中同一 token 的概率 ~2^-128, 故至多一个凭据匹配。
+/// O(N) HMAC/握手; 小团队 (几十用户) 可忽略。
+pub fn identify_session_token(passwords: &[String], token: &[u8; 32], tolerance_secs: u64) -> Option<usize> {
+    passwords.iter().position(|pw| verify_session_token(pw, token, tolerance_secs))
+}
+
 /// 会话 bootstrap 加密帧 (客户端读 TIME_SYNC / 服务端读 first_chunk) 解密失败时的**统一排查
 /// 提示**。两侧 (`pool` 客户端 + `control` 服务端) 共用同一文案, 避免诊断分散/漏项 (审计 #8)。
 ///
@@ -177,6 +188,39 @@ pub fn session_decrypt_failure_hint() -> &'static str {
      ③两端高级特征是否一致: `pfs`/`tls_padding`/`cipher_agility` 一端开一端没开 (或版本过老不支持) \
      都会改会话密钥或分帧派生 → 必然失配 (见 README 安全声明 / tuning 各项注释)。若三项都排除, \
      可能是链路损坏或协议版本不匹配。"
+}
+
+#[cfg(test)]
+mod multiuser_tests {
+    use super::*;
+
+    #[test]
+    fn identify_matches_correct_user() {
+        let pws = vec!["alice-pw".to_string(), "bob-pw".to_string(), "carol-pw".to_string()];
+        // bob 的 token 必须只被 bob (index 1) 认出。
+        let tok = make_session_token("bob-pw");
+        assert_eq!(identify_session_token(&pws, &tok, 60), Some(1));
+        // alice 的 token → index 0。
+        let tok_a = make_session_token("alice-pw");
+        assert_eq!(identify_session_token(&pws, &tok_a, 60), Some(0));
+    }
+
+    #[test]
+    fn identify_none_when_no_credential_matches() {
+        let pws = vec!["alice-pw".to_string(), "bob-pw".to_string()];
+        let tok = make_session_token("stranger-pw"); // 不在列表
+        assert_eq!(identify_session_token(&pws, &tok, 60), None);
+    }
+
+    #[test]
+    fn identify_replay_inserts_once_not_per_credential() {
+        // 同一 token 连认两次: 第一次命中, 第二次因 replay 应 None (证明命中那次插了、且只插一次;
+        // 非匹配凭据在 tag 比对处返回 false 不碰 replay, 故不会把别的用户的桶污染)。
+        let pws = vec!["u0".to_string(), "u1".to_string(), "u2".to_string()];
+        let tok = make_session_token("u2");
+        assert_eq!(identify_session_token(&pws, &tok, 60), Some(2), "首次命中 u2");
+        assert_eq!(identify_session_token(&pws, &tok, 60), None, "重放同 token 必拒 (replay 已插)");
+    }
 }
 
 #[cfg(test)]
