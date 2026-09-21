@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [v0.14.0] - 多用户凭据 (per-user 密钥隔离 + 用量统计 + Mirage-console 管理) (2026-09-21)
+
 ### feat(auth): 多用户凭据 (per-user 密钥隔离 + 用量统计 + 管理 API)
 
 `mirage_server` 加 `users: [{name, password}]` —— 每人独立口令。**协议零改动、向后兼容**:

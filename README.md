@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.13.2-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.14.0-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -415,6 +415,8 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.14.0** | 2026-09-21 | **多用户凭据**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户 (`identify_session_token`, **协议零改动**, 客户端只配自己那份口令), per-user 密钥隔离 + 用量统计 (连接/上下行/活跃), 按人吊销。`/api/users` GET(列 name+用量, **不返 password**)/POST(**op-based** 增删/改密, 因藏 password 不能整表替换) 供 **Mirage-console 用户管理页** (server 模式) 操作。覆盖 TCP + QUIC(lean)。 |
+| **v0.13.3** | 2026-09-21 | **recv/send 热路径压榨**: recv 借用式解密去每帧 alloc+zero-fill (alloc/帧 1.00→0, +4.2%) · send 去 framed 双拷贝 (header/body 分写 BufWriter, wire 一致) · rustls RUSTSEC-2026-0285 安全修复 · install.sh UI 微调。附 P2 实测: ring AEAD 已在网关 CPU 峰值 (持平 openssl), crypto 后端非杠杆。 |
 | **v0.13.0** | 2026-09-10 | **DNS 解析增强线**: `fakeip.exclude` 按域名 (精确/后缀/关键字/正则) 排除代理解析 · **DNS 规则层** `advanced_dns.rules` (按域名选 cn 本地/remote 隧道解析 + `host` 静态 + `reject` 空答复, 与 fake-ip 无关、fakeip 关时也生效) · cn/remote 多上游 (cn 抢最快、remote 故障转移 + geoip 自动降级 cn) · 全局 fakeip 下国内非标端口连不上修复 (`auto_classify` 才是 fakeip 兼容的 geoip 分流)。含限速 WebUI 旋钮 + fakeip 反查 miss fail-fast。后续 v0.13.1 (ServerHello.random 每连接随机化 + geo 载入自检覆盖第三方) / v0.13.2 (移除废弃 `api` 段 + 全面刷新配置模板)。 |
 | **v0.12.0** | 2026-09-07 | **tcp-brutal 2.0 groups 适配**: 服务端按客户端 IP 分 group, 该客户端所有连接 (暖池+mux) 共享一个 brutal 总速率, 修此前每连接各设速率并发聚合 N× 超发。`TCP_BRUTAL_PARAMS` 12B→20B (+group_id) + `getsockopt(23302)≥0x020000` 探测, **v1 模块自动回落 per-socket**。**单一部署不变**: 只服务端装 brutal 2.0, 客户端不装照拿下载加速。附单隧道高 RTT 吞吐实机调查结论 (v0.12.1)。 |
 | **v0.11.0** | 2026-09-04 | **TLS 指纹捕获 + 回放**: `mirage tls-capture` CLI (一次性 SOCKS5 抓取代理) + `POST/GET /api/v1/tls/capture` 抓本机真浏览器 ClientHello 存成模板 (**不 phone-home**, 用实时真握手非联网拉取)。配 `client_hello_template` 让出站 fake-TLS **复刻该模板 JA3/JA4**, 仅替换 SNI(→camouflage_host)/session_id(token)/random(PFS 公钥) 三处动态字段, 变长 SNI 重编 server_name 扩展 + 修三层长度; 不配 = 内置 Chrome/FF/OkHttp 加权轮换 (保留)。移动端 (mirage-core) tokio 去 `full` 精简传递依赖。 |
