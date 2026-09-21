@@ -35,6 +35,7 @@ pub(super) async fn dispatch_authenticated(
     write_half: crate::proxy::tunnel::TunnelWrite,
     client_ip: Option<std::net::IpAddr>,
     password: String,
+    user: String, // 命中的用户名 (多用户统计维度); 单用户 config 恒为 "default"
     client_random: [u8; 32],
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     ecdh: Option<[u8; 32]>,
@@ -214,7 +215,7 @@ pub(super) async fn dispatch_authenticated(
         match parse_tcp_target(&first_chunk) {
             Ok((target, payload)) => {
                 info!("Mirage Server: Target resolved to {}", target);
-                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip).await;
+                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user).await;
             }
             Err(e) => tracing::error!("Mirage Server: {}", e),
         }

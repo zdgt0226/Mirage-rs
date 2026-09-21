@@ -15,7 +15,9 @@
 >   X25519 ECDH** (临时私钥用完即弃), 开启后即便口令泄露也解不了已录流量。**两端必须同开**
 >   (改了会话密钥派生, 一端开一端没开会连不上)。无论是否开 PFS, 都请用高强度随机口令、
 >   限制传播、定期更换。见 brain external-audit-2026-08 / handshake-forward-secrecy。
-> - **认证是单一共享口令**, 无 per-user 维度。多人共用即共担泄露风险。
+> - **认证支持多用户凭据** (`mirage_server.users[]`): 每人独立口令 → per-user 密钥隔离 + 用量统计,
+>   可按人吊销 (删该 user 即失效, 不影响他人), Mirage-console 可增删/查用量 (见 `/api/users`)。
+>   不配 `users` = 单一共享口令 (原行为)。**口令仍是唯一凭据 (无二次因子)**, 请用高强度随机口令。
 > - **负责任使用**: 本工具用于**保护自己合法流量的隐私与可达性**。是否可在你所在司法辖区使用、
 >   以及如何使用, 由你自行判断与负责; 请遵守当地法律。
 
@@ -30,6 +32,7 @@
 
 * **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），配 `client_hello_template` 即让出站握手复刻其 JA3/JA4（仅替换 SNI/session_id/random）。
 * **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关（向后兼容），认证仍靠口令、与加密解耦（对标 REALITY）。
+* **多用户凭据**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃），按人吊销。`/api/users` 供 Mirage-console 增删改密/查用量（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。

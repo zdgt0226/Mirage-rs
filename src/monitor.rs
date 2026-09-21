@@ -43,6 +43,7 @@ pub struct ConnInfo {
     pub proto: &'static str,   // "tcp" / "udp"
     pub process: Option<String>,
     pub source: Option<String>, // 发起方 IP (LAN 设备 / 连接的客户端); None=不适用
+    pub user: Option<String>,   // 多用户: 命中的用户名 (服务端 mirage_server); None=不适用 (客户端侧)
     pub start: Instant,
     pub up: AtomicU64,
     pub down: AtomicU64,
@@ -139,6 +140,17 @@ struct DeviceAgg {
     last: Instant,
 }
 static DEVICE_STATS: LazyLock<Mutex<HashMap<String, DeviceAgg>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// per-用户统计 (多用户: mirage_server 按命中的用户名聚合)。conns=累计连接, active=当前活跃。
+#[derive(Default)]
+struct UserAgg {
+    conns: u64,
+    up: u64,
+    down: u64,
+    active: u64,
+}
+static USER_STATS: LazyLock<Mutex<HashMap<String, UserAgg>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ── 统计持久化 (gui.stats_persist_path): 重启保住 WebUI 排行/总量 ──────────────────
@@ -300,6 +312,14 @@ impl Drop for ConnGuard {
                 e.down += down;
             }
         }
+        // per-用户累计字节 + 活跃 -1 (连接终态定格)。
+        if let Some(u) = &self.0.user {
+            let mut us = USER_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            let e = us.entry(u.clone()).or_default();
+            e.up += up;
+            e.down += down;
+            e.active = e.active.saturating_sub(1);
+        }
     }
 }
 
@@ -312,6 +332,7 @@ pub fn register(
     proto: &'static str,
     process: Option<String>,
     source: Option<String>,
+    user: Option<String>,
 ) -> ConnGuard {
     let id = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
     let info = Arc::new(ConnInfo {
@@ -322,6 +343,7 @@ pub fn register(
         proto,
         process,
         source,
+        user,
         start: Instant::now(),
         up: AtomicU64::new(0),
         down: AtomicU64::new(0),
@@ -345,8 +367,35 @@ pub fn register(
         e.conns += 1;
         e.last = Instant::now();
     }
+    // per-用户累计连接数 +1 + 活跃 +1 (多用户: 按命中的用户名聚合)。
+    if let Some(u) = &info.user {
+        let mut us = USER_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = us.entry(u.clone()).or_default();
+        e.conns += 1;
+        e.active += 1;
+    }
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).live.insert(id, info.clone());
     ConnGuard(info)
+}
+
+/// per-用户统计快照 (多用户): 按累计流量降序。**只含 name + 用量, 无 password** (供 /api/users)。
+#[derive(serde::Serialize)]
+pub struct UserStat {
+    pub name: String,
+    pub conns: u64,
+    pub up: u64,
+    pub down: u64,
+    pub active: u64,
+}
+
+/// per-用户统计快照 (累计流量降序)。API 会把 config 里存在但尚无流量的用户也补进来 (active/up/down=0)。
+pub fn user_stats() -> Vec<UserStat> {
+    let us = USER_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<UserStat> = us.iter().map(|(name, a)| UserStat {
+        name: name.clone(), conns: a.conns, up: a.up, down: a.down, active: a.active,
+    }).collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.up + s.down));
+    out
 }
 
 /// 设备/来源统计快照: 按活跃度 (idle 升序 = 最近活跃在前)。
@@ -793,8 +842,8 @@ mod conn_registry_tests {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let base_live = live_conn_count();
 
-        let g1 = register("example.com:443".into(), "socks".into(), "proxy".into(), "tcp", Some("curl".into()), Some("192.168.1.5".into()));
-        let g2 = register("1.1.1.1:80".into(), "tproxy".into(), "direct".into(), "tcp", None, None);
+        let g1 = register("example.com:443".into(), "socks".into(), "proxy".into(), "tcp", Some("curl".into()), Some("192.168.1.5".into()), Some("alice".into()));
+        let g2 = register("1.1.1.1:80".into(), "tproxy".into(), "direct".into(), "tcp", None, None, None);
         assert_eq!(live_conn_count(), base_live + 2);
 
         // 无锁累加
@@ -833,11 +882,30 @@ mod conn_registry_tests {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 连开连关多于容量, 环长不超过 CLOSED_RING_CAP。
         for i in 0..(CLOSED_RING_CAP + 20) {
-            let g = register(format!("h{i}:1"), "in".into(), "out".into(), "tcp", None, None);
+            let g = register(format!("h{i}:1"), "in".into(), "out".into(), "tcp", None, None, None);
             drop(g);
         }
         let (_, closed) = conn_snapshots();
         assert!(closed.len() <= CLOSED_RING_CAP, "closed ring 超容量: {}", closed.len());
+    }
+
+    // 多用户 per-user 统计: 用唯一 user 名避免与其它测试共享全局 USER_STATS 污染。
+    #[test]
+    fn user_stats_accumulates_bytes_and_active() {
+        let uname = "p1-multiuser-test-user";
+        let g = register("t:443".into(), "in".into(), "out".into(), "tcp", None, Some("9.9.9.9".into()), Some(uname.into()));
+        // 活跃期: active >= 1, 字节累加。
+        g.counter().up(500);
+        g.counter().down(1500);
+        let mid = user_stats();
+        let s = mid.iter().find(|s| s.name == uname).expect("活跃期应在 user_stats");
+        assert!(s.active >= 1, "活跃连接 active>=1");
+        assert!(s.conns >= 1, "累计连接 conns>=1");
+        drop(g); // 终态: 字节定格, active -1。
+        let after = user_stats();
+        let s2 = after.iter().find(|s| s.name == uname).expect("终态仍在 (累计量保留)");
+        assert_eq!((s2.up, s2.down), (500, 1500), "per-user 字节定格");
+        assert_eq!(s2.active, s.active - 1, "drop 后 active 减 1");
     }
 }
 

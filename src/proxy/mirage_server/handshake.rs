@@ -79,12 +79,12 @@ fn unauth_reflect_rate_exceeded(ip: IpAddr) -> bool {
 async fn run_handshake<S>(
     mut stream: S,
     peer_addr: SocketAddr,
-    password: &str,
+    creds: &[(String, String)],
     camouflage_host: &str,
     cam_pool: &Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
     pfs: bool,
-) -> Option<(S, [u8; 32], Option<[u8; 32]>)>
+) -> Option<(S, [u8; 32], Option<[u8; 32]>, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -128,7 +128,9 @@ where
     //   body[6..38]    Random (32 bytes) ← client_random
     //   body[38]       legacy_session_id.length (1 byte)
     //   body[39..]     legacy_session_id (32 bytes for Mirage) ← token here
-    let mut authenticated = false;
+    // 多用户: token 对每个凭据试, 命中即认出是哪个用户 (matched_idx)。非匹配在 tag 比对处即返回
+    // false 不碰 replay, 故 replay 对同一 token 仍单插 (见 hello_auth::identify_session_token)。
+    let mut matched_idx: Option<usize> = None;
     let mut client_random = [0u8; 32];
 
     if content_type == 0x16 && body.len() >= 39 && body[0] == 0x01 {
@@ -137,12 +139,15 @@ where
             let session_id = &body[39..39 + sid_len];
             let mut sid_array = [0u8; 32];
             sid_array.copy_from_slice(session_id);
-            if crate::crypto::hello_auth::verify_session_token(password, &sid_array, auth_ts_tolerance_secs) {
-                authenticated = true;
+            matched_idx = creds
+                .iter()
+                .position(|(_, pw)| crate::crypto::hello_auth::verify_session_token(pw, &sid_array, auth_ts_tolerance_secs));
+            if matched_idx.is_some() {
                 client_random.copy_from_slice(&body[6..38]);
             }
         }
     }
+    let authenticated = matched_idx.is_some();
 
     if !authenticated {
         warn!("Mirage Server auth failed from {}", peer_addr);
@@ -255,15 +260,16 @@ where
         None => None,
     };
 
-    // Hand off to control plane (crypto setup + TIME_SYNC + dispatch)
-    Some((stream, client_random, ecdh))
+    // Hand off to control plane (crypto setup + TIME_SYNC + dispatch)。matched_idx 此处必 Some
+    // (上方 !authenticated 已 return None), 即命中的凭据下标, 供调用方取用户名/派生密钥的 password。
+    Some((stream, client_random, ecdh, matched_idx.expect("authenticated ⇒ matched_idx")))
 }
 
 /// TCP 传输入口: 握手 → into_split (Tcp 变体, 保留静态分发 + 无锁) → dispatch。
 pub(super) async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    password: String,
+    creds: Arc<Vec<(String, String)>>,
     camouflage_host: String,
     cam_pool: Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
@@ -272,17 +278,19 @@ pub(super) async fn handle_connection(
 ) {
     stream.set_nodelay(true).unwrap_or_default();
     let client_ip = peer_addr.ip();
-    if let Some((stream, client_random, ecdh)) = run_handshake(
-        stream, peer_addr, &password, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
+    if let Some((stream, client_random, ecdh, idx)) = run_handshake(
+        stream, peer_addr, &creds, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
     )
     .await
     {
+        let (user, password) = creds[idx].clone(); // 命中的凭据: 用户名 + 派生会话密钥的 password
         let (rh, wh) = stream.into_split();
         control::dispatch_authenticated(
             crate::proxy::tunnel::TunnelRead::Tcp(rh),
             crate::proxy::tunnel::TunnelWrite::Tcp(wh),
             Some(client_ip),
             password,
+            user,
             client_random,
             upstream,
             ecdh,

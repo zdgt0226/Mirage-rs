@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### feat(auth): 多用户凭据 (per-user 密钥隔离 + 用量统计 + 管理 API)
+
+`mirage_server` 加 `users: [{name, password}]` —— 每人独立口令。**协议零改动、向后兼容**:
+token 格式不变, 客户端只配自己那份 password; 服务端握手对每个凭据试 `verify_session_token`,
+命中即认出用户 (`identify_session_token`, O(N) HMAC)。非匹配凭据在 tag 比对处即返回, 不碰
+replay → replay 对同一 token 仍单插 (与单用户语义一致)。主 `password` 恒为凭据 "default"。
+- **per-user 密钥隔离**: 用命中用户的 password 派生会话 master, 各用户流量不同密钥。
+- **per-user 统计** (monitor): 连接数 / 上下行字节 / 活跃连接, 按用户名聚合 (内存版重启清零)。
+- **管理 API** (供 Mirage-console): `GET /api/users` 列 name + 用量 (**绝不返 password**);
+  `POST /api/users` 改 `mirage_server.users[]` (复用 profiles 的 version 乐观锁 + parse/semantic
+  校验 + dry_run + 原子写 + 热重载)。
+- config `check` 校验: user name 非空且唯一 (含不撞保留名 `default`)、password 非空。
+- 覆盖 TCP 主路 + QUIC(lean) 实验腿。README 安全声明更新 (单口令 → 多用户按人吊销)。
+- v2 (未做): per-user 限速/流量配额 enforcement + 计量持久化。
+
 ## [v0.13.3] - recv/send 热路径压榨 (借用式解密 + 去 framed 拷贝) + rustls 安全修复 (2026-09-21)
 
 ### perf(crypto): send 写路径去 framed 双拷贝 (header/body 分写 BufWriter)

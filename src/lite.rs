@@ -231,9 +231,11 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
     let brutal_bps = cfg.brutal_rate_mbps.filter(|m| *m > 0).map(|m| m * 125_000);
     let ss_upstream = crate::build_upstream(cfg.upstream.as_ref())?;
 
+    // 轻量服务端单用户: 单凭据 ("default", password)。
+    let creds = std::sync::Arc::new(vec![("default".to_string(), cfg.password.clone())]);
     crate::proxy::mirage_server::start_server(
         &addr,
-        &cfg.password,
+        creds,
         &cfg.sni,
         None, // 无 eBPF
         brutal_bps,

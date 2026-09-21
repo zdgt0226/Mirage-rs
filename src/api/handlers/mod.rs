@@ -21,3 +21,4 @@ pub mod history;
 pub mod logs;
 pub mod proxies;
 pub mod rules;
+pub mod users;

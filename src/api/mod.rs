@@ -269,6 +269,7 @@ fn api_routes() -> Router<AppState> {
         .route("/proxies/select", post(handlers::proxies::select_proxy))
         .route("/rules", get(handlers::rules::get_rules).post(handlers::rules::update_rules))
         .route("/profiles", get(handlers::profiles::get_profiles).post(handlers::profiles::update_profiles))
+        .route("/users", get(handlers::users::get_users).post(handlers::users::update_users))
         .route("/bpf/tunnels", get(handlers::bpf_tunnels::get_bpf_tunnels))
         .route("/tls/capture", get(handlers::tls_capture::get_capture).post(handlers::tls_capture::post_capture))
 }
