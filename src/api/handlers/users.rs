@@ -73,12 +73,49 @@ pub async fn get_users(State(app_state): State<AppState>) -> Response {
     .into_response()
 }
 
+/// 一条用户操作。**op-based (增量) 而非整表替换** —— 因为 GET 不回显 password, 前端拿不到
+/// 既有用户的密码, 无法做整表替换 (会把未改用户的密码清空)。故只发变更: 增/改密/删。
+#[derive(Deserialize)]
+pub struct UserOp {
+    /// "upsert" (增或改密, 需 password) | "remove" (删, 忽略 password)。
+    pub action: String,
+    pub name: String,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct UpdateReq {
-    /// 要设置的用户列表 (整表替换)。每项 {name, password}。password 仅写入 config, 不回显。
-    pub users: Value,
+    /// 要应用的操作 (增量)。保留名 "default" (主密码) 不由此管理。
+    pub ops: Vec<UserOp>,
     #[serde(default)]
     pub version: Option<String>,
+}
+
+/// 对当前 users 数组应用增量操作。纯函数 (无 IO), 便于单测。Err = (错误码, 消息)。
+/// 保留名 "default" (主密码) 拒绝; upsert 需非空 password (存在则改密, 否则新增); remove 按名删。
+/// 结果的 name 唯一/非空/密码非空由上层 semantic_issues 兜底校验 (此处只挡明显的 op 级错误)。
+fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'static str, String)> {
+    for op in ops {
+        if op.name == "default" {
+            return Err(("reserved_name", "保留名 `default` 是主密码, 不通过 /api/users 管理".into()));
+        }
+        match op.action.as_str() {
+            "upsert" => {
+                let pw = op.password.clone().unwrap_or_default();
+                if pw.is_empty() {
+                    return Err(("empty_password", format!("user `{}` 的 password 为空", op.name)));
+                }
+                match users.iter_mut().find(|u| u.get("name").and_then(|n| n.as_str()) == Some(op.name.as_str())) {
+                    Some(u) => { u["password"] = Value::String(pw); }
+                    None => users.push(json!({"name": op.name, "password": pw})),
+                }
+            }
+            "remove" => users.retain(|u| u.get("name").and_then(|n| n.as_str()) != Some(op.name.as_str())),
+            other => return Err(("bad_op", format!("未知操作 `{other}` (仅 upsert/remove)"))),
+        }
+    }
+    Ok(users)
 }
 
 pub async fn update_users(
@@ -108,7 +145,14 @@ pub async fn update_users(
     let Some(ib) = inbounds[idx].as_object_mut() else {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "corrupt_config", "mirage_server 入站非对象", vec![]);
     };
-    ib.insert("users".to_string(), req.users);
+
+    // 取当前 users 数组 (缺则空), 应用增量操作 —— 不需要既有密码。
+    let cur: Vec<Value> = ib.get("users").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+    let users = match apply_ops(cur, &req.ops) {
+        Ok(u) => u,
+        Err((code, msg)) => return err_resp(StatusCode::UNPROCESSABLE_ENTITY, code, msg, vec![]),
+    };
+    ib.insert("users".to_string(), Value::Array(users));
 
     let Ok(candidate) = serde_json::to_string_pretty(&v) else {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "serialize_error", "候选配置序列化失败", vec![]);
@@ -141,4 +185,43 @@ pub async fn update_users(
     }
     let _ = tokio::fs::remove_file(&tmp).await;
     err_resp(StatusCode::INTERNAL_SERVER_ERROR, "write_error", "写入配置失败 (原文件未改动)", vec![])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(action: &str, name: &str, pw: Option<&str>) -> UserOp {
+        UserOp { action: action.into(), name: name.into(), password: pw.map(|s| s.into()) }
+    }
+    fn names(v: &[Value]) -> Vec<String> {
+        v.iter().filter_map(|u| u.get("name").and_then(|n| n.as_str()).map(String::from)).collect()
+    }
+
+    #[test]
+    fn upsert_adds_then_changes_password() {
+        let u = apply_ops(vec![], &[op("upsert", "alice", Some("p1"))]).unwrap();
+        assert_eq!(names(&u), vec!["alice"]);
+        assert_eq!(u[0]["password"], "p1");
+        // 再 upsert 同名 = 改密, 不新增。
+        let u2 = apply_ops(u, &[op("upsert", "alice", Some("p2"))]).unwrap();
+        assert_eq!(u2.len(), 1);
+        assert_eq!(u2[0]["password"], "p2");
+    }
+
+    #[test]
+    fn remove_deletes_by_name_untouched_kept() {
+        let start = vec![json!({"name":"a","password":"x"}), json!({"name":"b","password":"y"})];
+        let u = apply_ops(start, &[op("remove", "a", None)]).unwrap();
+        assert_eq!(names(&u), vec!["b"]);
+        assert_eq!(u[0]["password"], "y", "未动用户密码保留 (op-based 不需回传既有密码)");
+    }
+
+    #[test]
+    fn reserved_default_and_empty_pw_and_bad_op_rejected() {
+        assert_eq!(apply_ops(vec![], &[op("upsert", "default", Some("p"))]).unwrap_err().0, "reserved_name");
+        assert_eq!(apply_ops(vec![], &[op("upsert", "u", Some(""))]).unwrap_err().0, "empty_password");
+        assert_eq!(apply_ops(vec![], &[op("upsert", "u", None)]).unwrap_err().0, "empty_password");
+        assert_eq!(apply_ops(vec![], &[op("frobnicate", "u", None)]).unwrap_err().0, "bad_op");
+    }
 }

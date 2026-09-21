@@ -11,7 +11,7 @@ replay → replay 对同一 token 仍单插 (与单用户语义一致)。主 `pa
 - **per-user 密钥隔离**: 用命中用户的 password 派生会话 master, 各用户流量不同密钥。
 - **per-user 统计** (monitor): 连接数 / 上下行字节 / 活跃连接, 按用户名聚合 (内存版重启清零)。
 - **管理 API** (供 Mirage-console): `GET /api/users` 列 name + 用量 (**绝不返 password**);
-  `POST /api/users` 改 `mirage_server.users[]` (复用 profiles 的 version 乐观锁 + parse/semantic
+  `POST /api/users` (**op-based 增删/改密**, 因 GET 藏 password 无法整表替换) 改 `mirage_server.users[]` (复用 profiles 的 version 乐观锁 + parse/semantic
   校验 + dry_run + 原子写 + 热重载)。
 - config `check` 校验: user name 非空且唯一 (含不撞保留名 `default`)、password 非空。
 - 覆盖 TCP 主路 + QUIC(lean) 实验腿。README 安全声明更新 (单口令 → 多用户按人吊销)。
