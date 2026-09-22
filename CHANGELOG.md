@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### chore(err): 文件加载错误补 `.with_context` (线上排障可诊断性)
+
+多处 fs 读取用裸 `?` 传播, 错误只剩 "No such file (os error 2)" 不带路径, 线上排障靠猜。给
+config / geo / fake-ip 这批**文件加载**路径补 `anyhow` 上下文 (带文件名 + 是"读"还是"解析"):
+- `config.rs` `load_from_file`: 读配置文件 / 解析配置 JSON 各带 path。
+- `router/geo.rs`: `load_geosite_dat` / `load_geoip_dat` / `load_all_geoip` / `load_singbox_json`
+  (读 + JSON 解析) 各带 path 与 geo 文件类型。
+- `dns/fake_ip.rs` `load`: 读 fake-ip 持久化文件带 path。
+- `router/geo_updater.rs`: `create_dir_all` 带目录名。
+- 未动: `.ok()?` 静默转 None 的点 (config_watcher / proc_lookup, 故意吞错)、`tls_capture`
+  (返 `std::io::Result` 非 anyhow, 且 debug 抓包路径, 不为它改签名)。
+
+`cargo test` 全过; `clippy --all-targets -D warnings` 干净。
+
 ### perf: 两处热路径细节 (clippy pedantic/nursery 分诊后精选)
 
 跑 `clippy --lib -W clippy::pedantic -W clippy::nursery` 分诊, 过滤掉 85 个 `cast_possible_truncation`
