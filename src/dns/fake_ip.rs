@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -88,7 +89,8 @@ impl FakeIpMapper {
     /// 从持久化文件恢复映射 + next_ip。行格式: `next_ip=<u32>` 或 `<ip> <domain>`。
     /// 只接受落在本 range 的 IP (换过 fakeip 网段的旧缓存自动丢弃)。best-effort 解析。
     fn load(&self, path: &Path) -> anyhow::Result<()> {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("读取 fake-ip 持久化文件失败: {}", path.display()))?;
         let mut d2i = self.domain_to_ip.write().unwrap_or_else(|e| e.into_inner());
         let mut i2d = self.ip_to_domain.write().unwrap_or_else(|e| e.into_inner());
         let mut loaded_next: Option<u32> = None;

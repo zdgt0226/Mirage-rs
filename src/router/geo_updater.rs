@@ -7,7 +7,7 @@
 //! via=proxy 会用客户端本地的 socks/mixed inbound 作 SOCKS5 代理. 找不到
 //! 可用代理时 fallback direct + WARN.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use arc_swap::ArcSwap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -274,7 +274,7 @@ async fn update_one(
 
     // 写到 .tmp 再原子重命名, 避免下载中途文件损坏被读
     if !Path::new(dir).exists() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("创建 geo 目录失败: {dir}"))?;
     }
     if let Err(e) = std::fs::write(&tmp_path, &bytes) {
         error!("GeoUpdater: 写 {} 的临时文件失败: {:?}", source.name, e);

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::Deserialize;
 
 /// 允许路由规则的列表字段既写**单个标量**也写**数组** —— 与 sing-box/Clash 一致。
@@ -1036,8 +1037,10 @@ fn default_auth_ts_tolerance() -> u64 {
 impl Config {
     /// Loads configuration from a JSON file.
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("读取配置文件失败: {path}"))?;
+        let config: Config = serde_json::from_str(&content)
+            .with_context(|| format!("解析配置 JSON 失败: {path}"))?;
         Ok(config)
     }
 
