@@ -857,7 +857,10 @@ impl WarmPool {
                 // 先获取通知句柄（关键：避免检查队列为空和发生通知之间的竞态条件 Race Condition）
                 let notified = self.notify.notified();
 
-                if let Some(tunnel) = self.queue.lock().await.pop_front() {
+                // pop 后立即释放 queue 锁, 别把它持有到整个 if-let body ——
+                // 否则 is_stale() 探测 (syscall) + tokio::spawn 期间都占着锁, 串行化其它 pool.get()。
+                let popped = self.queue.lock().await.pop_front();
+                if let Some(tunnel) = popped {
                     if tunnel.created_at.elapsed().as_secs() > tunnel.max_age_sec {
                         tracing::debug!("Tunnel reached max age ({}s), gracefully closing",
                             tunnel.created_at.elapsed().as_secs());

@@ -363,7 +363,7 @@ pub fn register(
                 dev.remove(&k);
             }
         }
-        let e = dev.entry(src.clone()).or_insert(DeviceAgg { conns: 0, up: 0, down: 0, last: Instant::now() });
+        let e = dev.entry(src.clone()).or_insert_with(|| DeviceAgg { conns: 0, up: 0, down: 0, last: Instant::now() });
         e.conns += 1;
         e.last = Instant::now();
     }
