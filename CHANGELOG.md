@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### perf: 两处热路径细节 (clippy pedantic/nursery 分诊后精选)
+
+跑 `clippy --lib -W clippy::pedantic -W clippy::nursery` 分诊, 过滤掉 85 个 `cast_possible_truncation`
+等风格噪声, 只取真·热路径收益两处 (其余边际/风险项按 surgical 原则不动):
+- **`pool.rs` 连接池获取: 缩短 queue 锁持有** (`significant_drop_in_scrutinee`)。原 `if let Some(t) =
+  self.queue.lock().await.pop_front()` 让 async MutexGuard 活到整个 if-let body 结束 —— `is_stale()`
+  探测 (syscall) 与 `tokio::spawn` 期间都占着锁, 串行化其它 `pool.get()`。改成先 `let popped = …pop_front()`
+  当即释放锁, 再处理。热路径 (handler/dns/udp_relay 都走 pool.get) 减锁竞争。
+- **`monitor.rs` per-device 统计: `or_insert` → `or_insert_with`** (`or_fun_call`)。原每次注册连接都**急构造**
+  `DeviceAgg { …, last: Instant::now() }` (含 `Instant::now()` syscall) 即使条目已存在; 改惰性构造, 仅新
+  设备才求值 (且 `last` 随后即被覆盖, 原求值双重浪费)。
+
+`cargo test` 399 passed; `clippy --all-targets -D warnings` 干净。
+
 ### perf(crypto): send 路径 copy2 基线 bench —— 实测无收益, 不改 (热路径已到地板)
 
 承接 v0.13.3 的 recv/send 压榨, 审 send 路径剩余 memcpy: 每帧 sealed body 经 `write_all` 进内嵌
