@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### perf(crypto): send 路径 copy2 基线 bench —— 实测无收益, 不改 (热路径已到地板)
+
+承接 v0.13.3 的 recv/send 压榨, 审 send 路径剩余 memcpy: 每帧 sealed body 经 `write_all` 进内嵌
+`BufWriter` 时被拷进其 64KB 内部缓冲 (copy2, 换 syscall 合并)。评估 single-copy 版 (复用 `framed` +
+`seal_in_place_separate_tag` 就地封装 + 单次 `write_all`, 省 copy2)。
+- **新增 `examples/bench_send.rs`**: 同 ring key / 同数据 / 同 sink, 手工复刻现状 (A, 含 copy2) vs
+  single-copy (B, 无 copy2), 隔离测 copy2 净成本。
+- **结论: B vs A = -0.1% (噪声内), copy2 净成本 ≈ 0 → 不改。** 根因: copy2 操作的是 64KB BufWriter
+  缓冲, **常驻 L2 cache**, 相对 ChaCha20 流式过 RAM 的 seal (实测 266 vs memcpy 3093 MB/s, seal 是一遍
+  memcpy 的 ~12 倍) 可忽略。P2「crypto 是墙」延伸到 send 分帧: recv/send/relay 无可再压的 alloc/memcpy。
+
 ## [v0.14.0] - 多用户凭据 (per-user 密钥隔离 + 用量统计 + Mirage-console 管理) (2026-09-21)
 
 ### feat(auth): 多用户凭据 (per-user 密钥隔离 + 用量统计 + 管理 API)
