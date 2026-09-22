@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### feat(config): check 增补入站监听 `listen:port` 冲突检测
+
+审 `semantic_issues` 校验覆盖: 出站/入站 tag 查重、WG/mirage/SS 必填、路由引用、组成员等都已很全,
+但**两个入站绑同一 `listen:port`** 没查 —— 启动时第二个 bind 会 `address already in use`, 配置层此前
+零提示。补上: 精确匹配 (listen, port) 跨入站查重, 命中报明"启动时会 bind 失败"。
+- 精确匹配, 不拦 `0.0.0.0` 与 `127.0.0.1` 的通配重叠 (需按接口判, 非本 check 目标, 避免误报)。
+- port=0 已另有校验, 冲突检测跳过 0 避免双重报错。
+- 测试: `duplicate_listen_bind_caught` (同 listen:port 必报) + `distinct_listen_bind_ok` (同端口不同
+  地址不误报)。config 校验测试 52 → 54。
+
 ### chore(err): 文件加载错误补 `.with_context` (线上排障可诊断性)
 
 多处 fs 读取用裸 `?` 传播, 错误只剩 "No such file (os error 2)" 不带路径, 线上排障靠猜。给

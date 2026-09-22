@@ -1296,16 +1296,19 @@ impl Config {
             }
         }
 
-        // 入站 tag 查重 + 端口 0 + 服务端空密码
+        // 入站 tag 查重 + 端口 0 + 监听冲突 + 服务端空密码
         let mut in_tags: Vec<&str> = Vec::new();
+        let mut in_binds: Vec<(&str, u16)> = Vec::new();
         for ib in &self.inbounds {
-            let (tag, port) = match ib {
-                InboundConfig::Socks { tag, port, .. }
-                | InboundConfig::Dns { tag, port, .. }
-                | InboundConfig::MirageServer { tag, port, .. }
-                | InboundConfig::Mixed { tag, port, .. }
-                | InboundConfig::Shadowsocks { tag, port, .. }
-                | InboundConfig::Transparent { tag, port, .. } => (tag.as_str(), *port),
+            let (tag, listen, port) = match ib {
+                InboundConfig::Socks { tag, listen, port, .. }
+                | InboundConfig::Dns { tag, listen, port, .. }
+                | InboundConfig::MirageServer { tag, listen, port, .. }
+                | InboundConfig::Mixed { tag, listen, port, .. }
+                | InboundConfig::Shadowsocks { tag, listen, port, .. }
+                | InboundConfig::Transparent { tag, listen, port, .. } => {
+                    (tag.as_str(), listen.as_str(), *port)
+                }
             };
             if in_tags.contains(&tag) {
                 issues.push(format!("inbound tag `{tag}` 重复定义"));
@@ -1313,6 +1316,18 @@ impl Config {
             in_tags.push(tag);
             if port == 0 {
                 issues.push(format!("inbound `{tag}` 的 port 为 0"));
+            }
+            // 监听地址:端口冲突 —— 两入站绑同一 listen:port, 启动时第二个 bind 会
+            // "address already in use", 而配置层此前零提示。精确匹配 (0.0.0.0 与
+            // 127.0.0.1 的通配重叠不在此拦, 那要按接口判, 非本 check 目标)。
+            if port != 0 {
+                if in_binds.contains(&(listen, port)) {
+                    issues.push(format!(
+                        "inbound `{tag}` 的监听 `{listen}:{port}` 与前一个入站冲突 \
+                         (启动时会 bind 失败: address already in use)"
+                    ));
+                }
+                in_binds.push((listen, port));
             }
             if let InboundConfig::Shadowsocks { tag, method, password, .. } = ib {
                 if password.is_empty() {
@@ -1784,6 +1799,29 @@ mod validation_tests {
         ]);
         v["routing"]["default_outbound"] = serde_json::json!("dup");
         assert!(has(&issues_of(&v), "重复定义"));
+    }
+
+    #[test]
+    fn duplicate_listen_bind_caught() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mixed",  "tag": "a", "listen": "0.0.0.0", "port": 1080 },
+            { "type": "socks",  "tag": "b", "listen": "0.0.0.0", "port": 1080 }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "0.0.0.0:1080"), "同 listen:port 应报冲突, 实际: {is:?}");
+        assert!(has(&is, "bind 失败"), "应点明 bind 失败, 实际: {is:?}");
+    }
+
+    #[test]
+    fn distinct_listen_bind_ok() {
+        // 同端口不同 listen 地址 (精确匹配, 不误报) —— 通配重叠不在此 check 范围。
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mixed", "tag": "a", "listen": "127.0.0.1", "port": 1080 },
+            { "type": "socks", "tag": "b", "listen": "192.168.1.1", "port": 1080 }
+        ]);
+        assert!(!has(&issues_of(&v), "冲突"), "不同 listen 地址不该报冲突: {:?}", issues_of(&v));
     }
 
     #[test]
