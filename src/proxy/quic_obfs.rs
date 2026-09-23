@@ -44,6 +44,30 @@ impl ObfsSocket {
     }
 }
 
+/// GRO-aware 逐段去混淆 (就地)。
+///
+/// `buf[..len]` 是 inner socket 收到的、可能被 UDP_GRO 合并的多段: 每段 `stride` 字节 (末段可能更短),
+/// 各段是**独立 salt+XOR** 混淆的。逐段用各自的 salt 解、剥掉 8B salt 前移压实, 返回压实后的有效长度。
+/// 段 < `SALT_LEN` 视为非法直接丢弃 (不计入输出)。`stride` 由调用方解析 (0 → 单段, 见 poll_recv)。
+fn deobfs_datagram(key: &[u8; 32], buf: &mut [u8], len: usize, stride: usize) -> usize {
+    let mut read = 0usize;
+    let mut write = 0usize;
+    while read < len {
+        let seg = stride.min(len - read);
+        if seg < SALT_LEN {
+            read += seg; // 太短, 非合法段 → 丢
+            continue;
+        }
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&buf[read..read + SALT_LEN]);
+        xor_keystream(key, &salt, &mut buf[read + SALT_LEN..read + seg]);
+        buf.copy_within(read + SALT_LEN..read + seg, write); // 剥 salt, 前移压实
+        write += seg - SALT_LEN;
+        read += seg;
+    }
+    write
+}
+
 /// keystream(blake3-XOF(key, salt)) 就地 XOR data。
 fn xor_keystream(key: &[u8; 32], salt: &[u8], data: &mut [u8]) {
     let mut hasher = blake3::Hasher::new_keyed(key);
@@ -110,22 +134,7 @@ impl AsyncUdpSocket for ObfsSocket {
             // 逐段用各自的 salt 解 —— 不能整块用首段 salt (否则首段之后全腐化, 小包如 ACK 大面积合并
             // → CC 饿死, 真机实测 ~15-40x 崩)。单 datagram 时 stride==len, 循环只跑一次。
             let stride = if meta[i].stride == 0 { len } else { meta[i].stride };
-            let buf = &mut bufs[i];
-            let mut read = 0usize;
-            let mut write = 0usize;
-            while read < len {
-                let seg = stride.min(len - read);
-                if seg < SALT_LEN {
-                    read += seg; // 太短, 非合法段 → 丢
-                    continue;
-                }
-                let mut salt = [0u8; SALT_LEN];
-                salt.copy_from_slice(&buf[read..read + SALT_LEN]);
-                xor_keystream(&self.key, &salt, &mut buf[read + SALT_LEN..read + seg]);
-                buf.copy_within(read + SALT_LEN..read + seg, write); // 剥 salt, 前移压实
-                write += seg - SALT_LEN;
-                read += seg;
-            }
+            let write = deobfs_datagram(&self.key, &mut bufs[i], len, stride);
             meta[i].len = write; // write==0 (全丢) → quinn 忽略
             meta[i].stride = stride.saturating_sub(SALT_LEN); // 每段少 8B, 新 stride 一致 (末段短 quinn 自处理)
         }
@@ -147,5 +156,102 @@ impl AsyncUdpSocket for ObfsSocket {
     }
     fn may_fragment(&self) -> bool {
         self.inner.may_fragment()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(pw: &str) -> [u8; 32] {
+        *blake3::hash(pw.as_bytes()).as_bytes()
+    }
+
+    /// 按 try_send 的线格式造一段: salt(8) || (payload XOR keystream(key,salt))。
+    fn obf_seg(k: &[u8; 32], salt: [u8; SALT_LEN], payload: &[u8]) -> Vec<u8> {
+        let mut seg = salt.to_vec();
+        let mut body = payload.to_vec();
+        xor_keystream(k, &salt, &mut body);
+        seg.extend_from_slice(&body);
+        seg
+    }
+
+    #[test]
+    fn xor_keystream_is_involution() {
+        let k = key("pw");
+        let salt = [9u8; SALT_LEN];
+        let orig = b"the quick brown fox jumps over the lazy dog x2 for >1KB block boundary";
+        let mut data = orig.to_vec();
+        xor_keystream(&k, &salt, &mut data);
+        assert_ne!(&data, orig, "XOR 一次必须改变内容");
+        xor_keystream(&k, &salt, &mut data);
+        assert_eq!(&data, orig, "XOR 两次 (同 key+salt) 必还原");
+    }
+
+    #[test]
+    fn xor_crosses_1kb_keystream_block() {
+        // keystream 内部按 1024B 块填充; 跨块必须连续正确。
+        let k = key("pw");
+        let salt = [3u8; SALT_LEN];
+        let orig = vec![0xA5u8; 3000];
+        let mut data = orig.clone();
+        xor_keystream(&k, &salt, &mut data);
+        xor_keystream(&k, &salt, &mut data);
+        assert_eq!(data, orig);
+    }
+
+    #[test]
+    fn deobfs_single_datagram_roundtrip() {
+        let k = key("pw");
+        let payload = b"one quic packet payload";
+        let seg = obf_seg(&k, [1u8; SALT_LEN], payload);
+        let mut buf = seg.clone();
+        // 单 datagram: stride == len。
+        let n = deobfs_datagram(&k, &mut buf, seg.len(), seg.len());
+        assert_eq!(&buf[..n], payload, "单段去混淆应还原原 payload");
+    }
+
+    #[test]
+    fn deobfs_gro_multi_segment() {
+        // 模拟 UDP_GRO 把 3 个独立 datagram 合并: 每段各自 salt, 等长 → stride 统一。
+        let k = key("pw");
+        let p0 = b"aaaaaaaaaaaaaaaaaaaa"; // 各 20B, 段长 28
+        let p1 = b"bbbbbbbbbbbbbbbbbbbb";
+        let p2 = b"cccccccccccccccccccc";
+        let stride = SALT_LEN + p0.len();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&obf_seg(&k, [10u8; SALT_LEN], p0));
+        buf.extend_from_slice(&obf_seg(&k, [20u8; SALT_LEN], p1));
+        buf.extend_from_slice(&obf_seg(&k, [30u8; SALT_LEN], p2));
+        let len = buf.len();
+        let n = deobfs_datagram(&k, &mut buf, len, stride);
+        let mut want = Vec::new();
+        want.extend_from_slice(p0);
+        want.extend_from_slice(p1);
+        want.extend_from_slice(p2);
+        assert_eq!(&buf[..n], &want[..], "GRO 多段应逐段各自 salt 解、压实拼接");
+    }
+
+    #[test]
+    fn deobfs_drops_undersized_trailing_segment() {
+        // 一整段 + 末尾 <SALT_LEN 的残段 (非法) → 残段丢弃, 只出第一段。
+        let k = key("pw");
+        let payload = b"first-full-segment!!";
+        let seg = obf_seg(&k, [7u8; SALT_LEN], payload);
+        let stride = seg.len();
+        let mut buf = seg.clone();
+        buf.extend_from_slice(&[0xFF; 5]); // 5 < SALT_LEN(8) 残段
+        let len = buf.len();
+        let n = deobfs_datagram(&k, &mut buf, len, stride);
+        assert_eq!(&buf[..n], payload, "残段应被丢弃, 只还原完整段");
+    }
+
+    #[test]
+    fn deobfs_wrong_key_corrupts() {
+        let payload = b"secret quic bytes";
+        let seg = obf_seg(&key("right-pw"), [5u8; SALT_LEN], payload);
+        let mut buf = seg.clone();
+        let n = deobfs_datagram(&key("wrong-pw"), &mut buf, seg.len(), seg.len());
+        assert_ne!(&buf[..n], payload, "错 key 解出必为腐化数据 (QUIC 层随后丢弃)");
     }
 }

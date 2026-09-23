@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### test(quic): 补 Salamander 混淆 GRO 去混淆测试 + CI 纳入 `--features quic`
+
+测试补漏审计: 401 lib 测覆盖已强, 剩余缺口多为 IO/网络/eBPF (难单测)。但 **quic_obfs 的 GRO 逐段
+去混淆** 是全仓最易错的纯逻辑之一 (注释记载搞错真机崩 15-40x), 却零测试; 且 **CI 默认构建不含
+quic, 这些模块此前从不编译也从不测试**。
+- 把 poll_recv 里的逐段去混淆抽成纯函数 `deobfs_datagram(key, buf, len, stride) -> usize` (纯提取,
+  poll_recv 行为不变), 便于单测。
+- 加 6 个测试: `xor_keystream` 对合性 + 跨 1KB keystream 块、单 datagram roundtrip、**GRO 多段
+  各自 salt 解压实**、残段 (<SALT_LEN) 丢弃、错 key 腐化。
+- CI `build.yml` 增 `Run tests (quic feature)` 步 (`cargo test --features quic --lib`), 补上 quic 覆盖洞。
+
+`cargo test --features quic --lib` 全过; 默认 `cargo test` 401 passed 不受影响。
+
 ### feat(config): check 增补入站监听 `listen:port` 冲突检测
 
 审 `semantic_issues` 校验覆盖: 出站/入站 tag 查重、WG/mirage/SS 必填、路由引用、组成员等都已很全,
