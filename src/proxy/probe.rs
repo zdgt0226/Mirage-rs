@@ -72,22 +72,27 @@ async fn probe_inner(
     // 2. 发带 token 的伪装 ClientHello, 读服务端握手 flight, 回假 Finished tail —— 与
     //    pool::connect_upstream 完全同一套原语。整段包一个总超时。
     let hs = async {
-        let token = crate::crypto::hello_auth::make_session_token(password);
-        let (hello, client_random) =
-            crate::crypto::tls_raw::build_client_hello(camouflage_host, &token);
+        let mut client_random = [0u8; 32];
+        rand::fill(&mut client_random);
+        let token = crate::crypto::hello_auth::make_session_token(password, &client_random);
+        let hello =
+            crate::crypto::tls_raw::build_client_hello_with_random(camouflage_host, &token, &client_random);
         write_half.write_all(&hello).await?;
         write_half.flush().await?;
-        crate::proxy::pool::read_server_handshake(&mut read_half).await?;
+        let server_random = crate::proxy::pool::read_server_handshake(&mut read_half).await?;
+        if server_random == [0u8; 32] {
+            anyhow::bail!("未能捕获有效的 ServerHello.random (全 0)");
+        }
         let tail = crate::crypto::tls_raw::build_fake_client_tail();
         write_half.write_all(&tail).await?;
         write_half.flush().await?;
-        Ok::<_, anyhow::Error>(client_random)
+        Ok::<_, anyhow::Error>((client_random, server_random))
     };
     // 握手阶段超时**下限 15s**: read_server_handshake 本身对真实慢链路容忍到 ~10-14s
     // (CCS 前), 若用外层 8s 总超时去卡它, 慢但可用的服务端会被误判 Fail (--require-live
     // 就会拒掉一个其实能用的节点)。故握手取 max(用户超时, 15s), 不低于协议自身容忍。
     let hs_dl = dl.max(Duration::from_secs(15));
-    let client_random = timeout(hs_dl, hs)
+    let (client_random, server_random) = timeout(hs_dl, hs)
         .await
         .map_err(|_| anyhow!("TLS 伪装握手超时 ({}s)", hs_dl.as_secs()))?
         .map_err(|e| anyhow!("TLS 伪装握手失败: {e}"))?;
@@ -98,6 +103,7 @@ async fn probe_inner(
         write_half,
         password,
         &client_random,
+        &server_random,
         true, // is_initiator
     );
     // 认证确认单独一个较短超时 (对齐 connect_upstream 的 3s TIME_SYNC 等待, 不超过总超时)。

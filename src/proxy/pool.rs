@@ -271,17 +271,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use std::time::Duration;
 
-/// 客户端伪装握手产物: 会话 salt + 可选 PFS ECDH 共享秘密。
+/// 客户端伪装握手产物: client_random + server_random + 可选 PFS ECDH 共享秘密。
 struct ClientHandshake {
     client_random: [u8; 32],
+    server_random: [u8; 32],
     /// PFS 开时 = 与服务端临时公钥 ECDH 出的共享秘密; 关时 None。
     ecdh: Option<[u8; 32]>,
 }
 
 /// 读服务端 flight (ServerHello + CCS + 加密段), 返回捕获的 **ServerHello.random**。
 ///
-/// PFS 下 server_random = 服务端临时 X25519 公钥 (见 crypto::pfs); 非 PFS 下调用方忽略之。
-/// 仍要求集齐 0x16+0x14+0x17 三型才成功 (见 handshake-template-completeness)。
+/// PFS 下 server_random = 服务端临时 X25519 公钥 (见 crypto::pfs); 非 PFS 下参与会话密钥派生。
+/// 仍要求集齐 0x16+0x14+0x17 三型才成功 (见 handshake-template-completeness)。若 server_random
+/// 全 0 则必须 fail-closed 报错断开。
 pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<[u8; 32]> {
     // v0.4.5-alpha.17: 放弃超时随机化, 消除固定 12s/1.5s 阈值的客户端时序指纹.
     // GFW 若主动操纵服务端响应时序 (拦截/延迟 ServerHello) 测客户端恒定放弃时间可
@@ -312,13 +314,6 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                         } else if ct == 0x16 {
                             // 首个 ServerHello: 捕获 random (body[6..38])。ServerHello body 布局:
                             // [0x02 type][3B len][2B version][32B random]... → random 在 [6..38]。
-                            //
-                            // PFS 边界: 假设**首条 0x16 record 就含完整 ServerHello 的 random**
-                            // (与服务端 get_server_hello_pfs 覆写 flight[11..43] 的假设对称:
-                            // 11-5=6, 帧头 5B)。random 在 body 前 38 字节内, fallback 是单条完整
-                            // record, fetch 模板首条通常也完整, 故实践中恒满足。若伪装站把
-                            // ServerHello 拆到首条 record < 38B (极罕见), 这里捕获不到 → server_random
-                            // 留全 0 → do_fake_tls 里 ECDH 失配 → fail-closed (安全, 见那里的 warn)。
                             if !saw_sh && body.len() >= 38 {
                                 server_random.copy_from_slice(&body[6..38]);
                             }
@@ -330,6 +325,9 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                         }
 
                         if saw_sh && saw_ccs && saw_enc {
+                            if server_random == [0u8; 32] {
+                                return Err(anyhow::anyhow!("未能捕获有效的 ServerHello.random (全 0), 握手失败断开 (fail-closed)"));
+                            }
                             return Ok(server_random);
                         }
                     }
@@ -349,6 +347,9 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
 
     if !saw_sh || !saw_ccs || !saw_enc {
         return Err(anyhow::anyhow!("Incomplete flight: sh={}, ccs={}, enc={}", saw_sh, saw_ccs, saw_enc));
+    }
+    if server_random == [0u8; 32] {
+        return Err(anyhow::anyhow!("未能捕获有效的 ServerHello.random (全 0), 握手失败断开 (fail-closed)"));
     }
     Ok(server_random)
 }
@@ -694,8 +695,10 @@ impl WarmPool {
                 match tokio::time::timeout(std::time::Duration::from_secs(3), crypto_reader.recv_data()).await {
                     Ok(Ok(ack)) => {
                         if let Some(final_cipher) = crate::crypto::cipher::parse_cipher_ack(&ack) {
-                            crypto_writer.rekey(final_cipher);
-                            crypto_reader.rekey(final_cipher);
+                            if final_cipher != crypto_writer.cipher() {
+                                crypto_writer.rekey(final_cipher);
+                                crypto_reader.rekey(final_cipher);
+                            }
                             tracing::debug!("cipher agility 协商为 {:?}", final_cipher);
                         } else {
                             tracing::warn!("cipher agility: CIPHER_ACK 格式异常, 维持 ChaCha20");
@@ -747,6 +750,7 @@ impl WarmPool {
                 TunnelWrite::Tcp(write_half),
                 &cfg.password,
                 &hs.client_random,
+                &hs.server_random,
                 &ecdh,
                 true,
             ),
@@ -755,6 +759,7 @@ impl WarmPool {
                 TunnelWrite::Tcp(write_half),
                 &cfg.password,
                 &hs.client_random,
+                &hs.server_random,
                 true,
             ),
         })
@@ -780,6 +785,7 @@ impl WarmPool {
                 TunnelWrite::Boxed(Box::new(write_half)),
                 &cfg.password,
                 &hs.client_random,
+                &hs.server_random,
                 &ecdh,
                 true,
             ),
@@ -788,6 +794,7 @@ impl WarmPool {
                 TunnelWrite::Boxed(Box::new(write_half)),
                 &cfg.password,
                 &hs.client_random,
+                &hs.server_random,
                 true,
             ),
         })
@@ -795,55 +802,44 @@ impl WarmPool {
 
 
     /// 伪装 TLS 握手 (发带 token 的 ClientHello / 读 server flight / 发假 Finished tail)。
-    /// 返回 client_random (会话密钥派生的 salt) + 可选 ecdh (PFS 开时)。
+    /// 返回 client_random 与 server_random (会话密钥派生的 64B salt) + 可选 ecdh (PFS 开时)。
     /// 对任意字节流生效 (物理 TCP / underlying 流)。
     async fn do_fake_tls<Rd, Wr>(rh: &mut Rd, wh: &mut Wr, cfg: &PoolConfig) -> Result<ClientHandshake>
     where
         Rd: tokio::io::AsyncRead + Unpin,
         Wr: tokio::io::AsyncWrite + Unpin,
     {
-        let token = crate::crypto::hello_auth::make_session_token(&cfg.password);
-        // PFS: 生成一次性 X25519 对, 公钥当 ClientHello.random 发出 (见 crypto::pfs)。
-        let ephemeral = if cfg.pfs {
-            Some(crate::crypto::pfs::Ephemeral::generate()?)
+        // 先确定 ClientHello.random (PFS 时是临时公钥), 再用它作 bind 生成 token。
+        let (ephemeral, client_random) = if cfg.pfs {
+            let e = crate::crypto::pfs::Ephemeral::generate()?;
+            let pk = e.public;
+            (Some(e), pk)
         } else {
-            None
+            let mut r = [0u8; 32];
+            rand::fill(&mut r);
+            (None, r)
         };
-        let (hello_bytes, client_random) = match &ephemeral {
-            Some(e) => (
-                crate::crypto::tls_raw::build_client_hello_with_random(
-                    &cfg.camouflage_host,
-                    &token,
-                    &e.public,
-                ),
-                e.public,
-            ),
-            None => crate::crypto::tls_raw::build_client_hello(&cfg.camouflage_host, &token),
-        };
+        let token = crate::crypto::hello_auth::make_session_token(&cfg.password, &client_random);
+        let hello_bytes = crate::crypto::tls_raw::build_client_hello_with_random(
+            &cfg.camouflage_host,
+            &token,
+            &client_random,
+        );
         wh.write_all(&hello_bytes).await?;
         wh.flush().await?;
         let server_random = read_server_handshake(rh).await?;
+        if server_random == [0u8; 32] {
+            anyhow::bail!("未能从服务端 ServerHello 捕获到 server_random (全 0), 握手失败断开 (fail-closed)");
+        }
         let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail();
         wh.write_all(&tail_bytes).await?;
         wh.flush().await?;
         // PFS: 与服务端临时公钥 (= server_random) 做 ECDH 得共享秘密。
         let ecdh = match ephemeral {
-            Some(e) => {
-                // server_random 全 0 = 没捕获到服务端临时公钥 (对端没开 pfs, 或 ServerHello
-                // 模板首条 record 不含完整 random —— 极罕见)。此时 ECDH 用全 0 公钥, master 必与
-                // 服务端失配 → fail-closed 连不上 (不会静默出明文, 但也连不通)。给个明确 warn。
-                if server_random == [0u8; 32] {
-                    tracing::warn!(
-                        "PFS: 未从服务端 ServerHello 捕获到临时公钥 (全 0) —— 对端很可能未开启 pfs, \
-                         或伪装站响应异常。本连接将因会话密钥失配而失败; 请确认服务端 config 也设 \
-                         \"pfs\": true。"
-                    );
-                }
-                Some(e.agree(&server_random)?)
-            }
+            Some(e) => Some(e.agree(&server_random)?),
             None => None,
         };
-        Ok(ClientHandshake { client_random, ecdh })
+        Ok(ClientHandshake { client_random, server_random, ecdh })
     }
 
     /// O(1) 复杂度提取连接.
@@ -982,5 +978,58 @@ impl Drop for WarmPool {
         if let Ok(mut q) = self.queue.try_lock() {
             q.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_handshake_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn build_mock_server_flight(server_random: &[u8; 32]) -> Vec<u8> {
+        let mut flight = Vec::new();
+        // 1. ServerHello: 0x16, 0x03, 0x03, len, 0x02, hs_len(3B), 0x03, 0x03, random(32B), sid_len=0, ciphers...
+        let mut hs_body = vec![0x03, 0x03]; // TLS 1.2
+        hs_body.extend_from_slice(server_random);
+        hs_body.push(0); // session_id len
+        hs_body.extend_from_slice(&[0x13, 0x01]); // cipher
+        hs_body.push(0); // compression
+        hs_body.extend_from_slice(&[0x00, 0x00]); // extensions len = 0
+
+        let hs_len = hs_body.len() as u32;
+        let mut hs = vec![0x02]; // ServerHello
+        hs.extend_from_slice(&hs_len.to_be_bytes()[1..4]);
+        hs.extend_from_slice(&hs_body);
+
+        flight.extend_from_slice(&[0x16, 0x03, 0x03]);
+        flight.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        flight.extend_from_slice(&hs);
+
+        // 2. ChangeCipherSpec: 0x14
+        flight.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+        // 3. EncryptedExtensions / AppData: 0x17
+        flight.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x10]);
+        flight.extend_from_slice(&[0xaa; 16]);
+
+        flight
+    }
+
+    #[tokio::test]
+    async fn read_server_handshake_fails_closed_on_all_zero_random() {
+        let flight = build_mock_server_flight(&[0u8; 32]);
+        let mut cursor = Cursor::new(flight);
+        let res = read_server_handshake(&mut cursor).await;
+        assert!(res.is_err(), "server_random 为全 0 时必须 fail-closed 断开");
+    }
+
+    #[tokio::test]
+    async fn read_server_handshake_succeeds_on_valid_random() {
+        let expected_random = [0x5au8; 32];
+        let flight = build_mock_server_flight(&expected_random);
+        let mut cursor = Cursor::new(flight);
+        let res = read_server_handshake(&mut cursor).await;
+        assert!(res.is_ok(), "有效 server_random 应成功捕获");
+        assert_eq!(res.unwrap(), expected_random);
     }
 }

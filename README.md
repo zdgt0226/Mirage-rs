@@ -8,10 +8,14 @@
 > 主打「零配置 eBPF 透明网关」+ 抗被动识别。
 
 > ⚠️ **安全声明 (务必先读)**:
+> - 🔴 **v0.15 协议断代 (BREAKING)**: 握手 token 与会话密钥派生已升级 (token 绑定 `ClientHello.random`、
+>   会话密钥混入服务端新鲜随机数, 堵住会话重放; 修复 cipher agility 协商 ChaCha 时的 nonce 复用)。
+>   **与 v0.14 及更早的服务端/客户端 (含 Android 客户端) 互不兼容, 必须两端同时升级**, 否则认证失败。
+>   不提供兼容开关。设计与论证见 `docs/protocol-freshness-design.md`。
 > - **未经专业安全审计**。加密分帧 (ChaCha20-Poly1305) 与握手认证由项目自研, 仅经过多轮 LLM
 >   复核与真机验证, **没有**独立安全公司审计。请据此评估信任度, 不要用于生命安全级场景。
-> - **前向保密 (PFS) 可选, 默认关**: 默认会话密钥仅由**共享口令**派生 (不做密钥协商) ——
->   **口令泄露则历史与未来流量都可被解密**。两端 config 设 `"pfs": true` 可开启**一次性
+> - **前向保密 (PFS) 可选, 默认关**: 默认会话密钥由**共享口令 + 双方随机数**派生 (v0.15 起服务端贡献
+>   新鲜性, 防重放), 但不做密钥协商 —— **口令泄露则历史与未来流量都可被解密**。两端 config 设 `"pfs": true` 可开启**一次性
 >   X25519 ECDH** (临时私钥用完即弃), 开启后即便口令泄露也解不了已录流量。**两端必须同开**
 >   (改了会话密钥派生, 一端开一端没开会连不上)。无论是否开 PFS, 都请用高强度随机口令、
 >   限制传播、定期更换。见 brain external-audit-2026-08 / handshake-forward-secrecy。
@@ -31,7 +35,7 @@
 ## 🌟 核心特性概览
 
 * **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），配 `client_hello_template` 即让出站握手复刻其 JA3/JA4（仅替换 SNI/session_id/random）。
-* **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关（向后兼容），认证仍靠口令、与加密解耦（对标 REALITY）。
+* **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关，认证仍靠口令、与加密解耦（对标 REALITY）。
 * **多用户凭据**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃），按人吊销。`/api/users` 供 Mirage-console 增删改密/查用量（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
@@ -377,6 +381,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] **cipher agility** (v0.7.0) —— 两端有 AES-NI 时协商 AES-256-GCM (比 ChaCha20 快 ~2.1x), 否则回落 ChaCha20; 协商全在加密信道内 (proto_ver 0x02 + CIPHER_NEGO/ACK), ClientHello 零触碰不改指纹; 服务端 `tuning.cipher_agility` 开关 (默认关=向后兼容)
 - [x] **IPv6 隧道传输** (v0.7.0, 瘦身自"IPv6 全栈") —— 隧道传输走 v6: 服务端 v6 监听 + 客户端 v6 字面量自动加方括号 (`net_util::join_host_port`) + `node_uri` v6。透明数据面 v6 大 epic **评估后否** (fake-IP + 服务端远程解析已让客户端 v6 数据面不必要; 已知限制见 brain `ipv6-full-stack-design`)
 - [x] **UDP 多路复用** (v0.9.0) —— 透明 UDP 的 Mirage 流按 flowkey 散列复用少量 (默认 K=4) 长命共享隧道, 拿掉"并发 UDP 流 ≤ `pool_size`"带机量硬伤 (真机拐点 20→450, 22.5×)。`tuning.udp_mux` 门控默认关 (两端同版)。容量不变量已有 CI 守卫 (v0.9.4)
+- [x] **协议新鲜性加固 (v0.15, 协议断代)** —— 2026-09-26 多模型审计的两条协议级 P1: token tag 绑定 `ClientHello.random` + `"mirage-token-v2"` 域分隔 (换 random 即认证失败), 会话 master salt = `client_random‖server_random` (服务端重启清空 replay cache 也无法重放录制会话), server_random 全 0 两端 fail-closed; cipher agility 协商结果不变时不 rekey (修 ChaCha 下 nonce 复用)。**不兼容旧协议**, 两端 (含 Android) 须同时升级。威胁模型新增 T6
 - [x] **可选前向保密 PFS** (v0.9.3, 外部审计 #2) —— 一次性 X25519 ECDH, 公钥搭 fake-TLS random 字段交换 (零指纹变化 + 高位随机化抗指纹), `password‖ecdh` 混进会话 master; opt-in 两端同开, 失配 fail-closed; install.sh 一键开关
 - [x] **供应链签名 + 多架构容器** (v0.9.3, 外部审计 #13) —— cosign **keyless** (Sigstore OIDC, 零密钥) 签 SHA256SUMS + ghcr 容器镜像 (amd64/arm64, 镜像亦签名); 验签命令见上方「验证产物签名」
 - [x] **外部审计整批清零** (v0.9.2–v0.9.4) —— API 失败限流 (#3) · cargo-deny 供应链门禁 (#11) · start_proxy 巨石拆分 (#4) · config 模板防漂移测试 (#7) · 版本歪斜诊断 (#8) · 解析器 proptest (#12) · 未审计声明 (#1)。纯代码/零密钥项全清, 残余仅 #14 bench (边际) / #10 orphan CI (需 ≥6.1 自托管 runner)

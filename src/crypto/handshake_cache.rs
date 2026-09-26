@@ -116,22 +116,24 @@ pub async fn prewarm(camouflage_host: &str) {
 }
 
 pub async fn get_server_hello(camouflage_host: &str, client_hello: &[u8]) -> Vec<u8> {
-    get_server_hello_pfs(camouflage_host, client_hello, None).await
+    get_server_hello_pfs(camouflage_host, client_hello, None).await.0
 }
 
 /// 同 `get_server_hello`, 但可用 `server_random_override` 把回放模板的 ServerHello.random
 /// (flight[11..43]) 覆写成指定 32B —— PFS 用它注入服务端一次性 X25519 公钥 (见 crypto::pfs)。
+/// 返回 (flight, 实际发出的 server_random)，保证线上发出的 random 与参与密钥派生的 random 严格一致。
 /// 覆写在**所有返回路径末尾**统一施加, 故 patch/fallback 各分支都生效。
 pub async fn get_server_hello_pfs(
     camouflage_host: &str,
     client_hello: &[u8],
     server_random_override: Option<&[u8; 32]>,
-) -> Vec<u8> {
+) -> (Vec<u8>, [u8; 32]) {
     let client_session_id = get_session_id(client_hello).unwrap_or(&[]);
 
-    // 末尾统一覆写 ServerHello.random (若 PFS 指定了)。flight 恒以 0x16 ServerHello 记录起头,
-    // random 在 [11..43] (5B record header + 4B hs header + 2B version = 11)。
-    let apply = |flight: Vec<u8>| -> Vec<u8> { apply_server_random(flight, server_random_override) };
+    // 末尾统一覆写 ServerHello.random 并返回 (flight, server_random)。
+    let apply = |flight: Vec<u8>| -> (Vec<u8>, [u8; 32]) {
+        apply_server_random(flight, server_random_override)
+    };
 
     if cache().lock().await.is_empty() {
         // 主动预热正常应已填充; 走到这说明预热失败或未运行 —— 懒预热兜底.
@@ -266,17 +268,28 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
 /// 覆写 ServerHello.random (flight[11..43])。真 TLS 的 ServerHello.random **每次握手全新**,
 /// 故回放模板必须逐连接改写它, 否则同模板所有连接共享一个 random = 被动可辨指纹。
 /// - PFS 开 (`override_random` = Some): 注入服务端一次性 X25519 公钥 (客户端读它做 ECDH, 见 crypto::pfs)。
-/// - PFS 关 (None): 填 32B 新随机 (与真 TLS 语义一致; 客户端此时不读 server random, 安全)。
+/// - PFS 关 (None): 填 32B 新随机, 沿 handshake → control 管道传递参与会话密钥派生。
 ///
+/// 返回 (改写后的 flight, 实际注入的 server_random)。
 /// flight 恒以 0x16 ServerHello 记录起头; random 在 [11..43] (5B record + 4B hs + 2B version)。
-fn apply_server_random(mut flight: Vec<u8>, override_random: Option<&[u8; 32]>) -> Vec<u8> {
+fn apply_server_random(
+    mut flight: Vec<u8>,
+    override_random: Option<&[u8; 32]>,
+) -> (Vec<u8>, [u8; 32]) {
+    let mut server_random = [0u8; 32];
     if flight.len() >= 43 && flight[0] == 0x16 {
         match override_random {
-            Some(pk) => flight[11..43].copy_from_slice(pk),
-            None => rand::fill(&mut flight[11..43]),
+            Some(pk) => {
+                server_random = *pk;
+                flight[11..43].copy_from_slice(pk);
+            }
+            None => {
+                rand::fill(&mut server_random);
+                flight[11..43].copy_from_slice(&server_random);
+            }
         }
     }
-    flight
+    (flight, server_random)
 }
 
 fn patch_server_hello(flight: &[u8], client_session_id: &[u8]) -> Vec<u8> {
@@ -417,18 +430,23 @@ mod tests {
             v
         };
         // PFS 关: 两次覆写 random 应各不相同 (每连接新随机), 且都非全 0 (确实写了)。
-        let a = apply_server_random(base.clone(), None);
-        let b = apply_server_random(base.clone(), None);
+        let (a, r_a) = apply_server_random(base.clone(), None);
+        let (b, r_b) = apply_server_random(base.clone(), None);
         assert_ne!(&a[11..43], &b[11..43], "PFS 关时 ServerHello.random 必须每连接不同");
         assert_ne!(&a[11..43], &[0u8; 32], "random 必须被真正写入");
+        assert_eq!(&a[11..43], &r_a);
+        assert_eq!(&b[11..43], &r_b);
         // PFS 开: random == 注入的公钥。
         let pk = [0x5Au8; 32];
-        let c = apply_server_random(base.clone(), Some(&pk));
+        let (c, r_c) = apply_server_random(base.clone(), Some(&pk));
         assert_eq!(&c[11..43], &pk, "PFS 开时 random 必须 == 注入的 X25519 公钥");
+        assert_eq!(r_c, pk);
         // 非 ServerHello (首字节非 0x16) 不动。
         let mut not_sh = base.clone();
         not_sh[0] = 0x17;
-        assert_eq!(apply_server_random(not_sh.clone(), None), not_sh);
+        let (d, r_d) = apply_server_random(not_sh.clone(), None);
+        assert_eq!(d, not_sh);
+        assert_eq!(r_d, [0u8; 32]);
     }
 
     // 构造一个最小合法 ClientHello 骨架, cipher 列表 = [1301,1302,1303].

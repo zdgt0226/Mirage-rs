@@ -280,7 +280,10 @@ pub async fn proxy_tcp_target(
                     Ok(s) => s,
                     Err(e) => { error!("Mirage QUIC open_stream {}: {}", target, e); return; }
                 };
-                let token = crate::crypto::hello_auth::make_session_token(pool.password());
+                let token = crate::crypto::hello_auth::make_session_token(
+                    pool.password(),
+                    crate::crypto::hello_auth::QUIC_LEAN_BIND,
+                );
                 let tb = target.as_bytes();
                 let mut hdr = Vec::with_capacity(32 + 2 + tb.len());
                 hdr.extend_from_slice(&token);

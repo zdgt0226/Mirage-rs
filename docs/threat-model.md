@@ -61,11 +61,26 @@ TLS 站点区分开。
 
 **红线**:引入任何与"是否 Mirage/认证是否通过"相关的固定/可测时序差 = 违规。
 
+## T6 会话新鲜性 / 抗重放 (session freshness & anti-replay)
+
+**目标**:主动中间人无法让服务端重现任何历史会话的密钥,也无法把新鲜认证嫁接到旧会话上。(v0.15 起,见
+`docs/protocol-freshness-design.md`)
+
+- ClientHello token 的 tag **绑定 `ClientHello.random`** (`bind`) 并带版本域分隔 → 换 random 即认证失败,转伪装站。
+- 会话主密钥 salt = `client_random ‖ server_random`,server_random 为**服务端线上实际发出**的 ServerHello.random →
+  即使服务端重启清空 replay cache,重放的录制会话也派生不出原密钥,首帧即解密失败。
+- server_random 全 0 (未写入/未捕获) → 客户端与服务端**都 fail-closed**。
+- 同一会话内 (key, nonce) 永不复用:cipher agility 协商结果与当前相同时不 rekey,`rekey()` 拒绝同 cipher 调用。
+- QUIC lean 每流 token 用独立 bind (`QUIC_LEAN_BIND`) 与 TCP token 域分隔。⚠️ QUIC 腿外层客户端 `NoVerify`、无服务端
+  认证,可被主动 MITM 读改 —— **QUIC 转正前必须补证书 pinning**,在此之前 T6 仅对 TCP fake-TLS 主链路成立。
+
+**红线**:任何让会话密钥只由客户端可控/可重放的输入决定、或导致同一 key 下 nonce 重复的改动 = 违规。
+
 ---
 
 ## 验收流程
 
-1. 每个新功能 PR:对照 T1–T5 自检,在描述里说明命中/无关。
+1. 每个新功能 PR:对照 T1–T6 自检,在描述里说明命中/无关。
 2. 触碰握手/DNS/路由/出站的改动:**必须**有对应 §7 场景测试或说明为何不需要。
 3. 违反红线的改动**不合并**,除非有明确的、记录在案的权衡 (如 SNI 伪装为 QoS 刻意留)。
 
@@ -84,6 +99,10 @@ TLS 站点区分开。
 | T4 | 被 block 域名 → NXDOMAIN,不解析不泄漏 | ✅ `::t4_blocked_domain_returns_nxdomain` |
 | T2 | WG 上游隧道内 DNS 解析符合预期 (不漏到本地) | 待补 (需 netns) |
 | T1 | 认证失败 → 转发伪装站 (会话密钥解不开其 TLS) | 部分 (probe.rs 有相关判定) |
+| T6 | 换 ClientHello.random 嫁接新鲜 token → 认证失败 | ✅ `tests/test_hello_auth.rs::random_substitution_attack_blocked` / `::test_token_bind_bit_flip_fails` |
+| T6 | 不同 server_random → 不同会话主密钥 (PFS/非 PFS 域分隔) | ✅ `crypto::aead::rekey_tests::master_deterministic_and_depends_on_both_randoms` |
+| T6 | 客户端 server_random 全 0 → fail-closed | ✅ `proxy::pool::pool_handshake_tests::read_server_handshake_fails_closed_on_all_zero_random` |
+| T6 | QUIC lean token 与 TCP token 互不可冒用 | ✅ `tests/test_hello_auth.rs::test_token_domain_quic_tcp_separation` |
 
 > 这张表是 #7 "泄漏测试变集成测试" 的施工清单。纯用户态可判定的守卫见
 > `tests/test_leak_guards.rs` 与 `config_watcher::leak_guard_tests` (进程内驱动真实

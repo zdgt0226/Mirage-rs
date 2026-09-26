@@ -11,7 +11,7 @@ async fn main() {
             let (read_half, write_half) = stream.into_split();
             // is_initiator = false (Server side)
             let (mut reader, _writer) = create_crypto_pair(
-                read_half, write_half, "my_secure_password", b"my_salt", false
+                read_half, write_half, "my_secure_password", &[0u8; 32], &[1u8; 32], false
             );
             
             // Read target header

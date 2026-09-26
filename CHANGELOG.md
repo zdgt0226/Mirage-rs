@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### feat(crypto)!: 协议新鲜性加固 —— **BREAKING: v0.15 协议断代, 不兼容旧版本**
+
+修 2026-09-26 审计的两条协议级 P1 (设计与论证: `docs/protocol-freshness-design.md`, 威胁模型新增 T6)。
+**客户端与服务端 (含 Android 客户端) 必须同时升级到 v0.15**, 新旧版本互连直接认证失败 (转伪装站, 与探针无异);
+不提供兼容开关 —— 不完善的旧协议直接断舍离。
+- **P1-A 非 PFS 缺服务端新鲜性 → 会话重放 / two-time pad**: 旧会话密钥只由 `client_random` + 口令派生、token 不绑
+  random, 主动中间人把新鲜 token 与旧 random 拼接即可让服务端派生出旧会话密钥并执行重放。修:
+  - token tag = `Poly1305(SHA256(pw‖ts‖prefix‖"mirage-token-v2"), ts‖bind)`, TCP 的 `bind = ClientHello.random`;
+    QUIC lean 每流 token 用独立 `bind = "mirage-quic-lean-v2"` (两类 token 互不可冒用)。布局仍 32B, 线上字节形状不变。
+  - 会话 master salt = `client_random ‖ server_random` (info `mirage-session-v2` / PFS `mirage-session-v2-pfs`),
+    server_random 为服务端**线上实际发出**的 ServerHello.random (`apply_server_random` 返回写入值沿 handshake → control
+    传递) → 服务端重启清空 replay cache 后, 重放的录制会话也派生不出原密钥。
+  - server_random 全 0 (模板未写入 / 客户端未捕获) → **客户端与服务端都 fail-closed**。
+- **P1-B cipher agility 协商为 ChaCha 时 (key, nonce) 复用**: 旧逻辑 rekey 回 ChaCha 会派生与 bootstrap 相同的 key 且
+  nonce 归零。修: 协商结果 == 当前 cipher 时不 rekey (nonce 继续递增); `rekey()` 只允许 bootstrap ChaCha20 → 其它
+  cipher, **拒绝同 cipher 或回切 ChaCha20** (ChaCha20 HKDF 后缀为空, 回切会重派 bootstrap 密钥 + nonce 归零)。
+- 测试: bind 翻位/QUIC-TCP 域隔离/**随机数替换攻击回归** (`tests/test_hello_auth.rs`)、双随机派生与域分隔、
+  客户端全 0 fail-closed、同 cipher rekey 防呆; e2e (full/lite/ss 上游) 在新协议下全部互通。
+- 实现初稿由 agy staffer 完成 (任务末尾因 API 错误中断), 经逐文件审阅; 补服务端全 0 server_random 拒绝与 rekey 回切
+  防呆。另经不同模型独立密码学复核: 无 P0/P1/P2。已知前提: 非 PFS 现也要求伪装模板首条 0x16 record 含完整
+  ServerHello.random (≥38B, 真实服务器几乎不拆), 不满足则 fail-closed (可用性, 非安全)。
+- 全量 `cargo test` 506 通过; clippy 默认/quic `-D warnings` 干净; `--features ebpf --examples` 构建通过。
+
+
 ## [v0.14.1] - 审计阶段 1 安全修复 (配置权限 / API rebinding / XDP 缓存) + 细节优化 (2026-09-26)
 
 ### fix(security): 审计阶段 1 —— 配置权限 / API rebinding / XDP 缓存陈旧 / 资源上限 (纯服务端, 向后兼容)

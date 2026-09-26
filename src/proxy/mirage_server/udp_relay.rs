@@ -530,14 +530,17 @@ mod mux_tests {
         // 3. crypto 对 (client=initiator, server=非)
         let (cr, cw) = {
             let (r, w) = cli.into_split();
-            crate::crypto::aead::create_crypto_pair(r, w, "pw", b"salt1234", true)
+            crate::crypto::aead::create_crypto_pair(r, w, "pw", &[0u8; 32], &[1u8; 32], true)
         };
         let (sr, sw) = {
             let (r, w) = srv.into_split();
             crate::crypto::aead::create_crypto_pair(
                 crate::proxy::tunnel::TunnelRead::Tcp(r),
                 crate::proxy::tunnel::TunnelWrite::Tcp(w),
-                "pw", b"salt1234", false,
+                "pw",
+                &[0u8; 32],
+                &[1u8; 32],
+                false,
             )
         };
 

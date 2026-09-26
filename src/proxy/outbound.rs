@@ -247,7 +247,10 @@ impl OutboundNode {
                     use tokio::io::AsyncWriteExt;
                     let mux = pool.quic_mux().ok_or_else(|| anyhow::anyhow!("quic mux 未初始化"))?;
                     let (send, recv) = mux.open_stream().await?;
-                    let token = crate::crypto::hello_auth::make_session_token(pool.password());
+                    let token = crate::crypto::hello_auth::make_session_token(
+                        pool.password(),
+                        crate::crypto::hello_auth::QUIC_LEAN_BIND,
+                    );
                     let mut hdr = Vec::with_capacity(32 + 2 + tb.len());
                     hdr.extend_from_slice(&token);
                     hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());

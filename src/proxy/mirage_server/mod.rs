@@ -234,7 +234,14 @@ async fn handle_quic_stream_lean(
         Ok(Ok(_)) => {}
         _ => return,
     }
-    let user = match creds.iter().position(|(_, pw)| crate::crypto::hello_auth::verify_session_token(pw, &token, tol)) {
+    let user = match creds.iter().position(|(_, pw)| {
+        crate::crypto::hello_auth::verify_session_token(
+            pw,
+            &token,
+            crate::crypto::hello_auth::QUIC_LEAN_BIND,
+            tol,
+        )
+    }) {
         Some(idx) => creds[idx].0.clone(),
         None => {
             static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

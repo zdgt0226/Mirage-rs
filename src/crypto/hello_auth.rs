@@ -16,21 +16,36 @@ fn ts_mask(password: &str, random_prefix: &[u8; 8]) -> [u8; 8] {
     mask
 }
 
-fn poly1305_tag(password_bytes: &[u8], ts_bytes: &[u8; 8], random_prefix: &[u8; 8]) -> [u8; 16] {
+/// Token v2 域分隔常量 (防跨版本差分碰撞)。
+pub const TOKEN_DOMAIN: &[u8] = b"mirage-token-v2";
+
+/// QUIC lean 每流认证绑定上下文 (与 TCP fake-TLS 的 client_random 域分隔)。
+pub const QUIC_LEAN_BIND: &[u8] = b"mirage-quic-lean-v2";
+
+fn poly1305_tag(
+    password_bytes: &[u8],
+    ts_bytes: &[u8; 8],
+    random_prefix: &[u8; 8],
+    bind: &[u8],
+) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(password_bytes);
     hasher.update(ts_bytes);
     hasher.update(random_prefix);
+    hasher.update(TOKEN_DOMAIN);
     let one_time_key = hasher.finalize();
 
     let poly = Poly1305::new(&one_time_key);
-    let tag = poly.compute_unpadded(ts_bytes);
+    let mut msg = Vec::with_capacity(8 + bind.len());
+    msg.extend_from_slice(ts_bytes);
+    msg.extend_from_slice(bind);
+    let tag = poly.compute_unpadded(&msg);
     let mut out = [0u8; 16];
     out.copy_from_slice(&tag);
     out
 }
 
-pub fn make_session_token(password: &str) -> [u8; 32] {
+pub fn make_session_token(password: &str, bind: &[u8]) -> [u8; 32] {
     let mut random_prefix = [0u8; 8];
     rand::fill(&mut random_prefix);
     
@@ -43,7 +58,7 @@ pub fn make_session_token(password: &str) -> [u8; 32] {
         hidden_ts[i] = ts_bytes[i] ^ mask[i];
     }
     
-    let tag = poly1305_tag(password.as_bytes(), &ts_bytes, &random_prefix);
+    let tag = poly1305_tag(password.as_bytes(), &ts_bytes, &random_prefix, bind);
     
     let mut token = [0u8; 32];
     token[0..8].copy_from_slice(&random_prefix);
@@ -124,7 +139,12 @@ fn ts_within_tolerance(ts: u64, now: u64, tolerance_secs: u64) -> bool {
 
 static REPLAY_CACHE: OnceLock<TokenReplayCache> = OnceLock::new();
 
-pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u64) -> bool {
+pub fn verify_session_token(
+    password: &str,
+    token: &[u8; 32],
+    bind: &[u8],
+    tolerance_secs: u64,
+) -> bool {
     let mut random_prefix = [0u8; 8];
     random_prefix.copy_from_slice(&token[0..8]);
     
@@ -137,7 +157,7 @@ pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u6
         ts_bytes[i] = hidden_ts[i] ^ mask[i];
     }
     
-    let expected_tag = poly1305_tag(password.as_bytes(), &ts_bytes, &random_prefix);
+    let expected_tag = poly1305_tag(password.as_bytes(), &ts_bytes, &random_prefix, bind);
     // 常量时间比 16B tag (握手 token 校验是真正的网络侧信道面)。用 subtle 而非手写累加器,
     // 带优化屏障, 与全仓 ct 比较统一。
     use subtle::ConstantTimeEq;
@@ -168,10 +188,15 @@ pub fn verify_session_token(password: &str, token: &[u8; 32], tolerance_secs: u6
 /// 关键正确性: `verify_session_token` 内含 replay `check_and_insert`, 但**非匹配的 password 在
 /// tag 常量时间比对处就返回 false, 根本走不到 replay 插入** —— 故本循环里 replay 对同一 token
 /// **只在命中那次插一次**, 与单用户语义完全一致 (无双插、无跨凭据误报)。tag 由 poly1305(password_key,
-/// ts, prefix) 生成, 不同 password 命中同一 token 的概率 ~2^-128, 故至多一个凭据匹配。
+/// ts, prefix, bind) 生成, 不同 password 命中同一 token 的概率 ~2^-128, 故至多一个凭据匹配。
 /// O(N) HMAC/握手; 小团队 (几十用户) 可忽略。
-pub fn identify_session_token(passwords: &[String], token: &[u8; 32], tolerance_secs: u64) -> Option<usize> {
-    passwords.iter().position(|pw| verify_session_token(pw, token, tolerance_secs))
+pub fn identify_session_token(
+    passwords: &[String],
+    token: &[u8; 32],
+    bind: &[u8],
+    tolerance_secs: u64,
+) -> Option<usize> {
+    passwords.iter().position(|pw| verify_session_token(pw, token, bind, tolerance_secs))
 }
 
 /// 会话 bootstrap 加密帧 (客户端读 TIME_SYNC / 服务端读 first_chunk) 解密失败时的**统一排查
@@ -197,19 +222,21 @@ mod multiuser_tests {
     #[test]
     fn identify_matches_correct_user() {
         let pws = vec!["alice-pw".to_string(), "bob-pw".to_string(), "carol-pw".to_string()];
+        let bind = [0x42u8; 32];
         // bob 的 token 必须只被 bob (index 1) 认出。
-        let tok = make_session_token("bob-pw");
-        assert_eq!(identify_session_token(&pws, &tok, 60), Some(1));
+        let tok = make_session_token("bob-pw", &bind);
+        assert_eq!(identify_session_token(&pws, &tok, &bind, 60), Some(1));
         // alice 的 token → index 0。
-        let tok_a = make_session_token("alice-pw");
-        assert_eq!(identify_session_token(&pws, &tok_a, 60), Some(0));
+        let tok_a = make_session_token("alice-pw", &bind);
+        assert_eq!(identify_session_token(&pws, &tok_a, &bind, 60), Some(0));
     }
 
     #[test]
     fn identify_none_when_no_credential_matches() {
         let pws = vec!["alice-pw".to_string(), "bob-pw".to_string()];
-        let tok = make_session_token("stranger-pw"); // 不在列表
-        assert_eq!(identify_session_token(&pws, &tok, 60), None);
+        let bind = [0x42u8; 32];
+        let tok = make_session_token("stranger-pw", &bind); // 不在列表
+        assert_eq!(identify_session_token(&pws, &tok, &bind, 60), None);
     }
 
     #[test]
@@ -217,9 +244,10 @@ mod multiuser_tests {
         // 同一 token 连认两次: 第一次命中, 第二次因 replay 应 None (证明命中那次插了、且只插一次;
         // 非匹配凭据在 tag 比对处返回 false 不碰 replay, 故不会把别的用户的桶污染)。
         let pws = vec!["u0".to_string(), "u1".to_string(), "u2".to_string()];
-        let tok = make_session_token("u2");
-        assert_eq!(identify_session_token(&pws, &tok, 60), Some(2), "首次命中 u2");
-        assert_eq!(identify_session_token(&pws, &tok, 60), None, "重放同 token 必拒 (replay 已插)");
+        let bind = [0x55u8; 32];
+        let tok = make_session_token("u2", &bind);
+        assert_eq!(identify_session_token(&pws, &tok, &bind, 60), Some(2), "首次命中 u2");
+        assert_eq!(identify_session_token(&pws, &tok, &bind, 60), None, "重放同 token 必拒 (replay 已插)");
     }
 }
 
