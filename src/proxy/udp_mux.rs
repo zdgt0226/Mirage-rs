@@ -541,7 +541,10 @@ mod tests {
             crate::crypto::aead::create_crypto_pair(
                 crate::proxy::tunnel::TunnelRead::Tcp(r),
                 crate::proxy::tunnel::TunnelWrite::Tcp(w),
-                "pw", b"salt1234", false,
+                "pw",
+                &[0u8; 32],
+                &[1u8; 32],
+                false,
             )
         };
         let server = tokio::spawn(async move {
@@ -555,7 +558,8 @@ mod tests {
                 crate::proxy::tunnel::TunnelRead::Boxed(Box::new(r)),
                 crate::proxy::tunnel::TunnelWrite::Boxed(Box::new(w)),
                 "pw",
-                b"salt1234",
+                &[0u8; 32],
+                &[1u8; 32],
                 true,
             )
         };

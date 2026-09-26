@@ -84,7 +84,7 @@ async fn run_handshake<S>(
     cam_pool: &Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
     pfs: bool,
-) -> Option<(S, [u8; 32], Option<[u8; 32]>, usize)>
+) -> Option<(S, [u8; 32], [u8; 32], Option<[u8; 32]>, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -136,15 +136,13 @@ where
     if content_type == 0x16 && body.len() >= 39 && body[0] == 0x01 {
         let sid_len = body[38] as usize;
         if sid_len == 32 && body.len() >= 39 + sid_len {
+            client_random.copy_from_slice(&body[6..38]);
             let session_id = &body[39..39 + sid_len];
             let mut sid_array = [0u8; 32];
             sid_array.copy_from_slice(session_id);
             matched_idx = creds
                 .iter()
-                .position(|(_, pw)| crate::crypto::hello_auth::verify_session_token(pw, &sid_array, auth_ts_tolerance_secs));
-            if matched_idx.is_some() {
-                client_random.copy_from_slice(&body[6..38]);
-            }
+                .position(|(_, pw)| crate::crypto::hello_auth::verify_session_token(pw, &sid_array, &client_random, auth_ts_tolerance_secs));
         }
     }
     let authenticated = matched_idx.is_some();
@@ -206,12 +204,19 @@ where
     };
 
     // 2.5 Send ServerHello template back to satisfy Mirage Client's TLS state machine
-    let template = crate::crypto::handshake_cache::get_server_hello_pfs(
+    let (template, server_random) = crate::crypto::handshake_cache::get_server_hello_pfs(
         camouflage_host,
         &client_hello,
         server_ephemeral.as_ref().map(|e| &e.public),
     )
     .await;
+    // v0.15: server_random 参与会话密钥派生 (服务端新鲜性的唯一来源)。全 0 = 回放模板异常没写进
+    // random —— 此时派生退化为只依赖 client_random, 重放防护失效。客户端遇全 0 会自行断开, 但攻击者
+    // 扮演客户端时不会, 故服务端也必须 fail-closed。正常路径 (apply_server_random) 恒写入随机值。
+    if server_random == [0u8; 32] {
+        warn!("Mirage Server: ServerHello 模板未携带 random (全 0), 拒绝该连接 (fail-closed) from {}", peer_addr);
+        return None;
+    }
 
     // v0.4.5-alpha.13: 消除 auth-succ vs auth-fail 时序侧信道.
     // auth-fail 走 camouflage 转发有 ~1 RTT 延迟 (探针→server→camouflage→回),
@@ -262,7 +267,7 @@ where
 
     // Hand off to control plane (crypto setup + TIME_SYNC + dispatch)。matched_idx 此处必 Some
     // (上方 !authenticated 已 return None), 即命中的凭据下标, 供调用方取用户名/派生密钥的 password。
-    Some((stream, client_random, ecdh, matched_idx.expect("authenticated ⇒ matched_idx")))
+    Some((stream, client_random, server_random, ecdh, matched_idx.expect("authenticated ⇒ matched_idx")))
 }
 
 /// TCP 传输入口: 握手 → into_split (Tcp 变体, 保留静态分发 + 无锁) → dispatch。
@@ -278,7 +283,7 @@ pub(super) async fn handle_connection(
 ) {
     stream.set_nodelay(true).unwrap_or_default();
     let client_ip = peer_addr.ip();
-    if let Some((stream, client_random, ecdh, idx)) = run_handshake(
+    if let Some((stream, client_random, server_random, ecdh, idx)) = run_handshake(
         stream, peer_addr, &creds, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
     )
     .await
@@ -292,6 +297,7 @@ pub(super) async fn handle_connection(
             password,
             user,
             client_random,
+            server_random,
             upstream,
             ecdh,
         )

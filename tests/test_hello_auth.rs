@@ -1,20 +1,78 @@
-use mirage_rs::crypto::hello_auth::{make_session_token, verify_session_token, TokenReplayCache};
+use mirage_rs::crypto::hello_auth::{
+    make_session_token, verify_session_token, TokenReplayCache, QUIC_LEAN_BIND,
+};
 
 #[test]
 fn test_token_auth_roundtrip() {
     let password = "super_secret_password";
+    let client_random = [0x42u8; 32];
     
-    // Generate
-    let token = make_session_token(password);
+    // Generate token bound to client_random
+    let token = make_session_token(password, &client_random);
     assert_eq!(token.len(), 32);
     
-    // Verify valid token
+    // Verify valid token with matching bind
     let mut token_arr = [0u8; 32];
     token_arr.copy_from_slice(&token);
-    assert!(verify_session_token(password, &token_arr, 60));
+    assert!(verify_session_token(password, &token_arr, &client_random, 60));
 
     // Replay should fail
-    assert!(!verify_session_token(password, &token_arr, 60));
+    assert!(!verify_session_token(password, &token_arr, &client_random, 60));
+}
+
+#[test]
+fn test_token_bind_bit_flip_fails() {
+    let password = "super_secret_password";
+    let client_random = [0x55u8; 32];
+    let token = make_session_token(password, &client_random);
+
+    // 翻转 client_random 的 1 bit
+    let mut tampered_random = client_random;
+    tampered_random[0] ^= 0x01;
+
+    assert!(
+        !verify_session_token(password, &token, &tampered_random, 60),
+        "bind 翻转 1 bit 校验必须失败"
+    );
+}
+
+#[test]
+fn test_token_domain_quic_tcp_separation() {
+    let password = "super_secret_password";
+    let client_random = [0x77u8; 32];
+
+    // QUIC lean token 绑定 QUIC_LEAN_BIND
+    let quic_token = make_session_token(password, QUIC_LEAN_BIND);
+    // 用 TCP bind 校验必须失败
+    assert!(
+        !verify_session_token(password, &quic_token, &client_random, 60),
+        "QUIC lean token 不能用 TCP client_random 校验通过"
+    );
+
+    // TCP token 绑定 client_random
+    let tcp_token = make_session_token(password, &client_random);
+    // 用 QUIC_LEAN_BIND 校验必须失败
+    assert!(
+        !verify_session_token(password, &tcp_token, QUIC_LEAN_BIND, 60),
+        "TCP token 不能用 QUIC_LEAN_BIND 校验通过"
+    );
+}
+
+#[test]
+fn random_substitution_attack_blocked() {
+    // 攻击场景回归: 攻击者拦截合法客户端发起的会话 2 (随机数 R2, Token T2),
+    // 将 ClientHello.random 替换为历史会话 1 的随机数 R1, 保留新鲜 Token T2。
+    let password = "victim_password";
+    let r1 = [0x11u8; 32];
+    let r2 = [0x22u8; 32];
+
+    // 客户端生成针对会话 2 (R2) 的新鲜 Token T2
+    let t2 = make_session_token(password, &r2);
+
+    // 服务端收到了被篡改后的 ClientHello, 其 random 字段为 R1, session_id 为 T2
+    // 服务端以收到的 random (R1) 作为 bind 校验 T2: 必失败!
+    let verified = verify_session_token(password, &t2, &r1, 60);
+    assert!(!verified, "随机数替换攻击必须在 token 校验阶段被阻断 (fail-closed)");
 }
 
 #[test]

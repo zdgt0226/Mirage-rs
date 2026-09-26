@@ -143,6 +143,7 @@ mod tests {
             TunnelWrite::Tcp(cw),
             "pw",
             &[0u8; 32],
+            &[1u8; 32],
             true,
         );
         (Tunnel::new(reader, writer), server)

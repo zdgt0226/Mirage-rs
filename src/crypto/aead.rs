@@ -26,14 +26,19 @@ pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
 pub const MAX_RECORD_SIZE: usize = 16384;
 
-/// 生成会话主密钥 (Session Master Key)
-fn derive_master(password: &str, salt: &[u8]) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(salt), password.as_bytes());
+pub const SESSION_INFO_V2: &[u8] = b"mirage-session-v2";
+pub const SESSION_INFO_V2_PFS: &[u8] = b"mirage-session-v2-pfs";
+
+/// 生成会话主密钥 (Session Master Key)。
+/// v0.15 断代: 废弃旧的 "pyrealiy-session" 协议常量，salt 改为 client_random || server_random (64 字节)，
+/// 引入双向新鲜度保证，彻底阻断重放与密钥流复用漏洞。
+fn derive_master(password: &str, client_random: &[u8; 32], server_random: &[u8; 32]) -> [u8; 32] {
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(client_random);
+    salt[32..].copy_from_slice(server_random);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), password.as_bytes());
     let mut okm = [0u8; 32];
-    // ⚠️ 协议冻结常量: "pyrealiy" 是 "pyreality" 的历史拼写错误。**切勿"修正"** ——
-    // 客户端/服务端必须用完全相同的 info 字节才能派生同一密钥, 改了会让新旧版本
-    // 密钥不兼容、静默解密失败。要动必须两端同步 + bump 协议版本。
-    hk.expand(b"pyrealiy-session", &mut okm).unwrap();
+    hk.expand(SESSION_INFO_V2, &mut okm).unwrap();
     okm
 }
 
@@ -118,12 +123,24 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
     }
 
     /// 切换 AEAD 算法 (cipher agility 协商后)。重派生该 cipher 的密钥 + **nonce 归零**
-    /// (新 (key,algo) 组合, 归零不复用)。只应在协商确定后调一次。
+    /// (新 (key,algo) 组合, 归零不复用)。只应在协商算法改变时调一次。
+    ///
+    /// 防呆: 只允许从 bootstrap (ChaCha20) 切到**别的** cipher。rekey 回 ChaCha20 (含同 cipher) 一律拒绝 ——
+    /// ChaCha20 的 HKDF 后缀为空, 回切会重新派生出 bootstrap 密钥且 nonce 归零 = (key,nonce) 复用。
     pub fn rekey(&mut self, cipher: Cipher) {
+        if cipher == self.cipher_kind || cipher == Cipher::ChaCha20Poly1305 {
+            debug_assert!(false, "rekey refused: identical/bootstrap cipher {:?}", cipher);
+            return;
+        }
         let info: &[u8] = if self.is_initiator { b"c2s" } else { b"s2c" };
         self.cipher = expand_key(&self.master, info, cipher);
         self.cipher_kind = cipher;
         self.nonce = 0;
+    }
+
+    /// 当前发送 nonce。
+    pub fn nonce(&self) -> u64 {
+        self.nonce
     }
 
     /// 当前 cipher (供协商/调试)。
@@ -268,11 +285,21 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
     }
 
     /// 切换 AEAD 算法 (cipher agility 协商后, 与对端 writer 的 rekey 同步)。重派生密钥 + nonce 归零。
+    /// 防呆同 CryptoWriter::rekey: 拒绝同 cipher 或回切 bootstrap ChaCha20 (会复用 bootstrap 密钥+归零 nonce)。
     pub fn rekey(&mut self, cipher: Cipher) {
+        if cipher == self.cipher_kind || cipher == Cipher::ChaCha20Poly1305 {
+            debug_assert!(false, "rekey refused: identical/bootstrap cipher {:?}", cipher);
+            return;
+        }
         let info: &[u8] = if self.is_initiator { b"s2c" } else { b"c2s" };
         self.cipher = expand_key(&self.master, info, cipher);
         self.cipher_kind = cipher;
         self.nonce = 0;
+    }
+
+    /// 当前接收 nonce。
+    pub fn nonce(&self) -> u64 {
+        self.nonce
     }
 
     /// 当前 cipher (供协商/调试)。
@@ -365,10 +392,11 @@ pub fn create_crypto_pair<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: W,
     password: &str,
-    salt: &[u8],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
     is_initiator: bool,
 ) -> (CryptoReader<R>, CryptoWriter<W>) {
-    let master = derive_master(password, salt);
+    let master = derive_master(password, client_random, server_random);
     (
         CryptoReader::new(reader, &master, is_initiator),
         CryptoWriter::new(writer, &master, is_initiator),
@@ -377,17 +405,24 @@ pub fn create_crypto_pair<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// 前向保密 (PFS) master: 在口令派生的基础上**混入临时 X25519 ECDH 共享秘密**。
 ///
-/// - salt 仍是 client_random (= 客户端临时公钥, 见 crypto::pfs)。
+/// - salt 同样为 client_random || server_random (64 字节)。
 /// - IKM = password || ecdh —— ecdh 是一次性的, 私钥用完即弃, 故口令泄露也解不了已录流量。
-/// - **新 info label `pyrealiy-session-pfs`**: 刻意与非 PFS 的 `pyrealiy-session` 域分隔 →
-///   pfs 与非 pfs 两端派生出不同密钥, 一端开一端没开会解密失败 (两端必须同开 pfs)。
-fn derive_master_pfs(password: &str, salt: &[u8], ecdh: &[u8; 32]) -> [u8; 32] {
+/// - info label 为独立的 "mirage-session-v2-pfs", 与非 PFS 严格域分隔。
+fn derive_master_pfs(
+    password: &str,
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+    ecdh: &[u8; 32],
+) -> [u8; 32] {
+    let mut salt = [0u8; 64];
+    salt[..32].copy_from_slice(client_random);
+    salt[32..].copy_from_slice(server_random);
     let mut ikm = Vec::with_capacity(password.len() + 32);
     ikm.extend_from_slice(password.as_bytes());
     ikm.extend_from_slice(ecdh);
-    let hk = Hkdf::<Sha256>::new(Some(salt), &ikm);
+    let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
     let mut okm = [0u8; 32];
-    hk.expand(b"pyrealiy-session-pfs", &mut okm).unwrap();
+    hk.expand(SESSION_INFO_V2_PFS, &mut okm).unwrap();
     okm
 }
 
@@ -396,11 +431,12 @@ pub fn create_crypto_pair_pfs<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     reader: R,
     writer: W,
     password: &str,
-    salt: &[u8],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
     ecdh: &[u8; 32],
     is_initiator: bool,
 ) -> (CryptoReader<R>, CryptoWriter<W>) {
-    let master = derive_master_pfs(password, salt, ecdh);
+    let master = derive_master_pfs(password, client_random, server_random, ecdh);
     (
         CryptoReader::new(reader, &master, is_initiator),
         CryptoWriter::new(writer, &master, is_initiator),
@@ -435,9 +471,18 @@ mod rekey_tests {
     async fn roundtrip_rekey_aes() {
         roundtrip(Some(Cipher::Aes256Gcm)).await;
     }
-    #[tokio::test]
-    async fn roundtrip_rekey_chacha() {
-        roundtrip(Some(Cipher::ChaCha20Poly1305)).await;
+    /// 回切 bootstrap ChaCha20 必须被拒 (否则重新派生出 bootstrap 密钥 + nonce 归零 = 复用)。
+    /// 只在 release (无 debug_assert) 下验"拒绝后 cipher/nonce 不变"; debug 下由下方 should_panic 覆盖。
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn rekey_back_to_bootstrap_chacha_refused() {
+        let (a, _b) = duplex(1024);
+        let mut w = CryptoWriter::new(a, &[7u8; 32], true);
+        w.rekey(Cipher::Aes256Gcm);
+        w.nonce = 5;
+        w.rekey(Cipher::ChaCha20Poly1305);
+        assert_eq!(w.cipher(), Cipher::Aes256Gcm, "回切 ChaCha 必须被拒");
+        assert_eq!(w.nonce(), 5, "被拒的 rekey 不得动 nonce");
     }
 
     #[tokio::test]
@@ -490,36 +535,57 @@ mod rekey_tests {
     }
 
     #[test]
-    fn pfs_master_deterministic_and_domain_separated() {
-        let salt = [1u8; 32];
-        let ecdh = [2u8; 32];
-        // 确定性: 同输入同密钥 (两端才能派同一 master)。
+    fn master_deterministic_and_depends_on_both_randoms() {
+        let c_rand = [1u8; 32];
+        let s_rand1 = [2u8; 32];
+        let s_rand2 = [3u8; 32];
+        // 确定性: 同输入同密钥
         assert_eq!(
-            derive_master_pfs("pw", &salt, &ecdh),
-            derive_master_pfs("pw", &salt, &ecdh),
+            derive_master("pw", &c_rand, &s_rand1),
+            derive_master("pw", &c_rand, &s_rand1),
         );
-        // 域分隔: PFS master 必须 != 非 PFS master (label 不同 → 一端开一端没开会解密失败)。
+        // 不同 server_random 必须派生不同 master (新鲜度注入)
         assert_ne!(
-            derive_master_pfs("pw", &salt, &ecdh),
-            derive_master("pw", &salt),
+            derive_master("pw", &c_rand, &s_rand1),
+            derive_master("pw", &c_rand, &s_rand2),
+            "同 client_random 不同 server_random 必须派生不同 master"
+        );
+        // 域分隔: PFS master 必须 != 非 PFS master
+        let ecdh = [4u8; 32];
+        assert_ne!(
+            derive_master_pfs("pw", &c_rand, &s_rand1, &ecdh),
+            derive_master("pw", &c_rand, &s_rand1),
             "PFS master 必须与非 PFS 域分隔",
         );
-        // ecdh 变 → master 变 (ecdh 真的进了派生; 这是 PFS 的根)。
+        // ecdh 变 → master 变
         assert_ne!(
-            derive_master_pfs("pw", &salt, &ecdh),
-            derive_master_pfs("pw", &salt, &[9u8; 32]),
+            derive_master_pfs("pw", &c_rand, &s_rand1, &ecdh),
+            derive_master_pfs("pw", &c_rand, &s_rand1, &[9u8; 32]),
             "不同 ecdh 必须派生不同 master",
         );
     }
 
     #[tokio::test]
-    async fn pfs_pair_roundtrips() {
-        // 两端同 (password, salt, ecdh) → create_crypto_pair_pfs 端到端解密通。
+    async fn non_pfs_pair_roundtrips() {
         let (a, b) = duplex(64 * 1024);
-        let salt = [7u8; 32];
-        let ecdh = [8u8; 32];
-        let (_ra, mut wa) = create_crypto_pair_pfs(tokio::io::empty(), a, "pw", &salt, &ecdh, true);
-        let (mut rb, _wb) = create_crypto_pair_pfs(b, tokio::io::sink(), "pw", &salt, &ecdh, false);
+        let c_rand = [7u8; 32];
+        let s_rand = [8u8; 32];
+        let (_ra, mut wa) = create_crypto_pair(tokio::io::empty(), a, "pw", &c_rand, &s_rand, true);
+        let (mut rb, _wb) = create_crypto_pair(b, tokio::io::sink(), "pw", &c_rand, &s_rand, false);
+        let msg = b"non-pfs v2 payload 0123456789";
+        wa.send_data(msg).await.unwrap();
+        assert_eq!(&rb.recv_data().await.unwrap(), msg);
+    }
+
+    #[tokio::test]
+    async fn pfs_pair_roundtrips() {
+        // 两端同 (password, c_rand, s_rand, ecdh) → create_crypto_pair_pfs 端到端解密通。
+        let (a, b) = duplex(64 * 1024);
+        let c_rand = [7u8; 32];
+        let s_rand = [8u8; 32];
+        let ecdh = [9u8; 32];
+        let (_ra, mut wa) = create_crypto_pair_pfs(tokio::io::empty(), a, "pw", &c_rand, &s_rand, &ecdh, true);
+        let (mut rb, _wb) = create_crypto_pair_pfs(b, tokio::io::sink(), "pw", &c_rand, &s_rand, &ecdh, false);
         let msg = b"pfs payload 0123456789";
         wa.send_data(msg).await.unwrap();
         assert_eq!(&rb.recv_data().await.unwrap(), msg);
@@ -529,11 +595,23 @@ mod rekey_tests {
     async fn pfs_mismatched_ecdh_fails_closed() {
         // 一端 ecdh 不同 (模拟 pfs 失配) → master 不同 → 解密必失败, 不静默出乱数据。
         let (a, b) = duplex(64 * 1024);
-        let salt = [7u8; 32];
-        let (_ra, mut wa) = create_crypto_pair_pfs(tokio::io::empty(), a, "pw", &salt, &[8u8; 32], true);
-        let (mut rb, _wb) = create_crypto_pair_pfs(b, tokio::io::sink(), "pw", &salt, &[9u8; 32], false);
+        let c_rand = [7u8; 32];
+        let s_rand = [8u8; 32];
+        let (_ra, mut wa) = create_crypto_pair_pfs(tokio::io::empty(), a, "pw", &c_rand, &s_rand, &[8u8; 32], true);
+        let (mut rb, _wb) = create_crypto_pair_pfs(b, tokio::io::sink(), "pw", &c_rand, &s_rand, &[9u8; 32], false);
         wa.send_data(b"boom").await.unwrap();
         assert!(rb.recv_data().await.is_err(), "ecdh 不一致必须解密失败 (fail-closed)");
+    }
+
+    #[cfg(debug_assertions)] // 依赖 debug_assert!, release 测试下不触发
+    #[test]
+    #[should_panic(expected = "rekey refused")]
+    fn writer_rekey_identical_cipher_debug_assert() {
+        let (a, _b) = duplex(1024);
+        let master = [7u8; 32];
+        let mut w = CryptoWriter::new(a, &master, true);
+        // 初始为 ChaCha20Poly1305, 传入相同 cipher 触发防呆 debug_assert!
+        w.rekey(Cipher::ChaCha20Poly1305);
     }
 }
 

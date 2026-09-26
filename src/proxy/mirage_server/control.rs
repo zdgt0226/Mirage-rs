@@ -37,6 +37,7 @@ pub(super) async fn dispatch_authenticated(
     password: String,
     user: String, // 命中的用户名 (多用户统计维度); 单用户 config 恒为 "default"
     client_random: [u8; 32],
+    server_random: [u8; 32],
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     ecdh: Option<[u8; 32]>,
 ) {
@@ -49,6 +50,7 @@ pub(super) async fn dispatch_authenticated(
             write_half,
             &password,
             &client_random,
+            &server_random,
             &ecdh,
             false, // is_initiator = false (Server)
         ),
@@ -57,6 +59,7 @@ pub(super) async fn dispatch_authenticated(
             write_half,
             &password,
             &client_random,
+            &server_random,
             false, // is_initiator = false (Server)
         ),
     };
@@ -142,8 +145,10 @@ pub(super) async fn dispatch_authenticated(
                 tracing::error!("Mirage Server: send CIPHER_ACK failed: {:?}", e);
                 return;
             }
-            writer.rekey(final_cipher);
-            reader.rekey(final_cipher);
+            if final_cipher != writer.cipher() {
+                writer.rekey(final_cipher);
+                reader.rekey(final_cipher);
+            }
             tracing::debug!("Mirage Server: cipher agility 协商为 {:?}", final_cipher);
             // 读 rekey 后的真首帧
             match tokio::time::timeout(std::time::Duration::from_secs(60), reader.recv_data()).await {
