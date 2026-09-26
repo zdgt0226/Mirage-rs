@@ -50,6 +50,7 @@ smoltcp = { version = "0.13", default-features = false, features = ["std", "medi
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 quinn-proto = { version = "0.11", optional = true } # erasure-aware CC 需要 RttEstimator 类型 (quinn 未直接 re-export)
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rustls-webpki = { version = "0.103", optional = true }
 rcgen = { version = "0.13", optional = true }
 
 [features]
@@ -57,7 +58,7 @@ default = ["gui"]
 ebpf = ["dep:aya"]
 gui = ["dep:axum", "dep:tower-http", "dep:async-stream"]
 # QUIC 传输 (实验, 默认关)。开启需 --features quic; release 二进制暂不含, 见 quic-transport-design.md P0。
-quic = ["dep:quinn", "dep:quinn-proto", "dep:rustls", "dep:rcgen"]
+quic = ["dep:quinn", "dep:quinn-proto", "dep:rustls", "dep:rcgen", "dep:rustls-webpki"]
 
 # Debug examples (require ebpf feature so they don't break default cargo check)
 [[example]]

@@ -301,6 +301,9 @@ pub enum InboundConfig {
         /// 一致**。默认关。仅 transport=quic。见 docs §7。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_obfs: Option<String>,
+        /// QUIC 服务端私钥路径 (PEM 格式, 默认 "quic_key.pem")。存在则读取, 不存在则生成并以 0600 保存。仅 transport=quic。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_key_path: Option<String>,
     },
     Mixed {
         tag: String,
@@ -385,6 +388,9 @@ pub enum OutboundConfig {
         /// (客户端出站 + 服务端入站同填)。默认关。仅 transport=quic。见 docs §7。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_obfs: Option<String>,
+        /// QUIC 服务端证书 SPKI 指纹 (43 字符 base64url SHA-256 SPKI 指纹)。transport=quic 时必填。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_pin: Option<String>,
     },
     /// Shadowsocks 出站: 选中流量经 SS 加密发往 SS 服务器。配 `underlying` 即 SS-over-X
     /// (如 underlying=mirage → SS 连接骑 Mirage 隧道 = 类 shadow-tls+ss 嵌套)。
@@ -1250,7 +1256,7 @@ impl Config {
 
         // Mirage 出站的必填项非空
         for ob in &self.outbounds {
-            if let OutboundConfig::Mirage { tag, server, server_port, password, underlying, transport, quic_window_mb, .. } = ob {
+            if let OutboundConfig::Mirage { tag, server, server_port, password, underlying, transport, quic_window_mb, quic_pin, .. } = ob {
                 if server.trim().is_empty() {
                     issues.push(format!("mirage 出站 `{tag}` 的 server 为空"));
                 }
@@ -1260,6 +1266,13 @@ impl Config {
                     issues.push(format!("mirage 出站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"));
                 }
                 if *transport == Transport::Quic {
+                    match quic_pin {
+                        None => issues.push(format!("mirage 出站 `{tag}` 配了 transport=quic 但未配置 quic_pin (服务端证书 SPKI 指纹, 必填)")),
+                        Some(pin) if !is_valid_quic_pin(pin) => issues.push(format!(
+                            "mirage 出站 `{tag}` 的 quic_pin `{pin}` 格式非法 (须为 43 字符 base64url SHA-256 SPKI 指纹)"
+                        )),
+                        _ => {}
+                    }
                     if let Some(mb) = quic_window_mb {
                         if *mb == 0 || *mb > 256 {
                             issues.push(format!("mirage 出站 `{tag}` 的 quic_window_mb={mb} 不合理 (荐 2~64; 重排序线路用 2, 干净长肥用 16-64)"));
@@ -1490,6 +1503,20 @@ impl Config {
         }
 
         issues
+    }
+}
+
+/// 校验 quic_pin 是否为合法的 43 位 base64url (无填充) SHA-256 SPKI 指纹
+pub fn is_valid_quic_pin(pin: &str) -> bool {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    if pin.len() != 43 {
+        return false;
+    }
+    match URL_SAFE_NO_PAD.decode(pin.as_bytes()) {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
     }
 }
 

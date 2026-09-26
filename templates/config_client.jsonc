@@ -93,6 +93,7 @@
 
             // 【QUIC 传输, 实验】需 --features quic 编译, 两端须同设 transport。
             // "transport": "quic",
+            // "quic_pin": "43字符Base64url指纹",   // 服务端证书 SPKI 固定指纹 (必填; mirage-rs quic-pin -c 服务端配置 获取)
             // "quic_obfs": "两端一致的混淆密码",   // 藏成随机 UDP, 抗 QUIC/SNI 封锁
             // "quic_window_mb": 2,        // 重排序线路要小 (2); 干净长肥可调大 (16-64)
             // "quic_sni": "www.apple.com" // QUIC ClientHello SNI, 默认 = camouflage_host

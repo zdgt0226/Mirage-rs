@@ -134,6 +134,7 @@ pub struct QuicMux {
     obfs: Option<String>,
     window_mb: u64,
     erasure: bool,
+    pin: Option<String>,
 }
 
 #[derive(Default)]
@@ -144,7 +145,17 @@ struct MuxInner {
 
 impl QuicMux {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(host: &str, port: u16, sni: &str, low_src_port: bool, pre_packet: bool, obfs: Option<String>, window_mb: u64, erasure: bool) -> Arc<Self> {
+    pub fn new(
+        host: &str,
+        port: u16,
+        sni: &str,
+        low_src_port: bool,
+        pre_packet: bool,
+        obfs: Option<String>,
+        window_mb: u64,
+        erasure: bool,
+        pin: Option<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner: tokio::sync::Mutex::new(MuxInner::default()),
             host: host.to_string(),
@@ -155,6 +166,7 @@ impl QuicMux {
             obfs,
             window_mb,
             erasure,
+            pin,
         })
     }
 
@@ -164,9 +176,20 @@ impl QuicMux {
             let mut g = self.inner.lock().await;
             // 惰性建 endpoint。默认绑通配临时口; low_src_port 时尝试绑 ≤ 目标端口的源口。
             if g.endpoint.is_none() {
+                let pin = match &self.pin {
+                    Some(p) if crate::config::is_valid_quic_pin(p) => p.as_str(),
+                    Some(p) => {
+                        tracing::error!("QUIC: quic_pin 格式非法 (`{p}`), 拒绝建立连接 (fail-closed)");
+                        anyhow::bail!("QUIC: quic_pin 格式非法，拒绝建立连接 (fail-closed)");
+                    }
+                    None => {
+                        tracing::error!("QUIC: 未配置 quic_pin (服务端证书 SPKI 指纹必填, fail-closed)");
+                        anyhow::bail!("QUIC: 未配置 quic_pin，拒绝建立连接 (fail-closed)");
+                    }
+                };
                 let addr = resolve(&self.host, self.port).await?;
                 let mut ep = make_client_endpoint(addr, self.low_src_port, self.pre_packet, self.obfs.as_deref())?;
-                ep.set_default_client_config(client_config(self.window_mb, self.erasure)?);
+                ep.set_default_client_config(client_config(self.window_mb, self.erasure, pin)?);
                 g.endpoint = Some(ep);
             }
             // 连接不存在或已关 → 重拨。
@@ -201,14 +224,14 @@ impl QuicMux {
     }
 }
 
-fn client_config(window_mb: u64, erasure: bool) -> Result<quinn::ClientConfig> {
+pub fn client_config(window_mb: u64, erasure: bool, pin: &str) -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])
     .context("QUIC: rustls 客户端 builder 失败")?
     .dangerous()
-    .with_custom_certificate_verifier(Arc::new(NoVerify))
+    .with_custom_certificate_verifier(Arc::new(PinnedVerifier::new(pin.to_string())))
     .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
@@ -218,13 +241,102 @@ fn client_config(window_mb: u64, erasure: bool) -> Result<quinn::ClientConfig> {
     Ok(cfg)
 }
 
+// ───────────────────────── 证书固定 (SPKI Pinning) ─────────────────────────
+
+/// 计算 SPKI DER 的证书固定指纹: base64url 无填充 (SHA-256(SPKI DER)), 43 字符。
+pub fn spki_pin(spki_der: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(spki_der);
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// 以 0600 权限原子写入私钥 (.tmp + rename)。
+fn write_key_atomic_0600(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp_path = match path.file_name() {
+        Some(name) => {
+            let mut tmp_name = name.to_os_string();
+            tmp_name.push(".tmp");
+            path.with_file_name(tmp_name)
+        }
+        None => std::path::PathBuf::from(format!("{}.tmp", path.display())),
+    };
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// 加载已有的 QUIC 私钥 (PEM), 或新生成一把并以 0600 原子写入。
+/// 关键: 若文件已存在但读取/解析失败, 必须返回错误, 绝不静默重新生成!
+pub fn load_or_generate_key(path: &std::path::Path) -> Result<rcgen::KeyPair> {
+    if path.exists() {
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("QUIC: 读取私钥文件 `{}` 失败", path.display()))?;
+        let key_pair = rcgen::KeyPair::from_pem(&pem)
+            .with_context(|| format!("QUIC: 解析私钥文件 `{}` 失败 (PEM 损坏或格式错误)", path.display()))?;
+        Ok(key_pair)
+    } else {
+        let key_pair = rcgen::KeyPair::generate()
+            .context("QUIC: 生成 ECDSA P-256 私钥失败")?;
+        let pem = key_pair.serialize_pem();
+        write_key_atomic_0600(path, &pem)
+            .with_context(|| format!("QUIC: 保存私钥至 `{}` 失败", path.display()))?;
+        Ok(key_pair)
+    }
+}
+
 // ───────────────────────── 服务端 ─────────────────────────
 
-/// 建一个 QUIC 服务端 endpoint, 监听 UDP `listen_addr`。证书自签 (P0, 认证在内层 Mirage)。
-pub fn server_endpoint(listen_addr: SocketAddr, window_mb: u64, erasure: bool, obfs: Option<&str>) -> Result<quinn::Endpoint> {
-    let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .context("QUIC: 生成自签证书失败")?;
+/// 建一个 QUIC 服务端 endpoint, 监听 UDP `listen_addr`。
+/// 私钥持久化于 `key_path` (默认 "quic_key.pem"), 证书自签并通过 SPKI Pinning 认证。
+pub fn server_endpoint(
+    listen_addr: SocketAddr,
+    window_mb: u64,
+    erasure: bool,
+    obfs: Option<&str>,
+    key_path: Option<&str>,
+) -> Result<quinn::Endpoint> {
+    let key_path_str = key_path.unwrap_or("quic_key.pem");
+    let key_pair = load_or_generate_key(std::path::Path::new(key_path_str))?;
+    let pin = spki_pin(&key_pair.public_key_der());
+    tracing::info!("QUIC 服务端证书指纹 (quic_pin): {pin}");
+
+    let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .context("QUIC: 构造证书参数失败")?;
+    let cert = params.self_signed(&key_pair)
+        .context("QUIC: 自签证书失败")?;
     let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
@@ -294,7 +406,7 @@ impl AsyncWrite for QuicBiStream {
     }
 }
 
-// ───────────────────────── 辅助 ─────────────────────────
+// ───────────────────────── 辅助与验证器 ─────────────────────────
 
 async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
     use tokio::net::lookup_host;
@@ -305,41 +417,351 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
         .with_context(|| format!("QUIC: {host}:{port} 无解析结果"))
 }
 
-/// P0 客户端证书验证器: 一律通过。安全性由内层 Mirage 协议 (口令派生 token + AEAD) 保证,
-/// 与 TCP fake-TLS 路径同源——QUIC 外层的 TLS 证书在此模型下只是把管道立起来。
+/// 基于 SPKI 指纹的服务端证书验证器 (替换原 NoVerify)。
+///
+/// 1. `verify_server_cert`: 仅用 SHA-256(SPKI) 指纹匹配认证服务端 (常数时间比较, 不验证书链/域名/有效期)。
+/// 2. `verify_tls13_signature` / `verify_tls12_signature`: 真正验签, 证明服务端持有该 SPKI 对应的私钥 (修复 A1)。
 #[derive(Debug)]
-struct NoVerify;
+pub struct PinnedVerifier {
+    pin: String,
+}
 
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
+impl PinnedVerifier {
+    pub fn new(pin: String) -> Self {
+        Self { pin }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let cert = webpki::EndEntityCert::try_from(end_entity)
+            .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+        let actual_pin = spki_pin(cert.subject_public_key_info().as_ref());
+
+        use subtle::ConstantTimeEq;
+        if actual_pin.len() != self.pin.len()
+            || actual_pin.as_bytes().ct_eq(self.pin.as_bytes()).unwrap_u8() != 1
+        {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ));
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
+
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
+
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
+
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::client::danger::ServerCertVerifier;
+
+    #[test]
+    fn test_spki_pin_consistency() {
+        // 1. 同一 rcgen 私钥, spki_pin(key.public_key_der()) == 客户端从自签证书经 webpki 解析的 SPKI 指纹
+        let key = rcgen::KeyPair::generate().unwrap();
+        let server_pin = spki_pin(&key.public_key_der());
+
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+
+        let ee = webpki::EndEntityCert::try_from(cert.der()).unwrap();
+        let client_pin = spki_pin(ee.subject_public_key_info().as_ref());
+
+        assert_eq!(server_pin, client_pin);
+        assert_eq!(server_pin.len(), 43);
+    }
+
+    #[test]
+    fn test_quic_pin_format_and_config_validation() {
+        // 2. 编码 43 字符 base64url; config 对缺 pin / 非法 pin 报语义问题
+        let key = rcgen::KeyPair::generate().unwrap();
+        let valid_pin = spki_pin(&key.public_key_der());
+        assert_eq!(valid_pin.len(), 43);
+        assert!(crate::config::is_valid_quic_pin(&valid_pin));
+
+        // 长度不对
+        assert!(!crate::config::is_valid_quic_pin("too_short"));
+        // 含有非法字符 (+ / =)
+        assert!(!crate::config::is_valid_quic_pin("+++++++++++++++++++++++++++++++++++++++++++"));
+
+        // 测试 Config 语义检查: transport=quic 缺 pin 报错
+        let cfg_no_pin = r#"{
+            "inbounds": [],
+            "outbounds": [{
+                "type": "mirage",
+                "tag": "proxy-quic",
+                "server": "1.2.3.4",
+                "server_port": 443,
+                "password": "secret_password",
+                "camouflage_host": "www.apple.com",
+                "transport": "quic"
+            }],
+            "routing": { "default_outbound": "proxy-quic", "rules": [] }
+        }"#;
+        let (_, issues) = crate::config::Config::parse_with_diagnostics(cfg_no_pin).unwrap();
+        assert!(issues.iter().any(|i| i.contains("quic_pin") && i.contains("必填")), "{:?}", issues);
+
+        // transport=quic pin 格式非法报错
+        let cfg_bad_pin = r#"{
+            "inbounds": [],
+            "outbounds": [{
+                "type": "mirage",
+                "tag": "proxy-quic",
+                "server": "1.2.3.4",
+                "server_port": 443,
+                "password": "secret_password",
+                "camouflage_host": "www.apple.com",
+                "transport": "quic",
+                "quic_pin": "invalid_pin_length"
+            }],
+            "routing": { "default_outbound": "proxy-quic", "rules": [] }
+        }"#;
+        let (_, issues) = crate::config::Config::parse_with_diagnostics(cfg_bad_pin).unwrap();
+        assert!(issues.iter().any(|i| i.contains("quic_pin") && i.contains("格式非法")), "{:?}", issues);
+
+        // transport=quic pin 正确无报错
+        let cfg_good_pin = format!(r#"{{
+            "inbounds": [],
+            "outbounds": [{{
+                "type": "mirage",
+                "tag": "proxy-quic",
+                "server": "1.2.3.4",
+                "server_port": 443,
+                "password": "secret_password",
+                "camouflage_host": "www.apple.com",
+                "transport": "quic",
+                "quic_pin": "{valid_pin}"
+            }}],
+            "routing": {{ "default_outbound": "proxy-quic", "rules": [] }}
+        }}"#);
+        let (_, issues) = crate::config::Config::parse_with_diagnostics(&cfg_good_pin).unwrap();
+        assert!(!issues.iter().any(|i| i.contains("quic_pin")), "{:?}", issues);
+    }
+
+    #[test]
+    fn test_pinned_verifier_rejects_mismatched_cert() {
+        // 3. PinnedVerifier 对指纹不符证书返回错误
+        let key_a = rcgen::KeyPair::generate().unwrap();
+        let key_b = rcgen::KeyPair::generate().unwrap();
+
+        let pin_a = spki_pin(&key_a.public_key_der());
+        let pin_b = spki_pin(&key_b.public_key_der());
+        assert_ne!(pin_a, pin_b);
+
+        let params_b = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_b = params_b.self_signed(&key_b).unwrap();
+
+        let verifier_a = PinnedVerifier::new(pin_a.clone());
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+
+        // 用 verifier_a 去验 cert_b，必须失败
+        let res = verifier_a.verify_server_cert(cert_b.der(), &[], &server_name, &[], now);
+        assert!(res.is_err(), "指纹不匹配应被拒绝");
+
+        // 用 verifier_b 去验 cert_b，必须成功
+        let verifier_b = PinnedVerifier::new(pin_b);
+        let res_ok = verifier_b.verify_server_cert(cert_b.der(), &[], &server_name, &[], now);
+        assert!(res_ok.is_ok(), "指纹匹配应通过");
+    }
+
+    #[test]
+    fn test_signature_verification_regression() {
+        // 4. 签名校验回归 (关键): 用证书 A 但以另一把私钥 B 对消息签名构造 DigitallySignedStruct,
+        // verify_tls13_signature 必须返回错误; 正确私钥签名必须通过。
+        let key_a = rcgen::KeyPair::generate().unwrap();
+        let key_b = rcgen::KeyPair::generate().unwrap();
+
+        let params_a = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert_a = params_a.self_signed(&key_a).unwrap();
+
+        let message = b"tls13 handshake signature transcript test message";
+        let rng = ring::rand::SystemRandom::new();
+
+        fn make_dss(scheme: rustls::SignatureScheme, sig_bytes: &[u8]) -> rustls::DigitallySignedStruct {
+            use rustls::internal::msgs::codec::{Codec, Reader};
+            let mut buf = Vec::new();
+            scheme.encode(&mut buf);
+            (sig_bytes.len() as u16).encode(&mut buf);
+            buf.extend_from_slice(sig_bytes);
+
+            let mut reader = Reader::init(&buf);
+            rustls::DigitallySignedStruct::read(&mut reader).expect("valid dss")
+        }
+
+        // 构造私钥 A 的真实签名
+        let ring_key_a = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &key_a.serialize_der(),
+            &rng,
+        ).unwrap();
+        let sig_a = ring_key_a.sign(&rng, message).unwrap();
+        let dss_a = make_dss(
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            sig_a.as_ref(),
+        );
+
+        // 构造私钥 B 的签名 (冒充者签名)
+        let ring_key_b = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &key_b.serialize_der(),
+            &rng,
+        ).unwrap();
+        let sig_b = ring_key_b.sign(&rng, message).unwrap();
+        let dss_b = make_dss(
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            sig_b.as_ref(),
+        );
+
+        let verifier = PinnedVerifier::new(spki_pin(&key_a.public_key_der()));
+
+        // 正确私钥签名必须通过
+        let verify_ok = verifier.verify_tls13_signature(message, cert_a.der(), &dss_a);
+        assert!(verify_ok.is_ok(), "正确私钥签名必须验签成功");
+
+        // 冒充私钥 B 的签名必须失败 (修 A1 核心安全漏洞)
+        let verify_err = verifier.verify_tls13_signature(message, cert_a.der(), &dss_b);
+        assert!(verify_err.is_err(), "错误私钥签名必须验签失败 (拒绝无私钥 MITM)");
+    }
+
+    #[tokio::test]
+    async fn test_quic_e2e_correct_and_wrong_pin() {
+        // 5. 端到端: 进程内起 QUIC 服务端 + 客户端, 正确 pin 能通信, 错误 pin 握手失败。
+        let temp_dir = std::env::temp_dir().join(format!("mirage_quic_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("quic_key.pem");
+        let key_path_str = key_path.to_str().unwrap();
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let ep_server = server_endpoint(listen_addr, 2, false, None, Some(key_path_str)).unwrap();
+        let server_addr = ep_server.local_addr().unwrap();
+
+        // 读回服务端的正确 pin
+        let server_key = load_or_generate_key(&key_path).unwrap();
+        let correct_pin = spki_pin(&server_key.public_key_der());
+
+        // 服务端后台 echo 任务
+        let srv_handle = tokio::spawn(async move {
+            while let Some(incoming) = ep_server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let mut buf = [0u8; 11];
+                            if tokio::io::AsyncReadExt::read_exact(&mut recv, &mut buf).await.is_ok() {
+                                let _ = tokio::io::AsyncWriteExt::write_all(&mut send, b"pong-quic").await;
+                                let _ = tokio::io::AsyncWriteExt::shutdown(&mut send).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // 1) 正确 pin 客户端: 能握手并读写数据
+        let client_cfg = client_config(2, false, &correct_pin).unwrap();
+        let mut ep_client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep_client.set_default_client_config(client_cfg);
+
+        let connecting = ep_client.connect(server_addr, "localhost").unwrap();
+        let conn = connecting.await.expect("正确 pin 握手应成功");
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut send, b"ping-quic11").await.unwrap();
+        tokio::io::AsyncWriteExt::shutdown(&mut send).await.unwrap();
+        let mut reply = [0u8; 9];
+        tokio::io::AsyncReadExt::read_exact(&mut recv, &mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong-quic");
+
+        // 2) 错误 pin 客户端: 握手失败
+        let wrong_key = rcgen::KeyPair::generate().unwrap();
+        let wrong_pin = spki_pin(&wrong_key.public_key_der());
+        let bad_client_cfg = client_config(2, false, &wrong_pin).unwrap();
+        let mut ep_bad = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep_bad.set_default_client_config(bad_client_cfg);
+
+        let bad_connecting = ep_bad.connect(server_addr, "localhost").unwrap();
+        let bad_conn_res = bad_connecting.await;
+        assert!(bad_conn_res.is_err(), "错误 pin 握手必须失败 (fail-closed)");
+
+        srv_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_quic_key_persistence_and_file_mode_and_corruption() {
+        // 6. 持久化: 两次加载同一路径指纹不变; 文件权限 0600; 损坏的私钥文件 → 返回错误而非重新生成。
+        let temp_dir = std::env::temp_dir().join(format!("mirage_key_test_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let key_path = temp_dir.join("quic_key.pem");
+
+        // 第一次生成
+        let key1 = load_or_generate_key(&key_path).unwrap();
+        let pin1 = spki_pin(&key1.public_key_der());
+
+        // 检查权限为 0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&key_path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "私钥文件必须是 0600 权限");
+        }
+
+        // 第二次加载同一路径: 指纹不变
+        let key2 = load_or_generate_key(&key_path).unwrap();
+        let pin2 = spki_pin(&key2.public_key_der());
+        assert_eq!(pin1, pin2, "两次加载同一私钥指纹必须一致");
+
+        // 损坏测试: 篡改内容为非法垃圾数据
+        std::fs::write(&key_path, b"CORRUPTED_GARBAGE_DATA_NOT_A_PEM").unwrap();
+        let load_res = load_or_generate_key(&key_path);
+        assert!(load_res.is_err(), "损坏的私钥文件必须返回错误 (绝不静默重新生成)");
+
+        // 确认文件没有被静默改写
+        let read_back = std::fs::read(&key_path).unwrap();
+        assert_eq!(read_back, b"CORRUPTED_GARBAGE_DATA_NOT_A_PEM");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
