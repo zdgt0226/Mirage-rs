@@ -100,12 +100,15 @@
   - `period_used_bytes`: 当前配额周期已使用字节数 (实时累加)。
   - `period_start`: 当前配额周期的起始 Unix 时间戳 (秒, UTC)。
   - `exhausted`: 当前是否已超额。超额新握手伪装回落, 存量连接即刻断开。
-- **POST `/api/users`** `{ ops: [ UserOp... ], version?: u64 }` → 写响应 (成功 `{ status: "success", written: true, issues: [...] }`)
-  - `add`: `{ op: "add", name: "...", password: "...", rate_limit_kbps?: u64, quota_gb?: f64, quota_reset_day?: u8 }` — 新增用户。
-  - `remove`: `{ op: "remove", name: "..." }` — 删除用户 (禁止操作 `default`)。
-  - `change_password`: `{ op: "change_password", name: "...", password: "..." }` — 修改口令 (禁止操作 `default`)。
-  - `set_limits`: `{ op: "set_limits", name: "...", rate_limit_kbps?: u64|null, quota_gb?: f64|null, quota_reset_day?: u8|null }` — 修改/清空用户限速与月度配额 (禁止操作 `default`)。走现有配置原子写 + 热重载。
-  - `reset_quota`: `{ op: "reset_quota", name: "..." }` — 清零用户本周期用量及超额状态, 立即落盘并刷新, **不改动 config 文件** (禁止操作 `default`)。
+- **POST `/api/users`** `{ ops: [ UserOp... ], version?: u64 }` (`?dry_run=true` 只校验不写) → 写响应 (成功 `{ status: "success", written: true, issues: [...], version }`)
+  - `UserOp = { action, name, password?, rate_limit_kbps?, quota_gb?, quota_reset_day? }`, `action` 取值:
+  - `upsert`: `{ action: "upsert", name, password }` — 新增用户, 或修改已有用户的口令 (需 password)。
+  - `remove`: `{ action: "remove", name }` — 删除用户。
+  - `set_limits`: `{ action: "set_limits", name, rate_limit_kbps?, quota_gb?, quota_reset_day? }` — 设置限速与月度配额。
+    **三个字段整体替换**: 某字段不传或传 `null` 即清空该限制, 所以修改时须把三个字段的最终值一起发 (未改的也要带当前值)。
+    取值: `rate_limit_kbps` >0 整数; `quota_gb` >0 有限数; `quota_reset_day` 1..=28 整数。走现有配置原子写 + 热重载。
+  - `reset_quota`: `{ action: "reset_quota", name }` — 清零该用户本周期用量与超额状态, 立即落盘, **不改动 config 文件**。
+  - 保留名 `default` (主口令用户) 不接受任何操作; 非法值 / 不存在的用户 → 422。
 
 ---
 

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### docs(api): 修正 `/api/users` POST 契约 —— 与实现不符
+
+`docs/api-contract.md` 中 #150 写入的 POST 操作格式 (`op` 字段、`add` / `change_password`) 与后端实现不符 (实为
+`action: upsert | remove | set_limits | reset_quota`), 按 `src/api/handlers/users.rs` 真实实现重写, 并写明
+**`set_limits` 三字段整体替换** (不传或 `null` 即清空, 须带齐三项) 与 `default` 保留名、422 等语义, 供 Mirage-console 对接。
+
 ### feat(quic): QUIC 腿服务端证书固定 (SPKI Pinning) —— 防主动中间人 + 私钥持久化
 
 按 `docs/quic-cert-pinning-design.md` 为实验 QUIC 传输腿引入 SPKI 指纹固定, 解决 Model X lean 裸转发在外层 TLS 不认证服务端时的中间人威胁 (修 T6 / A1):
