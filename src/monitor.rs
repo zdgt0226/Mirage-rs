@@ -193,6 +193,8 @@ struct PersistedStats {
     global_down: u64,
     #[serde(default)]
     blocklist: Vec<std::net::IpAddr>,
+    #[serde(default)]
+    user_quota: HashMap<String, crate::proxy::user_limits::UserQuotaPersist>,
 }
 
 /// 串行化落盘: 周期落盘与关服落盘可能并发写同一个 .tmp → 文件交错损坏。
@@ -258,8 +260,9 @@ pub fn load_stats(path: &str) {
         .collect();
     GLOBAL_UP.store(parsed.global_up, Ordering::Relaxed);
     GLOBAL_DOWN.store(parsed.global_down, Ordering::Relaxed);
+    crate::proxy::user_limits::restore_persisted_quotas(parsed.user_quota);
     crate::blocklist::restore_all(parsed.blocklist);
-    tracing::info!("[STATS] 从 {} 恢复统计 (域名/设备/出站/用户聚合表, 全局流量及屏蔽名单)", path);
+    tracing::info!("[STATS] 从 {} 恢复统计 (域名/设备/出站/用户聚合表, 全局流量及屏蔽名单, 用户配额)", path);
 }
 
 /// 落盘聚合表、全局总量与屏蔽名单。先以 0600 写 .tmp 再原子 rename。
@@ -286,6 +289,7 @@ pub fn flush_stats(path: &str) {
         global_up: GLOBAL_UP.load(Ordering::Relaxed),
         global_down: GLOBAL_DOWN.load(Ordering::Relaxed),
         blocklist: crate::blocklist::all_ips(),
+        user_quota: crate::proxy::user_limits::export_persisted_quotas(),
     };
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
@@ -1231,6 +1235,68 @@ mod stats_persist_tests {
         OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    // 用户周期配额状态 flush -> load 往返验证
+    #[test]
+    fn stats_persist_user_quota_roundtrip() {
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = std::env::temp_dir().join("mirage_stats_user_quota_test.json");
+        let path = path.to_str().unwrap();
+
+        let user = crate::config::MirageUser {
+            name: "grace".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(5.0),
+            quota_reset_day: Some(1),
+        };
+        crate::proxy::user_limits::init_user_limits(&[user]);
+        let h = crate::proxy::user_limits::get_user_limit("grace").unwrap();
+        h.record_bytes(1024 * 1024);
+
+        flush_stats(path);
+
+        // 重置内存用量
+        h.period_used.store(0, Ordering::Relaxed);
+        assert_eq!(h.period_used.load(Ordering::Relaxed), 0);
+
+        load_stats(path);
+
+        assert_eq!(h.period_used.load(Ordering::Relaxed), 1024 * 1024, "重启后用户配额用量应成功恢复");
+
+        let _ = std::fs::remove_file(path);
+        reset_persist_path();
+    }
+
+    // 旧 stats 文件 (无 user_quota 字段) 仍能平滑加载
+    #[test]
+    fn stats_persist_user_quota_backward_compat() {
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = std::env::temp_dir().join("mirage_stats_old_format_test.json");
+        let path = path.to_str().unwrap();
+
+        // 模拟旧版本 stats 文件, 无 user_quota
+        let old_json = r#"{
+            "outbounds": {},
+            "domains": {},
+            "devices": {},
+            "users": {},
+            "global_up": 100,
+            "global_down": 200,
+            "blocklist": []
+        }"#;
+        std::fs::write(path, old_json).expect("写入旧格式文件应成功");
+
+        load_stats(path);
+
+        assert_eq!(GLOBAL_UP.load(Ordering::Relaxed), 100);
+        assert_eq!(GLOBAL_DOWN.load(Ordering::Relaxed), 200);
+
+        let _ = std::fs::remove_file(path);
+        reset_persist_path();
     }
 
     // 落盘文件权限必须严格为 0600 (仅所有者可读写, 避免域名历史等隐私泄露)

@@ -289,6 +289,14 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 }
                 crate::proxy::rate_limit::set_server_limiter(rl);
             }
+            // 多用户限速与配额: 初始化 mirage_server 的 users 配置并挂周期滚动检查
+            for ib in &inbounds {
+                if let crate::config::InboundConfig::MirageServer { users, .. } = ib {
+                    crate::proxy::user_limits::init_user_limits(users);
+                    crate::proxy::user_limits::start_rollover_task();
+                    break;
+                }
+            }
             if let Some(gui) = config.gui {
                 gui_enabled = gui.enabled;
                 gui_listen = gui.listen;

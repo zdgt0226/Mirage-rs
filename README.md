@@ -19,8 +19,9 @@
 >   X25519 ECDH** (临时私钥用完即弃), 开启后即便口令泄露也解不了已录流量。**两端必须同开**
 >   (改了会话密钥派生, 一端开一端没开会连不上)。无论是否开 PFS, 都请用高强度随机口令、
 >   限制传播、定期更换。见 brain external-audit-2026-08 / handshake-forward-secrecy。
-> - **认证支持多用户凭据** (`mirage_server.users[]`): 每人独立口令 → per-user 密钥隔离 + 用量统计,
->   可按人吊销 (删该 user 即失效, 不影响他人), Mirage-console 可增删/查用量 (见 `/api/users`)。
+> - **认证支持多用户凭据与配额限速** (`mirage_server.users[]`): 每人独立口令 → per-user 密钥隔离 + 用量统计 +
+>   **按用户独立限速与月度流量配额** (超额静默回落伪装站, 活跃连接即断, 周期用量持久化),
+>   可按人吊销 (删该 user 即失效, 不影响他人), Mirage-console 可增删/改密/查用量, 限速与配额经 `/api/users` 的 `set_limits` / `reset_quota` 设置 (console 界面待接)。
 >   不配 `users` = 单一共享口令 (原行为)。**口令仍是唯一凭据 (无二次因子)**, 请用高强度随机口令。
 > - **负责任使用**: 本工具用于**保护自己合法流量的隐私与可达性**。是否可在你所在司法辖区使用、
 >   以及如何使用, 由你自行判断与负责; 请遵守当地法律。
@@ -36,7 +37,7 @@
 
 * **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），配 `client_hello_template` 即让出站握手复刻其 JA3/JA4（仅替换 SNI/session_id/random）。
 * **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关，认证仍靠口令、与加密解耦（对标 REALITY）。
-* **多用户凭据**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃），按人吊销。`/api/users` 供 Mirage-console 增删改密/查用量（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
+* **多用户凭据与配额限速**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃）+ **按用户独立限速 (`rate_limit_kbps`) + 按月流量配额 (`quota_gb`, `quota_reset_day`)**，跨额连接即断、新握手伪装回落，周期用量持久化跨重启保留。`/api/users` 供 Mirage-console 增删/改密/查用量, API 另支持调限速/重置配额 (console 界面待接)（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
@@ -386,7 +387,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] **供应链签名 + 多架构容器** (v0.9.3, 外部审计 #13) —— cosign **keyless** (Sigstore OIDC, 零密钥) 签 SHA256SUMS + ghcr 容器镜像 (amd64/arm64, 镜像亦签名); 验签命令见上方「验证产物签名」
 - [x] **外部审计整批清零** (v0.9.2–v0.9.4) —— API 失败限流 (#3) · cargo-deny 供应链门禁 (#11) · start_proxy 巨石拆分 (#4) · config 模板防漂移测试 (#7) · 版本歪斜诊断 (#8) · 解析器 proptest (#12) · 未审计声明 (#1)。纯代码/零密钥项全清, 残余仅 #14 bench (边际) / #10 orphan CI (需 ≥6.1 自托管 runner)
 - [x] **CI 回归哨兵** (v0.9.4) —— mux 容量不变量 · crypto AES/ChaCha 相对吞吐比值 (≥1.3×) · brutal 收敛轨迹; 相对/行为门抗共享 runner 计时噪声
-- [x] **限速** —— 客户端**按设备** / 服务端**按客户端**限带宽。**TCP 已做**: 用户态 token bucket 整形 relay 字节流 (无 eBPF 依赖), 复用 `routing.device_profiles` —— 给设备分配加 `rate_limit_kbps` (源 IP 命中→上/下行各独立整形, 按源 IP 聚合跨连接共享)。客户端按 LAN 设备源 IP、服务端按连接的客户端 IP, 同一套配置。实机验证: 本地两侧各限 1MB/s 误差<1%; CN2→US 服务端限 250KB/s (线路 4.25MB/s) 精准生效。**UDP 也做了** (SOCKS/mixed relay): 无背压故用 policing (令牌不足丢包), 实机 flood 114MB/s → recv 245KB/s cap 住。transparent UDP (网关 LAN) + 服务端 UDP + udp_mux **也已做** (同 policing 机制, `#90`)。**WebUI Admin 限速旋钮已接后端**: Admin → 用户策略 → 设备分配新增「限速 (kbps)」列 (客户端按设备 / 服务端按客户端 IP), 经 `/api/profiles` 写 `device_profiles.rate_limit_kbps`, 已清除过时"需新数据面"stub (数据面早已是用户态令牌桶, 无需 eBPF)。GET/POST round-trip + 磁盘写入实测通过
+- [x] **限速与配额** —— 客户端**按设备** / 服务端**按客户端** / 服务端**按用户**限带宽与流量配额。**TCP 已做**: 用户态 token bucket 整形 relay 字节流 (无 eBPF 依赖), 复用 `routing.device_profiles` (按源 IP 聚合跨连接共享) 与 `mirage_server.users[].rate_limit_kbps` (同用户连接共享上/下行桶, 与源 IP 桶双重叠加生效)。实机验证: 本地两侧各限 1MB/s 误差<1%; CN2→US 服务端限 250KB/s 精准生效。**UDP 也做了**: policing (令牌不足丢包), 覆盖透明 UDP (网关 LAN) + 服务端 UDP + udp_mux + QUIC lean。**按月流量配额 (多用户 v2)**: 服务端 `users[].quota_gb` + `quota_reset_day` (UTC 按月滚动), 实时原子累加, 超额存量连接即断、新握手伪装回落; 周期用量持久化跨重启保留; API 支持 `set_limits` 与 `reset_quota`。**WebUI Admin 限速旋钮已接后端**: Admin 用户管理与设备分配经 API 控制。GET/POST round-trip + 磁盘写入实测通过
 - [x] **WebUI 全新看板 Mirage Console** (v0.10.0) —— 界面重构 (侧栏切视图 + 暗/亮双主题 + Canvas 流量图, 对标 Linear/shadcn) + i18n 中/英双语 + **服务端/客户端多模式分视图 + Admin 区**。客户端: LAN 设备表 + 按设备一键路由; 服务端: 域名排行 · 连接历史 · 连接的客户端 (版本 `tuning.client_info` 两端 opt-in 零指纹 + 一键屏蔽)。规则编辑器 dry_run 预检/进程分流维度/拖排。前身 v0.9.6 五阶段 (连接登记/面板/统计/透明 UDP 登记)。（注: `gui.stats_persist_path` 开启后, 域名排行、设备统计、多用户统计、全局总量与屏蔽名单均落盘持久化跨重启保留; live 连接、closed 环与客户端版本为刻意瞬态, 重启清零）
 - [x] **规则集自动更新** —— 即上「geo 自动更新 + 热重载」: `geo_sources` 常用 v2ray `.dat` (geosite/geoip) 周期下载 → 落地触发热重载, 全程免手动放文件、免重启。更新失败保留旧文件 (freshness meta + `update_days` clamp≥1 防打爆源)。**任意远端 rule-set / sing-box `.json` 格式刻意不支持自动化** —— 聚焦零配置网关, 只认常用 `.dat`
 - [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道

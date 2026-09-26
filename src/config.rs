@@ -216,10 +216,16 @@ pub enum Transport {
 
 /// 多用户凭据 (mirage_server `users[]`)。每个 user 一个独立 password —— 握手按 token tag 认出
 /// 是哪个用户。password 是秘密, **绝不出 API/日志** (GET /api/users 只返 name + 用量)。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct MirageUser {
     pub name: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_kbps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_gb: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reset_day: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1358,6 +1364,21 @@ impl Config {
                     if u.password.is_empty() {
                         issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name));
                     }
+                    if let Some(kbps) = u.rate_limit_kbps {
+                        if kbps == 0 {
+                            issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` rate_limit_kbps 必须大于 0", u.name));
+                        }
+                    }
+                    if let Some(quota) = u.quota_gb {
+                        if !quota.is_finite() || quota <= 0.0 {
+                            issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` quota_gb 必须为有效正数 (>0)", u.name));
+                        }
+                    }
+                    if let Some(day) = u.quota_reset_day {
+                        if !(1..=28).contains(&day) {
+                            issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` quota_reset_day 必须在 1..=28 范围内", u.name));
+                        }
+                    }
                 }
                 // 容忍窗口直接推导 replay 去重桶数, 极大值会放大内存。3600s (1h) 已远超时钟漂移
                 // 与 TIME_SYNC bootstrap 所需, 上不封顶等于给配置错留个内存放大口。
@@ -2241,6 +2262,29 @@ mod profile_tests {
         assert!(srv_with_users(r#"[{"name":"default","password":"x"}]"#).semantic_issues().iter().any(|i| i.contains("重复")), "撞 default 未拦");
         // 空密码
         assert!(srv_with_users(r#"[{"name":"u","password":""}]"#).semantic_issues().iter().any(|i| i.contains("password 为空")), "空密码未拦");
+    }
+
+    #[test]
+    fn users_limits_and_quota_validation() {
+        // 合法限速与配额
+        let valid = srv_with_users(r#"[{"name":"alice","password":"p","rate_limit_kbps":1000,"quota_gb":10.5,"quota_reset_day":15}]"#);
+        assert!(!valid.semantic_issues().iter().any(|i| i.contains("user")), "合法配额不该报错: {:?}", valid.semantic_issues());
+
+        // kbps == 0
+        let zero_kbps = srv_with_users(r#"[{"name":"alice","password":"p","rate_limit_kbps":0}]"#);
+        assert!(zero_kbps.semantic_issues().iter().any(|i| i.contains("rate_limit_kbps 必须大于 0")));
+
+        // quota_gb <= 0
+        let zero_quota = srv_with_users(r#"[{"name":"alice","password":"p","quota_gb":0.0}]"#);
+        assert!(zero_quota.semantic_issues().iter().any(|i| i.contains("quota_gb 必须为有效正数")));
+        let neg_quota = srv_with_users(r#"[{"name":"alice","password":"p","quota_gb":-5.0}]"#);
+        assert!(neg_quota.semantic_issues().iter().any(|i| i.contains("quota_gb 必须为有效正数")));
+
+        // quota_reset_day 越界
+        let day_0 = srv_with_users(r#"[{"name":"alice","password":"p","quota_reset_day":0}]"#);
+        assert!(day_0.semantic_issues().iter().any(|i| i.contains("quota_reset_day 必须在 1..=28")));
+        let day_29 = srv_with_users(r#"[{"name":"alice","password":"p","quota_reset_day":29}]"#);
+        assert!(day_29.semantic_issues().iter().any(|i| i.contains("quota_reset_day 必须在 1..=28")));
     }
 }
 

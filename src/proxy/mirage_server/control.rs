@@ -206,7 +206,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user).await;
     } else if first_chunk.len() == 1 && first_chunk[0] == crate::proxy::udp_mux::MUX_SENTINEL {
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
         if upstream.as_ref().is_some_and(|u| u.block_udp()) {
@@ -214,7 +214,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip).await;
+        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         match parse_tcp_target(&first_chunk) {

@@ -548,7 +548,7 @@ mod tests {
             )
         };
         let server = tokio::spawn(async move {
-            crate::proxy::mirage_server::udp_relay::handle_udp_mux_relay(sr, sw, None, None).await;
+            crate::proxy::mirage_server::udp_relay::handle_udp_mux_relay(sr, sw, None, None, "default".to_string()).await;
         });
 
         // 客户端: Boxed crypto (initiator) 组 Tunnel → from_tunnel (不发 sentinel, 对端直接 relay)

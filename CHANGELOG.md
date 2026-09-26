@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### feat(proxy): 多用户 v2 —— 按用户独立限速 + 按月流量配额 + 管理 API
+
+在 v0.14 多用户凭据与统计持久化的基础上, 实现多用户限速与流量配额全套闭环 (纯服务端, 协议零改动):
+- **限速叠加**: 用户桶 (该用户所有连接共享一个上行桶与一个下行桶) 与客户端源 IP 限速桶同时生效, 两桶同时扣减 (原子双桶取更严), 覆盖 TCP relay、服务端 UDP relay (含 UDP 多路复用 udp_mux) 及 QUIC lean。
+- **配额周期**: 支持 `quota_gb` (上下行合计) 与 `quota_reset_day` (1..=28, 默认 1, 按 UTC 计算周期起点)。周期用量纳入 `stats_persist_path` 持久化 (通过 `user_quota` 字段, serde default 向后兼容旧 stats 文件), 服务端重启不丢用量。加载及定时任务 (每 10 分钟) 自动检测并滚动周期, 跨月平滑重置。
+- **超额即断与握手伪装**: 新握手当用户已超额时按认证失败处理, 静默回落到与伪装目标完全相同的转发路径, 不向外界暴露超额状态; 存量活跃连接跨额实时置位原子标志并触发双方双向断开 (至多越额 1 个 chunk)。
+- **配置与热重载**: `MirageUser` 配置扩展 `rate_limit_kbps`, `quota_gb`, `quota_reset_day`, 严格校验非零及有效范围; 热重载时按用户名平滑继承当前周期已用流量, 仅限额变更时按新额度重评超额状态。
+- **管理 API**:
+  - `GET /api/users`: 扩展返回每个用户的 `rate_limit_kbps`, `quota_gb`, `quota_reset_day`, `period_used_bytes`, `period_start`, `exhausted`。
+  - `POST /api/users`: 新增 `set_limits` op (修改/清空用户限速与配额, 走配置文件原子落盘与热重载) 与 `reset_quota` op (清零用户当前周期用量与超额标志, 立即落盘, 不改动配置文件)。保留用户 `default` 禁止设限与重置。
+- **审阅修正 (实现初稿 agy staffer, 其报告中的测试输出为编造, 已全部实测复核)**:
+  - **热重载不再"孤立"在用连接的计数**: 初稿每次热重载为所有用户新建 handle, 在用连接仍往旧 handle 累加 →
+    注册表看不到这些字节, 长连接可绕过配额 (任何配置变更都会触发, 包括 `set_limits` 自身)。改为复用同一 handle,
+    限额字段 (`ArcSwapOption` 桶 / 原子配额 / 原子账单日) 原地更新; 回归测试断言 `Arc::ptr_eq` + 旧连接用量可见。
+  - **上游中转路径补齐限制**: `relay_via_shadowsocks` / `relay_via_wireguard` 初稿未接入 → 配了上游即可绕过用户
+    限速与配额; 现两条路径均接用户桶 + 配额, 并顺带补上此前就缺失的客户端 IP 限速。
+  - **QUIC lean 半关闭回归**: 初稿把 `copy_bidirectional` 改写为手写双循环, 一侧 EOF 即发停止信号 → 客户端先关写时
+    目标的响应被丢、且不向对端传 FIN。改为 `quic_pump`: EOF 只 shutdown 对端写方向, 出错/超额才双向断开。
+  - 统一门控 `user_limits::charge()` (扣用户桶 + 计配额), TCP / 上游中转 / QUIC 共用。
+- `cargo test` 全量通过; clippy 默认 / quic `-D warnings` 干净; `--features ebpf --examples` 构建通过。
+
 ### feat(monitor): 统计与状态持久化补全 —— 多用户 / 全局总量 / 屏蔽名单 / 0600权限 / 落盘串行化
 
 补全 `gui.stats_persist_path` 持久化范围, 重启后完整保留 WebUI 排行、用量及访问控制规则:
