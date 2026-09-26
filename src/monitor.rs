@@ -153,12 +153,25 @@ struct UserAgg {
 static USER_STATS: LazyLock<Mutex<HashMap<String, UserAgg>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-// ── 统计持久化 (gui.stats_persist_path): 重启保住 WebUI 排行/总量 ──────────────────
-// 只持久化三张聚合表 (域名/设备/出站); live 连接与 closed 环是瞬态, 不存。DeviceAgg.last
-// (Instant) 不可序列化, 落盘丢弃、load 时重置为 now (只影响"最近活跃"排序的相对时刻)。
+// ── 统计持久化 (gui.stats_persist_path): 重启保住 WebUI 排行/总量/多用户/屏蔽名单 ────────
+// 持久化六部分状态:
+// 1. outbound: per-出站聚合 (up/down/conns)
+// 2. domain: 域名聚合排行 (up/down/conns)
+// 3. device: 设备/来源聚合 (up/down/conns), DeviceAgg.last (Instant) 不可序列化, 落盘丢弃、load 时重置为 now
+// 4. user: 多用户累计聚合 (up/down/conns), UserAgg.active 为当前活跃连接数是瞬态, 落盘丢弃、load 时归 0
+// 5. global_up / global_down: 全局上/下行字节总量 (AtomicU64)
+// 6. blocklist: 服务端按源 IP 屏蔽名单 (HashSet<IpAddr>)
+// live 连接 (REGISTRY.live) 与 closed 连接环 (REGISTRY.closed) 为刻意瞬态, 不存。
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
 struct DevicePersist {
+    conns: u64,
+    up: u64,
+    down: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+struct UserPersist {
     conns: u64,
     up: u64,
     down: u64,
@@ -166,13 +179,57 @@ struct DevicePersist {
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct PersistedStats {
+    #[serde(default)]
     outbound: HashMap<String, OutboundAgg>,
+    #[serde(default)]
     domain: HashMap<String, DomainAgg>,
+    #[serde(default)]
     device: HashMap<String, DevicePersist>,
+    #[serde(default)]
+    user: HashMap<String, UserPersist>,
+    #[serde(default)]
+    global_up: u64,
+    #[serde(default)]
+    global_down: u64,
+    #[serde(default)]
+    blocklist: Vec<std::net::IpAddr>,
 }
 
-/// 启动时从持久化文件恢复三张聚合表。best-effort: 文件缺失/损坏则空启动 (仅 warn)。
+/// 串行化落盘: 周期落盘与关服落盘可能并发写同一个 .tmp → 文件交错损坏。
+/// 加一把全局锁串行化落盘 (参照 src/dns/fake_ip.rs ~19-25)。
+static STATS_FLUSH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// 当前活跃的统计持久化路径 (None = 未启用持久化)。
+static STATS_PERSIST_PATH: LazyLock<std::sync::RwLock<Option<String>>> =
+    LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// 设置持久化路径 (供启动或测试配置)。
+pub fn set_persist_path(path: &str) {
+    let mut lock = STATS_PERSIST_PATH.write().unwrap_or_else(|e| e.into_inner());
+    *lock = Some(path.to_string());
+}
+
+/// 重置持久化路径 (测试清理用)。
+pub fn reset_persist_path() {
+    let mut lock = STATS_PERSIST_PATH.write().unwrap_or_else(|e| e.into_inner());
+    *lock = None;
+}
+
+/// 若已配置持久化路径, 立即落盘 (供屏蔽/解封等关键状态变更立即持久化)。
+pub fn flush_current() {
+    let path = {
+        let lock = STATS_PERSIST_PATH.read().unwrap_or_else(|e| e.into_inner());
+        lock.clone()
+    };
+    if let Some(p) = path {
+        flush_stats(&p);
+    }
+}
+
+/// 启动时从持久化文件恢复各聚合表、全局总量与屏蔽名单。best-effort: 文件缺失/损坏则空启动 (仅 warn)。
+/// 向后兼容: 旧版文件缺失 user/global/blocklist 字段时, 自动取 default 正常启动。
 pub fn load_stats(path: &str) {
+    set_persist_path(path);
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return, // 首次运行无文件, 正常
@@ -193,11 +250,24 @@ pub fn load_stats(path: &str) {
         .into_iter()
         .map(|(k, v)| (k, DeviceAgg { conns: v.conns, up: v.up, down: v.down, last: now }))
         .collect();
-    tracing::info!("[STATS] 从 {} 恢复统计 (域名/设备/出站聚合表)", path);
+    let mut us = USER_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    *us = parsed
+        .user
+        .into_iter()
+        .map(|(k, v)| (k, UserAgg { conns: v.conns, up: v.up, down: v.down, active: 0 }))
+        .collect();
+    GLOBAL_UP.store(parsed.global_up, Ordering::Relaxed);
+    GLOBAL_DOWN.store(parsed.global_down, Ordering::Relaxed);
+    crate::blocklist::restore_all(parsed.blocklist);
+    tracing::info!("[STATS] 从 {} 恢复统计 (域名/设备/出站/用户聚合表, 全局流量及屏蔽名单)", path);
 }
 
-/// 落盘三张聚合表。先写 .tmp 再原子 rename。best-effort, 失败仅 warn (下轮重试)。
+/// 落盘聚合表、全局总量与屏蔽名单。先以 0600 写 .tmp 再原子 rename。
+/// 全程持全局锁串行化, 避免并发 flush 撕裂临时文件。best-effort, 失败仅 warn (下轮重试)。
 pub fn flush_stats(path: &str) {
+    set_persist_path(path);
+    let _flush_guard = STATS_FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let snap = PersistedStats {
         outbound: OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         domain: DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -207,6 +277,15 @@ pub fn flush_stats(path: &str) {
             .iter()
             .map(|(k, v)| (k.clone(), DevicePersist { conns: v.conns, up: v.up, down: v.down }))
             .collect(),
+        user: USER_STATS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), UserPersist { conns: v.conns, up: v.up, down: v.down }))
+            .collect(),
+        global_up: GLOBAL_UP.load(Ordering::Relaxed),
+        global_down: GLOBAL_DOWN.load(Ordering::Relaxed),
+        blocklist: crate::blocklist::all_ips(),
     };
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
@@ -219,12 +298,36 @@ pub fn flush_stats(path: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp = format!("{path}.tmp");
-    if std::fs::write(&tmp, json.as_bytes()).is_err() {
-        tracing::warn!("[STATS] 写临时文件 {} 失败", tmp);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        tracing::warn!("[STATS] rename {} 失败: {}", path, e);
+
+    #[cfg(unix)]
+    let mode: u32 = 0o600;
+
+    let write_res: std::io::Result<()> = (|| {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(mode)
+                .open(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.flush()?;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(mode));
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, json.as_bytes())
+        }
+    })()
+    .and_then(|()| std::fs::rename(&tmp, path));
+
+    if let Err(e) = write_res {
+        tracing::warn!("[STATS] 写持久化文件 {} 失败: {}", path, e);
         let _ = std::fs::remove_file(&tmp);
     }
 }
@@ -844,7 +947,7 @@ mod conn_registry_tests {
     use super::*;
 
     // REGISTRY 是进程全局单例; 两个测试并行会互相扰动活跃计数, 用锁串行化。
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn register_count_counter_and_drop_to_closed_ring() {
@@ -946,25 +1049,39 @@ mod conn_registry_tests {
 mod stats_persist_tests {
     use super::*;
 
-    // 纯 serde roundtrip (不碰全局态, 并行安全): 验证持久化数据模型自洽, 尤其 DevicePersist
-    // 绕开 DeviceAgg 的 Instant。
+    // 纯 serde roundtrip (不碰全局态, 并行安全): 验证持久化数据模型自洽, 包含所有六部分状态
     #[test]
     fn persisted_stats_serde_roundtrip() {
         let mut s = PersistedStats::default();
         s.outbound.insert("ob".into(), OutboundAgg { up: 1, down: 2, conns: 3 });
         s.domain.insert("d".into(), DomainAgg { conns: 4, up: 5, down: 6 });
         s.device.insert("dev".into(), DevicePersist { conns: 7, up: 8, down: 9 });
+        s.user.insert("alice".into(), UserPersist { conns: 10, up: 11, down: 12 });
+        s.global_up = 13;
+        s.global_down = 14;
+        s.blocklist.push("192.0.2.1".parse().unwrap());
+        s.blocklist.push("2001:db8::1".parse().unwrap());
+
         let json = serde_json::to_string(&s).unwrap();
         let back: PersistedStats = serde_json::from_str(&json).unwrap();
         assert_eq!(back.outbound["ob"].up, 1);
         assert_eq!(back.outbound["ob"].conns, 3);
         assert_eq!(back.domain["d"].conns, 4);
         assert_eq!(back.device["dev"].down, 9);
+        assert_eq!(back.user["alice"].conns, 10);
+        assert_eq!(back.user["alice"].up, 11);
+        assert_eq!(back.user["alice"].down, 12);
+        assert_eq!(back.global_up, 13);
+        assert_eq!(back.global_down, 14);
+        assert_eq!(back.blocklist.len(), 2);
+        assert!(back.blocklist.contains(&"192.0.2.1".parse().unwrap()));
+        assert!(back.blocklist.contains(&"2001:db8::1".parse().unwrap()));
     }
 
     // flush 落盘: 塞唯一 key 到全局表, flush, 读回文件断言含该 key (对并行加的其它 key 稳健)。
     #[test]
     fn flush_stats_writes_file() {
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DOMAIN_STATS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -977,5 +1094,193 @@ mod stats_persist_tests {
         let d = parsed.domain.get("persist-test.example").expect("落盘应含该域名");
         assert_eq!((d.conns, d.up, d.down), (11, 22, 33));
         let _ = std::fs::remove_file(path);
+        reset_persist_path();
+    }
+
+    // users + global + blocklist 的 flush → 清空内存 → load 往返后数据一致
+    // 验证:
+    // - USER_STATS: conns/up/down 完整保留, active 重置为 0 (瞬态归零)
+    // - GLOBAL_UP / GLOBAL_DOWN: 正确恢复
+    // - blocklist: 正确恢复
+    // - outbound / domain / device: 正常恢复
+    #[test]
+    fn stats_persist_flush_load_roundtrip_all() {
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = std::env::temp_dir().join("mirage_stats_roundtrip_test.json");
+        let path = path.to_str().unwrap();
+
+        // 1. 灌入测试状态
+        {
+            OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner())
+                .insert("rt_ob".into(), OutboundAgg { up: 101, down: 102, conns: 103 });
+            DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner())
+                .insert("rt-domain.example".into(), DomainAgg { conns: 201, up: 202, down: 203 });
+            DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner())
+                .insert("192.0.2.77".into(), DeviceAgg { conns: 301, up: 302, down: 303, last: Instant::now() });
+            let mut us = USER_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            us.insert("rt_alice".into(), UserAgg { conns: 401, up: 402, down: 403, active: 5 });
+            GLOBAL_UP.store(50001, Ordering::Relaxed);
+            GLOBAL_DOWN.store(60002, Ordering::Relaxed);
+            crate::blocklist::clear();
+            crate::blocklist::block("198.51.100.77".parse().unwrap());
+        }
+
+        // 2. 落盘
+        flush_stats(path);
+
+        // 3. 彻底清空内存
+        {
+            OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            USER_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            GLOBAL_UP.store(0, Ordering::Relaxed);
+            GLOBAL_DOWN.store(0, Ordering::Relaxed);
+            crate::blocklist::clear();
+        }
+
+        // 验证内存已被清空
+        assert!(OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert_eq!(GLOBAL_UP.load(Ordering::Relaxed), 0);
+        assert!(!crate::blocklist::is_blocked(&"198.51.100.77".parse().unwrap()));
+
+        // 4. 加载恢复
+        load_stats(path);
+
+        // 5. 断言恢复后的一致性
+        {
+            let ob = OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = ob.get("rt_ob").expect("outbound 应恢复");
+            assert_eq!((entry.up, entry.down, entry.conns), (101, 102, 103));
+
+            let ds = DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = ds.get("rt-domain.example").expect("domain 应恢复");
+            assert_eq!((entry.conns, entry.up, entry.down), (201, 202, 203));
+
+            let dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = dev.get("192.0.2.77").expect("device 应恢复");
+            assert_eq!((entry.conns, entry.up, entry.down), (301, 302, 303));
+
+            let us = USER_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = us.get("rt_alice").expect("user 应恢复");
+            assert_eq!((entry.conns, entry.up, entry.down), (401, 402, 403));
+            assert_eq!(entry.active, 0, "active 为瞬态, 加载时必须归 0");
+
+            assert_eq!(GLOBAL_UP.load(Ordering::Relaxed), 50001);
+            assert_eq!(GLOBAL_DOWN.load(Ordering::Relaxed), 60002);
+
+            assert!(crate::blocklist::is_blocked(&"198.51.100.77".parse().unwrap()));
+        }
+
+        // 清理现场
+        let _ = std::fs::remove_file(path);
+        reset_persist_path();
+        OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        USER_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        GLOBAL_UP.store(0, Ordering::Relaxed);
+        GLOBAL_DOWN.store(0, Ordering::Relaxed);
+        crate::blocklist::clear();
+    }
+
+    // 旧格式文件 (只含 outbound/domain/device 三张表) 能够正常加载, 新字段自动取 default
+    #[test]
+    fn stats_persist_backward_compatible_old_format() {
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = std::env::temp_dir().join("mirage_stats_old_format_test.json");
+        let path = path.to_str().unwrap();
+
+        let old_json = r#"{
+            "outbound": {
+                "direct": { "up": 10, "down": 20, "conns": 1 }
+            },
+            "domain": {
+                "legacy.example": { "conns": 5, "up": 50, "down": 60 }
+            },
+            "device": {
+                "10.0.0.2": { "conns": 3, "up": 30, "down": 40 }
+            }
+        }"#;
+        std::fs::write(path, old_json).unwrap();
+
+        // 预设一些污染数据
+        GLOBAL_UP.store(8888, Ordering::Relaxed);
+        GLOBAL_DOWN.store(9999, Ordering::Relaxed);
+        crate::blocklist::block("10.0.0.99".parse().unwrap());
+        USER_STATS.lock().unwrap_or_else(|e| e.into_inner())
+            .insert("dummy".into(), UserAgg { conns: 1, up: 2, down: 3, active: 4 });
+
+        load_stats(path);
+
+        // 验证旧数据正常恢复
+        assert_eq!(OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner())["direct"].up, 10);
+        assert_eq!(DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner())["legacy.example"].conns, 5);
+        assert_eq!(DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner())["10.0.0.2"].down, 40);
+
+        // 验证新字段取默认值
+        assert!(USER_STATS.lock().unwrap_or_else(|e| e.into_inner()).is_empty(), "旧文件无 user, 加载后应为空");
+        assert_eq!(GLOBAL_UP.load(Ordering::Relaxed), 0, "旧文件无 global_up, 取 0");
+        assert_eq!(GLOBAL_DOWN.load(Ordering::Relaxed), 0, "旧文件无 global_down, 取 0");
+        assert!(crate::blocklist::all_ips().is_empty(), "旧文件无 blocklist, 取空");
+
+        let _ = std::fs::remove_file(path);
+        reset_persist_path();
+        OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    // 落盘文件权限必须严格为 0600 (仅所有者可读写, 避免域名历史等隐私泄露)
+    #[test]
+    #[cfg(unix)]
+    fn stats_persist_file_permissions_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = std::env::temp_dir().join("mirage_stats_perm_test.json");
+        let path = path.to_str().unwrap();
+
+        flush_stats(path);
+
+        let meta = std::fs::metadata(path).expect("持久化文件应生成");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "持久化文件权限必须为 0600 (当前为 {:o})", mode);
+
+        let _ = std::fs::remove_file(path);
+        reset_persist_path();
+    }
+
+    // 屏蔽与解封操作要立即落盘 (不能只等 60s 周期)
+    #[test]
+    fn stats_persist_blocklist_persists_immediately() {
+        let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let path = std::env::temp_dir().join("mirage_stats_immediate_block_test.json");
+        let path = path.to_str().unwrap();
+
+        set_persist_path(path);
+        crate::blocklist::clear();
+        flush_stats(path);
+
+        let ip: std::net::IpAddr = "203.0.113.88".parse().unwrap();
+
+        // 1. 执行屏蔽: 必须立即落盘
+        crate::blocklist::block(ip);
+        let content = std::fs::read_to_string(path).expect("文件应存在");
+        let parsed: PersistedStats = serde_json::from_str(&content).expect("应为有效 JSON");
+        assert!(parsed.blocklist.contains(&ip), "屏蔽后必须立即可在文件中查到该 IP");
+
+        // 2. 执行解封: 必须立即落盘
+        crate::blocklist::unblock(&ip);
+        let content2 = std::fs::read_to_string(path).expect("文件应存在");
+        let parsed2: PersistedStats = serde_json::from_str(&content2).expect("应为有效 JSON");
+        assert!(!parsed2.blocklist.contains(&ip), "解封后必须立即可在文件中移除该 IP");
+
+        let _ = std::fs::remove_file(path);
+        reset_persist_path();
+        crate::blocklist::clear();
     }
 }
