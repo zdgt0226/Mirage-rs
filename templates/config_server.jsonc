@@ -60,6 +60,7 @@
 
             // 【QUIC 传输, 实验】需 --features quic, 两端须同设。
             // "transport": "quic",
+            // "quic_key_path": "quic_key.pem",      // 私钥持久化路径 (默认 quic_key.pem, 0600 保存)
             // "quic_obfs": "与客户端一致的混淆密码",
             // "quic_window_mb": 2
         }

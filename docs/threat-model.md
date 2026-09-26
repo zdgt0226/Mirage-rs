@@ -71,8 +71,7 @@ TLS 站点区分开。
   即使服务端重启清空 replay cache,重放的录制会话也派生不出原密钥,首帧即解密失败。
 - server_random 全 0 (未写入/未捕获) → 客户端与服务端**都 fail-closed**。
 - 同一会话内 (key, nonce) 永不复用:cipher agility 协商结果与当前相同时不 rekey,`rekey()` 拒绝同 cipher 调用。
-- QUIC lean 每流 token 用独立 bind (`QUIC_LEAN_BIND`) 与 TCP token 域分隔。⚠️ QUIC 腿外层客户端 `NoVerify`、无服务端
-  认证,可被主动 MITM 读改 —— **QUIC 转正前必须补证书 pinning**,在此之前 T6 仅对 TCP fake-TLS 主链路成立。
+- QUIC lean 每流 token 用独立 bind (`QUIC_LEAN_BIND`) 与 TCP token 域分隔。✅ QUIC 腿外层现已接入 **SPKI 固定 (`PinnedVerifier`)**：服务端持久化私钥 (`quic_key.pem`, 0600) + 客户端比对 SHA-256(SPKI) 指纹并真正校验 TLS 1.3 握手签名，阻断主动 MITM 终止连接窃取 token 与数据。残余风险：①主动探测者直连能看到固定自签证书 (跨重启不变可被关联，建议配合 `quic_obfs` 混淆缓解)；②无服务端前向吊销机制 (密钥轮换须人工更新客户端 `quic_pin`)。
 
 **红线**:任何让会话密钥只由客户端可控/可重放的输入决定、或导致同一 key 下 nonce 重复的改动 = 违规。
 

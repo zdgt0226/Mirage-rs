@@ -41,6 +41,16 @@ enum Mode {
         #[arg(short, long, default_value = "config.json")]
         config: String,
     },
+    /// 打印 (或生成并保存) QUIC 服务端私钥对应的 SPKI 证书指纹 (quic_pin)
+    ///
+    /// 读配置中 mirage_server 的 quic_key_path; 不起服务、不联网:
+    ///   mirage-rs quic-pin -c config_server.json
+    #[command(name = "quic-pin")]
+    QuicPin {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "config_server.json")]
+        config: String,
+    },
     /// 轻量客户端: 仅 SOCKS5 (TCP) 入站, 全部流量走隧道
     ///
     /// 无分流 / DNS / fake-IP / 透明代理 / 看板。协议与完整版一致, 可互通。
@@ -252,6 +262,53 @@ fn run_format(path: &str) -> i32 {
             1
         }
     }
+}
+
+/// 打印 (或生成并保存) QUIC 服务端私钥对应的 SPKI 证书指纹 (quic_pin)。
+/// 不启动服务、不联网。
+#[cfg(feature = "quic")]
+fn run_quic_pin(config_path: &str) -> i32 {
+    let config = match mirage_rs::config::Config::load_from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("✗ 读不了或解析 {config_path} 失败: {e:#}");
+            return 1;
+        }
+    };
+
+    let mut found = 0;
+    for ib in &config.inbounds {
+        if let mirage_rs::config::InboundConfig::MirageServer { quic_key_path, .. } = ib {
+            found += 1;
+            let key_path_str = quic_key_path.as_deref().unwrap_or("quic_key.pem");
+            let path = std::path::Path::new(key_path_str);
+            let newly_created = !path.exists();
+            let key = match mirage_rs::proxy::quic::load_or_generate_key(path) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("✗ 读取或生成 QUIC 私钥失败 ({key_path_str}): {e:#}");
+                    return 1;
+                }
+            };
+            let pin = mirage_rs::proxy::quic::spki_pin(&key.public_key_der());
+            if newly_created {
+                eprintln!("✓ 已生成新私钥并以 0600 保存至 {key_path_str}");
+            }
+            println!("{pin}");
+        }
+    }
+
+    if found == 0 {
+        eprintln!("✗ {config_path} 中未找到 mirage_server 入站配置");
+        return 1;
+    }
+    0
+}
+
+#[cfg(not(feature = "quic"))]
+fn run_quic_pin(_config_path: &str) -> i32 {
+    eprintln!("✗ quic-pin 子命令需要以 `--features quic` 编译");
+    1
 }
 
 /// 收集配置里已有的出站 tag。
@@ -1457,6 +1514,7 @@ async fn main() -> anyhow::Result<()> {
         Mode::Check { config } => std::process::exit(run_check(config)),
         Mode::Format { config } => std::process::exit(run_format(config)),
         Mode::Export { config, out } => std::process::exit(run_export(config, out.as_deref())),
+        Mode::QuicPin { config } => std::process::exit(run_quic_pin(config)),
         _ => {}
     }
 

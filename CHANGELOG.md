@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### feat(quic): QUIC 腿服务端证书固定 (SPKI Pinning) —— 防主动中间人 + 私钥持久化
+
+按 `docs/quic-cert-pinning-design.md` 为实验 QUIC 传输腿引入 SPKI 指纹固定, 解决 Model X lean 裸转发在外层 TLS 不认证服务端时的中间人威胁 (修 T6 / A1):
+- **服务端私钥持久化**: `mirage_server` 入站新增 `quic_key_path` (默认 `"quic_key.pem"`), 存在则读取 (读/解析失败拒绝启动, 绝不静默重新生成), 不存在则以 0600 权限原子写 (.tmp + rename) 生成并持久化 ECDSA P-256 私钥; 每次启动用该密钥重签自签证书 (`CN=localhost`), 启动日志 info 打印 `quic_pin` 指纹。
+- **SPKI 指纹编码**: 提取公钥 SPKI DER 计算 `base64url_nopad(SHA-256(SPKI))`, 43 字符定长, 两端与 CLI 共用 `spki_pin`。
+- **客户端 PinnedVerifier**: 彻底移除无条件放行的 `NoVerify`, 替换为 `PinnedVerifier`。`verify_server_cert` 提取 SPKI 指纹并使用常数时间比较 (`ct_eq`); `verify_tls13_signature` / `verify_tls12_signature` 接入 ring 标准验签, 真正校验握手签名 (封死出示合法证书但无私钥的 MITM 路径)。
+- **客户端强制必填 (Fail-Closed)**: Mirage 出站新增 `quic_pin`; `semantic_issues` 校验 transport=quic 时缺 pin 或格式非法即报错; 运行时缺 pin 拒绝建立 QUIC 连接并输出明确错误。
+- **CLI 子命令 `mirage-rs quic-pin`**: `quic-pin -c <服务端配置>` 直接读取服务端配置中的私钥并输出指纹 (若私钥不存在则预先生成并以 0600 保存), 便于部署前获取指纹。不起服务、不联网。
+- **文档与模板**: 配置模板补充 `quic_pin` 与 `quic_key_path` 示例; `threat-model.md` T6 标注 QUIC 腿已 pinning 并记录残余风险; README 补充说明。
+- **审阅与验证** (实现初稿 agy staffer, 全部实测复核): 核实 `PinnedVerifier` 验签调用 rustls 标准实现; **变异验证**把
+  `verify_tls13_signature` 改成无条件 `Ok` 后, 回归测试 `test_signature_verification_regression` 确实转红, 证明它能锁住
+  "只比指纹不验签"这一致命退化; CLI 实测: 指纹 43 字符、私钥 0600、重复运行指纹不变、私钥损坏退出码 1 且不覆盖原文件;
+  `rustls-webpki` 仍为依赖树中唯一的 0.103.15。`cargo test` 全量 + `--features quic --lib` 通过, clippy 默认 / quic (含测试) 干净。
+
 ### feat(proxy): 多用户 v2 —— 按用户独立限速 + 按月流量配额 + 管理 API
 
 在 v0.14 多用户凭据与统计持久化的基础上, 实现多用户限速与流量配额全套闭环 (纯服务端, 协议零改动):
