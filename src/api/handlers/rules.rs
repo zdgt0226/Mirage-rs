@@ -116,11 +116,8 @@ pub async fn update_rules(
         return Json(json!({"status": "success", "dry_run": true, "written": false, "issues": issues})).into_response();
     }
 
-    // 4. 原子写: 先写 .tmp 再 rename。裸 fs::write 原地覆写中途崩溃/并发会把 config 截断变砖。
-    let tmp = format!("{}.tmp", app_state.config_path);
-    if tokio::fs::write(&tmp, &candidate).await.is_ok()
-        && tokio::fs::rename(&tmp, &app_state.config_path).await.is_ok()
-    {
+    // 4. 原子写: 先写 .tmp (0600/沿用原权限) 再 rename。裸 fs::write 原地覆写中途崩溃/并发会把 config 截断变砖。
+    if super::atomic_write_config(&app_state.config_path, &candidate).await.is_ok() {
         // 新 version = 落盘后内容指纹, 前端更新本地锁值 (免下次立刻 stale)。
         return Json(json!({
             "status": "success", "written": true, "issues": issues,
@@ -128,6 +125,5 @@ pub async fn update_rules(
         }))
         .into_response();
     }
-    let _ = tokio::fs::remove_file(&tmp).await;
     err_resp(StatusCode::INTERNAL_SERVER_ERROR, "write_error", "写入配置失败 (原文件未改动)", vec![])
 }

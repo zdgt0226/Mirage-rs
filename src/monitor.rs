@@ -352,8 +352,17 @@ pub fn register(
     OUTBOUND_STATS.lock().unwrap_or_else(|e| e.into_inner())
         .entry(info.outbound.clone()).or_default().conns += 1;
     // per-域名累计连接数 +1 (域名排行)。
-    DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner())
-        .entry(target_host(&info.target)).or_default().conns += 1;
+    let host = target_host(&info.target);
+    {
+        let mut ds = DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        if !ds.contains_key(&host) && ds.len() >= DOMAIN_STATS_CAP {
+            // 满 + 新域名: 淘汰流量/连接数最小的一条 (保留头部排行)。
+            if let Some(k) = ds.iter().min_by_key(|(_, a)| (a.up + a.down, a.conns)).map(|(k, _)| k.clone()) {
+                ds.remove(&k);
+            }
+        }
+        ds.entry(host).or_default().conns += 1;
+    }
     // per-设备/来源累计连接数 +1 + 刷新 last (LAN 设备 / 连接的客户端)。
     if let Some(src) = &info.source {
         let mut dev = DEVICE_STATS.lock().unwrap_or_else(|e| e.into_inner());
@@ -887,6 +896,30 @@ mod conn_registry_tests {
         }
         let (_, closed) = conn_snapshots();
         assert!(closed.len() <= CLOSED_RING_CAP, "closed ring 超容量: {}", closed.len());
+    }
+
+    #[test]
+    fn domain_stats_capped() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 预填或登记多于 DOMAIN_STATS_CAP 个唯一域名
+        {
+            let mut ds = DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            ds.clear();
+            for i in 0..DOMAIN_STATS_CAP {
+                ds.insert(format!("domain-{i}.example.com"), DomainAgg { conns: 1, up: 10, down: 10 });
+            }
+            assert_eq!(ds.len(), DOMAIN_STATS_CAP);
+        }
+        // 再 register 新域名, 触发淘汰
+        let g = register("new-domain-overflow.example.com:443".into(), "in".into(), "out".into(), "tcp", None, None, None);
+        {
+            let ds = DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(ds.len(), DOMAIN_STATS_CAP, "满后注册新域名仍保持 DOMAIN_STATS_CAP 上限");
+            assert!(ds.contains_key("new-domain-overflow.example.com"), "新域名应被记录");
+        }
+        drop(g);
+        // 清掉灌入的 4096 条假数据, 免得污染其它读域名统计的测试。
+        DOMAIN_STATS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     // 多用户 per-user 统计: 用唯一 user 名避免与其它测试共享全局 USER_STATS 污染。

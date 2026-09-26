@@ -739,8 +739,11 @@ impl DnsForwarder {
     fn answer_fakeip(&self, req: &[u8], domain: &str, qtype: u16) -> Option<Vec<u8>> {
         if let Some(mapper) = &self.fake_ip_mapper {
             if qtype == 1 {
-                let fake_ip = mapper.lookup_or_assign(domain);
+                let (fake_ip, evicted) = mapper.lookup_or_assign_with_eviction(domain);
                 if let Some(engine) = &self.xdp_engine {
+                    if let Some(old) = evicted {
+                        let _ = engine.remove_dns_cache(&old);
+                    }
                     let _ = engine.update_dns_cache(domain, fake_ip);
                 }
                 return make_fake_ip_response(req, fake_ip);
@@ -1120,9 +1123,12 @@ impl DnsForwarder {
                 OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
                         if qtype == 1 { // A
-                            let fake_ip = mapper.lookup_or_assign(&domain);
+                            let (fake_ip, evicted) = mapper.lookup_or_assign_with_eviction(&domain);
                             debug!("[DNS] proxy   [{}] → fake-IP {} (A)", domain, fake_ip);
                             if let Some(engine) = &self.xdp_engine {
+                                if let Some(old) = evicted {
+                                    let _ = engine.remove_dns_cache(&old);
+                                }
                                 let _ = engine.update_dns_cache(&domain, fake_ip);
                             }
                             return make_fake_ip_response(req, fake_ip);

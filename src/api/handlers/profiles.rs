@@ -102,16 +102,12 @@ pub async fn update_profiles(
         return Json(json!({"status": "success", "dry_run": true, "written": false, "issues": issues})).into_response();
     }
 
-    let tmp = format!("{}.tmp", app_state.config_path);
-    if tokio::fs::write(&tmp, &candidate).await.is_ok()
-        && tokio::fs::rename(&tmp, &app_state.config_path).await.is_ok()
-    {
+    if super::atomic_write_config(&app_state.config_path, &candidate).await.is_ok() {
         return Json(json!({
             "status": "success", "written": true, "issues": issues,
             "version": config_version(&candidate),
         }))
         .into_response();
     }
-    let _ = tokio::fs::remove_file(&tmp).await;
     err_resp(StatusCode::INTERNAL_SERVER_ERROR, "write_error", "写入配置失败 (原文件未改动)", vec![])
 }

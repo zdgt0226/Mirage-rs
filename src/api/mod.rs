@@ -109,17 +109,81 @@ fn same_origin(headers: &HeaderMap) -> bool {
     false
 }
 
-/// 鉴权 + CSRF 中间件。
-/// - **鉴权**: gui.token 设了才拦, 校验 Authorization/cookie/query 任一; 未配 → 放行 (localhost 默认)。
+/// 提取 Host header 或 authority 中的主机部分 (剥除端口号与两端方括号)。
+pub(crate) fn extract_host_part(host: &str) -> &str {
+    let host = host.trim();
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            return &host[1..end];
+        }
+    }
+    if let Some((h, _)) = host.rsplit_once(':') {
+        if !h.contains(':') {
+            return h;
+        }
+    }
+    host
+}
+
+/// DNS rebinding 防护校验: 未配 token 时, Host header 主机部分必须是本机地址或监听 IP。
+pub(crate) fn is_valid_host(host_header: &str, listen_ip: Option<std::net::IpAddr>) -> bool {
+    let raw = extract_host_part(host_header);
+    if raw.is_empty() {
+        return false;
+    }
+    if raw.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let ip_str = raw.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() {
+            return true;
+        }
+        if let Some(lip) = listen_ip {
+            if ip == lip {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 鉴权 + CSRF + DNS Rebinding 防护中间件。
+/// - **DNS Rebinding**: 未配 gui.token 且监听 loopback (默认部署) 时, 严格校验 Host header 主机部分为
+///   本机 (localhost / 127.0.0.1 / [::1] / 监听 IP), 否则 403 (包括 GET)。不校验的话, 恶意网页让
+///   evil.tld 解析到 127.0.0.1 后 Host 与 Origin 都是 evil.tld, same_origin 被直接绕过 → 读日志/配置、
+///   改路由/用户。非 loopback 监听不做此校验 (见 auth_mw 内注释)。
+/// - **鉴权**: gui.token 设了才拦, 校验 Authorization/cookie/query 任一; 配了 token 时 Host
+///   header 校验免除 (信任持有合法 token 的请求)。未配 token 时放行合法本机访问。
 /// - **CSRF** (方案 B): 变更方法 (POST/PUT/DELETE/PATCH) 且**非 Bearer-header 认证**时, 要求同源
 ///   (Origin/Referer 匹配 Host)。理由: Bearer header 跨站发不出 → 抗 CSRF, 直接放行; cookie 会被
-///   浏览器跨站自动带, 必须同源防护; 未启用 token 的 localhost 写接口也靠这层挡恶意网页/DNS-rebinding。
+///   浏览器跨站自动带, 必须同源防护。
 async fn auth_mw(
     State(app): State<AppState>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
+    // 0. DNS Rebinding 防护: 未配 token 且**监听在 loopback** 时, 所有请求 (含 GET) 的 Host 必须是本机。
+    //    只对 loopback 生效: 非 loopback 无 token 本就对 LAN 直接敞开 (启动已告警), rebinding 不增加攻击面,
+    //    而那种部署下管理员用 LAN IP/主机名访问, 强校验只会误伤。
+    let loopback_bind = app.gui_listen_ip.is_some_and(|ip| ip.is_loopback());
+    if app.gui_token.is_none() && loopback_bind {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .or_else(|| req.uri().authority().map(|a| a.as_str()));
+        let host_ok = host.map(|h| is_valid_host(h, app.gui_listen_ip)).unwrap_or(false);
+        if !host_ok {
+            return (
+                StatusCode::FORBIDDEN,
+                "dns-rebinding: request host not permitted without api token (must be localhost / loopback / listen IP)",
+            )
+                .into_response();
+        }
+    }
+
     // 1. 鉴权 (若配了 token), 记录认证来源供 CSRF 判定。
     let auth_src: Option<TokenSrc> = match app.gui_token.as_ref() {
         None => None, // 未启用鉴权 (无 token = 无暴力面, 不限流)
@@ -315,6 +379,15 @@ pub async fn start_server(
         bpf: { let mut v = VecDeque::new(); v.resize(120, 0); v },
     }));
 
+    let addr: SocketAddr = match listen_addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("GUI listen addr '{}' 非法 ({}); GUI 未启动", listen_addr, e);
+            return;
+        }
+    };
+    let gui_listen_ip = Some(addr.ip());
+
     let gui_token = token.filter(|t| !t.is_empty()).map(Arc::new);
     let auth_enabled = gui_token.is_some();
     let app_state = AppState {
@@ -326,6 +399,7 @@ pub async fn start_server(
         gui_token,
         rate_limiter: Arc::new(std::sync::Mutex::new(ratelimit::RateLimiter::new())),
         is_server,
+        gui_listen_ip,
     };
 
     // 2. 启动 1Hz 采样后台 task
@@ -341,14 +415,6 @@ pub async fn start_server(
         .route_layer(middleware::from_fn_with_state(app_state.clone(), auth_mw))
         .layer(build_cors(&cors_origins))
         .with_state(app_state);
-
-    let addr: SocketAddr = match listen_addr.parse() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("GUI listen addr '{}' 非法 ({}); GUI 未启动", listen_addr, e);
-            return;
-        }
-    };
 
     if auth_enabled {
         tracing::info!("GUI Server listening on http://{} (API 鉴权已启用; 浏览器用 /?token=XXX 访问)", addr);
@@ -474,5 +540,33 @@ mod tests {
         h.insert(header::HOST, "host:80".parse().unwrap());
         h.insert(header::REFERER, "http://host:80/page".parse().unwrap());
         assert!(same_origin(&h));
+    }
+
+    #[test]
+    fn dns_rebinding_host_validation() {
+        let listen_ip: Option<std::net::IpAddr> = Some("192.168.1.10".parse().unwrap());
+
+        // 合法本机访问
+        assert!(is_valid_host("localhost", None));
+        assert!(is_valid_host("localhost:9090", None));
+        assert!(is_valid_host("127.0.0.1", None));
+        assert!(is_valid_host("127.0.0.1:9090", None));
+        assert!(is_valid_host("127.0.0.2:80", None));
+        assert!(is_valid_host("[::1]", None));
+        assert!(is_valid_host("[::1]:9090", None));
+        assert!(is_valid_host("::1", None));
+
+        // 匹配 listen_ip
+        assert!(is_valid_host("192.168.1.10", listen_ip));
+        assert!(is_valid_host("192.168.1.10:9090", listen_ip));
+        assert!(!is_valid_host("192.168.1.11:9090", listen_ip));
+
+        // 恶意 Host (DNS rebinding) 必须拦截
+        assert!(!is_valid_host("evil.com", None));
+        assert!(!is_valid_host("evil.com:9090", None));
+        assert!(!is_valid_host("attacker.localhost", None));
+        assert!(!is_valid_host("localhost.attacker.com:9090", None));
+        assert!(!is_valid_host("1.2.3.4:9090", None));
+        assert!(!is_valid_host("", None));
     }
 }

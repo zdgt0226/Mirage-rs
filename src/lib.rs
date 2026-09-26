@@ -257,6 +257,15 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     
     crate::startup::spawn_ebpf_monitor_tasks(&ebpf_engine, &watcher.state);
 
+    if let Some(xdp) = &xdp_engine {
+        let xdp_clone = xdp.clone();
+        watcher.set_reload_hook(move |_st| {
+            if let Err(e) = xdp_clone.clear_dns_cache() {
+                warn!("配置热重载: 清空 XDP DNS 缓存 map 失败: {}", e);
+            }
+        });
+    }
+
     let mut inbounds = Vec::new();
     let mut fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>> = None;
     let mut gui_enabled = false;

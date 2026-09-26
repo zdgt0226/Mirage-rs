@@ -364,11 +364,41 @@ fn mirage_outbound_json(tag: &str, node: &mirage_rs::node_uri::NodeUri) -> serde
 }
 
 /// 原子写回配置: 先备份 `<path>.bak`, 再写 `<path>.tmp` + rename (中途失败不留半截)。
+/// 新文件与备份文件**恒为 0600**: 配置含口令/私钥/token, 没有组或他人可读的正当理由; 固定收紧
+/// (而非沿用原权限) 让早期安装留下的 0644 配置在下一次回写时自愈。
 fn atomic_write_config(path: &str, original: &str, rendered: &str) -> Result<(), String> {
     let bak = format!("{path}.bak");
-    std::fs::write(&bak, original).map_err(|e| format!("备份到 {bak} 失败: {e} (未改动原文件)"))?;
     let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, rendered).map_err(|e| format!("写临时文件 {tmp} 失败: {e} (未改动原文件)"))?;
+
+    #[cfg(unix)]
+    let mode: u32 = 0o600;
+
+    let write_file = |fpath: &str, content: &str| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(mode)
+                .open(fpath)?;
+            f.write_all(content.as_bytes())?;
+            f.flush()?;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(mode));
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(fpath, content)
+        }
+    };
+
+    write_file(&bak, original).map_err(|e| format!("备份到 {bak} 失败: {e} (未改动原文件)"))?;
+    write_file(&tmp, rendered).map_err(|e| format!("写临时文件 {tmp} 失败: {e} (未改动原文件)"))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("替换 {path} 失败: {e}")

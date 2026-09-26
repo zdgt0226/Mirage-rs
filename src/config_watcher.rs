@@ -58,10 +58,18 @@ impl ConfigWatcher {
         Ok(watcher)
     }
 
-    /// 注入 reload 回调 (幂等覆盖)。lib.rs 在 tc_divert 引擎建好后调用, 使热重载
-    /// 后 direct_cidr map 随新规则刷新。
+    /// 注入 reload 回调 (链式追加)。lib.rs 在 tc_divert/xdp 引擎建好后调用, 使热重载
+    /// 后 direct_cidr map 随新规则刷新、XDP DNS 缓存 map 同步清空。
     pub fn set_reload_hook(&self, hook: impl Fn(&CoreState) + Send + Sync + 'static) {
-        *self.reload_hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+        let mut guard = self.reload_hook.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prev) = guard.take() {
+            *guard = Some(Box::new(move |st| {
+                prev(st);
+                hook(st);
+            }));
+        } else {
+            *guard = Some(Box::new(hook));
+        }
     }
 
     /// 从 config 文件里抽出 UpdaterState.
