@@ -17,7 +17,7 @@
         "enabled": true,
         "listen": "0.0.0.0:9090",
         "token": "改成一段长随机串"   // ⚠️ listen=0.0.0.0 暴露公网**必设**, 否则任何人可读日志/改路由
-        // "stats_persist_path": "/var/lib/mirage-rs/stats.json"  // 流量统计重启不清零
+        // "stats_persist_path": "/var/lib/mirage-rs/stats_server.json"  // 统计持久化 (出站/域名/设备/用户/全局流量/屏蔽名单, 0600权限, 重启不清零)
     },
 
     // ── 入站 (服务端专属 mirage_server) ─────────────────────────────────

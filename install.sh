@@ -1494,7 +1494,8 @@ EOM
     ],
     "gui": {
         "enabled": ${server_gui_enabled},
-        "listen": "${server_gui_listen}"${server_gui_token_line}
+        "listen": "${server_gui_listen}"${server_gui_token_line},
+        "stats_persist_path": "/var/lib/mirage-rs/stats_server.json"
     },
     "routing": {
         "default_outbound": "direct",
@@ -1914,7 +1915,8 @@ EOM
     ],
     "gui": {
         "enabled": ${client_gui_enabled},
-        "listen": "${client_gui_listen}"${client_gui_token_line}
+        "listen": "${client_gui_listen}"${client_gui_token_line},
+        "stats_persist_path": "/var/lib/mirage-rs/stats_client.json"
     },
     ${routing_json},
     ${advanced_dns_line}

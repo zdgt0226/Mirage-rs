@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### feat(monitor): 统计与状态持久化补全 —— 多用户 / 全局总量 / 屏蔽名单 / 0600权限 / 落盘串行化
+
+补全 `gui.stats_persist_path` 持久化范围, 重启后完整保留 WebUI 排行、用量及访问控制规则:
+- **多用户统计 (USER_STATS)**: 纳入持久化, 记录每个用户的累计连接数及上下行流量 (conns/up/down); `active` 为瞬态, 加载时安全归零。
+- **全局总量 (GLOBAL_UP / GLOBAL_DOWN)**: 纳入持久化并在启动加载时恢复, 避免网关或服务端重启后吞吐计数归零。
+- **屏蔽名单 (blocklist)**: 服务端源 IP 屏蔽名单 (`BLOCKED`) 纳入同一持久化文件 (`blocklist` 字段); 屏蔽与解封操作 (`block`/`unblock`/API `/api/clients/block`) 触发立即原子落盘, 不依赖 60s 周期刷新, 重启不失效。
+- **向后兼容**: 新增字段一律 `#[serde(default)]`, 旧版仅包含 3 张表 (outbound/domain/device) 的统计文件可平滑加载, 新字段自动取默认值。
+- **文件权限 0600**: 统计包含域名访问排行等隐私数据, 临时文件与目标文件均严格以 0600 权限创建 (Unix 使用 `mode(0o600)` 与 `set_permissions`), 与配置原子写风格一致。
+- **落盘串行化**: 引入全局 `STATS_FLUSH_LOCK`, 串行化周期落盘、关服落盘与关键事件即时落盘, 避免并发写入同一个 `.tmp` 导致文件损坏。
+- **默认开启**: `install.sh` 生成 full 模式 `config_server.json` 与 `config_client.json` 时默认配置 `stats_persist_path` (服务端 `/var/lib/mirage-rs/stats_server.json`, 客户端 `stats_client.json` —— 按角色分文件, 同机装两种角色时统计与屏蔽名单互不覆盖); 同步更新配置模板注释。
+
 ### feat(crypto)!: 协议新鲜性加固 —— **BREAKING: v0.15 协议断代, 不兼容旧版本**
 
 修 2026-09-26 审计的两条协议级 P1 (设计与论证: `docs/protocol-freshness-design.md`, 威胁模型新增 T6)。

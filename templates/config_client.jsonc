@@ -24,7 +24,7 @@
         "enabled": true,
         "listen": "127.0.0.1:9090"  // 客户端建议只监听本地
         // "token": "长随机串",     // listen 改 0.0.0.0 暴露公网时**必设**, 否则任何人可读日志/改路由
-        // "stats_persist_path": "/var/lib/mirage-rs/stats.json",  // 流量排行持久化, 重启不清零
+        // "stats_persist_path": "/var/lib/mirage-rs/stats_client.json",  // 统计持久化 (出站/域名/设备/用户/全局流量/屏蔽名单, 0600权限, 重启不清零)
         // "cors_origins": ["https://ui.example.com"]  // 独立前端跨源对接; 默认空 = 仅同源
     },
 

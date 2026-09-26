@@ -33,6 +33,7 @@ pub async fn post_block(Json(req): Json<BlockReq>) -> axum::response::Response {
     use axum::response::IntoResponse;
     match req.ip.parse::<std::net::IpAddr>() {
         Ok(ip) => {
+            // block/unblock 内部会在配置了 stats_persist_path 时立即触发落盘, 无需等待 60s 周期
             if req.blocked {
                 crate::blocklist::block(ip);
             } else {

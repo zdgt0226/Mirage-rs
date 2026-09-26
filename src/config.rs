@@ -39,9 +39,9 @@ pub struct GuiConfig {
     /// 日志/配置、改路由规则。浏览器访问 http://host:9090/?token=XXX 一次即种 cookie。
     #[serde(default)]
     pub token: Option<String>,
-    /// 可选: 统计 (域名/设备/出站 聚合流量) 持久化文件路径。设了则启动加载 + 周期/退出落盘,
-    /// 网关重启后 WebUI 排行/总量不清零。不设 = 纯内存 (重启清零, 向后兼容)。
-    /// install.sh 网关模式可默认填 /var/lib/mirage-rs/stats.json。
+    /// 可选: 统计 (出站/域名/设备/用户/全局总量/屏蔽名单) 持久化文件路径。设了则启动加载 + 周期/退出落盘,
+    /// 屏蔽/解封立即落盘 (0600 权限), 重启后 WebUI 排行/总量/规则不清零。不设 = 纯内存 (重启清零, 向后兼容)。
+    /// install.sh 默认按角色填 /var/lib/mirage-rs/stats_{server,client}.json (同机装两种角色时互不覆盖)。
     #[serde(default)]
     pub stats_persist_path: Option<String>,
     /// 可选: 允许跨源 (CORS) 调用 API 的前端 origin 列表 (如 `["https://ui.example.com"]`)。
