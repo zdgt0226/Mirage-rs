@@ -368,6 +368,7 @@ pub struct WarmPool {
     metrics: Arc<PoolMetrics>,                // 反馈式弹性算法的运行时指标
     cfg: Arc<PoolConfig>,                     // 保留 config (transport/password/quic_sni 等, 供 Model X)
     shutdown: Arc<AtomicBool>,                // 停机标志位 (Drop / 关闭时优雅停止后台协程)
+    net_shutdown_notify: Arc<Notify>,         // 专用网络变更 watcher 停机通知 (不与 notify 混用)
     // Model X: transport=quic 时的共享 QUIC mux。connect() 直接在其上开精简流 (绕过 fake-TLS Tunnel)。
     #[cfg(feature = "quic")]
     quic_mux: Option<Arc<crate::proxy::quic::QuicMux>>,
@@ -388,6 +389,7 @@ impl WarmPool {
         let stats = Arc::new(RwLock::new(PoolStats::new()));
         let metrics = Arc::new(PoolMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
+        let net_shutdown_notify = Arc::new(Notify::new());
 
         // mux 架构: transport=quic 时建一个共享 QUIC mux (一个连接开多流)。TCP 路径无。
         #[cfg(feature = "quic")]
@@ -405,6 +407,7 @@ impl WarmPool {
             metrics: metrics.clone(),
             cfg: cfg.clone(),
             shutdown: shutdown.clone(),
+            net_shutdown_notify: net_shutdown_notify.clone(),
             #[cfg(feature = "quic")]
             quic_mux: quic_mux.clone(),
         };
@@ -418,18 +421,30 @@ impl WarmPool {
             let flush_q = queue.clone();
             let mut net_rx = crate::net_monitor::subscribe();
             let shutdown_net = shutdown.clone();
+            let net_exit = net_shutdown_notify.clone();
             tokio::spawn(async move {
                 // changed() 只对订阅后的未来变更就绪, 启动瞬间不会误 flush。
-                while net_rx.changed().await.is_ok() {
+                // 监听 net_exit: WarmPool drop 时退出, 避免热重载每个 Mirage 出站泄漏任务直到下次网络变更。
+                loop {
                     if shutdown_net.load(Ordering::Relaxed) {
                         break;
                     }
-                    let mut q = flush_q.lock().await;
-                    let n = q.len();
-                    q.clear();
-                    drop(q);
-                    if n > 0 {
-                        info!("WarmPool: 检测到网络变更, 清空 {} 条旧隧道, builder 将用新路径重建", n);
+                    tokio::select! {
+                        _ = net_exit.notified() => {
+                            break;
+                        }
+                        res = net_rx.changed() => {
+                            if res.is_err() || shutdown_net.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let mut q = flush_q.lock().await;
+                            let n = q.len();
+                            q.clear();
+                            drop(q);
+                            if n > 0 {
+                                info!("WarmPool: 检测到网络变更, 清空 {} 条旧隧道, builder 将用新路径重建", n);
+                            }
+                        }
                     }
                 }
             });
@@ -961,6 +976,9 @@ impl Drop for WarmPool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
+        // notify_one 而非 notify_waiters: 无等待者时存一个 permit —— watcher 若尚未首次 poll 或正处在
+        // 网络变更分支体内, 下一次 notified() 仍会立即完成, 不会漏唤醒而泄漏任务。
+        self.net_shutdown_notify.notify_one();
         if let Ok(mut q) = self.queue.try_lock() {
             q.clear();
         }

@@ -246,6 +246,35 @@ mod sys {
             lru.insert(hash, ip_u32, 0)?;
             Ok(())
         }
+
+        /**
+         * [从 XDP 层删除 Fake-IP 缓存条目]
+         * 当 fake-IP 槽位复用淘汰旧域名时，同步从 mirage_dns_cache 删除，
+         * 避免 XDP 层继续用已被新域名占用的 IP 回复旧域名导致误路由。
+         */
+        pub fn remove_dns_cache(&self, domain: &str) -> Result<()> {
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
+            let map = bpf.map_mut("mirage_dns_cache").unwrap();
+            let mut lru = aya::maps::HashMap::<_, u64, u32>::try_from(map)?;
+            let hash = super::hash_domain(domain);
+            let _ = lru.remove(&hash);
+            Ok(())
+        }
+
+        /**
+         * [清空 XDP 层的 Fake-IP 缓存]
+         * 配置热重载或 fake-IP 映射重建时调用，使 XDP 缓存与用户态映射同步清空。
+         */
+        pub fn clear_dns_cache(&self) -> Result<()> {
+            let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
+            let map = bpf.map_mut("mirage_dns_cache").unwrap();
+            let mut lru = aya::maps::HashMap::<_, u64, u32>::try_from(map)?;
+            let keys: Vec<u64> = lru.keys().filter_map(|k| k.ok()).collect();
+            for k in keys {
+                let _ = lru.remove(&k);
+            }
+            Ok(())
+        }
     }
 
     pub fn get_socket_cookie(fd: std::os::unix::io::RawFd) -> Result<u64> {
@@ -306,6 +335,12 @@ mod sys {
             Err(anyhow::anyhow!("eBPF disabled"))
         }
         pub fn update_dns_cache(&self, _domain: &str, _fake_ip: std::net::Ipv4Addr) -> Result<()> {
+            Ok(())
+        }
+        pub fn remove_dns_cache(&self, _domain: &str) -> Result<()> {
+            Ok(())
+        }
+        pub fn clear_dns_cache(&self) -> Result<()> {
             Ok(())
         }
         pub fn attach(&self, _iface: &str) -> Result<()> {

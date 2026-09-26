@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### fix(security): 审计阶段 1 —— 配置权限 / API rebinding / XDP 缓存陈旧 / 资源上限 (纯服务端, 向后兼容)
+
+2026-09-26 多模型本地审计 (4 个模型分切面 + 逐条回源核实) 中**只改服务端、完全兼容**的一批。
+- **配置文件权限 (P2)**: full 模式 `config_server.json` / `config_client.json` 安装后是 0644 (仅 lite 配置
+  chmod 600), 本机任意用户可读全员口令/WG 私钥/gui token; API 改配置 (`/api/users|rules|profiles`) 的
+  tmp+rename 又会把手工改好的 0600 打回 0644。修: install.sh 两处补 `chmod 600`; API 与 CLI
+  (`import`/`subscribe` 回写及 `.bak`) 的原子写统一**恒以 0600 创建** —— 不沿用原权限, 让早期安装遗留的
+  0644 在下一次写入时自愈。
+- **API DNS rebinding (P2)**: 默认 `127.0.0.1:9090` 不设 token 时唯一防线是 Origin==Host, rebinding 后两者
+  同为 `evil.tld:9090` → 恶意网页可读日志/配置、改路由/用户 (原注释称能挡, 不成立)。修: **loopback 监听 +
+  无 token** 时校验 Host 必须是 localhost / 回环 / 监听 IP, 否则 403 (含 GET)。非 loopback 监听不校验
+  (本就对 LAN 敞开且启动已告警, 强校验只会误伤用 LAN IP/主机名访问的管理员)。配了 token 行为不变。
+- **XDP DNS 缓存陈旧 → 误路由 (P2)**: fake-IP 地址段用完轮转复用时, 用户态删了旧域名映射, 但 XDP
+  `mirage_dns_cache` 里 `hash(旧域名)→IP` 仍在, XDP 继续用已归新域名的 IP 回答旧域名 → 流量被透明代理
+  送到错误主机。修: `lookup_or_assign_with_eviction` 返回被淘汰域名, DNS 两处应答路径同步
+  `remove_dns_cache`; 配置热重载时 `clear_dns_cache` (XDP 回落用户态, 下次查询重新填)。
+  `ConfigWatcher::set_reload_hook` 改为链式追加 (原为覆盖, 第二个钩子会顶掉 tc_divert 的)。仅开
+  `advanced_dns.xdp_interface` 时相关。
+- **域名统计无上限 (P2)**: `DOMAIN_STATS_CAP` 淘汰检查写在 `ConnGuard::drop` 里, 而 `register()` 早已插入 →
+  死代码, 长跑网关 (海量随机子域) 内存持续爬升。修: 移到 `register()` 插入前 (同 DEVICE_STATS 写法)。
+- **连接池 watcher 任务泄漏 (P3)**: `WarmPool` 的网络变更监听任务只在网络变更时查 shutdown, drop 不唤醒它 →
+  每次热重载每个 Mirage 出站泄漏一个任务。修: 专用关闭 Notify + select; drop 用 `notify_one` (存 permit,
+  避免任务未首次 poll 或正处理变更时漏唤醒)。
+- **限速 live 表无上限 (P3)**: `RateLimiter.live` 加 4096 上限, 满时优先淘汰无活跃连接持有的桶 (不拆分在用
+  IP 的聚合限速)。
+- **tc_divert MSS clamp 回绕 (P3)**: `__u8 pos` 累加畸形 option 长度可回绕 → 改 `__u32` 并越界即停。
+
+测试 +6: API 原子写收紧 0600、Host 白名单 (合法/rebinding 用例)、fake-IP 淘汰返回旧域名、域名统计封顶、
+限速表封顶、CLI `import` 回写配置与 `.bak` 均为 0600。`cargo test` 全过 (lib 406); clippy (默认 / quic)
+`-D warnings` 干净; `cargo build --features ebpf` 通过。协议级两条 P1 (非 PFS 缺服务端新鲜性 / agility
+协商 ChaCha 时 nonce 复用) 需两端改, 留阶段 2。
+
+
 ### test(quic): 补 Salamander 混淆 GRO 去混淆测试 + CI 纳入 `--features quic`
 
 测试补漏审计: 401 lib 测覆盖已强, 剩余缺口多为 IO/网络/eBPF (难单测)。但 **quic_obfs 的 GRO 逐段

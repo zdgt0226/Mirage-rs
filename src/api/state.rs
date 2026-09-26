@@ -32,4 +32,6 @@ pub struct AppState {
     /// 运行模式: true=服务端 (mirage server), false=客户端/网关。WebUI 按此分视图 + 决定
     /// 服务端专属功能 (域名排行/连接历史/客户端管理) vs 客户端专属 (LAN 设备规则)。
     pub is_server: bool,
+    /// GUI 监听 IP, 用于未配置 gui_token 时防御 DNS rebinding (Host header 白名单)。
+    pub gui_listen_ip: Option<std::net::IpAddr>,
 }

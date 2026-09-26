@@ -1505,6 +1505,7 @@ EOM
     }
 }
 EOF
+    chmod 600 "${ETC_DIR}/config_server.json"
     
     ok "服务端配置文件已保存至: ${ETC_DIR}/config_server.json"
     setup_service "server"
@@ -1938,6 +1939,7 @@ EOM
     }
 }
 EOF
+    chmod 600 "${ETC_DIR}/config_client.json"
 
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
     [[ -z "$cht_line" ]] && info "想让指纹贴合本机真浏览器? 跑 mirage tls-capture 抓个模板, 填进 config 的 client_hello_template。"

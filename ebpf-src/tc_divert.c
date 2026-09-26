@@ -53,8 +53,8 @@ static __always_inline void clamp_tcp_mss(struct __sk_buff *skb, struct tcphdr *
     __u32 opt_base = ETH_HLEN + sizeof(struct iphdr) + 20; // 54 (ihl==5)
     __u32 csum_off = ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, check);
     __u8 *opt = (__u8 *)th + 20;
-    __u8 opts_len = doff - 20;
-    __u8 pos = 0;
+    __u32 opts_len = doff - 20;
+    __u32 pos = 0;
 
 #pragma unroll
     for (int i = 0; i < 10; i++) {
@@ -72,6 +72,8 @@ static __always_inline void clamp_tcp_mss(struct __sk_buff *skb, struct tcphdr *
         }
         __u8 olen = opt[1];
         if (olen < 2)
+            break;
+        if (pos + olen > opts_len)
             break;
         if (kind == 2 && olen == 4) {
             if ((void *)(opt + 4) > data_end)

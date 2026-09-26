@@ -204,6 +204,11 @@ impl FakeIpMapper {
     }
 
     pub fn lookup_or_assign(&self, domain: &str) -> Ipv4Addr {
+        self.lookup_or_assign_with_eviction(domain).0
+    }
+
+    /// 查询或分配 fake-IP, 若触发槽位轮转复用, 同时返回被淘汰的旧域名 (供上层清理 XDP 缓存等)。
+    pub fn lookup_or_assign_with_eviction(&self, domain: &str) -> (Ipv4Addr, Option<String>) {
         let domain = domain.to_lowercase();
 
         // 1. 快路径: 读锁命中 (常见).
@@ -213,7 +218,7 @@ impl FakeIpMapper {
             .unwrap_or_else(|e| e.into_inner())
             .get(&domain)
         {
-            return ip;
+            return (ip, None);
         }
 
         // 2. 慢路径: 分配新 IP. 持 domain_to_ip 写锁全程, 双检防两个并发同域名各占
@@ -224,7 +229,7 @@ impl FakeIpMapper {
         //    不可能仍活跃).
         let mut d2i = self.domain_to_ip.write().unwrap_or_else(|e| e.into_inner());
         if let Some(&ip) = d2i.get(&domain) {
-            return ip; // 双检: 慢路径拿锁期间别的线程已分配
+            return (ip, None); // 双检: 慢路径拿锁期间别的线程已分配
         }
 
         let ip_u32 = {
@@ -240,19 +245,21 @@ impl FakeIpMapper {
         };
         let ip = Ipv4Addr::from(ip_u32);
 
+        let mut evicted = None;
         let mut i2d = self.ip_to_domain.write().unwrap_or_else(|e| e.into_inner());
         // 占用该 IP; 若之前被别的域名占着 (round-robin 复用), 删掉旧域名的正向映射.
         if let Some(old_domain) = i2d.insert(ip, domain.clone()) {
             if old_domain != domain {
                 d2i.remove(&old_domain);
                 tracing::debug!("[FAKEIP] {} 槽位复用 → 淘汰旧域名 [{}]", ip, old_domain);
+                evicted = Some(old_domain);
             }
         }
         tracing::debug!("[FAKEIP] assign [{}] → {} (已用 {}/~{})", domain, ip, d2i.len() + 1, !self.mask);
         d2i.insert(domain, ip);
         self.dirty.store(true, Ordering::Relaxed); // 新分配 → 待落盘
 
-        ip
+        (ip, evicted)
     }
 
     pub fn lookup_domain(&self, ip: &Ipv4Addr) -> Option<String> {
@@ -303,6 +310,20 @@ mod bounded_tests {
             Some("d99.example.com"),
             "最近域名正反映射一致"
         );
+    }
+
+    #[test]
+    fn eviction_returns_old_domain() {
+        // /29: 可用 5 个 IP (.2, .3, .4, .5, .6)
+        let m = FakeIpMapper::new("10.0.0.0/29").unwrap();
+        for i in 0..5 {
+            let (_, evicted) = m.lookup_or_assign_with_eviction(&format!("d{i}.com"));
+            assert_eq!(evicted, None, "前 5 个不应淘汰");
+        }
+        // 第 6 个触发复用 .2 (d0.com 的槽位)
+        let (_, evicted) = m.lookup_or_assign_with_eviction("d5.com");
+        assert_eq!(evicted.as_deref(), Some("d0.com"), "应淘汰 d0.com");
+        assert_eq!(m.lookup_domain(&"10.0.0.2".parse().unwrap()).as_deref(), Some("d5.com"), "槽位已归新域名");
     }
 
     #[test]

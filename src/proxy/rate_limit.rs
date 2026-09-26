@@ -84,12 +84,20 @@ pub struct DeviceBuckets {
     pub down: TokenBucket,
 }
 
+/// live 表最大容量 (源 IP 桶数上限, 与 monitor.rs 风格一致)。
+const RATE_LIMIT_CAP: usize = 4096;
+
+struct LiveBucketEntry {
+    buckets: Arc<DeviceBuckets>,
+    last: Instant,
+}
+
 /// 按源 IP 限速器。从 `device_profiles` 建 (CIDR 网段 → 限速 bytes/s), 运行时按源 IP 懒建共享桶。
 pub struct RateLimiter {
     /// (网段, bytes/s)。**首命中**生效 (对齐 device_profiles 首命中语义)。空 = 全局不限速。
     cidrs: Vec<(IpNet, u64)>,
     /// 源 IP → 共享桶 (懒建)。
-    live: Mutex<HashMap<IpAddr, Arc<DeviceBuckets>>>,
+    live: Mutex<HashMap<IpAddr, LiveBucketEntry>>,
 }
 
 impl RateLimiter {
@@ -132,13 +140,41 @@ impl RateLimiter {
         }
         let rate = self.resolve(ip)?;
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
-        Some(
-            live.entry(ip)
-                .or_insert_with(|| {
-                    Arc::new(DeviceBuckets { up: TokenBucket::new(rate), down: TokenBucket::new(rate) })
-                })
-                .clone(),
-        )
+        let now = Instant::now();
+
+        if let Some(entry) = live.get_mut(&ip) {
+            entry.last = now;
+            return Some(entry.buckets.clone());
+        }
+
+        if live.len() >= RATE_LIMIT_CAP {
+            // 满 + 新 IP: 优先淘汰无活跃连接 (strong_count <= 1) 中最久未活跃的一条;
+            // 若全部都在活跃连接中, 则淘汰最久未活跃的一条。
+            let evict_key = live
+                .iter()
+                .filter(|(_, e)| Arc::strong_count(&e.buckets) <= 1)
+                .min_by_key(|(_, e)| e.last)
+                .map(|(k, _)| *k)
+                .or_else(|| {
+                    live.iter().min_by_key(|(_, e)| e.last).map(|(k, _)| *k)
+                });
+            if let Some(k) = evict_key {
+                live.remove(&k);
+            }
+        }
+
+        let buckets = Arc::new(DeviceBuckets {
+            up: TokenBucket::new(rate),
+            down: TokenBucket::new(rate),
+        });
+        live.insert(
+            ip,
+            LiveBucketEntry {
+                buckets: buckets.clone(),
+                last: now,
+            },
+        );
+        Some(buckets)
     }
 }
 
@@ -217,5 +253,22 @@ mod tests {
             rate_limit_kbps: None,
         }];
         assert!(RateLimiter::from_device_profiles(&dps).is_empty());
+    }
+
+    #[test]
+    fn rate_limiter_live_capped() {
+        let dps = vec![crate::config::DeviceProfile {
+            source_ip_cidr: vec!["0.0.0.0/0".into()],
+            profile: "default".into(),
+            name: None,
+            rate_limit_kbps: Some(1000),
+        }];
+        let rl = RateLimiter::from_device_profiles(&dps);
+        for i in 0..(RATE_LIMIT_CAP + 50) as u32 {
+            let ip = std::net::Ipv4Addr::from(0x0a000000 + i);
+            assert!(rl.buckets_for(std::net::IpAddr::V4(ip)).is_some());
+        }
+        let live = rl.live.lock().unwrap();
+        assert_eq!(live.len(), RATE_LIMIT_CAP, "超出容量后 live 长度应严格封顶在 RATE_LIMIT_CAP");
     }
 }

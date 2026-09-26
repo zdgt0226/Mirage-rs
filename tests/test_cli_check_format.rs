@@ -209,3 +209,22 @@ fn import_bad_uri_exits_nonzero_without_touching_config() {
     assert_eq!(std::fs::read_to_string(&p).unwrap(), CLEAN, "URI 非法时绝不能改动配置");
     std::fs::remove_file(&p).ok();
 }
+
+/// 回写配置 (import) 后, 配置与 .bak 都必须是 0600 —— 含口令, 早期安装遗留的 0644 也要被收紧。
+#[cfg(unix)]
+#[test]
+fn import_writes_config_and_backup_as_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = write_tmp("imp_perm.json", CLEAN);
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = run_import(&p, URI, "perm-node\n");
+    assert!(out.status.success(), "stderr={}", String::from_utf8_lossy(&out.stderr));
+
+    let mode = |q: &str| std::fs::metadata(q).unwrap().permissions().mode() & 0o777;
+    let bak = format!("{}.bak", p.display());
+    assert_eq!(mode(p.to_str().unwrap()), 0o600, "回写后的配置应为 0600");
+    assert_eq!(mode(&bak), 0o600, "含口令的 .bak 也应为 0600");
+
+    std::fs::remove_file(&p).ok();
+    std::fs::remove_file(&bak).ok();
+}
