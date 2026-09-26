@@ -15,8 +15,8 @@ use ipnet::IpNet;
 /// 单向令牌桶 (字节)。`rate` = 限速 (bytes/s), `burst` = 桶容量 (突发上限)。
 pub struct TokenBucket {
     inner: Mutex<BucketState>,
-    rate: f64,
-    burst: f64,
+    pub rate: f64,
+    pub burst: f64,
 }
 
 struct BucketState {
@@ -25,7 +25,7 @@ struct BucketState {
 }
 
 impl TokenBucket {
-    fn new(rate_bytes_per_sec: u64) -> Self {
+    pub fn new(rate_bytes_per_sec: u64) -> Self {
         let rate = rate_bytes_per_sec.max(1) as f64;
         // burst = 0.5s 的量 (下限 64KB): 太小会让单个 64KB relay 块每次都要等、吞吐抖动; 太大突发穿透。
         let burst = (rate * 0.5).max(65536.0);
@@ -78,10 +78,51 @@ impl TokenBucket {
     }
 }
 
-/// 某源 IP 的上/下行桶对 (跨该 IP 全部连接共享)。
+/// 某源 IP 或用户的上/下行桶对 (跨该 IP 或该用户全部连接共享)。
 pub struct DeviceBuckets {
     pub up: TokenBucket,
     pub down: TokenBucket,
+}
+
+impl DeviceBuckets {
+    pub fn new(rate_bytes_per_sec: u64) -> Self {
+        Self {
+            up: TokenBucket::new(rate_bytes_per_sec),
+            down: TokenBucket::new(rate_bytes_per_sec),
+        }
+    }
+}
+
+/// 同时消费两对桶中的单侧 (如客户端 IP 桶 + 用户桶)。
+/// 只有当两个存在的桶都有足够令牌时才同时扣除 (取更严, 互不泄露)。
+/// 若其中任一桶令牌不足, 返回 false 且不扣除任何一桶的令牌。
+pub fn try_consume_two(b1: Option<&TokenBucket>, b2: Option<&TokenBucket>, n: usize) -> bool {
+    match (b1, b2) {
+        (None, None) => true,
+        (Some(b), None) | (None, Some(b)) => b.try_consume(n),
+        (Some(b1), Some(b2)) => {
+            let mut s1 = b1.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s2 = b2.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let now = Instant::now();
+
+            let elapsed1 = now.duration_since(s1.last).as_secs_f64();
+            s1.last = now;
+            s1.tokens = (s1.tokens + elapsed1 * b1.rate).min(b1.burst);
+
+            let elapsed2 = now.duration_since(s2.last).as_secs_f64();
+            s2.last = now;
+            s2.tokens = (s2.tokens + elapsed2 * b2.rate).min(b2.burst);
+
+            let need = n as f64;
+            if s1.tokens >= need && s2.tokens >= need {
+                s1.tokens -= need;
+                s2.tokens -= need;
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 /// live 表最大容量 (源 IP 桶数上限, 与 monitor.rs 风格一致)。

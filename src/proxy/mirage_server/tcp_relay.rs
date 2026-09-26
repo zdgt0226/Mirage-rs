@@ -37,16 +37,21 @@ pub(super) async fn handle_tcp_relay(
         None => "direct",
     };
     let inbound_label = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "client".into());
-    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None, client_ip.map(|ip| ip.to_string()), Some(user));
+    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None, client_ip.map(|ip| ip.to_string()), Some(user.clone()));
 
     // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
     if let Some(outlet) = upstream_cfg {
+        // 中转路径同样受限速/配额约束 (客户端 IP 桶 + 用户桶), 否则配了上游即可绕过。
+        let limits = UpstreamLimits {
+            ip: client_ip.and_then(crate::proxy::rate_limit::server_buckets_for),
+            user: crate::proxy::user_limits::get_user_limit(&user),
+        };
         match &*outlet {
             crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
-                relay_via_shadowsocks(target, initial_payload, reader, writer, ss).await;
+                relay_via_shadowsocks(target, initial_payload, reader, writer, ss, limits).await;
             }
             crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => {
-                relay_via_wireguard(target, initial_payload, reader, writer, wg).await;
+                relay_via_wireguard(target, initial_payload, reader, writer, wg, limits).await;
             }
         }
         return;
@@ -100,13 +105,26 @@ pub(super) async fn handle_tcp_relay(
     let up_bkt = dev_buckets.clone();
     let dn_bkt = dev_buckets;
 
+    // 用户级限速与配额 (mirage_server.users): 连接建立时查一次句柄 Arc, 跨该用户全部连接共享。
+    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+    let up_user = user_limit.clone();
+    let dn_user = user_limit;
+
     let up_conn = _conn.counter();
     let upload = async move {
         loop {
+            if up_user.as_ref().is_some_and(|u| u.is_exhausted()) {
+                break;
+            }
             match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
+                    // 限速叠加: 客户端 IP 桶与用户桶同时扣 (取更严)
                     if let Some(b) = &up_bkt {
                         b.up.consume(data.len()).await; // 客户端上行限速整形
+                    }
+                    // 用户上行限速 + 配额计数; 越过配额即断开
+                    if crate::proxy::user_limits::charge(up_user.as_deref(), data.len(), true).await {
+                        break;
                     }
                     if up_write.write_all(data).await.is_err() {
                         break;
@@ -133,6 +151,9 @@ pub(super) async fn handle_tcp_relay(
         // 把多帧 syscall 合成一个大 write. 打破"读一片写一片"串行的碎片.
         let mut buf = vec![0u8; 65536];
         loop {
+            if dn_user.as_ref().is_some_and(|u| u.is_exhausted()) {
+                break;
+            }
             match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
@@ -148,8 +169,13 @@ pub(super) async fn handle_tcp_relay(
                             Err(_) => break,
                         }
                     }
+                    // 限速叠加: 客户端 IP 桶与用户桶同时扣 (取更严)
                     if let Some(b) = &dn_bkt {
                         b.down.consume(total).await; // 客户端下行限速整形
+                    }
+                    // 用户下行限速 + 配额计数; 越过配额即断开
+                    if crate::proxy::user_limits::charge(dn_user.as_deref(), total, false).await {
+                        break;
                     }
                     if writer.send_data(&buf[..total]).await.is_err() {
                         break;
@@ -178,12 +204,34 @@ pub(super) async fn handle_tcp_relay(
 /// 结构与直连路径一致(共享 fd + 任一方退出即 `shutdown(SHUT_RDWR)` 唤醒另一方),
 /// 差别只在: 上游是 SS 加密流, 因此下行按**整块解密**读取, 用不上直连路径那个
 /// 基于 `try_read` 的贪婪收割(SS 已按 ≤16KB 分块, 半块数据没有意义)。
+/// 上游中转路径的限速/配额上下文 (客户端 IP 桶 + 用户桶, 两桶都扣)。
+#[derive(Clone)]
+struct UpstreamLimits {
+    ip: Option<Arc<crate::proxy::rate_limit::DeviceBuckets>>,
+    user: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+}
+
+impl UpstreamLimits {
+    /// 扣限速 + 计配额; 返回 true = 用户已超额, 调用方断开。
+    async fn charge(&self, n: usize, up: bool) -> bool {
+        if let Some(b) = &self.ip {
+            if up { b.up.consume(n).await } else { b.down.consume(n).await }
+        }
+        crate::proxy::user_limits::charge(self.user.as_deref(), n, up).await
+    }
+
+    fn exhausted(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.is_exhausted())
+    }
+}
+
 async fn relay_via_shadowsocks(
     target: String,
     initial_payload: Option<Vec<u8>>,
     mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
     mut writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     ss: &crate::proxy::shadowsocks::SsConfig,
+    limits: UpstreamLimits,
 ) {
     debug!("Mirage Server: 经 SS 上游 {} 转发到 {}", ss.addr(), target);
     let (mut up_read, mut up_write, up_fd) =
@@ -210,10 +258,17 @@ async fn relay_via_shadowsocks(
         }
     };
 
+    let up_lim = limits.clone();
     let upload = async move {
         loop {
+            if up_lim.exhausted() {
+                break;
+            }
             match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
+                    if up_lim.charge(data.len(), true).await {
+                        break; // 越过配额即断开
+                    }
                     if up_write.write_all(data).await.is_err() {
                         break;
                     }
@@ -226,9 +281,15 @@ async fn relay_via_shadowsocks(
 
     let download = async move {
         loop {
+            if limits.exhausted() {
+                break;
+            }
             match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read_chunk()).await {
                 Ok(Ok(chunk)) if chunk.is_empty() => break, // 上游 EOF
                 Ok(Ok(chunk)) => {
+                    if limits.charge(chunk.len(), false).await {
+                        break; // 越过配额即断开
+                    }
                     if writer.send_data(&chunk).await.is_err() {
                         break;
                     }
@@ -262,6 +323,7 @@ async fn relay_via_wireguard(
     mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
     mut writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     wg: &crate::proxy::upstream::WgUpstream,
+    limits: UpstreamLimits,
 ) {
     debug!("Mirage Server: 经 WireGuard 上游 {} 转发到 {}", wg.cfg.endpoint, target);
 
@@ -308,10 +370,17 @@ async fn relay_via_wireguard(
         }
     }
 
+    let up_lim = limits.clone();
     let upload = async move {
         loop {
+            if up_lim.exhausted() {
+                break;
+            }
             match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
+                    if up_lim.charge(data.len(), true).await {
+                        break; // 越过配额即断开
+                    }
                     if up_write.write_all(data).await.is_err() {
                         break;
                     }
@@ -326,6 +395,9 @@ async fn relay_via_wireguard(
     let download = async move {
         let mut buf = vec![0u8; 32 * 1024];
         loop {
+            if limits.exhausted() {
+                break;
+            }
             match tokio::time::timeout(
                 crate::proxy::relay_idle(),
                 up_read.read(&mut buf),
@@ -334,6 +406,9 @@ async fn relay_via_wireguard(
             {
                 Ok(Ok(0)) => break, // 上游 EOF
                 Ok(Ok(n)) => {
+                    if limits.charge(n, false).await {
+                        break; // 越过配额即断开
+                    }
                     if writer.send_data(&buf[..n]).await.is_err() {
                         break;
                     }

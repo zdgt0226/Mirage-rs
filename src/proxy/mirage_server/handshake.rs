@@ -73,6 +73,28 @@ fn unauth_reflect_rate_exceeded(ip: IpAddr) -> bool {
     e.1 > UNAUTH_RATE_MAX
 }
 
+/// 校验 token 是否匹配有效 (且未超额) 凭据。
+/// 超额用户按认证失败处理 (None), 走与 token 校验失败完全相同的伪装站转发路径。
+pub(crate) fn verify_creds_and_quota<F>(
+    creds: &[(String, String)],
+    token: &[u8; 32],
+    client_random: &[u8; 32],
+    auth_ts_tolerance_secs: u64,
+    is_exhausted: F,
+) -> Option<usize>
+where
+    F: Fn(&str) -> bool,
+{
+    let idx = creds.iter().position(|(_, pw)| {
+        crate::crypto::hello_auth::verify_session_token(pw, token, client_random, auth_ts_tolerance_secs)
+    })?;
+    let username = &creds[idx].0;
+    if is_exhausted(username) {
+        return None;
+    }
+    Some(idx)
+}
+
 /// 传输无关的服务端握手核心 (ClientHello 鉴权 + 模板回放 + tail 消费)。返回 `Some((stream,
 /// client_random, ecdh))` 表示鉴权通过、可进 dispatch; `None` = 已按 auth-fail 走 camouflage
 /// 或出错 (调用方直接结束)。TCP/QUIC 各自的 `handle_connection*` 包一层做 split + dispatch。
@@ -140,9 +162,13 @@ where
             let session_id = &body[39..39 + sid_len];
             let mut sid_array = [0u8; 32];
             sid_array.copy_from_slice(session_id);
-            matched_idx = creds
-                .iter()
-                .position(|(_, pw)| crate::crypto::hello_auth::verify_session_token(pw, &sid_array, &client_random, auth_ts_tolerance_secs));
+            matched_idx = verify_creds_and_quota(
+                creds,
+                &sid_array,
+                &client_random,
+                auth_ts_tolerance_secs,
+                crate::proxy::user_limits::is_user_exhausted,
+            );
         }
     }
     let authenticated = matched_idx.is_some();
@@ -326,5 +352,23 @@ mod tests {
         let a = rate_limit_key("2001:db8::1".parse().unwrap());
         let b = rate_limit_key("2001:db8::dead:beef".parse().unwrap());
         assert_eq!(a, b, "同 /64 应归一为同 key");
+    }
+
+    #[test]
+    fn test_verify_creds_and_quota_exhausted_treated_as_auth_failed() {
+        let creds = vec![
+            ("alice".to_string(), "pwd_alice".to_string()),
+            ("bob".to_string(), "pwd_bob".to_string()),
+        ];
+        let client_random = [42u8; 32];
+        let token = crate::crypto::hello_auth::make_session_token("pwd_alice", &client_random);
+
+        // 1. 未超额 -> 认证成功, 返回 Some(0)
+        let res = verify_creds_and_quota(&creds, &token, &client_random, 60, |_| false);
+        assert_eq!(res, Some(0));
+
+        // 2. 超额 -> 返回 None (当作认证失败)
+        let res_exh = verify_creds_and_quota(&creds, &token, &client_random, 60, |user| user == "alice");
+        assert_eq!(res_exh, None);
     }
 }

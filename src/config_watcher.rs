@@ -278,6 +278,16 @@ impl ConfigWatcher {
         if !rate_limiter.is_empty() {
             info!("限速: device_profiles 已配置带宽上限 (按源 IP TCP 整形)");
         }
+        // 服务端 IP 限速器随热重载更新
+        crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
+
+        // 多用户限速与配额热重载: 保留既有用量, 重新计算超额
+        for ib in &config.inbounds {
+            if let crate::config::InboundConfig::MirageServer { users, .. } = ib {
+                crate::proxy::user_limits::reload_user_limits(users);
+                break;
+            }
+        }
 
         Ok(CoreState {
             router: Arc::new(router),

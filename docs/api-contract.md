@@ -90,6 +90,23 @@
 > `issues` = 语义告警 (如规则引用不存在的出站), 成功也可能非空 (热重载会看到同样告警)。
 > rules/profiles 两端点共用 `config.json` + 同名 `.tmp`, 后端已用 `CONFIG_WRITE_LOCK` 串行化, 前端并发保存安全。
 
+### 4.5 用户管理 (多用户 / 限速 / 配额, 服务端)
+- **GET `/api/users`** → `{ users: [ { name, conns, up, down, active, in_config, rate_limit_kbps, quota_gb, quota_reset_day, period_used_bytes, period_start, exhausted } ] }`
+  - 绝不返回 password。
+  - `name`: 用户名 (`default` 为主口令用户)。
+  - `rate_limit_kbps`: 限速 (kbps), `null` 表示不限速。
+  - `quota_gb`: 月度配额 (GB, 上下行合计), `null` 表示不限制。
+  - `quota_reset_day`: 周期重置日 (1..=28, UTC), 默认 1。
+  - `period_used_bytes`: 当前配额周期已使用字节数 (实时累加)。
+  - `period_start`: 当前配额周期的起始 Unix 时间戳 (秒, UTC)。
+  - `exhausted`: 当前是否已超额。超额新握手伪装回落, 存量连接即刻断开。
+- **POST `/api/users`** `{ ops: [ UserOp... ], version?: u64 }` → 写响应 (成功 `{ status: "success", written: true, issues: [...] }`)
+  - `add`: `{ op: "add", name: "...", password: "...", rate_limit_kbps?: u64, quota_gb?: f64, quota_reset_day?: u8 }` — 新增用户。
+  - `remove`: `{ op: "remove", name: "..." }` — 删除用户 (禁止操作 `default`)。
+  - `change_password`: `{ op: "change_password", name: "...", password: "..." }` — 修改口令 (禁止操作 `default`)。
+  - `set_limits`: `{ op: "set_limits", name: "...", rate_limit_kbps?: u64|null, quota_gb?: f64|null, quota_reset_day?: u8|null }` — 修改/清空用户限速与月度配额 (禁止操作 `default`)。走现有配置原子写 + 热重载。
+  - `reset_quota`: `{ op: "reset_quota", name: "..." }` — 清零用户本周期用量及超额状态, 立即落盘并刷新, **不改动 config 文件** (禁止操作 `default`)。
+
 ---
 
 ## 5. 独立前端落地建议
@@ -111,4 +128,5 @@ GET  /api/clients           POST /api/clients/block
 GET  /api/proxies           POST /api/proxies/select
 GET  /api/rules             POST /api/rules?dry_run=
 GET  /api/profiles          POST /api/profiles?dry_run=
+GET  /api/users             POST /api/users
 ```

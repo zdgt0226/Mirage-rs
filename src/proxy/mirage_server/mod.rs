@@ -252,6 +252,11 @@ async fn handle_quic_stream_lean(
             return;
         }
     };
+    // 握手门控: 超额用户按认证失败处理
+    if crate::proxy::user_limits::is_user_exhausted(&user) {
+        tracing::warn!("Mirage QUIC(lean): user `{}` quota exhausted from {}", user, peer_ip);
+        return;
+    }
     // 2. target: [2B len][host:port]
     let mut lenb = [0u8; 2];
     if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut lenb)).await.map(|r| r.is_err()).unwrap_or(true) {
@@ -268,14 +273,75 @@ async fn handle_quic_stream_lean(
         Err(_) => return,
     };
     // 3. 直连出口
-    let mut up = match crate::proxy::resolver::connect_smart(&target).await {
+    let up = match crate::proxy::resolver::connect_smart(&target).await {
         Ok(s) => s,
         Err(e) => { tracing::warn!("Mirage QUIC(lean): 连 {} 失败: {}", target, e); return; }
     };
     let _conn = crate::monitor::register(
-        target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()), Some(user),
+        target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()), Some(user.clone()),
     );
-    // 4. 裸转发 (QUIC 加密, 无内层 AEAD)。
-    let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut up).await;
+    // 4. 转发 (限速 + 配额计数)
+    let (q_read, q_write) = tokio::io::split(crate::proxy::quic::QuicBiStream::new(send, recv));
+    let (up_read, up_write) = up.into_split();
+
+    let dev_buckets = crate::proxy::rate_limit::server_buckets_for(peer_ip);
+    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+
+    // 半关闭语义同原 copy_bidirectional: 一侧 EOF 只关对端写方向 (传 FIN), 另一方向继续传完;
+    // 只有出错或用户超额才发 stop 让两个方向都立刻退出。
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::join!(
+        quic_pump(q_read, up_write, dev_buckets.clone(), user_limit.clone(), true, stop_tx.clone(), stop_rx.clone()),
+        quic_pump(up_read, q_write, dev_buckets, user_limit, false, stop_tx, stop_rx),
+    );
+}
+
+/// QUIC lean 单向泵: 带客户端 IP 桶 + 用户桶限速与配额计数 (`up` = 客户端→目标)。
+/// - EOF: `shutdown` 对端写方向后返回, **不打断另一方向** (半关闭, 否则客户端先关写时目标的响应会被丢)。
+/// - 读写出错 / 用户超额: 发 stop, 另一方向随之退出。
+#[cfg(feature = "quic")]
+async fn quic_pump<R, W>(
+    mut r: R,
+    mut w: W,
+    ip: Option<std::sync::Arc<crate::proxy::rate_limit::DeviceBuckets>>,
+    user: Option<std::sync::Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    up: bool,
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 32768];
+    loop {
+        if user.as_ref().is_some_and(|u| u.is_exhausted()) {
+            let _ = stop_tx.send(true);
+            return;
+        }
+        let n = tokio::select! {
+            biased;
+            _ = stop_rx.changed() => return,
+            res = r.read(&mut buf) => match res {
+                Ok(n) => n,
+                Err(_) => {
+                    let _ = stop_tx.send(true);
+                    return;
+                }
+            },
+        };
+        if n == 0 {
+            let _ = w.shutdown().await; // EOF → 半关闭
+            return;
+        }
+        if let Some(b) = &ip {
+            if up { b.up.consume(n).await } else { b.down.consume(n).await }
+        }
+        if crate::proxy::user_limits::charge(user.as_deref(), n, up).await
+            || w.write_all(&buf[..n]).await.is_err()
+        {
+            let _ = stop_tx.send(true); // 超额或写失败 → 两个方向都断
+            return;
+        }
+    }
 }
