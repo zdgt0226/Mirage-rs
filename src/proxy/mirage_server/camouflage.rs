@@ -62,7 +62,11 @@ pub(super) async fn run_camouflage_forward<S>(
         }
     }
 
-    // 3. camouflage_host 不可达, 回落 HandshakeCache 合成模板
+    // 3. camouflage_host 不可达, 回落 HandshakeCache 合成模板。仅当探针发来的像 TLS 握手
+    //    (首字节 0x16) 才回 ServerHello; 明文探测 / 0 字节超时回 ServerHello 反成特征, 直接断开。
+    if client_hello.first() != Some(&0x16) {
+        return;
+    }
     let template =
         crate::crypto::handshake_cache::get_server_hello(camouflage_host, client_hello).await;
     let _ = tokio::time::timeout(
