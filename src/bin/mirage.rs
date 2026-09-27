@@ -446,11 +446,17 @@ fn atomic_write_config(path: &str, original: &str, rendered: &str) -> Result<(),
             f.write_all(content.as_bytes())?;
             f.flush()?;
             let _ = f.set_permissions(std::fs::Permissions::from_mode(mode));
+            f.sync_all()?;
             Ok(())
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(fpath, content)
+            use std::io::Write;
+            let mut f = std::fs::File::create(fpath)?;
+            f.write_all(content.as_bytes())?;
+            f.flush()?;
+            f.sync_all()?;
+            Ok(())
         }
     };
 
@@ -459,7 +465,21 @@ fn atomic_write_config(path: &str, original: &str, rendered: &str) -> Result<(),
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("替换 {path} 失败: {e}")
-    })
+    })?;
+    #[cfg(unix)]
+    {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let parent_path = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            if let Ok(dir) = std::fs::File::open(parent_path) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 生成一个不与 `taken` 冲突的 tag (base 撞名则 base-2 / base-3 …)。批量非交互用。

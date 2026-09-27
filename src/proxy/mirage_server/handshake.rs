@@ -37,7 +37,7 @@ const TLS_RECORD_MAX_BODY: usize = 16384; // 2^14, RFC 8446 §5.1
 
 /// UNAUTH 限流 key: IPv6 归一到 /64 前缀 (清零低 64 位), 防攻击者用一个 /64
 /// 段造 2^64 个"独立 IP" 逃逸限流. IPv4 原样返回 (单地址已是最细粒度).
-fn rate_limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+pub(crate) fn rate_limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
         std::net::IpAddr::V4(_) => ip,
         std::net::IpAddr::V6(v6) => {
@@ -238,6 +238,43 @@ async fn reflect_to_camouflage<S>(
     camouflage::run_camouflage_forward(stream, bytes, camouflage_host, cam_pool).await;
 }
 
+/// 结构化消费 Fake Client Finished Tail:
+/// 1. 6B 必须是 CCS `14 03 03 00 01 01`
+/// 2. 5B 记录头 (类型 0x17, 版本 0x03 0x03)
+/// 3. 体长只接受 53 (0x1301/0x1303) 或 69 (0x1302)
+///
+/// 读体丢弃，任何不符返回错误。
+pub(crate) async fn consume_fake_client_tail<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> anyhow::Result<usize> {
+    let mut ccs = [0u8; 6];
+    stream.read_exact(&mut ccs).await?;
+    if ccs != [0x14, 0x03, 0x03, 0x00, 0x01, 0x01] {
+        return Err(anyhow::anyhow!("invalid CCS in client tail: {:02x?}", ccs));
+    }
+
+    let mut rec_hdr = [0u8; 5];
+    stream.read_exact(&mut rec_hdr).await?;
+    if rec_hdr[0] != 0x17 || rec_hdr[1] != 0x03 || rec_hdr[2] != 0x03 {
+        return Err(anyhow::anyhow!(
+            "invalid record header in client tail: {:02x?}",
+            rec_hdr
+        ));
+    }
+
+    let body_len = u16::from_be_bytes([rec_hdr[3], rec_hdr[4]]) as usize;
+    if body_len != 53 && body_len != 69 {
+        return Err(anyhow::anyhow!(
+            "invalid finished body length in client tail: {}",
+            body_len
+        ));
+    }
+
+    let mut body = [0u8; 69];
+    stream.read_exact(&mut body[..body_len]).await?;
+    Ok(body_len)
+}
+
 /// 传输无关的服务端握手核心 (ClientHello 鉴权 + 模板回放 + tail 消费)。返回 `Some((stream,
 /// client_random, ecdh))` 表示鉴权通过、可进 dispatch; `None` = 已按 auth-fail 走 camouflage
 /// 或出错 (调用方直接结束)。TCP/QUIC 各自的 `handle_connection*` 包一层做 split + dispatch。
@@ -360,19 +397,22 @@ where
         return None;
     }
 
-    // 2.7 Consume Fake Client Tail (64 bytes: 6B CCS + 5B record header + 53B fake finished body)
-    let mut tail = [0u8; 64];
-    match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut tail)).await {
+    // 2.7 Consume Fake Client Tail (按结构读取: 6B CCS + 5B record header + 53B/69B body)
+    match tokio::time::timeout(Duration::from_secs(5), consume_fake_client_tail(&mut stream)).await {
         Ok(Err(e)) => {
-            tracing::error!("Mirage Server: read_exact tail failed: {}", e);
+            tracing::error!("Mirage Server: consume tail failed: {}", e);
             return None;
         }
         Err(_) => {
-            tracing::error!("Mirage Server: read_exact tail timed out!");
+            tracing::error!("Mirage Server: consume tail timed out!");
             return None;
         }
-        Ok(Ok(_)) => {
-            tracing::info!("Mirage Server: Successfully consumed 64 bytes tail");
+        Ok(Ok(body_len)) => {
+            tracing::info!(
+                "Mirage Server: Successfully consumed {} bytes tail (body {}B)",
+                6 + 5 + body_len,
+                body_len
+            );
         }
     }
 
@@ -700,8 +740,8 @@ mod tests {
         let n = client.read(&mut resp_buf).await.unwrap();
         assert!(n > 0, "服务端必须返回 ServerHello 模板");
 
-        // 客户端发送 64B fake client finished tail
-        let tail = [0xAAu8; 64];
+        // 客户端发送 fake client finished tail (0x1301 -> 53B body, 总长 64B)
+        let tail = crate::crypto::tls_raw::build_fake_client_tail(0x1301);
         client.write_all(&tail).await.unwrap();
 
         let handshake_res = server_task.await.unwrap();
@@ -710,5 +750,61 @@ mod tests {
         assert_eq!(idx, 0, "命中的凭据下标为 0");
         assert_eq!(c_rand, client_random);
         assert_ne!(s_rand, [0u8; 32], "server_random 必须有效写入");
+    }
+
+    #[tokio::test]
+    async fn test_consume_fake_client_tail_53_and_69_and_no_overread() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        // 1. 53B body tail + 额外载荷: 正确消费 64B, 额外字节不被多读
+        let tail_53 = crate::crypto::tls_raw::build_fake_client_tail(0x1301);
+        assert_eq!(tail_53.len(), 64);
+        let mut stream_data = tail_53;
+        stream_data.extend_from_slice(b"EXTRA_STREAM_PAYLOAD_53");
+        let mut cursor = Cursor::new(stream_data);
+
+        let consumed = consume_fake_client_tail(&mut cursor).await.unwrap();
+        assert_eq!(consumed, 53);
+        let mut remaining = Vec::new();
+        cursor.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, b"EXTRA_STREAM_PAYLOAD_53");
+
+        // 2. 69B body tail + 额外载荷: 正确消费 80B, 额外字节不被多读
+        let tail_69 = crate::crypto::tls_raw::build_fake_client_tail(0x1302);
+        assert_eq!(tail_69.len(), 80);
+        let mut stream_data_69 = tail_69;
+        stream_data_69.extend_from_slice(b"EXTRA_STREAM_PAYLOAD_69");
+        let mut cursor_69 = Cursor::new(stream_data_69);
+
+        let consumed_69 = consume_fake_client_tail(&mut cursor_69).await.unwrap();
+        assert_eq!(consumed_69, 69);
+        let mut remaining_69 = Vec::new();
+        cursor_69.read_to_end(&mut remaining_69).await.unwrap();
+        assert_eq!(remaining_69, b"EXTRA_STREAM_PAYLOAD_69");
+    }
+
+    #[tokio::test]
+    async fn test_consume_fake_client_tail_rejects_invalid() {
+        use std::io::Cursor;
+
+        // 非法 CCS
+        let mut bad_ccs = crate::crypto::tls_raw::build_fake_client_tail(0x1301);
+        bad_ccs[0] = 0x15;
+        let res = consume_fake_client_tail(&mut Cursor::new(bad_ccs)).await;
+        assert!(res.is_err(), "非法 CCS 应被拒绝");
+
+        // 非法 record type (非 0x17)
+        let mut bad_type = crate::crypto::tls_raw::build_fake_client_tail(0x1301);
+        bad_type[6] = 0x16;
+        let res = consume_fake_client_tail(&mut Cursor::new(bad_type)).await;
+        assert!(res.is_err(), "非法 record type 应被拒绝");
+
+        // 非法体长 (例如 64B 体长, 或 52B)
+        let mut bad_len = crate::crypto::tls_raw::build_fake_client_tail(0x1301);
+        bad_len[9] = 0x00;
+        bad_len[10] = 52; // 52B != 53 && != 69
+        let res = consume_fake_client_tail(&mut Cursor::new(bad_len)).await;
+        assert!(res.is_err(), "非法体长应被拒绝");
     }
 }

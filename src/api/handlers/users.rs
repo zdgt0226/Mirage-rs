@@ -125,7 +125,7 @@ pub async fn get_users(State(app_state): State<AppState>) -> Response {
 
 /// 一条用户操作。**op-based (增量) 而非整表替换** —— 因为 GET 不回显 password, 前端拿不到
 /// 既有用户的密码, 无法做整表替换 (会把未改用户的密码清空)。故只发变更: 增/改密/删/改限额/清配额。
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct UserOp {
     /// "upsert" (增或改密, 需 password) | "remove" (删, 忽略 password) | "set_limits" (设限速/配额) | "reset_quota" (清本周期用量)
     pub action: String,
@@ -140,7 +140,7 @@ pub struct UserOp {
     pub quota_reset_day: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct UpdateReq {
     /// 要应用的操作 (增量)。保留名 "default" (主密码) 不由此管理。
     pub ops: Vec<UserOp>,
@@ -291,23 +291,27 @@ pub async fn update_users(
         return err_resp(StatusCode::UNPROCESSABLE_ENTITY, "invalid_users", format!("凭据校验失败, 已拒绝 (未写入): {}", user_errs.join("; ")), user_errs);
     }
 
-    // 处理 reset_quota: 仅清零运行时用量与超额标志并立即落盘 (不改 config)
-    let has_reset_quota = req.ops.iter().any(|op| op.action == "reset_quota");
-    if has_reset_quota && !q.dry_run {
-        for op in &req.ops {
-            if op.action == "reset_quota" {
-                crate::proxy::user_limits::reset_user_quota(&op.name);
-            }
-        }
-        crate::monitor::flush_current();
-    }
-
     if q.dry_run {
         return Json(json!({"status": "success", "dry_run": true, "written": false, "issues": issues})).into_response();
     }
 
+    // 处理 reset_quota: 仅清零运行时用量与超额标志并立即落盘 (不改 config)。
+    // 挪至成功路径执行 (配置未改动直接返回 / atomic_write_config 成功), 写失败则不执行。
+    let apply_reset_quota = || {
+        let has_reset_quota = req.ops.iter().any(|op| op.action == "reset_quota");
+        if has_reset_quota {
+            for op in &req.ops {
+                if op.action == "reset_quota" {
+                    crate::proxy::user_limits::reset_user_quota(&op.name);
+                }
+            }
+            crate::monitor::flush_current();
+        }
+    };
+
     // 若配置未发生改动 (如仅 reset_quota 操作), 无需落盘配置
     if candidate == content {
+        apply_reset_quota();
         return Json(json!({
             "status": "success", "written": false, "issues": issues,
             "version": config_version(&candidate),
@@ -316,6 +320,7 @@ pub async fn update_users(
     }
 
     if super::atomic_write_config(&app_state.config_path, &candidate).await.is_ok() {
+        apply_reset_quota();
         return Json(json!({
             "status": "success", "written": true, "issues": issues,
             "version": config_version(&candidate),
@@ -498,5 +503,101 @@ mod tests {
         };
         let u = apply_ops(start.clone(), &[op_rq]).unwrap();
         assert_eq!(u, start, "reset_quota 不修改 config 中的 users 结构");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_reset_quota_only_executes_on_success() {
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let temp_dir = std::env::temp_dir().join(format!("mirage_test_users_{}", fastrand::u64(..)));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let cfg_file = temp_dir.join("config.json");
+        let initial_cfg = r#"{
+            "schema_version": 1,
+            "inbounds": [{
+                "type": "mirage_server",
+                "tag": "in",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "mainpw",
+                "users": [{"name": "alice", "password": "p", "quota_gb": 1.0}]
+            }],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "routing": {"default_outbound": "direct", "rules": []}
+        }"#;
+        tokio::fs::write(&cfg_file, initial_cfg).await.unwrap();
+
+        let user = crate::config::MirageUser {
+            name: "alice".to_string(),
+            password: "p".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(1.0),
+            quota_reset_day: Some(1),
+        };
+        // 跨 await 持 std 锁: 仅为与其它 init 注册表的测试串行 (current_thread 运行时, 无死锁风险)。
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::proxy::user_limits::init_user_limits(&[user]);
+        let h = crate::proxy::user_limits::get_user_limit("alice").unwrap();
+        h.record_bytes(1000);
+        assert_eq!(h.period_used.load(Ordering::SeqCst), 1000);
+
+        let cfg_parsed: crate::config::Config = serde_json::from_str(initial_cfg).unwrap();
+        let router = crate::router::RouterEngine::new(
+            Vec::new(),
+            "direct".into(),
+            ".",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let dummy_core = Arc::new(arc_swap::ArcSwap::from_pointee(crate::config_watcher::CoreState {
+            router: Arc::new(router),
+            outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg_parsed).unwrap()),
+            advanced_dns: None,
+            auto_classify: None,
+            rate_limiter: Arc::new(crate::proxy::rate_limit::RateLimiter::from_device_profiles(&[])),
+        }));
+
+        let app_state = AppState {
+            state: dummy_core,
+            ebpf_engine: None,
+            xdp_engine: None,
+            config_path: cfg_file.to_str().unwrap().to_string(),
+            history: Arc::new(std::sync::RwLock::new(crate::api::state::HistoryData {
+                up: std::collections::VecDeque::new(),
+                down: std::collections::VecDeque::new(),
+                bpf: std::collections::VecDeque::new(),
+            })),
+            gui_token: None,
+            rate_limiter: Arc::new(std::sync::Mutex::new(crate::api::ratelimit::RateLimiter::new())),
+            is_server: true,
+            gui_listen_ip: None,
+        };
+
+        // 1. dry_run = true 时, reset_quota 不执行
+        let q_dry = DryQuery { dry_run: true };
+        let req_reset = UpdateReq {
+            version: None,
+            ops: vec![UserOp {
+                action: "reset_quota".into(),
+                name: "alice".into(),
+                password: None,
+                rate_limit_kbps: None,
+                quota_gb: None,
+                quota_reset_day: None,
+            }],
+        };
+        let resp = update_users(State(app_state.clone()), Query(q_dry), Json(req_reset.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(h.period_used.load(Ordering::SeqCst), 1000, "dry_run 不应清零配额");
+
+        // 2. 真实成功执行 reset_quota (配置无改动直接返回路径): 配额清零
+        let q_real = DryQuery { dry_run: false };
+        let resp2 = update_users(State(app_state.clone()), Query(q_real), Json(req_reset)).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(h.period_used.load(Ordering::SeqCst), 0, "成功路径应清零配额");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }

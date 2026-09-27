@@ -79,14 +79,14 @@ async fn probe_inner(
             crate::crypto::tls_raw::build_client_hello_with_random(camouflage_host, &token, &client_random);
         write_half.write_all(&hello).await?;
         write_half.flush().await?;
-        let server_random = crate::proxy::pool::read_server_handshake(&mut read_half).await?;
-        if server_random == [0u8; 32] {
+        let handshake = crate::proxy::pool::read_server_handshake(&mut read_half).await?;
+        if handshake.server_random == [0u8; 32] {
             anyhow::bail!("未能捕获有效的 ServerHello.random (全 0)");
         }
-        let tail = crate::crypto::tls_raw::build_fake_client_tail();
+        let tail = crate::crypto::tls_raw::build_fake_client_tail(handshake.cipher_suite);
         write_half.write_all(&tail).await?;
         write_half.flush().await?;
-        Ok::<_, anyhow::Error>((client_random, server_random))
+        Ok::<_, anyhow::Error>((client_random, handshake.server_random))
     };
     // 握手阶段超时**下限 15s**: read_server_handshake 本身对真实慢链路容忍到 ~10-14s
     // (CCS 前), 若用外层 8s 总超时去卡它, 慢但可用的服务端会被误判 Fail (--require-live

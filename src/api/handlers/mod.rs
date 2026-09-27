@@ -49,7 +49,22 @@ pub(crate) async fn atomic_write_config(path: &str, content: &str) -> std::io::R
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(mode)).await;
         }
+        file.sync_all().await?;
+        drop(file);
         tokio::fs::rename(&tmp, path).await?;
+        #[cfg(unix)]
+        {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let parent_path = if parent.as_os_str().is_empty() {
+                    std::path::Path::new(".")
+                } else {
+                    parent
+                };
+                if let Ok(dir) = tokio::fs::File::open(parent_path).await {
+                    let _ = dir.sync_all().await;
+                }
+            }
+        }
         Ok(())
     }
     .await;

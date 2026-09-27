@@ -2,7 +2,7 @@
 //!
 //! 模块拓扑 (v0.4.2 重组):
 //! - `mod.rs` 本文件: start_server + accept 循环 + UNAUTH 限流 (本模块共享状态)
-//! - `handshake`: ClientHello 解析 + token 验证 + ServerHello 模拟 + 63B tail
+//! - `handshake`: ClientHello 解析 + token 验证 + ServerHello 模拟 + fake tail (64B/80B)
 //! - `camouflage`: auth 失败时伪装成正常 TLS 转发到真实站点 (反 GFW 探测)
 //! - `control`: crypto channel 建立 + TIME_SYNC 帧 + first_chunk 接收 + TCP/UDP 分发
 //! - `tcp_relay`: TCP 上游转发 (协议解密后)
@@ -117,6 +117,102 @@ impl Drop for IpSlotGuard {
                 if *c == 0 { map.remove(&self.0); }
             }
         }
+    }
+}
+
+/// QUIC 未认证握手限流器: 防未认证 QUIC 握手 CPU DoS 攻击。
+/// 在 accept 处按源 IP (IPv6 归一到 /64) 统计"握手中 + 未认证"并发数, 同时限制全局握手并发数。
+#[derive(Debug)]
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) struct QuicHandshakeLimiter {
+    max_per_ip: usize,
+    max_global: usize,
+    global_count: AtomicUsize,
+    ip_counts: Mutex<HashMap<IpAddr, usize>>,
+}
+
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+impl QuicHandshakeLimiter {
+    pub const DEFAULT_MAX_PER_IP: usize = 32;
+    pub const DEFAULT_MAX_GLOBAL: usize = 2048;
+
+    pub fn new(max_per_ip: usize, max_global: usize) -> Self {
+        Self {
+            max_per_ip,
+            max_global,
+            global_count: AtomicUsize::new(0),
+            ip_counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn default_limits() -> Self {
+        Self::new(Self::DEFAULT_MAX_PER_IP, Self::DEFAULT_MAX_GLOBAL)
+    }
+
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<QuicHandshakeGuard> {
+        let norm_ip = handshake::rate_limit_key(ip);
+        let current_global = self.global_count.fetch_add(1, Ordering::SeqCst);
+        if current_global >= self.max_global {
+            self.global_count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+
+        let mut map = match self.ip_counts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let count = map.entry(norm_ip).or_insert(0);
+        if *count >= self.max_per_ip {
+            self.global_count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        *count += 1;
+
+        Some(QuicHandshakeGuard {
+            limiter: self.clone(),
+            norm_ip,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn current_global(&self) -> usize {
+        self.global_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn current_for_ip(&self, ip: IpAddr) -> usize {
+        let norm_ip = handshake::rate_limit_key(ip);
+        let map = match self.ip_counts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(&norm_ip).copied().unwrap_or(0)
+    }
+
+    fn release(&self, norm_ip: IpAddr) {
+        self.global_count.fetch_sub(1, Ordering::SeqCst);
+        let mut map = match self.ip_counts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(c) = map.get_mut(&norm_ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&norm_ip);
+            }
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) struct QuicHandshakeGuard {
+    limiter: Arc<QuicHandshakeLimiter>,
+    norm_ip: IpAddr,
+}
+
+impl Drop for QuicHandshakeGuard {
+    fn drop(&mut self) {
+        self.limiter.release(self.norm_ip);
     }
 }
 
@@ -249,14 +345,34 @@ pub async fn start_quic_server(
 
     let _ = (camouflage_host, pfs); // Model X 精简: QUIC 路径不用 camouflage/fake-TLS/pfs
 
+    let limiter = Arc::new(QuicHandshakeLimiter::default_limits());
+
     while let Some(incoming) = endpoint.accept().await {
+        let peer_ip = incoming.remote_address().ip();
+        let guard = match limiter.try_acquire(peer_ip) {
+            Some(g) => g,
+            None => {
+                debug!(
+                    "Mirage QUIC Server: 握手并发超限 (每IP上限 {} 或全局上限 {}), 拒绝来自 {} 的连接",
+                    QuicHandshakeLimiter::DEFAULT_MAX_PER_IP,
+                    QuicHandshakeLimiter::DEFAULT_MAX_GLOBAL,
+                    peer_ip
+                );
+                incoming.refuse();
+                continue;
+            }
+        };
+
         let creds_c = creds.clone();
         let up = upstream.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
-                Err(_) => return, // QUIC 握手失败 (对端非法/超时)
+                Err(_) => return, // QUIC 握手失败 (对端非法/超时), guard 在此 drop 释放槽位
             };
+            // 握手完成, 释放握手阶段并发计数 (计数仅覆盖至底层 QUIC/TLS 连接握手完成, 防握手阶段 CPU DoS)
+            drop(guard);
+
             let peer = conn.remote_address();
             if crate::blocklist::is_blocked(&peer.ip()) {
                 debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {}", peer.ip());
@@ -422,5 +538,97 @@ async fn quic_pump<R, W>(
             let _ = stop_tx.send(true); // 超额或写失败 → 两个方向都断
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod quic_limiter_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    fn test_quic_limiter_per_ip_limit_and_release() {
+        let limiter = Arc::new(QuicHandshakeLimiter::new(2, 10));
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+
+        let g1 = limiter.try_acquire(ip);
+        assert!(g1.is_some());
+        assert_eq!(limiter.current_for_ip(ip), 1);
+        assert_eq!(limiter.current_global(), 1);
+
+        let g2 = limiter.try_acquire(ip);
+        assert!(g2.is_some());
+        assert_eq!(limiter.current_for_ip(ip), 2);
+        assert_eq!(limiter.current_global(), 2);
+
+        // 超出每 IP 上限 (2)
+        let g3 = limiter.try_acquire(ip);
+        assert!(g3.is_none());
+        assert_eq!(limiter.current_for_ip(ip), 2);
+        assert_eq!(limiter.current_global(), 2);
+
+        // drop g1 释放 1 个槽位
+        drop(g1);
+        assert_eq!(limiter.current_for_ip(ip), 1);
+        assert_eq!(limiter.current_global(), 1);
+
+        // 重新获取成功
+        let g4 = limiter.try_acquire(ip);
+        assert!(g4.is_some());
+        assert_eq!(limiter.current_for_ip(ip), 2);
+        assert_eq!(limiter.current_global(), 2);
+
+        drop(g2);
+        drop(g4);
+        assert_eq!(limiter.current_for_ip(ip), 0);
+        assert_eq!(limiter.current_global(), 0);
+    }
+
+    #[test]
+    fn test_quic_limiter_ipv6_64_shared_limit() {
+        let limiter = Arc::new(QuicHandshakeLimiter::new(2, 10));
+        let ip1: IpAddr = "2001:db8::1".parse().unwrap();
+        let ip2: IpAddr = "2001:db8::dead:beef".parse().unwrap();
+
+        let g1 = limiter.try_acquire(ip1);
+        assert!(g1.is_some());
+
+        let g2 = limiter.try_acquire(ip2);
+        assert!(g2.is_some());
+
+        // 同 /64 第三个连接被拒
+        let ip3: IpAddr = "2001:db8::cafe".parse().unwrap();
+        let g3 = limiter.try_acquire(ip3);
+        assert!(g3.is_none());
+
+        drop(g1);
+        let g4 = limiter.try_acquire(ip3);
+        assert!(g4.is_some());
+    }
+
+    #[test]
+    fn test_quic_limiter_global_limit() {
+        let limiter = Arc::new(QuicHandshakeLimiter::new(10, 3));
+        let ip1: IpAddr = "192.0.2.1".parse().unwrap();
+        let ip2: IpAddr = "192.0.2.2".parse().unwrap();
+        let ip3: IpAddr = "192.0.2.3".parse().unwrap();
+        let ip4: IpAddr = "192.0.2.4".parse().unwrap();
+
+        let g1 = limiter.try_acquire(ip1);
+        let g2 = limiter.try_acquire(ip2);
+        let g3 = limiter.try_acquire(ip3);
+        assert!(g1.is_some() && g2.is_some() && g3.is_some());
+        assert_eq!(limiter.current_global(), 3);
+
+        // 全局达到 3, 不同 IP 也被拒
+        let g4 = limiter.try_acquire(ip4);
+        assert!(g4.is_none());
+        assert_eq!(limiter.current_global(), 3);
+
+        drop(g1);
+        assert_eq!(limiter.current_global(), 2);
+        let g5 = limiter.try_acquire(ip4);
+        assert!(g5.is_some());
+        assert_eq!(limiter.current_global(), 3);
     }
 }

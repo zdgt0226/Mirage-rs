@@ -274,6 +274,11 @@ pub fn collect_users(inbounds: &[crate::config::InboundConfig]) -> Vec<crate::co
 }
 
 /// 初始化全局用户限制 (启动时调用)
+/// 测试串行锁: init_user_limits 替换进程级注册表, 并行测试互相覆盖会让持有的句柄与注册表脱节
+/// (reset/restore 找不到用户)。凡在测试里 init 注册表的都先持此锁。
+#[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn init_user_limits(users: &[crate::config::MirageUser]) {
     let now = current_unix_time();
     let reg = build_registry(users, None, now);
@@ -562,6 +567,7 @@ mod tests {
             quota_gb: Some(1.0),
             quota_reset_day: Some(1),
         };
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init_user_limits(&[user]);
         let h = get_user_limit("eve").unwrap();
         h.record_bytes((1.5 * BYTES_PER_GB) as usize);
@@ -581,6 +587,7 @@ mod tests {
             quota_gb: Some(10.0),
             quota_reset_day: Some(5),
         };
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         init_user_limits(&[user]);
         let h = get_user_limit("frank").unwrap();
         h.record_bytes(4096);

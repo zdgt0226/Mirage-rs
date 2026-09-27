@@ -1,7 +1,7 @@
 //! 加密 channel 建立 + v0.4 协议 TIME_SYNC 帧下发 + first_chunk 接收 +
 //! 根据 first_chunk 内容分发到 TCP 或 UDP relay.
 //!
-//! 调用方: `handshake::handle_connection` 在 ClientHello 鉴权 + 63B tail 消费
+//! 调用方: `handshake::handle_connection` 在 ClientHello 鉴权 + fake tail 消费
 //! 通过后进入这里. 不再退回 handshake — 这之后所有流量都是加密的.
 
 use tracing::info;

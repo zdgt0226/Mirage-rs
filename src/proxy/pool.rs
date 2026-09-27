@@ -281,12 +281,19 @@ struct ClientHandshake {
     ecdh: Option<[u8; 32]>,
 }
 
-/// 读服务端 flight (ServerHello + CCS + 加密段), 返回捕获的 **ServerHello.random**。
+/// 服务端握手返回的元数据: 包含 ServerHello.random 与协商出的 cipher_suite。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerHandshake {
+    pub server_random: [u8; 32],
+    pub cipher_suite: u16,
+}
+
+/// 读服务端 flight (ServerHello + CCS + 加密段), 返回捕获的 **ServerHello.random** 与 **cipher_suite**。
 ///
 /// PFS 下 server_random = 服务端临时 X25519 公钥 (见 crypto::pfs); 非 PFS 下参与会话密钥派生。
 /// 仍要求集齐 0x16+0x14+0x17 三型才成功 (见 handshake-template-completeness)。若 server_random
 /// 全 0 则必须 fail-closed 报错断开。
-pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<[u8; 32]> {
+pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<ServerHandshake> {
     // v0.4.5-alpha.17: 放弃超时随机化, 消除固定 12s/1.5s 阈值的客户端时序指纹.
     // GFW 若主动操纵服务端响应时序 (拦截/延迟 ServerHello) 测客户端恒定放弃时间可
     // 识别 Mirage 客户端. 每连接各随机一次 (非每轮, 保持单次握手内一致), 围绕原值
@@ -299,6 +306,7 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
     let mut saw_enc = false;
     // ServerHello.random (record body[6..38]): PFS 下即服务端临时公钥。首个 0x16 时捕获。
     let mut server_random = [0u8; 32];
+    let mut cipher_suite = 0x1301u16;
 
     loop {
         let t = if saw_ccs { post_ccs_timeout } else { pre_ccs_timeout };
@@ -314,10 +322,19 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                         if ct == 0x15 {
                             return Err(anyhow::anyhow!("Server sent TLS alert"));
                         } else if ct == 0x16 {
-                            // 首个 ServerHello: 捕获 random (body[6..38])。ServerHello body 布局:
-                            // [0x02 type][3B len][2B version][32B random]... → random 在 [6..38]。
+                            // 首个 ServerHello: 捕获 random (body[6..38]) 与 cipher_suite。ServerHello body 布局:
+                            // [0x02 type][3B len][2B version][32B random][1B sid_len][sid][2B cipher]...
                             if !saw_sh && body.len() >= 38 {
                                 server_random.copy_from_slice(&body[6..38]);
+                                if body.len() >= 39 {
+                                    let sid_len = body[38] as usize;
+                                    if body.len() >= 39 + sid_len + 2 {
+                                        cipher_suite = u16::from_be_bytes([
+                                            body[39 + sid_len],
+                                            body[40 + sid_len],
+                                        ]);
+                                    }
+                                }
                             }
                             saw_sh = true;
                         } else if ct == 0x14 {
@@ -330,7 +347,10 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                             if server_random == [0u8; 32] {
                                 return Err(anyhow::anyhow!("未能捕获有效的 ServerHello.random (全 0), 握手失败断开 (fail-closed)"));
                             }
-                            return Ok(server_random);
+                            return Ok(ServerHandshake {
+                                server_random,
+                                cipher_suite,
+                            });
                         }
                     }
                     Ok(Err(e)) => return Err(anyhow::anyhow!("Incomplete body: {}", e)),
@@ -353,7 +373,10 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
     if server_random == [0u8; 32] {
         return Err(anyhow::anyhow!("未能捕获有效的 ServerHello.random (全 0), 握手失败断开 (fail-closed)"));
     }
-    Ok(server_random)
+    Ok(ServerHandshake {
+        server_random,
+        cipher_suite,
+    })
 }
 
 /// [弹性预热连接池 (WarmPool)]
@@ -839,13 +862,14 @@ impl WarmPool {
         );
         wh.write_all(&hello_bytes).await?;
         wh.flush().await?;
-        let server_random = read_server_handshake(rh).await?;
-        if server_random == [0u8; 32] {
+        let handshake = read_server_handshake(rh).await?;
+        if handshake.server_random == [0u8; 32] {
             anyhow::bail!("未能从服务端 ServerHello 捕获到 server_random (全 0), 握手失败断开 (fail-closed)");
         }
-        let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail();
+        let tail_bytes = crate::crypto::tls_raw::build_fake_client_tail(handshake.cipher_suite);
         wh.write_all(&tail_bytes).await?;
         wh.flush().await?;
+        let server_random = handshake.server_random;
         // PFS: 与服务端临时公钥 (= server_random) 做 ECDH 得共享秘密。
         let ecdh = match ephemeral {
             Some(e) => Some(e.agree(&server_random)?),
@@ -998,13 +1022,13 @@ mod pool_handshake_tests {
     use super::*;
     use std::io::Cursor;
 
-    fn build_mock_server_flight(server_random: &[u8; 32]) -> Vec<u8> {
+    fn build_mock_server_flight(server_random: &[u8; 32], cipher: u16) -> Vec<u8> {
         let mut flight = Vec::new();
         // 1. ServerHello: 0x16, 0x03, 0x03, len, 0x02, hs_len(3B), 0x03, 0x03, random(32B), sid_len=0, ciphers...
         let mut hs_body = vec![0x03, 0x03]; // TLS 1.2
         hs_body.extend_from_slice(server_random);
         hs_body.push(0); // session_id len
-        hs_body.extend_from_slice(&[0x13, 0x01]); // cipher
+        hs_body.extend_from_slice(&cipher.to_be_bytes()); // cipher
         hs_body.push(0); // compression
         hs_body.extend_from_slice(&[0x00, 0x00]); // extensions len = 0
 
@@ -1029,7 +1053,7 @@ mod pool_handshake_tests {
 
     #[tokio::test]
     async fn read_server_handshake_fails_closed_on_all_zero_random() {
-        let flight = build_mock_server_flight(&[0u8; 32]);
+        let flight = build_mock_server_flight(&[0u8; 32], 0x1301);
         let mut cursor = Cursor::new(flight);
         let res = read_server_handshake(&mut cursor).await;
         assert!(res.is_err(), "server_random 为全 0 时必须 fail-closed 断开");
@@ -1038,10 +1062,12 @@ mod pool_handshake_tests {
     #[tokio::test]
     async fn read_server_handshake_succeeds_on_valid_random() {
         let expected_random = [0x5au8; 32];
-        let flight = build_mock_server_flight(&expected_random);
+        let flight = build_mock_server_flight(&expected_random, 0x1302);
         let mut cursor = Cursor::new(flight);
         let res = read_server_handshake(&mut cursor).await;
         assert!(res.is_ok(), "有效 server_random 应成功捕获");
-        assert_eq!(res.unwrap(), expected_random);
+        let hs = res.unwrap();
+        assert_eq!(hs.server_random, expected_random);
+        assert_eq!(hs.cipher_suite, 0x1302);
     }
 }
