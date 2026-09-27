@@ -83,9 +83,24 @@ pub(super) async fn handle_tcp_relay(
     // 后大量重传排队 → 拖垮吞吐). 用户实测 alpha.22 就慢, 定位到这段
     // sockopt 是元凶. 让 kernel auto-tune 自己按 BDP + 丢包动态调节.
 
+    // 限速 (device_profiles rate_limit_kbps): 服务端按连接的客户端 IP 取共享桶, 上/下行各整形。
+    // 全局 limiter (server_buckets_for, 见 rate_limit.rs) 在 server 启动时按 config.routing 装。
+    let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
+    // 用户级限速与配额 (mirage_server.users): 连接建立时查一次句柄 Arc, 跨该用户全部连接共享。
+    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+
     if let Some(payload) = initial_payload {
         if !payload.is_empty() {
-            let _ = upstream.write_all(&payload).await;
+            if let Some(b) = &dev_buckets {
+                b.up.consume(payload.len()).await;
+            }
+            if crate::proxy::user_limits::charge(user_limit.as_deref(), payload.len(), true).await {
+                return;
+            }
+            if upstream.write_all(&payload).await.is_err() {
+                return;
+            }
+            _conn.counter().up(payload.len() as u64);
         }
     }
     let (mut up_read, mut up_write) = upstream.into_split();
@@ -105,14 +120,9 @@ pub(super) async fn handle_tcp_relay(
         }
     };
 
-    // 限速 (device_profiles rate_limit_kbps): 服务端按连接的客户端 IP 取共享桶, 上/下行各整形。
-    // 全局 limiter (server_buckets_for, 见 rate_limit.rs) 在 server 启动时按 config.routing 装。
-    let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
     let up_bkt = dev_buckets.clone();
     let dn_bkt = dev_buckets;
 
-    // 用户级限速与配额 (mirage_server.users): 连接建立时查一次句柄 Arc, 跨该用户全部连接共享。
-    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
     let up_user = user_limit.clone();
     let dn_user = user_limit;
 
@@ -250,8 +260,13 @@ async fn relay_via_shadowsocks(
         };
 
     if let Some(payload) = initial_payload {
-        if !payload.is_empty() && up_write.write_all(&payload).await.is_err() {
-            return;
+        if !payload.is_empty() {
+            if limits.charge(payload.len(), true).await {
+                return;
+            }
+            if up_write.write_all(&payload).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -371,8 +386,13 @@ async fn relay_via_wireguard(
     let (stop_up, stop_down) = (closer.clone(), closer);
 
     if let Some(payload) = initial_payload {
-        if !payload.is_empty() && up_write.write_all(&payload).await.is_err() {
-            return;
+        if !payload.is_empty() {
+            if limits.charge(payload.len(), true).await {
+                return;
+            }
+            if up_write.write_all(&payload).await.is_err() {
+                return;
+            }
         }
     }
 

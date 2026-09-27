@@ -321,14 +321,34 @@ pub fn flush_stats(path: &str) {
             f.write_all(json.as_bytes())?;
             f.flush()?;
             let _ = f.set_permissions(std::fs::Permissions::from_mode(mode));
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            // rename 后尽力对父目录 fsync (失败忽略, 仅 unix)
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let parent_path = if parent.as_os_str().is_empty() {
+                    std::path::Path::new(".")
+                } else {
+                    parent
+                };
+                if let Ok(dir) = std::fs::File::open(parent_path) {
+                    let _ = dir.sync_all();
+                }
+            }
             Ok(())
         }
         #[cfg(not(unix))]
         {
-            std::fs::write(&tmp, json.as_bytes())
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(json.as_bytes())?;
+            f.flush()?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            Ok(())
         }
-    })()
-    .and_then(|()| std::fs::rename(&tmp, path));
+    })();
 
     if let Err(e) = write_res {
         tracing::warn!("[STATS] 写持久化文件 {} 失败: {}", path, e);
@@ -1252,6 +1272,7 @@ mod stats_persist_tests {
             quota_gb: Some(5.0),
             quota_reset_day: Some(1),
         };
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::proxy::user_limits::init_user_limits(&[user]);
         let h = crate::proxy::user_limits::get_user_limit("grace").unwrap();
         h.record_bytes(1024 * 1024);

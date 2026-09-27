@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### fix(security): 伪造 Client Finished 长度随协商套件动态调整 (审计 P2)
+
+修复客户端 Client Finished fake tail 固定 64B (53B 体) 与真实 TLS 1.3 协商 0x1302 套件时的长度指纹差异:
+- **客户端解析套件并匹配长度**: `read_server_handshake` 扩展返回 `ServerHandshake` (含 `server_random` 与 `cipher_suite`); `build_fake_client_tail` 接收套件参数, 协商 `TLS_AES_256_GCM_SHA384` (0x1302) 时生成 69B 体 (总长 80B: 6B CCS + 5B 头 + 69B 体), 其余套件保持 53B 体 (总长 64B)。
+- **服务端结构化消费**: 服务端 `consume_fake_client_tail` 按结构严格校验 6B CCS (`14 03 03 00 01 01`) 与 5B 0x17 记录头, 仅接受 53B 或 69B 体长并丢弃, 任何不符或超时直接断开并防多读后续载荷。
+
+### fix(security): QUIC 认证前握手按 IP 及全局并发限流防 DoS (审计 P2)
+
+修复 QUIC 服务端在 accept 后直接并发进行 QUIC/TLS 握手导致的 CPU DoS 风险:
+- **并发跟踪与门禁**: 新增 `QuicHandshakeLimiter`, 按源 IP (IPv6 自动归一化到 /64) 限制并发握手数 (上限 32), 同时设置全局并发握手上限 (2048)。
+- **即时拒绝与 RAII 释放**: 达到并发上限时立即调用 `incoming.refuse()` 拒绝连接; 采用 RAII `QuicHandshakeGuard` 确保握手完成、失败或超时退出时可靠释放槽位。
+
+### fix: 禁止同一入站内重复口令防鉴权串号 (审计 P3)
+
+- **重复口令拦截**: 在 `Config::semantic_issues()` 中新增口令查重逻辑, 若同一 `mirage_server` 入站内多个凭据 (顶层 `password` 与 `users[].password`) 存在重复口令, 产生含 `user` 关键字的校验错误, 防止鉴权命中顺序导致流量记账串号。
+- **管理 API 与启动闸门联动**: `/api/users` 自动将其作为硬错拒绝写入配置并返回 422, `mirage-rs check` 同样拦截并退出非零码。
+
+### fix: /api/users 的 reset_quota 延后至写配置成功后执行 (审计 P3)
+
+- **事务时序修正**: 将 `handle_post_users` 中的 `reset_quota` 操作挪至配置未修改直接返回以及 `atomic_write_config` 成功返回的两条成功路径上执行; 当请求因其他错误或落盘失败中断时, 保证不会误清空用户配额用量。
+- **审阅修正 (测试)**: 新增的 reset_quota 测试会替换进程级用户限额注册表, 与既有 `eve`/`frank`/`grace` 测试并行时互相覆盖 (持有的句柄与注册表脱节 → 偶发失败)。新增 `#[cfg(test)] REGISTRY_TEST_LOCK`, 所有 init 注册表的测试先持锁串行。
+
+### fix: 统计持久化与配置原子写增加 fsync 防止掉电文件截断 (审计 P3)
+
+- **可靠落盘**: 在 `monitor::flush_stats` 与 `atomic_write_config` (API handlers 及 CLI) 中, 于临时文件 rename 覆盖目标前显式调用 `sync_all()`, 并在 Unix 下对父目录尽力执行 `sync_all()`, 保证系统掉电或断电重启时统计与配置文件不丢失、不截断。保持 0600 权限机制不变。
+
+### fix: TCP 中继连接首帧 initial_payload 计入配额与限速 (审计 P3)
+
+- **首帧门禁计费**: 在服务端直连 (direct)、Shadowsocks 上游以及 WireGuard 上游三处写出 `initial_payload` 前调用 `charge`, 与后续上行数据采用相同限速桶与配额 handle; 若已超额立即终止连接, 避免连接首帧上行数据绕过用量统计与限速。
+
 ### fix(security): 伪装模板 ServerHello key_share 与加密 flight 逐连接随机化 (审计 #3)
 
 修复回放模板缓存生命周期内 (1800s) 所有 Mirage 握手的 ServerHello key_share 公钥与 0x17 加密记录逐字节相同、可被被动去重识别的指纹漏洞:

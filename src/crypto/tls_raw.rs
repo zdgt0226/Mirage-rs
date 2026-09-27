@@ -792,17 +792,20 @@ pub fn ja4(ch: &[u8]) -> String {
     format!("{}_{}_{}", a, b, c)
 }
 
-pub fn build_fake_client_tail() -> Vec<u8> {
-    // 尾巴 body 53B 匹配真实 TLS 1.3 Client Finished (ChaCha20-Poly1305 + SHA-256
-    // HMAC): 4B handshake header + 32B HMAC digest + 1B content_type + 16B AEAD tag.
+pub fn build_fake_client_tail(cipher: u16) -> Vec<u8> {
+    // 尾巴 body 随 ServerHello 协商套件变化:
+    // - 0x1302 (TLS_AES_256_GCM_SHA384): 4B hs 头 + 48B SHA-384 verify_data + 1B 内容类型 + 16B tag = 69B 体
+    // - 其它 (0x1301 TLS_AES_128_GCM_SHA256 / 0x1303 TLS_CHACHA20_POLY1305_SHA256):
+    //   4B hs 头 + 32B SHA-256 verify_data + 1B 内容类型 + 16B tag = 53B 体
+    let body_len = if cipher == 0x1302 { 69 } else { 53 };
     let ccs = b"\x14\x03\x03\x00\x01\x01";
-    let mut finished_body = [0u8; 53];
-    rand::fill(&mut finished_body);
+    let mut finished_body = vec![0u8; body_len];
+    rand::fill(&mut finished_body[..]);
 
-    let mut record = Vec::with_capacity(ccs.len() + 5 + finished_body.len());
+    let mut record = Vec::with_capacity(ccs.len() + 5 + body_len);
     record.extend_from_slice(ccs);
     record.extend_from_slice(b"\x17\x03\x03");
-    record.extend_from_slice(&(finished_body.len() as u16).to_be_bytes());
+    record.extend_from_slice(&(body_len as u16).to_be_bytes());
     record.extend_from_slice(&finished_body);
     record
 }
@@ -870,5 +873,29 @@ mod template_tests {
         let mut bad = build_chromium(b"a.com", &sid, &rnd);
         bad[43] = 31;
         assert!(build_from_template(&bad, b"x", &sid, &rnd).is_none());
+    }
+
+    #[test]
+    fn test_fake_client_tail_lengths() {
+        // 0x1302: 6B CCS + 5B hdr + 69B body = 80B
+        let tail_1302 = build_fake_client_tail(0x1302);
+        assert_eq!(tail_1302.len(), 80);
+        assert_eq!(&tail_1302[..6], b"\x14\x03\x03\x00\x01\x01");
+        assert_eq!(&tail_1302[6..9], b"\x17\x03\x03");
+        assert_eq!(u16::from_be_bytes([tail_1302[9], tail_1302[10]]), 69);
+
+        // 0x1301: 6B CCS + 5B hdr + 53B body = 64B
+        let tail_1301 = build_fake_client_tail(0x1301);
+        assert_eq!(tail_1301.len(), 64);
+        assert_eq!(&tail_1301[..6], b"\x14\x03\x03\x00\x01\x01");
+        assert_eq!(&tail_1301[6..9], b"\x17\x03\x03");
+        assert_eq!(u16::from_be_bytes([tail_1301[9], tail_1301[10]]), 53);
+
+        // 0x1303: 6B CCS + 5B hdr + 53B body = 64B
+        let tail_1303 = build_fake_client_tail(0x1303);
+        assert_eq!(tail_1303.len(), 64);
+        assert_eq!(&tail_1303[..6], b"\x14\x03\x03\x00\x01\x01");
+        assert_eq!(&tail_1303[6..9], b"\x17\x03\x03");
+        assert_eq!(u16::from_be_bytes([tail_1303[9], tail_1303[10]]), 53);
     }
 }

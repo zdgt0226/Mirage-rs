@@ -1370,9 +1370,13 @@ impl Config {
                 if password.is_empty() {
                     issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
                 }
-                // 多用户校验: name 非空且唯一 (含不撞保留名 "default")、password 非空。
+                // 多用户校验: name 非空且唯一 (含不撞保留名 "default")、password 非空且不重复 (含不撞 default 主口令)。
                 let mut seen_names = std::collections::HashSet::new();
                 seen_names.insert("default".to_string());
+                let mut seen_passwords: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+                if !password.is_empty() {
+                    seen_passwords.insert(password.as_str(), "default");
+                }
                 for u in users {
                     if u.name.trim().is_empty() {
                         issues.push(format!("mirage_server 入站 `{tag}` 有 user 的 name 为空"));
@@ -1381,6 +1385,13 @@ impl Config {
                     }
                     if u.password.is_empty() {
                         issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name));
+                    } else if let Some(prev) = seen_passwords.get(u.password.as_str()) {
+                        issues.push(format!(
+                            "mirage_server 入站 `{tag}` 的 user `{}` password 与 `{prev}` 重复 (口令相同会导致鉴权串号)",
+                            u.name
+                        ));
+                    } else {
+                        seen_passwords.insert(u.password.as_str(), u.name.as_str());
                     }
                     if let Some(kbps) = u.rate_limit_kbps {
                         if kbps == 0 {
@@ -2294,6 +2305,27 @@ mod profile_tests {
         assert!(srv_with_users(r#"[{"name":"default","password":"x"}]"#).semantic_issues().iter().any(|i| i.contains("重复")), "撞 default 未拦");
         // 空密码
         assert!(srv_with_users(r#"[{"name":"u","password":""}]"#).semantic_issues().iter().any(|i| i.contains("password 为空")), "空密码未拦");
+    }
+
+    #[test]
+    fn users_duplicate_password_caught() {
+        // 与 default 主口令重复
+        let dup_default = srv_with_users(r#"[{"name":"u","password":"mainpw"}]"#);
+        let issues_default = dup_default.semantic_issues();
+        assert!(
+            issues_default.iter().any(|i| i.contains("user") && i.contains("password 与 `default` 重复")),
+            "撞 default 口令未拦: {:?}",
+            issues_default
+        );
+
+        // 两个用户之间口令重复
+        let dup_users = srv_with_users(r#"[{"name":"u1","password":"same"},{"name":"u2","password":"same"}]"#);
+        let issues_users = dup_users.semantic_issues();
+        assert!(
+            issues_users.iter().any(|i| i.contains("user") && i.contains("password 与 `u1` 重复")),
+            "多用户重口令未拦: {:?}",
+            issues_users
+        );
     }
 
     #[test]
