@@ -553,7 +553,11 @@ mod leak_guard_tests {
     }
 
     async fn forwarder_for(cfg: &str, geo: &str, mapper: Option<Arc<FakeIpMapper>>) -> Arc<DnsForwarder> {
-        let state = ConfigWatcher::build_state(cfg, geo, None).unwrap();
+        // build_state 会 reload 进程级用户限额注册表, 与 init 注册表的测试串行 (锁只包住这一同步调用)。
+        let state = {
+            let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            ConfigWatcher::build_state(cfg, geo, None).unwrap()
+        };
         let arc = Arc::new(arc_swap::ArcSwap::from_pointee(state));
         DnsForwarder::for_hijack(arc, mapper, None).await.unwrap()
     }

@@ -29,7 +29,7 @@
 ### fix: /api/users 的 reset_quota 延后至写配置成功后执行 (审计 P3)
 
 - **事务时序修正**: 将 `handle_post_users` 中的 `reset_quota` 操作挪至配置未修改直接返回以及 `atomic_write_config` 成功返回的两条成功路径上执行; 当请求因其他错误或落盘失败中断时, 保证不会误清空用户配额用量。
-- **审阅修正 (测试)**: 新增的 reset_quota 测试会替换进程级用户限额注册表, 与既有 `eve`/`frank`/`grace` 测试并行时互相覆盖 (持有的句柄与注册表脱节 → 偶发失败)。新增 `#[cfg(test)] REGISTRY_TEST_LOCK`, 所有 init 注册表的测试先持锁串行。
+- **审阅修正 (测试)**: 新增的 reset_quota 测试会替换进程级用户限额注册表, 与既有 `eve`/`frank`/`grace` 测试并行时互相覆盖 (持有的句柄与注册表脱节 → 偶发失败)。新增 `#[cfg(test)] REGISTRY_TEST_LOCK`, 所有 init 注册表的测试先持锁串行。 后续补漏 (CI 偶发失败暴露): `config_watcher::build_state` 会 reload 注册表, 其测试辅助 `forwarder_for` 也须持锁。
 
 ### fix: 统计持久化与配置原子写增加 fsync 防止掉电文件截断 (审计 P3)
 

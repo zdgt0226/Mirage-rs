@@ -274,8 +274,9 @@ pub fn collect_users(inbounds: &[crate::config::InboundConfig]) -> Vec<crate::co
 }
 
 /// 初始化全局用户限制 (启动时调用)
-/// 测试串行锁: init_user_limits 替换进程级注册表, 并行测试互相覆盖会让持有的句柄与注册表脱节
-/// (reset/restore 找不到用户)。凡在测试里 init 注册表的都先持此锁。
+/// 测试串行锁: init_user_limits / reload_user_limits (经 config_watcher::build_state) 替换进程级
+/// 注册表, 并行测试互相覆盖会让持有的句柄与注册表脱节 (reset/restore 找不到用户)。凡在测试里
+/// 会替换注册表的都先持此锁。
 #[cfg(test)]
 pub(crate) static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
