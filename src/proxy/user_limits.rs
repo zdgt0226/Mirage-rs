@@ -255,6 +255,24 @@ pub fn build_registry(
     UserLimitsRegistry { users: map }
 }
 
+/// 汇总**所有** mirage_server 入站的 users (同名以先出现者为准)。
+/// 限额注册表是全进程一张表: 必须一次性用全部入站的用户构建, 不能逐入站调用
+/// init/reload —— 每次调用都整表替换, 逐个调用会让后一个入站覆盖前一个 (前者独有的用户掉出注册表 → 不限速不限额)。
+pub fn collect_users(inbounds: &[crate::config::InboundConfig]) -> Vec<crate::config::MirageUser> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for ib in inbounds {
+        if let crate::config::InboundConfig::MirageServer { users, .. } = ib {
+            for u in users {
+                if seen.insert(u.name.clone()) {
+                    out.push(u.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 初始化全局用户限制 (启动时调用)
 pub fn init_user_limits(users: &[crate::config::MirageUser]) {
     let now = current_unix_time();
@@ -427,6 +445,32 @@ mod tests {
         assert!(!charge(Some(&h), 600, true).await);
         assert!(charge(Some(&h), 500, false).await, "上下行合计跨过 1000B 必须判超额");
         assert!(h.is_exhausted());
+    }
+
+    /// 多个 mirage_server 入站 (如 TCP + QUIC 各一个) 的用户须全部进注册表, 同名以先出现者为准。
+    #[test]
+    fn collect_users_merges_all_inbounds_first_wins() {
+        let mk = |name: &str, kbps: Option<u64>| MirageUser {
+            name: name.to_string(),
+            password: format!("pw-{name}"),
+            rate_limit_kbps: kbps,
+            quota_gb: None,
+            quota_reset_day: None,
+        };
+        let ib = |tag: &str, users: Vec<MirageUser>| -> crate::config::InboundConfig {
+            let v = serde_json::json!({"type": "mirage_server", "tag": tag, "listen": "0.0.0.0", "port": 443,
+                "password": "main", "users": users.iter().map(|u| serde_json::json!({
+                    "name": u.name, "password": u.password, "rate_limit_kbps": u.rate_limit_kbps})).collect::<Vec<_>>()});
+            serde_json::from_value(v).unwrap()
+        };
+        let inbounds = vec![
+            ib("tcp", vec![mk("alice", Some(100)), mk("bob", None)]),
+            ib("quic", vec![mk("alice", Some(999)), mk("carol", None)]),
+        ];
+        let all = collect_users(&inbounds);
+        let names: Vec<_> = all.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(names, vec!["alice", "bob", "carol"], "三个用户都要进注册表");
+        assert_eq!(all[0].rate_limit_kbps, Some(100), "同名以第一个入站为准");
     }
 
     #[test]

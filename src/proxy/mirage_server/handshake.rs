@@ -300,21 +300,23 @@ where
 pub(super) async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    creds: Arc<Vec<(String, String)>>,
+    creds: super::CredsSnapshot,
     camouflage_host: String,
     cam_pool: Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
+    allow_local_targets: bool,
 ) {
     stream.set_nodelay(true).unwrap_or_default();
     let client_ip = peer_addr.ip();
+    let creds_snapshot = creds.load_full();
     if let Some((stream, client_random, server_random, ecdh, idx)) = run_handshake(
-        stream, peer_addr, &creds, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
+        stream, peer_addr, &creds_snapshot, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
     )
     .await
     {
-        let (user, password) = creds[idx].clone(); // 命中的凭据: 用户名 + 派生会话密钥的 password
+        let (user, password) = creds_snapshot[idx].clone(); // 命中的凭据: 用户名 + 派生会话密钥的 password
         let (rh, wh) = stream.into_split();
         control::dispatch_authenticated(
             crate::proxy::tunnel::TunnelRead::Tcp(rh),
@@ -326,6 +328,7 @@ pub(super) async fn handle_connection(
             server_random,
             upstream,
             ecdh,
+            allow_local_targets,
         )
         .await;
     }
@@ -370,5 +373,65 @@ mod tests {
         // 2. 超额 -> 返回 None (当作认证失败)
         let res_exh = verify_creds_and_quota(&creds, &token, &client_random, 60, |user| user == "alice");
         assert_eq!(res_exh, None);
+    }
+
+    #[test]
+    fn test_creds_registry_hot_reload_reflects_changes() {
+        let tag = "test_tag_hot_reload";
+        let initial_creds = vec![
+            ("default".to_string(), "main_pwd".to_string()),
+            ("alice".to_string(), "alice_pwd".to_string()),
+            ("bob".to_string(), "bob_pwd".to_string()),
+        ];
+        let store = super::super::register_creds(tag, initial_creds);
+
+        let client_random = [11u8; 32];
+        let token_alice = crate::crypto::hello_auth::make_session_token("alice_pwd", &client_random);
+        let token_bob = crate::crypto::hello_auth::make_session_token("bob_pwd", &client_random);
+
+        // 初始状态: alice 与 bob 均能通过
+        let snap1 = store.load();
+        assert_eq!(verify_creds_and_quota(&snap1, &token_alice, &client_random, 60, |_| false), Some(1));
+        assert_eq!(verify_creds_and_quota(&snap1, &token_bob, &client_random, 60, |_| false), Some(2));
+
+        // 热重载: 删掉 bob, 修改 alice 密码, 增加 charlie
+        let new_creds = vec![
+            ("default".to_string(), "main_pwd".to_string()),
+            ("alice".to_string(), "alice_pwd_new".to_string()),
+            ("charlie".to_string(), "charlie_pwd".to_string()),
+        ];
+        let updated = super::super::reload_creds(tag, new_creds);
+        assert!(updated, "已注册 tag 热重载应返回 true");
+
+        // 新快照立即生效
+        let snap2 = store.load();
+
+        // 1. 被删掉的 bob token 不再通过
+        assert_eq!(
+            verify_creds_and_quota(&snap2, &token_bob, &client_random, 60, |_| false),
+            None,
+            "删掉的用户 token 不应再通过"
+        );
+
+        // 2. alice 旧密码 token 不再通过
+        assert_eq!(
+            verify_creds_and_quota(&snap2, &token_alice, &client_random, 60, |_| false),
+            None,
+            "旧密码 token 不应再通过"
+        );
+
+        // 3. alice 新密码 token 通过
+        let token_alice_new = crate::crypto::hello_auth::make_session_token("alice_pwd_new", &client_random);
+        assert_eq!(
+            verify_creds_and_quota(&snap2, &token_alice_new, &client_random, 60, |_| false),
+            Some(1)
+        );
+
+        // 4. 新用户 charlie token 通过
+        let token_charlie = crate::crypto::hello_auth::make_session_token("charlie_pwd", &client_random);
+        assert_eq!(
+            verify_creds_and_quota(&snap2, &token_charlie, &client_random, 60, |_| false),
+            Some(2)
+        );
     }
 }

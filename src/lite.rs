@@ -82,6 +82,9 @@ pub struct LiteServerConfig {
     /// 前向保密 (PFS): 握手做一次性 X25519 ECDH。**须与客户端 `pfs` 同开**。默认关。
     #[serde(default)]
     pub pfs: bool,
+    /// 是否允许服务端直连回环与链路本地目标 (默认 false, 拒绝 SSRF)。
+    #[serde(default)]
+    pub allow_local_targets: bool,
     #[serde(default = "d_log_level")]
     pub log_level: String,
 }
@@ -231,8 +234,9 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
     let brutal_bps = cfg.brutal_rate_mbps.filter(|m| *m > 0).map(|m| m * 125_000);
     let ss_upstream = crate::build_upstream(cfg.upstream.as_ref())?;
 
-    // 轻量服务端单用户: 单凭据 ("default", password)。
-    let creds = std::sync::Arc::new(vec![("default".to_string(), cfg.password.clone())]);
+    // 轻量服务端单用户: 单凭据 ("default", password)。按 "lite_server" 注册到凭据快照表。
+    let creds_vec = vec![("default".to_string(), cfg.password.clone())];
+    let creds = crate::proxy::mirage_server::register_creds("lite_server", creds_vec);
     crate::proxy::mirage_server::start_server(
         &addr,
         creds,
@@ -242,6 +246,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
         cfg.auth_ts_tolerance_secs,
         ss_upstream,
         cfg.pfs,
+        cfg.allow_local_targets,
     )
     .await;
     Ok(())

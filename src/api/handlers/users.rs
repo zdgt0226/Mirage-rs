@@ -1,6 +1,7 @@
 //! 多用户凭据管理 (P1) —— 供 Mirage-console 操作。
 //! - GET  /api/users — 列用户 (name + per-user 用量: conns/up/down/active)。**绝不返 password**。
 //! - POST /api/users — 设 mirage_server 入站的 `users[]` (增删/改密), 校验 → 原子写 → 热重载。
+//!   热重载即时生效: 凭据快照按入站 tag 原子替换 (新连接/新流立即生效, 已建连接不受影响), 限额与用量同步重载。
 //!
 //! 与 /api/profiles 同款: version 乐观锁 (409)、parse+semantic 校验、dry_run、原子写。
 //! 安全: GET 只出 name+用量; password 仅经 POST 进 config, 不回显、不进日志。

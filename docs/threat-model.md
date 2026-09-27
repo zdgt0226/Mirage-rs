@@ -75,11 +75,28 @@ TLS 站点区分开。
 
 **红线**:任何让会话密钥只由客户端可控/可重放的输入决定、或导致同一 key 下 nonce 重复的改动 = 违规。
 
+## T7 服务端防 SSRF / 内部网络隔离 (anti-SSRF & intranet isolation)
+
+**目标**:已认证的客户端通过隧道直连出站时, 默认无法触碰服务端本机的管理接口与云服务元数据。(v0.14.2 起)
+
+- 服务端直连出站 (TCP relay、UDP relay、UDP mux、QUIC lean) 默认拒绝:
+  - 回环地址 (`127.0.0.0/8`, `::1`, 防探测本机 WebUI `:9090` 或其他本地监听服务)
+  - 未指定地址 (`0.0.0.0`, `::`)
+  - 链路本地 (`169.254.0.0/16`, `fe80::/10`)
+  - 组播与广播 (`224.0.0.0/4`, `255.255.255.255`, `ff00::/8`)
+  - 云元数据特殊地址 (AWS IPv6 `fd00:ec2::254`, 阿里云 `100.100.100.200`)
+- 防绕过:
+  - `::ffff:a.b.c.d` (IPv4-mapped IPv6) 在判定前统一还原为 IPv4, 阻断 `::ffff:127.0.0.1`。
+  - 严格在 DNS 解析后对实际获取的 IP 进行白名单过滤; connect_smart 尝试多 IP 时跳过非法候选, 全部非法则 fail-closed。
+- 局域网访问: RFC1918、其余 ULA 及其余 CGNAT 默认放行 (支持私网穿透用法)。如确需服务端回环穿透, 可由入站显式配置 `allow_local_targets: true` 放开。
+
+**红线**:默认配置下, 任何服务端直连请求以回环/链路本地/云元数据 IP 作为目标发起 socket 连接 = 违规。
+
 ---
 
 ## 验收流程
 
-1. 每个新功能 PR:对照 T1–T6 自检,在描述里说明命中/无关。
+1. 每个新功能 PR:对照 T1–T7 自检,在描述里说明命中/无关。
 2. 触碰握手/DNS/路由/出站的改动:**必须**有对应 §7 场景测试或说明为何不需要。
 3. 违反红线的改动**不合并**,除非有明确的、记录在案的权衡 (如 SNI 伪装为 QoS 刻意留)。
 
@@ -102,6 +119,8 @@ TLS 站点区分开。
 | T6 | 不同 server_random → 不同会话主密钥 (PFS/非 PFS 域分隔) | ✅ `crypto::aead::rekey_tests::master_deterministic_and_depends_on_both_randoms` |
 | T6 | 客户端 server_random 全 0 → fail-closed | ✅ `proxy::pool::pool_handshake_tests::read_server_handshake_fails_closed_on_all_zero_random` |
 | T6 | QUIC lean token 与 TCP token 互不可冒用 | ✅ `tests/test_hello_auth.rs::test_token_domain_quic_tcp_separation` |
+| T7 | 服务端直连出站拒绝回环/链路本地/云元数据 (防 SSRF) | ✅ `net_util::tests::test_egress_allowed_categories` |
+| T7 | 域名解析到回环地址在直连出口被拒绝 | ✅ `proxy::resolver::dns_tcp_tests::test_filtered_rejects_domain_resolving_to_loopback` |
 
 > 这张表是 #7 "泄漏测试变集成测试" 的施工清单。纯用户态可判定的守卫见
 > `tests/test_leak_guards.rs` 与 `config_watcher::leak_guard_tests` (进程内驱动真实

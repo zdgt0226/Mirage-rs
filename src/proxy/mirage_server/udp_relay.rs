@@ -54,6 +54,7 @@ pub(super) async fn handle_udp_relay(
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String,
+    allow_local_targets: bool,
 ) {
     debug!("Mirage Server: Started UDP relay session");
 
@@ -262,24 +263,35 @@ pub(super) async fn handle_udp_relay(
                     }
                 }
 
-                // v0.4.5-alpha.16: 走 resolver::resolve_first (60s 缓存 + IPv4 优先 +
-                // 并发限流), 不再每 UDP 包裸调 lookup_host 打满阻塞池 (高频 QUIC /
-                // 唯一域名洪泛防护). IP 字面量 (ATYP 1/4) 直接构造不解析.
+                // v0.4.5-alpha.16: 走 resolver::resolve_first_filtered (60s 缓存 + IPv4 优先 +
+                // 并发限流 + 出站 SSRF 白名单过滤), 不再每 UDP 包裸调 lookup_host 打满阻塞池.
                 // send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为).
-                if let Ok(socket_addr) =
-                    crate::proxy::resolver::resolve_first(&target_addr_str, port).await
-                {
-                    // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
-                    // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                    if let Err(e) = udp_socket.send_to(payload, socket_addr).await {
-                        static WARNED: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(false);
-                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            tracing::warn!(
-                                "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
-                                socket_addr, e
+                match crate::proxy::resolver::resolve_first_filtered(&target_addr_str, port, |ip| {
+                    crate::net_util::egress_allowed(ip, allow_local_targets)
+                }).await {
+                    Ok(socket_addr) => {
+                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
+                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
+                        if let Err(e) = udp_socket.send_to(payload, socket_addr).await {
+                            static WARNED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                tracing::warn!(
+                                    "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
+                                    socket_addr, e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            super::warn_egress_blocked(
+                                "Mirage Server UDP",
+                                &user,
+                                &crate::net_util::join_host_port(&target_addr_str, port),
                             );
                         }
+                        continue;
                     }
                 }
             }
@@ -364,6 +376,7 @@ pub(crate) async fn handle_udp_mux_relay(
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String,
+    allow_local_targets: bool,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
 
@@ -445,12 +458,21 @@ pub(crate) async fn handle_udp_mux_relay(
                     }
                     continue;
                 }
-                // 解析目标 (IP 字面量不解析, 域名走 60s 缓存 resolver)。
-                let target_sa = match crate::proxy::resolver::resolve_first(&uf.target, uf.port)
-                    .await
-                {
+                // 解析目标 (带 SSRF 校验: IP 字面量不解析, 域名走 60s 缓存 resolver)。
+                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                    crate::net_util::egress_allowed(ip, allow_local_targets)
+                }).await {
                     Ok(sa) => sa,
-                    Err(_) => continue,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                            super::warn_egress_blocked(
+                                "Mirage Server UDP mux",
+                                &user,
+                                &crate::net_util::join_host_port(&uf.target, uf.port),
+                            );
+                        }
+                        continue;
+                    }
                 };
                 // 建 egress。
                 let egress = match &wg_tunnel {
@@ -588,9 +610,9 @@ mod mux_tests {
             )
         };
 
-        // 4. 起服务端 mux relay (upstream=None → Direct egress)
+        // 4. 起服务端 mux relay (upstream=None → Direct egress, 测试环境连本地 echo 需 allow_local_targets=true)
         let server = tokio::spawn(async move {
-            handle_udp_mux_relay(sr, sw, None, None, "default".to_string()).await;
+            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), true).await;
         });
 
         // 5. 客户端发两帧: 同目标, 不同 sid + payload

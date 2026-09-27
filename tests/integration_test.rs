@@ -49,7 +49,8 @@ async fn test_full_e2e_proxy() {
             "listen": "127.0.0.1",
             "port": server_port,
             "password": "test_password",
-            "camouflage_host": "www.apple.com"
+            "camouflage_host": "www.apple.com",
+            "allow_local_targets": true
         }],
         "outbounds": [{
             "type": "direct",

@@ -40,6 +40,7 @@ pub(super) async fn dispatch_authenticated(
     server_random: [u8; 32],
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     ecdh: Option<[u8; 32]>,
+    allow_local_targets: bool,
 ) {
     // 3. Setup Crypto Stream。PFS 开时 (ecdh=Some) 走混入 ecdh 的 master 派生。
     // read_half/write_half 已是传输无关的 TunnelRead/Write (TCP=Tcp 变体, QUIC=Boxed);
@@ -206,7 +207,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, allow_local_targets).await;
     } else if first_chunk.len() == 1 && first_chunk[0] == crate::proxy::udp_mux::MUX_SENTINEL {
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
         if upstream.as_ref().is_some_and(|u| u.block_udp()) {
@@ -214,13 +215,13 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user).await;
+        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, allow_local_targets).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         match parse_tcp_target(&first_chunk) {
             Ok((target, payload)) => {
                 info!("Mirage Server: Target resolved to {}", target);
-                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user).await;
+                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, allow_local_targets).await;
             }
             Err(e) => tracing::error!("Mirage Server: {}", e),
         }

@@ -28,6 +28,7 @@ pub(super) async fn handle_tcp_relay(
     upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String, // 命中的用户名 (多用户统计); 单用户恒 "default"
+    allow_local_targets: bool,
 ) {
     // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径;
     // 字节在下方 direct 路径 relay 循环累加 (ss/wg 子路径仅登记可见, 字节暂不计, 同客户端 splice 限制)。
@@ -57,13 +58,18 @@ pub(super) async fn handle_tcp_relay(
         return;
     }
     debug!("Mirage Server: Connecting to TCP target {}", target);
-    // connect_smart: 60s DNS 缓存 + IP 字面量零解析快车道 + **多候选 IP 逐一带超时** ——
-    // 既有缓存(免每连接重解析), 又保证首个 IP 丢包时跳到下一个, 不会卡死内核 connect 超时。
-    // (eb322b9 曾误用 resolve_first+裸connect, 只取第一个 IP 无 failover, 已回退。)
-    let mut upstream = match crate::proxy::resolver::connect_smart(&target).await {
+    // connect_smart_filtered: 60s DNS 缓存 + IP 字面量零解析快车道 + 多候选 IP 逐一带超时 + 出站 SSRF 白名单过滤 ——
+    // 既有缓存(免每连接重解析), 又保证首个 IP 丢包时跳到下一个, 且拒绝内网/链路本地/云元数据目标。
+    let mut upstream = match crate::proxy::resolver::connect_smart_filtered(&target, |ip| {
+        crate::net_util::egress_allowed(ip, allow_local_targets)
+    }).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("Mirage Server failed to connect to {}: {}", target, e);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                super::warn_egress_blocked("Mirage Server TCP", &user, &target);
+            } else {
+                warn!("Mirage Server failed to connect to {}: {}", target, e);
+            }
             return;
         }
     };

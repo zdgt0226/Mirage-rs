@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### fix(auth): 凭据热重载生效 —— 按入站 tag 注册快照并在热重载时更新 (影响已发布的 v0.14.x)
+
+修复自 v0.14.0 起凭据不热更新的访问控制缺陷 (#1):
+- **原子凭据快照与全局注册**: 每个 `mirage_server` 入站按 tag 在全局凭据注册表注册快照 (`Arc<ArcSwap<Vec<(String, String)>>>`); 握手与 QUIC lean 建立每条新连接/新流时 `load()` 当前快照进行认证, 已建立的存量连接不受影响。
+- **配置热重载联动**: `config_watcher` 监听到配置文件变化时, 遍历所有 `mirage_server` 入站, 按 tag 重建凭据并原子替换快照; 增/删用户或修改密码立即生效, 无需重启服务。
+- **文档一致性**: 修正 `src/api/handlers/users.rs` 顶部文档, 准确说明凭据快照原子替换与热重载生效机制。
+- **限额注册表汇总所有入站** (审阅补充): 限额注册表是全进程一张表, 每次 init/reload 整表替换。初稿在热重载里逐入站调用
+  → 后一个入站覆盖前一个, 仅出现在前面入站的用户掉出注册表变成不限速不限额。改为 `collect_users` 汇总所有
+  `mirage_server` 入站 (同名先到为准) 后一次性构建; 启动初始化同样汇总 (原先只读第一个入站, 顺带修掉该 P3)。
+
+### fix(security): 服务端直连出站 SSRF 防护 —— 默认禁止访问回环、链路本地与云元数据
+
+修复多用户场景下服务端直连目标无内网过滤导致的 SSRF 风险 (#2):
+- **严格出站 IP 判定 (`egress_allowed`)**:
+  - 先将 IPv4 映射的 IPv6 地址 (`::ffff:a.b.c.d`) 还原为 IPv4, 防止 IPv6 映射绕过。
+  - 默认拒绝回环 (127.0.0.0/8, ::1)、未指定地址 (0.0.0.0, ::)、链路本地 (169.254.0.0/16 含 169.254.169.254, fe80::/10)、组播/广播、云元数据地址 (AWS `fd00:ec2::254`, 阿里云 `100.100.100.200`)。
+  - RFC1918 私网、其余 ULA 及其余 CGNAT 默认放行 (兼容通过服务端访问内网 LAN 场景)。
+- **DNS 解析后即时过滤**:
+  - 新增 `resolve_first_filtered` 与 `connect_smart_filtered`, 在 DNS 解析出实际目标 IP 后逐一过滤, 拒绝并跳过受限 IP, 防范域名解析指向 127.0.0.1 绕过。
+  - 严格限制在服务端 4 处直连出口 (TCP relay、UDP relay 标准、UDP 多路复用 relay、QUIC lean), 不影响客户端与上游中转路径。
+- **入站配置与告警**:
+  - `mirage_server` 入站配置新增 `allow_local_targets: bool` (默认 false); 配置为 true 时放开回环与链路本地。
+  - 目标被拒时 TCP/QUIC 立即终止连接/流, UDP 丢弃报文, 并通过带限频/去重的 warn 日志记录用户名与被阻断目标。
+- **审阅补充**: `resolve_first_filtered` 在解析结果为空时仍返回 `NotFound` (与原 `resolve_first` 一致), 不误报为"被过滤";
+  客户端路径经 `resolve_first` 走同一实现, 行为不变。实现初稿 agy staffer, 全部实测复核。
+
 ### docs(api): 修正 `/api/users` POST 契约 —— 与实现不符
 
 `docs/api-contract.md` 中 #150 写入的 POST 操作格式 (`op` 字段、`add` / `change_password`) 与后端实现不符 (实为
