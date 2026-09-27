@@ -384,7 +384,7 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 - [x] **IPv6 隧道传输** (v0.7.0, 瘦身自"IPv6 全栈") —— 隧道传输走 v6: 服务端 v6 监听 + 客户端 v6 字面量自动加方括号 (`net_util::join_host_port`) + `node_uri` v6。透明数据面 v6 大 epic **评估后否** (fake-IP + 服务端远程解析已让客户端 v6 数据面不必要; 已知限制见 brain `ipv6-full-stack-design`)
 - [x] **UDP 多路复用** (v0.9.0) —— 透明 UDP 的 Mirage 流按 flowkey 散列复用少量 (默认 K=4) 长命共享隧道, 拿掉"并发 UDP 流 ≤ `pool_size`"带机量硬伤 (真机拐点 20→450, 22.5×)。`tuning.udp_mux` 门控默认关 (两端同版)。容量不变量已有 CI 守卫 (v0.9.4)
 - [x] **协议新鲜性加固 (v0.15, 协议断代)** —— 2026-09-26 多模型审计的两条协议级 P1: token tag 绑定 `ClientHello.random` + `"mirage-token-v2"` 域分隔 (换 random 即认证失败), 会话 master salt = `client_random‖server_random` (服务端重启清空 replay cache 也无法重放录制会话), server_random 全 0 两端 fail-closed; cipher agility 协商结果不变时不 rekey (修 ChaCha 下 nonce 复用)。**不兼容旧协议**, 两端 (含 Android) 须同时升级。威胁模型新增 T6
-- [x] **可选前向保密 PFS** (v0.9.3, 外部审计 #2) —— 一次性 X25519 ECDH, 公钥搭 fake-TLS random 字段交换 (零指纹变化 + 高位随机化抗指纹), `password‖ecdh` 混进会话 master; opt-in 两端同开, 失配 fail-closed; install.sh 一键开关
+- [x] **可选前向保密 PFS** (v0.9.3, 外部审计 #2; v0.15 Elligator2 编码) —— 一次性 X25519 ECDH, 公钥经 Elligator2 编码搭 fake-TLS random 字段交换 (消除 Legendre 区分特征 + 高位随机化抗指纹), `password‖ecdh` 混进会话 master; opt-in 两端同开, 失配 fail-closed; install.sh 一键开关
 - [x] **供应链签名 + 多架构容器** (v0.9.3, 外部审计 #13) —— cosign **keyless** (Sigstore OIDC, 零密钥) 签 SHA256SUMS + ghcr 容器镜像 (amd64/arm64, 镜像亦签名); 验签命令见上方「验证产物签名」
 - [x] **外部审计整批清零** (v0.9.2–v0.9.4) —— API 失败限流 (#3) · cargo-deny 供应链门禁 (#11) · start_proxy 巨石拆分 (#4) · config 模板防漂移测试 (#7) · 版本歪斜诊断 (#8) · 解析器 proptest (#12) · 未审计声明 (#1)。纯代码/零密钥项全清, 残余仅 #14 bench (边际) / #10 orphan CI (需 ≥6.1 自托管 runner)
 - [x] **CI 回归哨兵** (v0.9.4) —— mux 容量不变量 · crypto AES/ChaCha 相对吞吐比值 (≥1.3×) · brutal 收敛轨迹; 相对/行为门抗共享 runner 计时噪声

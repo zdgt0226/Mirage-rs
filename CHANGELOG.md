@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### feat(security)!: PFS 模式引入 Elligator2 编码消除 Legendre 区分特征
+
+修复 PFS 模式 (`pfs: true`) 下 `ClientHello.random` 与 `ServerHello.random` 中放裸 X25519 公钥可被审查者单次 Legendre 检验区分的指纹漏洞:
+- **Elligator2 均匀编码**: 引入 `elligator2` crate, 临时公钥经拒绝采样生成并编码为 32B 均匀 representative; 自动处理 torsion-dirty 构造 (`E_pub = clamp(e)·B + T`), 避免公钥恒为素数阶; representative 高 2 位经真随机化填充, 解码时自动 mask。
+- **Fail-Closed 低阶点拒绝**: 协商时经 `elligator2::from_representative` 解码对端 representative 为 Montgomery u 坐标, 并在 ECDH 后强制校验 `SharedSecret::was_contributory()`, 拒绝低阶点使共享秘密退化为全 0 的攻击输入。
+- **BREAKING CHANGE (PFS 线上格式不兼容)**: 开启 PFS 的两端必须同时升级至 v0.15 才能正常协商; 非 PFS 模式 (`pfs: false`) 不受影响。
+
 ### fix(security): 伪造 Client Finished 长度随协商套件动态调整 (审计 P2)
 
 修复客户端 Client Finished fake tail 固定 64B (53B 体) 与真实 TLS 1.3 协商 0x1302 套件时的长度指纹差异:

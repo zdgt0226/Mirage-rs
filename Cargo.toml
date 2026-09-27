@@ -18,6 +18,7 @@ ring = "0.17"
 clap = { version = "4.6.1", features = ["derive"] }
 hex = "0.4.3"
 fastrand = "2.0.1"
+elligator2 = { version = "0.1", features = ["x25519"] }
 hkdf = "0.13.0"
 hmac = "0.13.0"
 ipnet = "2.12.0"
@@ -44,6 +45,7 @@ blake3 = "1.8.5"
 base64 = "0.22.1"
 subtle = "2.6"
 boringtun = "0.7"
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize"] }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "async"] }
 # QUIC 传输 (P0 实验, 默认关; 见 docs/quic-transport-design.md)。rustls 0.23 已在树 (reqwest),
 # 无版本冲突。rustls-ring 复用已有 ring, 保持纯 Rust 交叉编译。

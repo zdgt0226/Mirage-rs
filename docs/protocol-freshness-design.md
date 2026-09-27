@@ -59,8 +59,8 @@ Mirage-rs 作为一款抗审查高性能透明代理，其核心伪装机制建�
 #### 2.1.3 PFS 模式为什么不受影响
 
 开启 PFS 时（`pfs: true`，见 [src/crypto/pfs.rs](file:///opt/Mirage-rs/src/crypto/pfs.rs)）：
-- `ClientHello.random` 承载客户端临时 X25519 公钥 $C_{pk}$；
-- 服务端生成一次性私钥并将其临时公钥 $S_{pk}$ 填入 `ServerHello.random`；
+- `ClientHello.random` 承载客户端临时 X25519 公钥（v0.15 起经 Elligator2 编码为 representative 并随机化高位，消除 Legendre 特征）$C_{pk}$；
+- 服务端生成一次性私钥并将其临时公钥（同样经 Elligator2 编码）$S_{pk}$ 填入 `ServerHello.random`；
 - [src/crypto/aead.rs#L384-L392](file:///opt/Mirage-rs/src/crypto/aead.rs#L384-L392) 的 `derive_master_pfs` 将 ECDH 共享秘密 $\text{X25519}(S_{sk}, C_{pk})$ 混入 IKM。  
 因为服务端私钥 $S_{sk}$ 每连接随机且用完即弃，即便中间人替换或重放历史的 $C_{pk1}$，服务端算出的 ECDH 共享秘密依然是全新的，攻击者无法解密也无法使服务端派生出历史密钥。
 
@@ -233,7 +233,7 @@ let server_random = read_server_handshake(rh).await?;
 | 一次性 Poly1305 key | `SHA256(password ‖ ts ‖ prefix ‖ "mirage-token-v2")` | `TOKEN_DOMAIN` 版本域分隔 |
 | tag | `Poly1305(key, ts ‖ bind)` | TCP fake-TLS: `bind = ClientHello.random`；QUIC lean: `bind = "mirage-quic-lean-v2"`（`QUIC_LEAN_BIND`，两种 token 互不可冒用） |
 | 会话主密钥 (非 PFS) | `HKDF-SHA256(salt = client_random ‖ server_random, ikm = password, info = "mirage-session-v2")` | server_random = 线上实际发出的 ServerHello.random |
-| 会话主密钥 (PFS) | 同 salt，`ikm = password ‖ ecdh`，`info = "mirage-session-v2-pfs"` | PFS 下 server_random 即服务端临时公钥 |
+| 会话主密钥 (PFS) | 同 salt，`ikm = password ‖ ecdh`，`info = "mirage-session-v2-pfs"` | PFS 下 server_random 即服务端临时公钥 (Elligator2 representative) |
 | server_random 全 0 | **客户端与服务端都 fail-closed** | 服务端：模板未写入 random 即拒绝连接（防攻击者扮客户端时派生退化）。前提：伪装模板首条 0x16 record 含完整 ServerHello.random（≥38B，真实服务器几乎不拆），否则 fail-closed（可用性，非安全） |
 | cipher agility | 协商结果 == 当前 cipher 时不 rekey；`rekey()` 只允许 bootstrap ChaCha20 → 其它 cipher，拒绝同 cipher 与回切 ChaCha20 | 修 P1-B（回切会重派 bootstrap 密钥 + nonce 归零） |
 
