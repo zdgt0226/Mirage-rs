@@ -15,6 +15,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // 全局时钟偏移 (秒): server_time = local_time + TIME_OFFSET
 static TIME_OFFSET: AtomicI64 = AtomicI64::new(0);
 
+/// 获取本地当前 Unix 秒时间戳 (纯本地时钟, 不加 TIME_OFFSET 校正)。
+///
+/// 服务端作为时间权威 (校验 session token、发送 TIME_SYNC 下发时间等) 时使用,
+/// 避免同一进程内作为客户端出站时学到的 TIME_OFFSET 污染服务端的权威时间。
+pub fn local_now_sec() -> u64 {
+    // unwrap_or_default: 嵌入式/软路由开机未同步 NTP 时时钟可能 < UNIX_EPOCH,
+    // 绝不在核心时间基准里 panic, 回落到 0。
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// 获取经过校正的当前 Unix 秒时间戳.
 /// auth token、replay cache 等所有协议层时间运算都用这个, 不要直接
 /// SystemTime::now() 否则会绕过同步.
@@ -23,10 +36,7 @@ pub fn now_sec() -> u64 {
     // 可能 < UNIX_EPOCH → duration_since 返回 Err. 绝不能在核心时间基准里 panic
     // 崩掉整个进程. 回落到 0 (epoch), NTP 同步后自动恢复; 服务端 TIME_SYNC 也会
     // 纠正客户端 offset.
-    let local = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let local = local_now_sec() as i64;
     let offset = TIME_OFFSET.load(Ordering::Relaxed);
     (local + offset) as u64
 }
@@ -73,28 +83,43 @@ pub fn set_offset_from_server_time(server_time: u64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
     // TIME_OFFSET 是 process-global atomic, 并行测试会互相覆盖.
     // 拿 Mutex 串行化, 每个测试运行期间独占 atomic.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn local_now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+        local_now_sec()
     }
 
-    fn reset_offset() {
+    pub(crate) fn reset_offset() {
         TIME_OFFSET.store(0, Ordering::Relaxed);
     }
 
     /// 测完工后还原, 避免污染下一个测试 (即便它在隔壁文件).
-    struct OffsetGuard;
+    pub(crate) struct OffsetGuard;
     impl Drop for OffsetGuard {
         fn drop(&mut self) {
             TIME_OFFSET.store(0, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn local_now_sec_ignores_offset() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let _restore = OffsetGuard;
+        reset_offset();
+
+        let local_before = local_now_sec();
+        set_offset_from_server_time(local_before + 100);
+
+        let local_after = local_now_sec();
+        // 两次读本地时钟可能跨秒边界, 容 1s; 关键是没被 +100 的 offset 带走。
+        assert!(local_after - local_before <= 1, "local_now_sec 不应受 offset 影响");
+        assert!((99..=101).contains(&(now_sec() as i64 - local_after as i64)));
     }
 
     #[test]

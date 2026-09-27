@@ -108,11 +108,32 @@ impl TokenReplayCache {
         let mut guard = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let (hwm, cache) = &mut *guard;
 
-        // hwm = 已见的最高桶 (单调)。ts 容忍窗口 ±tol + 桶量化 → 一个仍有效的 token 桶
-        // 最低可到 hwm - 2*tol/bucket (未来向 token 可把 hwm 推到 now_bucket + tol/bucket)。
-        // retain_buckets 已按此推导。参考用 hwm 而非 current_bucket, 旧 token 重放不会把
-        // 参考拉回复活已淘汰桶。
-        *hwm = (*hwm).max(current_bucket);
+        // 检查时钟大幅回拨:
+        // 若 current_bucket + retain_buckets < *hwm, 说明当前 token 的时间戳落后 hwm
+        // 超过了整个保留窗口。
+        //
+        // 为什么清空安全:
+        // 在回拨前已缓存的旧 token, 其 ts 相对新系统时间 now 落在未来, 且超出了容差范围 (> retain_buckets > tol)。
+        // 任何对旧 token 的重放都会直接在 check_and_insert 前被 ts_within_tolerance 拦截,
+        // 根本走不到此处, 故清空旧缓存不会引发历史 token 的重放漏洞。
+        // 反之若不清空, 新时间的桶会被过时的未来 hwm 立即淘汰, 导致时钟追上 hwm 前重放全面失效。
+        //
+        // 为什么不破坏 F1 ("旧 token 重放不能把 hwm 拉回"):
+        // 在调用本方法前, token 已通过 ts_within_tolerance(ts, now, tol) 门控, 合法 token 的 ts 必在 now ± tol 内。
+        // 在时钟单调或正常容差波动下, hwm 最多比 current_bucket 领先 2*tol/bucket + 1 <= retain_buckets,
+        // 因此单个旧 token (即使在容差边缘重放) 绝不会满足 current_bucket + retain_buckets < *hwm,
+        // 只有服务器系统时间 now 本身发生超出保留窗口的大幅回拨时才会触发。
+        if current_bucket.saturating_add(retain_buckets) < *hwm {
+            tracing::warn!(
+                "[REPLAY_CACHE] 检测到系统时钟大幅回拨: current_bucket={}, hwm={}, 重置缓存与 hwm",
+                current_bucket,
+                *hwm
+            );
+            cache.clear();
+            *hwm = current_bucket;
+        } else {
+            *hwm = (*hwm).max(current_bucket);
+        }
         let hwm_val = *hwm;
         cache.retain(|&k, _| hwm_val.saturating_sub(k) <= retain_buckets);
 
@@ -166,7 +187,9 @@ pub fn verify_session_token(
     }
     
     let ts = u64::from_be_bytes(ts_bytes);
-    let now = crate::time_sync::now_sec();
+    // 服务端作为时间权威, 校验 token 必须用纯本地时钟 local_now_sec(),
+    // 避免进程内作为客户端出站时学到的 TIME_OFFSET 污染服务端鉴权时间。
+    let now = crate::time_sync::local_now_sec();
 
     if !ts_within_tolerance(ts, now, tolerance_secs) {
         return false;
@@ -289,7 +312,7 @@ mod tolerance_tests {
 
 #[cfg(test)]
 mod replay_tests {
-    use super::TokenReplayCache;
+    use super::*;
 
     #[test]
     fn first_seen_ok_replay_denied() {
@@ -325,5 +348,61 @@ mod replay_tests {
         assert!(c.check_and_insert(1300, b"now", 2));
         // 桶 100 已淘汰, 这里返回 true 只是证明桶确实被清 (内存有界); 真实场景 ts 校验已挡
         assert!(c.check_and_insert(1000, b"ancient", 2));
+    }
+
+    #[test]
+    fn clock_rollback_resets_cache_and_detects_replay() {
+        let c = TokenReplayCache::new();
+        // 初始在桶 200 (ts = 2000), retain = 2 桶
+        assert!(c.check_and_insert(2000, b"future-tok", 2));
+
+        // 时钟大幅回拨至桶 100 (ts = 1000): 100 + 2 < 200, 触发大幅回拨分支
+        // 第一次插入新时代的 token: 应该放行 (清空旧缓存并重置 hwm 为 100)
+        assert!(c.check_and_insert(1000, b"tok-after-rollback", 2));
+
+        // 同一 token 在回拨后第二次插入: 必须检出为重放 (返回 false)!
+        // (旧实现中因为 hwm 仍为 200, 桶 100 在插入后立即被 retain(<=200-2) 淘汰, 导致重放检测失效)
+        assert!(
+            !c.check_and_insert(1000, b"tok-after-rollback", 2),
+            "回拨后同一 token 第二次插入必须被拒 (重放检测正常生效)"
+        );
+    }
+
+    #[test]
+    fn server_verification_unaffected_by_client_time_offset() {
+        let _g = crate::time_sync::tests::TEST_LOCK.lock().unwrap();
+        let _restore = crate::time_sync::tests::OffsetGuard;
+        crate::time_sync::tests::reset_offset();
+
+        let local = crate::time_sync::local_now_sec();
+        // 模拟客户端出站学到了一个大的 offset (+500s)
+        crate::time_sync::set_offset_from_server_time(local + 500);
+
+        // 验证 local_now_sec() 依然是真实本地时间, 客户端 now_sec() 偏移了 500s
+        // 可能跨秒边界, 容 1s; 关键是没被 +500 的 offset 带走。
+        assert!(crate::time_sync::local_now_sec() - local <= 1);
+        let diff = crate::time_sync::now_sec() as i64 - local as i64;
+        assert!((498..=502).contains(&diff));
+
+        // 构造一个基于服务端本地时间的合法 token (客户端时间正常的情况)
+        let pw = "server-test-pw";
+        let bind = [0x77u8; 32];
+        let mut prefix = [0u8; 8];
+        rand::fill(&mut prefix);
+        let mask = ts_mask(pw, &prefix);
+        let mut hidden_ts = [0u8; 8];
+        let ts_bytes = local.to_be_bytes();
+        for i in 0..8 {
+            hidden_ts[i] = ts_bytes[i] ^ mask[i];
+        }
+        let tag = poly1305_tag(pw.as_bytes(), &ts_bytes, &prefix, &bind);
+        let mut token = [0u8; 32];
+        token[0..8].copy_from_slice(&prefix);
+        token[8..16].copy_from_slice(&hidden_ts);
+        token[16..32].copy_from_slice(&tag);
+
+        // verify_session_token (服务端鉴权) 使用 local_now_sec, 容差 60s,
+        // 即使 TIME_OFFSET 达到 500s, 基于服务端真实时间的 token 依然通过校验!
+        assert!(verify_session_token(pw, &token, &bind, 60), "服务端校验必须不受客户端 offset 污染");
     }
 }

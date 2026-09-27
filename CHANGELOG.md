@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### fix: 2026-09-27 审计剩余 P3 问题修复
+
+- **配额周期滚动原子化与即时生效 (`src/proxy/user_limits.rs`)**:
+  - `UserLimitHandle` 新增 `maybe_rollover(now)`: 基于 Howard Hinnant 日历算法计算预期周期起点 `expected_start`, 当跨越周期时通过 `compare_exchange` 原子 CAS 争抢更新 `period_start`; 仅抢赢的单一线程清零 `period_used` 并调用 `reevaluate_exhausted()`, 彻底消除并发清零写覆盖竞态。
+  - 在新连接握手门控 `is_user_exhausted` 与 `get_user_limit` 返回前以及 API 查询统计时即时触发 `maybe_rollover`, 跨周期后首个连接立即解除超额并清零, 消除旧实现最多延迟 10 分钟的窗口; 后台滚动定时检查间隔从 600s 缩减至 60s。
+- **RESTORED_QUOTAS 内存快照生命周期收敛 (`src/proxy/user_limits.rs`)**:
+  - `RESTORED_QUOTAS` 明确语义为"当前不在注册表中的用户的最近已知用量": `build_registry` 在新用户分支消费 snapshot 后从 map 中即刻移除; `restore_persisted_quotas` 对已在注册表中的用户应用后不再保留进 map。
+  - 配置热重载 `reload_user_limits` 时, 自动将本次被移除用户的当前 `period_used`/`period_start` 写入 map, 确保在同周期内删除后重新加回时保留原有用量, 跨周期时不沿用。
+- **重放缓存对时钟大幅回拨自愈 (`src/crypto/hello_auth.rs`)**:
+  - `TokenReplayCache::check_and_insert` 新增大幅回拨检测: 当 `current_bucket.saturating_add(retain_buckets) < hwm` 时判定服务器系统时钟大幅回拨, 记录 warn 日志并清空 cache、重置 `hwm = current_bucket` 后正常插入, 避免回拨期间新桶被未来 hwm 立即淘汰导致重放检测失效。
+  - 论证清空安全性: 回拨前已缓存 token 的 ts 相对回拨后的本地时间落在未来且超出容差, 任何旧 token 重放均在门控前被 `ts_within_tolerance` 拦截; 且单个旧 token 绝无法满足回拨条件, 完全保留 F1 语义。
+- **服务端权威鉴权时钟与客户端 TIME_OFFSET 隔离 (`src/time_sync.rs`, `src/crypto/hello_auth.rs`)**:
+  - 新增 `time_sync::local_now_sec()` 纯本地时钟基准 (不加 TIME_OFFSET, unwrap_or_default 防 panic); 服务端校验会话 token (`verify_session_token`) 以及下发 TIME_SYNC 帧时统一改用 `local_now_sec`, 杜绝同一进程内作为客户端出站时同步到的 `TIME_OFFSET` 污染服务端的权威时间基准。
+- **客户端握手 TIME_SYNC 与 CIPHER_ACK 接收改为 Fail-Closed (`src/proxy/pool.rs`)**:
+  - 客户端在连接池握手阶段等待服务端主动下发的 TIME_SYNC 帧改为严格 fail-closed: 接收超时 (3s)、解密失败或帧格式异常 (长度/类型/版本) 均直接返回 Err 关闭隧道, 客户端不再兼容 v0.14 以前不发 TIME_SYNC 的老服务端, 避免迟到的时间帧污染隧道上层应用数据或将转至伪装站的死隧道误入连接池。
+  - 发送 `CIPHER_NEGO` 协商后, 若接收 `CIPHER_ACK` 发生超时 (3s)、格式异常或 recv 错误, 同样直接返回 Err 关闭隧道, 防止两端 cipher/rekey 状态不一致导致死连接入池。
+- **审阅修正**: `maybe_rollover` 初稿抢到 CAS 后 `store(0)` —— CAS 与清零之间其它线程已按新周期 `record_bytes` 的字节会被一并抹掉 (其并发测试断言恰为此场景, 会偶发失败)。改为 CAS 前快照旧用量、抢到后 `saturating_sub` 只减旧周期部分。另修两处测试对 `local_now_sec()` 两次读取做精确相等断言 (跨秒边界偶发失败), 改为容 1s。
+
 ### feat(security)!: PFS 模式引入 Elligator2 编码消除 Legendre 区分特征
 
 修复 PFS 模式 (`pfs: true`) 下 `ClientHello.random` 与 `ServerHello.random` 中放裸 X25519 公钥可被审查者单次 Legendre 检验区分的指纹漏洞:
