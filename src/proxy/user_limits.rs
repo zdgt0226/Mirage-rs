@@ -156,6 +156,46 @@ impl UserLimitHandle {
         self.exhausted.load(Ordering::Relaxed)
     }
 
+    /// 检查并按需执行配额周期滚动 (CAS 保证并发安全)。
+    ///
+    /// 跨周期后首次握手门控 (`is_user_exhausted`)、获取 handle (`get_user_limit`)
+    /// 以及后台 60s 定时检查任务均会调用此方法。
+    ///
+    /// 设计说明 (不缓存 next_period_start 的考量):
+    /// `compute_period_start` 基于 Howard Hinnant 日历算法, 纯整数算术运算 (除以常数与少量加减分支),
+    /// 无系统调用、无堆内存分配、无锁, 单次耗时仅约 10ns; 且 `maybe_rollover` 仅在建连握手与 60s
+    /// 定时任务中调用, 并不处于每数据块转发的极其严苛热路径 (`charge()`) 上, 故不额外缓存下一周期起点,
+    /// 避免在账单日热重载或跨年时维护冗余原子状态的同步复杂度。
+    ///
+    /// 并发安全性:
+    /// 当跨入新周期时, 仅由 `compare_exchange` 抢赢将 `period_start` CAS 更新为 `expected_start`
+    /// 的单一线程负责将 `period_used` 清零并调用 `reevaluate_exhausted` (尊重配额 0 等边界),
+    /// 其余未抢赢的并发线程直接返回, 避免已在新周期累加的用量被重复清零抹掉。
+    pub fn maybe_rollover(&self, now: u64) {
+        let reset_day = self.reset_day();
+        let expected_start = compute_period_start(now, reset_day);
+        let cur_start = self.period_start.load(Ordering::Relaxed);
+        if cur_start == expected_start {
+            return;
+        }
+        // CAS 前先快照旧周期用量; 抢到的线程只减掉这部分 (而非 store(0))。CAS 之后其它线程看到的
+        // 已是新周期、会立即 record_bytes —— 直接清零会把这些新周期字节一并抹掉。快照与 CAS 之间
+        // 记入的少量字节归入新周期 (偏向多计, 安全侧)。saturating: 与 reset_user_quota 并发清零时不下溢。
+        let old_used = self.period_used.load(Ordering::SeqCst);
+        if self
+            .period_start
+            .compare_exchange(cur_start, expected_start, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            let _ = self.period_used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| Some(u.saturating_sub(old_used)));
+            self.reevaluate_exhausted();
+            info!(
+                "[USER_LIMITS] 用户 `{}` 滚动进入新配额周期 (起点 {}), 用量已清零",
+                self.name, expected_start
+            );
+        }
+    }
+
     /// 查询该用户是否已超额
     pub fn is_exhausted(&self) -> bool {
         self.exhausted.load(Ordering::Relaxed)
@@ -213,7 +253,7 @@ pub fn build_registry(
     now_secs: u64,
 ) -> UserLimitsRegistry {
     let mut map = HashMap::new();
-    let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+    let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
 
     for u in users {
         if u.name == "default" {
@@ -242,8 +282,8 @@ pub fn build_registry(
             continue;
         }
 
-        // 新用户 (或启动): 若刚从持久化文件恢复过同周期用量则沿用。
-        let period_used = match restored.get(&u.name) {
+        // 新用户 (或启动): 若刚从持久化文件恢复过同周期用量则沿用, 并从 restored map 中移除。
+        let period_used = match restored.remove(&u.name) {
             Some(p) if p.period_start == expected_start => p.period_bytes,
             _ => 0,
         };
@@ -291,6 +331,24 @@ pub fn reload_user_limits(users: &[crate::config::MirageUser]) {
     let now = current_unix_time();
     let old = registry_slot().load();
     let reg = build_registry(users, Some(&old), now);
+
+    // 对被移除的用户 (旧注册表有、新 users 没有), 把其当前 period_used/period_start 写入 restored map,
+    // 保证在同一周期内删后再加回时不会清零用量。
+    {
+        let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+        for (name, handle) in &old.users {
+            if !reg.users.contains_key(name) {
+                restored.insert(
+                    name.clone(),
+                    UserQuotaPersist {
+                        period_bytes: handle.period_used.load(Ordering::Relaxed),
+                        period_start: handle.period_start.load(Ordering::Relaxed),
+                    },
+                );
+            }
+        }
+    }
+
     let count = reg.users.len();
     registry_slot().store(Arc::new(reg));
     info!("[USER_LIMITS] 热重载完成, 已更新 {} 位用户限速与配额", count);
@@ -327,40 +385,37 @@ pub fn export_persisted_quotas() -> HashMap<String, UserQuotaPersist> {
 pub fn restore_persisted_quotas(data: HashMap<String, UserQuotaPersist>) {
     let now = current_unix_time();
     let reg = registry_slot().load();
-    for (name, p) in &data {
-        if let Some(h) = reg.users.get(name) {
+    let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+    restored.clear();
+    for (name, p) in data {
+        if let Some(h) = reg.users.get(&name) {
             let expected_start = compute_period_start(now, h.reset_day());
             if p.period_start == expected_start {
                 h.period_start.store(p.period_start, Ordering::SeqCst);
                 h.period_used.store(p.period_bytes, Ordering::SeqCst);
                 h.reevaluate_exhausted();
             }
+            // 已在注册表中的用户不保留在 restored 中
+        } else {
+            // 只保留注册表里还没有的用户的条目
+            restored.insert(name, p);
         }
     }
-    let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
-    *restored = data;
 }
 
-/// 周期滚动检查: 进入新周期则清零已用量与 exhausted
+/// 周期滚动检查: 对所有活跃用户句柄调用 maybe_rollover
 pub fn check_period_rollover() {
     let now = current_unix_time();
     let reg = registry_slot().load();
-    for (name, h) in &reg.users {
-        let expected_start = compute_period_start(now, h.reset_day());
-        let cur_start = h.period_start.load(Ordering::Relaxed);
-        if expected_start != cur_start {
-            h.period_start.store(expected_start, Ordering::SeqCst);
-            h.period_used.store(0, Ordering::SeqCst);
-            h.exhausted.store(false, Ordering::SeqCst);
-            info!("[USER_LIMITS] 用户 `{}` 滚动进入新配额周期 (起点 {}), 用量已清零", name, expected_start);
-        }
+    for h in reg.users.values() {
+        h.maybe_rollover(now);
     }
 }
 
-/// 启动每 10 分钟一次的配额周期滚动定时检查任务
+/// 启动每 60 秒一次的配额周期滚动定时检查任务
 pub fn start_rollover_task() {
     tokio::spawn(async {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
             check_period_rollover();
@@ -368,22 +423,31 @@ pub fn start_rollover_task() {
     });
 }
 
-/// 获取指定用户的限速与配额句柄 (连接建立时查询一次)
+/// 获取指定用户的限速与配额句柄 (连接建立时查询一次, 返回前检查周期滚动)
 pub fn get_user_limit(name: &str) -> Option<Arc<UserLimitHandle>> {
-    registry_slot().load().users.get(name).cloned()
+    let now = current_unix_time();
+    let h = registry_slot().load().users.get(name).cloned()?;
+    h.maybe_rollover(now);
+    Some(h)
 }
 
-/// 判定指定用户当前是否已超额 (握手鉴权快速门控)
+/// 判定指定用户当前是否已超额 (握手鉴权快速门控, 门控前检查周期滚动)
 pub fn is_user_exhausted(name: &str) -> bool {
     if name == "default" {
         return false;
     }
-    registry_slot().load().users.get(name).is_some_and(|h| h.is_exhausted())
+    let now = current_unix_time();
+    registry_slot().load().users.get(name).is_some_and(|h| {
+        h.maybe_rollover(now);
+        h.is_exhausted()
+    })
 }
 
 /// 获取用户本周期统计 (供 API 查询): (已用字节, 周期起点, 是否超额)
 pub fn get_user_period_stats(name: &str) -> (u64, u64, bool) {
+    let now = current_unix_time();
     if let Some(h) = registry_slot().load().users.get(name) {
+        h.maybe_rollover(now);
         (
             h.period_used.load(Ordering::Relaxed),
             h.period_start.load(Ordering::Relaxed),
@@ -602,5 +666,185 @@ mod tests {
 
         restore_persisted_quotas(exported);
         assert_eq!(h.period_used.load(Ordering::Relaxed), 4096);
+    }
+
+    #[test]
+    fn test_is_user_exhausted_immediate_rollover() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let user = MirageUser {
+            name: "rollover_user".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(1.0),
+            quota_reset_day: Some(1),
+        };
+        init_user_limits(&[user]);
+        let h = get_user_limit("rollover_user").unwrap();
+
+        // 模拟上个周期的超额状态: 把 period_start 改为上个月, 用量设为超额
+        let past_start = h.period_start.load(Ordering::Relaxed).saturating_sub(35 * 86400);
+        h.period_start.store(past_start, Ordering::SeqCst);
+        h.period_used.store((1.5 * BYTES_PER_GB) as u64, Ordering::SeqCst);
+        h.reevaluate_exhausted();
+        assert!(h.is_exhausted(), "上周期应为超额状态");
+
+        // 跨周期后首次调用 is_user_exhausted: 必须立即解除超额并清零
+        let exhausted = is_user_exhausted("rollover_user");
+        assert!(!exhausted, "跨周期后首次门控检查必须立即解除超额");
+        assert_eq!(h.period_used.load(Ordering::Relaxed), 0, "跨周期后已用字节必须清零");
+        assert!(!h.is_exhausted());
+    }
+
+    #[test]
+    fn test_maybe_rollover_concurrency() {
+        // 构造一个处于旧周期的 handle
+        let past_start = 1_000_000u64;
+        let future_now = 2_000_000u64;
+        let expected_start = compute_period_start(future_now, 1);
+        assert_ne!(past_start, expected_start);
+
+        let handle = Arc::new(UserLimitHandle::new(
+            "concurrent_user",
+            None,
+            Some(100_000),
+            1,
+            past_start,
+            5000,
+        ));
+
+        // 启动 10 个线程并发执行 maybe_rollover, 并在完成后各自累加 100 字节
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let h = handle.clone();
+            handles.push(std::thread::spawn(move || {
+                h.maybe_rollover(future_now);
+                // 模拟滚动完成后的新业务流量
+                h.record_bytes(100);
+            }));
+        }
+
+        for j in handles {
+            j.join().unwrap();
+        }
+
+        assert_eq!(handle.period_start.load(Ordering::Relaxed), expected_start);
+        // 并发多线程中仅有一个 CAS 赢家将 period_used 清零, 之后的 10 次 record_bytes(100) 不被覆盖
+        assert_eq!(
+            handle.period_used.load(Ordering::Relaxed),
+            1000,
+            "并发滚动只清零一次, 后续 record_bytes 不被抹掉"
+        );
+    }
+
+    #[test]
+    fn test_restored_quotas_consumed_and_removed() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_user_limits(&[]);
+
+        let now = current_unix_time();
+        let expected_start = compute_period_start(now, 1);
+
+        // 启动快照: 包含未在注册表中的用户 "newbie"
+        let mut snap = HashMap::new();
+        snap.insert("newbie".to_string(), UserQuotaPersist {
+            period_bytes: 2048,
+            period_start: expected_start,
+        });
+        restore_persisted_quotas(snap);
+
+        // 确认 newbie 在 restored map 中
+        {
+            let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(restored.contains_key("newbie"));
+        }
+
+        // 热重载: 新增用户 "newbie"
+        let newbie = MirageUser {
+            name: "newbie".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(1.0),
+            quota_reset_day: Some(1),
+        };
+        reload_user_limits(&[newbie]);
+
+        // 应该拿到快照值 2048
+        let h = get_user_limit("newbie").unwrap();
+        assert_eq!(h.period_used.load(Ordering::Relaxed), 2048);
+
+        // 且 restored map 中的该条已被移除
+        {
+            let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!restored.contains_key("newbie"), "消费后必须从 restored map 移除");
+        }
+    }
+
+    #[test]
+    fn test_user_removal_and_readdition_preserves_usage() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let grace = MirageUser {
+            name: "grace".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(1.0),
+            quota_reset_day: Some(1),
+        };
+        init_user_limits(std::slice::from_ref(&grace));
+        let h = get_user_limit("grace").unwrap();
+        h.record_bytes(8192);
+
+        // 热重载: 移除用户 grace
+        reload_user_limits(&[]);
+        assert!(get_user_limit("grace").is_none());
+
+        // restored map 中应保存 grace 移除时的用量 8192
+        {
+            let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(restored.get("grace").unwrap().period_bytes, 8192);
+        }
+
+        // 同一周期内再加回 grace
+        reload_user_limits(&[grace]);
+        let h2 = get_user_limit("grace").unwrap();
+        assert_eq!(h2.period_used.load(Ordering::Relaxed), 8192, "加回后必须保留删前用量");
+
+        // restored map 中应已被消费清除
+        {
+            let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!restored.contains_key("grace"));
+        }
+    }
+
+    #[test]
+    fn test_cross_period_restored_not_applied() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        init_user_limits(&[]);
+
+        // 在 restored 中塞入一个周期起点不匹配的记录
+        {
+            let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+            restored.insert("helen".to_string(), UserQuotaPersist {
+                period_bytes: 9999,
+                period_start: 12345, // 不匹配当前周期
+            });
+        }
+
+        let helen = MirageUser {
+            name: "helen".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(1.0),
+            quota_reset_day: Some(1),
+        };
+        reload_user_limits(&[helen]);
+
+        let h = get_user_limit("helen").unwrap();
+        assert_eq!(h.period_used.load(Ordering::Relaxed), 0, "跨周期记录不应沿用");
+
+        // 且该条依然已被消费移除
+        {
+            let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
+            assert!(!restored.contains_key("helen"));
+        }
     }
 }

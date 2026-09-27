@@ -68,10 +68,8 @@ pub(super) async fn dispatch_authenticated(
     // 3.5 v0.4 协议: 通过加密 channel 主动下发服务器时间, 让客户端无需 NTP/HTTP 探测.
     //     帧格式: [0x01 type=TIME_SYNC][0x01 proto_ver][8B u64 BE server unix sec] = 10 字节
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        // unwrap_or_default: 服务端时钟 < epoch (嵌入式无 RTC 未同步 NTP) 不 panic
-        // 崩溃, 回落 0. 见 time_sync::now_sec 注释.
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        // 服务端作为时间权威, 恒取纯本地时钟 local_now_sec, 不受出站学到的 TIME_OFFSET 污染。
+        let now = crate::time_sync::local_now_sec();
         let mut frame = [0u8; 10];
         frame[0] = 0x01; // type = TIME_SYNC
         // proto_ver: 开了 cipher_agility 才广播 0x02 (老客户端严格只认 0x01, 见 config 注释)。

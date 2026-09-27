@@ -677,33 +677,21 @@ impl WarmPool {
             },
         };
 
-        // 5. v0.4 协议: 收 server 主动下发的 TIME_SYNC 帧, 写入全局 TIME_OFFSET.
-        //    帧格式: [0x01 type][0x01 ver][8B u64 BE server unix sec] = 10 字节
-        //    失败/超时降级: 用 local time 继续 (不阻塞连接), 仅 INFO 一次.
+        // 5. v0.4+ 协议: 收 server 主动下发的 TIME_SYNC 帧, 写入全局 TIME_OFFSET.
+        //    帧格式: [0x01 type][0x01/0x02 ver][8B u64 BE server unix sec] = 10 字节
+        //    v0.15 改为 fail-closed: v0.15 服务端恒发 TIME_SYNC, 超时 / 解密失败 / 非预期帧
+        //    均直接返回错误放弃该连接。杜绝迟到的 TIME_SYNC 帧污染上层数据、认证失败连接
+        //    (被转伪装站) 误入连接池等问题。
         // proto_ver 0x02 = 服务端开了 cipher agility, 需在下方协商。
-        let mut server_agility = false;
-        match tokio::time::timeout(
+        let server_agility = match tokio::time::timeout(
             std::time::Duration::from_secs(3),
             crypto_reader.recv_data()
         ).await {
-            Ok(Ok(data)) if data.len() == 10 && data[0] == 0x01
-                && (data[1] == crate::crypto::cipher::PROTO_VER_LEGACY
-                    || data[1] == crate::crypto::cipher::PROTO_VER_AGILITY) =>
-            {
-                server_agility = data[1] == crate::crypto::cipher::PROTO_VER_AGILITY;
-                let server_time = u64::from_be_bytes(data[2..10].try_into().unwrap());
-                crate::time_sync::set_offset_from_server_time(server_time);
-            }
-            Ok(Ok(data)) => {
-                tracing::warn!(
-                    "TIME_SYNC: unexpected frame (len={}, type={:?}), proceeding without sync",
-                    data.len(), data.first()
-                );
-            }
+            Ok(Ok(data)) => process_time_sync_frame(&data)?,
             Ok(Err(e)) => {
                 // 解密失败 = 服务端很可能拒了本次认证、把连接转发到了伪装站, 我们却在用
                 // 密码派生的会话密钥去解伪装站的 TLS 流量 → 解不开。这是"认证没过"的信号。
-                // 池子每次补货都会撞到, 故只详细提示一次 (避免刷屏)。两大常见原因见下。
+                // 池子每次补货都会撞到, 故只详细提示一次 (避免刷屏)。
                 static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !HINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     // 统一诊断文案 (与服务端 control.rs 共用, 见 hello_auth::session_decrypt_failure_hint)。
@@ -713,34 +701,44 @@ impl WarmPool {
                         crate::crypto::hello_auth::session_decrypt_failure_hint()
                     );
                 } else {
-                    tracing::debug!("TIME_SYNC: recv failed: {:?}, proceeding without sync", e);
+                    tracing::debug!("TIME_SYNC: recv failed: {:?}", e);
                 }
+                anyhow::bail!("TIME_SYNC 接收/解密失败: {:?}", e);
             }
             Err(_) => {
-                tracing::info!("TIME_SYNC: timeout waiting for server time (3s), proceeding with local time. Old server?");
+                tracing::warn!("TIME_SYNC: 等待服务端时间帧超时 (3s), 放弃建连 (fail-closed)");
+                anyhow::bail!("TIME_SYNC 等待超时 (3s)");
             }
-        }
+        };
 
         // 6. cipher agility 协商 (仅服务端广播 0x02 时): 发 CIPHER_NEGO(本机AES), 读 CIPHER_ACK,
         //    两端 rekey 到协商 cipher。协商在加密 ChaCha20 信道内完成, ClientHello 未动 (指纹不变)。
-        //    任何失败 → 保持 ChaCha20 (fail-safe, 不影响连接可用性)。
+        //    v0.15 fail-closed: 已发送 CIPHER_NEGO 后, CIPHER_ACK 超时 / 格式异常 / recv 错误
+        //    均直接报错断开, 避免两端密钥或密码套件状态不同步导致死隧道入池。
         if server_agility {
             let nego = crate::crypto::cipher::build_cipher_nego(crate::crypto::cipher::local_supports_aes());
-            if crypto_writer.send_data(&nego).await.is_ok() {
-                match tokio::time::timeout(std::time::Duration::from_secs(3), crypto_reader.recv_data()).await {
-                    Ok(Ok(ack)) => {
-                        if let Some(final_cipher) = crate::crypto::cipher::parse_cipher_ack(&ack) {
-                            if final_cipher != crypto_writer.cipher() {
-                                crypto_writer.rekey(final_cipher);
-                                crypto_reader.rekey(final_cipher);
-                            }
-                            tracing::debug!("cipher agility 协商为 {:?}", final_cipher);
-                        } else {
-                            tracing::warn!("cipher agility: CIPHER_ACK 格式异常, 维持 ChaCha20");
-                        }
-                    }
-                    _ => tracing::warn!("cipher agility: 未收到 CIPHER_ACK, 维持 ChaCha20"),
+            crypto_writer.send_data(&nego).await
+                .map_err(|e| anyhow::anyhow!("cipher agility: 发送 CIPHER_NEGO 失败: {e}"))?;
+            let ack = match tokio::time::timeout(std::time::Duration::from_secs(3), crypto_reader.recv_data()).await {
+                Ok(Ok(ack)) => ack,
+                Ok(Err(e)) => {
+                    tracing::warn!("cipher agility: 接收 CIPHER_ACK 失败: {e}");
+                    anyhow::bail!("cipher agility: 接收 CIPHER_ACK 失败: {e}");
                 }
+                Err(_) => {
+                    tracing::warn!("cipher agility: 等待 CIPHER_ACK 超时 (3s)");
+                    anyhow::bail!("cipher agility: 等待 CIPHER_ACK 超时 (3s)");
+                }
+            };
+            if let Some(final_cipher) = crate::crypto::cipher::parse_cipher_ack(&ack) {
+                if final_cipher != crypto_writer.cipher() {
+                    crypto_writer.rekey(final_cipher);
+                    crypto_reader.rekey(final_cipher);
+                }
+                tracing::debug!("cipher agility 协商为 {:?}", final_cipher);
+            } else {
+                tracing::warn!("cipher agility: CIPHER_ACK 格式异常");
+                anyhow::bail!("cipher agility: CIPHER_ACK 格式异常");
             }
         }
 
@@ -1017,10 +1015,79 @@ impl Drop for WarmPool {
     }
 }
 
+/// 处理接收到的 TIME_SYNC 帧数据, 返回是否启用 cipher agility (bool)。
+/// 抽成独立函数便于单元测试 (不依赖网络 IO)。
+pub(crate) fn process_time_sync_frame(data: &[u8]) -> anyhow::Result<bool> {
+    if data.len() == 10 && data[0] == 0x01
+        && (data[1] == crate::crypto::cipher::PROTO_VER_LEGACY
+            || data[1] == crate::crypto::cipher::PROTO_VER_AGILITY)
+    {
+        let server_agility = data[1] == crate::crypto::cipher::PROTO_VER_AGILITY;
+        let server_time = u64::from_be_bytes(data[2..10].try_into().unwrap());
+        crate::time_sync::set_offset_from_server_time(server_time);
+        Ok(server_agility)
+    } else {
+        tracing::warn!(
+            "TIME_SYNC: unexpected frame (len={}, type={:?})",
+            data.len(),
+            data.first()
+        );
+        anyhow::bail!(
+            "TIME_SYNC 非预期帧 (len={}, type={:?})",
+            data.len(),
+            data.first()
+        )
+    }
+}
+
 #[cfg(test)]
 mod pool_handshake_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn process_time_sync_frame_accepts_legacy_and_agility() {
+        let _g = crate::time_sync::tests::TEST_LOCK.lock().unwrap();
+        let _restore = crate::time_sync::tests::OffsetGuard;
+        crate::time_sync::tests::reset_offset();
+
+        let now = crate::time_sync::local_now_sec();
+        // 1. Legacy version (0x01)
+        let mut frame_legacy = [0u8; 10];
+        frame_legacy[0] = 0x01;
+        frame_legacy[1] = crate::crypto::cipher::PROTO_VER_LEGACY;
+        frame_legacy[2..10].copy_from_slice(&(now + 10).to_be_bytes());
+
+        let res = process_time_sync_frame(&frame_legacy);
+        assert!(res.is_ok());
+        assert!(!res.unwrap(), "Legacy proto_ver 不开启 agility");
+
+        // 2. Agility version (0x02)
+        let mut frame_agility = [0u8; 10];
+        frame_agility[0] = 0x01;
+        frame_agility[1] = crate::crypto::cipher::PROTO_VER_AGILITY;
+        frame_agility[2..10].copy_from_slice(&(now + 20).to_be_bytes());
+
+        let res = process_time_sync_frame(&frame_agility);
+        assert!(res.is_ok());
+        assert!(res.unwrap(), "Agility proto_ver 必须开启 agility");
+    }
+
+    #[test]
+    fn process_time_sync_frame_fails_closed_on_malformed_frame() {
+        // 长度不足
+        assert!(process_time_sync_frame(&[0x01, 0x01]).is_err());
+        // 长度过长
+        assert!(process_time_sync_frame(&[0x01; 11]).is_err());
+        // 错误帧类型 (type != 0x01)
+        let mut bad_type = [0x01u8; 10];
+        bad_type[0] = 0x02;
+        assert!(process_time_sync_frame(&bad_type).is_err());
+        // 错误协议版本 (ver != 0x01 && ver != 0x02)
+        let mut bad_ver = [0x01u8; 10];
+        bad_ver[1] = 0x03;
+        assert!(process_time_sync_frame(&bad_ver).is_err());
+    }
 
     fn build_mock_server_flight(server_random: &[u8; 32], cipher: u16) -> Vec<u8> {
         let mut flight = Vec::new();
