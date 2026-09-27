@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### feat(security)!: PFS 模式引入 Elligator2 编码消除 Legendre 区分特征
+
+修复 PFS 模式 (`pfs: true`) 下 `ClientHello.random` 与 `ServerHello.random` 中放裸 X25519 公钥可被审查者单次 Legendre 检验区分的指纹漏洞:
+- **Elligator2 均匀编码**: 引入 `elligator2` crate, 临时公钥经拒绝采样生成并编码为 32B 均匀 representative; 自动处理 torsion-dirty 构造 (`E_pub = clamp(e)·B + T`), 避免公钥恒为素数阶; representative 高 2 位经真随机化填充, 解码时自动 mask。
+- **Fail-Closed 低阶点拒绝**: 协商时经 `elligator2::from_representative` 解码对端 representative 为 Montgomery u 坐标, 并在 ECDH 后强制校验 `SharedSecret::was_contributory()`, 拒绝低阶点使共享秘密退化为全 0 的攻击输入。
+- **BREAKING CHANGE (PFS 线上格式不兼容)**: 开启 PFS 的两端必须同时升级至 v0.15 才能正常协商; 非 PFS 模式 (`pfs: false`) 不受影响。
+
 ### fix(security): 伪造 Client Finished 长度随协商套件动态调整 (审计 P2)
 
 修复客户端 Client Finished fake tail 固定 64B (53B 体) 与真实 TLS 1.3 协商 0x1302 套件时的长度指纹差异:
@@ -22,7 +29,7 @@
 ### fix: /api/users 的 reset_quota 延后至写配置成功后执行 (审计 P3)
 
 - **事务时序修正**: 将 `handle_post_users` 中的 `reset_quota` 操作挪至配置未修改直接返回以及 `atomic_write_config` 成功返回的两条成功路径上执行; 当请求因其他错误或落盘失败中断时, 保证不会误清空用户配额用量。
-- **审阅修正 (测试)**: 新增的 reset_quota 测试会替换进程级用户限额注册表, 与既有 `eve`/`frank`/`grace` 测试并行时互相覆盖 (持有的句柄与注册表脱节 → 偶发失败)。新增 `#[cfg(test)] REGISTRY_TEST_LOCK`, 所有 init 注册表的测试先持锁串行。
+- **审阅修正 (测试)**: 新增的 reset_quota 测试会替换进程级用户限额注册表, 与既有 `eve`/`frank`/`grace` 测试并行时互相覆盖 (持有的句柄与注册表脱节 → 偶发失败)。新增 `#[cfg(test)] REGISTRY_TEST_LOCK`, 所有 init 注册表的测试先持锁串行。 后续补漏 (CI 偶发失败暴露): `config_watcher::build_state` 会 reload 注册表, 其测试辅助 `forwarder_for` 也须持锁。
 
 ### fix: 统计持久化与配置原子写增加 fsync 防止掉电文件截断 (审计 P3)
 
