@@ -131,31 +131,67 @@ fn split_host_port(target: &str) -> Option<(&str, u16)> {
     Some((host, port))
 }
 
-/// 解析 host+port 为**首选** SocketAddr (IPv4 优先). host 是 IP 字面量则直接构造
-/// 不解析; 是域名则走 60s 缓存 + 并发限流. 供无连接场景 (UDP 转发) 用 —— 让服务端
-/// UDP relay 遇域名也享受缓存 + 洪泛防护, 不再每包裸调 lookup_host 打满阻塞池.
-pub(crate) async fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
+/// 解析 host+port 为首选 SocketAddr (IPv4 优先), 并应用自定义 filter 过滤 (用于服务端出站防 SSRF)。
+/// 若 host 为 IP 字面量, 校验 filter; 若为域名则走 60s 缓存解析并选首个通过 filter 的 IP。
+/// 若全部解析 IP 均被过滤, 返回 io::ErrorKind::PermissionDenied。
+pub(crate) async fn resolve_first_filtered<F>(
+    host: &str,
+    port: u16,
+    mut filter: F,
+) -> io::Result<SocketAddr>
+where
+    F: FnMut(IpAddr) -> bool,
+{
     if let Ok(ip) = host.parse::<IpAddr>() {
+        if !filter(ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("egress to {ip} not allowed"),
+            ));
+        }
         return Ok(SocketAddr::new(ip, port));
     }
     let ips = resolve_cached(host, port).await?;
-    ips.into_iter()
-        .next()
-        .map(|ip| SocketAddr::new(ip, port))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}")))
+    if ips.is_empty() {
+        // 与原 resolve_first 一致: 无解析结果 = NotFound, 别误报成"被过滤" (客户端路径也走这里)。
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}")));
+    }
+    for ip in ips {
+        if filter(ip) {
+            return Ok(SocketAddr::new(ip, port));
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("all addresses for {host} were filtered"),
+    ))
 }
 
-/// 智能连接 "host:port". host 是 IP 字面量则直连; 是域名则走缓存解析 +
-/// IPv4 优先 + 每尝试超时. 返回首个连上的 TcpStream.
-pub async fn connect_smart(target: &str) -> io::Result<TcpStream> {
+/// 解析 host+port 为**首选** SocketAddr (IPv4 优先). host 是 IP 字面量则直接构造
+/// 不解析; 是域名则走 60s 缓存 + 并发限流. 默认不过滤 (供客户端 handler 等使用)。
+pub(crate) async fn resolve_first(host: &str, port: u16) -> io::Result<SocketAddr> {
+    resolve_first_filtered(host, port, |_| true).await
+}
+
+/// 智能连接 "host:port" 并应用自定义 filter 过滤 (用于服务端出站防 SSRF)。
+/// host 是 IP 字面量则校验 filter 后直连; 是域名则走缓存解析 + IPv4 优先 + 每尝试超时 + 跳过被拒候选。
+/// 若全部解析 IP 均被过滤, 返回 io::ErrorKind::PermissionDenied。
+pub async fn connect_smart_filtered<F>(target: &str, mut filter: F) -> io::Result<TcpStream>
+where
+    F: FnMut(IpAddr) -> bool,
+{
     let (host, port) = split_host_port(target).ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("bad target: {target}"))
     })?;
 
-    // host 已是 IP → 直连, 不解析不缓存 (对应日志里 target=180.101.49.44:443, connect 6ms)
-    // 超时和域名路径一致: 少了这个就只能等内核的 TCP 重传超时 (~130s), 被墙/黑洞的
-    // 裸 IP 目的地会把这条连接吊死两分钟。
+    // host 已是 IP → 直连, 不解析不缓存
     if let Ok(ip) = host.parse::<IpAddr>() {
+        if !filter(ip) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("egress to {ip} not allowed"),
+            ));
+        }
         let addr = SocketAddr::new(ip, port);
         return match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(r) => r,
@@ -166,10 +202,15 @@ pub async fn connect_smart(target: &str) -> io::Result<TcpStream> {
         };
     }
 
-    // 域名 → 缓存解析 + 候选逐一试
+    // 域名 → 缓存解析 + 候选逐一试 (跳过被 filter 拒绝的地址)
     let ips = resolve_cached(host, port).await?;
     let mut last_err: Option<io::Error> = None;
+    let mut any_allowed = false;
     for ip in ips {
+        if !filter(ip) {
+            continue;
+        }
+        any_allowed = true;
         let addr = SocketAddr::new(ip, port);
         match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => return Ok(s),
@@ -182,9 +223,21 @@ pub async fn connect_smart(target: &str) -> io::Result<TcpStream> {
             }
         }
     }
+    if !any_allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("all resolved addresses for {host} were filtered"),
+        ));
+    }
     Err(last_err.unwrap_or_else(|| {
         io::Error::new(io::ErrorKind::AddrNotAvailable, format!("all addresses failed for {host}"))
     }))
+}
+
+/// 智能连接 "host:port". host 是 IP 字面量则直连; 是域名则走缓存解析 +
+/// IPv4 优先 + 每尝试超时. 默认不过滤 (供客户端 handler 使用).
+pub async fn connect_smart(target: &str) -> io::Result<TcpStream> {
+    connect_smart_filtered(target, |_| true).await
 }
 
 // ── DNS-over-TCP 解析 (tuning.dns_tcp_resolver, UDP 被封的 VPS 用) ─────────────
@@ -400,6 +453,32 @@ mod dns_tcp_tests {
         let mut r = vec![0, 0, 0x81, 0x80, 0, 0, 0, 1, 0, 0, 0, 0];
         r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01, 0, 0, 1, 44, 0, 4, 1, 2]); // rdlen=4 但只剩 2B
         assert!(parse_answer_ips(&r, 0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_filtered_rejects_domain_resolving_to_loopback() {
+        // localhost 必然解析为 127.0.0.1 / ::1
+        // 当 allow_local = false 时, resolve_first_filtered 与 connect_smart_filtered 必须拒绝
+        let res_first = super::resolve_first_filtered("localhost", 80, |ip| {
+            crate::net_util::egress_allowed(ip, false)
+        }).await;
+        assert!(res_first.is_err());
+        assert_eq!(res_first.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+
+        let res_conn = super::connect_smart_filtered("localhost:80", |ip| {
+            crate::net_util::egress_allowed(ip, false)
+        }).await;
+        assert!(res_conn.is_err());
+        assert_eq!(res_conn.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+
+        // 当 allow_local = true 时, resolve_first_filtered 应放行 localhost
+        let res_allowed = super::resolve_first_filtered("localhost", 80, |ip| {
+            crate::net_util::egress_allowed(ip, true)
+        }).await;
+        assert!(res_allowed.is_ok());
+        let addr = res_allowed.unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 80);
     }
 
     // 真实网络: DNS-over-TCP 对 1.1.1.1 解析已知域名。默认 ignore (CI 无出口时不挂),

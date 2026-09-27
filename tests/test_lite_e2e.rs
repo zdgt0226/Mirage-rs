@@ -118,7 +118,7 @@ fn lite_tunnel_forwards_tcp_end_to_end() {
     let srv_cfg = write_cfg(
         "srv.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-e2e","sni":"www.apple.com","log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-e2e","sni":"www.apple.com","allow_local_targets":true,"log_level":"warn"}}"#
         ),
     );
     let cli_cfg = write_cfg(
@@ -197,7 +197,7 @@ fn server_falls_back_when_camouflage_template_incomplete() {
     let srv_cfg = write_cfg(
         "fallback_srv.json",
         &format!(
-            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-fb","camouflage_host":"127.0.0.1:{camo}"}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-fb","camouflage_host":"127.0.0.1:{camo}","allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
         ),
     );
     let cli_cfg = write_cfg(
@@ -233,7 +233,7 @@ fn pfs_both_ends_tunnel_works() {
     let srv_cfg = write_cfg(
         "pfs_srv.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-pfs","sni":"www.apple.com","pfs":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-pfs","sni":"www.apple.com","pfs":true,"allow_local_targets":true,"log_level":"warn"}}"#
         ),
     );
     let cli_cfg = write_cfg(
@@ -271,7 +271,7 @@ fn pfs_mismatch_fails_closed() {
     let srv_cfg = write_cfg(
         "pfs_mm_srv.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-mm","sni":"www.apple.com","pfs":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-mm","sni":"www.apple.com","pfs":true,"allow_local_targets":true,"log_level":"warn"}}"#
         ),
     );
     // 客户端不开 pfs (默认 false)。
@@ -312,7 +312,7 @@ fn pfs_full_server_interops_with_lite_client() {
     let srv_cfg = write_cfg(
         "pfs_full_srv.json",
         &format!(
-            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-pfs-full","camouflage_host":"www.apple.com","pfs":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-pfs-full","camouflage_host":"www.apple.com","pfs":true,"allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
         ),
     );
     let cli_cfg = write_cfg(

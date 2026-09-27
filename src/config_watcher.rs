@@ -281,11 +281,15 @@ impl ConfigWatcher {
         // 服务端 IP 限速器随热重载更新
         crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
 
-        // 多用户限速与配额热重载: 保留既有用量, 重新计算超额
+        // 多用户凭据与限速/配额热重载:
+        // 1. 保留既有用量, 重新计算超额
+        // 2. 对每个 mirage_server 入站按 tag 重建凭据并原子替换; tag 不存在的跳过
+        // 限额注册表全进程一张: 汇总所有入站的 users 一次性重建 (逐入站调用会互相覆盖, 见 collect_users)。
+        crate::proxy::user_limits::reload_user_limits(&crate::proxy::user_limits::collect_users(&config.inbounds));
         for ib in &config.inbounds {
-            if let crate::config::InboundConfig::MirageServer { users, .. } = ib {
-                crate::proxy::user_limits::reload_user_limits(users);
-                break;
+            if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
+                let new_creds = crate::proxy::mirage_server::build_creds(password, users);
+                crate::proxy::mirage_server::reload_creds(tag, new_creds);
             }
         }
 

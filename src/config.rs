@@ -304,6 +304,11 @@ pub enum InboundConfig {
         /// QUIC 服务端私钥路径 (PEM 格式, 默认 "quic_key.pem")。存在则读取, 不存在则生成并以 0600 保存。仅 transport=quic。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_key_path: Option<String>,
+        /// 是否允许服务端直连回环与链路本地目标 (默认 false, 拒绝 SSRF)。
+        /// 为 true 时放开回环 (127.0.0.0/8, ::1)、链路本地 (169.254.0.0/16, fe80::/10) 及云元数据地址。
+        /// ⚠️ 安全风险警告: 开启后认证客户端可直连本机管理 API (如 :9090) 或偷取云元数据凭据。
+        #[serde(default)]
+        allow_local_targets: bool,
     },
     Mixed {
         tag: String,

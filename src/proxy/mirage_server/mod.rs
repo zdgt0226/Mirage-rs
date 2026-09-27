@@ -24,9 +24,74 @@ use camouflage_pool::CamouflagePool;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
+
+pub type CredsSnapshot = Arc<arc_swap::ArcSwap<Vec<(String, String)>>>;
+
+static CREDS_REGISTRY: LazyLock<Mutex<HashMap<String, CredsSnapshot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 构造凭据列表: [0] = ("default", 主密码), 其余 = users[].(name, password)
+pub fn build_creds(password: &str, users: &[crate::config::MirageUser]) -> Vec<(String, String)> {
+    let mut v = Vec::with_capacity(1 + users.len());
+    v.push(("default".to_string(), password.to_string()));
+    v.extend(users.iter().map(|u| (u.name.clone(), u.password.clone())));
+    v
+}
+
+/// 按入站 tag 注册 mirage_server 凭据快照。若已存在则原地 store 更新并返回现有 handle。
+pub fn register_creds(tag: &str, initial: Vec<(String, String)>) -> CredsSnapshot {
+    let mut map = CREDS_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = map.get(tag) {
+        existing.store(Arc::new(initial));
+        existing.clone()
+    } else {
+        let snapshot = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
+        map.insert(tag.to_string(), snapshot.clone());
+        snapshot
+    }
+}
+
+/// 热重载时按 tag 更新凭据快照。若 tag 尚未注册则跳过, 返回 false。
+pub fn reload_creds(tag: &str, new_creds: Vec<(String, String)>) -> bool {
+    let map = CREDS_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get(tag) {
+        entry.store(Arc::new(new_creds));
+        true
+    } else {
+        false
+    }
+}
+
+static WARNED_EGRESS: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 记录被阻断的出站访问 warn 日志, 10s 内同一 (user, target) 不重复刷屏。
+pub fn warn_egress_blocked(proto: &str, user: &str, target: &str) {
+    let now = Instant::now();
+    let mut map = match WARNED_EGRESS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(last) = map.get(&(user.to_string(), target.to_string())) {
+        if now.duration_since(*last) < Duration::from_secs(10) {
+            return;
+        }
+    }
+    if map.len() >= 1024 {
+        map.retain(|_, last| now.duration_since(*last) < Duration::from_secs(10));
+    }
+    map.insert((user.to_string(), target.to_string()), now);
+    tracing::warn!(
+        "{}: 拒绝用户 `{}` 直连内网/元数据目标 `{}` (egress_allowed check failed)",
+        proto,
+        user,
+        target
+    );
+}
 
 // UNAUTH 限流 (整个 mirage_server 子模块共用). handshake.rs 在 auth 失败时
 // 增 count, IpSlotGuard 在 drop 时回收.
@@ -57,14 +122,15 @@ impl Drop for IpSlotGuard {
 
 pub async fn start_server(
     listen_addr: &str,
-    // 凭据列表 (name, password): [0]=("default", 主密码), 其余=多用户 users。握手按 token 认出是哪个。
-    creds: Arc<Vec<(String, String)>>,
+    // 凭据快照 (name, password): [0]=("default", 主密码), 其余=多用户 users。握手每次新连接 load() 最新快照。
+    creds: CredsSnapshot,
     camouflage_host: &str,
     ebpf_engine: Option<Arc<tokio::sync::Mutex<crate::ebpf::EbpfEngine>>>,
     brutal_rate_bytes_per_sec: Option<u64>,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
+    allow_local_targets: bool,
 ) {
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
@@ -137,7 +203,7 @@ pub async fn start_server(
                 let pool = cam_pool.clone();
                 let up = upstream.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, creds_c, cam, pool, auth_ts_tolerance_secs, up, pfs).await;
+                    handshake::handle_connection(stream, peer_addr, creds_c, cam, pool, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
                 });
             }
             Err(e) => {
@@ -154,7 +220,7 @@ pub async fn start_server(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_quic_server(
     listen_addr: &str,
-    creds: Arc<Vec<(String, String)>>,
+    creds: CredsSnapshot,
     camouflage_host: &str,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
@@ -163,6 +229,7 @@ pub async fn start_quic_server(
     quic_erasure_cc: bool,
     quic_obfs: Option<String>,
     quic_key_path: Option<&str>,
+    allow_local_targets: bool,
 ) {
     let addr: std::net::SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
@@ -203,7 +270,7 @@ pub async fn start_quic_server(
                         let creds2 = creds_c.clone();
                         let up2 = up.clone();
                         tokio::spawn(async move {
-                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2).await;
+                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2, allow_local_targets).await;
                         });
                     }
                     Err(_) => break, // 连接关闭
@@ -221,21 +288,23 @@ async fn handle_quic_stream_lean(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     peer_ip: IpAddr,
-    creds: Arc<Vec<(String, String)>>,
+    creds: CredsSnapshot,
     tol: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    allow_local_targets: bool,
 ) {
     if upstream.is_some() {
         debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
         return;
     }
-    // 1. token (32B) — 无状态每流认证 (多用户: 认出是哪个凭据)。
+    // 1. token (32B) — 无状态每流认证 (每条新流 load() 最新快照认出是哪个凭据)。
     let mut token = [0u8; 32];
     match tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_exact(&mut token)).await {
         Ok(Ok(_)) => {}
         _ => return,
     }
-    let user = match creds.iter().position(|(_, pw)| {
+    let creds_snapshot = creds.load_full();
+    let user = match creds_snapshot.iter().position(|(_, pw)| {
         crate::crypto::hello_auth::verify_session_token(
             pw,
             &token,
@@ -243,7 +312,7 @@ async fn handle_quic_stream_lean(
             tol,
         )
     }) {
-        Some(idx) => creds[idx].0.clone(),
+        Some(idx) => creds_snapshot[idx].0.clone(),
         None => {
             static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !HINTED.swap(true, Ordering::Relaxed) {
@@ -273,10 +342,19 @@ async fn handle_quic_stream_lean(
         Ok(t) => t,
         Err(_) => return,
     };
-    // 3. 直连出口
-    let up = match crate::proxy::resolver::connect_smart(&target).await {
+    // 3. 直连出口 (带 SSRF 过滤)
+    let up = match crate::proxy::resolver::connect_smart_filtered(&target, |ip| {
+        crate::net_util::egress_allowed(ip, allow_local_targets)
+    }).await {
         Ok(s) => s,
-        Err(e) => { tracing::warn!("Mirage QUIC(lean): 连 {} 失败: {}", target, e); return; }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                warn_egress_blocked("Mirage QUIC(lean)", &user, &target);
+            } else {
+                tracing::warn!("Mirage QUIC(lean): 连 {} 失败: {}", target, e);
+            }
+            return;
+        }
     };
     let _conn = crate::monitor::register(
         target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()), Some(user.clone()),
