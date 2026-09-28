@@ -103,7 +103,7 @@ impl CamouflagePool {
     }
 
     async fn maintain(self: Arc<Self>) {
-        let addr = format!("{}:443", self.host);
+        let addr = crate::net_util::host_with_default_port(&self.host, 443);
         loop {
             tokio::time::sleep(REFILL_INTERVAL).await;
 

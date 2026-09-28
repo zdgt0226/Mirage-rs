@@ -66,6 +66,8 @@ pub fn reload_creds(tag: &str, new_creds: Vec<(String, String)>) -> bool {
     }
 }
 
+pub(crate) const WARNED_EGRESS_CAPACITY: usize = 1024;
+
 static WARNED_EGRESS: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -81,8 +83,11 @@ pub fn warn_egress_blocked(proto: &str, user: &str, target: &str) {
             return;
         }
     }
-    if map.len() >= 1024 {
+    if map.len() >= WARNED_EGRESS_CAPACITY {
         map.retain(|_, last| now.duration_since(*last) < Duration::from_secs(10));
+        if map.len() >= WARNED_EGRESS_CAPACITY {
+            map.clear();
+        }
     }
     map.insert((user.to_string(), target.to_string()), now);
     tracing::warn!(
@@ -447,8 +452,9 @@ pub async fn start_quic_server(
                     Ok((send, recv)) => {
                         let creds2 = creds_c.clone();
                         let up2 = up.clone();
+                        let conn2 = conn.clone();
                         tokio::spawn(async move {
-                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2, allow_local_targets).await;
+                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2, allow_local_targets, conn2).await;
                         });
                     }
                     Err(_) => break, // 连接关闭
@@ -470,6 +476,7 @@ async fn handle_quic_stream_lean(
     tol: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     allow_local_targets: bool,
+    conn: quinn::Connection,
 ) {
     if upstream.is_some() {
         debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
@@ -497,6 +504,7 @@ async fn handle_quic_stream_lean(
                 tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
                     crate::crypto::hello_auth::session_decrypt_failure_hint());
             }
+            conn.close(quinn::VarInt::from_u32(0), b"");
             return;
         }
     };
@@ -760,5 +768,19 @@ mod quic_limiter_tests {
         let _gv1 = limiter.try_acquire(v6_1, false).unwrap();
         let _gv2 = limiter.try_acquire(v6_2, false).unwrap();
         assert!(limiter.under_pressure(v6_3), "同 /64 的 IPv6 达到上限应被判定为 under_pressure");
+    }
+
+    #[test]
+    fn test_warned_egress_capacity_bounded() {
+        for i in 0..(WARNED_EGRESS_CAPACITY + 10) {
+            warn_egress_blocked("test", "alice", &format!("10.0.0.{}:80", i));
+        }
+        let map = WARNED_EGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map.len() <= WARNED_EGRESS_CAPACITY,
+            "warned_egress 表大小 {} 超过上限 {}",
+            map.len(),
+            WARNED_EGRESS_CAPACITY
+        );
     }
 }

@@ -155,7 +155,7 @@ impl TokenReplayCache {
 
 /// token 时间戳是否落在 ±tolerance 窗口内 (双向对称: 客户端可能快也可能慢)。
 fn ts_within_tolerance(ts: u64, now: u64, tolerance_secs: u64) -> bool {
-    now <= ts + tolerance_secs && ts <= now + tolerance_secs
+    now <= ts.saturating_add(tolerance_secs) && ts <= now.saturating_add(tolerance_secs)
 }
 
 static REPLAY_CACHE: OnceLock<TokenReplayCache> = OnceLock::new();
@@ -410,5 +410,12 @@ mod replay_tests {
         // verify_session_token (服务端鉴权) 使用 local_now_sec, 容差 60s,
         // 即使 TIME_OFFSET 达到 500s, 基于服务端真实时间的 token 依然通过校验!
         assert!(verify_session_token(pw, &token, &bind, 60), "服务端校验必须不受客户端 offset 污染");
+    }
+
+    #[test]
+    fn ts_within_tolerance_max_u64_no_panic() {
+        assert!(!ts_within_tolerance(u64::MAX, 1000, 60));
+        assert!(!ts_within_tolerance(1000, u64::MAX, 60));
+        assert!(!ts_within_tolerance(u64::MAX, u64::MAX - 100, 60));
     }
 }

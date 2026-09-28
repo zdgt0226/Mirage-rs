@@ -53,7 +53,7 @@ pub(super) async fn run_camouflage_forward<S>(
     // 2. 即时 connect camouflage_host:443
     if let Ok(Ok(cam)) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        TcpStream::connect(&format!("{}:443", camouflage_host)),
+        TcpStream::connect(crate::net_util::host_with_default_port(camouflage_host, 443)),
     )
     .await
     {

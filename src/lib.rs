@@ -277,6 +277,19 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     if let Ok(content) = std::fs::read_to_string(config_path) {
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             inbounds = config.inbounds;
+            // 启动前校验 mirage_server 入站 tag 唯一性: 重复 tag 会导致凭据快照覆盖、鉴权串号
+            {
+                let mut seen_tags = std::collections::HashSet::new();
+                for ib in &inbounds {
+                    if let crate::config::InboundConfig::MirageServer { tag, .. } = ib {
+                        if !seen_tags.insert(tag.as_str()) {
+                            let msg = format!("inbound tag `{tag}` 重复定义");
+                            tracing::error!("{msg}");
+                            return Err(anyhow::anyhow!("{msg}"));
+                        }
+                    }
+                }
+            }
             // 服务端限速: 按 config.routing.device_profiles 装进程级 limiter (mirage_server relay 泵按
             // 连接的客户端 IP 取桶整形)。客户端侧限速走 CoreState.rate_limiter (config_watcher), 互不影响;
             // 纯客户端无 MirageServer 入站时这个全局装了也不会被读, 无副作用。
