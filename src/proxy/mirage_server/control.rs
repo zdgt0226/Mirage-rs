@@ -181,6 +181,13 @@ pub(super) async fn dispatch_authenticated(
 
     info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
+    // 分发前复核: 若用户已被删除, 拒绝分发并断开连接
+    if !crate::proxy::user_limits::user_still_valid(&user) {
+        tracing::debug!("Mirage Server: 用户 `{}` 已被删除, 拒绝分发并断开连接", user);
+        let _ = writer.send_close_notify().await;
+        return;
+    }
+
     if first_chunk.len() == 1 && first_chunk[0] == 0x00 {
         // UDP Mode.
         // 策略为 block 时直接拒绝, 让客户端立刻知道 UDP 不可用, 而不是静默走错出口。

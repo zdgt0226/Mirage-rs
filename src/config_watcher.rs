@@ -281,17 +281,8 @@ impl ConfigWatcher {
         // 服务端 IP 限速器随热重载更新
         crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
 
-        // 多用户凭据与限速/配额热重载:
-        // 1. 保留既有用量, 重新计算超额
-        // 2. 对每个 mirage_server 入站按 tag 重建凭据并原子替换; tag 不存在的跳过
-        // 限额注册表全进程一张: 汇总所有入站的 users 一次性重建 (逐入站调用会互相覆盖, 见 collect_users)。
-        crate::proxy::user_limits::reload_user_limits(&crate::proxy::user_limits::collect_users(&config.inbounds));
-        for ib in &config.inbounds {
-            if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
-                let new_creds = crate::proxy::mirage_server::build_creds(password, users);
-                crate::proxy::mirage_server::reload_creds(tag, new_creds);
-            }
-        }
+        // 多用户凭据与限速/配额热重载
+        apply_user_config(&config.inbounds);
 
         Ok(CoreState {
             router: Arc::new(router),
@@ -314,13 +305,28 @@ impl ConfigWatcher {
                 }
             };
 
-            // 1. Watch config file
+            // 1. 监听配置文件所在的父目录 (NonRecursive), 解决 tmp+rename 覆盖导致的 inode watch 失效
             let config_pathbuf = Path::new(&config_path).to_path_buf();
-            if let Err(e) = watcher.watch(&config_pathbuf, RecursiveMode::NonRecursive) {
-                error!("Failed to watch config file {}: {}", config_path, e);
+            let config_file_name = match config_pathbuf.file_name() {
+                Some(name) => name.to_os_string(),
+                None => {
+                    error!("Config path has no file name: {}", config_path);
+                    return;
+                }
+            };
+            let config_dir = config_pathbuf
+                .parent()
+                .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+                .unwrap_or(Path::new("."));
+            let config_dir_canon = config_dir
+                .canonicalize()
+                .unwrap_or_else(|_| config_dir.to_path_buf());
+
+            if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
+                error!("Failed to watch config dir {}: {}", config_dir.display(), e);
                 return;
             }
-            info!("Started hot-reload watcher on {}", config_path);
+            info!("Started hot-reload watcher on config dir {} for file {:?}", config_dir.display(), config_file_name);
 
             // 2. Watch geodata directory — geo_updater 下载新 .dat 后触发 Router 重建.
             // 修复 bug #2 (启动时序空隙): 之前只 watch config_path, geo_updater 30s
@@ -330,13 +336,20 @@ impl ConfigWatcher {
             //
             // 目录不存在时主动创建 (geo_updater 也会创建, 但 watcher 必须在 .dat 写入
             // 前就 watch 上, 否则 inotify 错过 IN_CREATE 事件).
+            // 与配置目录相同时不重复 watch (配置目录已被 watch)。
             let geodir_pathbuf = Path::new(&geodata_dir).to_path_buf();
             if !geodir_pathbuf.exists() {
                 if let Err(e) = std::fs::create_dir_all(&geodir_pathbuf) {
                     warn!("Failed to create geodata dir {} (geo hot-reload disabled): {}", geodata_dir, e);
                 }
             }
-            if geodir_pathbuf.exists() {
+            let geodir_canon = geodir_pathbuf.canonicalize().ok();
+            let same_dir = match &geodir_canon {
+                Some(g_canon) => g_canon == &config_dir_canon,
+                None => geodir_pathbuf == config_dir,
+            };
+
+            if !same_dir && geodir_pathbuf.exists() {
                 match watcher.watch(&geodir_pathbuf, RecursiveMode::NonRecursive) {
                     Ok(_) => info!("Also watching geodata dir for .dat hot-reload: {}", geodata_dir),
                     Err(e) => warn!(
@@ -344,6 +357,8 @@ impl ConfigWatcher {
                         geodata_dir, e
                     ),
                 }
+            } else if same_dir {
+                info!("Geodata dir is same as config dir; skipping duplicate watch.");
             }
 
             // 3. Event loop — 过滤事件路径, 只对 config 文件本身或 .dat 文件触发
@@ -359,7 +374,7 @@ impl ConfigWatcher {
                         // 的 .tmp 路径. find 匹配 trigger predicate 保证 log 显
                         // 示的就是真正被认可导致 reload 的那条路径.
                         let trigger_path = paths.iter().find(|p| {
-                            *p == &config_pathbuf
+                            is_config_event(p, &config_dir_canon, &config_file_name)
                                 || p.extension().is_some_and(|e| e == "dat")
                         });
                         let trigger_path = match trigger_path {
@@ -395,7 +410,7 @@ impl ConfigWatcher {
                         // 到 proxy). update() 幂等 = 一次 Arc swap + notify_one,
                         // 成本很低. 只有 config 文件本身改动才触发 (`.dat` 变化
                         // 不影响 updater 配置).
-                        if trigger_path == &config_pathbuf {
+                        if is_config_event(trigger_path, &config_dir_canon, &config_file_name) {
                             let old_updater = (**updater_handle.state.load()).clone();
                             if let Some(new_updater) = Self::extract_updater_state(&config_path, &old_updater) {
                                 let sources_delta = new_updater.sources.len() as i64
@@ -414,6 +429,46 @@ impl ConfigWatcher {
                 }
             }
         });
+    }
+}
+
+/// 多用户凭据与限速/配额配置应用 (build_state 与 /api/users 共用):
+/// 1. 保留既有用量, 重新计算超额
+/// 2. 对每个 mirage_server 入站按 tag 重建凭据并原子替换; tag 不存在的跳过
+///
+/// 限额注册表全进程一张: 汇总所有入站的 users 一次性重建 (逐入站调用会互相覆盖, 见 collect_users)。
+pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
+    crate::proxy::user_limits::reload_user_limits(&crate::proxy::user_limits::collect_users(inbounds));
+    for ib in inbounds {
+        if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
+            let new_creds = crate::proxy::mirage_server::build_creds(password, users);
+            crate::proxy::mirage_server::reload_creds(tag, new_creds);
+        }
+    }
+}
+
+/// 判定事件路径是否指向配置文件本身。
+///
+/// 解决 inotify 监听配置文件本身在 tmp+rename 覆盖后丢失 inode watch 的问题。
+/// 监听父目录时, notify 上报该目录下所有变动, 本函数过滤出对目标配置文件的变更:
+/// - 比较文件名 (忽略同目录下的 .tmp 临时文件、stats 持久化文件等)
+/// - 比较父目录 canonical 路径 (支持相对路径、绝对路径及软链接目录)
+pub fn is_config_event(
+    path: &Path,
+    config_dir_canon: &Path,
+    config_file_name: &std::ffi::OsStr,
+) -> bool {
+    if path.file_name() != Some(config_file_name) {
+        return false;
+    }
+    let p_parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(canon) = p_parent.canonicalize() {
+        canon == config_dir_canon
+    } else {
+        p_parent == config_dir_canon
     }
 }
 
@@ -622,3 +677,88 @@ mod leak_guard_tests {
         let _ = std::fs::remove_dir_all(std::path::Path::new(&cfg).parent().unwrap());
     }
 }
+
+#[cfg(test)]
+mod watcher_event_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_config_event_relative_and_absolute() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_watch_unit_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let canon_dir = temp_dir.canonicalize().unwrap();
+        let file_name = std::ffi::OsString::from("config.json");
+
+        // 1. 绝对路径匹配
+        let abs_path = canon_dir.join("config.json");
+        assert!(is_config_event(&abs_path, &canon_dir, &file_name));
+
+        // 2. 相对路径 (以当前工作目录为例)
+        let cwd_canon = Path::new(".").canonicalize().unwrap();
+        let rel_file = Path::new("config.json");
+        let rel_dot_file = Path::new("./config.json");
+        assert!(is_config_event(rel_file, &cwd_canon, &file_name));
+        assert!(is_config_event(rel_dot_file, &cwd_canon, &file_name));
+
+        // 3. 其它文件名 (如 .tmp, stats 文件) 不匹配
+        let tmp_file = canon_dir.join("config.json.tmp");
+        let stats_file = canon_dir.join("stats.json");
+        assert!(!is_config_event(&tmp_file, &canon_dir, &file_name));
+        assert!(!is_config_event(&stats_file, &canon_dir, &file_name));
+
+        // 4. 不同目录下的同名文件不匹配
+        let other_dir = std::env::temp_dir().join(format!("mirage_other_dir_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other_file = other_dir.join("config.json");
+        assert!(!is_config_event(&other_file, &canon_dir, &file_name));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn test_rename_events_detected_consecutively() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_watch_rename_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let config_dir_canon = temp_dir.canonicalize().unwrap();
+        let config_file_name = std::ffi::OsString::from("config.json");
+        let config_path = temp_dir.join("config.json");
+
+        // 初始写入 config.json
+        std::fs::write(&config_path, b"initial").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(tx).expect("watcher create failed");
+        watcher.watch(&temp_dir, RecursiveMode::NonRecursive).expect("watcher watch failed");
+
+        // 连续 3 次 tmp+rename 写入覆盖, 每次均须被识别到
+        for i in 1..=3 {
+            let tmp_path = temp_dir.join(format!("config.json.tmp.{}", i));
+            std::fs::write(&tmp_path, format!("version_{}", i)).unwrap();
+            std::fs::rename(&tmp_path, &config_path).unwrap();
+
+            // 等待直到收到命中 is_config_event 的事件 (2 秒超时)
+            let mut hit = false;
+            let timeout = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < timeout {
+                if let Ok(Ok(Event { kind, paths, .. })) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    if (kind.is_modify() || kind.is_create())
+                        && paths.iter().any(|p| is_config_event(p, &config_dir_canon, &config_file_name))
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            assert!(hit, "第 {} 次 tmp+rename 覆盖必须被 watcher 识别到", i);
+        }
+
+        // 验证写入同目录无关文件 (.tmp) 不被判定为 config 事件
+        let unrelated_path = temp_dir.join("config.json.tmp");
+        std::fs::write(&unrelated_path, b"tmp data").unwrap();
+        assert!(!is_config_event(&unrelated_path, &config_dir_canon, &config_file_name));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+

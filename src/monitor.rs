@@ -1106,6 +1106,7 @@ mod stats_persist_tests {
     #[test]
     fn flush_stats_writes_file() {
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DOMAIN_STATS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1130,6 +1131,7 @@ mod stats_persist_tests {
     #[test]
     fn stats_persist_flush_load_roundtrip_all() {
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let path = std::env::temp_dir().join("mirage_stats_roundtrip_test.json");
         let path = path.to_str().unwrap();
@@ -1213,6 +1215,7 @@ mod stats_persist_tests {
     #[test]
     fn stats_persist_backward_compatible_old_format() {
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let path = std::env::temp_dir().join("mirage_stats_old_format_test.json");
         let path = path.to_str().unwrap();
@@ -1261,6 +1264,7 @@ mod stats_persist_tests {
     #[test]
     fn stats_persist_user_quota_roundtrip() {
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let path = std::env::temp_dir().join("mirage_stats_user_quota_test.json");
         let path = path.to_str().unwrap();
@@ -1272,7 +1276,6 @@ mod stats_persist_tests {
             quota_gb: Some(5.0),
             quota_reset_day: Some(1),
         };
-        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::proxy::user_limits::init_user_limits(&[user]);
         let h = crate::proxy::user_limits::get_user_limit("grace").unwrap();
         h.record_bytes(1024 * 1024);
@@ -1295,6 +1298,7 @@ mod stats_persist_tests {
     #[test]
     fn stats_persist_user_quota_backward_compat() {
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let path = std::env::temp_dir().join("mirage_stats_old_format_test.json");
         let path = path.to_str().unwrap();
@@ -1326,6 +1330,7 @@ mod stats_persist_tests {
     fn stats_persist_file_permissions_0600() {
         use std::os::unix::fs::PermissionsExt;
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let path = std::env::temp_dir().join("mirage_stats_perm_test.json");
         let path = path.to_str().unwrap();
@@ -1344,6 +1349,7 @@ mod stats_persist_tests {
     #[test]
     fn stats_persist_blocklist_persists_immediately() {
         let _serial = conn_registry_tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let path = std::env::temp_dir().join("mirage_stats_immediate_block_test.json");
         let path = path.to_str().unwrap();
