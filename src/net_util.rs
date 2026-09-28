@@ -13,6 +13,82 @@ pub fn join_host_port(host: &str, port: u16) -> String {
     }
 }
 
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use arc_swap::ArcSwap;
+use tracing::warn;
+
+static LOCAL_IPS: LazyLock<ArcSwap<HashSet<IpAddr>>> = LazyLock::new(|| {
+    ArcSwap::from_pointee(enumerate_local_ips().unwrap_or_else(|e| {
+        warn!("枚举本机网络接口地址失败: {e}");
+        HashSet::new()
+    }))
+});
+
+static LOCAL_IPS_UPDATER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub static LOCAL_IPS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 枚举本机所有网络接口上的 IPv4 与 IPv6 地址。
+fn enumerate_local_ips() -> nix::Result<HashSet<IpAddr>> {
+    let mut ips = HashSet::new();
+    for ifa in nix::ifaddrs::getifaddrs()? {
+        if let Some(storage) = ifa.address {
+            if let Some(sa) = storage.as_sockaddr_in() {
+                ips.insert(IpAddr::V4(sa.ip()));
+            }
+            if let Some(sa) = storage.as_sockaddr_in6() {
+                ips.insert(IpAddr::V6(sa.ip()));
+            }
+        }
+    }
+    Ok(ips)
+}
+
+/// 刷新进程级本机地址集合。若枚举失败则 warn 并保持旧集合不变。
+pub fn refresh_local_ips() {
+    match enumerate_local_ips() {
+        Ok(ips) => LOCAL_IPS.store(Arc::new(ips)),
+        Err(e) => warn!("枚举本机网络接口地址失败: {e}"),
+    }
+}
+
+/// 启动后台 60s 定期刷新本机地址集合的任务。
+/// 启动时立即刷新一次, 之后每 60s 后台刷新。
+pub fn start_local_ips_updater() {
+    refresh_local_ips();
+    if LOCAL_IPS_UPDATER_STARTED.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        tokio::spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // 跳过首触 (启动时已立即刷新一次)
+            loop {
+                interval.tick().await;
+                refresh_local_ips();
+            }
+        });
+    }
+}
+
+/// 检查某个 IP 是否属于本机网卡地址集合。
+pub fn is_local_ip(ip: &IpAddr) -> bool {
+    LOCAL_IPS.load().contains(ip)
+}
+
+#[cfg(test)]
+pub fn inject_local_ip_for_test(ip: IpAddr) {
+    let mut current = (**LOCAL_IPS.load()).clone();
+    current.insert(ip);
+    LOCAL_IPS.store(Arc::new(current));
+}
+
+#[cfg(test)]
+pub fn clear_injected_local_ips_for_test() {
+    refresh_local_ips();
+}
+
 /// 服务端出站目标 IP 白名单校验 (防 SSRF)。
 ///
 /// 默认 (allow_local = false) 拒绝:
@@ -20,12 +96,13 @@ pub fn join_host_port(host: &str, port: u16) -> String {
 /// - 未指定: 0.0.0.0, ::
 /// - 链路本地: 169.254.0.0/16 (含云元数据 169.254.169.254), fe80::/10
 /// - 组播 / 广播: 224.0.0.0/4, 255.255.255.255, ff00::/8
-/// - 云元数据特殊地址: fd00:ec2::254 (AWS IPv6 元数据, 属 ULA), 100.100.100.200 (阿里云元数据, 属 CGNAT)
+/// - 云元数据特殊地址: fd00:ec2::254 (AWS IPv6 元数据, 属 ULA), 100.100.100.200 (阿里云元数据, 属 CGNAT), 168.63.129.16 (Azure WireServer, 属公网段)
+/// - 本机自身网卡地址 (含公网 IP、docker 网桥等由 getifaddrs 枚举得到的所有接口 IP)
 ///
 /// 放行原则:
 /// - 先把 IPv4 映射的 IPv6 (::ffff:a.b.c.d) 还原成 IPv4 再判断, 防 `::ffff:127.0.0.1` 绕过。
 /// - RFC1918 (10/8, 172.16/12, 192.168/16)、其余 ULA (fc00::/7)、其余 CGNAT (100.64.0.0/10) 默认放行 (支持访问局域网)。
-/// - allow_local = true 时放开回环与链路本地 (含云元数据), 但组播/广播始终拒绝。
+/// - allow_local = true 时放开回环、链路本地 (含云元数据) 与本机自身网卡地址, 但组播/广播始终拒绝。
 pub fn egress_allowed(ip: std::net::IpAddr, allow_local: bool) -> bool {
     // 1. 先把 IPv4-mapped IPv6 (::ffff:a.b.c.d) 还原为 IPv4
     let ip = match ip {
@@ -67,6 +144,10 @@ pub fn egress_allowed(ip: std::net::IpAddr, allow_local: bool) -> bool {
             if v4 == std::net::Ipv4Addr::new(100, 100, 100, 200) {
                 return false;
             }
+            // Azure WireServer 168.63.129.16 (属于公网段)
+            if v4 == std::net::Ipv4Addr::new(168, 63, 129, 16) {
+                return false;
+            }
         }
         std::net::IpAddr::V6(v6) => {
             if v6.is_loopback() || v6.is_unspecified() {
@@ -84,12 +165,24 @@ pub fn egress_allowed(ip: std::net::IpAddr, allow_local: bool) -> bool {
         }
     }
 
+    // 4. 本机网卡自身地址 (含公网 IP、docker 网桥等): 默认拒绝
+    if is_local_ip(&ip) {
+        return false;
+    }
+
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::{egress_allowed, join_host_port};
+
+    /// 默认策略下应放行 —— 除非该地址恰好是跑测试这台机器的网卡地址 (本机地址恒拒)。
+    /// 避免在网关 / 内网机器上因本机就是 192.168.1.1 之类而误挂。
+    fn allowed_unless_local(s: &str) -> bool {
+        let ip: std::net::IpAddr = s.parse().unwrap();
+        egress_allowed(ip, false) || super::is_local_ip(&ip)
+    }
 
     #[test]
     fn brackets_v6_literals() {
@@ -156,15 +249,15 @@ mod tests {
         }
 
         // 7. 默认放行: RFC1918 / ULA 其余 / CGNAT 其余 / 正常公网 IP
-        assert!(egress_allowed("10.0.0.1".parse().unwrap(), false));
-        assert!(egress_allowed("172.16.0.1".parse().unwrap(), false));
-        assert!(egress_allowed("192.168.1.1".parse().unwrap(), false));
-        assert!(egress_allowed("192.168.0.254".parse().unwrap(), false));
+        assert!(allowed_unless_local("10.0.0.1"));
+        assert!(allowed_unless_local("172.16.0.1"));
+        assert!(allowed_unless_local("192.168.1.1"));
+        assert!(allowed_unless_local("192.168.0.254"));
         assert!(egress_allowed("fd00:1::1".parse().unwrap(), false), "其他 ULA 默认放行");
         assert!(egress_allowed("100.64.0.1".parse().unwrap(), false), "其他 CGNAT 默认放行");
-        assert!(egress_allowed("8.8.8.8".parse().unwrap(), false));
-        assert!(egress_allowed("1.1.1.1".parse().unwrap(), false));
-        assert!(egress_allowed("2606:4700:4700::1111".parse().unwrap(), false));
+        assert!(allowed_unless_local("8.8.8.8"));
+        assert!(allowed_unless_local("1.1.1.1"));
+        assert!(allowed_unless_local("2606:4700:4700::1111"));
 
         // 8. allow_local = true 放行回环/链路本地/云元数据
         assert!(egress_allowed("127.0.0.1".parse().unwrap(), true));
@@ -173,5 +266,32 @@ mod tests {
         assert!(egress_allowed("fe80::1".parse().unwrap(), true));
         assert!(egress_allowed("fd00:ec2::254".parse().unwrap(), true));
         assert!(egress_allowed("100.100.100.200".parse().unwrap(), true));
+
+        // 9. Azure WireServer 168.63.129.16 (默认拒、allow_local 放行)
+        assert!(!egress_allowed("168.63.129.16".parse().unwrap(), false), "Azure WireServer 默认应拒绝");
+        assert!(egress_allowed("168.63.129.16".parse().unwrap(), true), "Azure WireServer allow_local 应放行");
+        assert!(!egress_allowed("::ffff:168.63.129.16".parse().unwrap(), false), "Azure WireServer 映射版默认应拒绝");
+        assert!(egress_allowed("::ffff:168.63.129.16".parse().unwrap(), true), "Azure WireServer 映射版 allow_local 应放行");
+    }
+
+    #[test]
+    fn test_local_ip_injection_and_egress_filter() {
+        let _serial = super::LOCAL_IPS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let test_ip: std::net::IpAddr = "198.51.100.42".parse().unwrap();
+        let mapped_test_ip: std::net::IpAddr = "::ffff:198.51.100.42".parse().unwrap();
+
+        // 注入前: 正常外部 IP 默认放行
+        assert!(egress_allowed(test_ip, false), "未注入前应放行");
+
+        // 注入到本机地址集合
+        super::inject_local_ip_for_test(test_ip);
+        assert!(!egress_allowed(test_ip, false), "本机地址在 allow_local=false 时必须拒绝");
+        assert!(egress_allowed(test_ip, true), "本机地址在 allow_local=true 时应放行");
+        assert!(!egress_allowed(mapped_test_ip, false), "IPv4-mapped 本机地址在 allow_local=false 时必须拒绝");
+        assert!(egress_allowed(mapped_test_ip, true), "IPv4-mapped 本机地址在 allow_local=true 时应放行");
+
+        // 清理注入
+        super::clear_injected_local_ips_for_test();
+        assert!(egress_allowed(test_ip, false), "清理后应恢复放行");
     }
 }

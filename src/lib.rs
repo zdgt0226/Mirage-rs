@@ -289,10 +289,11 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 }
                 crate::proxy::rate_limit::set_server_limiter(rl);
             }
-            // 多用户限速与配额: 初始化 mirage_server 的 users 配置并挂周期滚动检查
+            // 多用户限速与配额及本机地址集合: 初始化 mirage_server 的 users 配置与本机网卡 IP 刷新
             if inbounds.iter().any(|ib| matches!(ib, crate::config::InboundConfig::MirageServer { .. })) {
                 crate::proxy::user_limits::init_user_limits(&crate::proxy::user_limits::collect_users(&inbounds));
                 crate::proxy::user_limits::start_rollover_task();
+                crate::net_util::start_local_ips_updater();
             }
             if let Some(gui) = config.gui {
                 gui_enabled = gui.enabled;
