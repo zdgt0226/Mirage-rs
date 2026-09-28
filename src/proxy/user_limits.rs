@@ -181,7 +181,7 @@ impl UserLimitHandle {
         let reset_day = self.reset_day();
         let expected_start = compute_period_start(now, reset_day);
         let cur_start = self.period_start.load(Ordering::Relaxed);
-        if cur_start == expected_start {
+        if expected_start <= cur_start {
             return;
         }
         // CAS 前先快照旧周期用量; 抢到的线程只减掉这部分 (而非 store(0))。CAS 之后其它线程看到的
@@ -717,11 +717,11 @@ mod tests {
 
     #[test]
     fn test_maybe_rollover_concurrency() {
-        // 构造一个处于旧周期的 handle
-        let past_start = 1_000_000u64;
-        let future_now = 2_000_000u64;
+        // 构造一个处于旧周期的 handle (旧周期起点 < 新周期起点)
+        let past_start = days_from_civil(2026, 8, 1) as u64 * 86400;
+        let future_now = days_from_civil(2026, 9, 2) as u64 * 86400;
         let expected_start = compute_period_start(future_now, 1);
-        assert_ne!(past_start, expected_start);
+        assert!(past_start < expected_start);
 
         let handle = Arc::new(UserLimitHandle::new(
             "concurrent_user",
@@ -754,6 +754,29 @@ mod tests {
             1000,
             "并发滚动只清零一次, 后续 record_bytes 不被抹掉"
         );
+    }
+
+    #[test]
+    fn test_maybe_rollover_clock_skew_backward() {
+        let cur_start = 2_000_000u64;
+        let handle = Arc::new(UserLimitHandle::new(
+            "skew_user",
+            None,
+            Some(100_000),
+            1,
+            cur_start,
+            5000,
+        ));
+        // 传入较早的 now, 算出的 expected_start < cur_start
+        let past_now = 1_000_000u64;
+        let expected_start = compute_period_start(past_now, 1);
+        assert!(expected_start < cur_start, "测试构造前置: expected_start 必须小于 cur_start");
+
+        handle.maybe_rollover(past_now);
+
+        // period_start 与 period_used 必须保持不变 (只允许向前滚动)
+        assert_eq!(handle.period_start.load(Ordering::Relaxed), cur_start, "时钟回拨不改变 period_start");
+        assert_eq!(handle.period_used.load(Ordering::Relaxed), 5000, "时钟回拨不改变 period_used");
     }
 
     #[test]

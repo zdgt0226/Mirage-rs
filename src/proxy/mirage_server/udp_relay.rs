@@ -14,6 +14,20 @@ use tracing::{debug, error};
 /// 流更短, 且客户端透明 UDP 自身 60s idle 即拆, 300s 只作服务端兜底不误杀活跃流)。
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// 将 SocketAddr 归一化 (IPv4-mapped IPv6 转为 IPv4, 便于地址比较)。
+fn normalize_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    match addr {
+        std::net::SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+            } else {
+                std::net::SocketAddr::V6(v6)
+            }
+        }
+        v4 => v4,
+    }
+}
+
 /// UDP 中继的出口。
 ///
 /// `Direct` = 从本机 IP 发出去 (不配上游、或上游 udp=direct);
@@ -97,6 +111,12 @@ pub(super) async fn handle_udp_relay(
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let udp_clone = udp_socket.clone();
 
+    // 维护该会话已发送过的目标地址集合 (限制 1024 条防膨胀)。
+    // 下行仅放行来自此集合的回包, 阻止未授权来源注入数据及恶意消耗用户配额。
+    let sent_targets = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let sent_targets_down = sent_targets.clone();
+    let sent_targets_up = sent_targets.clone();
+
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     let writer_clone = writer.clone();
 
@@ -107,6 +127,17 @@ pub(super) async fn handle_udp_relay(
         loop {
             match tokio::time::timeout(UDP_IDLE_TIMEOUT, udp_clone.recv_from(&mut buf)).await {
                 Ok(Ok((size, addr))) => {
+                    // 校验回包来源: 丢弃未知来源的包 (不计费、不回送)。
+                    // 自动处理 IPv4-mapped IPv6 (::ffff:a.b.c.d)。
+                    // 注意: 这会收紧 full-cone UDP (如某些 STUN/P2P 游戏) 语义为 restricted-cone。
+                    let norm = normalize_addr(addr);
+                    if !sent_targets_down
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&norm)
+                    {
+                        continue;
+                    }
                     // 下行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
                     if !crate::proxy::rate_limit::try_consume_two(
                         dn_buckets.as_ref().map(|b| &b.down),
@@ -189,7 +220,7 @@ pub(super) async fn handle_udp_relay(
 
     let tunnel_uplink = async move {
         let mut buffer = Vec::new();
-        loop {
+        'outer: loop {
             let chunk = tokio::select! {
                 biased;
                 _ = stop_rx_up.changed() => break,
@@ -259,7 +290,7 @@ pub(super) async fn handle_udp_relay(
                 }
                 if let Some(u) = &user_limit {
                     if u.record_bytes(payload.len()) {
-                        break; // 越额退出
+                        break 'outer; // 越额退出整个会话
                     }
                 }
 
@@ -272,14 +303,29 @@ pub(super) async fn handle_udp_relay(
                     Ok(socket_addr) => {
                         // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
                         // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                        if let Err(e) = udp_socket.send_to(payload, socket_addr).await {
-                            static WARNED: std::sync::atomic::AtomicBool =
-                                std::sync::atomic::AtomicBool::new(false);
-                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                tracing::warn!(
-                                    "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
-                                    socket_addr, e
-                                );
+                        // 成功则记入已发目标集合, 供下行校验回包来源。
+                        match udp_socket.send_to(payload, socket_addr).await {
+                            Ok(()) => {
+                                let norm = normalize_addr(socket_addr);
+                                let mut set = sent_targets_up
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if !set.contains(&norm) {
+                                    if set.len() >= 1024 {
+                                        set.clear();
+                                    }
+                                    set.insert(norm);
+                                }
+                            }
+                            Err(e) => {
+                                static WARNED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                    tracing::warn!(
+                                        "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
+                                        socket_addr, e
+                                    );
+                                }
                             }
                         }
                     }
@@ -350,11 +396,15 @@ impl SidEgress {
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Direct(s) => s.recv(buf).await,
-            Self::Wireguard(s, _) => s
-                .recv_from(buf)
-                .await
-                .map(|(n, _)| n)
-                .map_err(|e| std::io::Error::other(e.to_string())),
+            Self::Wireguard(s, dst) => loop {
+                let (n, from) = s
+                    .recv_from(buf)
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                if normalize_addr(from) == normalize_addr(*dst) {
+                    return Ok(n);
+                }
+            },
         }
     }
 }
@@ -412,7 +462,7 @@ pub(crate) async fn handle_udp_mux_relay(
     let up_tx = tx.clone();
     let uplink = async move {
         let mut buffer: Vec<u8> = Vec::new();
-        loop {
+        'outer: loop {
             let chunk =
                 match tokio::time::timeout(UDP_IDLE_TIMEOUT, reader.recv_data()).await {
                     Ok(Ok(c)) => c,
@@ -435,7 +485,7 @@ pub(crate) async fn handle_udp_mux_relay(
                 }
                 if let Some(u) = &user_limit {
                     if u.record_bytes(uf.payload.len()) {
-                        break; // 越额退出
+                        break 'outer; // 越额退出整个会话
                     }
                 }
 

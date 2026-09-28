@@ -114,7 +114,18 @@ impl ConfigWatcher {
 
     pub(crate) fn build_state(config_path: &str, geodata_dir: &str, old_outbounds: Option<Arc<OutboundManager>>) -> Result<CoreState> {
         info!("Loading configuration from {}", config_path);
-        let config = Config::load_from_file(config_path)?;
+        let content = std::fs::read_to_string(config_path)
+            .map_err(|e| anyhow::anyhow!("读取配置文件失败: {config_path}: {e}"))?;
+        let (config, issues) = Config::parse_with_diagnostics(&content)
+            .map_err(|e| anyhow::anyhow!("解析配置 JSON 失败: {config_path}: {e}"))?;
+        for issue in &issues {
+            // 重复口令会让鉴权命中错误用户 (用量记错人), 用 error 级别醒目提示。
+            if issue.contains("password 与") {
+                error!("配置校验: {}", issue);
+            } else {
+                warn!("配置校验: {}", issue);
+            }
+        }
         
         let outbounds = if let Some(old) = old_outbounds {
             info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
@@ -442,7 +453,9 @@ pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
     for ib in inbounds {
         if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
             let new_creds = crate::proxy::mirage_server::build_creds(password, users);
-            crate::proxy::mirage_server::reload_creds(tag, new_creds);
+            if !crate::proxy::mirage_server::reload_creds(tag, new_creds) {
+                warn!("入站 `{tag}` 未在运行中注册 (新增或改名的入站需重启才生效, 其凭据变更本次未应用)");
+            }
         }
     }
 }

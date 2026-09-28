@@ -1501,6 +1501,33 @@ impl Config {
             }
         }
 
+        // 跨入站同名用户限额一致性: collect_users 跨入站同名用户以先出现者为准,
+        // 后续入站对同名用户配置的不同限额会被静默忽略。在此检查并提示。
+        let mut global_users: std::collections::HashMap<&str, (&str, &MirageUser)> = std::collections::HashMap::new();
+        for ib in &self.inbounds {
+            if let InboundConfig::MirageServer { tag, users, .. } = ib {
+                for u in users {
+                    if let Some((prev_tag, prev_u)) = global_users.get(u.name.as_str()) {
+                        let diff_kbps = prev_u.rate_limit_kbps != u.rate_limit_kbps;
+                        let diff_reset = prev_u.quota_reset_day != u.quota_reset_day;
+                        let diff_quota = match (prev_u.quota_gb, u.quota_gb) {
+                            (Some(a), Some(b)) => (a - b).abs() > f64::EPSILON,
+                            (None, None) => false,
+                            _ => true,
+                        };
+                        if diff_kbps || diff_reset || diff_quota {
+                            issues.push(format!(
+                                "mirage_server 入站 `{tag}` 的 user `{}` 限额配置与入站 `{prev_tag}` 不一致 (全局注册表以先出现者为准, 后续配置被忽略)",
+                                u.name
+                            ));
+                        }
+                    } else {
+                        global_users.insert(u.name.as_str(), (tag.as_str(), u));
+                    }
+                }
+            }
+        }
+
         // DNS 上游地址校验: 直连/国内上游 (tag=direct/cn) 运行时要求解析成 IP —— 解不出会被
         // **静默跳过**回落公共 DNS。把这个运行期沉默失败前移到 check, 明确报错而非默默 fallback。
         // 支持 tcp://|udp:// 前缀 (剥后再验)。remote/proxy/default 上游允许域名, 不在此严格验 IP。
@@ -2349,6 +2376,26 @@ mod profile_tests {
         assert!(day_0.semantic_issues().iter().any(|i| i.contains("quota_reset_day 必须在 1..=28")));
         let day_29 = srv_with_users(r#"[{"name":"alice","password":"p","quota_reset_day":29}]"#);
         assert!(day_29.semantic_issues().iter().any(|i| i.contains("quota_reset_day 必须在 1..=28")));
+    }
+
+    #[test]
+    fn users_cross_inbound_limit_inconsistency_caught() {
+        let json = r#"{
+            "inbounds": [
+                {"type": "mirage_server", "tag": "in1", "listen": "0.0.0.0", "port": 443, "password": "p1",
+                 "users": [{"name": "alice", "password": "pa", "rate_limit_kbps": 1000}]},
+                {"type": "mirage_server", "tag": "in2", "listen": "0.0.0.0", "port": 8443, "password": "p2",
+                 "users": [{"name": "alice", "password": "pa", "rate_limit_kbps": 2000}]}
+            ],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "routing": {"default_outbound": "direct", "rules": []}
+        }"#;
+        let (cfg, _) = Config::parse_with_diagnostics(json).unwrap();
+        let issues = cfg.semantic_issues();
+        assert!(
+            issues.iter().any(|i| i.contains("alice") && i.contains("限额配置与入站 `in1` 不一致")),
+            "跨入站同名用户限额不一致应被提示: {issues:?}"
+        );
     }
 }
 

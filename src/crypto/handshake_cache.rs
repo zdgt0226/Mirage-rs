@@ -178,11 +178,7 @@ pub async fn get_server_hello_pfs(
 }
 
 async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
-    let target = if host.contains(':') {
-        host.to_string()
-    } else {
-        format!("{}:443", host)
-    };
+    let target = crate::net_util::host_with_default_port(host, 443);
 
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -191,7 +187,7 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
 
     let mut session_id = [0u8; 32];
     rand::fill(&mut session_id);
-    let hostname = host.split(':').next().unwrap_or(host);
+    let hostname = crate::net_util::extract_hostname(host);
     // 模板 fetch **固定用 OkHttp CH** (无 MLKEM, 只提供 X25519/P256/P384) —— 这三个曲线是
     // 所有 profile (Chrome/FF/OkHttp) 的**交集**, camouflage 站据此协商出的曲线 (通常 X25519)
     // 任何 profile 的客户端都提供过 → 回放的 ServerHello 恒自洽、不会"选了没提供的曲线"= 非法 TLS。
@@ -265,6 +261,22 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
         ));
     }
 
+    // 校验 ServerHello 的 key_share 是可重生成的 group (X25519 32B 或 P-256 65B),
+    // 否则 key_share 跨连接恒定, 当作不合格模板返回 Err (让上层回落 fallback)。
+    match key_share_group(&buf) {
+        Some((0x001d, 32)) | Some((0x0017, 65)) => {}
+        Some((g, len)) => {
+            return Err(anyhow::anyhow!(
+                "camouflage host template has unsupported key_share group 0x{g:04x} (len {len})"
+            ));
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "camouflage host template missing or malformed key_share extension"
+            ));
+        }
+    }
+
     Ok(buf)
 }
 
@@ -326,67 +338,81 @@ fn generate_key_share(group: u16) -> Option<Vec<u8>> {
     }
 }
 
-/// 解析 ServerHello 扩展, 查找 key_share (0x0033) 并用全新真公钥替换 key_exchange 内容。
-/// 全程边界检查, 遇到越界或畸形结构安全退回 (不改 key_share)。
-fn patch_key_share(buf: &mut [u8], sh_rec_len: usize) {
+/// 解析 ServerHello 扩展中的 key_share (0x0033):
+/// 返回 Option<(group, key_len, key_start_offset)>
+fn key_share_info(flight: &[u8]) -> Option<(u16, usize, usize)> {
+    if flight.len() < 9 || flight[0] != 0x16 {
+        return None;
+    }
+    let sh_rec_len = u16::from_be_bytes([flight[3], flight[4]]) as usize;
     let rec_end = 5 + sh_rec_len;
-    if rec_end > buf.len() || rec_end < 9 {
-        return;
+    if rec_end > flight.len() || rec_end < 9 {
+        return None;
     }
     // HandshakeType 必须是 ServerHello (0x02)
-    if buf[5] != 0x02 {
-        return;
+    if flight[5] != 0x02 {
+        return None;
     }
-    let hs_len = u32::from_be_bytes([0, buf[6], buf[7], buf[8]]) as usize;
+    let hs_len = u32::from_be_bytes([0, flight[6], flight[7], flight[8]]) as usize;
     let hs_end = 9 + hs_len;
     if hs_end > rec_end || hs_end < 44 {
-        return;
+        return None;
     }
-    let sid_len = buf[43] as usize;
+    let sid_len = flight[43] as usize;
     let cipher_off = 44 + sid_len;
-    // cipher_suite (2B) + compression (1B) + ext_len (2B)
     if cipher_off + 5 > hs_end {
-        return;
+        return None;
     }
     let ext_len_off = cipher_off + 3;
-    let ext_len = u16::from_be_bytes([buf[ext_len_off], buf[ext_len_off + 1]]) as usize;
+    let ext_len = u16::from_be_bytes([flight[ext_len_off], flight[ext_len_off + 1]]) as usize;
     let ext_start = ext_len_off + 2;
     let ext_end = ext_start + ext_len;
     if ext_end > hs_end {
-        return;
+        return None;
     }
 
     let mut curr = ext_start;
     while curr + 4 <= ext_end {
-        let ext_type = u16::from_be_bytes([buf[curr], buf[curr + 1]]);
-        let ext_data_len = u16::from_be_bytes([buf[curr + 2], buf[curr + 3]]) as usize;
+        let ext_type = u16::from_be_bytes([flight[curr], flight[curr + 1]]);
+        let ext_data_len = u16::from_be_bytes([flight[curr + 2], flight[curr + 3]]) as usize;
         let data_start = curr + 4;
         let data_end = data_start + ext_data_len;
         if data_end > ext_end {
-            break; // 畸形扩展长度, 安全退出
+            break;
         }
         if ext_type == 0x0033 {
             // key_share ServerHello: group (2B) + key_exchange_len (2B) + key_exchange
             if ext_data_len >= 4 {
-                let group = u16::from_be_bytes([buf[data_start], buf[data_start + 1]]);
-                let klen = u16::from_be_bytes([buf[data_start + 2], buf[data_start + 3]]) as usize;
+                let group = u16::from_be_bytes([flight[data_start], flight[data_start + 1]]);
+                let klen = u16::from_be_bytes([flight[data_start + 2], flight[data_start + 3]]) as usize;
                 let key_start = data_start + 4;
                 let key_end = key_start + klen;
                 if key_end == data_end {
-                    if group == 0x001d && klen == 32 {
-                        if let Some(new_key) = generate_key_share(0x001d) {
-                            buf[key_start..key_end].copy_from_slice(&new_key);
-                        }
-                    } else if group == 0x0017 && klen == 65 {
-                        if let Some(new_key) = generate_key_share(0x0017) {
-                            buf[key_start..key_end].copy_from_slice(&new_key);
-                        }
-                    }
+                    return Some((group, klen, key_start));
                 }
             }
             break;
         }
         curr = data_end;
+    }
+    None
+}
+
+/// 解析 ServerHello 扩展中的 key_share group 与公钥长度: (group, klen)。
+pub(crate) fn key_share_group(flight: &[u8]) -> Option<(u16, usize)> {
+    key_share_info(flight).map(|(g, klen, _)| (g, klen))
+}
+
+/// 解析 ServerHello 扩展, 查找 key_share (0x0033) 并用全新真公钥替换 key_exchange 内容。
+/// 全程边界检查, 遇到越界或畸形结构安全退回 (不改 key_share)。
+fn patch_key_share(buf: &mut [u8], _sh_rec_len: usize) {
+    if let Some((group, klen, key_start)) = key_share_info(buf) {
+        let key_end = key_start + klen;
+        if (group == 0x001d && klen == 32) || (group == 0x0017 && klen == 65) {
+            if let Some(new_key) = generate_key_share(group) {
+                buf[key_start..key_end].copy_from_slice(&new_key);
+            }
+        }
     }
 }
 
@@ -542,7 +568,7 @@ fn fallback_server_hello(client_hello: &[u8], client_session_id: &[u8]) -> Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_server_random, fallback_server_hello, generate_key_share, patch_server_hello, pick_cipher};
+    use super::{apply_server_random, fallback_server_hello, generate_key_share, key_share_group, patch_server_hello, pick_cipher};
 
     #[test]
     fn server_random_per_connection_and_pfs_override() {
@@ -960,5 +986,47 @@ mod tests {
         let new_sid = [0xBBu8; 32];
         let patched = patch_server_hello(&fb, &new_sid);
         assert!(template_is_complete(&patched), "patch 后的模板必须保持 template_is_complete == true");
+    }
+
+    #[test]
+    fn test_key_share_group_parsing() {
+        let ch = make_client_hello();
+        let sid = [0xAAu8; 32];
+        let fb = fallback_server_hello(&ch, &sid);
+        assert_eq!(key_share_group(&fb), Some((0x001d, 32)));
+
+        let mut unknown_group = fb.clone();
+        for i in 0..unknown_group.len() - 4 {
+            if unknown_group[i..i + 4] == [0x00, 0x33, 0x00, 0x24] {
+                unknown_group[i + 4] = 0x00;
+                unknown_group[i + 5] = 0x99;
+                break;
+            }
+        }
+        assert_eq!(key_share_group(&unknown_group), Some((0x0099, 32)));
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_unknown_key_share_template() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ch = make_client_hello();
+        let mut unknown_sh = fallback_server_hello(&ch, &[0xAA; 32]);
+        for i in 0..unknown_sh.len() - 4 {
+            if unknown_sh[i..i + 4] == [0x00, 0x33, 0x00, 0x24] {
+                unknown_sh[i + 4] = 0x00;
+                unknown_sh[i + 5] = 0x99;
+                break;
+            }
+        }
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(&unknown_sh).await;
+        });
+        let res = fetch_real_server_hello(&addr.to_string()).await;
+        assert!(res.is_err(), "未知 key_share group 模板必须被拒: {:?}", res);
     }
 }

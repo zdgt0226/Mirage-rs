@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### fix: 2026-09-28 审计剩余 P3 缺陷修复 (第三批)
+
+- 凭据热重载: `apply_user_config` 检查 `reload_creds` 返回值并在 tag 未注册时记录 warn 日志; 启动阶段检查 `mirage_server` tag 重复并致命报错拒绝启动。
+- 配额时钟回拨: `maybe_rollover` 改为 `expected_start <= cur_start` 直接返回, 杜绝系统时钟回拨跨账单日时逆向回滚并重复清零用量。
+- 出站阻断日志去重: `warn_egress_blocked` 抽取 `WARNED_EGRESS_CAPACITY` 常量 (1024), 超过上限 retain 10s 条目后若仍满则 clear, 杜绝无界增长。
+- 时间戳饱和与无符号边界: `ts_within_tolerance` 中加法改用 `saturating_add`, 修复客户端超大时间戳导致的 debug panic; `now_sec` 增加 `.max(0)` 避免负数回绕。
+- 伪装地址拼接规范化: 新增 `host_with_default_port` 与 `extract_hostname`, 统一规范 `[v6]:port`、裸 IPv6、`name:port` 等格式拼接与 SNI 提取, 修复伪装站连接与握手缓存对 IPv6 字面量的错误拼接。
+- UDP 来源校验 (收紧行为说明): 服务端 UDP 非 mux 转发维护会话已发送目标白名单集合 (上限 1024 条), 下行丢弃非白名单来源报文 (防伪造来源刷配额/注入数据); 注意此改动会将 full-cone UDP (如部分 STUN/P2P) 语义收紧为 restricted-cone。
+- UDP 配额超额退出: 上行 `record_bytes` 超额后通过标签 break 退出整个会话循环, 协同停止下行任务并关闭连接。
+- QUIC 精简流认证失败关闭连接: `handle_quic_stream_lean` 在 token 认证失败时立即调用 `conn.close` 关闭整个底层 QUIC 连接, 防范单连接穷举试探 token。
+- 伪装模板 key_share 校验加固: 抽取 `key_share_group`, 并在真实 ServerHello 模板入缓存前校验其 key_share 为支持重新生成的 group (X25519/P-256), 否则拒绝缓存回落 fallback。
+- 配置文件重复口令/跨入站同名用户提示: 启动与热重载时对重复口令 issue 输出 error! 日志显著提醒; 在 `semantic_issues` 新增不同 `mirage_server` 入站下同名用户限额配置不一致的检查提示。
+- ⚠️ 行为变化: 配置中存在重复 tag 的 `mirage_server` 入站现在**拒绝启动** (此前仅 WARN, 两入站实际共用同一份凭据快照 → A 入站用 B 的口令鉴权); 升级前请用 `mirage-rs check` 确认。UDP 非 mux 回包来源收紧见上。
+- 审阅修正: 恢复初稿误删的 udp_relay `send_to` 失败排障注释; build_state 改为只解析一次配置 (初稿对同一内容解析两遍)。
+
 ### test/ci: 修复 QUIC 端到端集成测试并在 CI 中纳入回归测试 (审计 P2)
 
 - **QUIC 端到端测试补齐 (`tests/test_quic_e2e.rs`)**:

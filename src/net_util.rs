@@ -13,6 +13,56 @@ pub fn join_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// 为 host 补齐默认端口 (若未显式指定):
+/// 规则:
+/// 1. `[v6]:port` 原样
+/// 2. 能解析为 SocketAddr 的原样
+/// 3. 能解析为 IpAddr (含裸 IPv6) 的用 `join_host_port(&ip.to_string(), default_port)`
+/// 4. 形如 `name:port` (恰一个冒号且后半是数字) 原样
+/// 5. 其余用 `join_host_port(host, default_port)`
+pub fn host_with_default_port(host: &str, default_port: u16) -> String {
+    if host.starts_with('[') {
+        if let Some(rest) = host.strip_prefix('[') {
+            if let Some((_v6, port_str)) = rest.split_once("]:") {
+                if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+                    return host.to_string();
+                }
+            }
+        }
+    }
+    if host.parse::<std::net::SocketAddr>().is_ok() {
+        return host.to_string();
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return join_host_port(&ip.to_string(), default_port);
+    }
+    if let Some((name, port_str)) = host.split_once(':') {
+        if !name.contains(':') && !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            return host.to_string();
+        }
+    }
+    join_host_port(host, default_port)
+}
+
+/// 从 host:port 或裸 host/IP 中提取主机名/IP 字符串 (用于 SNI 等):
+/// - `[v6]:port` 或 `[v6]` → 提取方括号内的 IPv6
+/// - 裸 v6 (如 `2606:4700::1`) → 原样返回
+/// - `name:port` (恰一个冒号且后半是数字, 如 `example.com:8443`, `127.0.0.1:8443`) → 提取 `name`
+/// - 其余 (如 `example.com`) → 原样返回
+pub fn extract_hostname(host: &str) -> &str {
+    if host.starts_with('[') {
+        if let Some(end) = host.find(']') {
+            return &host[1..end];
+        }
+    }
+    if let Some((name, port_str)) = host.split_once(':') {
+        if !name.contains(':') && !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            return name;
+        }
+    }
+    host
+}
+
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -293,5 +343,40 @@ mod tests {
         // 清理注入
         super::clear_injected_local_ips_for_test();
         assert!(egress_allowed(test_ip, false), "清理后应恢复放行");
+    }
+
+    #[test]
+    fn test_host_with_default_port_and_extract_hostname() {
+        use super::{extract_hostname, host_with_default_port};
+
+        // 1. [v6]:port
+        assert_eq!(host_with_default_port("[2606:4700::1]:8443", 443), "[2606:4700::1]:8443");
+        assert_eq!(extract_hostname("[2606:4700::1]:8443"), "2606:4700::1");
+
+        // 2. [v6] without port
+        assert_eq!(host_with_default_port("[2606:4700::1]", 443), "[2606:4700::1]:443");
+        assert_eq!(extract_hostname("[2606:4700::1]"), "2606:4700::1");
+
+        // 3. SocketAddr (IPv4 with port)
+        assert_eq!(host_with_default_port("127.0.0.1:8443", 443), "127.0.0.1:8443");
+        assert_eq!(extract_hostname("127.0.0.1:8443"), "127.0.0.1");
+
+        // 4. Bare IPv6
+        assert_eq!(host_with_default_port("2606:4700::1", 443), "[2606:4700::1]:443");
+        assert_eq!(extract_hostname("2606:4700::1"), "2606:4700::1");
+        assert_eq!(host_with_default_port("::1", 443), "[::1]:443");
+        assert_eq!(extract_hostname("::1"), "::1");
+
+        // 5. Bare IPv4
+        assert_eq!(host_with_default_port("127.0.0.1", 443), "127.0.0.1:443");
+        assert_eq!(extract_hostname("127.0.0.1"), "127.0.0.1");
+
+        // 6. name:port
+        assert_eq!(host_with_default_port("example.com:8443", 443), "example.com:8443");
+        assert_eq!(extract_hostname("example.com:8443"), "example.com");
+
+        // 7. plain name
+        assert_eq!(host_with_default_port("example.com", 443), "example.com:443");
+        assert_eq!(extract_hostname("example.com"), "example.com");
     }
 }

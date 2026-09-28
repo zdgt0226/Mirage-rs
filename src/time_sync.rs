@@ -38,7 +38,7 @@ pub fn now_sec() -> u64 {
     // 纠正客户端 offset.
     let local = local_now_sec() as i64;
     let offset = TIME_OFFSET.load(Ordering::Relaxed);
-    (local + offset) as u64
+    (local + offset).max(0) as u64
 }
 
 /// 客户端从 server 收到 TIME_SYNC 帧后调用, 计算并存储 offset.

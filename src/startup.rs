@@ -133,7 +133,11 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
             Ok((_, issues)) if !issues.is_empty() => {
                 warn!("配置校验发现 {} 个问题 (不影响启动, 但很可能不是你想要的):", issues.len());
                 for issue in &issues {
-                    warn!("  · {}", issue);
+                    if issue.contains("password 与") {
+                        error!("  · {}", issue);
+                    } else {
+                        warn!("  · {}", issue);
+                    }
                 }
             }
             Ok(_) => info!("配置校验通过 (无未知字段, 引用完整)"),
