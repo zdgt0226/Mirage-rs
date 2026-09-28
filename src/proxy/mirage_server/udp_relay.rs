@@ -43,6 +43,25 @@ pub(crate) fn record_sent_target(
     targets.insert(target, now);
 }
 
+/// 下行回包帧体: `[1B ATYP][ADDR][2B PORT][PAYLOAD]` (外层再加 2B 长度)。
+/// `from` 须已经过 normalize_addr (IPv4-mapped 还原为 IPv4), 否则双栈 socket 上的 IPv4 回包会被编码成 IPv6。
+pub(crate) fn encode_reply_frame(from: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1 + 16 + 2 + payload.len());
+    match from.ip() {
+        std::net::IpAddr::V4(ip) => {
+            frame.push(1);
+            frame.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            frame.push(4);
+            frame.extend_from_slice(&ip.octets());
+        }
+    }
+    frame.extend_from_slice(&from.port().to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
 /// 将目标地址转换为双栈/单栈 direct socket 所需的目标地址。
 /// 若 socket 为双栈 (`is_dual_stack == true`):
 /// - IPv4 转换为 IPv4-mapped IPv6 (`::ffff:a.b.c.d:port`)
@@ -225,23 +244,9 @@ pub(super) async fn handle_udp_relay(
                         }
                     }
                     // Frame format: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
-                    let atyp: u8; // Declared but assigned in match
-                    let mut addr_bytes = Vec::new();
-                    match addr.ip() {
-                        std::net::IpAddr::V4(ip) => {
-                            atyp = 1;
-                            addr_bytes.extend_from_slice(&ip.octets());
-                        }
-                        std::net::IpAddr::V6(ip) => {
-                            atyp = 4;
-                            addr_bytes.extend_from_slice(&ip.octets());
-                        }
-                    }
-
-                    let mut frame = vec![atyp];
-                    frame.extend_from_slice(&addr_bytes);
-                    frame.extend_from_slice(&addr.port().to_be_bytes());
-                    frame.extend_from_slice(&buf[..size]);
+                    // 用归一化后的来源地址封帧: 双栈 socket 上 IPv4 目标的回包来源是 ::ffff:a.b.c.d,
+                    // 原样编码会成 ATYP=4 + 16B, 客户端按 IPv6 回给应用 → IPv4 UDP 回包全丢。
+                    let frame = encode_reply_frame(norm, &buf[..size]);
 
                     let frame_len = frame.len() as u16;
                     let mut packet = Vec::with_capacity(2 + frame.len());
@@ -831,6 +836,18 @@ mod mux_tests {
         record_sent_target(&mut map, a3, now2, idle_timeout, 2);
         assert_eq!(map.len(), 2);
         assert_eq!(map[&a3], now2);
+    }
+
+    /// 双栈 socket 上 IPv4 目标回包来源为 ::ffff:a.b.c.d: 归一化后必须编码为 ATYP=1 + 4B。
+    #[test]
+    fn test_encode_reply_frame_mapped_v4_is_atyp1() {
+        let mapped: SocketAddr = "[::ffff:8.8.8.8]:53".parse().unwrap();
+        let f = encode_reply_frame(normalize_addr(mapped), b"hi");
+        assert_eq!(f, vec![1, 8, 8, 8, 8, 0, 53, b'h', b'i']);
+        let v6: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let f6 = encode_reply_frame(normalize_addr(v6), b"x");
+        assert_eq!(f6[0], 4);
+        assert_eq!(f6.len(), 1 + 16 + 2 + 1);
     }
 
     #[test]

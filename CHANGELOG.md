@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### fix: 服务端 UDP 非 mux 双栈回包地址族编码错误 (#161 回归, 审计第五轮 P1)
+
+- #161 让服务端非 mux UDP 直连改用 `[::]:0` 双栈 socket, IPv4 目标回包的来源地址因此是 `::ffff:a.b.c.d`; 下行封帧仍用未归一化的地址 → 编码成 `ATYP=4` + 16B, 客户端按 IPv6 源回给应用 → **支持 IPv6 的服务端上非 mux UDP 的全部 IPv4 回包失效** (如经代理的 DNS)。改为用 `normalize_addr` 后的地址封帧 (抽出 `encode_reply_frame` 并加单测)。mux 路径每目标按地址族单独 connect, 不受影响。
+
 ### fix: 修复 /api/users 校验受 "user" 子串匹配误拦问题 (审计 P2-1)
 
 - 抽取 `user_hard_errors` 替代原先在语义提示文本中匹配 `"user"` 子串的粗暴逻辑, 避免跨入站同名用户限额提示等普通 issue 误被当成硬错拦截 (422), 恢复多入站场景下的用户修改与限额设定能力。
