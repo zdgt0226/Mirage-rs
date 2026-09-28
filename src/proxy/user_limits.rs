@@ -273,16 +273,25 @@ pub fn build_registry(
         let reset_day = u.quota_reset_day.unwrap_or(1).clamp(1, 28);
         let expected_start = compute_period_start(now_secs, reset_day);
 
-        if let Some(old_h) = old_registry.and_then(|r| r.users.get(&u.name)) {
+        // 若旧句柄存在且未被撤销 (例如未被并发 reload 移除), 则复用旧句柄
+        if let Some(old_h) = old_registry
+            .and_then(|r| r.users.get(&u.name))
+            .filter(|h| !h.revoked.load(Ordering::SeqCst))
+        {
             // 限速: 速率没变就留原桶 (令牌状态连续), 变了才换; 取消限速则清空。
             let keep = matches!((old_h.buckets(), rate_bytes), (Some(b), Some(r)) if (b.up.rate as u64) == r);
             if !keep {
                 old_h.buckets.store(rate_bytes.map(|r| Arc::new(DeviceBuckets::new(r))));
             }
             old_h.quota_bytes.store(quota_bytes.unwrap_or(0), Ordering::SeqCst);
-            old_h.reset_day.store(reset_day, Ordering::SeqCst);
-            // 账单日改动导致周期起点变化 → 按新周期从 0 计; 否则保留本周期用量。
-            if old_h.period_start.load(Ordering::Relaxed) != expected_start {
+            // 账单日改动 → 按新账单日的周期从 0 计; 否则只允许向前滚动 (与 maybe_rollover 一致,
+            // 时钟回拨时的热重载不倒回周期、不清零用量)。
+            let old_reset_day = old_h.reset_day.swap(reset_day, Ordering::SeqCst);
+            let old_start = old_h.period_start.load(Ordering::Relaxed);
+            // 账单日改动导致周期起点变化 → 按新周期从 0 计;
+            // 账单日未变: 仅当前滚至新周期 (expected_start > old_start) 时清零;
+            // 时钟回拨 (expected_start <= old_start) 不清零。
+            if old_reset_day != reset_day || expected_start > old_start {
                 old_h.period_start.store(expected_start, Ordering::SeqCst);
                 old_h.period_used.store(0, Ordering::SeqCst);
             }
@@ -291,10 +300,22 @@ pub fn build_registry(
             continue;
         }
 
-        // 新用户 (或启动): 若刚从持久化文件恢复过同周期用量则沿用, 并从 restored map 中移除。
+        // 新用户 (或启动、或旧句柄已被 revoked): 若刚从持久化/热重载移除写入过同周期用量则沿用, 并从 restored map 中移除。
+        // 新用户 (或启动 / 旧句柄已吊销): 若 restored map 有同周期用量则沿用并从 map 中移除;
+        // 否则若旧注册表里有同名 (已吊销) 句柄且同周期, 沿用其用量 (并发重载时 restored 条目可能已被另一次消费)。
         let period_used = match restored.remove(&u.name) {
             Some(p) if p.period_start == expected_start => p.period_bytes,
-            _ => 0,
+            _ => {
+                if let Some(old_h) = old_registry.and_then(|r| r.users.get(&u.name)) {
+                    if old_h.period_start.load(Ordering::Relaxed) == expected_start {
+                        old_h.period_used.load(Ordering::Relaxed)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
         };
         let buckets = rate_bytes.map(|r| Arc::new(DeviceBuckets::new(r)));
         let handle = Arc::new(UserLimitHandle::new(&u.name, buckets, quota_bytes, reset_day, expected_start, period_used));
@@ -453,15 +474,6 @@ pub fn is_user_exhausted(name: &str) -> bool {
     })
 }
 
-/// 检查指定用户是否仍然有效 (未被删除)。
-///
-/// 保留名 "default" 恒有效; 其余用户在注册表中存在句柄即为有效。
-pub fn user_still_valid(user: &str) -> bool {
-    if user == "default" {
-        return true;
-    }
-    get_user_limit(user).is_some()
-}
 
 /// 获取用户本周期统计 (供 API 查询): (已用字节, 周期起点, 是否超额)
 pub fn get_user_period_stats(name: &str) -> (u64, u64, bool) {
@@ -924,13 +936,113 @@ mod tests {
         assert!(!h2.is_exhausted(), "新句柄不应超额");
         assert!(!charge(Some(&h2), 100, true).await, "新句柄 charge 应正常放行");
 
-        // 3. user_still_valid 逻辑测试
-        assert!(user_still_valid("default"), "default 用户恒有效");
-        assert!(user_still_valid("bob"), "注册表中存在的 bob 有效");
-        assert!(!user_still_valid("nonexistent"), "不存在的用户无效");
+        // 3. 用户有效性查询
+        assert!(get_user_limit("bob").is_some(), "加回后查得到句柄");
+        assert!(get_user_limit("nonexistent").is_none(), "不存在的用户查不到句柄");
 
         // 清理: 恢复注册表为空
         reload_user_limits(&[]);
-        assert!(!user_still_valid("bob"), "再次删除后 bob 无效");
+        assert!(get_user_limit("bob").is_none(), "再次删除后 bob 无句柄");
+    }
+
+    /// P3-2: 模拟 A/B 两次基于同一旧表并发重载: A 删 bob 置 revoked=true, B (含 bob) 复用同一旧表时不得复用已撤销句柄
+    #[tokio::test]
+    async fn test_concurrent_reload_revoked_handle_creates_new_valid_handle() {
+        let h_new = {
+            let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let user_bob = MirageUser {
+                name: "bob_concurrent".to_string(),
+                password: "pwd".to_string(),
+                rate_limit_kbps: None,
+                quota_gb: Some(10.0),
+                quota_reset_day: Some(1),
+            };
+            init_user_limits(std::slice::from_ref(&user_bob));
+            let h_old = get_user_limit("bob_concurrent").expect("初始 bob 存在");
+            h_old.record_bytes(5000);
+            let now = current_unix_time();
+
+            // 记录此时的旧表
+            let old_reg = registry_slot().load();
+
+            // 重载 A: 删除了 bob (配置为空表)
+            reload_user_limits(&[]);
+            assert!(h_old.revoked.load(Ordering::SeqCst), "重载 A 将旧句柄标记为 revoked");
+
+            // 重载 B: 基于同一张 old_reg 重载 (含 bob)
+            let reg_b = build_registry(std::slice::from_ref(&user_bob), Some(&old_reg), now);
+            let h_new = reg_b.users.get("bob_concurrent").expect("B 包含 bob").clone();
+            assert!(!Arc::ptr_eq(&h_old, &h_new), "B 不能复用已撤销的旧句柄, 必须新建");
+            assert!(!h_new.revoked.load(Ordering::SeqCst), "新建句柄 revoked 必须为 false");
+            assert_eq!(
+                h_new.period_used.load(Ordering::Relaxed),
+                5000,
+                "同周期用量必须通过 restored map 延续"
+            );
+            h_new
+        };
+        assert!(!charge(Some(&h_new), 100, true).await, "新句柄 charge 必须正常放行");
+
+        // 清理
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reload_user_limits(&[]);
+    }
+
+    /// P3-6: build_registry 周期重置测试: 回拨不清零、前滚清零、改账单日重算
+    #[test]
+    fn test_build_registry_period_reset_and_clock_rewind() {
+        // build_registry 会读/消费进程级 RESTORED_QUOTAS, 与其它改注册表的测试串行。
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 2026-09-15 00:00:00 UTC
+        let t0 = days_from_civil(2026, 9, 15) as u64 * 86400;
+        let start_sept = days_from_civil(2026, 9, 1) as u64 * 86400;
+        let user = MirageUser {
+            name: "rollover_user".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(10.0),
+            quota_reset_day: Some(1),
+        };
+
+        // 初始构建: 2026-09-15, expected_start 为 2026-09-01
+        let reg1 = build_registry(std::slice::from_ref(&user), None, t0);
+        let h1 = reg1.users.get("rollover_user").unwrap();
+        h1.record_bytes(8192);
+        assert_eq!(h1.period_start.load(Ordering::Relaxed), start_sept);
+        assert_eq!(h1.period_used.load(Ordering::Relaxed), 8192);
+
+        // 1. 时钟回拨: 回拨到 2026-08-20 (expected_start 为 2026-08-01 < 2026-09-01)
+        let t_rewind = days_from_civil(2026, 8, 20) as u64 * 86400;
+        let reg_rewind = build_registry(std::slice::from_ref(&user), Some(&reg1), t_rewind);
+        let h_rewind = reg_rewind.users.get("rollover_user").unwrap();
+        assert!(Arc::ptr_eq(h1, h_rewind));
+        assert_eq!(h_rewind.period_start.load(Ordering::Relaxed), start_sept, "时钟回拨不倒退 period_start");
+        assert_eq!(h_rewind.period_used.load(Ordering::Relaxed), 8192, "时钟回拨不清零 period_used");
+
+        // 2. 前滚进入新周期: 2026-10-05 (expected_start 为 2026-10-01 > 2026-09-01)
+        let t_forward = days_from_civil(2026, 10, 5) as u64 * 86400;
+        let start_oct = days_from_civil(2026, 10, 1) as u64 * 86400;
+        let reg_forward = build_registry(std::slice::from_ref(&user), Some(&reg1), t_forward);
+        let h_forward = reg_forward.users.get("rollover_user").unwrap();
+        assert!(Arc::ptr_eq(h1, h_forward));
+        assert_eq!(h_forward.period_start.load(Ordering::Relaxed), start_oct, "新周期更新 period_start");
+        assert_eq!(h_forward.period_used.load(Ordering::Relaxed), 0, "新周期清零 period_used");
+
+        // 恢复部分用量以便测试修改账单日
+        h_forward.record_bytes(4096);
+        assert_eq!(h_forward.period_used.load(Ordering::Relaxed), 4096);
+
+        // 3. 修改账单日: reset_day 改为 15, 当前时间 2026-10-20
+        // expected_start 变为 2026-10-15
+        let mut user_mod = user.clone();
+        user_mod.quota_reset_day = Some(15);
+        let t_mod = days_from_civil(2026, 10, 20) as u64 * 86400;
+        let start_oct_15 = days_from_civil(2026, 10, 15) as u64 * 86400;
+        let reg_mod = build_registry(std::slice::from_ref(&user_mod), Some(&reg_forward), t_mod);
+        let h_mod = reg_mod.users.get("rollover_user").unwrap();
+        assert!(Arc::ptr_eq(h_forward, h_mod));
+        assert_eq!(h_mod.reset_day(), 15, "reset_day 更新为 15");
+        assert_eq!(h_mod.period_start.load(Ordering::Relaxed), start_oct_15, "周期起点更新为 15 号");
+        assert_eq!(h_mod.period_used.load(Ordering::Relaxed), 0, "修改账单日清零用量从 0 计");
     }
 }

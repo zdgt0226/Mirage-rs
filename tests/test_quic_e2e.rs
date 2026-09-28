@@ -96,16 +96,26 @@ fn free_port() -> u16 {
 
 fn socks5_connect(proxy: u16, target_port: u16) -> std::io::Result<TcpStream> {
     let mut s = TcpStream::connect(("127.0.0.1", proxy))?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
     s.write_all(&[5, 1, 0])?;
     let mut r = [0u8; 2];
     s.read_exact(&mut r)?;
-    assert_eq!(r, [5, 0], "服务端应选无认证");
+    if r != [5, 0] {
+        return Err(std::io::Error::other(format!(
+            "服务端认证协商失败: {:?}",
+            r
+        )));
+    }
     let p = target_port.to_be_bytes();
     s.write_all(&[5, 1, 0, 1, 127, 0, 0, 1, p[0], p[1]])?;
     let mut rep = [0u8; 10];
     s.read_exact(&mut rep)?;
-    assert_eq!(rep[1], 0, "CONNECT 应成功 (REP=0), 实际 REP={}", rep[1]);
+    if rep[1] != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("CONNECT 应成功 (REP=0), 实际 REP={}", rep[1]),
+        ));
+    }
     Ok(s)
 }
 
@@ -153,14 +163,36 @@ fn quic_transport_tunnels_tcp() {
     let _clean_cli = CleanFile(cli.clone());
 
     let _s = spawn("server", &srv);
-    std::thread::sleep(std::time::Duration::from_millis(1500)); // QUIC 服务端无 TCP 口可探, 等其起
     let _c = spawn("client", &cli);
     assert!(wait_port(cport), "客户端 SOCKS 入站未就绪");
-    std::thread::sleep(std::time::Duration::from_millis(500));
 
-    let mut s = socks5_connect(cport, echo).expect("经 QUIC 隧道 SOCKS5 CONNECT 应成功");
-    s.write_all(b"hello quic").unwrap();
-    let mut buf = [0u8; 64];
-    let n = s.read(&mut buf).expect("应从 echo 读回数据");
-    assert_eq!(&buf[..n], b"hello quic", "QUIC 隧道回显不匹配");
+    // 端到端请求带重试 (最多 10 次、每次间隔 300ms, 替代原先固定 sleep 等待 QUIC 服务端)
+    let mut last_err = String::new();
+    let mut success = false;
+    for _ in 1..=10 {
+        match socks5_connect(cport, echo) {
+            Ok(mut s) => {
+                if s.write_all(b"hello quic").is_ok() {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = s.read(&mut buf) {
+                        if &buf[..n] == b"hello quic" {
+                            success = true;
+                            break;
+                        } else {
+                            last_err = format!("回显数据不匹配: {:?}", &buf[..n]);
+                        }
+                    } else {
+                        last_err = "从 echo 读取数据失败".to_string();
+                    }
+                } else {
+                    last_err = "向 stream 发送数据失败".to_string();
+                }
+            }
+            Err(e) => {
+                last_err = format!("socks5_connect 失败: {e}");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    assert!(success, "QUIC 端到端请求重试超限失败: {last_err}");
 }

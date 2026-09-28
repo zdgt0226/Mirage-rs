@@ -127,6 +127,7 @@ impl ConfigWatcher {
             }
         }
         
+        let is_hot_reload = old_outbounds.is_some();
         let outbounds = if let Some(old) = old_outbounds {
             info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
             // NOTE: Stateful components like pool/fake_ip_mapper are preserved during reload.
@@ -292,8 +293,10 @@ impl ConfigWatcher {
         // 服务端 IP 限速器随热重载更新
         crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
 
-        // 多用户凭据与限速/配额热重载
-        apply_user_config(&config.inbounds);
+        // 多用户凭据与限速/配额热重载 (仅在热重载时应用; 冷启动由 lib.rs 的 init_user_limits + register_creds 负责)
+        if is_hot_reload {
+            apply_user_config(&config.inbounds);
+        }
 
         Ok(CoreState {
             router: Arc::new(router),
@@ -339,6 +342,28 @@ impl ConfigWatcher {
             }
             info!("Started hot-reload watcher on config dir {} for file {:?}", config_dir.display(), config_file_name);
 
+            // 若配置是软链接 (真实路径与原路径不同), 额外 watch 真实父目录 (与已 watch 目录相同则不重复)
+            let real_pathbuf = config_pathbuf.canonicalize().ok();
+            let (real_dir_canon, real_file_name) = match &real_pathbuf {
+                Some(real) if real != &config_pathbuf && real != &config_dir_canon.join(&config_file_name) => {
+                    let r_name = real.file_name().map(|n| n.to_os_string());
+                    let r_dir = real.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+                    let r_dir_canon = r_dir.canonicalize().unwrap_or_else(|_| r_dir.to_path_buf());
+                    (Some(r_dir_canon), r_name)
+                }
+                _ => (None, None),
+            };
+
+            if let Some(ref r_dir_canon) = real_dir_canon {
+                if r_dir_canon != &config_dir_canon {
+                    if let Err(e) = watcher.watch(r_dir_canon, RecursiveMode::NonRecursive) {
+                        warn!("Failed to watch real config dir {} for symlink target: {}", r_dir_canon.display(), e);
+                    } else {
+                        info!("Also watching real config dir {} for symlink target {:?}", r_dir_canon.display(), real_file_name);
+                    }
+                }
+            }
+
             // 2. Watch geodata directory — geo_updater 下载新 .dat 后触发 Router 重建.
             // 修复 bug #2 (启动时序空隙): 之前只 watch config_path, geo_updater 30s
             // 后下载 .dat 落地, 但 ConfigWatcher 不知道, Router 内存里 geo 表始终空,
@@ -372,7 +397,7 @@ impl ConfigWatcher {
                 info!("Geodata dir is same as config dir; skipping duplicate watch.");
             }
 
-            // 3. Event loop — 过滤事件路径, 只对 config 文件本身或 .dat 文件触发
+            // 3. Event loop — 过滤事件路径, 只对 config 文件本身 (含软链接真实目标) 或 .dat 文件触发
             // (避免 .tmp 写入 + 其他无关文件抖动). create/modify/rename 都算变更.
             for res in rx {
                 match res {
@@ -384,8 +409,12 @@ impl ConfigWatcher {
                         // 里可能 .tmp 在前 .dat 在后, 老 first() 会 log 出误导
                         // 的 .tmp 路径. find 匹配 trigger predicate 保证 log 显
                         // 示的就是真正被认可导致 reload 的那条路径.
+                        let real_target = match (&real_dir_canon, &real_file_name) {
+                            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+                            _ => None,
+                        };
                         let trigger_path = paths.iter().find(|p| {
-                            is_config_event(p, &config_dir_canon, &config_file_name)
+                            is_config_event(p, &config_dir_canon, &config_file_name, real_target)
                                 || p.extension().is_some_and(|e| e == "dat")
                         });
                         let trigger_path = match trigger_path {
@@ -421,7 +450,7 @@ impl ConfigWatcher {
                         // 到 proxy). update() 幂等 = 一次 Arc swap + notify_one,
                         // 成本很低. 只有 config 文件本身改动才触发 (`.dat` 变化
                         // 不影响 updater 配置).
-                        if is_config_event(trigger_path, &config_dir_canon, &config_file_name) {
+                        if is_config_event(trigger_path, &config_dir_canon, &config_file_name, real_target) {
                             let old_updater = (**updater_handle.state.load()).clone();
                             if let Some(new_updater) = Self::extract_updater_state(&config_path, &old_updater) {
                                 let sources_delta = new_updater.sources.len() as i64
@@ -443,12 +472,16 @@ impl ConfigWatcher {
     }
 }
 
+static APPLY_USER_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 多用户凭据与限速/配额配置应用 (build_state 与 /api/users 共用):
 /// 1. 保留既有用量, 重新计算超额
 /// 2. 对每个 mirage_server 入站按 tag 重建凭据并原子替换; tag 不存在的跳过
 ///
 /// 限额注册表全进程一张: 汇总所有入站的 users 一次性重建 (逐入站调用会互相覆盖, 见 collect_users)。
+/// 全程持一把进程级 Mutex 串行化, 避免 /api/users 与 watcher 观察到交错的注册表状态。
 pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
+    let _lock = APPLY_USER_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     crate::proxy::user_limits::reload_user_limits(&crate::proxy::user_limits::collect_users(inbounds));
     for ib in inbounds {
         if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
@@ -460,18 +493,36 @@ pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
     }
 }
 
-/// 判定事件路径是否指向配置文件本身。
+/// 判定事件路径是否指向配置文件本身 (同时支持软链接自身与真实目标路径)。
 ///
 /// 解决 inotify 监听配置文件本身在 tmp+rename 覆盖后丢失 inode watch 的问题。
 /// 监听父目录时, notify 上报该目录下所有变动, 本函数过滤出对目标配置文件的变更:
 /// - 比较文件名 (忽略同目录下的 .tmp 临时文件、stats 持久化文件等)
 /// - 比较父目录 canonical 路径 (支持相对路径、绝对路径及软链接目录)
+/// - 当 real_target 为 Some 时, 额外比对真实目标文件与真实目录 (软链接场景)
 pub fn is_config_event(
     path: &Path,
     config_dir_canon: &Path,
     config_file_name: &std::ffi::OsStr,
+    real_target: Option<(&Path, &std::ffi::OsStr)>,
 ) -> bool {
-    if path.file_name() != Some(config_file_name) {
+    if is_single_config_event(path, config_dir_canon, config_file_name) {
+        return true;
+    }
+    if let Some((real_dir_canon, real_file_name)) = real_target {
+        if is_single_config_event(path, real_dir_canon, real_file_name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_single_config_event(
+    path: &Path,
+    dir_canon: &Path,
+    file_name: &std::ffi::OsStr,
+) -> bool {
+    if path.file_name() != Some(file_name) {
         return false;
     }
     let p_parent = match path.parent() {
@@ -479,9 +530,9 @@ pub fn is_config_event(
         _ => Path::new("."),
     };
     if let Ok(canon) = p_parent.canonicalize() {
-        canon == config_dir_canon
+        canon == dir_canon
     } else {
-        p_parent == config_dir_canon
+        p_parent == dir_canon
     }
 }
 
@@ -704,26 +755,26 @@ mod watcher_event_tests {
 
         // 1. 绝对路径匹配
         let abs_path = canon_dir.join("config.json");
-        assert!(is_config_event(&abs_path, &canon_dir, &file_name));
+        assert!(is_config_event(&abs_path, &canon_dir, &file_name, None));
 
         // 2. 相对路径 (以当前工作目录为例)
         let cwd_canon = Path::new(".").canonicalize().unwrap();
         let rel_file = Path::new("config.json");
         let rel_dot_file = Path::new("./config.json");
-        assert!(is_config_event(rel_file, &cwd_canon, &file_name));
-        assert!(is_config_event(rel_dot_file, &cwd_canon, &file_name));
+        assert!(is_config_event(rel_file, &cwd_canon, &file_name, None));
+        assert!(is_config_event(rel_dot_file, &cwd_canon, &file_name, None));
 
         // 3. 其它文件名 (如 .tmp, stats 文件) 不匹配
         let tmp_file = canon_dir.join("config.json.tmp");
         let stats_file = canon_dir.join("stats.json");
-        assert!(!is_config_event(&tmp_file, &canon_dir, &file_name));
-        assert!(!is_config_event(&stats_file, &canon_dir, &file_name));
+        assert!(!is_config_event(&tmp_file, &canon_dir, &file_name, None));
+        assert!(!is_config_event(&stats_file, &canon_dir, &file_name, None));
 
         // 4. 不同目录下的同名文件不匹配
         let other_dir = std::env::temp_dir().join(format!("mirage_other_dir_{}_{}", std::process::id(), fastrand::u64(..)));
         std::fs::create_dir_all(&other_dir).unwrap();
         let other_file = other_dir.join("config.json");
-        assert!(!is_config_event(&other_file, &canon_dir, &file_name));
+        assert!(!is_config_event(&other_file, &canon_dir, &file_name, None));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
         let _ = std::fs::remove_dir_all(&other_dir);
@@ -756,7 +807,7 @@ mod watcher_event_tests {
             while std::time::Instant::now() < timeout {
                 if let Ok(Ok(Event { kind, paths, .. })) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
                     if (kind.is_modify() || kind.is_create())
-                        && paths.iter().any(|p| is_config_event(p, &config_dir_canon, &config_file_name))
+                        && paths.iter().any(|p| is_config_event(p, &config_dir_canon, &config_file_name, None))
                     {
                         hit = true;
                         break;
@@ -769,7 +820,51 @@ mod watcher_event_tests {
         // 验证写入同目录无关文件 (.tmp) 不被判定为 config 事件
         let unrelated_path = temp_dir.join("config.json.tmp");
         std::fs::write(&unrelated_path, b"tmp data").unwrap();
-        assert!(!is_config_event(&unrelated_path, &config_dir_canon, &config_file_name));
+        assert!(!is_config_event(&unrelated_path, &config_dir_canon, &config_file_name, None));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_is_config_event_with_symlink() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_watch_symlink_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_dir = temp_dir.join("real_dir");
+        let link_dir = temp_dir.join("link_dir");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+
+        let real_path = real_dir.join("real.json");
+        std::fs::write(&real_path, b"initial").unwrap();
+
+        let link_path = link_dir.join("link.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+
+        let link_dir_canon = link_dir.canonicalize().unwrap();
+        let link_file_name = std::ffi::OsString::from("link.json");
+        let real_dir_canon = real_dir.canonicalize().unwrap();
+        let real_file_name = std::ffi::OsString::from("real.json");
+        let real_target = Some((real_dir_canon.as_path(), real_file_name.as_os_str()));
+
+        // 对 real.json 的路径 (无论是绝对路径还是通过 tmp+rename 写入) 能被识别
+        assert!(is_config_event(&real_path, &link_dir_canon, &link_file_name, real_target));
+
+        // 对 link.json 的路径也能被识别
+        assert!(is_config_event(&link_path, &link_dir_canon, &link_file_name, real_target));
+
+        // 对 real_dir 下的 tmp 文件不被判定为 config 事件
+        let real_tmp = real_dir.join("real.json.tmp");
+        assert!(!is_config_event(&real_tmp, &link_dir_canon, &link_file_name, real_target));
+
+        // 对 link_dir 下的 tmp 文件不被判定为 config 事件
+        let link_tmp = link_dir.join("link.json.tmp");
+        assert!(!is_config_event(&link_tmp, &link_dir_canon, &link_file_name, real_target));
+
+        // 对无关文件不被判定为 config 事件
+        let unrelated = real_dir.join("other.json");
+        assert!(!is_config_event(&unrelated, &link_dir_canon, &link_file_name, real_target));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

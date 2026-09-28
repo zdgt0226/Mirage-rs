@@ -29,7 +29,13 @@ pub mod users;
 pub(crate) async fn atomic_write_config(path: &str, content: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let tmp = format!("{path}.tmp");
+    // 若目标是软链接或已存在文件, 解析为 canonical 真实路径; 不存在则用原路径。
+    // 将 tmp 文件放在真实文件同目录下并 rename 到真实路径, 保持软链接本身不变。
+    let target_path = match tokio::fs::canonicalize(path).await {
+        Ok(real) => real,
+        Err(_) => std::path::PathBuf::from(path),
+    };
+    let tmp = format!("{}.tmp", target_path.display());
     #[cfg(unix)]
     let mode: u32 = 0o600;
 
@@ -51,10 +57,10 @@ pub(crate) async fn atomic_write_config(path: &str, content: &str) -> std::io::R
         }
         file.sync_all().await?;
         drop(file);
-        tokio::fs::rename(&tmp, path).await?;
+        tokio::fs::rename(&tmp, &target_path).await?;
         #[cfg(unix)]
         {
-            if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Some(parent) = target_path.parent() {
                 let parent_path = if parent.as_os_str().is_empty() {
                     std::path::Path::new(".")
                 } else {
@@ -99,5 +105,29 @@ mod tests {
         assert!(!std::path::Path::new(&format!("{p}.tmp")).exists(), "tmp 不应残留");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn atomic_write_config_preserves_symlink() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_awc_sym_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_file = temp_dir.join("real.json");
+        std::fs::write(&real_file, "{\"initial\":1}").unwrap();
+
+        let link_file = temp_dir.join("link.json");
+        std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+        // 写入软链接路径 link.json
+        atomic_write_config(link_file.to_str().unwrap(), "{\"updated\":2}").await.unwrap();
+
+        // 验证 link.json 仍为软链接, 且 real.json 内容已更新
+        let sym_meta = std::fs::symlink_metadata(&link_file).unwrap();
+        assert!(sym_meta.file_type().is_symlink(), "link.json 必须保持为软链接");
+        let content = std::fs::read_to_string(&real_file).unwrap();
+        assert_eq!(content, "{\"updated\":2}", "real.json 内容应已更新");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
