@@ -316,7 +316,7 @@ impl ConfigWatcher {
             };
             let config_dir = config_pathbuf
                 .parent()
-                .and_then(|p| if p.as_os_str().is_empty() { None } else { Some(p) })
+                .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or(Path::new("."));
             let config_dir_canon = config_dir
                 .canonicalize()
