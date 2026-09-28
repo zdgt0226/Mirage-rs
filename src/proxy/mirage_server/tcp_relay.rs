@@ -28,7 +28,7 @@ pub(super) async fn handle_tcp_relay(
     upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String, // 命中的用户名 (多用户统计); 单用户恒 "default"
-    user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    session_auth: super::SessionAuth,
     allow_local_targets: bool,
 ) {
     // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径;
@@ -43,10 +43,10 @@ pub(super) async fn handle_tcp_relay(
 
     // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
     if let Some(outlet) = upstream_cfg {
-        // 中转路径同样受限速/配额约束 (客户端 IP 桶 + 用户桶), 否则配了上游即可绕过。
+        // 中转路径同样受限速/配额/吊销约束 (客户端 IP 桶 + 用户桶 + 凭据令牌), 否则配了上游即可绕过。
         let limits = UpstreamLimits {
             ip: client_ip.and_then(crate::proxy::rate_limit::server_buckets_for),
-            user: user_limit.clone(),
+            auth: session_auth.clone(),
         };
         match &*outlet {
             crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
@@ -87,14 +87,14 @@ pub(super) async fn handle_tcp_relay(
     // 限速 (device_profiles rate_limit_kbps): 服务端按连接的客户端 IP 取共享桶, 上/下行各整形。
     // 全局 limiter (server_buckets_for, 见 rate_limit.rs) 在 server 启动时按 config.routing 装。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
-    // 用户级限速与配额已在分发时一次性获取 (避免与 connect 期间存在 TOCTOU 导致删除后放行)
+    // 用户级限速与配额及凭据吊销已在分发时一次性获取 (避免与 connect 期间存在 TOCTOU 导致删除后放行)
 
     if let Some(payload) = initial_payload {
         if !payload.is_empty() {
             if let Some(b) = &dev_buckets {
                 b.up.consume(payload.len()).await;
             }
-            if crate::proxy::user_limits::charge(user_limit.as_deref(), payload.len(), true).await {
+            if session_auth.charge(payload.len(), true).await {
                 return;
             }
             if upstream.write_all(&payload).await.is_err() {
@@ -123,13 +123,13 @@ pub(super) async fn handle_tcp_relay(
     let up_bkt = dev_buckets.clone();
     let dn_bkt = dev_buckets;
 
-    let up_user = user_limit.clone();
-    let dn_user = user_limit;
+    let up_auth = session_auth.clone();
+    let dn_auth = session_auth;
 
     let up_conn = _conn.counter();
     let upload = async move {
         loop {
-            if up_user.as_ref().is_some_and(|u| u.is_exhausted()) {
+            if up_auth.should_stop() {
                 break;
             }
             match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
@@ -138,8 +138,8 @@ pub(super) async fn handle_tcp_relay(
                     if let Some(b) = &up_bkt {
                         b.up.consume(data.len()).await; // 客户端上行限速整形
                     }
-                    // 用户上行限速 + 配额计数; 越过配额即断开
-                    if crate::proxy::user_limits::charge(up_user.as_deref(), data.len(), true).await {
+                    // 用户上行限速 + 配额计数; 越过配额或凭据吊销即断开
+                    if up_auth.charge(data.len(), true).await {
                         break;
                     }
                     if up_write.write_all(data).await.is_err() {
@@ -167,7 +167,7 @@ pub(super) async fn handle_tcp_relay(
         // 把多帧 syscall 合成一个大 write. 打破"读一片写一片"串行的碎片.
         let mut buf = vec![0u8; 65536];
         loop {
-            if dn_user.as_ref().is_some_and(|u| u.is_exhausted()) {
+            if dn_auth.should_stop() {
                 break;
             }
             match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
@@ -189,8 +189,8 @@ pub(super) async fn handle_tcp_relay(
                     if let Some(b) = &dn_bkt {
                         b.down.consume(total).await; // 客户端下行限速整形
                     }
-                    // 用户下行限速 + 配额计数; 越过配额即断开
-                    if crate::proxy::user_limits::charge(dn_user.as_deref(), total, false).await {
+                    // 用户下行限速 + 配额计数; 越过配额或凭据吊销即断开
+                    if dn_auth.charge(total, false).await {
                         break;
                     }
                     if writer.send_data(&buf[..total]).await.is_err() {
@@ -220,24 +220,24 @@ pub(super) async fn handle_tcp_relay(
 /// 结构与直连路径一致(共享 fd + 任一方退出即 `shutdown(SHUT_RDWR)` 唤醒另一方),
 /// 差别只在: 上游是 SS 加密流, 因此下行按**整块解密**读取, 用不上直连路径那个
 /// 基于 `try_read` 的贪婪收割(SS 已按 ≤16KB 分块, 半块数据没有意义)。
-/// 上游中转路径的限速/配额上下文 (客户端 IP 桶 + 用户桶, 两桶都扣)。
+/// 上游中转路径的限速/配额/吊销上下文 (客户端 IP 桶 + 用户桶 + 凭据令牌, 两桶都扣)。
 #[derive(Clone)]
 struct UpstreamLimits {
     ip: Option<Arc<crate::proxy::rate_limit::DeviceBuckets>>,
-    user: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    auth: super::SessionAuth,
 }
 
 impl UpstreamLimits {
-    /// 扣限速 + 计配额; 返回 true = 用户已超额, 调用方断开。
+    /// 扣限速 + 计配额; 返回 true = 用户已超额或凭据已吊销, 调用方断开。
     async fn charge(&self, n: usize, up: bool) -> bool {
         if let Some(b) = &self.ip {
             if up { b.up.consume(n).await } else { b.down.consume(n).await }
         }
-        crate::proxy::user_limits::charge(self.user.as_deref(), n, up).await
+        self.auth.charge(n, up).await
     }
 
     fn exhausted(&self) -> bool {
-        self.user.as_ref().is_some_and(|u| u.is_exhausted())
+        self.auth.should_stop()
     }
 }
 

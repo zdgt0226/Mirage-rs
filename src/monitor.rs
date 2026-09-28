@@ -1052,6 +1052,7 @@ mod conn_registry_tests {
     // 多用户 per-user 统计: 用唯一 user 名避免与其它测试共享全局 USER_STATS 污染。
     #[test]
     fn user_stats_accumulates_bytes_and_active() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let uname = "p1-multiuser-test-user";
         let g = register("t:443".into(), "in".into(), "out".into(), "tcp", None, Some("9.9.9.9".into()), Some(uname.into()));
         // 活跃期: active >= 1, 字节累加。

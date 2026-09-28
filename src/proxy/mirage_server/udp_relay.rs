@@ -148,7 +148,7 @@ pub(super) async fn handle_udp_relay(
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String,
-    user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    session_auth: super::SessionAuth,
     allow_local_targets: bool,
 ) {
     debug!("Mirage Server: Started UDP relay session");
@@ -213,10 +213,13 @@ pub(super) async fn handle_udp_relay(
     let writer_clone = writer.clone();
 
     let dn_buckets = dev_buckets.clone();
-    let dn_user = user_limit.clone();
+    let dn_auth = session_auth.clone();
     let downlink = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
+            if dn_auth.should_stop() {
+                break;
+            }
             match tokio::time::timeout(UDP_IDLE_TIMEOUT, udp_clone.recv_from(&mut buf)).await {
                 Ok(Ok((size, addr))) => {
                     // 校验回包来源: 丢弃未知来源的包 (不计费、不回送)。
@@ -233,15 +236,13 @@ pub(super) async fn handle_udp_relay(
                     // 下行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
                     if !crate::proxy::rate_limit::try_consume_two(
                         dn_buckets.as_ref().map(|b| &b.down),
-                        dn_user.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
+                        dn_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
                         size,
                     ) {
                         continue;
                     }
-                    if let Some(u) = &dn_user {
-                        if u.record_bytes(size) {
-                            break; // 越额退出
-                        }
+                    if dn_auth.record_bytes(size) {
+                        break; // 越额或吊销退出
                     }
                     // Frame format: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
                     // 用归一化后的来源地址封帧: 双栈 socket 上 IPv4 目标的回包来源是 ::ffff:a.b.c.d,
@@ -278,8 +279,12 @@ pub(super) async fn handle_udp_relay(
     let stop_tx_down = stop_tx.clone();
     let stop_tx_up = stop_tx.clone();
 
+    let dn_auth_tunnel = session_auth.clone();
     let tunnel_downlink = async move {
         loop {
+            if dn_auth_tunnel.should_stop() {
+                break;
+            }
             let packet = tokio::select! {
                 biased;
                 _ = stop_rx_down.changed() => break,
@@ -296,9 +301,13 @@ pub(super) async fn handle_udp_relay(
         let _ = stop_tx_down.send(true);
     };
 
+    let up_auth = session_auth.clone();
     let tunnel_uplink = async move {
         let mut buffer = Vec::new();
         'outer: loop {
+            if up_auth.should_stop() {
+                break;
+            }
             let chunk = tokio::select! {
                 biased;
                 _ = stop_rx_up.changed() => break,
@@ -361,15 +370,13 @@ pub(super) async fn handle_udp_relay(
                 // 上行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
                 if !crate::proxy::rate_limit::try_consume_two(
                     dev_buckets.as_ref().map(|b| &b.up),
-                    user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
+                    up_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
                     payload.len(),
                 ) {
                     continue;
                 }
-                if let Some(u) = &user_limit {
-                    if u.record_bytes(payload.len()) {
-                        break 'outer; // 越额退出整个会话
-                    }
+                if up_auth.record_bytes(payload.len()) {
+                    break 'outer; // 越额或吊销退出整个会话
                 }
 
                 // v0.4.5-alpha.16: 走 resolver::resolve_first_filtered (60s 缓存 + IPv4 优先 +
@@ -516,7 +523,7 @@ pub(crate) async fn handle_udp_mux_relay(
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String,
-    user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    session_auth: super::SessionAuth,
     allow_local_targets: bool,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
@@ -547,11 +554,15 @@ pub(crate) async fn handle_udp_mux_relay(
     let sessions: MuxSessions = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     // uplink: 读隧道 → 解 mux 帧 → 按 sid 分发 (新 sid 建 egress + spawn 下行泵)。
+    let up_auth = session_auth.clone();
     let up_sessions = sessions.clone();
     let up_tx = tx.clone();
     let uplink = async move {
         let mut buffer: Vec<u8> = Vec::new();
         'outer: loop {
+            if up_auth.should_stop() {
+                break;
+            }
             let chunk =
                 match tokio::time::timeout(UDP_IDLE_TIMEOUT, reader.recv_data()).await {
                     Ok(Ok(c)) => c,
@@ -567,15 +578,13 @@ pub(crate) async fn handle_udp_mux_relay(
                 // 上行限速 (policing): 令牌不足丢本报文 (choke point, 覆盖已有/新 sid 两路), 两桶都扣 (取更严)
                 if !crate::proxy::rate_limit::try_consume_two(
                     dev_buckets.as_ref().map(|b| &b.up),
-                    user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
+                    up_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
                     uf.payload.len(),
                 ) {
                     continue;
                 }
-                if let Some(u) = &user_limit {
-                    if u.record_bytes(uf.payload.len()) {
-                        break 'outer; // 越额退出整个会话
-                    }
+                if up_auth.record_bytes(uf.payload.len()) {
+                    break 'outer; // 越额或吊销退出整个会话
                 }
 
                 // 已有 sid → 直接发 (锁内只取 egress Arc, await 在锁外, 避免 guard 跨 await)。
@@ -642,11 +651,14 @@ pub(crate) async fn handle_udp_mux_relay(
                 let pump_tx = up_tx.clone();
                 let pump_sessions = up_sessions.clone();
                 let pump_buckets = dev_buckets.clone();
-                let pump_user = user_limit.clone();
+                let pump_auth = up_auth.clone();
                 let sid = uf.sid;
                 let pump = tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     loop {
+                        if pump_auth.should_stop() {
+                            break;
+                        }
                         match tokio::time::timeout(MUX_SID_IDLE_TIMEOUT, pump_egress.recv(&mut buf))
                             .await
                         {
@@ -654,15 +666,13 @@ pub(crate) async fn handle_udp_mux_relay(
                                 // 下行限速 (policing): 令牌不足丢本报文, 两桶都扣 (取更严)
                                 if !crate::proxy::rate_limit::try_consume_two(
                                     pump_buckets.as_ref().map(|b| &b.down),
-                                    pump_user.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
+                                    pump_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
                                     n,
                                 ) {
                                     continue;
                                 }
-                                if let Some(u) = &pump_user {
-                                    if u.record_bytes(n) {
-                                        break; // 越额退出
-                                    }
+                                if pump_auth.record_bytes(n) {
+                                    break; // 越额或吊销退出
                                 }
                                 if let Some(f) = crate::proxy::udp_mux::frame_mux_addr(
                                     sid,
@@ -695,10 +705,14 @@ pub(crate) async fn handle_udp_mux_relay(
 
     // writer 泵: 唯一 AEAD 写点。rx 在 uplink 结束清表 + 主 tx drop 后关闭 → 退出。
     drop(tx); // 只留 up_tx (uplink 持有) 与各泵 clone; uplink 退出后全部释放
+    let writer_auth = session_auth.clone();
     let writer_pump = {
         let writer = writer.clone();
         async move {
             while let Some(pkt) = rx.recv().await {
+                if writer_auth.should_stop() {
+                    break;
+                }
                 if writer.lock().await.send_data(&pkt).await.is_err() {
                     break;
                 }
@@ -757,7 +771,7 @@ mod mux_tests {
 
         // 4. 起服务端 mux relay (upstream=None → Direct egress, 测试环境连本地 echo 需 allow_local_targets=true)
         let server = tokio::spawn(async move {
-            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), None, true).await;
+            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), crate::proxy::mirage_server::SessionAuth::unlimited(), true).await;
         });
 
         // 5. 客户端发两帧: 同目标, 不同 sid + payload

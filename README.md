@@ -21,7 +21,7 @@
 >   限制传播、定期更换。见 brain external-audit-2026-08 / handshake-forward-secrecy。
 > - **认证支持多用户凭据与配额限速** (`mirage_server.users[]`): 每人独立口令 → per-user 密钥隔离 + 用量统计 +
 >   **按用户独立限速与月度流量配额** (超额静默回落伪装站, 活跃连接即断, 周期用量持久化),
->   可按人吊销 (删该 user 即失效, 不影响他人), Mirage-console 可增删/改密/查用量, 限速与配额经 `/api/users` 的 `set_limits` / `reset_quota` 设置 (console 界面待接)。
+>   可按人吊销 (改口令、改主口令或删用户均会立即断开该凭据上已建立的会话, 删该 user 即失效, 不影响他人), Mirage-console 可增删/改密/查用量, 限速与配额经 `/api/users` 的 `set_limits` / `reset_quota` 设置 (console 界面待接)。
 >   不配 `users` = 单一共享口令 (原行为)。**口令仍是唯一凭据 (无二次因子)**, 请用高强度随机口令。
 > - **服务端出站防 SSRF / 内部网络隔离**: 服务端替客户端直连出站时默认拒绝回环 (127.0.0.0/8, ::1)、链路本地 (169.254.0.0/16, fe80::/10)、常见云元数据地址 (AWS `fd00:ec2::254`、阿里云 `100.100.100.200`、Azure WireServer `168.63.129.16`) 以及**本机自身地址 (含公网 IP、docker 网桥等)**, 防止多用户场景下普通用户经隧道探测服务端本地管理 API (如 :9090) 或窃取云元数据凭据。RFC1918 私网默认放行 (便于自建中转连家庭 LAN); 若确需允许服务端访问本机/链路本地, 可在入站配置显式开启 `"allow_local_targets": true` (有安全风险)。(残余风险说明: 部分云主机采用 1:1 NAT, 其公网 IP (如 AWS EIP) 并不绑定在网卡上而无法被网卡枚举识别, 强烈建议管理 API 监听 127.0.0.1 或配置强 gui token)。
 > - **负责任使用**: 本工具用于**保护自己合法流量的隐私与可达性**。是否可在你所在司法辖区使用、
@@ -38,7 +38,7 @@
 
 * **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），配 `client_hello_template` 即让出站握手复刻其 JA3/JA4（仅替换 SNI/session_id/random）。
 * **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关，认证仍靠口令、与加密解耦（对标 REALITY）。
-* **多用户凭据与配额限速**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃）+ **按用户独立限速 (`rate_limit_kbps`) + 按月流量配额 (`quota_gb`, `quota_reset_day`)**，跨额连接即断、新握手伪装回落，周期用量持久化跨重启保留。`/api/users` 供 Mirage-console 增删/改密/查用量, API 另支持调限速/重置配额 (console 界面待接)（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
+* **多用户凭据与配额限速**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃）+ **按用户独立限速 (`rate_limit_kbps`) + 按月流量配额 (`quota_gb`, `quota_reset_day`)**，跨额连接即断、新握手伪装回落，改口令/改主口令/删用户立即断开存量会话，周期用量持久化跨重启保留。`/api/users` 供 Mirage-console 增删/改密/查用量, API 另支持调限速/重置配额 (console 界面待接)（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
 * **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
 * **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。

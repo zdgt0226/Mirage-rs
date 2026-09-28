@@ -36,6 +36,7 @@ pub(super) async fn dispatch_authenticated(
     client_ip: Option<std::net::IpAddr>,
     password: String,
     user: String, // 命中的用户名 (多用户统计维度); 单用户 config 恒为 "default"
+    cred_revoked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     client_random: [u8; 32],
     server_random: [u8; 32],
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
@@ -181,6 +182,13 @@ pub(super) async fn dispatch_authenticated(
 
     info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
+    // 凭据是否已吊销
+    if cred_revoked.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("Mirage Server: 凭据已被吊销, 拒绝分发并断开连接");
+        let _ = writer.send_close_notify().await;
+        return;
+    }
+
     // 分发前一次性取出用户限额句柄: 非 default 用户若取到 None (说明已被删除或不存在), 拒绝分发并断开连接。
     // 将句柄直接传给后续 relay, 消除与 connect 之间的 TOCTOU 窗口。
     let user_limit = crate::proxy::user_limits::get_user_limit(&user);
@@ -189,6 +197,8 @@ pub(super) async fn dispatch_authenticated(
         let _ = writer.send_close_notify().await;
         return;
     }
+
+    let session_auth = super::SessionAuth::new(user_limit, cred_revoked);
 
     if first_chunk.len() == 1 && first_chunk[0] == 0x00 {
         // UDP Mode.
@@ -214,7 +224,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, user_limit, allow_local_targets).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
     } else if first_chunk.len() == 1 && first_chunk[0] == crate::proxy::udp_mux::MUX_SENTINEL {
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
         if upstream.as_ref().is_some_and(|u| u.block_udp()) {
@@ -222,13 +232,13 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, user_limit, allow_local_targets).await;
+        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         match parse_tcp_target(&first_chunk) {
             Ok((target, payload)) => {
                 info!("Mirage Server: Target resolved to {}", target);
-                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, user_limit, allow_local_targets).await;
+                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
             }
             Err(e) => tracing::error!("Mirage Server: {}", e),
         }
