@@ -294,8 +294,9 @@ impl ConfigWatcher {
         crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
 
         // 多用户凭据与限速/配额热重载 (仅在热重载时应用; 冷启动由 lib.rs 的 init_user_limits + register_creds 负责)
+        // watcher 路径在锁内重新读取并解析磁盘文件, 避免并发覆盖 API 的更新
         if is_hot_reload {
-            apply_user_config(&config.inbounds);
+            apply_user_config_from_file(config_path);
         }
 
         Ok(CoreState {
@@ -392,11 +393,77 @@ impl ConfigWatcher {
                 info!("Geodata dir is same as config dir; skipping duplicate watch.");
             }
 
+            let inspect_config = |p: &Path| -> Option<(PathBuf, Option<std::time::SystemTime>, u64)> {
+                let real = p.canonicalize().ok()?;
+                let meta = std::fs::metadata(&real).ok()?;
+                let mtime = meta.modified().ok();
+                let len = meta.len();
+                Some((real, mtime, len))
+            };
+
+            let mut last_record = inspect_config(&config_pathbuf);
+
             // 3. Event loop — 过滤事件路径, 只对 config 文件本身 (含软链接真实目标) 或 .dat 文件触发
             // (避免 .tmp 写入 + 其他无关文件抖动). create/modify/rename 都算变更.
-            for res in rx {
-                match res {
-                    Ok(Event { kind, paths, .. }) => {
+            // 采用 30s 兜底轮询: 事件驱动覆盖一层链接与 K8s ConfigMap, 更深的链接链由 30s 轮询兜底.
+            loop {
+                let event = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                    Ok(Ok(event)) => Some(event),
+                    Ok(Err(e)) => {
+                        error!("Watch error: {:?}", e);
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+
+                let execute_reload = |trigger_path: &Path, symlink_changed: bool, real_target: Option<(&Path, &std::ffi::OsStr)>| {
+                    info!("Watched path {} changed. Attempting hot-reload...", trigger_path.display());
+                    // Give the writer a moment to finish flushing the file
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+
+                    let current_outbounds = state.load().outbounds.clone();
+                    match Self::build_state(&config_path, &geodata_dir, Some(current_outbounds)) {
+                        Ok(new_state) => {
+                            state.store(Arc::new(new_state));
+                            info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
+                            // 刷新 eBPF direct_cidr map (若已注入 hook)
+                            if let Some(hook) = reload_hook.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                hook(&state.load());
+                            }
+                        }
+                        Err(e) => {
+                            error!("Hot-reload failed! Keeping previous state. Error: {}", e);
+                        }
+                    }
+
+                    // 修 Issue 4 方案 C: 也重建 UpdaterState 让 geo_updater
+                    // 拿到新 sources / update_days. proxy_url 保留旧值
+                    // (inbounds 不热更新, 同步无意义).
+                    //
+                    // 无脏比较全字段总是 update: GeoSource 字段太多 (name/url/
+                    // kind/via), 手写差分容易漏字段 (例如只改 via 从 direct
+                    // 到 proxy). update() 幂等 = 一次 Arc swap + notify_one,
+                    // 成本很低. 只有 config 文件本身改动 (含软链接改指向) 才触发
+                    // (`.dat` 变化不影响 updater 配置).
+                    if symlink_changed || is_config_event(trigger_path, &config_dir_canon, &config_file_name, real_target) {
+                        let old_updater = (**updater_handle.state.load()).clone();
+                        if let Some(new_updater) = Self::extract_updater_state(&config_path, &old_updater) {
+                            let sources_delta = new_updater.sources.len() as i64
+                                - old_updater.sources.len() as i64;
+                            info!(
+                                "Geo updater config reloaded ({} source(s), interval {} days, Δsources={:+}). Notifying updater.",
+                                new_updater.sources.len(),
+                                new_updater.update_days,
+                                sources_delta,
+                            );
+                            updater_handle.update(new_updater);
+                        }
+                    }
+                };
+
+                match event {
+                    Some(Event { kind, paths, .. }) => {
                         if !(kind.is_modify() || kind.is_create()) {
                             continue;
                         }
@@ -409,6 +476,7 @@ impl ConfigWatcher {
                                 &config_file_name,
                                 symlink_state.real_file_name.as_deref(),
                                 symlink_state.real_dir_canon.as_deref(),
+                                Some(&config_dir_canon),
                             )
                         });
 
@@ -466,50 +534,52 @@ impl ConfigWatcher {
                             None => continue, // 无路径命中 trigger, skip
                         };
 
-                        info!("Watched path {} changed. Attempting hot-reload...", trigger_path.display());
-                        // Give the writer a moment to finish flushing the file
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-
-                        let current_outbounds = state.load().outbounds.clone();
-                        match Self::build_state(&config_path, &geodata_dir, Some(current_outbounds)) {
-                            Ok(new_state) => {
-                                state.store(Arc::new(new_state));
-                                info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
-                                // 刷新 eBPF direct_cidr map (若已注入 hook)
-                                if let Some(hook) = reload_hook.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                                    hook(&state.load());
+                        execute_reload(trigger_path, symlink_changed, real_target);
+                        last_record = inspect_config(&config_pathbuf);
+                    }
+                    None => {
+                        // 30s 低频兜底轮询: 覆盖深层中间目录链接切换与配置目录链接切换场景
+                        let current_record = inspect_config(&config_pathbuf);
+                        if current_record.is_some() && current_record != last_record {
+                            info!("30s 兜底轮询: 检测到配置文件真实路径/mtime/长度变更, 触发重载...");
+                            let symlink_action = symlink_state.update(
+                                &config_pathbuf,
+                                &config_dir_canon,
+                                &config_file_name,
+                                geodir_canon.as_deref(),
+                            );
+                            let symlink_changed = match symlink_action {
+                                SymlinkUpdateAction::Unchanged => false,
+                                SymlinkUpdateAction::PathChangedOnly => {
+                                    info!("Config symlink target updated to {}", symlink_state.current_real_path.display());
+                                    true
                                 }
-                            }
-                            Err(e) => {
-                                error!("Hot-reload failed! Keeping previous state. Error: {}", e);
-                            }
-                        }
-
-                        // 修 Issue 4 方案 C: 也重建 UpdaterState 让 geo_updater
-                        // 拿到新 sources / update_days. proxy_url 保留旧值
-                        // (inbounds 不热更新, 同步无意义).
-                        //
-                        // 无脏比较全字段总是 update: GeoSource 字段太多 (name/url/
-                        // kind/via), 手写差分容易漏字段 (例如只改 via 从 direct
-                        // 到 proxy). update() 幂等 = 一次 Arc swap + notify_one,
-                        // 成本很低. 只有 config 文件本身改动 (含软链接改指向) 才触发
-                        // (`.dat` 变化不影响 updater 配置).
-                        if symlink_changed || is_config_event(trigger_path, &config_dir_canon, &config_file_name, real_target) {
-                            let old_updater = (**updater_handle.state.load()).clone();
-                            if let Some(new_updater) = Self::extract_updater_state(&config_path, &old_updater) {
-                                let sources_delta = new_updater.sources.len() as i64
-                                    - old_updater.sources.len() as i64;
-                                info!(
-                                    "Geo updater config reloaded ({} source(s), interval {} days, Δsources={:+}). Notifying updater.",
-                                    new_updater.sources.len(),
-                                    new_updater.update_days,
-                                    sources_delta,
-                                );
-                                updater_handle.update(new_updater);
-                            }
+                                SymlinkUpdateAction::DirChanged { old_dir, new_dir } => {
+                                    if let Some(old) = old_dir {
+                                        if let Err(e) = watcher.unwatch(&old) {
+                                            warn!("Failed to unwatch old real config dir {}: {}", old.display(), e);
+                                        } else {
+                                            info!("Unwatched old real config dir {}", old.display());
+                                        }
+                                    }
+                                    if let Some(new) = new_dir {
+                                        if let Err(e) = watcher.watch(&new, RecursiveMode::NonRecursive) {
+                                            warn!("Failed to watch new real config dir {}: {}", new.display(), e);
+                                        } else {
+                                            info!("Watching new real config dir {} for symlink target {:?}", new.display(), symlink_state.real_file_name);
+                                        }
+                                    }
+                                    true
+                                }
+                            };
+                            let real_target = match (&symlink_state.real_dir_canon, &symlink_state.real_file_name) {
+                                (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+                                _ => None,
+                            };
+                            execute_reload(&config_pathbuf, symlink_changed, real_target);
+                            last_record = current_record;
                         }
                     }
-                    Err(e) => error!("Watch error: {:?}", e),
                 }
             }
         });
@@ -526,6 +596,31 @@ static APPLY_USER_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 全程持一把进程级 Mutex 串行化, 避免 /api/users 与 watcher 观察到交错的注册表状态。
 pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
     let _lock = APPLY_USER_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    apply_user_config_locked(inbounds);
+}
+
+fn apply_user_config_locked(inbounds: &[crate::config::InboundConfig]) {
+    // 5(a) 检查 mirage_server 入站是否存在重复 tag: 存在则拒绝本次应用, error 日志, 保持现有凭据与限额
+    let mut seen_tags = std::collections::HashSet::new();
+    for ib in inbounds {
+        if let crate::config::InboundConfig::MirageServer { tag, .. } = ib {
+            if !seen_tags.insert(tag.as_str()) {
+                error!("apply_user_config: mirage_server 入站 tag `{tag}` 重复定义, 拒绝本次用户配置应用 (保持现有凭据与限额)");
+                return;
+            }
+        }
+    }
+
+    // 5(b) CREDS_REGISTRY 中存在、但新配置里已没有的 mirage_server tag (入站被删除或改名):
+    // 对该 tag 快照执行"替换为空凭据列表"(reconcile 吊销全部存量会话, 新握手全部走伪装)
+    let current_registered = crate::proxy::mirage_server::registered_creds_tags();
+    for registered_tag in current_registered {
+        if !seen_tags.contains(registered_tag.as_str()) {
+            crate::proxy::mirage_server::reload_creds(&registered_tag, Vec::new());
+            warn!("入站 `{registered_tag}` 已从配置移除: 已吊销其全部凭据, 监听端口需重启才会关闭");
+        }
+    }
+
     crate::proxy::user_limits::reload_user_limits(&crate::proxy::user_limits::collect_users(inbounds));
     for ib in inbounds {
         if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
@@ -535,6 +630,27 @@ pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
             }
         }
     }
+}
+
+/// 从文件重新读取并解析配置文件后再应用用户配置 (watcher 路径专用)。
+/// 保证在 APPLY_USER_CONFIG_LOCK 内直接读取磁盘上的最新配置, 避免 watcher 并发时以旧内存配置覆盖 API 刚写的新配置。
+pub fn apply_user_config_from_file(config_path: &str) {
+    let _lock = APPLY_USER_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("apply_user_config_from_file: 读取配置文件失败 ({config_path}): {e}, 放弃本次用户配置应用");
+            return;
+        }
+    };
+    let (config, _) = match Config::parse_with_diagnostics(&content) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("apply_user_config_from_file: 解析配置文件失败 ({config_path}): {e}, 放弃本次用户配置应用");
+            return;
+        }
+    };
+    apply_user_config_locked(&config.inbounds);
 }
 
 /// 软链接监视状态: 追踪配置文件的真实路径及真实目录/文件名。
@@ -583,7 +699,7 @@ pub fn resolve_symlink_target(
 /// 1. 事件路径名以 `..` 开头 (如 K8s ConfigMap 原子切换 `..data` 目录或其临时链接 `..data_tmp`)
 /// 2. 事件文件名等于配置文件/软链接自身文件名 (如直接 `ln -sf` 覆盖)
 /// 3. 事件文件名等于当前记录的真实目标文件名 (如目标文件被就地修改)
-/// 4. 事件来自真实目录
+/// 4. 事件来自真实目录 (当真实目录 != 配置目录时)
 ///
 /// 其余无关文件事件 (如同目录每几秒写一次的 stats 持久化文件) 跳过重解析以降低开销。
 pub fn should_recheck_symlink(
@@ -591,6 +707,7 @@ pub fn should_recheck_symlink(
     config_file_name: &std::ffi::OsStr,
     real_file_name: Option<&std::ffi::OsStr>,
     real_dir_canon: Option<&Path>,
+    config_dir_canon: Option<&Path>,
 ) -> bool {
     if event_path.file_name() == Some(config_file_name) {
         return true;
@@ -603,6 +720,13 @@ pub fn should_recheck_symlink(
     if let Some(name) = event_path.file_name().and_then(|n| n.to_str()) {
         if name.starts_with("..") {
             return true;
+        }
+    }
+    // 当真实目录与配置目录相同时, 同目录无关写 (如 stats 持久化文件) 不得触发重解析;
+    // 仅在真实目录与配置目录不同时, 真实目录下的事件才无条件触发重解析。
+    if let (Some(rd), Some(cd)) = (real_dir_canon, config_dir_canon) {
+        if rd == cd {
+            return false;
         }
     }
     if let Some(rd) = real_dir_canon {
@@ -1164,7 +1288,7 @@ mod watcher_event_tests {
         }
 
         // 验证 should_recheck_symlink 对 ..data 路径返回 true
-        assert!(should_recheck_symlink(&data_link, &config_file_name, symlink_state.real_file_name.as_deref(), symlink_state.real_dir_canon.as_deref()));
+        assert!(should_recheck_symlink(&data_link, &config_file_name, symlink_state.real_file_name.as_deref(), symlink_state.real_dir_canon.as_deref(), Some(&config_dir_canon)));
 
         // 执行 update, 识别目录变更
         let action = symlink_state.update(&config_link, &config_dir_canon, &config_file_name, None);
@@ -1186,6 +1310,136 @@ mod watcher_event_tests {
         assert!(!is_config_event(&cfg_1, &config_dir_canon, &config_file_name, real_target2));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_should_recheck_symlink_same_dir_filters_unrelated_files() {
+        let dir = Path::new("/etc/mirage");
+        let cfg_name = std::ffi::OsStr::new("config.json");
+        let real_name = std::ffi::OsStr::new("config_v1.json");
+        let stats_path = Path::new("/etc/mirage/stats.json");
+        let cfg_path = Path::new("/etc/mirage/config.json");
+        let real_path = Path::new("/etc/mirage/config_v1.json");
+        let k8s_path = Path::new("/etc/mirage/..data");
+
+        // 真实目录 == 配置目录: 只有命中文件名 / .. 前缀才返回 true, 无关文件 (stats.json) 返回 false
+        assert!(!should_recheck_symlink(stats_path, cfg_name, Some(real_name), Some(dir), Some(dir)));
+        assert!(should_recheck_symlink(cfg_path, cfg_name, Some(real_name), Some(dir), Some(dir)));
+        assert!(should_recheck_symlink(real_path, cfg_name, Some(real_name), Some(dir), Some(dir)));
+        assert!(should_recheck_symlink(k8s_path, cfg_name, Some(real_name), Some(dir), Some(dir)));
+
+        // 真实目录 != 配置目录: 真实目录下的事件返回 true
+        let diff_dir = Path::new("/opt/releases/v1");
+        let diff_path = Path::new("/opt/releases/v1/random.json");
+        assert!(should_recheck_symlink(diff_path, cfg_name, Some(real_name), Some(diff_dir), Some(dir)));
+    }
+
+    #[test]
+    fn test_watcher_apply_from_file_does_not_overwrite_api_with_stale() {
+        let _lock = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("mirage_test_p3_task3_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_path = temp_dir.join("config.json");
+        let tag = format!("tag_task3_{}", fastrand::u64(..));
+
+        // 1. 初始向 CREDS_REGISTRY 注册一个初始凭据
+        let initial_creds = crate::proxy::mirage_server::build_creds("init_pw", &[]);
+        let snapshot = crate::proxy::mirage_server::register_creds(&tag, initial_creds);
+
+        // 2. 模拟 API 更新: 文件中写入了新口令 "api_new_pw"
+        let new_cfg_content = format!(
+            r#"{{
+  "inbounds": [
+    {{
+      "type": "mirage_server",
+      "tag": "{}",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "password": "api_new_pw",
+      "users": [{{"name": "alice", "password": "alice_api_pw"}}]
+    }}
+  ],
+  "outbounds": [{{"type": "direct", "tag": "direct"}}],
+  "routing": {{"default_outbound": "direct", "rules": []}}
+}}"#,
+            tag
+        );
+        std::fs::write(&cfg_path, &new_cfg_content).unwrap();
+
+        // API 路径立即应用新配置
+        let (parsed_new, _) = Config::parse_with_diagnostics(&new_cfg_content).unwrap();
+        apply_user_config(&parsed_new.inbounds);
+        assert_eq!(snapshot.load()[0].password, "api_new_pw");
+        assert_eq!(snapshot.load()[1].password, "alice_api_pw");
+
+        // 3. 模拟 watcher: watcher 在锁内重新读取磁盘文件
+        apply_user_config_from_file(cfg_path.to_str().unwrap());
+
+        // 验证最终状态依然是磁盘上的最新 API 内容, 没有被旧内存对象覆盖
+        assert_eq!(snapshot.load()[0].password, "api_new_pw");
+        assert_eq!(snapshot.load()[1].password, "alice_api_pw");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_apply_user_config_duplicate_tag_rejected() {
+        let _lock = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("tag_dup_{}", fastrand::u64(..));
+
+        let initial_creds = crate::proxy::mirage_server::build_creds("initial_pw", &[]);
+        let snapshot = crate::proxy::mirage_server::register_creds(&tag, initial_creds);
+
+        // 构造含有重复 tag 的配置
+        let json_dup = format!(
+            r#"{{
+  "inbounds": [
+    {{ "type": "mirage_server", "tag": "{}", "listen": "0.0.0.0", "port": 443, "password": "new_pw1" }},
+    {{ "type": "mirage_server", "tag": "{}", "listen": "0.0.0.0", "port": 444, "password": "new_pw2" }}
+  ],
+  "outbounds": [{{"type": "direct", "tag": "direct"}}],
+  "routing": {{"default_outbound": "direct", "rules": []}}
+}}"#,
+            tag, tag
+        );
+        let (cfg, _) = Config::parse_with_diagnostics(&json_dup).unwrap();
+
+        // 应用重复 tag: 应该被拒绝, snapshot 保持原样
+        apply_user_config(&cfg.inbounds);
+        assert_eq!(snapshot.load()[0].password, "initial_pw");
+    }
+
+    #[test]
+    fn test_apply_user_config_removed_tag_revoked() {
+        let _lock = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag_remove = format!("tag_rem_{}", fastrand::u64(..));
+        let tag_keep = format!("tag_keep_{}", fastrand::u64(..));
+
+        let creds_remove = crate::proxy::mirage_server::build_creds("pw_rem", &[]);
+        let snapshot_remove = crate::proxy::mirage_server::register_creds(&tag_remove, creds_remove);
+
+        let creds_keep = crate::proxy::mirage_server::build_creds("pw_keep", &[]);
+        let snapshot_keep = crate::proxy::mirage_server::register_creds(&tag_keep, creds_keep);
+
+        // 新配置中移除了 tag_remove, 只保留 tag_keep
+        let json_new = format!(
+            r#"{{
+  "inbounds": [
+    {{ "type": "mirage_server", "tag": "{}", "listen": "0.0.0.0", "port": 443, "password": "pw_keep_updated" }}
+  ],
+  "outbounds": [{{"type": "direct", "tag": "direct"}}],
+  "routing": {{"default_outbound": "direct", "rules": []}}
+}}"#,
+            tag_keep
+        );
+        let (cfg, _) = Config::parse_with_diagnostics(&json_new).unwrap();
+
+        apply_user_config(&cfg.inbounds);
+
+        // 验证 tag_remove 上的凭据已被清空 (且旧条目置 revoked = true)
+        assert!(snapshot_remove.load().is_empty());
+        // tag_keep 已正常更新
+        assert_eq!(snapshot_keep.load()[0].password, "pw_keep_updated");
     }
 }
 

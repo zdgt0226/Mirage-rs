@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### fix: 2026-09-28 第六轮审计缺陷批量修复 (P3)
+
+- **QUIC 空闲流与 UDP mux 吊销唤醒 (P3-1)**: `quic_pump` 增加 10s 周期唤醒分支检查凭据吊销, 避免两端空闲时流常驻无法断开; `handle_udp_mux_relay` 增加 watch 协同通道使 writer_pump 吊销退出时即刻通知 uplink 结束 (TCP 与非 mux UDP 空闲方向保持在下一块数据或最长超时内断开).
+- **非 mux UDP 下行帧长溢出校验 (P3-2)**: 非 mux UDP 下行回包在封帧后增加 `frame.len() > u16::MAX as usize` 校验, 超限直接丢弃并记 debug 日志, 杜绝 IPv6 大报文转 u16 截断导致的解帧失步.
+- **消除热重载与 API 覆盖竞态 (P3-3)**: watcher 触发用户配置热重载时在 `APPLY_USER_CONFIG_LOCK` 内重新读取并解析配置文件后再应用 (`apply_user_config_from_file`), 杜绝并发写盘时 watcher 晚于 API 应用旧内容.
+- **多层软链接与中间目录链接 30s 兜底轮询 (P3-4)**: watcher 增加 30s 周期性真实路径与元数据比对轮询, 事件驱动覆盖一层软链接与 K8s ConfigMap, 跨目录及多层软链接由轮询兜底自动检测并触发重载与监听迁移.
+- **热重载入站 tag 校验与移除凭据吊销 (P3-5)**: `apply_user_config` 发现新配置存在重复 `mirage_server` tag 时拒绝应用并报错; 对已删除/改名的入站 tag 替换为空凭据列表吊销其存量会话并 warn.
+- **优化同目录软链接无关写事件检查 (P3-6)**: `should_recheck_symlink` 针对真实目录与配置目录相同时限制仅匹配配置文件名、真实文件名或 `..` 前缀时才触发 `canonicalize`, 避免同目录无关写入引起的多余解析.
+- **敏感口令配置结构 Debug 打码脱敏 (P3-7)**: 为 `MirageUser`、`InboundAuth`、`UpstreamConfig`、`InboundConfig` 与 `OutboundConfig` 手写 `Debug` 实现, 密码、预共享密钥等敏感字段自动脱敏为 `"[REDACTED]"`, 消除 `{:?}` 打印时的口令明文泄露风险.
+- **审阅修正 (测试)**: P3-5 的"已移除 tag 全部吊销"会作用于进程级凭据注册表中所有不在所给配置里的 tag —— 生产中注册表只含配置入站无碍, 但测试里 mirage_server/handshake 的凭据测试以随机 tag 注册且未持锁, 会被 config_watcher 新测试顺带吊销 (新的 flaky 源)。这 6 个测试补持 `REGISTRY_TEST_LOCK` (锁序: registry → time_sync, 无反向); 16 线程连跑 6 次零失败。
+
 ### fix(security): 改口令 / 改主口令 / 删用户 会断开已建立的会话 (审计第五轮 P2-1)
 
 - **凭据级吊销与会话中断**: 改口令、改 default 主口令或删除用户时, 以入站为单位的凭据快照会为失效凭据置位 `revoked` 标志, 并自动复用未变动凭据 (同名同口令) 的吊销令牌。
