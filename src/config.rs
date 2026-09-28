@@ -95,7 +95,7 @@ pub struct Config {
 ///
 /// ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 当前未实现 —— 配了 SS 上游时
 /// 服务端的 UDP 中继**仍走直连**, 意味着 TCP 与 UDP 的出口 IP 不同。启动时会 WARN。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UpstreamConfig {
     Shadowsocks {
@@ -132,6 +132,46 @@ pub enum UpstreamConfig {
         #[serde(default = "default_wg_udp")]
         udp: UdpPolicy,
     },
+}
+
+impl std::fmt::Debug for UpstreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shadowsocks { server, server_port, password: _, method, udp } => {
+                f.debug_struct("Shadowsocks")
+                    .field("server", server)
+                    .field("server_port", server_port)
+                    .field("password", &"[REDACTED]")
+                    .field("method", method)
+                    .field("udp", udp)
+                    .finish()
+            }
+            Self::Wireguard {
+                private_key: _,
+                peer_public_key,
+                preshared_key,
+                endpoint,
+                address,
+                mtu,
+                persistent_keepalive,
+                dns,
+                udp,
+            } => {
+                let psk_redacted = preshared_key.as_ref().map(|_| "[REDACTED]");
+                f.debug_struct("Wireguard")
+                    .field("private_key", &"[REDACTED]")
+                    .field("peer_public_key", peer_public_key)
+                    .field("preshared_key", &psk_redacted)
+                    .field("endpoint", endpoint)
+                    .field("address", address)
+                    .field("mtu", mtu)
+                    .field("persistent_keepalive", persistent_keepalive)
+                    .field("dns", dns)
+                    .field("udp", udp)
+                    .finish()
+            }
+        }
+    }
 }
 
 /// 配置了上游出口时, 服务端对 UDP 的处理策略。
@@ -174,10 +214,19 @@ fn default_wg_udp() -> UdpPolicy {
 /// **不配 = 不鉴权**(向后兼容既有配置)。但 socks/mixed 入站一旦监听非回环地址而又不配它,
 /// 就是一个**开放代理** —— 任何能连到该端口的人都能白嫖隧道, 流量从你的服务端出去,
 /// 出口 IP 会被滥用/拉黑。故 `lib.rs` 在这种组合下启动时 WARN。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct InboundAuth {
     pub username: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for InboundAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundAuth")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl InboundAuth {
@@ -216,7 +265,7 @@ pub enum Transport {
 
 /// 多用户凭据 (mirage_server `users[]`)。每个 user 一个独立 password —— 握手按 token tag 认出
 /// 是哪个用户。password 是秘密, **绝不出 API/日志** (GET /api/users 只返 name + 用量)。
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 pub struct MirageUser {
     pub name: String,
     pub password: String,
@@ -228,7 +277,19 @@ pub struct MirageUser {
     pub quota_reset_day: Option<u8>,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for MirageUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirageUser")
+            .field("name", &self.name)
+            .field("password", &"[REDACTED]")
+            .field("rate_limit_kbps", &self.rate_limit_kbps)
+            .field("quota_gb", &self.quota_gb)
+            .field("quota_reset_day", &self.quota_reset_day)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboundConfig {
     Socks {
@@ -342,7 +403,94 @@ pub enum InboundConfig {
     },
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for InboundConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Socks { tag, listen, port, auth } => {
+                f.debug_struct("Socks")
+                    .field("tag", tag)
+                    .field("listen", listen)
+                    .field("port", port)
+                    .field("auth", auth)
+                    .finish()
+            }
+            Self::Shadowsocks { tag, listen, port, method, password: _ } => {
+                f.debug_struct("Shadowsocks")
+                    .field("tag", tag)
+                    .field("listen", listen)
+                    .field("port", port)
+                    .field("method", method)
+                    .field("password", &"[REDACTED]")
+                    .finish()
+            }
+            Self::Dns { tag, listen, port } => {
+                f.debug_struct("Dns")
+                    .field("tag", tag)
+                    .field("listen", listen)
+                    .field("port", port)
+                    .finish()
+            }
+            Self::MirageServer {
+                tag,
+                listen,
+                port,
+                password: _,
+                users,
+                camouflage_host,
+                brutal_rate_mbps,
+                auth_ts_tolerance_secs,
+                upstream,
+                pfs,
+                transport,
+                quic_window_mb,
+                quic_erasure_cc,
+                quic_obfs,
+                quic_key_path,
+                allow_local_targets,
+            } => {
+                let obfs_redacted = quic_obfs.as_ref().map(|_| "[REDACTED]");
+                f.debug_struct("MirageServer")
+                    .field("tag", tag)
+                    .field("listen", listen)
+                    .field("port", port)
+                    .field("password", &"[REDACTED]")
+                    .field("users", users)
+                    .field("camouflage_host", camouflage_host)
+                    .field("brutal_rate_mbps", brutal_rate_mbps)
+                    .field("auth_ts_tolerance_secs", auth_ts_tolerance_secs)
+                    .field("upstream", upstream)
+                    .field("pfs", pfs)
+                    .field("transport", transport)
+                    .field("quic_window_mb", quic_window_mb)
+                    .field("quic_erasure_cc", quic_erasure_cc)
+                    .field("quic_obfs", &obfs_redacted)
+                    .field("quic_key_path", quic_key_path)
+                    .field("allow_local_targets", allow_local_targets)
+                    .finish()
+            }
+            Self::Mixed { tag, listen, port, auth } => {
+                f.debug_struct("Mixed")
+                    .field("tag", tag)
+                    .field("listen", listen)
+                    .field("port", port)
+                    .field("auth", auth)
+                    .finish()
+            }
+            Self::Transparent { tag, listen, port, interface, proxy_local, dns_hijack } => {
+                f.debug_struct("Transparent")
+                    .field("tag", tag)
+                    .field("listen", listen)
+                    .field("port", port)
+                    .field("interface", interface)
+                    .field("proxy_local", proxy_local)
+                    .field("dns_hijack", dns_hijack)
+                    .finish()
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutboundConfig {
     #[serde(alias = "pyreality")]
@@ -484,6 +632,124 @@ pub enum OutboundConfig {
         #[serde(default = "default_urltest_interval")]
         interval: u64,
     },
+}
+
+impl std::fmt::Debug for OutboundConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mirage {
+                tag,
+                server,
+                server_port,
+                password: _,
+                camouflage_host,
+                pool_size,
+                brutal_rate_mbps,
+                brutal_base_rtt_ms,
+                underlying,
+                pfs,
+                transport,
+                quic_window_mb,
+                quic_erasure_cc,
+                quic_sni,
+                quic_low_src_port,
+                quic_pre_packet,
+                quic_obfs,
+                quic_pin,
+            } => {
+                let obfs_redacted = quic_obfs.as_ref().map(|_| "[REDACTED]");
+                f.debug_struct("Mirage")
+                    .field("tag", tag)
+                    .field("server", server)
+                    .field("server_port", server_port)
+                    .field("password", &"[REDACTED]")
+                    .field("camouflage_host", camouflage_host)
+                    .field("pool_size", pool_size)
+                    .field("brutal_rate_mbps", brutal_rate_mbps)
+                    .field("brutal_base_rtt_ms", brutal_base_rtt_ms)
+                    .field("underlying", underlying)
+                    .field("pfs", pfs)
+                    .field("transport", transport)
+                    .field("quic_window_mb", quic_window_mb)
+                    .field("quic_erasure_cc", quic_erasure_cc)
+                    .field("quic_sni", quic_sni)
+                    .field("quic_low_src_port", quic_low_src_port)
+                    .field("quic_pre_packet", quic_pre_packet)
+                    .field("quic_obfs", &obfs_redacted)
+                    .field("quic_pin", quic_pin)
+                    .finish()
+            }
+            Self::Shadowsocks { tag, server, server_port, method, password: _, underlying } => {
+                f.debug_struct("Shadowsocks")
+                    .field("tag", tag)
+                    .field("server", server)
+                    .field("server_port", server_port)
+                    .field("method", method)
+                    .field("password", &"[REDACTED]")
+                    .field("underlying", underlying)
+                    .finish()
+            }
+            Self::Wireguard {
+                tag,
+                private_key: _,
+                peer_public_key,
+                preshared_key,
+                endpoint,
+                address,
+                mtu,
+                persistent_keepalive,
+                dns,
+            } => {
+                let psk_redacted = preshared_key.as_ref().map(|_| "[REDACTED]");
+                f.debug_struct("Wireguard")
+                    .field("tag", tag)
+                    .field("private_key", &"[REDACTED]")
+                    .field("peer_public_key", peer_public_key)
+                    .field("preshared_key", &psk_redacted)
+                    .field("endpoint", endpoint)
+                    .field("address", address)
+                    .field("mtu", mtu)
+                    .field("persistent_keepalive", persistent_keepalive)
+                    .field("dns", dns)
+                    .finish()
+            }
+            Self::Direct { tag } => f.debug_struct("Direct").field("tag", tag).finish(),
+            Self::Block { tag } => f.debug_struct("Block").field("tag", tag).finish(),
+            Self::Urltest { tag, outbounds, url, interval, tolerance, test_type } => {
+                f.debug_struct("Urltest")
+                    .field("tag", tag)
+                    .field("outbounds", outbounds)
+                    .field("url", url)
+                    .field("interval", interval)
+                    .field("tolerance", tolerance)
+                    .field("test_type", test_type)
+                    .finish()
+            }
+            Self::Fallback { tag, outbounds, url, interval } => {
+                f.debug_struct("Fallback")
+                    .field("tag", tag)
+                    .field("outbounds", outbounds)
+                    .field("url", url)
+                    .field("interval", interval)
+                    .finish()
+            }
+            Self::Selector { tag, outbounds } => {
+                f.debug_struct("Selector")
+                    .field("tag", tag)
+                    .field("outbounds", outbounds)
+                    .finish()
+            }
+            Self::LoadBalance { tag, outbounds, strategy, url, interval } => {
+                f.debug_struct("LoadBalance")
+                    .field("tag", tag)
+                    .field("outbounds", outbounds)
+                    .field("strategy", strategy)
+                    .field("url", url)
+                    .field("interval", interval)
+                    .finish()
+            }
+        }
+    }
 }
 
 fn default_probe_url() -> String {
@@ -2439,5 +2705,153 @@ mod prop_tests {
             obj.push('}');
             let _ = serde_json::from_str::<Config>(&obj);
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_debug_tests {
+    use super::*;
+
+    #[test]
+    fn test_mirage_user_debug_redacts_password() {
+        let user = MirageUser {
+            name: "alice".to_string(),
+            password: "super_secret_password_123".to_string(),
+            rate_limit_kbps: Some(1000),
+            quota_gb: Some(10.0),
+            quota_reset_day: Some(1),
+        };
+        let debug_str = format!("{:?}", user);
+        assert!(!debug_str.contains("super_secret_password_123"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(debug_str.contains("alice"));
+
+        // 验证 serde round-trip
+        let json = serde_json::to_string(&user).unwrap();
+        assert!(json.contains("super_secret_password_123"));
+        let deserialized: MirageUser = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, user.name);
+        assert_eq!(deserialized.password, user.password);
+    }
+
+    #[test]
+    fn test_inbound_auth_debug_redacts_password() {
+        let auth = InboundAuth {
+            username: "bob".to_string(),
+            password: "auth_secret_password_456".to_string(),
+        };
+        let debug_str = format!("{:?}", auth);
+        assert!(!debug_str.contains("auth_secret_password_456"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(debug_str.contains("bob"));
+    }
+
+    #[test]
+    fn test_inbound_config_debug_redacts_secrets() {
+        let ms_json = r#"{
+            "type": "mirage_server",
+            "tag": "in_ms",
+            "listen": "0.0.0.0",
+            "port": 443,
+            "password": "server_main_password_789",
+            "quic_obfs": "quic_obfs_secret_abc",
+            "users": [{"name": "carol", "password": "carol_user_password_xyz"}]
+        }"#;
+        let ib_ms: InboundConfig = serde_json::from_str(ms_json).unwrap();
+        let debug_ms = format!("{:?}", ib_ms);
+        assert!(!debug_ms.contains("server_main_password_789"));
+        assert!(!debug_ms.contains("quic_obfs_secret_abc"));
+        assert!(!debug_ms.contains("carol_user_password_xyz"));
+        assert!(debug_ms.contains("[REDACTED]"));
+
+        let ss_json = r#"{
+            "type": "shadowsocks",
+            "tag": "in_ss",
+            "listen": "0.0.0.0",
+            "port": 8388,
+            "method": "aes-256-gcm",
+            "password": "ss_inbound_password_def"
+        }"#;
+        let ib_ss: InboundConfig = serde_json::from_str(ss_json).unwrap();
+        let debug_ss = format!("{:?}", ib_ss);
+        assert!(!debug_ss.contains("ss_inbound_password_def"));
+        assert!(debug_ss.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_outbound_config_debug_redacts_secrets() {
+        let mirage_json = r#"{
+            "type": "mirage",
+            "tag": "out_m",
+            "server": "1.2.3.4",
+            "server_port": 443,
+            "password": "client_mirage_password_111",
+            "camouflage_host": "example.com",
+            "quic_obfs": "client_quic_obfs_222"
+        }"#;
+        let ob_m: OutboundConfig = serde_json::from_str(mirage_json).unwrap();
+        let debug_m = format!("{:?}", ob_m);
+        assert!(!debug_m.contains("client_mirage_password_111"));
+        assert!(!debug_m.contains("client_quic_obfs_222"));
+        assert!(debug_m.contains("[REDACTED]"));
+
+        let ss_json = r#"{
+            "type": "shadowsocks",
+            "tag": "out_ss",
+            "server": "1.2.3.4",
+            "server_port": 8388,
+            "method": "aes-256-gcm",
+            "password": "client_ss_password_333"
+        }"#;
+        let ob_ss: OutboundConfig = serde_json::from_str(ss_json).unwrap();
+        let debug_ss = format!("{:?}", ob_ss);
+        assert!(!debug_ss.contains("client_ss_password_333"));
+        assert!(debug_ss.contains("[REDACTED]"));
+
+        let wg_json = r#"{
+            "type": "wireguard",
+            "tag": "out_wg",
+            "private_key": "private_key_secret_444",
+            "peer_public_key": "public_key_open_555",
+            "preshared_key": "preshared_key_secret_666",
+            "endpoint": "1.2.3.4:51820",
+            "address": "10.0.0.2"
+        }"#;
+        let ob_wg: OutboundConfig = serde_json::from_str(wg_json).unwrap();
+        let debug_wg = format!("{:?}", ob_wg);
+        assert!(!debug_wg.contains("private_key_secret_444"));
+        assert!(!debug_wg.contains("preshared_key_secret_666"));
+        assert!(debug_wg.contains("public_key_open_555"));
+        assert!(debug_wg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_upstream_config_debug_redacts_secrets() {
+        let ss_json = r#"{
+            "type": "shadowsocks",
+            "server": "1.2.3.4",
+            "server_port": 8388,
+            "method": "aes-256-gcm",
+            "password": "upstream_ss_password_777"
+        }"#;
+        let up_ss: UpstreamConfig = serde_json::from_str(ss_json).unwrap();
+        let debug_ss = format!("{:?}", up_ss);
+        assert!(!debug_ss.contains("upstream_ss_password_777"));
+        assert!(debug_ss.contains("[REDACTED]"));
+
+        let wg_json = r#"{
+            "type": "wireguard",
+            "private_key": "upstream_wg_priv_888",
+            "peer_public_key": "upstream_wg_pub_999",
+            "preshared_key": "upstream_wg_psk_000",
+            "endpoint": "1.2.3.4:51820",
+            "address": "10.0.0.2"
+        }"#;
+        let up_wg: UpstreamConfig = serde_json::from_str(wg_json).unwrap();
+        let debug_wg = format!("{:?}", up_wg);
+        assert!(!debug_wg.contains("upstream_wg_priv_888"));
+        assert!(!debug_wg.contains("upstream_wg_psk_000"));
+        assert!(debug_wg.contains("upstream_wg_pub_999"));
+        assert!(debug_wg.contains("[REDACTED]"));
     }
 }

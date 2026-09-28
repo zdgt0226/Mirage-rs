@@ -249,6 +249,14 @@ pub(super) async fn handle_udp_relay(
                     // 原样编码会成 ATYP=4 + 16B, 客户端按 IPv6 回给应用 → IPv4 UDP 回包全丢。
                     let frame = encode_reply_frame(norm, &buf[..size]);
 
+                    if frame.len() > u16::MAX as usize {
+                        debug!(
+                            "Mirage Server UDP: 下行帧长度 ({}B) 超过 u16::MAX, 丢弃该报文以防解帧失步",
+                            frame.len()
+                        );
+                        continue;
+                    }
+
                     let frame_len = frame.len() as u16;
                     let mut packet = Vec::with_capacity(2 + frame.len());
                     packet.extend_from_slice(&frame_len.to_be_bytes());
@@ -553,6 +561,14 @@ pub(crate) async fn handle_udp_mux_relay(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
     let sessions: MuxSessions = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // 协作式停止信号: writer_pump 检测到吊销/写失败时通知 uplink 立即退出 (不再阻塞在最长 300s 的 recv_data);
+    // 反之 uplink 退出时也通知 writer_pump 立即结束。
+    let (stop_tx, _stop_rx_seed) = tokio::sync::watch::channel(false);
+    let mut stop_rx_up = stop_tx.subscribe();
+    let mut stop_rx_writer = stop_tx.subscribe();
+    let stop_tx_up = stop_tx.clone();
+    let stop_tx_writer = stop_tx;
+
     // uplink: 读隧道 → 解 mux 帧 → 按 sid 分发 (新 sid 建 egress + spawn 下行泵)。
     let up_auth = session_auth.clone();
     let up_sessions = sessions.clone();
@@ -563,11 +579,14 @@ pub(crate) async fn handle_udp_mux_relay(
             if up_auth.should_stop() {
                 break;
             }
-            let chunk =
-                match tokio::time::timeout(UDP_IDLE_TIMEOUT, reader.recv_data()).await {
+            let chunk = tokio::select! {
+                biased;
+                _ = stop_rx_up.changed() => break,
+                r = tokio::time::timeout(UDP_IDLE_TIMEOUT, reader.recv_data()) => match r {
                     Ok(Ok(c)) => c,
                     _ => break,
-                };
+                }
+            };
             buffer.extend_from_slice(&chunk);
             while let Some((consumed, frame_opt)) =
                 crate::proxy::udp_mux::parse_mux_uplink(&buffer)
@@ -701,6 +720,7 @@ pub(crate) async fn handle_udp_mux_relay(
         }
         // uplink 结束: 清 session 表 → 各 SidSession drop → 下行泵 abort → 释放 tx clone。
         lock_mux(&up_sessions).clear();
+        let _ = stop_tx_up.send(true);
     };
 
     // writer 泵: 唯一 AEAD 写点。rx 在 uplink 结束清表 + 主 tx drop 后关闭 → 退出。
@@ -709,7 +729,15 @@ pub(crate) async fn handle_udp_mux_relay(
     let writer_pump = {
         let writer = writer.clone();
         async move {
-            while let Some(pkt) = rx.recv().await {
+            loop {
+                let pkt = tokio::select! {
+                    biased;
+                    _ = stop_rx_writer.changed() => break,
+                    p = rx.recv() => match p {
+                        Some(p) => p,
+                        None => break,
+                    }
+                };
                 if writer_auth.should_stop() {
                     break;
                 }
@@ -717,6 +745,7 @@ pub(crate) async fn handle_udp_mux_relay(
                     break;
                 }
             }
+            let _ = stop_tx_writer.send(true);
         }
     };
 
@@ -914,5 +943,21 @@ mod mux_tests {
         let (n_reply, from_srv) = client.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n_reply], b"pong-v6");
         assert_eq!(from_srv, server_addr);
+    }
+
+    /// 非 mux UDP 下行帧长溢出检查: 帧长超过 u16::MAX 时丢弃, 避免截断后解帧失步
+    #[test]
+    fn test_encode_reply_frame_overflow_check() {
+        let v6: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        // IPv6 帧头: 1B ATYP + 16B IP + 2B PORT = 19B
+        // 若 payload 为 65535 - 18 = 65517B, frame.len() = 65536 > u16::MAX (65535)
+        let large_payload = vec![0x42; 65518];
+        let frame = encode_reply_frame(normalize_addr(v6), &large_payload);
+        assert_eq!(frame.len(), 19 + 65518);
+        assert!(frame.len() > u16::MAX as usize);
+
+        let small_payload = vec![0x42; 100];
+        let frame_ok = encode_reply_frame(normalize_addr(v6), &small_payload);
+        assert!(frame_ok.len() <= u16::MAX as usize);
     }
 }

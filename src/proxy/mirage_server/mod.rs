@@ -184,6 +184,12 @@ pub fn reload_creds(tag: &str, new_creds: Vec<CredEntry>) -> bool {
     }
 }
 
+/// 获取当前已注册的所有 mirage_server 入站 tag。
+pub fn registered_creds_tags() -> Vec<String> {
+    let map = CREDS_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    map.keys().cloned().collect()
+}
+
 pub(crate) const WARNED_EGRESS_CAPACITY: usize = 1024;
 
 static WARNED_EGRESS: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
@@ -706,6 +712,9 @@ async fn handle_quic_stream_lean(
     );
 }
 
+#[cfg(feature = "quic")]
+const REVOKE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// QUIC lean 单向泵: 带客户端 IP 桶 + 用户桶限速与配额计数 (`up` = 客户端→目标)。
 /// - EOF: `shutdown` 对端写方向后返回, **不打断另一方向** (半关闭, 否则客户端先关写时目标的响应会被丢)。
 /// - 读写出错 / 用户超额 / 凭据吊销: 发 stop, 另一方向随之退出。
@@ -739,6 +748,8 @@ async fn quic_pump<R, W>(
                     return;
                 }
             },
+            // 周期唤醒检查 auth.should_stop(): 避免两个方向均空闲时已吊销流无法断开
+            _ = tokio::time::sleep(REVOKE_CHECK_INTERVAL) => continue,
         };
         if n == 0 {
             let _ = w.shutdown().await; // EOF → 半关闭
@@ -949,6 +960,8 @@ mod quic_limiter_tests {
 
     #[test]
     fn test_reload_creds_password_change_revokes_old_and_reuses_unchanged() {
+        // 串行: config_watcher 的 apply_user_config 测试会吊销注册表中"不在其配置里"的所有 tag。
+        let _creds_serial = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("test_p2_1_ab_{}", fastrand::u64(..));
         let c1 = register_creds(&tag, vec![
             CredEntry::new("default", "pw_main"),
@@ -981,6 +994,8 @@ mod quic_limiter_tests {
 
     #[test]
     fn test_reload_creds_main_password_change_revokes_old_default() {
+        // 串行: config_watcher 的 apply_user_config 测试会吊销注册表中"不在其配置里"的所有 tag。
+        let _creds_serial = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("test_p2_1_c_{}", fastrand::u64(..));
         let c = register_creds(&tag, vec![
             CredEntry::new("default", "pw_main_old"),
@@ -1004,6 +1019,8 @@ mod quic_limiter_tests {
 
     #[test]
     fn test_reload_creds_remove_and_readd_same_cred_not_revoked() {
+        // 串行: config_watcher 的 apply_user_config 测试会吊销注册表中"不在其配置里"的所有 tag。
+        let _creds_serial = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("test_p2_1_d_{}", fastrand::u64(..));
         let c = register_creds(&tag, vec![
             CredEntry::new("default", "pw_main"),
@@ -1026,6 +1043,8 @@ mod quic_limiter_tests {
 
     #[test]
     fn test_reload_creds_two_inbounds_isolated() {
+        // 串行: config_watcher 的 apply_user_config 测试会吊销注册表中"不在其配置里"的所有 tag。
+        let _creds_serial = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag_a = format!("test_p2_1_e_a_{}", fastrand::u64(..));
         let tag_b = format!("test_p2_1_e_b_{}", fastrand::u64(..));
 
@@ -1056,6 +1075,8 @@ mod quic_limiter_tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_duplex_session_auth_should_stop_after_reload_creds() {
+        // 串行: config_watcher 的 apply_user_config 测试会吊销注册表中"不在其配置里"的所有 tag。
+        let _creds_serial = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = format!("test_p2_1_f_{}", fastrand::u64(..));
         let (mut client, server) = tokio::io::duplex(8192);
