@@ -181,9 +181,11 @@ pub(super) async fn dispatch_authenticated(
 
     info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
-    // 分发前复核: 若用户已被删除, 拒绝分发并断开连接
-    if !crate::proxy::user_limits::user_still_valid(&user) {
-        tracing::debug!("Mirage Server: 用户 `{}` 已被删除, 拒绝分发并断开连接", user);
+    // 分发前一次性取出用户限额句柄: 非 default 用户若取到 None (说明已被删除或不存在), 拒绝分发并断开连接。
+    // 将句柄直接传给后续 relay, 消除与 connect 之间的 TOCTOU 窗口。
+    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+    if user != "default" && user_limit.is_none() {
+        tracing::debug!("Mirage Server: 用户 `{}` 已被删除或不存在, 拒绝分发并断开连接", user);
         let _ = writer.send_close_notify().await;
         return;
     }
@@ -212,7 +214,7 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, allow_local_targets).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, user_limit, allow_local_targets).await;
     } else if first_chunk.len() == 1 && first_chunk[0] == crate::proxy::udp_mux::MUX_SENTINEL {
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
         if upstream.as_ref().is_some_and(|u| u.block_udp()) {
@@ -220,13 +222,13 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, allow_local_targets).await;
+        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, user_limit, allow_local_targets).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         match parse_tcp_target(&first_chunk) {
             Ok((target, payload)) => {
                 info!("Mirage Server: Target resolved to {}", target);
-                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, allow_local_targets).await;
+                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, user_limit, allow_local_targets).await;
             }
             Err(e) => tracing::error!("Mirage Server: {}", e),
         }

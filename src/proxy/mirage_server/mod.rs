@@ -447,14 +447,17 @@ pub async fn start_quic_server(
             }
             // 一条 QUIC 连接可承载多条双向流 (每条 = 一条隧道)。逐条 accept_bi, 各自成 task。
             // Model X 精简: 每流 [token][target][data], 无 per-stream fake-TLS、无内层 AEAD (QUIC 自加密)。
+            // 每连接一个失败计数: 单流认证失败只结束该流; 累计失败 >= 3 次才关闭整条连接。
+            let fail_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             loop {
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         let creds2 = creds_c.clone();
                         let up2 = up.clone();
                         let conn2 = conn.clone();
+                        let fc = fail_count.clone();
                         tokio::spawn(async move {
-                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2, allow_local_targets, conn2).await;
+                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2, allow_local_targets, conn2, fc).await;
                         });
                     }
                     Err(_) => break, // 连接关闭
@@ -462,6 +465,12 @@ pub async fn start_quic_server(
             }
         });
     }
+}
+
+/// 判定单流认证失败后是否达到关闭整条连接的阈值 (同一连接累计失败 >= 3 次)。
+#[cfg(feature = "quic")]
+pub(crate) fn record_stream_auth_failure(fail_count: &std::sync::atomic::AtomicU32) -> bool {
+    fail_count.fetch_add(1, Ordering::SeqCst) + 1 >= 3
 }
 
 /// Model X 精简 QUIC 流处理: `[token(32B)][2B target_len][target][data...]`, 无 per-stream fake-TLS、
@@ -477,6 +486,7 @@ async fn handle_quic_stream_lean(
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     allow_local_targets: bool,
     conn: quinn::Connection,
+    fail_count: Arc<std::sync::atomic::AtomicU32>,
 ) {
     if upstream.is_some() {
         debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
@@ -504,7 +514,9 @@ async fn handle_quic_stream_lean(
                 tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
                     crate::crypto::hello_auth::session_decrypt_failure_hint());
             }
-            conn.close(quinn::VarInt::from_u32(0), b"");
+            if record_stream_auth_failure(&fail_count) {
+                conn.close(quinn::VarInt::from_u32(0), b"");
+            }
             return;
         }
     };
@@ -513,9 +525,11 @@ async fn handle_quic_stream_lean(
         tracing::warn!("Mirage QUIC(lean): user `{}` quota exhausted from {}", user, peer_ip);
         return;
     }
-    // 分发前复核: 若用户已被删除, 拒绝并断开流
-    if !crate::proxy::user_limits::user_still_valid(&user) {
-        tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除, 拒绝并断开流", user);
+    // 分发前一次性取出用户限额句柄: 非 default 用户若取到 None (说明已被删除或不存在), 拒绝并断开流。
+    // 消除与后续 connect 之间的 TOCTOU 窗口。
+    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+    if user != "default" && user_limit.is_none() {
+        tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除或不存在, 拒绝并断开流", user);
         return;
     }
     // 2. target: [2B len][host:port]
@@ -555,7 +569,7 @@ async fn handle_quic_stream_lean(
     let (up_read, up_write) = up.into_split();
 
     let dev_buckets = crate::proxy::rate_limit::server_buckets_for(peer_ip);
-    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+    // 用户级限速与配额已在分发时获取 (user_limit)
 
     // 半关闭语义同原 copy_bidirectional: 一侧 EOF 只关对端写方向 (传 FIN), 另一方向继续传完;
     // 只有出错或用户超额才发 stop 让两个方向都立刻退出。
@@ -782,5 +796,28 @@ mod quic_limiter_tests {
             map.len(),
             WARNED_EGRESS_CAPACITY
         );
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn test_quic_stream_auth_failure_counter() {
+        use std::sync::atomic::AtomicU32;
+        let counter = AtomicU32::new(0);
+
+        // 第一次失败: 不关闭连接 (返回 false)
+        assert!(!record_stream_auth_failure(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // 第二次失败: 仍不关闭连接 (返回 false)
+        assert!(!record_stream_auth_failure(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+
+        // 第三次失败: 达到阈值, 触发关闭连接 (返回 true)
+        assert!(record_stream_auth_failure(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+
+        // 后续失败: 依然超过阈值
+        assert!(record_stream_auth_failure(&counter));
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
     }
 }

@@ -1080,9 +1080,44 @@ impl Config {
         Ok((config, issues))
     }
 
+    /// 校验用户硬错误 (空名、重名/撞保留名 default、空口令、重复口令)。
+    /// 仅返回必须拒写的硬错误, 不包含跨入站限额不一致等普通 issue。
+    pub fn user_hard_errors(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        for ib in &self.inbounds {
+            if let InboundConfig::MirageServer { tag, password, users, .. } = ib {
+                let mut seen_names = std::collections::HashSet::new();
+                seen_names.insert("default".to_string());
+                let mut seen_passwords: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+                if !password.is_empty() {
+                    seen_passwords.insert(password.as_str(), "default");
+                }
+                for u in users {
+                    if u.name.trim().is_empty() {
+                        issues.push(format!("mirage_server 入站 `{tag}` 有 user 的 name 为空"));
+                    } else if !seen_names.insert(u.name.clone()) {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 user name `{}` 重复 (或撞保留名 default)", u.name));
+                    }
+                    if u.password.is_empty() {
+                        issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name));
+                    } else if let Some(prev) = seen_passwords.get(u.password.as_str()) {
+                        issues.push(format!(
+                            "mirage_server 入站 `{tag}` 的 user `{}` password 与 `{prev}` 重复 (口令相同会导致鉴权串号)",
+                            u.name
+                        ));
+                    } else {
+                        seen_passwords.insert(u.password.as_str(), u.name.as_str());
+                    }
+                }
+            }
+        }
+        issues
+    }
+
     /// 语义校验: 语法没问题但逻辑不成立的配置。
     pub fn semantic_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
+        issues.extend(self.user_hard_errors());
 
         // 收集全部 outbound tag, 顺带查重
         let mut tags: Vec<&str> = Vec::new();
@@ -1370,29 +1405,7 @@ impl Config {
                 if password.is_empty() {
                     issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
                 }
-                // 多用户校验: name 非空且唯一 (含不撞保留名 "default")、password 非空且不重复 (含不撞 default 主口令)。
-                let mut seen_names = std::collections::HashSet::new();
-                seen_names.insert("default".to_string());
-                let mut seen_passwords: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-                if !password.is_empty() {
-                    seen_passwords.insert(password.as_str(), "default");
-                }
                 for u in users {
-                    if u.name.trim().is_empty() {
-                        issues.push(format!("mirage_server 入站 `{tag}` 有 user 的 name 为空"));
-                    } else if !seen_names.insert(u.name.clone()) {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 user name `{}` 重复 (或撞保留名 default)", u.name));
-                    }
-                    if u.password.is_empty() {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name));
-                    } else if let Some(prev) = seen_passwords.get(u.password.as_str()) {
-                        issues.push(format!(
-                            "mirage_server 入站 `{tag}` 的 user `{}` password 与 `{prev}` 重复 (口令相同会导致鉴权串号)",
-                            u.name
-                        ));
-                    } else {
-                        seen_passwords.insert(u.password.as_str(), u.name.as_str());
-                    }
                     if let Some(kbps) = u.rate_limit_kbps {
                         if kbps == 0 {
                             issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` rate_limit_kbps 必须大于 0", u.name));

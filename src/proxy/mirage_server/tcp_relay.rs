@@ -28,6 +28,7 @@ pub(super) async fn handle_tcp_relay(
     upstream_cfg: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String, // 命中的用户名 (多用户统计); 单用户恒 "default"
+    user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
     allow_local_targets: bool,
 ) {
     // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径;
@@ -45,7 +46,7 @@ pub(super) async fn handle_tcp_relay(
         // 中转路径同样受限速/配额约束 (客户端 IP 桶 + 用户桶), 否则配了上游即可绕过。
         let limits = UpstreamLimits {
             ip: client_ip.and_then(crate::proxy::rate_limit::server_buckets_for),
-            user: crate::proxy::user_limits::get_user_limit(&user),
+            user: user_limit.clone(),
         };
         match &*outlet {
             crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
@@ -86,8 +87,7 @@ pub(super) async fn handle_tcp_relay(
     // 限速 (device_profiles rate_limit_kbps): 服务端按连接的客户端 IP 取共享桶, 上/下行各整形。
     // 全局 limiter (server_buckets_for, 见 rate_limit.rs) 在 server 启动时按 config.routing 装。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
-    // 用户级限速与配额 (mirage_server.users): 连接建立时查一次句柄 Arc, 跨该用户全部连接共享。
-    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
+    // 用户级限速与配额已在分发时一次性获取 (避免与 connect 期间存在 TOCTOU 导致删除后放行)
 
     if let Some(payload) = initial_payload {
         if !payload.is_empty() {

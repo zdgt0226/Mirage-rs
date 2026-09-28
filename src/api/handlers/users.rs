@@ -280,13 +280,15 @@ pub async fn update_users(
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "serialize_error", "候选配置序列化失败", vec![]);
     };
 
-    // parse (挡未知字段/类型错) + semantic_issues (挡空名/重名/空密码)。issues 里凡提 user 的均视为硬错拒写。
+    // parse (挡未知字段/类型错) + user_hard_errors (挡空名/重名/空密码/重复口令硬错拒写)。
+    // 跨入站限额不一致等普通提示在 issues 里返回, 不阻断写入。
     let (cfg, issues) = match crate::config::Config::parse_with_diagnostics(&candidate) {
         Ok(pair) => pair,
         Err(e) => return err_resp(StatusCode::UNPROCESSABLE_ENTITY, "invalid_config", format!("用户列表非法, 已拒绝 (未写入): {e}"), vec![]),
     };
-    let sem = cfg.semantic_issues();
-    let user_errs: Vec<String> = sem.iter().filter(|s| s.contains("user")).cloned().collect();
+    // parse (挡未知字段/类型错) + user_hard_errors (挡空名/重名/空密码/重复口令) 视为硬错拒写;
+    // 其余语义提示 (如跨入站同名用户限额不一致) 只随响应 issues 返回, 不拦写入。
+    let user_errs = cfg.user_hard_errors();
     if !user_errs.is_empty() {
         return err_resp(StatusCode::UNPROCESSABLE_ENTITY, "invalid_users", format!("凭据校验失败, 已拒绝 (未写入): {}", user_errs.join("; ")), user_errs);
     }
@@ -334,6 +336,7 @@ pub async fn update_users(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn op(action: &str, name: &str, pw: Option<&str>) -> UserOp {
         UserOp {
@@ -598,6 +601,109 @@ mod tests {
         let resp2 = update_users(State(app_state.clone()), Query(q_real), Json(req_reset)).await;
         assert_eq!(resp2.status(), StatusCode::OK);
         assert_eq!(h.period_used.load(Ordering::SeqCst), 0, "成功路径应清零配额");
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 仅测试串行锁, current_thread 运行时无死锁
+    async fn test_cross_inbound_limit_inconsistency_allows_user_ops_but_warns() {
+        // update_users 写盘成功后 apply_user_config 会替换进程级限额注册表, 与其它 init 注册表的测试串行。
+        let _reg = crate::proxy::user_limits::REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!("mirage_user_api_test_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_file = temp_dir.join("config.json");
+
+        let initial_cfg = r#"{
+            "schema_version": 1,
+            "inbounds": [
+                {
+                    "type": "mirage_server",
+                    "tag": "srv1",
+                    "listen": "0.0.0.0",
+                    "port": 443,
+                    "password": "pass1",
+                    "users": [{"name": "alice", "password": "pa", "rate_limit_kbps": 1000}]
+                },
+                {
+                    "type": "mirage_server",
+                    "tag": "srv2",
+                    "listen": "0.0.0.0",
+                    "port": 8443,
+                    "password": "pass2",
+                    "users": [{"name": "alice", "password": "pa", "rate_limit_kbps": 2000}]
+                }
+            ],
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "routing": {"default_outbound": "direct", "rules": []}
+        }"#;
+        std::fs::write(&cfg_file, initial_cfg).unwrap();
+
+        let cfg_parsed: crate::config::Config = serde_json::from_str(initial_cfg).unwrap();
+        let router = crate::router::RouterEngine::new(
+            Vec::new(),
+            "direct".into(),
+            ".",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let dummy_core = Arc::new(arc_swap::ArcSwap::from_pointee(crate::config_watcher::CoreState {
+            router: Arc::new(router),
+            outbounds: Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg_parsed).unwrap()),
+            advanced_dns: None,
+            auto_classify: None,
+            rate_limiter: Arc::new(crate::proxy::rate_limit::RateLimiter::from_device_profiles(&[])),
+        }));
+
+        let app_state = AppState {
+            state: dummy_core,
+            ebpf_engine: None,
+            xdp_engine: None,
+            config_path: cfg_file.to_str().unwrap().to_string(),
+            history: Arc::new(std::sync::RwLock::new(crate::api::state::HistoryData {
+                up: std::collections::VecDeque::new(),
+                down: std::collections::VecDeque::new(),
+                bpf: std::collections::VecDeque::new(),
+            })),
+            gui_token: None,
+            rate_limiter: Arc::new(std::sync::Mutex::new(crate::api::ratelimit::RateLimiter::new())),
+            is_server: true,
+            gui_listen_ip: None,
+        };
+
+        // 1. set_limits 修改 alice 的限额: 即使两入站限额不一致, 仍应成功 (200), 且 issues 含提示
+        let req_set = UpdateReq {
+            version: None,
+            ops: vec![UserOp {
+                action: "set_limits".into(),
+                name: "alice".into(),
+                password: None,
+                rate_limit_kbps: Some(serde_json::json!(5000)),
+                quota_gb: None,
+                quota_reset_day: None,
+            }],
+        };
+        let resp = update_users(State(app_state.clone()), Query(DryQuery { dry_run: false }), Json(req_set)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let issues = body.get("issues").and_then(|i| i.as_array()).unwrap();
+        assert!(issues.iter().any(|i| i.as_str().unwrap_or("").contains("限额配置与入站")), "issues 应包含跨入站不一致提示: {:?}", issues);
+
+        // 2. upsert 添加同口令用户 (撞 srv1 default 密码 pass1): 应被硬错拒写 (422)
+        let req_dup_pw = UpdateReq {
+            version: None,
+            ops: vec![UserOp {
+                action: "upsert".into(),
+                name: "bob".into(),
+                password: Some("pass1".into()),
+                rate_limit_kbps: None,
+                quota_gb: None,
+                quota_reset_day: None,
+            }],
+        };
+        let resp_dup = update_users(State(app_state.clone()), Query(DryQuery { dry_run: false }), Json(req_dup_pw)).await;
+        assert_eq!(resp_dup.status(), StatusCode::UNPROCESSABLE_ENTITY, "重复口令应返回 422");
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

@@ -4,6 +4,7 @@
 //! 帧格式: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
 //! ATYP: 1=IPv4, 3=Domain, 4=IPv6
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -13,6 +14,66 @@ use tracing::{debug, error};
 /// 导致 task/UdpSocket/64KB buf 僵尸泄露 (对齐 tcp_relay 的 1800s 兜底思路; UDP
 /// 流更短, 且客户端透明 UDP 自身 60s idle 即拆, 300s 只作服务端兜底不误杀活跃流)。
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 白名单最大目标数 (防无限膨胀)
+pub(crate) const MAX_SENT_TARGETS: usize = 1024;
+
+/// 记录上行发送目标地址及时间戳。
+/// 满额 (>= capacity) 时先淘汰超过 idle_timeout 未刷新的目标;
+/// 若仍满额, 淘汰最旧的一条 (按时间戳最早)。
+pub(crate) fn record_sent_target(
+    targets: &mut std::collections::HashMap<SocketAddr, std::time::Instant>,
+    target: SocketAddr,
+    now: std::time::Instant,
+    idle_timeout: Duration,
+    capacity: usize,
+) {
+    if let std::collections::hash_map::Entry::Occupied(mut e) = targets.entry(target) {
+        e.insert(now);
+        return;
+    }
+    if targets.len() >= capacity {
+        targets.retain(|_, last_sent| now.saturating_duration_since(*last_sent) <= idle_timeout);
+        if targets.len() >= capacity {
+            if let Some((&oldest, _)) = targets.iter().min_by_key(|(_, t)| *t) {
+                targets.remove(&oldest);
+            }
+        }
+    }
+    targets.insert(target, now);
+}
+
+/// 将目标地址转换为双栈/单栈 direct socket 所需的目标地址。
+/// 若 socket 为双栈 (`is_dual_stack == true`):
+/// - IPv4 转换为 IPv4-mapped IPv6 (`::ffff:a.b.c.d:port`)
+/// - IPv6 保持不变
+///
+/// 若 socket 为 IPv4 单栈 (`is_dual_stack == false`):
+/// - IPv4 保持不变
+/// - IPv6 返回 None (调用方丢弃并记录 debug 日志)
+pub(crate) fn prepare_target_addr(target: SocketAddr, is_dual_stack: bool) -> Option<SocketAddr> {
+    match target {
+        SocketAddr::V4(v4) => {
+            if is_dual_stack {
+                Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                    v4.ip().to_ipv6_mapped(),
+                    v4.port(),
+                    0,
+                    0,
+                )))
+            } else {
+                Some(SocketAddr::V4(v4))
+            }
+        }
+        SocketAddr::V6(_) => {
+            if is_dual_stack {
+                Some(target)
+            } else {
+                None
+            }
+        }
+    }
+}
 
 /// 将 SocketAddr 归一化 (IPv4-mapped IPv6 转为 IPv4, 便于地址比较)。
 fn normalize_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
@@ -68,6 +129,7 @@ pub(super) async fn handle_udp_relay(
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String,
+    user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
     allow_local_targets: bool,
 ) {
     debug!("Mirage Server: Started UDP relay session");
@@ -75,11 +137,10 @@ pub(super) async fn handle_udp_relay(
     // 服务端按连接的客户端 IP 限速 (device_profiles rate_limit_kbps): UDP 无背压 → policing
     // (令牌不足丢包), 与 SOCKS/transparent UDP 一致; 全局 limiter 同 tcp_relay::server_buckets_for。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
-    // 用户级限速与配额
-    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
 
     // 上游是 WG 且策略为 tunnel → UDP 也走隧道, 出口与 TCP 一致。否则从本机直发。
-    let egress = match upstream.as_deref() {
+    // 非 mux 路径直发: 优先绑定 [::]:0 双栈; 失败则回退 0.0.0.0:0。
+    let (egress, is_dual_stack) = match upstream.as_deref() {
         Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(wg))
             if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) =>
         {
@@ -91,18 +152,29 @@ pub(super) async fn handle_udp_relay(
                 }
             };
             match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
-                Ok(s) => UdpEgress::Wireguard(Arc::new(s)),
+                Ok(s) => (UdpEgress::Wireguard(Arc::new(s)), false),
                 Err(e) => {
                     error!("UDP 中继: 隧道内绑 UDP 失败: {}", e);
                     return;
                 }
             }
         }
-        _ => match UdpSocket::bind("0.0.0.0:0").await {
-            Ok(s) => UdpEgress::Direct(Arc::new(s)),
-            Err(e) => {
-                error!("Failed to bind server UDP socket: {}", e);
-                return;
+        // 双栈: 绑 [::]:0, 发往 IPv4 目标时转 IPv4-mapped (见 prepare_target_addr)。依赖 IPV6_V6ONLY=0
+        // (Linux 默认); 若主机设了 net.ipv6.bindv6only=1 则该 socket 只通 IPv6 → 退回 0.0.0.0:0 保 IPv4
+        // (Linux 上 bind 后不能再改 v6only, 故绑后探测而非强设)。
+        _ => match UdpSocket::bind("[::]:0").await.ok().filter(|s| {
+            !nix::sys::socket::getsockopt(s, nix::sys::socket::sockopt::Ipv6V6Only).unwrap_or(true)
+        }) {
+            Some(s) => (UdpEgress::Direct(Arc::new(s)), true),
+            None => {
+                debug!("[::]:0 dual-stack UDP socket unavailable (bind failed or v6only), falling back to 0.0.0.0:0");
+                match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => (UdpEgress::Direct(Arc::new(s)), false),
+                    Err(e) => {
+                        error!("Failed to bind server UDP socket: {}", e);
+                        return;
+                    }
+                }
             }
         },
     };
@@ -112,8 +184,9 @@ pub(super) async fn handle_udp_relay(
     let udp_clone = udp_socket.clone();
 
     // 维护该会话已发送过的目标地址集合 (限制 1024 条防膨胀)。
-    // 下行仅放行来自此集合的回包, 阻止未授权来源注入数据及恶意消耗用户配额。
-    let sent_targets = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // 记最近一次向该目标发送的时间, 供下行校验回包来源 (阻止未授权来源注入数据及恶意消耗用户配额)。
+    let sent_targets: Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let sent_targets_down = sent_targets.clone();
     let sent_targets_up = sent_targets.clone();
 
@@ -134,7 +207,7 @@ pub(super) async fn handle_udp_relay(
                     if !sent_targets_down
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .contains(&norm)
+                        .contains_key(&norm)
                     {
                         continue;
                     }
@@ -301,22 +374,34 @@ pub(super) async fn handle_udp_relay(
                     crate::net_util::egress_allowed(ip, allow_local_targets)
                 }).await {
                     Ok(socket_addr) => {
-                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
-                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                        // 成功则记入已发目标集合, 供下行校验回包来源。
-                        match udp_socket.send_to(payload, socket_addr).await {
-                            Ok(()) => {
-                                let norm = normalize_addr(socket_addr);
-                                let mut set = sent_targets_up
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                if !set.contains(&norm) {
-                                    if set.len() >= 1024 {
-                                        set.clear();
-                                    }
-                                    set.insert(norm);
+                        let send_addr = if matches!(*udp_socket, UdpEgress::Direct(_)) {
+                            match prepare_target_addr(socket_addr, is_dual_stack) {
+                                Some(a) => a,
+                                None => {
+                                    debug!("UDP direct socket (IPv4 only): dropping IPv6 target {}", socket_addr);
+                                    continue;
                                 }
                             }
+                        } else {
+                            socket_addr
+                        };
+
+                        // P2-3 + P3-1: 发送前插入白名单并刷新时间 (先发后记可能导致极快回包被丢)
+                        let norm = normalize_addr(socket_addr);
+                        record_sent_target(
+                            &mut sent_targets_up.lock().unwrap_or_else(|e| e.into_inner()),
+                            norm,
+                            std::time::Instant::now(),
+                            UDP_IDLE_TIMEOUT,
+                            MAX_SENT_TARGETS,
+                        );
+
+                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
+                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
+                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
+                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
+                        match udp_socket.send_to(payload, send_addr).await {
+                            Ok(()) => {}
                             Err(e) => {
                                 static WARNED: std::sync::atomic::AtomicBool =
                                     std::sync::atomic::AtomicBool::new(false);
@@ -426,6 +511,7 @@ pub(crate) async fn handle_udp_mux_relay(
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
     client_ip: Option<std::net::IpAddr>,
     user: String,
+    user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
     allow_local_targets: bool,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
@@ -433,8 +519,6 @@ pub(crate) async fn handle_udp_mux_relay(
     // 服务端按客户端 IP 限速 (device_profiles): mux 复用一条隧道多 sid, 但都同一客户端 IP →
     // 共享同一对桶, policing (令牌不足丢包)。同 handle_udp_relay。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
-    // 用户级限速与配额 (mirage_server.users)
-    let user_limit = crate::proxy::user_limits::get_user_limit(&user);
 
     // 上游是否 WG-tunnel 出口 (与 TCP 同出口 IP)。是则各 sid 在同一 WG 隧道内绑独立端口。
     let wg_tunnel = match upstream.as_deref() {
@@ -533,13 +617,19 @@ pub(crate) async fn handle_udp_mux_relay(
                             continue;
                         }
                     },
-                    None => match UdpSocket::bind("0.0.0.0:0").await {
-                        Ok(s) => match s.connect(target_sa).await {
-                            Ok(()) => SidEgress::Direct(s),
+                    None => {
+                        let bind_addr = match target_sa {
+                            SocketAddr::V4(_) => "0.0.0.0:0",
+                            SocketAddr::V6(_) => "[::]:0",
+                        };
+                        match UdpSocket::bind(bind_addr).await {
+                            Ok(s) => match s.connect(target_sa).await {
+                                Ok(()) => SidEgress::Direct(s),
+                                Err(_) => continue,
+                            },
                             Err(_) => continue,
-                        },
-                        Err(_) => continue,
-                    },
+                        }
+                    }
                 };
                 let egress = Arc::new(egress);
                 // spawn 下行泵: egress.recv → frame_mux_addr(sid) → tx。
@@ -662,7 +752,7 @@ mod mux_tests {
 
         // 4. 起服务端 mux relay (upstream=None → Direct egress, 测试环境连本地 echo 需 allow_local_targets=true)
         let server = tokio::spawn(async move {
-            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), true).await;
+            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), None, true).await;
         });
 
         // 5. 客户端发两帧: 同目标, 不同 sid + payload
@@ -701,5 +791,97 @@ mod mux_tests {
         assert_eq!(got.get(&1u32).map(|v| v.as_slice()), Some(&b"AAA"[..]));
         assert_eq!(got.get(&2u32).map(|v| v.as_slice()), Some(&b"BBB"[..]));
         server.abort();
+    }
+
+    #[test]
+    fn test_record_sent_target_eviction() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let idle_timeout = Duration::from_secs(300);
+
+        let a1: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let a2: SocketAddr = "2.2.2.2:53".parse().unwrap();
+        let a3: SocketAddr = "3.3.3.3:53".parse().unwrap();
+
+        // 1. 正常插入并在满额前不淘汰
+        record_sent_target(&mut map, a1, now - Duration::from_secs(400), idle_timeout, 2);
+        record_sent_target(&mut map, a2, now - Duration::from_secs(10), idle_timeout, 2);
+        assert_eq!(map.len(), 2);
+
+        // 2. 满额 (capacity=2) 插入新目标 a3: a1 超时 (400s > 300s), 应被优先淘汰
+        record_sent_target(&mut map, a3, now, idle_timeout, 2);
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&a1), "超时的 a1 应被淘汰");
+        assert!(map.contains_key(&a2));
+        assert!(map.contains_key(&a3));
+
+        // 3. 满额时所有目标均未超时, 淘汰最旧的一条
+        let a4: SocketAddr = "4.4.4.4:53".parse().unwrap();
+        record_sent_target(&mut map, a4, now, idle_timeout, 2);
+        assert_eq!(map.len(), 2);
+        assert!(!map.contains_key(&a2), "未超时但最旧的 a2 应被淘汰");
+        assert!(map.contains_key(&a3));
+        assert!(map.contains_key(&a4));
+
+        // 4. 重复向已有目标发送: 刷新时间戳且不淘汰其他目标
+        let now2 = now + Duration::from_secs(5);
+        record_sent_target(&mut map, a3, now2, idle_timeout, 2);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&a3], now2);
+    }
+
+    #[test]
+    fn test_prepare_target_addr() {
+        let v4: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:80".parse().unwrap();
+
+        // 双栈模式
+        let p_v4_dual = prepare_target_addr(v4, true).unwrap();
+        assert_eq!(p_v4_dual, SocketAddr::V6(std::net::SocketAddrV6::new(
+            std::net::Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped(),
+            80,
+            0,
+            0
+        )));
+        let p_v6_dual = prepare_target_addr(v6, true).unwrap();
+        assert_eq!(p_v6_dual, v6);
+
+        // IPv4 单栈模式
+        let p_v4_single = prepare_target_addr(v4, false).unwrap();
+        assert_eq!(p_v4_single, v4);
+        let p_v6_single = prepare_target_addr(v6, false);
+        assert!(p_v6_single.is_none(), "IPv4 单栈下应丢弃 IPv6 目标");
+    }
+
+    #[tokio::test]
+    async fn test_dual_stack_send_recv_loopback() {
+        // 如果环境支持 ::1, 进行实际双栈收发测试
+        let Ok(server) = tokio::net::UdpSocket::bind("[::1]:0").await else {
+            return; // 环境不支持 IPv6 loopback, 跳过
+        };
+        let server_addr = server.local_addr().unwrap();
+
+        let Ok(client) = tokio::net::UdpSocket::bind("[::]:0").await else {
+            return;
+        };
+        let client_port = client.local_addr().unwrap().port();
+
+        // 从 client 发送给 server (::1)
+        client.send_to(b"ping-v6", server_addr).await.unwrap();
+
+        let mut buf = [0u8; 64];
+        let (n, from) = server.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping-v6");
+        assert_eq!(from.port(), client_port);
+        assert_eq!(from.ip(), std::net::Ipv6Addr::LOCALHOST);
+
+        // 从 server 回包给 client
+        server.send_to(b"pong-v6", from).await.unwrap();
+        let (n_reply, from_srv) = client.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n_reply], b"pong-v6");
+        assert_eq!(from_srv, server_addr);
     }
 }

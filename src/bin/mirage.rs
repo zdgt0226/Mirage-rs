@@ -424,8 +424,14 @@ fn mirage_outbound_json(tag: &str, node: &mirage_rs::node_uri::NodeUri) -> serde
 /// 新文件与备份文件**恒为 0600**: 配置含口令/私钥/token, 没有组或他人可读的正当理由; 固定收紧
 /// (而非沿用原权限) 让早期安装留下的 0644 配置在下一次回写时自愈。
 fn atomic_write_config(path: &str, original: &str, rendered: &str) -> Result<(), String> {
-    let bak = format!("{path}.bak");
-    let tmp = format!("{path}.tmp");
+    // 若目标是软链接或已存在文件, 解析为 canonical 真实路径; 不存在则用原路径。
+    let target_path = match std::fs::canonicalize(path) {
+        Ok(real) => real,
+        Err(_) => std::path::PathBuf::from(path),
+    };
+    let target_str = target_path.to_string_lossy();
+    let bak = format!("{target_str}.bak");
+    let tmp = format!("{target_str}.tmp");
 
     #[cfg(unix)]
     let mode: u32 = 0o600;
@@ -462,13 +468,13 @@ fn atomic_write_config(path: &str, original: &str, rendered: &str) -> Result<(),
 
     write_file(&bak, original).map_err(|e| format!("备份到 {bak} 失败: {e} (未改动原文件)"))?;
     write_file(&tmp, rendered).map_err(|e| format!("写临时文件 {tmp} 失败: {e} (未改动原文件)"))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    std::fs::rename(&tmp, &target_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("替换 {path} 失败: {e}")
     })?;
     #[cfg(unix)]
     {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Some(parent) = target_path.parent() {
             let parent_path = if parent.as_os_str().is_empty() {
                 std::path::Path::new(".")
             } else {
@@ -1992,5 +1998,28 @@ mod tests {
         let tags: Vec<&str> = e["outbounds"].as_array().unwrap().iter()
             .filter_map(|o| o["tag"].as_str()).collect();
         assert!(tags.contains(&"grpB") && tags.contains(&"grpC"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bin_atomic_write_config_preserves_symlink() {
+        use super::atomic_write_config;
+        let temp_dir = std::env::temp_dir().join(format!("mirage_bin_awc_sym_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_file = temp_dir.join("real.json");
+        std::fs::write(&real_file, "{\"initial\":1}").unwrap();
+
+        let link_file = temp_dir.join("link.json");
+        std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+        atomic_write_config(link_file.to_str().unwrap(), "{\"initial\":1}", "{\"updated\":2}").unwrap();
+
+        let sym_meta = std::fs::symlink_metadata(&link_file).unwrap();
+        assert!(sym_meta.file_type().is_symlink(), "link.json 必须保持为软链接");
+        let content = std::fs::read_to_string(&real_file).unwrap();
+        assert_eq!(content, "{\"updated\":2}", "real.json 内容应已更新");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
