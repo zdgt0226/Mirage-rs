@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### test/ci: 修复 QUIC 端到端集成测试并在 CI 中纳入回归测试 (审计 P2)
+
+- **QUIC 端到端测试补齐 (`tests/test_quic_e2e.rs`)**:
+  - 服务端入站配置添加 `"quic_key_path"` 指向临时目录唯一样本, 并在测试结束时自动通过 RAII drop 清理, 杜绝在工作区根目录生成 `quic_key.pem` 污染代码库。
+  - 服务端配置添加 `"allow_local_targets": true`, 修复自 #153 起因回环直连默认拒绝导致连往 127.0.0.1 echo 服务端被重置的问题。
+  - 测试初始化阶段通过 `load_or_generate_key` 与 `spki_pin` 预生成私钥并计算 SPKI 指纹, 填入客户端出站 `"quic_pin"`, 解决自 #151 起出站缺失 pin 校验失败的问题。
+- **CI 流程补齐 (`.github/workflows/build.yml`)**:
+  - 在 `Run tests (quic feature)` 之后新增独立运行 `cargo test --features quic --test test_quic_e2e --verbose` 步骤, 杜绝 QUIC 端到端测试再度被漏跑。
+
+### fix(security): 出站 SSRF 过滤拦截本机网卡自身所有地址与 Azure WireServer (审计 P2)
+
+- **本机网卡所有接口地址动态识别与定时刷新 (`src/net_util.rs`, `src/lib.rs`, `src/lite.rs`)**:
+  - 利用已有依赖 `nix::ifaddrs::getifaddrs()` 枚举当前节点全部网络接口的 IPv4 与 IPv6 单播地址, 存入进程级 `ArcSwap<HashSet<IpAddr>>`。
+  - 在服务端启动时 (标准版含 `MirageServer` 入站及轻量版服务端) 立即刷新并在后台每 60 秒定期刷新一次; 枚举失败时仅记录警告日志并保留旧集合。
+- **SSRF 出站白名单拦截完善 (`src/net_util.rs`)**:
+  - `egress_allowed`: 当 `allow_local == false` 时, 若目标 IP (经 IPv4-mapped 还原后) 属于本机网卡自身地址集合, 坚决拒绝出站; 当 `allow_local == true` 时予以放行 (与回环语义一致)。
+  - 云元数据黑名单新增 Azure WireServer (`168.63.129.16`), 默认拒绝直连出站。
+- **文档与威胁模型补充 (`README.md`, `templates/config_server.jsonc`, `docs/threat-model.md`)**:
+  - 明确标注本机自身地址 (含公网 IP、docker 网桥等) 默认拒绝直连访问; 说明云主机 1:1 NAT (如 AWS EIP) 并不在网卡上绑定的残余风险, 建议管理 API 监听 127.0.0.1 或配置 token。
+
+### fix(security): QUIC 握手限流引入抗源地址伪造 Initial 的有压 Retry 与超时释放 (审计 P2)
+
+- **自适应有压 Retry 地址验证 (`src/proxy/mirage_server/mod.rs`)**:
+  - 避免对所有连接恒常发 Retry (抗审查考虑: 普通 HTTP/3 极少发 Retry, 恒发具有特征且增加 1 RTT)。
+  - 在 `QuicHandshakeLimiter` 中引入软阈值 `soft_global` (默认全局上限的一半 1024) 与 `under_pressure(ip)` 查询方法: 仅在全局在途并发达到软阈值或该 IP 已达每 IP 上限时处于压力状态。
+  - 当处于压力状态且对端地址未验证 (`!incoming.remote_address_validated()`) 时, 若支持 Retry (`incoming.may_retry()`), 调用 `incoming.retry()` 发送 Retry 包验证源地址真实性, 且不占在途配额, 彻底防范伪造源地址 Initial 包打满全局握手槽位或锁死受害 IP。
+  - 地址验证通过后才占用并发槽位, 超出硬上限则 `refuse`。
+- **握手超时兜底与黑名单前置 (`src/proxy/mirage_server/mod.rs`)**:
+  - `incoming.await` 增加 10 秒超时门控 (`tokio::time::timeout`), 避免未完成握手的连接长期占用槽位, 超时立即 drop guard 释放并发名额。
+  - 黑名单拦截前置到 `endpoint.accept()` 之后、握手之前, 对黑名单 IP 立即 `incoming.refuse()`, 节约握手 CPU 开销。
+
+- **审阅修正**: 初稿每 IP 计数不区分源地址是否已验证 —— 攻击者冒充受害者 IP 发 32 个伪造 Initial 占满该 IP 名额后, 受害者即使完成 Retry 验证也被每 IP 上限拒绝, 每 10s 补 32 包即可持续锁死该用户。改为按 (归一 IP, 是否已验证) 分桶, 伪造的未验证连接挤不掉已验证名额 (附回归测试)。同批 SSRF 部分: 合并重复的网卡枚举代码; 既有"RFC1918 / 公网默认放行"断言改为跳过恰为本机网卡的地址, 避免在网关等内网主机上误挂。
+
 ### fix: 配置文件热重载监听父目录解决 rename 覆盖失效 (影响已发布版本: API 管理用户第二次起不生效)
 
 - **监听父目录与事件过滤 (`src/config_watcher.rs`)**:

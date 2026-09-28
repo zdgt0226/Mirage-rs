@@ -237,6 +237,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
     // 轻量服务端单用户: 单凭据 ("default", password)。按 "lite_server" 注册到凭据快照表。
     let creds_vec = vec![("default".to_string(), cfg.password.clone())];
     let creds = crate::proxy::mirage_server::register_creds("lite_server", creds_vec);
+    crate::net_util::start_local_ips_updater();
     crate::proxy::mirage_server::start_server(
         &addr,
         creds,

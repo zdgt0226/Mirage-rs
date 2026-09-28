@@ -112,25 +112,45 @@ fn socks5_connect(proxy: u16, target_port: u16) -> std::io::Result<TcpStream> {
 /// QUIC 传输打通一条真实 TCP 流 (SOCKS5 → mirage-over-QUIC → direct → echo)。
 #[test]
 fn quic_transport_tunnels_tcp() {
+    struct CleanFile(std::path::PathBuf);
+    impl Drop for CleanFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     let echo = spawn_echo();
     let camo = spawn_incomplete_camouflage();
     let sport = free_port(); // 服务端 QUIC 监听 (UDP 用同号)
     let cport = free_port(); // 客户端 SOCKS 入站 (TCP)
 
+    let key_path = std::env::temp_dir().join(format!("mirage_quic_key_{}.pem", std::process::id()));
+    let _ = std::fs::remove_file(&key_path);
+    let key = mirage_rs::proxy::quic::load_or_generate_key(&key_path).expect("生成测试 QUIC 密钥");
+    let pin = mirage_rs::proxy::quic::spki_pin(&key.public_key_der());
+    let key_path_str = key_path.to_str().unwrap();
+
+    let _clean_key = CleanFile(key_path.clone());
+
     let srv = write_cfg("srv", &format!(
         r#"{{"schema_version":1,"log_level":"warn",
             "inbounds":[{{"type":"mirage_server","tag":"m-in","listen":"127.0.0.1","port":{sport},
-                          "password":"pw-quic","camouflage_host":"127.0.0.1:{camo}","transport":"quic"}}],
+                          "password":"pw-quic","camouflage_host":"127.0.0.1:{camo}","transport":"quic",
+                          "quic_key_path":"{key_path_str}","allow_local_targets":true}}],
             "outbounds":[{{"type":"direct","tag":"direct"}}],
             "routing":{{"default_outbound":"direct","rules":[]}}}}"#
     ));
+    let _clean_srv = CleanFile(srv.clone());
+
     let cli = write_cfg("cli", &format!(
         r#"{{"schema_version":1,"log_level":"warn",
             "inbounds":[{{"type":"socks","tag":"socks-in","listen":"127.0.0.1","port":{cport}}}],
             "outbounds":[{{"type":"mirage","tag":"m-out","server":"127.0.0.1","server_port":{sport},
-                           "password":"pw-quic","camouflage_host":"www.apple.com","pool_size":2,"transport":"quic"}}],
+                            "password":"pw-quic","camouflage_host":"www.apple.com","pool_size":2,"transport":"quic",
+                            "quic_pin":"{pin}"}}],
             "routing":{{"default_outbound":"m-out","rules":[]}}}}"#
     ));
+    let _clean_cli = CleanFile(cli.clone());
 
     let _s = spawn("server", &srv);
     std::thread::sleep(std::time::Duration::from_millis(1500)); // QUIC 服务端无 TCP 口可探, 等其起

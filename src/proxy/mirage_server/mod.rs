@@ -127,8 +127,11 @@ impl Drop for IpSlotGuard {
 pub(crate) struct QuicHandshakeLimiter {
     max_per_ip: usize,
     max_global: usize,
+    soft_global: usize,
     global_count: AtomicUsize,
-    ip_counts: Mutex<HashMap<IpAddr, usize>>,
+    /// 每 IP 计数按 (归一 IP, 源地址是否已验证) 分桶: 伪造源的未验证 Initial 只能占满未验证桶,
+    /// 挤不掉真实客户端完成 Retry 验证后的名额 (否则冒充受害者 IP 发 32 包即可持续锁死该用户)。
+    ip_counts: Mutex<HashMap<(IpAddr, bool), usize>>,
 }
 
 #[cfg_attr(not(feature = "quic"), allow(dead_code))]
@@ -137,9 +140,14 @@ impl QuicHandshakeLimiter {
     pub const DEFAULT_MAX_GLOBAL: usize = 2048;
 
     pub fn new(max_per_ip: usize, max_global: usize) -> Self {
+        Self::new_with_soft(max_per_ip, max_global, max_global / 2)
+    }
+
+    pub fn new_with_soft(max_per_ip: usize, max_global: usize, soft_global: usize) -> Self {
         Self {
             max_per_ip,
             max_global,
+            soft_global,
             global_count: AtomicUsize::new(0),
             ip_counts: Mutex::new(HashMap::new()),
         }
@@ -149,8 +157,37 @@ impl QuicHandshakeLimiter {
         Self::new(Self::DEFAULT_MAX_PER_IP, Self::DEFAULT_MAX_GLOBAL)
     }
 
-    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<QuicHandshakeGuard> {
+    pub fn max_per_ip(&self) -> usize {
+        self.max_per_ip
+    }
+
+    pub fn max_global(&self) -> usize {
+        self.max_global
+    }
+
+    #[cfg(test)]
+    pub fn soft_global(&self) -> usize {
+        self.soft_global
+    }
+
+    /// 查询在当前握手在途计数下, 目标 IP 或全局是否处于"有压力"状态。
+    /// 当全局在途达到软阈值 (默认全局上限的一半) 或该 IP 的未验证桶已达每 IP 上限时返回 true,
+    /// 触发对未经验证源地址的连接发送 QUIC Retry (地址所有权验证)。
+    pub fn under_pressure(&self, ip: IpAddr) -> bool {
+        if self.global_count.load(Ordering::SeqCst) >= self.soft_global {
+            return true;
+        }
         let norm_ip = handshake::rate_limit_key(ip);
+        let map = match self.ip_counts.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(&(norm_ip, false)).copied().unwrap_or(0) >= self.max_per_ip
+    }
+
+    /// `validated`: 源地址是否已经 Retry 验证 (决定计入哪个每 IP 桶, 见 ip_counts)。
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr, validated: bool) -> Option<QuicHandshakeGuard> {
+        let key = (handshake::rate_limit_key(ip), validated);
         let current_global = self.global_count.fetch_add(1, Ordering::SeqCst);
         if current_global >= self.max_global {
             self.global_count.fetch_sub(1, Ordering::SeqCst);
@@ -161,7 +198,7 @@ impl QuicHandshakeLimiter {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let count = map.entry(norm_ip).or_insert(0);
+        let count = map.entry(key).or_insert(0);
         if *count >= self.max_per_ip {
             self.global_count.fetch_sub(1, Ordering::SeqCst);
             return None;
@@ -170,7 +207,7 @@ impl QuicHandshakeLimiter {
 
         Some(QuicHandshakeGuard {
             limiter: self.clone(),
-            norm_ip,
+            key,
         })
     }
 
@@ -186,19 +223,19 @@ impl QuicHandshakeLimiter {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        map.get(&norm_ip).copied().unwrap_or(0)
+        map.get(&(norm_ip, false)).copied().unwrap_or(0) + map.get(&(norm_ip, true)).copied().unwrap_or(0)
     }
 
-    fn release(&self, norm_ip: IpAddr) {
+    fn release(&self, key: (IpAddr, bool)) {
         self.global_count.fetch_sub(1, Ordering::SeqCst);
         let mut map = match self.ip_counts.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(c) = map.get_mut(&norm_ip) {
+        if let Some(c) = map.get_mut(&key) {
             *c = c.saturating_sub(1);
             if *c == 0 {
-                map.remove(&norm_ip);
+                map.remove(&key);
             }
         }
     }
@@ -207,12 +244,12 @@ impl QuicHandshakeLimiter {
 #[cfg_attr(not(feature = "quic"), allow(dead_code))]
 pub(crate) struct QuicHandshakeGuard {
     limiter: Arc<QuicHandshakeLimiter>,
-    norm_ip: IpAddr,
+    key: (IpAddr, bool),
 }
 
 impl Drop for QuicHandshakeGuard {
     fn drop(&mut self) {
-        self.limiter.release(self.norm_ip);
+        self.limiter.release(self.key);
     }
 }
 
@@ -348,14 +385,39 @@ pub async fn start_quic_server(
     let limiter = Arc::new(QuicHandshakeLimiter::default_limits());
 
     while let Some(incoming) = endpoint.accept().await {
-        let peer_ip = incoming.remote_address().ip();
-        let guard = match limiter.try_acquire(peer_ip) {
+        let peer_addr = incoming.remote_address();
+        let peer_ip = peer_addr.ip();
+
+        // 1. 黑名单检查前置 (省下握手 CPU)
+        if crate::blocklist::is_blocked(&peer_ip) {
+            debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {peer_ip}");
+            incoming.refuse();
+            continue;
+        }
+
+        // 2. 抗 Initial 洪泛与伪造源地址:
+        // 普通 HTTP/3 服务器极少恒常发 Retry (是可识别特征且增加 1 RTT)。
+        // 仅在"有压力" (全局在途 ≥ 软阈值 或 该 IP 已达每 IP 上限) 时,
+        // 若地址未经验证且支持 Retry, 则发 Retry 验证对端源地址所有权 (不占在途计数)。
+        if !incoming.remote_address_validated()
+            && limiter.under_pressure(peer_ip)
+            && incoming.may_retry()
+        {
+            debug!("Mirage QUIC Server: 握手压力下要求地址验证 (Retry): {peer_ip}");
+            if let Err(e) = incoming.retry() {
+                debug!("Mirage QUIC Server: 发送 Retry 失败 ({peer_ip}): {e}");
+            }
+            continue;
+        }
+
+        // 3. 尝试获取握手并发槽位 (硬上限检查)
+        let guard = match limiter.try_acquire(peer_ip, incoming.remote_address_validated()) {
             Some(g) => g,
             None => {
                 debug!(
                     "Mirage QUIC Server: 握手并发超限 (每IP上限 {} 或全局上限 {}), 拒绝来自 {} 的连接",
-                    QuicHandshakeLimiter::DEFAULT_MAX_PER_IP,
-                    QuicHandshakeLimiter::DEFAULT_MAX_GLOBAL,
+                    limiter.max_per_ip(),
+                    limiter.max_global(),
                     peer_ip
                 );
                 incoming.refuse();
@@ -366,9 +428,9 @@ pub async fn start_quic_server(
         let creds_c = creds.clone();
         let up = upstream.clone();
         tokio::spawn(async move {
-            let conn = match incoming.await {
-                Ok(c) => c,
-                Err(_) => return, // QUIC 握手失败 (对端非法/超时), guard 在此 drop 释放槽位
+            let conn = match tokio::time::timeout(std::time::Duration::from_secs(10), incoming).await {
+                Ok(Ok(c)) => c,
+                _ => return, // QUIC 握手失败或超时 (10s), guard 在此 drop 释放槽位
             };
             // 握手完成, 释放握手阶段并发计数 (计数仅覆盖至底层 QUIC/TLS 连接握手完成, 防握手阶段 CPU DoS)
             drop(guard);
@@ -556,18 +618,18 @@ mod quic_limiter_tests {
         let limiter = Arc::new(QuicHandshakeLimiter::new(2, 10));
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
 
-        let g1 = limiter.try_acquire(ip);
+        let g1 = limiter.try_acquire(ip, false);
         assert!(g1.is_some());
         assert_eq!(limiter.current_for_ip(ip), 1);
         assert_eq!(limiter.current_global(), 1);
 
-        let g2 = limiter.try_acquire(ip);
+        let g2 = limiter.try_acquire(ip, false);
         assert!(g2.is_some());
         assert_eq!(limiter.current_for_ip(ip), 2);
         assert_eq!(limiter.current_global(), 2);
 
         // 超出每 IP 上限 (2)
-        let g3 = limiter.try_acquire(ip);
+        let g3 = limiter.try_acquire(ip, false);
         assert!(g3.is_none());
         assert_eq!(limiter.current_for_ip(ip), 2);
         assert_eq!(limiter.current_global(), 2);
@@ -578,7 +640,7 @@ mod quic_limiter_tests {
         assert_eq!(limiter.current_global(), 1);
 
         // 重新获取成功
-        let g4 = limiter.try_acquire(ip);
+        let g4 = limiter.try_acquire(ip, false);
         assert!(g4.is_some());
         assert_eq!(limiter.current_for_ip(ip), 2);
         assert_eq!(limiter.current_global(), 2);
@@ -595,19 +657,19 @@ mod quic_limiter_tests {
         let ip1: IpAddr = "2001:db8::1".parse().unwrap();
         let ip2: IpAddr = "2001:db8::dead:beef".parse().unwrap();
 
-        let g1 = limiter.try_acquire(ip1);
+        let g1 = limiter.try_acquire(ip1, false);
         assert!(g1.is_some());
 
-        let g2 = limiter.try_acquire(ip2);
+        let g2 = limiter.try_acquire(ip2, false);
         assert!(g2.is_some());
 
         // 同 /64 第三个连接被拒
         let ip3: IpAddr = "2001:db8::cafe".parse().unwrap();
-        let g3 = limiter.try_acquire(ip3);
+        let g3 = limiter.try_acquire(ip3, false);
         assert!(g3.is_none());
 
         drop(g1);
-        let g4 = limiter.try_acquire(ip3);
+        let g4 = limiter.try_acquire(ip3, false);
         assert!(g4.is_some());
     }
 
@@ -619,21 +681,84 @@ mod quic_limiter_tests {
         let ip3: IpAddr = "192.0.2.3".parse().unwrap();
         let ip4: IpAddr = "192.0.2.4".parse().unwrap();
 
-        let g1 = limiter.try_acquire(ip1);
-        let g2 = limiter.try_acquire(ip2);
-        let g3 = limiter.try_acquire(ip3);
+        let g1 = limiter.try_acquire(ip1, false);
+        let g2 = limiter.try_acquire(ip2, false);
+        let g3 = limiter.try_acquire(ip3, false);
         assert!(g1.is_some() && g2.is_some() && g3.is_some());
         assert_eq!(limiter.current_global(), 3);
 
         // 全局达到 3, 不同 IP 也被拒
-        let g4 = limiter.try_acquire(ip4);
+        let g4 = limiter.try_acquire(ip4, false);
         assert!(g4.is_none());
         assert_eq!(limiter.current_global(), 3);
 
         drop(g1);
         assert_eq!(limiter.current_global(), 2);
-        let g5 = limiter.try_acquire(ip4);
+        let g5 = limiter.try_acquire(ip4, false);
         assert!(g5.is_some());
         assert_eq!(limiter.current_global(), 3);
+    }
+
+    /// 冒充受害者 IP 的伪造 Initial (未验证) 占满该 IP 的未验证桶后, 受害者完成 Retry 验证
+    /// 的连接仍能拿到名额 —— 否则攻击者每 10s 补 32 个包即可持续把该用户锁在门外。
+    #[test]
+    fn test_quic_limiter_spoofed_unvalidated_cannot_lock_out_validated() {
+        let limiter = Arc::new(QuicHandshakeLimiter::new(2, 10));
+        let victim: IpAddr = "192.0.2.9".parse().unwrap();
+        let _s1 = limiter.try_acquire(victim, false).unwrap();
+        let _s2 = limiter.try_acquire(victim, false).unwrap();
+        assert!(limiter.try_acquire(victim, false).is_none(), "未验证桶已满");
+        assert!(limiter.under_pressure(victim), "未验证桶满 → 新的未验证 Initial 应被要求 Retry");
+        assert!(limiter.try_acquire(victim, true).is_some(), "已验证连接不受伪造占满的未验证桶影响");
+    }
+
+    #[test]
+    fn test_quic_limiter_under_pressure() {
+        // 每 IP 上限 2, 全局上限 10, 软阈值 5
+        let limiter = Arc::new(QuicHandshakeLimiter::new_with_soft(2, 10, 5));
+        assert_eq!(limiter.soft_global(), 5);
+        let ip1: IpAddr = "192.0.2.1".parse().unwrap();
+        let ip2: IpAddr = "192.0.2.2".parse().unwrap();
+
+        // 初始无压力
+        assert!(!limiter.under_pressure(ip1));
+        assert!(!limiter.under_pressure(ip2));
+
+        // ip1 占用 1 个槽位, 未达每 IP 上限 (2), 全局为 1 (< 5)
+        let _g1 = limiter.try_acquire(ip1, false).unwrap();
+        assert!(!limiter.under_pressure(ip1));
+
+        // ip1 占用第 2 个槽位, 达到每 IP 上限 (2)
+        let g2 = limiter.try_acquire(ip1, false).unwrap();
+        assert!(limiter.under_pressure(ip1), "IP 达到上限时应处于 under_pressure");
+        // ip2 此时未达到上限, 全局在途 2 (< 5), 故无压力
+        assert!(!limiter.under_pressure(ip2));
+
+        // 释放 ip1 的 1 个槽位, 恢复无压力
+        drop(g2);
+        assert!(!limiter.under_pressure(ip1));
+
+        // 测试全局软阈值: 全局到达 5 时, 任何新 IP 即使自身连接为 0 也被判定为 under_pressure
+        let _g2 = limiter.try_acquire(ip1, false).unwrap(); // 全局 2
+        let _g3 = limiter.try_acquire(ip2, false).unwrap(); // 全局 3
+        let ip3: IpAddr = "192.0.2.3".parse().unwrap();
+        let _g4 = limiter.try_acquire(ip3, false).unwrap(); // 全局 4
+        let ip4: IpAddr = "192.0.2.4".parse().unwrap();
+        let g5 = limiter.try_acquire(ip4, false).unwrap(); // 全局 5 (达到 soft_global)
+
+        let ip_new: IpAddr = "192.0.2.100".parse().unwrap();
+        assert!(limiter.under_pressure(ip_new), "全局达到软阈值时所有 IP 均应处于 under_pressure");
+
+        // 释放 1 个槽位, 全局回到 4 (< 5), ip_new 恢复无压力
+        drop(g5);
+        assert!(!limiter.under_pressure(ip_new));
+
+        // 测试 IPv6 /64 前缀归一化下的压力判断
+        let v6_1: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6_2: IpAddr = "2001:db8::2".parse().unwrap();
+        let v6_3: IpAddr = "2001:db8::3".parse().unwrap();
+        let _gv1 = limiter.try_acquire(v6_1, false).unwrap();
+        let _gv2 = limiter.try_acquire(v6_2, false).unwrap();
+        assert!(limiter.under_pressure(v6_3), "同 /64 的 IPv6 达到上限应被判定为 under_pressure");
     }
 }
