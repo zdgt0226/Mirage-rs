@@ -29,24 +29,142 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-pub type CredsSnapshot = Arc<arc_swap::ArcSwap<Vec<(String, String)>>>;
+pub use std::sync::atomic::AtomicBool;
+
+/// 凭据条目: 携带吊销令牌。改口令或删用户时, 旧条目的 `revoked` 置为 true,
+/// 促使已建立的会话在下次数据块转发或状态检查时立即断开。
+#[derive(Clone)]
+pub struct CredEntry {
+    pub name: String,
+    pub password: String,
+    pub revoked: Arc<AtomicBool>,
+}
+
+// 手写 Debug: 口令绝不能经 {:?} 进日志。
+impl std::fmt::Debug for CredEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredEntry")
+            .field("name", &self.name)
+            .field("password", &"<redacted>")
+            .field("revoked", &self.revoked.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl CredEntry {
+    pub fn new(name: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            password: password.into(),
+            revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+pub type CredsSnapshot = Arc<arc_swap::ArcSwap<Vec<CredEntry>>>;
+
+/// 会话鉴权与吊销状态: 结合用户配额/限速句柄与凭据吊销令牌。
+/// 在每次数据转发热路径上只产生极低的 Relaxed load 开销。
+#[derive(Clone)]
+pub struct SessionAuth {
+    pub user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    pub cred_revoked: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for SessionAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionAuth")
+            .field("user", &self.user_limit.as_ref().map(|u| &u.name))
+            .field("cred_revoked", &self.cred_revoked.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl SessionAuth {
+    pub fn new(
+        user_limit: Option<Arc<crate::proxy::user_limits::UserLimitHandle>>,
+        cred_revoked: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            user_limit,
+            cred_revoked,
+        }
+    }
+
+    /// 测试/无吊销上下文时使用的快捷构造 (未设限且未吊销)
+    pub fn unlimited() -> Self {
+        Self {
+            user_limit: None,
+            cred_revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[inline]
+    pub fn should_stop(&self) -> bool {
+        self.cred_revoked.load(Ordering::Relaxed)
+            || self.user_limit.as_ref().is_some_and(|u| u.is_exhausted())
+    }
+
+    #[inline]
+    pub async fn charge(&self, n: usize, up: bool) -> bool {
+        if self.should_stop() {
+            return true;
+        }
+        crate::proxy::user_limits::charge(self.user_limit.as_deref(), n, up).await
+    }
+
+    #[inline]
+    pub fn record_bytes(&self, n: usize) -> bool {
+        if self.should_stop() {
+            return true;
+        }
+        if let Some(u) = &self.user_limit {
+            u.record_bytes(n)
+        } else {
+            false
+        }
+    }
+}
 
 static CREDS_REGISTRY: LazyLock<Mutex<HashMap<String, CredsSnapshot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 构造凭据列表: [0] = ("default", 主密码), 其余 = users[].(name, password)
-pub fn build_creds(password: &str, users: &[crate::config::MirageUser]) -> Vec<(String, String)> {
+pub fn build_creds(password: &str, users: &[crate::config::MirageUser]) -> Vec<CredEntry> {
     let mut v = Vec::with_capacity(1 + users.len());
-    v.push(("default".to_string(), password.to_string()));
-    v.extend(users.iter().map(|u| (u.name.clone(), u.password.clone())));
+    v.push(CredEntry::new("default", password));
+    v.extend(users.iter().map(|u| CredEntry::new(&u.name, &u.password)));
     v
 }
 
+/// 内部辅助: 比对新旧快照。同名同口令条目复用旧条目的 revoked 状态 Arc,
+/// 旧快照中在新快照中不存在的条目置 revoked = true, 原地替换快照指针。
+fn reconcile_and_swap_creds(target: &CredsSnapshot, mut new_creds: Vec<CredEntry>) {
+    let old_snapshot = target.load_full();
+    for new_entry in &mut new_creds {
+        if let Some(old) = old_snapshot
+            .iter()
+            .find(|o| o.name == new_entry.name && o.password == new_entry.password)
+        {
+            new_entry.revoked = old.revoked.clone();
+        }
+    }
+    for old in old_snapshot.iter() {
+        if !new_creds
+            .iter()
+            .any(|n| n.name == old.name && n.password == old.password)
+        {
+            old.revoked.store(true, Ordering::Relaxed);
+        }
+    }
+    target.store(Arc::new(new_creds));
+}
+
 /// 按入站 tag 注册 mirage_server 凭据快照。若已存在则原地 store 更新并返回现有 handle。
-pub fn register_creds(tag: &str, initial: Vec<(String, String)>) -> CredsSnapshot {
+pub fn register_creds(tag: &str, initial: Vec<CredEntry>) -> CredsSnapshot {
     let mut map = CREDS_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = map.get(tag) {
-        existing.store(Arc::new(initial));
+        reconcile_and_swap_creds(existing, initial);
         existing.clone()
     } else {
         let snapshot = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
@@ -56,10 +174,10 @@ pub fn register_creds(tag: &str, initial: Vec<(String, String)>) -> CredsSnapsho
 }
 
 /// 热重载时按 tag 更新凭据快照。若 tag 尚未注册则跳过, 返回 false。
-pub fn reload_creds(tag: &str, new_creds: Vec<(String, String)>) -> bool {
+pub fn reload_creds(tag: &str, new_creds: Vec<CredEntry>) -> bool {
     let map = CREDS_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(entry) = map.get(tag) {
-        entry.store(Arc::new(new_creds));
+        reconcile_and_swap_creds(entry, new_creds);
         true
     } else {
         false
@@ -499,15 +617,18 @@ async fn handle_quic_stream_lean(
         _ => return,
     }
     let creds_snapshot = creds.load_full();
-    let user = match creds_snapshot.iter().position(|(_, pw)| {
+    let (user, cred_revoked) = match creds_snapshot.iter().position(|entry| {
         crate::crypto::hello_auth::verify_session_token(
-            pw,
+            &entry.password,
             &token,
             crate::crypto::hello_auth::QUIC_LEAN_BIND,
             tol,
         )
     }) {
-        Some(idx) => creds_snapshot[idx].0.clone(),
+        Some(idx) => (
+            creds_snapshot[idx].name.clone(),
+            creds_snapshot[idx].revoked.clone(),
+        ),
         None => {
             static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !HINTED.swap(true, Ordering::Relaxed) {
@@ -520,6 +641,10 @@ async fn handle_quic_stream_lean(
             return;
         }
     };
+    if cred_revoked.load(Ordering::Relaxed) {
+        tracing::debug!("Mirage QUIC(lean): 凭据已吊销 from {}", peer_ip);
+        return;
+    }
     // 握手门控: 超额用户按认证失败处理
     if crate::proxy::user_limits::is_user_exhausted(&user) {
         tracing::warn!("Mirage QUIC(lean): user `{}` quota exhausted from {}", user, peer_ip);
@@ -532,6 +657,7 @@ async fn handle_quic_stream_lean(
         tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除或不存在, 拒绝并断开流", user);
         return;
     }
+    let session_auth = SessionAuth::new(user_limit, cred_revoked);
     // 2. target: [2B len][host:port]
     let mut lenb = [0u8; 2];
     if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut lenb)).await.map(|r| r.is_err()).unwrap_or(true) {
@@ -569,26 +695,26 @@ async fn handle_quic_stream_lean(
     let (up_read, up_write) = up.into_split();
 
     let dev_buckets = crate::proxy::rate_limit::server_buckets_for(peer_ip);
-    // 用户级限速与配额已在分发时获取 (user_limit)
+    // 用户级限速与配额已在分发时获取 (session_auth)
 
     // 半关闭语义同原 copy_bidirectional: 一侧 EOF 只关对端写方向 (传 FIN), 另一方向继续传完;
-    // 只有出错或用户超额才发 stop 让两个方向都立刻退出。
+    // 只有出错、用户超额或凭据吊销才发 stop 让两个方向都立刻退出。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     tokio::join!(
-        quic_pump(q_read, up_write, dev_buckets.clone(), user_limit.clone(), true, stop_tx.clone(), stop_rx.clone()),
-        quic_pump(up_read, q_write, dev_buckets, user_limit, false, stop_tx, stop_rx),
+        quic_pump(q_read, up_write, dev_buckets.clone(), session_auth.clone(), true, stop_tx.clone(), stop_rx.clone()),
+        quic_pump(up_read, q_write, dev_buckets, session_auth, false, stop_tx, stop_rx),
     );
 }
 
 /// QUIC lean 单向泵: 带客户端 IP 桶 + 用户桶限速与配额计数 (`up` = 客户端→目标)。
 /// - EOF: `shutdown` 对端写方向后返回, **不打断另一方向** (半关闭, 否则客户端先关写时目标的响应会被丢)。
-/// - 读写出错 / 用户超额: 发 stop, 另一方向随之退出。
+/// - 读写出错 / 用户超额 / 凭据吊销: 发 stop, 另一方向随之退出。
 #[cfg(feature = "quic")]
 async fn quic_pump<R, W>(
     mut r: R,
     mut w: W,
     ip: Option<std::sync::Arc<crate::proxy::rate_limit::DeviceBuckets>>,
-    user: Option<std::sync::Arc<crate::proxy::user_limits::UserLimitHandle>>,
+    auth: SessionAuth,
     up: bool,
     stop_tx: tokio::sync::watch::Sender<bool>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -599,7 +725,7 @@ async fn quic_pump<R, W>(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 32768];
     loop {
-        if user.as_ref().is_some_and(|u| u.is_exhausted()) {
+        if auth.should_stop() {
             let _ = stop_tx.send(true);
             return;
         }
@@ -621,10 +747,10 @@ async fn quic_pump<R, W>(
         if let Some(b) = &ip {
             if up { b.up.consume(n).await } else { b.down.consume(n).await }
         }
-        if crate::proxy::user_limits::charge(user.as_deref(), n, up).await
+        if auth.charge(n, up).await
             || w.write_all(&buf[..n]).await.is_err()
         {
-            let _ = stop_tx.send(true); // 超额或写失败 → 两个方向都断
+            let _ = stop_tx.send(true); // 超额、凭据吊销或写失败 → 两个方向都断
             return;
         }
     }
@@ -819,5 +945,176 @@ mod quic_limiter_tests {
         // 后续失败: 依然超过阈值
         assert!(record_stream_auth_failure(&counter));
         assert_eq!(counter.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_reload_creds_password_change_revokes_old_and_reuses_unchanged() {
+        let tag = format!("test_p2_1_ab_{}", fastrand::u64(..));
+        let c1 = register_creds(&tag, vec![
+            CredEntry::new("default", "pw_main"),
+            CredEntry::new("alice", "pw_alice_1"),
+            CredEntry::new("bob", "pw_bob"),
+        ]);
+        let snap1 = c1.load_full();
+        let alice_old_revoked = snap1[1].revoked.clone();
+        let bob_old_revoked = snap1[2].revoked.clone();
+        assert!(!alice_old_revoked.load(Ordering::Relaxed));
+        assert!(!bob_old_revoked.load(Ordering::Relaxed));
+
+        // 改 alice 口令, bob 不变
+        let updated = reload_creds(&tag, vec![
+            CredEntry::new("default", "pw_main"),
+            CredEntry::new("alice", "pw_alice_2"),
+            CredEntry::new("bob", "pw_bob"),
+        ]);
+        assert!(updated);
+        let snap2 = c1.load_full();
+
+        // (a) 旧条目 revoked = true, 新条目 false
+        assert!(alice_old_revoked.load(Ordering::Relaxed), "旧 alice 条目应被置为 revoked");
+        assert!(!snap2[1].revoked.load(Ordering::Relaxed), "新 alice 条目不应被 revoked");
+
+        // (b) 口令不变的条目复用同一 Arc 且保持 false
+        assert!(!bob_old_revoked.load(Ordering::Relaxed), "bob 未修改, 不应被 revoked");
+        assert!(Arc::ptr_eq(&bob_old_revoked, &snap2[2].revoked), "bob 应复用旧条目的 revoked Arc");
+    }
+
+    #[test]
+    fn test_reload_creds_main_password_change_revokes_old_default() {
+        let tag = format!("test_p2_1_c_{}", fastrand::u64(..));
+        let c = register_creds(&tag, vec![
+            CredEntry::new("default", "pw_main_old"),
+            CredEntry::new("alice", "pw_alice"),
+        ]);
+        let snap1 = c.load_full();
+        let default_old_revoked = snap1[0].revoked.clone();
+        assert!(!default_old_revoked.load(Ordering::Relaxed));
+
+        // 改 default 主口令
+        let updated = reload_creds(&tag, vec![
+            CredEntry::new("default", "pw_main_new"),
+            CredEntry::new("alice", "pw_alice"),
+        ]);
+        assert!(updated);
+        let snap2 = c.load_full();
+
+        assert!(default_old_revoked.load(Ordering::Relaxed), "旧 default 条目应被置为 revoked");
+        assert!(!snap2[0].revoked.load(Ordering::Relaxed), "新 default 条目不应被 revoked");
+    }
+
+    #[test]
+    fn test_reload_creds_remove_and_readd_same_cred_not_revoked() {
+        let tag = format!("test_p2_1_d_{}", fastrand::u64(..));
+        let c = register_creds(&tag, vec![
+            CredEntry::new("default", "pw_main"),
+            CredEntry::new("alice", "pw_alice"),
+        ]);
+        let snap1 = c.load_full();
+        let alice_old_revoked = snap1[1].revoked.clone();
+
+        // 模拟 remove + upsert 同名同口令在同一次热重载请求中应用 (快照最终结果相同)
+        let updated = reload_creds(&tag, vec![
+            CredEntry::new("default", "pw_main"),
+            CredEntry::new("alice", "pw_alice"),
+        ]);
+        assert!(updated);
+        let snap2 = c.load_full();
+
+        assert!(!alice_old_revoked.load(Ordering::Relaxed), "同名同口令未变, 不应被吊销");
+        assert!(Arc::ptr_eq(&alice_old_revoked, &snap2[1].revoked), "同名同口令应复用同一 Arc");
+    }
+
+    #[test]
+    fn test_reload_creds_two_inbounds_isolated() {
+        let tag_a = format!("test_p2_1_e_a_{}", fastrand::u64(..));
+        let tag_b = format!("test_p2_1_e_b_{}", fastrand::u64(..));
+
+        let ca = register_creds(&tag_a, vec![
+            CredEntry::new("default", "pw_main_a"),
+            CredEntry::new("alice", "pw_alice"),
+        ]);
+        let cb = register_creds(&tag_b, vec![
+            CredEntry::new("default", "pw_main_b"),
+            CredEntry::new("alice", "pw_alice"),
+        ]);
+
+        let snap_a1 = ca.load_full();
+        let snap_b1 = cb.load_full();
+        let alice_a_revoked = snap_a1[1].revoked.clone();
+        let alice_b_revoked = snap_b1[1].revoked.clone();
+
+        // 从入站 A 删掉 alice
+        let updated_a = reload_creds(&tag_a, vec![
+            CredEntry::new("default", "pw_main_a"),
+        ]);
+        assert!(updated_a);
+
+        assert!(alice_a_revoked.load(Ordering::Relaxed), "入站 A 删掉 alice, 其条目应被吊销");
+        assert!(!alice_b_revoked.load(Ordering::Relaxed), "入站 B 上的 alice 条目不应受影响");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_duplex_session_auth_should_stop_after_reload_creds() {
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tag = format!("test_p2_1_f_{}", fastrand::u64(..));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let creds_store = register_creds(&tag, vec![
+            CredEntry::new("default", "main_pw"),
+            CredEntry::new("alice", "alice_secret"),
+        ]);
+
+        let client_random = [0x77u8; 32];
+        let token = crate::crypto::hello_auth::make_session_token("alice_secret", &client_random);
+
+        // 构造合法 ClientHello
+        let mut hs = vec![0x01, 0x00, 0x00, 0x00];
+        hs.extend_from_slice(&[0x03, 0x03]);
+        hs.extend_from_slice(&client_random);
+        hs.push(32);
+        hs.extend_from_slice(&token);
+        hs.extend_from_slice(&2u16.to_be_bytes());
+        hs.extend_from_slice(&[0x13, 0x01]);
+        hs.extend_from_slice(&[0x01, 0x00]);
+        hs.extend_from_slice(&[0x00, 0x00]);
+        let body_len = (hs.len() - 4) as u32;
+        hs[1..4].copy_from_slice(&body_len.to_be_bytes()[1..4]);
+
+        let mut ch_record = vec![0x16, 0x03, 0x01];
+        ch_record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        ch_record.extend_from_slice(&hs);
+
+        let pool = std::sync::Arc::new(CamouflagePool::new("example.com".to_string()));
+        let peer_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        let snap = creds_store.load_full();
+        let server_task = tokio::spawn(async move {
+            handshake::run_handshake(server, peer_addr, &snap, "example.com", &pool, 60, false).await
+        });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client.write_all(&ch_record).await.unwrap();
+        let mut resp_buf = vec![0u8; 4096];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        assert!(n > 0);
+        let tail = crate::crypto::tls_raw::build_fake_client_tail(0x1301);
+        client.write_all(&tail).await.unwrap();
+
+        let res = server_task.await.unwrap().expect("handshake success");
+        let (_stream, _cr, _sr, _ecdh, idx) = res;
+        assert_eq!(idx, 1, "命中 alice");
+
+        let snap_now = creds_store.load_full();
+        let alice_entry = &snap_now[idx];
+        let session_auth = SessionAuth::new(None, alice_entry.revoked.clone());
+        assert!(!session_auth.should_stop(), "初始未吊销");
+
+        // 热重载修改 alice 口令
+        reload_creds(&tag, vec![
+            CredEntry::new("default", "main_pw"),
+            CredEntry::new("alice", "alice_new_secret"),
+        ]);
+
+        assert!(session_auth.should_stop(), "改口令后在用会话的 should_stop() 必须为 true");
     }
 }

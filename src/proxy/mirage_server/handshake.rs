@@ -84,7 +84,7 @@ fn unauth_reflect_rate_exceeded(ip: IpAddr) -> bool {
 /// 校验 token 是否匹配有效 (且未超额) 凭据。
 /// 超额用户按认证失败处理 (None), 走与 token 校验失败完全相同的伪装站转发路径。
 pub(crate) fn verify_creds_and_quota<F>(
-    creds: &[(String, String)],
+    creds: &[super::CredEntry],
     token: &[u8; 32],
     client_random: &[u8; 32],
     auth_ts_tolerance_secs: u64,
@@ -93,10 +93,10 @@ pub(crate) fn verify_creds_and_quota<F>(
 where
     F: Fn(&str) -> bool,
 {
-    let idx = creds.iter().position(|(_, pw)| {
-        crate::crypto::hello_auth::verify_session_token(pw, token, client_random, auth_ts_tolerance_secs)
+    let idx = creds.iter().position(|entry| {
+        crate::crypto::hello_auth::verify_session_token(&entry.password, token, client_random, auth_ts_tolerance_secs)
     })?;
-    let username = &creds[idx].0;
+    let username = &creds[idx].name;
     if is_exhausted(username) {
         return None;
     }
@@ -278,10 +278,10 @@ pub(crate) async fn consume_fake_client_tail<S: AsyncRead + Unpin>(
 /// 传输无关的服务端握手核心 (ClientHello 鉴权 + 模板回放 + tail 消费)。返回 `Some((stream,
 /// client_random, ecdh))` 表示鉴权通过、可进 dispatch; `None` = 已按 auth-fail 走 camouflage
 /// 或出错 (调用方直接结束)。TCP/QUIC 各自的 `handle_connection*` 包一层做 split + dispatch。
-async fn run_handshake<S>(
+pub(super) async fn run_handshake<S>(
     mut stream: S,
     peer_addr: SocketAddr,
-    creds: &[(String, String)],
+    creds: &[super::CredEntry],
     camouflage_host: &str,
     cam_pool: &Arc<CamouflagePool>,
     auth_ts_tolerance_secs: u64,
@@ -453,7 +453,11 @@ pub(super) async fn handle_connection(
     )
     .await
     {
-        let (user, password) = creds_snapshot[idx].clone(); // 命中的凭据: 用户名 + 派生会话密钥的 password
+        // 命中的凭据: 用户名 + 派生会话密钥的 password + 该凭据的吊销令牌 (改口令/删用户时置位)
+        let entry = &creds_snapshot[idx];
+        let user = entry.name.clone();
+        let password = entry.password.clone();
+        let cred_revoked = entry.revoked.clone();
         let (rh, wh) = stream.into_split();
         control::dispatch_authenticated(
             crate::proxy::tunnel::TunnelRead::Tcp(rh),
@@ -461,6 +465,7 @@ pub(super) async fn handle_connection(
             Some(client_ip),
             password,
             user,
+            cred_revoked,
             client_random,
             server_random,
             upstream,
@@ -475,6 +480,7 @@ pub(super) async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::mirage_server::CredEntry;
 
     #[test]
     fn unauth_reflect_rate_trips_after_max() {
@@ -499,8 +505,8 @@ mod tests {
         // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
         let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let creds = vec![
-            ("alice".to_string(), "pwd_alice".to_string()),
-            ("bob".to_string(), "pwd_bob".to_string()),
+            CredEntry::new("alice", "pwd_alice"),
+            CredEntry::new("bob", "pwd_bob"),
         ];
         let client_random = [42u8; 32];
         let token = crate::crypto::hello_auth::make_session_token("pwd_alice", &client_random);
@@ -520,9 +526,9 @@ mod tests {
         let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = "test_tag_hot_reload";
         let initial_creds = vec![
-            ("default".to_string(), "main_pwd".to_string()),
-            ("alice".to_string(), "alice_pwd".to_string()),
-            ("bob".to_string(), "bob_pwd".to_string()),
+            super::super::CredEntry::new("default", "main_pwd"),
+            super::super::CredEntry::new("alice", "alice_pwd"),
+            super::super::CredEntry::new("bob", "bob_pwd"),
         ];
         let store = super::super::register_creds(tag, initial_creds);
 
@@ -537,9 +543,9 @@ mod tests {
 
         // 热重载: 删掉 bob, 修改 alice 密码, 增加 charlie
         let new_creds = vec![
-            ("default".to_string(), "main_pwd".to_string()),
-            ("alice".to_string(), "alice_pwd_new".to_string()),
-            ("charlie".to_string(), "charlie_pwd".to_string()),
+            super::super::CredEntry::new("default", "main_pwd"),
+            super::super::CredEntry::new("alice", "alice_pwd_new"),
+            super::super::CredEntry::new("charlie", "charlie_pwd"),
         ];
         let updated = super::super::reload_creds(tag, new_creds);
         assert!(updated, "已注册 tag 热重载应返回 true");
@@ -711,7 +717,7 @@ mod tests {
         let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (mut client, server) = tokio::io::duplex(8192);
         let password = "test_handshake_pwd";
-        let creds = vec![("default".to_string(), password.to_string())];
+        let creds = vec![super::super::CredEntry::new("default", password)];
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let pool = CamouflagePool::new("example.com".to_string());
 

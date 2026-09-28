@@ -5,7 +5,7 @@ use crate::router::geo_updater::{UpdaterHandle, UpdaterState};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use notify::{Event, RecursiveMode, Watcher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use ipnet::IpNet;
 use tracing::{error, info, warn};
@@ -343,23 +343,18 @@ impl ConfigWatcher {
             info!("Started hot-reload watcher on config dir {} for file {:?}", config_dir.display(), config_file_name);
 
             // 若配置是软链接 (真实路径与原路径不同), 额外 watch 真实父目录 (与已 watch 目录相同则不重复)
-            let real_pathbuf = config_pathbuf.canonicalize().ok();
-            let (real_dir_canon, real_file_name) = match &real_pathbuf {
-                Some(real) if real != &config_pathbuf && real != &config_dir_canon.join(&config_file_name) => {
-                    let r_name = real.file_name().map(|n| n.to_os_string());
-                    let r_dir = real.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-                    let r_dir_canon = r_dir.canonicalize().unwrap_or_else(|_| r_dir.to_path_buf());
-                    (Some(r_dir_canon), r_name)
-                }
-                _ => (None, None),
-            };
+            let mut symlink_state = SymlinkWatchState::new(
+                &config_pathbuf,
+                &config_dir_canon,
+                &config_file_name,
+            );
 
-            if let Some(ref r_dir_canon) = real_dir_canon {
+            if let Some(ref r_dir_canon) = symlink_state.real_dir_canon {
                 if r_dir_canon != &config_dir_canon {
                     if let Err(e) = watcher.watch(r_dir_canon, RecursiveMode::NonRecursive) {
                         warn!("Failed to watch real config dir {} for symlink target: {}", r_dir_canon.display(), e);
                     } else {
-                        info!("Also watching real config dir {} for symlink target {:?}", r_dir_canon.display(), real_file_name);
+                        info!("Also watching real config dir {} for symlink target {:?}", r_dir_canon.display(), symlink_state.real_file_name);
                     }
                 }
             }
@@ -405,20 +400,69 @@ impl ConfigWatcher {
                         if !(kind.is_modify() || kind.is_create()) {
                             continue;
                         }
+                        // 判定是否可能涉及软链接变更: 文件名以 .. 开头 (K8s)、等于链接名、等于真实目标名或来自真实目录。
+                        // 若命中则重新 canonicalize(config_path) 检测软链接指向是否改变。
+                        // 这样既能即时响应 ln -sf 与 K8s ..data 切换, 又避免同目录每几秒写一次 stats 的开销。
+                        let needs_symlink_check = paths.iter().any(|p| {
+                            should_recheck_symlink(
+                                p,
+                                &config_file_name,
+                                symlink_state.real_file_name.as_deref(),
+                                symlink_state.real_dir_canon.as_deref(),
+                            )
+                        });
+
+                        let symlink_action = if needs_symlink_check {
+                            symlink_state.update(
+                                &config_pathbuf,
+                                &config_dir_canon,
+                                &config_file_name,
+                                geodir_canon.as_deref(),
+                            )
+                        } else {
+                            SymlinkUpdateAction::Unchanged
+                        };
+
+                        let symlink_changed = match symlink_action {
+                            SymlinkUpdateAction::Unchanged => false,
+                            SymlinkUpdateAction::PathChangedOnly => {
+                                info!("Config symlink target updated to {}", symlink_state.current_real_path.display());
+                                true
+                            }
+                            SymlinkUpdateAction::DirChanged { old_dir, new_dir } => {
+                                if let Some(old) = old_dir {
+                                    if let Err(e) = watcher.unwatch(&old) {
+                                        warn!("Failed to unwatch old real config dir {}: {}", old.display(), e);
+                                    } else {
+                                        info!("Unwatched old real config dir {}", old.display());
+                                    }
+                                }
+                                if let Some(new) = new_dir {
+                                    if let Err(e) = watcher.watch(&new, RecursiveMode::NonRecursive) {
+                                        warn!("Failed to watch new real config dir {}: {}", new.display(), e);
+                                    } else {
+                                        info!("Watching new real config dir {} for symlink target {:?}", new.display(), symlink_state.real_file_name);
+                                    }
+                                }
+                                true
+                            }
+                        };
+
+                        let real_target = match (&symlink_state.real_dir_canon, &symlink_state.real_file_name) {
+                            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+                            _ => None,
+                        };
                         // find 触发路径, 而不是 paths.first(). rename 事件 paths
                         // 里可能 .tmp 在前 .dat 在后, 老 first() 会 log 出误导
                         // 的 .tmp 路径. find 匹配 trigger predicate 保证 log 显
                         // 示的就是真正被认可导致 reload 的那条路径.
-                        let real_target = match (&real_dir_canon, &real_file_name) {
-                            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
-                            _ => None,
-                        };
                         let trigger_path = paths.iter().find(|p| {
                             is_config_event(p, &config_dir_canon, &config_file_name, real_target)
                                 || p.extension().is_some_and(|e| e == "dat")
                         });
                         let trigger_path = match trigger_path {
                             Some(p) => p,
+                            None if symlink_changed => &config_pathbuf,
                             None => continue, // 无路径命中 trigger, skip
                         };
 
@@ -448,9 +492,9 @@ impl ConfigWatcher {
                         // 无脏比较全字段总是 update: GeoSource 字段太多 (name/url/
                         // kind/via), 手写差分容易漏字段 (例如只改 via 从 direct
                         // 到 proxy). update() 幂等 = 一次 Arc swap + notify_one,
-                        // 成本很低. 只有 config 文件本身改动才触发 (`.dat` 变化
-                        // 不影响 updater 配置).
-                        if is_config_event(trigger_path, &config_dir_canon, &config_file_name, real_target) {
+                        // 成本很低. 只有 config 文件本身改动 (含软链接改指向) 才触发
+                        // (`.dat` 变化不影响 updater 配置).
+                        if symlink_changed || is_config_event(trigger_path, &config_dir_canon, &config_file_name, real_target) {
                             let old_updater = (**updater_handle.state.load()).clone();
                             if let Some(new_updater) = Self::extract_updater_state(&config_path, &old_updater) {
                                 let sources_delta = new_updater.sources.len() as i64
@@ -489,6 +533,154 @@ pub fn apply_user_config(inbounds: &[crate::config::InboundConfig]) {
             if !crate::proxy::mirage_server::reload_creds(tag, new_creds) {
                 warn!("入站 `{tag}` 未在运行中注册 (新增或改名的入站需重启才生效, 其凭据变更本次未应用)");
             }
+        }
+    }
+}
+
+/// 软链接监视状态: 追踪配置文件的真实路径及真实目录/文件名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymlinkWatchState {
+    pub current_real_path: PathBuf,
+    pub real_dir_canon: Option<PathBuf>,
+    pub real_file_name: Option<std::ffi::OsString>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SymlinkUpdateAction {
+    /// 真实路径未变
+    Unchanged,
+    /// 真实路径变了, 但真实目录未变 (如指向同目录下的不同文件)
+    PathChangedOnly,
+    /// 真实路径变了且真实目录发生切换, 需 unwatch 旧真实目录并 watch 新真实目录
+    DirChanged {
+        old_dir: Option<PathBuf>,
+        new_dir: Option<PathBuf>,
+    },
+}
+
+/// 解析软链接真实目标所在的规范化父目录与目标文件名。
+/// 若真实路径与原配置路径一致 (非软链接), 返回 (None, None)。
+pub fn resolve_symlink_target(
+    real_path: &Path,
+    config_path: &Path,
+    config_dir_canon: &Path,
+    config_file_name: &std::ffi::OsStr,
+) -> (Option<PathBuf>, Option<std::ffi::OsString>) {
+    if real_path != config_path && real_path != config_dir_canon.join(config_file_name) {
+        let r_name = real_path.file_name().map(|n| n.to_os_string());
+        let r_dir = real_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let r_dir_canon = r_dir.canonicalize().unwrap_or_else(|_| r_dir.to_path_buf());
+        (Some(r_dir_canon), r_name)
+    } else {
+        (None, None)
+    }
+}
+
+/// 判定是否应当重新解析软链接指向:
+/// 1. 事件路径名以 `..` 开头 (如 K8s ConfigMap 原子切换 `..data` 目录或其临时链接 `..data_tmp`)
+/// 2. 事件文件名等于配置文件/软链接自身文件名 (如直接 `ln -sf` 覆盖)
+/// 3. 事件文件名等于当前记录的真实目标文件名 (如目标文件被就地修改)
+/// 4. 事件来自真实目录
+///
+/// 其余无关文件事件 (如同目录每几秒写一次的 stats 持久化文件) 跳过重解析以降低开销。
+pub fn should_recheck_symlink(
+    event_path: &Path,
+    config_file_name: &std::ffi::OsStr,
+    real_file_name: Option<&std::ffi::OsStr>,
+    real_dir_canon: Option<&Path>,
+) -> bool {
+    if event_path.file_name() == Some(config_file_name) {
+        return true;
+    }
+    if let Some(rf) = real_file_name {
+        if event_path.file_name() == Some(rf) {
+            return true;
+        }
+    }
+    if let Some(name) = event_path.file_name().and_then(|n| n.to_str()) {
+        if name.starts_with("..") {
+            return true;
+        }
+    }
+    if let Some(rd) = real_dir_canon {
+        if let Some(parent) = event_path.parent() {
+            if parent == rd || parent.canonicalize().ok().as_deref() == Some(rd) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+impl SymlinkWatchState {
+    pub fn new(
+        config_path: &Path,
+        config_dir_canon: &Path,
+        config_file_name: &std::ffi::OsStr,
+    ) -> Self {
+        let (real_path, real_dir_canon, real_file_name) = match config_path.canonicalize() {
+            Ok(real) => {
+                let (d, f) = resolve_symlink_target(&real, config_path, config_dir_canon, config_file_name);
+                (real, d, f)
+            }
+            Err(_) => (config_path.to_path_buf(), None, None),
+        };
+        Self {
+            current_real_path: real_path,
+            real_dir_canon,
+            real_file_name,
+        }
+    }
+
+    /// 重新 canonicalize(config_path) 并计算是否需要更新 watch 目录及重新加载配置。
+    /// 若 canonicalize 因软链接暂时悬空或原子替换窗口失败, 返回 Unchanged, 保持旧记录, 不 panic。
+    pub fn update(
+        &mut self,
+        config_path: &Path,
+        config_dir_canon: &Path,
+        config_file_name: &std::ffi::OsStr,
+        geodir_canon: Option<&Path>,
+    ) -> SymlinkUpdateAction {
+        let Ok(new_real) = config_path.canonicalize() else {
+            return SymlinkUpdateAction::Unchanged;
+        };
+        if new_real == self.current_real_path {
+            return SymlinkUpdateAction::Unchanged;
+        }
+
+        let old_dir = self.real_dir_canon.clone();
+        let (new_real_dir_canon, new_real_file_name) = resolve_symlink_target(
+            &new_real,
+            config_path,
+            config_dir_canon,
+            config_file_name,
+        );
+
+        self.current_real_path = new_real;
+        self.real_dir_canon = new_real_dir_canon.clone();
+        self.real_file_name = new_real_file_name;
+
+        if new_real_dir_canon != old_dir {
+            let should_unwatch = old_dir.as_ref().is_some_and(|d| {
+                d != config_dir_canon && Some(d.as_path()) != geodir_canon
+            });
+            let should_watch_new = new_real_dir_canon.as_ref().is_some_and(|d| {
+                d != config_dir_canon && Some(d.as_path()) != geodir_canon
+            });
+
+            if should_unwatch || should_watch_new {
+                SymlinkUpdateAction::DirChanged {
+                    old_dir: if should_unwatch { old_dir } else { None },
+                    new_dir: if should_watch_new { new_real_dir_canon } else { None },
+                }
+            } else {
+                SymlinkUpdateAction::PathChangedOnly
+            }
+        } else {
+            SymlinkUpdateAction::PathChangedOnly
         }
     }
 }
@@ -865,6 +1057,133 @@ mod watcher_event_tests {
         // 对无关文件不被判定为 config 事件
         let unrelated = real_dir.join("other.json");
         assert!(!is_config_event(&unrelated, &link_dir_canon, &link_file_name, real_target));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_symlink_target_retarget_event_recognition() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_retarget_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let a_path = temp_dir.join("a.json");
+        let b_path = temp_dir.join("b.json");
+        let link_path = temp_dir.join("link.json");
+
+        std::fs::write(&a_path, b"{\"a\": 1}").unwrap();
+        std::fs::write(&b_path, b"{\"b\": 2}").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&a_path, &link_path).unwrap();
+
+        let link_dir_canon = temp_dir.canonicalize().unwrap();
+        let link_file_name = std::ffi::OsString::from("link.json");
+
+        let mut symlink_state = SymlinkWatchState::new(&link_path, &link_dir_canon, &link_file_name);
+        assert_eq!(symlink_state.real_file_name.as_deref(), Some(std::ffi::OsStr::new("a.json")));
+
+        // link.json -> a.json 时, 修改 a.json 能匹配, b.json 不匹配
+        let real_target1 = match (&symlink_state.real_dir_canon, &symlink_state.real_file_name) {
+            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+            _ => None,
+        };
+        assert!(is_config_event(&a_path, &link_dir_canon, &link_file_name, real_target1));
+        assert!(!is_config_event(&b_path, &link_dir_canon, &link_file_name, real_target1));
+
+        // 改指向 b.json
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(&link_path);
+            std::os::unix::fs::symlink(&b_path, &link_path).unwrap();
+        }
+
+        // 检测指向变更
+        let action = symlink_state.update(&link_path, &link_dir_canon, &link_file_name, None);
+        assert_eq!(action, SymlinkUpdateAction::PathChangedOnly);
+        assert_eq!(symlink_state.real_file_name.as_deref(), Some(std::ffi::OsStr::new("b.json")));
+
+        // 改指向后, 修改 b.json 能被识别为配置事件, 修改 a.json 不再识别
+        let real_target2 = match (&symlink_state.real_dir_canon, &symlink_state.real_file_name) {
+            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+            _ => None,
+        };
+        assert!(is_config_event(&b_path, &link_dir_canon, &link_file_name, real_target2));
+        assert!(!is_config_event(&a_path, &link_dir_canon, &link_file_name, real_target2));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_k8s_configmap_atomic_rotation_event_recognition() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_k8s_cm_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let dir_2026_01 = temp_dir.join("..2026_01");
+        let dir_2026_02 = temp_dir.join("..2026_02");
+        std::fs::create_dir_all(&dir_2026_01).unwrap();
+        std::fs::create_dir_all(&dir_2026_02).unwrap();
+
+        let cfg_1 = dir_2026_01.join("config.json");
+        let cfg_2 = dir_2026_02.join("config.json");
+        std::fs::write(&cfg_1, b"{\"version\": 1}").unwrap();
+        std::fs::write(&cfg_2, b"{\"version\": 2}").unwrap();
+
+        let data_link = temp_dir.join("..data");
+        let config_link = temp_dir.join("config.json");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir_2026_01, &data_link).unwrap();
+            std::os::unix::fs::symlink(Path::new("..data/config.json"), &config_link).unwrap();
+        }
+
+        let config_dir_canon = temp_dir.canonicalize().unwrap();
+        let config_file_name = std::ffi::OsString::from("config.json");
+
+        let mut symlink_state = SymlinkWatchState::new(&config_link, &config_dir_canon, &config_file_name);
+        let canon_01 = dir_2026_01.canonicalize().unwrap();
+        let canon_02 = dir_2026_02.canonicalize().unwrap();
+
+        assert_eq!(symlink_state.real_dir_canon.as_ref(), Some(&canon_01));
+        assert_eq!(symlink_state.real_file_name.as_deref(), Some(std::ffi::OsStr::new("config.json")));
+
+        // 初始状态: ..2026_01/config.json 匹配
+        let real_target1 = match (&symlink_state.real_dir_canon, &symlink_state.real_file_name) {
+            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+            _ => None,
+        };
+        assert!(is_config_event(&cfg_1, &config_dir_canon, &config_file_name, real_target1));
+        assert!(!is_config_event(&cfg_2, &config_dir_canon, &config_file_name, real_target1));
+
+        // K8s 风格原子替换: 创建临时软链接 ..data_tmp 指向 ..2026_02, 然后 rename 覆盖 ..data
+        #[cfg(unix)]
+        {
+            let data_tmp = temp_dir.join("..data_tmp");
+            std::os::unix::fs::symlink(&dir_2026_02, &data_tmp).unwrap();
+            std::fs::rename(&data_tmp, &data_link).unwrap();
+        }
+
+        // 验证 should_recheck_symlink 对 ..data 路径返回 true
+        assert!(should_recheck_symlink(&data_link, &config_file_name, symlink_state.real_file_name.as_deref(), symlink_state.real_dir_canon.as_deref()));
+
+        // 执行 update, 识别目录变更
+        let action = symlink_state.update(&config_link, &config_dir_canon, &config_file_name, None);
+        assert_eq!(
+            action,
+            SymlinkUpdateAction::DirChanged {
+                old_dir: Some(canon_01),
+                new_dir: Some(canon_02.clone()),
+            }
+        );
+        assert_eq!(symlink_state.real_dir_canon.as_ref(), Some(&canon_02));
+
+        // 新版本 ..2026_02/config.json 匹配为配置事件
+        let real_target2 = match (&symlink_state.real_dir_canon, &symlink_state.real_file_name) {
+            (Some(rd), Some(rf)) => Some((rd.as_path(), rf.as_os_str())),
+            _ => None,
+        };
+        assert!(is_config_event(&cfg_2, &config_dir_canon, &config_file_name, real_target2));
+        assert!(!is_config_event(&cfg_1, &config_dir_canon, &config_file_name, real_target2));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
