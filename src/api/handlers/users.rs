@@ -320,6 +320,7 @@ pub async fn update_users(
     }
 
     if super::atomic_write_config(&app_state.config_path, &candidate).await.is_ok() {
+        crate::config_watcher::apply_user_config(&cfg.inbounds);
         apply_reset_quota();
         return Json(json!({
             "status": "success", "written": true, "issues": issues,

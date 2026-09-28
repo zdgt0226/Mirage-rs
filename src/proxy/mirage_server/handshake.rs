@@ -496,6 +496,8 @@ mod tests {
 
     #[test]
     fn test_verify_creds_and_quota_exhausted_treated_as_auth_failed() {
+        // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let creds = vec![
             ("alice".to_string(), "pwd_alice".to_string()),
             ("bob".to_string(), "pwd_bob".to_string()),
@@ -514,6 +516,8 @@ mod tests {
 
     #[test]
     fn test_creds_registry_hot_reload_reflects_changes() {
+        // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tag = "test_tag_hot_reload";
         let initial_creds = vec![
             ("default".to_string(), "main_pwd".to_string()),
@@ -701,7 +705,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 仅测试串行锁, current_thread 运行时无死锁
     async fn test_run_handshake_authenticated_success_over_duplex() {
+        // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (mut client, server) = tokio::io::duplex(8192);
         let password = "test_handshake_pwd";
         let creds = vec![("default".to_string(), password.to_string())];

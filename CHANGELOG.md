@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### fix: 配置文件热重载监听父目录解决 rename 覆盖失效 (影响已发布版本: API 管理用户第二次起不生效)
+
+- **监听父目录与事件过滤 (`src/config_watcher.rs`)**:
+  - `spawn_watcher` 改为监听配置文件的父目录 (NonRecursive), 解决由于 `atomic_write_config` 和 vim 等采用 tmp+rename 覆盖导致旧 inode 被替换后 inotify watch 失效的问题 (影响已发布版本中 API 管理用户第二次起删用户/改密/改限额不生效)。
+  - 实现纯函数 `is_config_event`, 结合父目录 canonicalize 与文件名精准匹配配置文件自身变动, 避免同目录下 `.tmp`、stats 等无关文件触发重载; 若 geodata 目录与配置目录一致则自动避免重复 watch。
+- **用户配置变更同步应用 (`src/config_watcher.rs`, `src/api/handlers/users.rs`)**:
+  - 抽取 `apply_user_config` 统一处理限额注册表重载与入站凭据原子更新; `/api/users` 写盘成功后直接同步应用, 不单向依赖 inotify。
+
+### fix(security): 用户被删后立即吊销限额句柄并在分发前复核状态 (审计 P2)
+
+- **旧句柄立即吊销 (`src/proxy/user_limits.rs`)**:
+  - `UserLimitHandle` 新增 `revoked: AtomicBool`, 在用户被移除时由 `reload_user_limits` 置为 `true`。
+  - `is_exhausted()` 在 `revoked` 时恒返回 `true`, 促使 relay 循环中的限额检查立即断开该用户的已有存量连接; `record_bytes()` 与 `charge()` 路径在句柄被撤销时立即返回 `true`。
+  - 删后再加回同名用户时新建 handle 并保持 `revoked = false`, 确保不复用旧已撤销句柄。
+- **连接/流分发前有效性复核 (`src/proxy/mirage_server/control.rs`, `src/proxy/mirage_server/mod.rs`)**:
+  - 新增 `user_still_valid(user)` 判定: "default" 恒有效, 其余用户查注册表句柄。
+  - 在 `control.rs` 接收到 `first_chunk` 准备分发 TCP/UDP 之前, 以及 QUIC lean 每条流鉴权完成后, 复核用户是否仍然有效; 若用户已被删除则直接拒绝分发并断开连接/流, 彻底消除认证通过但等待分发期间用户被删导致绕过限额的漏洞。
+
+### test: 统一测试中持 REGISTRY_TEST_LOCK 锁顺序, 修复 stats_persist 测试偶发失败 (审计 P3)
+
+- **测试锁顺序收敛 (`src/monitor.rs`)**:
+  - 凡调用 `load_stats`、`flush_stats`、`restore_persisted_quotas` 的持久化测试, 统一先获取 `conn_registry_tests::TEST_LOCK`, 再获取 `crate::proxy::user_limits::REGISTRY_TEST_LOCK`, 避免跨模块并行测试改写进程级用户限额注册表与 `RESTORED_QUOTAS` 导致的偶发竞争失败, 杜绝潜在死锁。
+
+- **审阅补漏**: 压力跑 (`--test-threads=16` 连跑) 仍暴露另一类 flaky —— #157 新增的 `server_verification_unaffected_by_client_time_offset` 临时改全局 `TIME_OFFSET` (+500s), 并行的 `hello_auth` 多用户测试与 `handshake` 测试经 `make_session_token` 生成的 token 时间戳被带偏、超出容差。这些测试现统一持 `time_sync::tests::TEST_LOCK`; 修复后 16 线程连跑 15 次零失败。另恢复初稿误删的 config_watcher 既有注释 (geodata 时序、find vs first、updater 全量更新理由)。
+
 ### fix: 2026-09-27 审计剩余 P3 问题修复
 
 - **配额周期滚动原子化与即时生效 (`src/proxy/user_limits.rs`)**:

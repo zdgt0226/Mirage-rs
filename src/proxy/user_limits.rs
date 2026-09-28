@@ -101,6 +101,8 @@ pub struct UserLimitHandle {
     pub period_used: AtomicU64,
     /// 是否已超额
     pub exhausted: AtomicBool,
+    /// 是否已被删除/撤销 (用户被删除时置为 true, 立即切断存量连接)
+    pub revoked: AtomicBool,
 }
 
 impl UserLimitHandle {
@@ -113,6 +115,7 @@ impl UserLimitHandle {
             period_start: AtomicU64::new(period_start),
             period_used: AtomicU64::new(period_used),
             exhausted: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
         };
         h.reevaluate_exhausted();
         h
@@ -143,8 +146,11 @@ impl UserLimitHandle {
         self.exhausted.store(exh, Ordering::SeqCst);
     }
 
-    /// 实时累加用量; 若越过配额则置 exhausted=true 并返回 true (表示超额需中断连接)
+    /// 实时累加用量; 若越过配额或已被撤销则置 exhausted=true 并返回 true (表示超额需中断连接)
     pub fn record_bytes(&self, n: usize) -> bool {
+        if self.is_exhausted() {
+            return true;
+        }
         if let Some(quota) = self.quota_bytes() {
             let prev = self.period_used.fetch_add(n as u64, Ordering::Relaxed);
             let current = prev.saturating_add(n as u64);
@@ -153,7 +159,7 @@ impl UserLimitHandle {
                 return true;
             }
         }
-        self.exhausted.load(Ordering::Relaxed)
+        self.is_exhausted()
     }
 
     /// 检查并按需执行配额周期滚动 (CAS 保证并发安全)。
@@ -196,9 +202,9 @@ impl UserLimitHandle {
         }
     }
 
-    /// 查询该用户是否已超额
+    /// 查询该用户是否已超额或已被撤销
     pub fn is_exhausted(&self) -> bool {
-        self.exhausted.load(Ordering::Relaxed)
+        self.revoked.load(Ordering::Relaxed) || self.exhausted.load(Ordering::Relaxed)
     }
 }
 
@@ -207,6 +213,9 @@ impl UserLimitHandle {
 /// `user` 为 None (default 用户 / 未配限额) 时零开销直接放行。
 pub async fn charge(user: Option<&UserLimitHandle>, n: usize, up: bool) -> bool {
     let Some(u) = user else { return false };
+    if u.is_exhausted() {
+        return true;
+    }
     if let Some(b) = u.buckets() {
         if up { b.up.consume(n).await } else { b.down.consume(n).await }
     }
@@ -333,7 +342,7 @@ pub fn reload_user_limits(users: &[crate::config::MirageUser]) {
     let reg = build_registry(users, Some(&old), now);
 
     // 对被移除的用户 (旧注册表有、新 users 没有), 把其当前 period_used/period_start 写入 restored map,
-    // 保证在同一周期内删后再加回时不会清零用量。
+    // 保证在同一周期内删后再加回时不会清零用量。同时将旧句柄置 revoked=true, 促使已有连接立刻断开。
     {
         let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
         for (name, handle) in &old.users {
@@ -345,6 +354,7 @@ pub fn reload_user_limits(users: &[crate::config::MirageUser]) {
                         period_start: handle.period_start.load(Ordering::Relaxed),
                     },
                 );
+                handle.revoked.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -441,6 +451,16 @@ pub fn is_user_exhausted(name: &str) -> bool {
         h.maybe_rollover(now);
         h.is_exhausted()
     })
+}
+
+/// 检查指定用户是否仍然有效 (未被删除)。
+///
+/// 保留名 "default" 恒有效; 其余用户在注册表中存在句柄即为有效。
+pub fn user_still_valid(user: &str) -> bool {
+    if user == "default" {
+        return true;
+    }
+    get_user_limit(user).is_some()
 }
 
 /// 获取用户本周期统计 (供 API 查询): (已用字节, 周期起点, 是否超额)
@@ -846,5 +866,48 @@ mod tests {
             let restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
             assert!(!restored.contains_key("helen"));
         }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_revoked_handle_on_user_removal_and_readdition() {
+        let _serial = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let user = MirageUser {
+            name: "bob".to_string(),
+            password: "pwd".to_string(),
+            rate_limit_kbps: None,
+            quota_gb: Some(10.0), // 远未用尽
+            quota_reset_day: Some(1),
+        };
+        init_user_limits(std::slice::from_ref(&user));
+        let h1 = get_user_limit("bob").expect("bob 存在");
+        assert!(!h1.is_exhausted(), "初始不应超额");
+        assert!(!h1.revoked.load(Ordering::Relaxed), "初始不应被撤销");
+        assert!(!charge(Some(&h1), 100, true).await, "charge 应放行");
+
+        // 1. 删除用户: reload 为空用户表
+        reload_user_limits(&[]);
+        assert!(get_user_limit("bob").is_none(), "删除后查不到句柄");
+        assert!(h1.revoked.load(Ordering::Relaxed), "被移除用户的旧句柄必须标记为 revoked");
+        assert!(h1.is_exhausted(), "被撤销句柄的 is_exhausted() 必须恒为 true");
+        assert!(h1.record_bytes(10), "record_bytes 在 revoked 句柄上必须返回 true");
+        assert!(charge(Some(&h1), 100, true).await, "charge 在 revoked 句柄上必须返回 true (立即断开)");
+
+        // 2. 重新加回 bob: 必须新建句柄, 不复用被 revoked 的旧句柄
+        reload_user_limits(std::slice::from_ref(&user));
+        let h2 = get_user_limit("bob").expect("加回后查得到句柄");
+        assert!(!Arc::ptr_eq(&h1, &h2), "加回同名用户必须新建 handle, 不得复用已撤销的旧 handle");
+        assert!(!h2.revoked.load(Ordering::Relaxed), "新句柄不应被撤销");
+        assert!(!h2.is_exhausted(), "新句柄不应超额");
+        assert!(!charge(Some(&h2), 100, true).await, "新句柄 charge 应正常放行");
+
+        // 3. user_still_valid 逻辑测试
+        assert!(user_still_valid("default"), "default 用户恒有效");
+        assert!(user_still_valid("bob"), "注册表中存在的 bob 有效");
+        assert!(!user_still_valid("nonexistent"), "不存在的用户无效");
+
+        // 清理: 恢复注册表为空
+        reload_user_limits(&[]);
+        assert!(!user_still_valid("bob"), "再次删除后 bob 无效");
     }
 }

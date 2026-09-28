@@ -244,6 +244,8 @@ mod multiuser_tests {
 
     #[test]
     fn identify_matches_correct_user() {
+        // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pws = vec!["alice-pw".to_string(), "bob-pw".to_string(), "carol-pw".to_string()];
         let bind = [0x42u8; 32];
         // bob 的 token 必须只被 bob (index 1) 认出。
@@ -256,6 +258,8 @@ mod multiuser_tests {
 
     #[test]
     fn identify_none_when_no_credential_matches() {
+        // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let pws = vec!["alice-pw".to_string(), "bob-pw".to_string()];
         let bind = [0x42u8; 32];
         let tok = make_session_token("stranger-pw", &bind); // 不在列表
@@ -264,6 +268,8 @@ mod multiuser_tests {
 
     #[test]
     fn identify_replay_inserts_once_not_per_credential() {
+        // 串行: 生成 token 读全局 TIME_OFFSET, 与会改 offset 的测试 (time_sync / 服务端时钟隔离) 并行会超容差。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 同一 token 连认两次: 第一次命中, 第二次因 replay 应 None (证明命中那次插了、且只插一次;
         // 非匹配凭据在 tag 比对处返回 false 不碰 replay, 故不会把别的用户的桶污染)。
         let pws = vec!["u0".to_string(), "u1".to_string(), "u2".to_string()];

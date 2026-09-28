@@ -443,6 +443,11 @@ async fn handle_quic_stream_lean(
         tracing::warn!("Mirage QUIC(lean): user `{}` quota exhausted from {}", user, peer_ip);
         return;
     }
+    // 分发前复核: 若用户已被删除, 拒绝并断开流
+    if !crate::proxy::user_limits::user_still_valid(&user) {
+        tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除, 拒绝并断开流", user);
+        return;
+    }
     // 2. target: [2B len][host:port]
     let mut lenb = [0u8; 2];
     if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut lenb)).await.map(|r| r.is_err()).unwrap_or(true) {
