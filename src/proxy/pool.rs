@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use std::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tokio::time::Instant;
 
 pub struct PoolConfig {
@@ -404,6 +404,20 @@ impl WarmPool {
     /// transport=quic 走 Model X (connect() 直接开精简流, 不经 fake-TLS 暖池)。
     pub fn is_quic(&self) -> bool {
         self.cfg.transport == crate::config::Transport::Quic
+    }
+    /// transport=quic 不支持 UDP 中继 (Model X 精简流只承载 TCP, 暖池也不建 fake-TLS 隧道 →
+    /// `get()` 只会 10s 超时)。是 QUIC 则告警 (进程内首次 warn, 之后 debug) 并返回 true, 调用方直接丢弃。
+    pub fn udp_unsupported(&self) -> bool {
+        if !self.is_quic() {
+            return false;
+        }
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            warn!("transport=quic 暂不支持 UDP 中继, UDP 流量被丢弃; 需要 UDP 请为该出站使用 transport=tcp 或用路由规则把 UDP 分到其它出站");
+        } else {
+            debug!("transport=quic 暂不支持 UDP 中继, UDP 流量被丢弃");
+        }
+        true
     }
     pub fn password(&self) -> &str { &self.cfg.password }
     #[cfg(feature = "quic")]

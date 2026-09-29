@@ -711,6 +711,9 @@ async fn setup_flow(
                 UdpTarget::Domain(d) => d.clone(),
                 UdpTarget::Ip(ip) => ip.to_string(),
             };
+            if pool.udp_unsupported() {
+                return;
+            }
             // ── UDP mux 路径: 多流复用少量共享隧道, 脱钩 pool_size 上限。默认关。 ──
             // 注: 不占 MirageUdpPermit (那个 256 子上限的前提是"每流独占一条隧道", mux 下
             // 不成立)。mux 流的并发由主循环的 MAX_FLOWS(4096) 总闸兜底, 无需再叠 256。

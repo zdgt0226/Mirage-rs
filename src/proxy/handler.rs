@@ -318,7 +318,12 @@ pub async fn proxy_tcp_target(
                     let mut buf = vec![0u8; 65536];
                     loop {
                         match tokio::time::timeout(relay_idle(), AsyncReadExt::read(&mut recv, &mut buf)).await {
-                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                            Ok(Ok(0)) => break,
+                            Ok(Err(e)) => {
+                                crate::proxy::quic::check_and_warn_quic_auth_failure(&e);
+                                break;
+                            }
+                            Err(_) => break,
                             Ok(Ok(n)) => {
                                 if lw.write_all(&buf[..n]).await.is_err() { break; }
                                 dn_c.down(n as u64);

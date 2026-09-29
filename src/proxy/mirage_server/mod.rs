@@ -450,9 +450,9 @@ pub async fn start_server(
                 // opt-in 高级选项, 默认不调用.
                 if let Some(rate) = brutal_rate_bytes_per_sec {
                     use std::os::unix::io::AsRawFd;
-                    // tcp-brutal 2.0: 按客户端 IP 分 group, 该客户端所有连接共享一个总速率
-                    // (v1 模块自动回落 per-socket)。修多连接并发聚合 N× 超发。
-                    let gid = crate::proxy::brutal::group_id_for_ip(peer_addr.ip());
+                    // tcp-brutal 2.0: 按 (客户端 IP, 速率) 分 group, 解决多入站串速率问题;
+                    // 同速率入站仍共享一个总速率配额 (v1 模块自动回落 per-socket)。
+                    let gid = crate::proxy::brutal::group_id_for(peer_addr.ip(), rate);
                     crate::proxy::brutal::set_brutal_rate(stream.as_raw_fd(), rate, gid);
                 }
 
@@ -602,7 +602,7 @@ pub(crate) fn record_stream_auth_failure(fail_count: &std::sync::atomic::AtomicU
 /// 直连出口 (upstream=SS/WG 的 lean 路径暂不支持, 有则拒)。
 #[cfg(feature = "quic")]
 async fn handle_quic_stream_lean(
-    send: quinn::SendStream,
+    mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     peer_ip: IpAddr,
     creds: CredsSnapshot,
@@ -641,6 +641,8 @@ async fn handle_quic_stream_lean(
                 tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
                     crate::crypto::hello_auth::session_decrypt_failure_hint());
             }
+            let _ = send.reset(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_AUTH_FAILED_CODE));
+            let _ = recv.stop(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_AUTH_FAILED_CODE));
             if record_stream_auth_failure(&fail_count) {
                 conn.close(quinn::VarInt::from_u32(0), b"");
             }

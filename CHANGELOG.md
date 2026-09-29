@@ -9,6 +9,13 @@
 - **握手尾部读取中断降为 debug**: Fake Client Tail 读取时的超时与连接断开错误从 error 降为 debug 级别，避免对端提前断开或网络探测流量刷屏错误日志。
 - **README 补全 glibc 与 musl 版本说明**: 补充说明预编译 glibc 版本二进制依赖 glibc ≥ 2.34，老系统（如 Debian 11 / CentOS 8）需选用 `-musl` 版本，并注明 `install.sh` 默认下载 musl 版本。
 
+### fix: brutal 多入站速率隔离、QUIC UDP 快速失败与 QUIC 客户端诊断增强 (2026-09-29)
+
+- **brutal group 跨入站隔离 (P3)**: `group_id_for(ip, rate_bytes_per_sec)` 将客户端 IP 与入站速率联合哈希分组，解决多入站配置不同 `brutal_rate_mbps` 时同一客户端被并入同一内核 group 导致后设速率覆盖整组的问题；同速率入站仍共享配额，不同速率入站互不干扰。
+- **QUIC 传输 UDP 快速失败与明确告警 (P3)**: 出站为 `transport=quic` 时，SOCKS5 UDP 与透明 UDP (含 mux) 中继直接快速失败（原先等暖池 10s 超时后静默丢弃）并进程内只警告一次，提示 QUIC 传输暂不支持 UDP 中继并建议改用 TCP 传输或路由规则分流；同时为 TCP 模式下连接池获取隧道失败补充 debug 日志，并在 README QUIC 说明中明确不支持 UDP 中继。
+- **QUIC 客户端证书指纹与口令错误诊断 (P3)**: 握手失败时区分证书指纹不符与网络异常，若因 SPKI 或签名不符（`quic_pin mismatch`）明确提示检查 pin 或私钥配置；QUIC lean 服务端 token 认证失败时使用专用错误码（`QUIC_AUTH_FAILED_CODE`）重置流，客户端识别重置错误码后限频输出 "QUIC 认证失败: 口令不符或时钟偏差超容差" 告警，避免黑盒排查。
+- **配置热重载日志措辞修正 (P3)**: 修正 `config_watcher` 中热重载成功日志，准确说明改口令或移除用户时其存量会话会被吊销断开，避免与实际行为不符。
+
 ### chore(ci): 端点防泄露门禁与测试用例安全加固 (2026-09-29)
 
 - **新增端点与敏感信息扫描门禁**: 增加 `scripts/check-no-real-endpoints.sh` 与 `scripts/endpoint-allowlist.txt`，在 CI 工作流最前置步骤硬门禁拦截真实公网 IP、非文档节点 URI、硬编码口令与环境变量默认值。
