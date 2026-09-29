@@ -74,6 +74,8 @@ sudo bash install.sh
 装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`
 (轻量版是 `mirage-rs-lite-{server,client}`)。
 
+> **手动下载 Releases 二进制**: glibc 版 (`mirage-rs-<arch>`) 需 glibc ≥ 2.34 (Debian 11 / CentOS 8 等老发行版会报 `GLIBC_2.3x not found`), 老系统请用 `-musl` 版; `install.sh` 默认即下载 musl 版。
+
 ### 容器镜像 (multi-arch amd64/arm64)
 
 ```bash

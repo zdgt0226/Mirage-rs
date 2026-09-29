@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### fix: 服务端日志降级、断开误诊修复与安装说明补充 (2026-09-29)
+
+- **服务端每连接日志降为 debug (隐私保护)**: 将服务端每连接的 `Received first_chunk`、`Target resolved to` 以及握手尾部消费完成等日志从 info 降为 debug 级别，避免默认 info 级落盘记录用户访问的目标地址与连接细节。
+- **首帧前对端断开免误报密钥失配**: 在接收首帧数据时增加对端断开判断（`UnexpectedEof`、`ConnectionReset`、`ConnectionAborted`、`BrokenPipe`），客户端提前断开（预热池回收、切网等）时仅记录 debug 并安全退出，不再误诊为会话密钥失配且不占用唯一一次的排查告警配额。
+- **握手尾部读取中断降为 debug**: Fake Client Tail 读取时的超时与连接断开错误从 error 降为 debug 级别，避免对端提前断开或网络探测流量刷屏错误日志。
+- **README 补全 glibc 与 musl 版本说明**: 补充说明预编译 glibc 版本二进制依赖 glibc ≥ 2.34，老系统（如 Debian 11 / CentOS 8）需选用 `-musl` 版本，并注明 `install.sh` 默认下载 musl 版本。
+
 ### chore(ci): 端点防泄露门禁与测试用例安全加固 (2026-09-29)
 
 - **新增端点与敏感信息扫描门禁**: 增加 `scripts/check-no-real-endpoints.sh` 与 `scripts/endpoint-allowlist.txt`，在 CI 工作流最前置步骤硬门禁拦截真实公网 IP、非文档节点 URI、硬编码口令与环境变量默认值。

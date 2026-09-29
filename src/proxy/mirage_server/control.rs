@@ -4,7 +4,7 @@
 //! 调用方: `handshake::handle_connection` 在 ClientHello 鉴权 + fake tail 消费
 //! 通过后进入这里. 不再退回 handshake — 这之后所有流量都是加密的.
 
-use tracing::info;
+use tracing::debug;
 
 use super::tcp_relay;
 use super::udp_relay;
@@ -28,6 +28,20 @@ pub(crate) fn parse_tcp_target(first_chunk: &[u8]) -> Result<(String, Option<Vec
         None
     };
     Ok((target, payload))
+}
+
+/// 判断错误链中是否存在指示对端断开/超时的 I/O 错误 (如 UnexpectedEof, ConnectionReset 等)。
+/// 首帧前客户端断开 (预热池回收/切网等) 属于常规关闭, 不应误报为密钥失配。
+pub(crate) fn is_peer_disconnect(e: &anyhow::Error) -> bool {
+    e.chain().find_map(|c| c.downcast_ref::<std::io::Error>()).is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+        )
+    })
 }
 
 pub(super) async fn dispatch_authenticated(
@@ -103,10 +117,13 @@ pub(super) async fn dispatch_authenticated(
         Ok(Ok(data)) => data,
         Ok(Err(e)) => {
             // close_notify 是客户端主动优雅关闭 (warmup expire 时 pool sweeper 触发),
-            // 不算错误. 其他 (crypto 解密失败 / 意外 EOF / 协议违反) 才算真错误.
+            // 不算错误. 对端提前断开 (UnexpectedEof/ConnectionReset 等) 亦作为常规关闭处理.
+            // 只有其余错误 (crypto 解密失败 / 协议违反) 才视为会话密钥失配等真错误.
             let msg = e.to_string();
             if msg.contains("close_notify") {
                 tracing::debug!("Mirage Server: warmup gracefully closed by client");
+            } else if is_peer_disconnect(&e) {
+                tracing::debug!("Mirage Server: client closed before first frame: {:?}", e);
             } else {
                 // token 认证已过却解不开首个加密帧 = 会话密钥失配。给一次完整排查提示 (密码/时钟/
                 // 高级特征单边), 而非裸 error 让运维无从下手。池化补货会反复撞到, 故只详细提示一次。
@@ -180,7 +197,7 @@ pub(super) async fn dispatch_authenticated(
         first_chunk
     };
 
-    info!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
+    debug!("Mirage Server: Received first_chunk of len {}", first_chunk.len());
 
     // 凭据是否已吊销
     if cred_revoked.load(std::sync::atomic::Ordering::Relaxed) {
@@ -237,12 +254,41 @@ pub(super) async fn dispatch_authenticated(
         // TCP Mode
         match parse_tcp_target(&first_chunk) {
             Ok((target, payload)) => {
-                info!("Mirage Server: Target resolved to {}", target);
+                debug!("Mirage Server: Target resolved to {}", target);
                 tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
             }
             Err(e) => tracing::error!("Mirage Server: {}", e),
         }
     } else {
         tracing::error!("Mirage Server: first_chunk too short to be valid!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn test_is_peer_disconnect() {
+        let eof = anyhow::Error::new(Error::new(ErrorKind::UnexpectedEof, "unexpected eof"));
+        assert!(is_peer_disconnect(&eof));
+
+        let eof_context = anyhow::Error::new(Error::new(ErrorKind::UnexpectedEof, "unexpected eof"))
+            .context("failed to read frame");
+        assert!(is_peer_disconnect(&eof_context));
+
+        let reset = anyhow::Error::new(Error::new(ErrorKind::ConnectionReset, "connection reset"));
+        assert!(is_peer_disconnect(&reset));
+
+        let aborted = anyhow::Error::new(Error::new(ErrorKind::ConnectionAborted, "aborted"));
+        assert!(is_peer_disconnect(&aborted));
+
+        let broken_pipe = anyhow::Error::new(Error::new(ErrorKind::BrokenPipe, "broken pipe"));
+        assert!(is_peer_disconnect(&broken_pipe));
+
+        let decrypt_err = anyhow!("decryption failed");
+        assert!(!is_peer_disconnect(&decrypt_err));
     }
 }
