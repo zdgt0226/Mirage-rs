@@ -712,8 +712,7 @@ async fn handle_quic_stream_lean(
     );
 }
 
-#[cfg(feature = "quic")]
-const REVOKE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const REVOKE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// QUIC lean 单向泵: 带客户端 IP 桶 + 用户桶限速与配额计数 (`up` = 客户端→目标)。
 /// - EOF: `shutdown` 对端写方向后返回, **不打断另一方向** (半关闭, 否则客户端先关写时目标的响应会被丢)。

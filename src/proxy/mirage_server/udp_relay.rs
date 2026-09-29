@@ -526,6 +526,28 @@ fn lock_mux(s: &MuxSessions) -> std::sync::MutexGuard<'_, std::collections::Hash
 }
 
 pub(crate) async fn handle_udp_mux_relay(
+    reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
+    upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    client_ip: Option<std::net::IpAddr>,
+    user: String,
+    session_auth: super::SessionAuth,
+    allow_local_targets: bool,
+) {
+    handle_udp_mux_relay_inner(
+        reader,
+        writer,
+        upstream,
+        client_ip,
+        user,
+        session_auth,
+        allow_local_targets,
+        super::REVOKE_CHECK_INTERVAL,
+    )
+    .await
+}
+
+pub(crate) async fn handle_udp_mux_relay_inner(
     mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
     writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
     upstream: Option<Arc<crate::proxy::upstream::UpstreamOutlet>>,
@@ -533,6 +555,7 @@ pub(crate) async fn handle_udp_mux_relay(
     user: String,
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
+    revoke_check_interval: Duration,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
 
@@ -724,15 +747,27 @@ pub(crate) async fn handle_udp_mux_relay(
     };
 
     // writer 泵: 唯一 AEAD 写点。rx 在 uplink 结束清表 + 主 tx drop 后关闭 → 退出。
+    // 在 select 中增加定时唤醒检查 session_auth.should_stop():
+    // 避免双向空闲时吊销必须等待最长 300s UDP_IDLE_TIMEOUT 才能感知。
+    // 由于 rx.recv() 满足 cancel-safe，在 writer_pump 的 select 中增加 tick 唤醒是完全安全的。
+    // 发现 should_stop 后通过 stop watch 通道通知 uplink，uplink 随之 break 终止会话。
     drop(tx); // 只留 up_tx (uplink 持有) 与各泵 clone; uplink 退出后全部释放
     let writer_auth = session_auth.clone();
     let writer_pump = {
         let writer = writer.clone();
         async move {
+            let mut revoke_tick = tokio::time::interval(revoke_check_interval);
+            revoke_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 let pkt = tokio::select! {
                     biased;
                     _ = stop_rx_writer.changed() => break,
+                    _ = revoke_tick.tick() => {
+                        if writer_auth.should_stop() {
+                            break;
+                        }
+                        continue;
+                    }
                     p = rx.recv() => match p {
                         Some(p) => p,
                         None => break,
@@ -839,6 +874,67 @@ mod mux_tests {
         assert_eq!(got.get(&1u32).map(|v| v.as_slice()), Some(&b"AAA"[..]));
         assert_eq!(got.get(&2u32).map(|v| v.as_slice()), Some(&b"BBB"[..]));
         server.abort();
+    }
+
+    /// 吊销后双向空闲的 UDP mux 会话在 ~REVOKE_CHECK_INTERVAL 内结束
+    #[tokio::test]
+    async fn mux_revocation_terminates_idle_session_promptly() {
+        // 1. TCP loopback 对
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = lis.local_addr().unwrap();
+        let cli = TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = lis.accept().await.unwrap();
+
+        // 2. crypto 对
+        let (_cr, _cw) = {
+            let (r, w) = cli.into_split();
+            crate::crypto::aead::create_crypto_pair(r, w, "pw", &[0u8; 32], &[1u8; 32], true)
+        };
+        let (sr, sw) = {
+            let (r, w) = srv.into_split();
+            crate::crypto::aead::create_crypto_pair(
+                crate::proxy::tunnel::TunnelRead::Tcp(r),
+                crate::proxy::tunnel::TunnelWrite::Tcp(w),
+                "pw",
+                &[0u8; 32],
+                &[1u8; 32],
+                false,
+            )
+        };
+
+        // 3. 构造受控 SessionAuth (初始未吊销)
+        let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth = crate::proxy::mirage_server::SessionAuth {
+            user_limit: None,
+            cred_revoked: revoked.clone(),
+        };
+
+        // 4. 起参数化更短唤醒间隔 (50ms) 的 mux relay 会话
+        let revoke_interval = std::time::Duration::from_millis(50);
+        let server = tokio::spawn(async move {
+            handle_udp_mux_relay_inner(
+                sr,
+                sw,
+                None,
+                None,
+                "default".to_string(),
+                auth,
+                true,
+                revoke_interval,
+            )
+            .await;
+        });
+
+        // 双向完全空闲: 客户端既不发 UDP 包, 下行也没有回包
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!server.is_finished(), "会话不应提前结束");
+
+        // 触发吊销
+        revoked.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // 预期在 ~50ms 内感知吊销并结束, 远早于 300s UDP_IDLE_TIMEOUT
+        let res = tokio::time::timeout(std::time::Duration::from_millis(500), server).await;
+        assert!(res.is_ok(), "双向空闲 mux 会话未能及时在吊销唤醒周期内退出");
     }
 
     #[test]
