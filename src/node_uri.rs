@@ -116,8 +116,8 @@ mod tests {
 
     #[test]
     fn parses_bracketed_ipv6_host() {
-        let n = NodeUri::parse("mirage://pw@[2606:4700:4700::1111]:443?sni=www.apple.com").unwrap();
-        assert_eq!(n.host, "2606:4700:4700::1111", "括号剥离, host 不带 []");
+        let n = NodeUri::parse("mirage://pw@[2001:db8::1]:443?sni=www.apple.com").unwrap();
+        assert_eq!(n.host, "2001:db8::1", "括号剥离, host 不带 []");
         assert_eq!(n.port, 443);
         // 拼回可用 socket 串 (join_host_port 会重新加括号)
         assert!(

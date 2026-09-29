@@ -1649,10 +1649,10 @@ mod tests {
 
     #[test]
     fn parse_subscription_plaintext_and_filters() {
-        let body = "# 注释\n\nmirage://p1@a.com:443?sni=www.apple.com\nnot-a-node\nmirage://p2@b.com:8443?sni=www.bing.com\n";
+        let body = "# 注释\n\nmirage://p1@a.example.com:443?sni=www.apple.com\nnot-a-node\nmirage://p2@b.example.com:8443?sni=www.bing.com\n";
         let nodes = parse_subscription(body);
         assert_eq!(nodes.len(), 2, "跳过注释/空行/非 mirage 行");
-        assert_eq!(nodes[0].host, "a.com");
+        assert_eq!(nodes[0].host, "a.example.com");
         assert_eq!(nodes[1].port, 8443);
     }
 

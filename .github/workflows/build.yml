@@ -11,6 +11,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
+    # 安全门禁: 静态扫描禁止硬编码真实服务器地址、公网 IP、密钥口令与未加白端点
+    - name: Check no real endpoints or hardcoded secrets
+      run: bash scripts/check-no-real-endpoints.sh
     - name: Install dependencies
       run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic
     - name: Build

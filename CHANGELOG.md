@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### chore(ci): 端点防泄露门禁与测试用例安全加固 (2026-09-29)
+
+- **新增端点与敏感信息扫描门禁**: 增加 `scripts/check-no-real-endpoints.sh` 与 `scripts/endpoint-allowlist.txt`，在 CI 工作流最前置步骤硬门禁拦截真实公网 IP、非文档节点 URI、硬编码口令与环境变量默认值。
+- **历史文档与测试用例脱敏规范化**: 替换历史排障笔记与单测中的真实/公网端点为 RFC 5737 文档专用地址（`203.0.113.x`）与 `example.com`；在被跟踪的 `GEMINI.md` 中固化安全防泄露规范 (`CLAUDE.md` 被 .gitignore 忽略, 仅本地生效, 同步写入)。
+
 ### fix: 2026-09-29 第七轮审计缺陷修复 (P3)
 
 - **UDP mux 空闲会话周期吊销唤醒**: 在 `handle_udp_mux_relay` 的 `writer_pump` 中引入周期性定时唤醒（复用 `REVOKE_CHECK_INTERVAL` = 10s），检查 `SessionAuth::should_stop()`。在双向完全空闲场景下，吊销发生后无需等待长达 300s 的 `UDP_IDLE_TIMEOUT`，即可在 ~10s 内经 stop watch 通道通知 uplink 协同终止会话，消除长连接僵死占用。
