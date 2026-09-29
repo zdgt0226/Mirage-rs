@@ -294,7 +294,15 @@ impl ConfigWatcher {
         crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
 
         // 多用户凭据与限速/配额热重载 (仅在热重载时应用; 冷启动由 lib.rs 的 init_user_limits + register_creds 负责)
-        // watcher 路径在锁内重新读取并解析磁盘文件, 避免并发覆盖 API 的更新
+        // watcher 路径在锁内重新读取并解析磁盘文件, 避免并发覆盖 API 的更新。
+        //
+        // [关于两次读盘的窄窗口与自愈保证]:
+        // build_state 顶部首次读取配置 (用于构建路由/DNS/出站), 此处 apply_user_config_from_file
+        // 在持有 APPLY_USER_CONFIG_LOCK 期间二次读取磁盘文件以更新凭据。
+        // 若在两次读取之间配置文件恰好被外部写入修改，本轮构建出的路由规则与应用的凭据可能会短暂
+        // 来自不同版本。但该窄窗口内的外部写入必然会产生新的文件系统事件（或在 30 秒兜底轮询
+        // 中比对 mtime/len 时被发现），从而排队触发下一轮 execute_reload / build_state 重载，
+        // 最终达到完全一致与收敛。
         if is_hot_reload {
             apply_user_config_from_file(config_path);
         }

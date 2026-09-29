@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### fix: 2026-09-29 第七轮审计缺陷修复 (P3)
+
+- **UDP mux 空闲会话周期吊销唤醒**: 在 `handle_udp_mux_relay` 的 `writer_pump` 中引入周期性定时唤醒（复用 `REVOKE_CHECK_INTERVAL` = 10s），检查 `SessionAuth::should_stop()`。在双向完全空闲场景下，吊销发生后无需等待长达 300s 的 `UDP_IDLE_TIMEOUT`，即可在 ~10s 内经 stop watch 通道通知 uplink 协同终止会话，消除长连接僵死占用。
+- **build_state 两次读盘窗口说明**: 在 `src/config_watcher.rs` 中补注文档，阐述 `build_state` 首次读盘与 `apply_user_config_from_file` 锁内二次读盘之间的窄窗口自愈机理（外部并发写盘必然触发新的文件系统事件或被 30s 兜底轮询捕获，从而排队重载收敛）。
+
 ## [v0.15.0] - 协议断代 + 多用户限速配额 + 多轮安全审计加固 (2026-09-28)
 
 ### ⚠️ 升级须知
