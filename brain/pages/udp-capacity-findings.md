@@ -33,8 +33,8 @@ updated: "2026-08-16T00:10:25"
 
 - time: 2026-08-04T22:52:18
   kind: note
-  summary: "UDP mux 真机实测通过 (2026-08-04)。拓扑: LAN 透明网关 172.16.0.162 (2 核, 旁路由 enp1s0, pool_size=100) + Mirage 服务端 144.225.246.83 (1 核)。两端从 v0.5.0 升级到 v0.8.1 (feat/udp-mux 分支, 协议 0.5<->0.8 向后兼容真实流量正常)。测法: 网关 netns 模拟 LAN 客户端 (走 sk_lookup fake-IP 路径, 因单臂网卡无法用 tc_divert bare-IP), 目标域名 muxbench.test 经 fake-IP+服务端 /etc/hosts 解到本地 echo, scripts/bench_udp_capacity.py 斜坡加压。结果 flow_ok 拐点: mux-off=20 (退化崩, 每流独占隧道压垮 1 核服务端) / mux-on 服务端 fd=1024 时=200 / mux-on 服务端 fd=65536 时=450 (100% 稳到 400 流)。20->450 = 22.5x。关键: 每道墙都是环境限 (先服务端 fd Too-many-open-files 后 1 核 CPU), 从不是 mux 设计 —— 全程无 sid 饱和告警、无 UdpRcvbufErrors; mux 还同时正确复用真实 YouTube QUIC 多流 (K=4 共享隧道)。结论: 带机量硬伤 (并发 UDP 流<=pool_size) 已解除, 特性生产可用。部署: 两端已 systemd 化 (mirage-rs.service, LimitNOFILE=65536, enable 自启), 网关 config tuning.udp_mux=true 常开, 服务端 config 补了 direct 出站 (0.8.1 校验必需)。旧二进制/配置备份在 .bak。"
-  source: "真机 172.16.0.162 + 144.225.246.83 bench 三轮 mux-off/on + systemd 部署"
+  summary: "UDP mux 真机实测通过 (2026-08-04)。拓扑: LAN 透明网关 172.16.0.162 (2 核, 旁路由 enp1s0, pool_size=100) + Mirage 服务端 203.0.113.83 (1 核)。两端从 v0.5.0 升级到 v0.8.1 (feat/udp-mux 分支, 协议 0.5<->0.8 向后兼容真实流量正常)。测法: 网关 netns 模拟 LAN 客户端 (走 sk_lookup fake-IP 路径, 因单臂网卡无法用 tc_divert bare-IP), 目标域名 muxbench.test 经 fake-IP+服务端 /etc/hosts 解到本地 echo, scripts/bench_udp_capacity.py 斜坡加压。结果 flow_ok 拐点: mux-off=20 (退化崩, 每流独占隧道压垮 1 核服务端) / mux-on 服务端 fd=1024 时=200 / mux-on 服务端 fd=65536 时=450 (100% 稳到 400 流)。20->450 = 22.5x。关键: 每道墙都是环境限 (先服务端 fd Too-many-open-files 后 1 核 CPU), 从不是 mux 设计 —— 全程无 sid 饱和告警、无 UdpRcvbufErrors; mux 还同时正确复用真实 YouTube QUIC 多流 (K=4 共享隧道)。结论: 带机量硬伤 (并发 UDP 流<=pool_size) 已解除, 特性生产可用。部署: 两端已 systemd 化 (mirage-rs.service, LimitNOFILE=65536, enable 自启), 网关 config tuning.udp_mux=true 常开, 服务端 config 补了 direct 出站 (0.8.1 校验必需)。旧二进制/配置备份在 .bak。"
+  source: "真机 172.16.0.162 + 203.0.113.83 bench 三轮 mux-off/on + systemd 部署"
   affects: [src/proxy/udp_mux.rs, scripts/bench_udp_capacity.py]
 
 - time: 2026-08-16T00:10:25

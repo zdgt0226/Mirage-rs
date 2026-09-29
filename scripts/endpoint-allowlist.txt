@@ -1,0 +1,116 @@
+# ==============================================================================
+# Mirage Endpoint & Public IP Allowlist
+# 门禁扫描允许的公网 IP / 占位 IP 白名单 (由 scripts/check-no-real-endpoints.sh 使用)
+# 规则：每一项必须写明合法用途，禁止将未经审查的真实服务器地址或密钥加白。
+# ==============================================================================
+
+# ── 公共 DNS 解析器 (已知合法公共递归服务) ──────────────────────────────────
+1.1.1.1 # Cloudflare 公共 DNS (DoH/DoT/UDP/TCP)
+8.8.8.8 # Google 公共 DNS (DoH/DoT/UDP/TCP)
+9.9.9.9 # Quad9 递归安全公共 DNS
+94.140.14.14 # AdGuard 默认公共 DNS
+114.114.114.114 # 114DNS 国内公共递归解析器
+119.29.29.29 # 腾讯 DNSPod 公共解析器
+180.76.76.76 # 百度公共 DNS
+180.184.1.1 # 火山引擎 / 字节跳动公共 DNS
+208.67.222.222 # Cisco OpenDNS 公共解析器
+223.5.5.5 # 阿里 AliDNS 国内公共递归解析器
+
+# ── 云服务商元数据服务地址 (SSRF 出站防护与特殊路由单元测试) ───────────────
+100.100.100.200 # 阿里云内部元数据服务 (CGNAT 范围内特异拦截/放行测试)
+168.63.129.16 # Azure WireServer 虚拟网络平台元数据服务
+
+# ── 单元测试与配置模板常用占位 / 合成测试 IP ─────────────────────────────────
+1.2.3.4 # 单元测试与客户端配置模板通用虚拟节点/出站目标占位
+2.2.2.2 # 单元测试常用合成目标 IP
+3.3.3.3 # 单元测试常用合成目标 IP (udp_relay 多入站测试)
+4.4.4.4 # 单元测试常用合成目标 IP (udp_relay 多入站测试)
+9.8.7.6 # 单元测试常用合成目标 IP (udp_relay SOCKS5 转发测试)
+1.2.3.0 # 单元测试合成 CIDR 网段 (router 路由优先级测试)
+1.2.3.5 # 单元测试合成命中 IP (router 路由匹配测试)
+1.2.3.9 # 单元测试合成命中 IP (router geo 国家归属测试)
+1.2.0.0 # 单元测试合成直连排除网段 (router 掩码重叠测试)
+5.6.7.0 # 单元测试合成国内 CIDR 网段 (router geo 模拟测试)
+5.6.7.200 # 单元测试合成国内目标 IP (router geo 模拟测试)
+1.1.1.0 # 单元测试虚拟 geoip CIDR (verify_tc_divert.rs BPF 分流测试)
+
+# ── 知名服务规范参考域名 IP / 协议测试特定公网测试桩 ─────────────────────────
+93.184.216.34 # RFC 2606 example.com 官方 A 记录 (CommandBusPayloadTest)
+140.82.112.4 # GitHub 官方 A 记录 (monitor.rs 连接监控文档字段示例)
+110.242.74.102 # baidu.com 真实 A 记录 (direct.rs is_cn_ip 单元测试用例)
+142.250.190.46 # google.com 真实 A 记录 (direct.rs !is_cn_ip 单元测试用例)
+104.16.1.1 # Cloudflare Anycast IP (direct.rs 境外 IP 零投毒说明注释)
+172.32.0.1 # 172.32.0.1 非私网边界 IP (direct.rs is_private_ip 私网 RFC 1918 边界测试)
+
+# ── 微信/腾讯推送网段与自适应保活测试 IP (tun/adaptive_idle.rs 注释与单测) ───
+183.3.226.35 # 腾讯推送测试 IP (adaptive_idle.rs 单测用例)
+183.2.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+183.4.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+120.232.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+120.240.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+14.17.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+14.18.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+14.215.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+113.96.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+113.108.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+129.226.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+119.28.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+101.32.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+43.128.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+150.109.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+162.14.0.0 # 腾讯推送 CIDR (adaptive_idle.rs 注释)
+
+# ── Android VpnService 绕过局域网 (Bypass LAN) 路由表前缀基址 (CoreService.kt)
+1.0.0.0 # Bypass LAN /8 前缀与 dns/server.rs 单测前缀
+2.0.0.0 # Bypass LAN /7 前缀
+4.0.0.0 # Bypass LAN /6 前缀
+8.0.0.0 # Bypass LAN /7 前缀
+11.0.0.0 # Bypass LAN /8 前缀
+12.0.0.0 # Bypass LAN /6 前缀
+16.0.0.0 # Bypass LAN /4 前缀
+32.0.0.0 # Bypass LAN /3 前缀
+64.0.0.0 # Bypass LAN /3 前缀
+72.0.0.0 # Bypass LAN /5 前缀
+76.0.0.0 # Bypass LAN /6 前缀
+78.0.0.0 # Bypass LAN /7 前缀
+80.0.0.0 # Bypass LAN /4 前缀
+96.0.0.0 # Bypass LAN /6 前缀
+100.0.0.0 # Bypass LAN /10 前缀
+100.128.0.0 # Bypass LAN /9 前缀
+101.0.0.0 # Bypass LAN /8 前缀
+102.0.0.0 # Bypass LAN /7 前缀
+104.0.0.0 # Bypass LAN /5 前缀
+112.0.0.0 # Bypass LAN /5 前缀
+120.0.0.0 # Bypass LAN /6 前缀
+124.0.0.0 # Bypass LAN /7 前缀
+126.0.0.0 # Bypass LAN /8 前缀
+128.0.0.0 # Bypass LAN /3 前缀
+160.0.0.0 # Bypass LAN /5 前缀
+168.0.0.0 # Bypass LAN /6 前缀
+172.0.0.0 # Bypass LAN /12 前缀
+172.32.0.0 # Bypass LAN /11 前缀
+172.64.0.0 # Bypass LAN /10 前缀
+172.128.0.0 # Bypass LAN /9 前缀
+173.0.0.0 # Bypass LAN /8 前缀
+174.0.0.0 # Bypass LAN /7 前缀
+176.0.0.0 # Bypass LAN /4 前缀
+192.128.0.0 # Bypass LAN /11 前缀
+192.160.0.0 # Bypass LAN /13 前缀
+192.169.0.0 # Bypass LAN /16 前缀
+192.170.0.0 # Bypass LAN /15 前缀
+192.172.0.0 # Bypass LAN /14 前缀
+192.176.0.0 # Bypass LAN /12 前缀
+192.188.0.0 # Bypass LAN /14 前缀
+192.192.0.0 # Bypass LAN /10 前缀
+193.0.0.0 # Bypass LAN /8 前缀
+194.0.0.0 # Bypass LAN /7 前缀
+196.0.0.0 # Bypass LAN /6 前缀
+200.0.0.0 # Bypass LAN /5 前缀
+208.0.0.0 # Bypass LAN /4 前缀
+
+# ── 历史排障实测记录 (docs/VERIFICATION.md Google Play 诊断中的 GFW 污染假 IP) 
+180.163.150.162 # 上海电信 GFW 污染假 IP (docs/VERIFICATION.md)
+202.101.48.66 # 上海电信 GFW 污染假 IP (docs/VERIFICATION.md)
+202.101.48.33 # 上海电信 GFW 污染假 IP (docs/VERIFICATION.md)
+180.163.151.33 # 上海电信 GFW 污染假 IP (docs/VERIFICATION.md)
+180.163.150.34 # 上海电信 GFW 污染假 IP (docs/VERIFICATION.md)

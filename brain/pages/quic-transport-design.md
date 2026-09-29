@@ -37,7 +37,7 @@ P0 数据报 mux 骨架 (复用 fake-TLS 密钥+有序重组) → P1 erasure 自
 Brutal) → P2 FEC → P3 共享瓶颈 → P4 保护交互流. 每块真机验 (无中美真机无法本地证).
 
 ## 真机实测 (2026-08-23, china-us P0)
-China 客户端 172.16.0.162 → US VPS 46.38.157.74, P0 二进制 (`--features quic`), QUIC UDP8443 vs TCP8444 同密码 A/B。
+China 客户端 172.16.0.162 → US VPS 203.0.113.74, P0 二进制 (`--features quic`), QUIC UDP8443 vs TCP8444 同密码 A/B。
 - **路径**: RTT 157ms, **27% 丢包, mdev 1ms** (RTT 极稳 → 独立 erasure 非拥塞, 正是 queqiao 模型路径)。
 - **UDP8443 China→US 未被封** (go/no-go 过): QUIC 隧道功能通, 出口 IP 正确 = VPS。
 - **吞吐 (50MB, target=VPS 自身 http)**: **QUIC ~20-25 KB/s (120s 超时只下 2-3MB) vs TCP 1.6-2.9 MB/s** ——
