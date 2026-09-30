@@ -403,6 +403,37 @@ pub enum InboundConfig {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboundProto {
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for InboundProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+impl InboundConfig {
+    pub fn bound_protocols(&self) -> &'static [InboundProto] {
+        match self {
+            Self::Socks { .. } => &[InboundProto::Tcp],
+            Self::Mixed { .. } => &[InboundProto::Tcp],
+            Self::Shadowsocks { .. } => &[InboundProto::Tcp],
+            Self::Dns { .. } => &[InboundProto::Udp],
+            Self::Transparent { .. } => &[InboundProto::Tcp, InboundProto::Udp],
+            Self::MirageServer { transport, .. } => match transport {
+                Transport::Tcp => &[InboundProto::Tcp],
+                Transport::Quic => &[InboundProto::Udp],
+            },
+        }
+    }
+}
+
 impl std::fmt::Debug for InboundConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1623,7 +1654,7 @@ impl Config {
 
         // 入站 tag 查重 + 端口 0 + 监听冲突 + 服务端空密码
         let mut in_tags: Vec<&str> = Vec::new();
-        let mut in_binds: Vec<(&str, u16)> = Vec::new();
+        let mut in_binds: Vec<(InboundProto, &str, u16)> = Vec::new();
         for ib in &self.inbounds {
             let (tag, listen, port) = match ib {
                 InboundConfig::Socks { tag, listen, port, .. }
@@ -1642,17 +1673,20 @@ impl Config {
             if port == 0 {
                 issues.push(format!("inbound `{tag}` 的 port 为 0"));
             }
-            // 监听地址:端口冲突 —— 两入站绑同一 listen:port, 启动时第二个 bind 会
-            // "address already in use", 而配置层此前零提示。精确匹配 (0.0.0.0 与
-            // 127.0.0.1 的通配重叠不在此拦, 那要按接口判, 非本 check 目标)。
+            // 监听地址:端口冲突 —— 两入站绑同一 (协议, listen:port), 启动时第二个 bind 会
+            // "address already in use", 而配置层此前零提示。TCP 与 UDP 监听同端口不冲突
+            // (内核允许分别 bind)。精确匹配 (0.0.0.0 与 127.0.0.1 的通配重叠不在此拦,
+            // 那要按接口判, 非本 check 目标)。
             if port != 0 {
-                if in_binds.contains(&(listen, port)) {
-                    issues.push(format!(
-                        "inbound `{tag}` 的监听 `{listen}:{port}` 与前一个入站冲突 \
-                         (启动时会 bind 失败: address already in use)"
-                    ));
+                for &proto in ib.bound_protocols() {
+                    if in_binds.contains(&(proto, listen, port)) {
+                        issues.push(format!(
+                            "inbound `{tag}` 的监听 `{proto} {listen}:{port}` 与前一个入站冲突 \
+                             (启动时会 bind 失败: address already in use)"
+                        ));
+                    }
+                    in_binds.push((proto, listen, port));
                 }
-                in_binds.push((listen, port));
             }
             if let InboundConfig::Shadowsocks { tag, method, password, .. } = ib {
                 if password.is_empty() {
@@ -2317,6 +2351,99 @@ mod validation_tests {
         let is = issues_of(&v);
         assert!(has(&is, "inbound tag `in` 重复定义"), "实际: {is:?}");
         assert!(has(&is, "port 为 0"), "实际: {is:?}");
+    }
+
+    #[test]
+    fn inbound_listener_conflict_distinguishes_tcp_and_udp() {
+        // ① TCP mirage_server 443 + QUIC mirage_server 443 同 listen → 无冲突
+        let mut v1 = base();
+        v1["inbounds"] = serde_json::json!([
+            {
+                "type": "mirage_server",
+                "tag": "srv_tcp",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "tcp"
+            },
+            {
+                "type": "mirage_server",
+                "tag": "srv_quic",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "quic"
+            }
+        ]);
+        let is1 = issues_of(&v1);
+        assert!(!has(&is1, "与前一个入站冲突"), "TCP 443 与 QUIC 443 协议不同不应报冲突, 实际: {is1:?}");
+
+        // ② 两个 TCP mirage_server 同 listen:port → 仍报冲突
+        let mut v2 = base();
+        v2["inbounds"] = serde_json::json!([
+            {
+                "type": "mirage_server",
+                "tag": "srv_tcp_1",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "tcp"
+            },
+            {
+                "type": "mirage_server",
+                "tag": "srv_tcp_2",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "tcp"
+            }
+        ]);
+        let is2 = issues_of(&v2);
+        assert!(has(&is2, "inbound `srv_tcp_2` 的监听 `tcp 0.0.0.0:443` 与前一个入站冲突"), "同端口两 TCP 入站必须报冲突, 实际: {is2:?}");
+
+        // ③ 两个 QUIC mirage_server 同 listen:port → 报冲突
+        let mut v3 = base();
+        v3["inbounds"] = serde_json::json!([
+            {
+                "type": "mirage_server",
+                "tag": "srv_quic_1",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "quic"
+            },
+            {
+                "type": "mirage_server",
+                "tag": "srv_quic_2",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "quic"
+            }
+        ]);
+        let is3 = issues_of(&v3);
+        assert!(has(&is3, "inbound `srv_quic_2` 的监听 `udp 0.0.0.0:443` 与前一个入站冲突"), "同端口两 QUIC 入站必须报冲突, 实际: {is3:?}");
+
+        // ④ 若某类入站同时绑 TCP+UDP (Transparent), 与同端口的 QUIC 入站 → 报冲突
+        let mut v4 = base();
+        v4["inbounds"] = serde_json::json!([
+            {
+                "type": "transparent",
+                "tag": "trans",
+                "listen": "0.0.0.0",
+                "port": 443
+            },
+            {
+                "type": "mirage_server",
+                "tag": "srv_quic_t",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "test_password_placeholder",
+                "transport": "quic"
+            }
+        ]);
+        let is4 = issues_of(&v4);
+        assert!(has(&is4, "inbound `srv_quic_t` 的监听 `udp 0.0.0.0:443` 与前一个入站冲突"), "Transparent (TCP+UDP) 与 QUIC (UDP) 必须报冲突, 实际: {is4:?}");
     }
 
     /// 外部审计 #7 —— config 模板防漂移: install.sh 生成的**全字段**配置必须逐个字段**真正

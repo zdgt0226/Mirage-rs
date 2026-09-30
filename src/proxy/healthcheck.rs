@@ -31,6 +31,42 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
                     "/success.txt"
                 };
 
+                #[cfg(feature = "quic")]
+                if pool.is_quic() {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let quic_res = timeout(Duration::from_secs(5), async {
+                        pool.open_quic_lean(target).await
+                    }).await;
+
+                    if let Ok(Ok(mut stream)) = quic_res {
+                        let req = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, target.split(':').next().unwrap_or(""));
+                        if stream.write_all(req.as_bytes()).await.is_ok() {
+                            let mut buf = [0u8; 1024];
+                            if let Ok(Ok(n)) = timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                                let resp = String::from_utf8_lossy(&buf[..n]);
+                                if resp.contains("HTTP/1.1 204") || resp.contains("HTTP/1.1 200") {
+                                    let rtt = start.elapsed().as_millis() as u64;
+                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_latency(rtt);
+                                    debug!("HealthCheck [{}] ok: {}ms", tag, rtt);
+                                } else {
+                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                                    debug!("HealthCheck [{}] failed (bad status)", tag);
+                                }
+                            } else {
+                                pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                                debug!("HealthCheck [{}] failed (recv timeout/err)", tag);
+                            }
+                        } else {
+                            pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                        }
+                    } else {
+                        pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                        debug!("HealthCheck [{}] failed (quic stream open timeout/err)", tag);
+                    }
+                    sleep(Duration::from_secs(interval)).await;
+                    continue;
+                }
+
                 // Acquire a tunnel. pool.get 自身有 10s timeout, healthcheck 再加 5s
                 // 上限避免单次 probe 阻塞太久. 双重 Result: 外层 timeout / 内层 pool 错.
                 let tunnel_res = timeout(Duration::from_secs(5), async {

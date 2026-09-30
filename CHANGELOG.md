@@ -16,6 +16,11 @@
 - **QUIC 客户端证书指纹与口令错误诊断 (P3)**: 握手失败时区分证书指纹不符与网络异常，若因 SPKI 或签名不符（`quic_pin mismatch`）明确提示检查 pin 或私钥配置；QUIC lean 服务端 token 认证失败时使用专用错误码（`QUIC_AUTH_FAILED_CODE`）重置流，客户端识别重置错误码后限频输出 "QUIC 认证失败: 口令不符或时钟偏差超容差" 告警，避免黑盒排查。
 - **配置热重载日志措辞修正 (P3)**: 修正 `config_watcher` 中热重载成功日志，准确说明改口令或移除用户时其存量会话会被吊销断开，避免与实际行为不符。
 
+### fix: 入站监听冲突区分协议维度与 QUIC 出站远程 DNS/健康检查支持 (2026-09-30)
+
+- **`mirage check` 监听冲突区分 TCP 与 UDP 协议维度**: 修复同端口的 TCP 入站与 QUIC 入站（UDP）被误判为监听冲突（`address already in use`）的问题；按各类入站实际 bind 的协议集合（Socks/Mixed/Shadowsocks 绑定 TCP，Dns 绑定 UDP，Transparent 绑定 TCP+UDP，MirageServer 按 transport=tcp 绑定 TCP、transport=quic 绑定 UDP）进行精确交集判定，仅在同一协议与监听地址端口重叠时报错，报错文案中明确标注协议（如 `udp 0.0.0.0:443`）。
+- **QUIC 出站支持经隧道远程 DNS 与健康检查**: QUIC 出站（Model X lean）不建 fake-TLS 暖池，提取 `WarmPool::open_quic_lean` 在共享 QUIC 连接上直接开流；修复 `dns_over_tunnel` 与 `start_health_checker` 在 `transport=quic` 时因调用 `pool.get()` 等待暖池导致 10s 超时恒失败的问题，同时保持原有 TCP 路径行为与时序逐字节不变。
+
 ### chore(ci): 端点防泄露门禁与测试用例安全加固 (2026-09-29)
 
 - **新增端点与敏感信息扫描门禁**: 增加 `scripts/check-no-real-endpoints.sh` 与 `scripts/endpoint-allowlist.txt`，在 CI 工作流最前置步骤硬门禁拦截真实公网 IP、非文档节点 URI、硬编码口令与环境变量默认值。

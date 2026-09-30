@@ -1185,7 +1185,70 @@ impl DnsForwarder {
         None
     }
 
-    async fn dns_over_tunnel(req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
+    pub(crate) async fn dns_over_tunnel(req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
+        #[cfg(feature = "quic")]
+        if pool.is_quic() {
+            let target = format!("{remote_host}:{remote_port}");
+            let mut stream = match pool.open_quic_lean(&target).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!("DNS over QUIC tunnel open failed for {}: {}", target, e);
+                    return None;
+                }
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut query = Vec::with_capacity(2 + req.len());
+            query.extend_from_slice(&(req.len() as u16).to_be_bytes());
+            query.extend_from_slice(req);
+            if let Err(e) = stream.write_all(&query).await {
+                tracing::debug!("DNS over QUIC tunnel write failed for {}: {}", target, e);
+                return None;
+            }
+
+            let deadline = std::time::Instant::now() + DNS_TUNNEL_REASSEMBLE_TIMEOUT;
+            let mut acc = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut frames = 0u32;
+            let dns_len = loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    tracing::debug!("DNS over QUIC tunnel timeout for {}", target);
+                    return None;
+                }
+                let chunk = match timeout(remaining.min(TCP_TIMEOUT), stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => &buf[..n],
+                    _ => {
+                        tracing::debug!("DNS over QUIC tunnel read failed or EOF for {}", target);
+                        return None;
+                    }
+                };
+                frames += 1;
+                if frames > 64 {
+                    tracing::debug!("DNS over QUIC tunnel exceeded frame limit for {}", target);
+                    return None;
+                }
+                acc.extend_from_slice(chunk);
+                match reassemble_tcp_dns(&acc) {
+                    Reassembled::Done(len) => break len,
+                    Reassembled::Malformed => {
+                        tracing::debug!("DNS over QUIC tunnel malformed response for {}", target);
+                        return None;
+                    }
+                    Reassembled::Need => {}
+                }
+            };
+
+            let mut resp_buf = acc[2..2 + dns_len].to_vec();
+
+            // Override tx_id just in case
+            if resp_buf.len() >= 2 && req.len() >= 2 {
+                resp_buf[0] = req[0];
+                resp_buf[1] = req[1];
+            }
+
+            return Some(resp_buf);
+        }
+
         let mut tunnel = match pool.get().await {
             Ok(t) => t,
             Err(e) => {
@@ -1270,6 +1333,106 @@ mod tests {
             // ATYP 回归护栏: 首字节不得是 SOCKS5 ATYP IPv4(0x01) 被误当长度高位
             assert_ne!(hdr[0], 0x01, "首字节像 SOCKS5 ATYP IPv4 = 回归");
         }
+    }
+
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn test_dns_over_quic_tunnel_e2e() {
+        // 1. 本地 TCP DNS 回显桩: 接收 [2B len][q], 原样回复 [2B len][q]
+        let dns_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = dns_listener.local_addr().unwrap();
+        let dns_stub = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = dns_listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut len_buf = [0u8; 2];
+                    if sock.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let len = u16::from_be_bytes(len_buf) as usize;
+                    let mut q = vec![0u8; len];
+                    if sock.read_exact(&mut q).await.is_err() {
+                        return;
+                    }
+                    let _ = sock.write_all(&len_buf).await;
+                    let _ = sock.write_all(&q).await;
+                });
+            }
+        });
+
+        // 2. 本地 QUIC mirage 服务端
+        let temp_dir = std::env::temp_dir().join(format!("mirage_quic_dns_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("quic_key.pem");
+        let key_path_str = key_path.to_str().unwrap();
+
+        let quic_port = {
+            let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            u.local_addr().unwrap().port()
+        };
+        let quic_listen = format!("127.0.0.1:{quic_port}");
+
+        let server_key = crate::proxy::quic::load_or_generate_key(&key_path).unwrap();
+        let correct_pin = crate::proxy::quic::spki_pin(&server_key.public_key_der());
+
+        let creds_vec = crate::proxy::mirage_server::build_creds("quic_dns_test_pw", &[]);
+        let creds = crate::proxy::mirage_server::register_creds("test_quic_dns_srv", creds_vec);
+
+        let srv_listen = quic_listen.clone();
+        let srv_key_path = key_path_str.to_string();
+        let srv_handle = tokio::spawn(async move {
+            crate::proxy::mirage_server::start_quic_server(
+                &srv_listen,
+                creds,
+                "example.com",
+                60,
+                None,
+                false,
+                2,
+                false,
+                None,
+                Some(&srv_key_path),
+                true, // 允许回环目标直连 (SSRF 白名单放开本地测试 DNS 桩)
+            ).await;
+        });
+
+        // 稍微等待服务端就绪
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3. 构造客户端 Outbound 配置与 WarmPool
+        let cfg_json = format!(r#"{{
+            "inbounds": [],
+            "outbounds": [
+                {{
+                    "type": "mirage",
+                    "tag": "quic-out",
+                    "server": "127.0.0.1",
+                    "server_port": {quic_port},
+                    "password": "quic_dns_test_pw",
+                    "camouflage_host": "example.com",
+                    "transport": "quic",
+                    "quic_pin": "{correct_pin}"
+                }}
+            ],
+            "routing": {{ "default_outbound": "quic-out", "rules": [] }}
+        }}"#);
+        let cfg: crate::config::Config = serde_json::from_str(&cfg_json).unwrap();
+        let mgr = crate::proxy::outbound::OutboundManager::new(&cfg).unwrap();
+        let node = mgr.outbounds.get("quic-out").unwrap();
+        let pool = match &**node {
+            crate::proxy::outbound::OutboundNode::Mirage { pool, .. } => pool.clone(),
+            _ => unreachable!(),
+        };
+
+        // 4. 经 dns_over_tunnel 发送查询
+        let query = aaaa_query();
+        let resp = DnsForwarder::dns_over_tunnel(&query, &pool, "127.0.0.1", dns_addr.port()).await;
+        assert!(resp.is_some(), "dns_over_tunnel 经 QUIC 应答不应为 None");
+        assert_eq!(resp.unwrap(), query, "回显应答报文应与查询一致");
+
+        srv_handle.abort();
+        dns_stub.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     // 隧道 DNS 响应重组: 覆盖前缀单独成帧 / 跨帧大响应 / len 非法 / 多余尾字节。

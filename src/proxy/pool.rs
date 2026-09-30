@@ -423,6 +423,30 @@ impl WarmPool {
     #[cfg(feature = "quic")]
     pub fn quic_mux(&self) -> Option<&Arc<crate::proxy::quic::QuicMux>> { self.quic_mux.as_ref() }
 
+    /// transport=quic (Model X lean): 在共享 QUIC 连接上开一条精简流, 写
+    /// [token(32B)][2B len][host:port] 头, 之后可裸流转发。含 u16 长度守卫。
+    #[cfg(feature = "quic")]
+    pub async fn open_quic_lean(&self, host_port: &str) -> anyhow::Result<crate::proxy::quic::QuicBiStream> {
+        let tb = host_port.as_bytes();
+        if tb.len() > u16::MAX as usize {
+            anyhow::bail!("target 过长: {} 字节", tb.len());
+        }
+        let mux = self.quic_mux().ok_or_else(|| anyhow::anyhow!("quic mux 未初始化"))?;
+        let (send, recv) = mux.open_stream().await?;
+        let token = crate::crypto::hello_auth::make_session_token(
+            self.password(),
+            crate::crypto::hello_auth::QUIC_LEAN_BIND,
+        );
+        let mut hdr = Vec::with_capacity(32 + 2 + tb.len());
+        hdr.extend_from_slice(&token);
+        hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());
+        hdr.extend_from_slice(tb);
+        let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(&hdr).await?;
+        Ok(stream)
+    }
+
     pub fn new(cfg: Arc<PoolConfig>, brutal_state: Arc<BrutalState>) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
         let notify = Arc::new(Notify::new());
