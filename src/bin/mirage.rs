@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+#[path = "mirage/config_edit.rs"]
+mod config_edit;
+
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("MIRAGE_GIT"), ")");
 
 #[derive(Parser, Debug)]
@@ -49,6 +52,12 @@ enum Mode {
     QuicPin {
         /// Path to configuration file
         #[arg(short, long, default_value = "config_server.json")]
+        config: String,
+    },
+    /// 交互式修改配置文件并协助生效 (节点管理 / 协议参数 / 用户凭据 / 热重载与重启提示)
+    Config {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "config.json")]
         config: String,
     },
     /// 轻量客户端: 仅 SOCKS5 (TCP) 入站, 全部流量走隧道
@@ -1579,6 +1588,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Mode::TlsCapture { listen, out, timeout } = &args.mode {
         std::process::exit(run_tls_capture(listen, out, *timeout).await);
+    }
+    if let Mode::Config { config } = &args.mode {
+        std::process::exit(config_edit::run_config(config).await);
     }
 
     // 轻量模式: 平铺配置 + 精简启动路径, 不走完整版那套 (热重载/看板/geo)。
