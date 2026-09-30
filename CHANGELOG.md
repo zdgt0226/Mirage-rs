@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### fix: 服务端日志降级、断开误诊修复与安装说明补充 (2026-09-29)
+
+- **服务端每连接日志降为 debug (隐私保护)**: 将服务端每连接的 `Received first_chunk`、`Target resolved to` 以及握手尾部消费完成等日志从 info 降为 debug 级别，避免默认 info 级落盘记录用户访问的目标地址与连接细节。
+- **首帧前对端断开免误报密钥失配**: 在接收首帧数据时增加对端断开判断（`UnexpectedEof`、`ConnectionReset`、`ConnectionAborted`、`BrokenPipe`），客户端提前断开（预热池回收、切网等）时仅记录 debug 并安全退出，不再误诊为会话密钥失配且不占用唯一一次的排查告警配额。
+- **握手尾部读取中断降为 debug**: Fake Client Tail 读取时的超时与连接断开错误从 error 降为 debug 级别，避免对端提前断开或网络探测流量刷屏错误日志。
+- **README 补全 glibc 与 musl 版本说明**: 补充说明预编译 glibc 版本二进制依赖 glibc ≥ 2.34，老系统（如 Debian 11 / CentOS 8）需选用 `-musl` 版本，并注明 `install.sh` 默认下载 musl 版本。
+
+### fix: brutal 多入站速率隔离、QUIC UDP 快速失败与 QUIC 客户端诊断增强 (2026-09-29)
+
+- **brutal group 跨入站隔离 (P3)**: `group_id_for(ip, rate_bytes_per_sec)` 将客户端 IP 与入站速率联合哈希分组，解决多入站配置不同 `brutal_rate_mbps` 时同一客户端被并入同一内核 group 导致后设速率覆盖整组的问题；同速率入站仍共享配额，不同速率入站互不干扰。
+- **QUIC 传输 UDP 快速失败与明确告警 (P3)**: 出站为 `transport=quic` 时，SOCKS5 UDP 与透明 UDP (含 mux) 中继直接快速失败（原先等暖池 10s 超时后静默丢弃）并进程内只警告一次，提示 QUIC 传输暂不支持 UDP 中继并建议改用 TCP 传输或路由规则分流；同时为 TCP 模式下连接池获取隧道失败补充 debug 日志，并在 README QUIC 说明中明确不支持 UDP 中继。
+- **QUIC 客户端证书指纹与口令错误诊断 (P3)**: 握手失败时区分证书指纹不符与网络异常，若因 SPKI 或签名不符（`quic_pin mismatch`）明确提示检查 pin 或私钥配置；QUIC lean 服务端 token 认证失败时使用专用错误码（`QUIC_AUTH_FAILED_CODE`）重置流，客户端识别重置错误码后限频输出 "QUIC 认证失败: 口令不符或时钟偏差超容差" 告警，避免黑盒排查。
+- **配置热重载日志措辞修正 (P3)**: 修正 `config_watcher` 中热重载成功日志，准确说明改口令或移除用户时其存量会话会被吊销断开，避免与实际行为不符。
+
+### fix: 入站监听冲突区分协议维度与 QUIC 出站远程 DNS/健康检查支持 (2026-09-30)
+
+- **`mirage check` 监听冲突区分 TCP 与 UDP 协议维度**: 修复同端口的 TCP 入站与 QUIC 入站（UDP）被误判为监听冲突（`address already in use`）的问题；按各类入站实际 bind 的协议集合（Socks/Mixed/Shadowsocks 绑定 TCP，Dns 绑定 UDP，Transparent 绑定 TCP+UDP，MirageServer 按 transport=tcp 绑定 TCP、transport=quic 绑定 UDP）进行精确交集判定，仅在同一协议与监听地址端口重叠时报错，报错文案中明确标注协议（如 `udp 0.0.0.0:443`）。
+- **QUIC 出站支持经隧道远程 DNS 与健康检查**: QUIC 出站（Model X lean）不建 fake-TLS 暖池，提取 `WarmPool::open_quic_lean` 在共享 QUIC 连接上直接开流；修复 `dns_over_tunnel` 与 `start_health_checker` 在 `transport=quic` 时因调用 `pool.get()` 等待暖池导致 10s 超时恒失败的问题，同时保持原有 TCP 路径行为与时序逐字节不变。
+
 ### chore(ci): 端点防泄露门禁与测试用例安全加固 (2026-09-29)
 
 - **新增端点与敏感信息扫描门禁**: 增加 `scripts/check-no-real-endpoints.sh` 与 `scripts/endpoint-allowlist.txt`，在 CI 工作流最前置步骤硬门禁拦截真实公网 IP、非文档节点 URI、硬编码口令与环境变量默认值。

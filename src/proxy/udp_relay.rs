@@ -256,7 +256,16 @@ async fn build_sink(
             Some((Sink::Direct { out }, Some(h.abort_handle())))
         }
         OutboundNode::Mirage { pool, .. } => {
-            let mut tunnel = pool.get().await.ok()?;
+            if pool.udp_unsupported() {
+                return None;
+            }
+            let mut tunnel = match pool.get().await {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("UDP relay 获取暖池隧道失败: {:#}", e);
+                    return None;
+                }
+            };
             // UDP 模式哨兵
             tunnel.writer.send_data(&[0x00]).await.ok()?;
             let mut reader = tunnel.reader;

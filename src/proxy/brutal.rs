@@ -98,18 +98,23 @@ fn brutal_module_version(fd: i32) -> u32 {
     }
 }
 
-/// 客户端身份 → brutal group_id (源 IP hash, 非零)。tcp-brutal 2.0: 同 group_id 的连接
+/// 客户端身份与速率 → brutal group_id (源 IP 与速率联合 hash, 非零)。tcp-brutal 2.0: 同 group_id 的连接
 /// **共享一个总速率**, 故服务端把一个客户端的所有连接归一组 → 该客户端下载总量 = brutal_rate
 /// (而非每连接各 rate 并发聚合 N× 超发)。见 tcp-brutal 2.0 README「groups」。
+///
+/// ⚠️ **跨入站隔离 (P3)**: group_id 同时哈希 `(ip, rate_bytes_per_sec)`。服务端若配多个入站且
+/// `brutal_rate_mbps` 不同, 同一客户端 IP 同时连不同入站时归入不同 group, 避免后设的 rate
+/// 覆盖整组导致速率串扰; 同速率的入站仍归一组, 保持"每客户端下载总量 = brutal_rate"语义。
 ///
 /// ⚠️ **已知取舍 (多模型审计 sonnet P2)**: 握手前只有源 IP 可用作身份。CGNAT / 校园-办公 NAT 下
 /// 多个互不相关的真实客户端共享同一出口 IP 会被并入**同一 group**, 聚合总量被压到单份 `brutal_rate`
 /// 配额。这是"用 IP 近似身份"的固有代价, 非 bug —— Mirage 服务端 brutal_rate 本就是全局单值 (非
 /// 每客户端配置), 且 brutal 定位是好链路性能腿; 真需按真实身份分组须移到握手后按 token 分, 当前不做。
-pub fn group_id_for_ip(ip: std::net::IpAddr) -> u64 {
+pub fn group_id_for(ip: std::net::IpAddr, rate_bytes_per_sec: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ip.hash(&mut h);
+    rate_bytes_per_sec.hash(&mut h);
     let id = h.finish();
     if id == 0 { 1 } else { id } // group_id 必须非零 (0 = per-socket v1 语义)
 }
@@ -119,7 +124,7 @@ pub fn group_id_for_ip(ip: std::net::IpAddr) -> u64 {
 ///
 /// `rate_bytes_per_sec` = config 里 `brutal_rate_mbps * 125_000`.
 /// `group_id`: 非零且内核模块 ≥ 2.0 时, 把本连接并入该 group (同组共享一个总速率); 0 或
-/// v1 模块 → per-socket 速率 (老行为, 发 12B v1 struct)。服务端传 [`group_id_for_ip`] 按客户端
+/// v1 模块 → per-socket 速率 (老行为, 发 12B v1 struct)。服务端传 [`group_id_for`] 按客户端
 /// 分组; 客户端出站传 0。
 pub fn set_brutal_rate(fd: i32, rate_bytes_per_sec: u64, group_id: u64) {
     static PARAMS_WARNED: AtomicBool = AtomicBool::new(false);
@@ -600,19 +605,25 @@ mod decide_tests {
 
 #[cfg(test)]
 mod group_tests {
-    use super::group_id_for_ip;
+    use super::group_id_for;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn group_id_deterministic_nonzero_distinct() {
         let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-        // 确定性: 同 IP 同 group (该客户端所有连接归一组的前提)
-        assert_eq!(group_id_for_ip(a), group_id_for_ip(a));
+        let rate1 = 12_500_000; // 100 Mbps
+        let rate2 = 37_500_000; // 300 Mbps
+
+        // 确定性: 同 IP 同 rate → 相同 (保持该客户端下载总量 = brutal_rate 语义)
+        assert_eq!(group_id_for(a, rate1), group_id_for(a, rate1));
         // 非零 (0 = per-socket v1 语义, group 必须非零)
-        assert_ne!(group_id_for_ip(a), 0);
-        assert_ne!(group_id_for_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)), 0);
-        // 不同客户端不同 group (各自独享 brutal_rate 总量)
-        assert_ne!(group_id_for_ip(a), group_id_for_ip(b));
+        assert_ne!(group_id_for(a, rate1), 0);
+        assert_ne!(group_id_for(IpAddr::V6(Ipv6Addr::LOCALHOST), rate1), 0);
+        assert_ne!(group_id_for(a, rate2), 0);
+        // 同 IP 不同 rate → 不同 (跨入站互不串扰覆盖)
+        assert_ne!(group_id_for(a, rate1), group_id_for(a, rate2));
+        // 不同客户端同 rate → 不同 (各自独享配额)
+        assert_ne!(group_id_for(a, rate1), group_id_for(b, rate1));
     }
 }

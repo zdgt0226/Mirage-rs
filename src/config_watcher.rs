@@ -434,7 +434,7 @@ impl ConfigWatcher {
                     match Self::build_state(&config_path, &geodata_dir, Some(current_outbounds)) {
                         Ok(new_state) => {
                             state.store(Arc::new(new_state));
-                            info!("Hot-reload successful! New rules and outbounds applied (existing connections uninterrupted).");
+                            info!("Hot-reload successful! New rules and outbounds applied (existing connections kept; sessions of removed/re-keyed users are revoked).");
                             // 刷新 eBPF direct_cidr map (若已注入 hook)
                             if let Some(hook) = reload_hook.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                                 hook(&state.load());

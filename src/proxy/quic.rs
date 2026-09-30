@@ -204,7 +204,7 @@ impl QuicMux {
                     .connect(addr, &self.sni) // SNI = 良性 camouflage_host, 非 server 真身
                     .context("QUIC: connect 配置无效")?
                     .await
-                    .context("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)")?;
+                    .map_err(classify_quic_handshake_error)?;
                 g.conn = Some(conn);
             }
             g.conn.as_ref().unwrap().clone() // Connection 是 Arc, clone 廉价
@@ -387,9 +387,56 @@ impl QuicBiStream {
     }
 }
 
+/// QUIC lean 流认证失败应用层错误码。
+///
+/// ⚠️ 安全取舍说明: 流级 reset 发生在已建立的 QUIC 加密连接内部, 不改变 QUIC 握手面 (ClientHello/ServerHello)
+/// 的指纹; 但能完成 QUIC 握手的对端探测者如果主动发送 stream 并触发认证失败, 可以观察到该应用层流重置错误码。
+pub const QUIC_AUTH_FAILED_CODE: u32 = 0x41555448; // 'AUTH'
+
+/// 判定 `io::Error` 是否为服务端因 QUIC 认证失败重置流引起的错误 (`ReadError::Reset(QUIC_AUTH_FAILED_CODE)`).
+pub fn is_quic_auth_failed_io(e: &std::io::Error) -> bool {
+    if let Some(quinn::ReadError::Reset(code)) = e.get_ref().and_then(|err| err.downcast_ref::<quinn::ReadError>()) {
+        return *code == quinn::VarInt::from_u32(QUIC_AUTH_FAILED_CODE);
+    }
+    let s = e.to_string();
+    s.contains(&format!("error {}", QUIC_AUTH_FAILED_CODE))
+}
+
+/// 进程内限频告警: 首次输出 warn, 之后输出 debug。
+pub fn warn_quic_auth_failed() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("QUIC 认证失败: 口令不符或时钟偏差超容差");
+    } else {
+        tracing::debug!("QUIC 认证失败: 口令不符或时钟偏差超容差");
+    }
+}
+
+/// 若该 io::Error 是 QUIC 认证失败, 则触发限频告警并返回 true。
+pub fn check_and_warn_quic_auth_failure(e: &std::io::Error) -> bool {
+    if is_quic_auth_failed_io(e) {
+        warn_quic_auth_failed();
+        true
+    } else {
+        false
+    }
+}
+
 impl AsyncRead for QuicBiStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.recv).poll_read(cx, buf)
+        match Pin::new(&mut self.recv).poll_read(cx, buf) {
+            Poll::Ready(Err(e)) => {
+                if check_and_warn_quic_auth_failure(&e) {
+                    Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "QUIC 认证失败: 口令不符或时钟偏差超容差",
+                    )))
+                } else {
+                    Poll::Ready(Err(e))
+                }
+            }
+            res => res,
+        }
     }
 }
 
@@ -449,9 +496,10 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
         if actual_pin.len() != self.pin.len()
             || actual_pin.as_bytes().ct_eq(self.pin.as_bytes()).unwrap_u8() != 1
         {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ));
+            return Err(rustls::Error::General(format!(
+                "quic_pin mismatch: expected {}, got {}",
+                self.pin, actual_pin
+            )));
         }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
@@ -488,6 +536,34 @@ impl rustls::client::danger::ServerCertVerifier for PinnedVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+/// 判定 QUIC 连接失败是否由证书指纹 (SPKI pin) 或签名校验失败引起。
+pub fn is_pin_mismatch_error(e: &quinn::ConnectionError) -> bool {
+    match e {
+        quinn::ConnectionError::TransportError(te) => {
+            te.reason.contains("quic_pin mismatch")
+                || te.reason.contains("ApplicationVerificationFailure")
+                || te.reason.contains("BadSignature")
+        }
+        _ => {
+            let s = e.to_string();
+            s.contains("quic_pin mismatch")
+                || s.contains("ApplicationVerificationFailure")
+                || s.contains("BadSignature")
+        }
+    }
+}
+
+/// 分类 QUIC 握手失败错误: 若为证书指纹 (pin) 不符则给出明确排查指导, 其它情况保留原文案。
+pub fn classify_quic_handshake_error(e: quinn::ConnectionError) -> anyhow::Error {
+    if is_pin_mismatch_error(&e) {
+        anyhow::anyhow!(
+            "QUIC: 服务端证书指纹与 quic_pin 不符 (pin 配错, 或服务端换了私钥; 服务端运行 `mirage-rs quic-pin -c <配置>` 获取当前指纹)"
+        )
+    } else {
+        anyhow::Error::new(e).context("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)")
     }
 }
 
@@ -723,6 +799,10 @@ mod tests {
         let bad_connecting = ep_bad.connect(server_addr, "localhost").unwrap();
         let bad_conn_res = bad_connecting.await;
         assert!(bad_conn_res.is_err(), "错误 pin 握手必须失败 (fail-closed)");
+        let err = bad_conn_res.unwrap_err();
+        assert!(is_pin_mismatch_error(&err), "错误 pin 必须被识别为 pin mismatch");
+        let classified = classify_quic_handshake_error(err);
+        assert!(classified.to_string().contains("服务端证书指纹与 quic_pin 不符"));
 
         srv_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -763,5 +843,50 @@ mod tests {
         assert_eq!(read_back, b"CORRUPTED_GARBAGE_DATA_NOT_A_PEM");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_quic_error_classification_unit() {
+        let err_pin = quinn::ConnectionError::TransportError(quinn_proto::TransportError {
+            code: quinn_proto::TransportErrorCode::crypto(42),
+            frame: None,
+            reason: "quic_pin mismatch: expected abc, got def".to_string(),
+        });
+        assert!(is_pin_mismatch_error(&err_pin));
+        let classified_pin = classify_quic_handshake_error(err_pin);
+        assert!(classified_pin.to_string().contains("服务端证书指纹与 quic_pin 不符"));
+
+        let err_app_fail = quinn::ConnectionError::TransportError(quinn_proto::TransportError {
+            code: quinn_proto::TransportErrorCode::crypto(46),
+            frame: None,
+            reason: "ApplicationVerificationFailure".to_string(),
+        });
+        assert!(is_pin_mismatch_error(&err_app_fail));
+
+        let err_timeout = quinn::ConnectionError::TimedOut;
+        assert!(!is_pin_mismatch_error(&err_timeout));
+        let classified_timeout = classify_quic_handshake_error(err_timeout);
+        assert!(classified_timeout.to_string().contains("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)"));
+    }
+
+    #[test]
+    fn test_quic_auth_failed_io_detection() {
+        let reset_io = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            quinn::ReadError::Reset(quinn::VarInt::from_u32(QUIC_AUTH_FAILED_CODE)),
+        );
+        assert!(is_quic_auth_failed_io(&reset_io));
+        assert!(check_and_warn_quic_auth_failure(&reset_io));
+
+        let other_reset = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            quinn::ReadError::Reset(quinn::VarInt::from_u32(0)),
+        );
+        assert!(!is_quic_auth_failed_io(&other_reset));
+        assert!(!check_and_warn_quic_auth_failure(&other_reset));
+
+        let regular_io = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broken");
+        assert!(!is_quic_auth_failed_io(&regular_io));
+        assert!(!check_and_warn_quic_auth_failure(&regular_io));
     }
 }

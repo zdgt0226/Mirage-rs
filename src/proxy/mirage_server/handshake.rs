@@ -393,22 +393,22 @@ where
     }
 
     if let Err(e) = stream.write_all(&template).await {
-        tracing::error!("Mirage Server: write_all template failed: {}", e);
+        tracing::debug!("Mirage Server: write_all template failed: {}", e);
         return None;
     }
 
     // 2.7 Consume Fake Client Tail (按结构读取: 6B CCS + 5B record header + 53B/69B body)
     match tokio::time::timeout(Duration::from_secs(5), consume_fake_client_tail(&mut stream)).await {
         Ok(Err(e)) => {
-            tracing::error!("Mirage Server: consume tail failed: {}", e);
+            tracing::debug!("Mirage Server: consume tail failed: {}", e);
             return None;
         }
         Err(_) => {
-            tracing::error!("Mirage Server: consume tail timed out!");
+            tracing::debug!("Mirage Server: consume tail timed out!");
             return None;
         }
         Ok(Ok(body_len)) => {
-            tracing::info!(
+            tracing::debug!(
                 "Mirage Server: Successfully consumed {} bytes tail (body {}B)",
                 6 + 5 + body_len,
                 body_len

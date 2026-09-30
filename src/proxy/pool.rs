@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use std::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tokio::time::Instant;
 
 pub struct PoolConfig {
@@ -405,9 +405,47 @@ impl WarmPool {
     pub fn is_quic(&self) -> bool {
         self.cfg.transport == crate::config::Transport::Quic
     }
+    /// transport=quic 不支持 UDP 中继 (Model X 精简流只承载 TCP, 暖池也不建 fake-TLS 隧道 →
+    /// `get()` 只会 10s 超时)。是 QUIC 则告警 (进程内首次 warn, 之后 debug) 并返回 true, 调用方直接丢弃。
+    pub fn udp_unsupported(&self) -> bool {
+        if !self.is_quic() {
+            return false;
+        }
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            warn!("transport=quic 暂不支持 UDP 中继, UDP 流量被丢弃; 需要 UDP 请为该出站使用 transport=tcp 或用路由规则把 UDP 分到其它出站");
+        } else {
+            debug!("transport=quic 暂不支持 UDP 中继, UDP 流量被丢弃");
+        }
+        true
+    }
     pub fn password(&self) -> &str { &self.cfg.password }
     #[cfg(feature = "quic")]
     pub fn quic_mux(&self) -> Option<&Arc<crate::proxy::quic::QuicMux>> { self.quic_mux.as_ref() }
+
+    /// transport=quic (Model X lean): 在共享 QUIC 连接上开一条精简流, 写
+    /// [token(32B)][2B len][host:port] 头, 之后可裸流转发。含 u16 长度守卫。
+    #[cfg(feature = "quic")]
+    pub async fn open_quic_lean(&self, host_port: &str) -> anyhow::Result<crate::proxy::quic::QuicBiStream> {
+        let tb = host_port.as_bytes();
+        if tb.len() > u16::MAX as usize {
+            anyhow::bail!("target 过长: {} 字节", tb.len());
+        }
+        let mux = self.quic_mux().ok_or_else(|| anyhow::anyhow!("quic mux 未初始化"))?;
+        let (send, recv) = mux.open_stream().await?;
+        let token = crate::crypto::hello_auth::make_session_token(
+            self.password(),
+            crate::crypto::hello_auth::QUIC_LEAN_BIND,
+        );
+        let mut hdr = Vec::with_capacity(32 + 2 + tb.len());
+        hdr.extend_from_slice(&token);
+        hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());
+        hdr.extend_from_slice(tb);
+        let mut stream = crate::proxy::quic::QuicBiStream::new(send, recv);
+        use tokio::io::AsyncWriteExt;
+        stream.write_all(&hdr).await?;
+        Ok(stream)
+    }
 
     pub fn new(cfg: Arc<PoolConfig>, brutal_state: Arc<BrutalState>) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
