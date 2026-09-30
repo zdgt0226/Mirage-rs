@@ -2392,6 +2392,44 @@ CONF
 EOM
 }
 
+# ── 修改现有配置 (交互式) ──
+# 仅支持完整版配置 (config_server.json / config_client.json); 轻量版是平铺极简格式, 直接编辑文件即可。
+edit_config_interactive() {
+    title "交互式修改配置"
+    if [[ ! -x "$BIN_PATH" ]]; then
+        warn "未找到 ${BIN_PATH}。请先部署, 或手动运行: mirage-rs config -c <配置文件路径>"
+        return
+    fi
+
+    local cfgs=()
+    [[ -f "${ETC_DIR}/config_server.json" ]] && cfgs+=("${ETC_DIR}/config_server.json")
+    [[ -f "${ETC_DIR}/config_client.json" ]] && cfgs+=("${ETC_DIR}/config_client.json")
+
+    local target_cfg=""
+    if [[ ${#cfgs[@]} -eq 0 ]]; then
+        if [[ -f "${ETC_DIR}/lite_server.json" || -f "${ETC_DIR}/lite_client.json" ]]; then
+            warn "检测到轻量版配置: 轻量版为平铺极简格式, 不支持交互式编辑, 请直接编辑 ${ETC_DIR}/lite_*.json 后重启服务。"
+            return
+        fi
+        warn "在 ${ETC_DIR} 下未找到完整版配置文件。"
+        target_cfg=$(ask "请输入配置文件路径 (留空取消)" "")
+        [[ -z "$target_cfg" ]] && return
+    elif [[ ${#cfgs[@]} -eq 1 ]]; then
+        target_cfg="${cfgs[0]}"
+    else
+        local choice
+        choice=$(ask_choice "检测到多个配置文件，请选择要修改的配置" "${cfgs[@]}")
+        target_cfg="${cfgs[$((choice - 1))]}"
+    fi
+
+    if [[ ! -f "$target_cfg" ]]; then
+        warn "指定的配置文件不存在: $target_cfg"
+        return
+    fi
+
+    "$BIN_PATH" config -c "$target_cfg"
+}
+
 main() {
     title "Mirage-rs 安装向导"
     if [[ $EUID -ne 0 ]]; then
@@ -2412,13 +2450,15 @@ main() {
         "更新二进制到最新版" \
         "查看服务端节点信息 (导入串 / 二维码)" \
         "卸载 Mirage-rs" \
-        "家庭 WireGuard 服务端 (干净设备接入)")
+        "家庭 WireGuard 服务端 (干净设备接入)" \
+        "修改现有配置 (交互式)")
 
     case "$mode" in
         4) update_binary; return ;;
         5) show_server_node; return ;;
         6) uninstall; return ;;
         7) config_wg_server; return ;;
+        8) edit_config_interactive; return ;;
     esac
 
     # 部署路径 (1/2/3): 先选形态 —— 完整版还是轻量版

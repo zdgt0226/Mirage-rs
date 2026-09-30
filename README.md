@@ -349,12 +349,29 @@ mirage-rs export -c config.json -o share.json                 # 无 -o 则写 st
 
 # 测节点可用性 (完整 Mirage 握手+认证, 非裸 TCP; 显 RTT + [国家码]; 默认穿隧道 HTTP 探测)
 mirage-rs test -c config.json                                 # --tag 只测某个; --no-http 关探测
+
+# 交互式配置管理 (节点增删改查 / 协议参数 / 多用户管理 / 待保存改动 diff / 校验与热重载/重启辅助)
+mirage-rs config -c config.json
 ```
 
 > 组类型 (rule / default_outbound 可指向): `urltest` (选延迟最低) · `fallback` (第一个健康) ·
 > `selector` (手动) · `load_balance` (round-robin 分摊)。`import`/`subscribe --group` 会自动建
 > urltest 组并把 `default_outbound` 指向它。`test` 与 `--group` 建组会读 `geoip.dat` 显示节点区域,
 > 混区域时告警 (负载均衡/自动选路出口国不一致会影响落地解锁)。
+
+#### 配置文件改动生效策略 (热重载 vs 需重启)
+
+| 配置维度 | 改动项目 | 生效策略 | 说明与代码依据 |
+| :--- | :--- | :--- | :--- |
+| **路由 (Routing)** | `rules` 规则增删改、`default_outbound` 选路切换、`profiles` / `device_profiles` 设备策略、`geo_alias` 短名 | **自动热重载** | `config_watcher` 监听文件写入，约 1 秒内自动重建 `RouterEngine` 生效，不中断连接 |
+| **用户与凭据** | `mirage_server` 的 `users` 增删改、密码变动、`rate_limit_kbps` 限速、流量配额及入站主 `password` | **自动热重载** | `apply_user_config` 动态热替换凭据注册表与限额器；删除/改密用户之存量会话立即吊销 |
+| **Geo 规则数据** | `tuning.geo_sources`、`tuning.geo_update_days` 以及本地 `.dat` 文件自动更新 | **自动热重载** | `extract_updater_state` 重建更新调度器，新 `.dat` 文件落地自动重编路由规则集 |
+| **出站 (Outbounds)** | 任何出站节点的增删、改端口/密钥/伪装/传输方式/连接池/组成员 | **需重启服务** | 防止在途连接断裂与连接池任务泄漏，热重载保持既有出站不变 (`config_watcher.rs:132`) |
+| **入站 (Inbounds)** | 监听端口 `port` / `listen`、传输 `transport`、PFS、伪装站、Brutal 限速、`allow_local_targets`、新增/删除入站 | **需重启服务** | 网络监听 socket 与传输栈在启动期绑定，修改后需重启服务才能生效或释放端口 |
+| **核心调优 (Tuning)** | `tls_padding`、`cipher_agility`、`ebpf_mode`、`dns_tcp_resolver` 等 | **需重启服务** | 加密策略与系统级解析器在进程启动初始化阶段生效 (`startup.rs:150`) |
+
+> `mirage-rs config` 按「仅上表列为热重载的字段才热重载、其余一律提示重启」判定 (宁可多提示重启, 不漏报)。仅支持完整版配置, 轻量版 (`lite_*.json`) 请直接编辑。
+> `mirage://` 链接只含 口令 / 地址 / 端口 / SNI 四项: 服务端开了 `pfs`、`transport: "quic"`、`tls_padding` / `cipher_agility` 时, 客户端导入后须手动设置对应参数 (菜单 9 显示链接时会列出)。
 
 ---
 
