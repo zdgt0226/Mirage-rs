@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v0.15.1] - v0.15 实测修复 + `mirage-rs config` 交互式配置编辑 (2026-10-02)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.0 客户端 / 服务端完全互通, 可单端升级; Android 端无需同步。
+- 服务端每连接日志 (目标地址等) 由 info 降为 debug: 默认 `log_level: info` 下不再落盘用户访问记录, 排障需临时调到 debug。
+- 手动下载 glibc 版二进制需 glibc ≥ 2.34; Debian 11 等老系统请用 `-musl` 版 (`install.sh` 默认即 musl)。
+
 ### feat: mirage-rs config 交互式配置编辑 (2026-09-30)
 
 - **新增 `mirage-rs config -c <配置>` 交互式配置编辑命令**:
