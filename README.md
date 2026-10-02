@@ -53,7 +53,7 @@
 
 **alpha.4+ 起提供交互式安装向导 `install.sh`**, 会自动 (需 root):
 - 下载最新预编译二进制到 `/usr/local/bin/mirage-rs` (含 SHA256 双通道校验)
-- 探测公网 IP + 端口占用检测 + Brutal 内核模块
+- 探测公网 IP + 端口占用检测 + Brutal 内核模块 (可选 v2 最新按客户端分组限速 / v1.0.3 兼容 <5.10 老内核)
 - 生成服务端 / 客户端 config, 写 systemd unit —— 完整版 `mirage-rs-{server,client}.service`,
   轻量版 `mirage-rs-lite-{server,client}.service`(名字区分, 一眼看出装的是哪个模式)
 - **选择部署形态**: 完整版 (分流/DNS/透明网关/看板) 或**轻量版** (只要能翻墙, 配置极简)
