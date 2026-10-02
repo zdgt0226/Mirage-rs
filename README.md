@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.15.0-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.15.1-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -441,6 +441,7 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.15.1** | 2026-10-02 | **无协议变更 (可单端升级)**: 新增 `mirage-rs config` 交互式配置编辑 (节点增删改 / 协议参数 / 服务端多用户, 保存时校验 + 原子写回, 能热重载的自动生效、其余提示并协助重启) · 实测修复: 服务端每连接日志降 debug (隐私) · brutal 多入站速率隔离 · QUIC 出站 UDP 快速失败, 远程 DNS 与健康检查改走 QUIC 流 · QUIC pin / 口令错误明确提示 · 配置校验区分 TCP / UDP 同端口 |
 | **v0.15.0** | 2026-09-28 | **⚠️ 协议断代, 两端须同时升级**: 会话新鲜性加固 (双随机 master salt 派生 + token tag 绑定 ClientHello.random, 防重放与伪造) · **PFS Elligator2 编码** (消除 X25519 公钥 Legendre 特征) · cipher agility 避免 ChaCha20 重协商下的 nonce 复用。**多用户 v2 与安全加固**: **按用户独立限速与月度流量配额** (`rate_limit_kbps`/`quota_gb`/账单日滚动/用量持久化/超额伪装回落) + `/api/users` 管理 API · **QUIC 证书 SPKI 固定** (客户端强制 `quic_pin`, 封死 MITM) · **服务端出站防 SSRF** (默认拦截回环/链路本地/云元数据/本机所有网卡地址, 可选 `allow_local_targets`) · **凭据热重载生效与吊销** (改口令/删用户即刻断开存量会话) · **伪装防被动与主动探测** (ServerHello key_share 与加密 flight 逐连接随机化, 认证前异常增量读取并全量回落伪装站) · **服务端 UDP 直连 IPv6 目标** · **配置软链接与 K8s ConfigMap 原子切换热重载**。重复 tag 的 `mirage_server` 拒绝启动, UDP 非 mux 收紧为 restricted-cone。 |
 | **v0.14.1** | 2026-09-26 | **审计阶段 1 安全修复 (纯服务端)**: 配置文件与备份原子写恒以 **0600 权限**创建 (自愈历史 0644) · API **DNS rebinding** 防护 (loopback 监听且无 token 时校验 Host 白名单) · **XDP DNS 缓存淘汰与重载清除** (解决 fake-IP 淘汰后映射陈旧导致误路由) · 域名统计与限速 live 表设容量上限、连接池 watcher 任务泄漏修复。**细节优化与健壮性**: config `check` 增补入站监听 `listen:port` 冲突检测 · Salamander GRO 去混淆测试与 CI 覆盖 `--features quic` · 文件加载错误补上下文 · 连接池 queue 锁与统计惰性构造优化。向后完全兼容。 |
 | **v0.14.0** | 2026-09-21 | **多用户凭据**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户 (`identify_session_token`, **协议零改动**, 客户端只配自己那份口令), per-user 密钥隔离 + 用量统计 (连接/上下行/活跃), 按人吊销。`/api/users` GET(列 name+用量, **不返 password**)/POST(**op-based** 增删/改密, 因藏 password 不能整表替换) 供 **Mirage-console 用户管理页** (server 模式) 操作。覆盖 TCP + QUIC(lean)。 |
