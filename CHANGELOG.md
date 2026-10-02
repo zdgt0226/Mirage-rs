@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### docs: 实测记录 + install.sh brutal 默认策略按实测调整 (2026-10-02)
+
+- **新增 `docs/benchmark-2026-09.md`**: v0.15 真实链路功能 / 安全实测、443 与非 443 端口对照 (晚高峰 + 白天)、与 sing-box 1.13.14 的吞吐 / CPU / 内存对比 (回环 + 白天 + 晚间, 含 hysteria2 vs Mirage QUIC)、brutal 与 BBR 对照。服务器与客户端均以代号表示, 不含真实地址。
+- **`install.sh` brutal 默认速率 50 → 100 Mbps**, 取值建议由「出口带宽 30–50%」改为「客户端实际跨境带宽, 一般 50–150, 不建议超过 200」(实测 50 被硬限在 ≈48, 200 重传 ≈30%); 删除与实现不符的「不适合的链路会自动回落到 BBR」(服务端无自动回落)。端口提示注明非 443 实测无性能差异。
+- **README 计划池新增「QUIC 定速模式 (待选优化)」**: 晚间 Mirage QUIC 51 vs hysteria2 81 Mbps, 定位为 CC 策略差异 (erasure CC 自适应 vs 定速), 方案为复用 `brutal_rate_mbps` 语义的可选定速发送。
+
 ## [v0.15.1] - v0.15 实测修复 + `mirage-rs config` 交互式配置编辑 (2026-10-02)
 
 ### 升级须知

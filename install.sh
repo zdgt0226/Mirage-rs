@@ -1231,7 +1231,7 @@ config_lite_server() {
   轻量服务端可以直接给完整版客户端用。
 EOM
     # 443 伪装效果最好, 但属特权端口; 这里跑在 root 下装 systemd 服务, 故无 bind 问题。
-    local port=$(ask_port "监听端口 [1-65535] (443 伪装最好, 也可自定义)" "443" tcp)
+    local port=$(ask_port "监听端口 [1-65535] (默认 443; 实测非 443 性能无差异, 被占用可改)" "443" tcp)
     local rand_pwd=$(generate_password)
     local pwd=$(ask "认证密码" "$rand_pwd")
 
@@ -1421,26 +1421,24 @@ EOM
 ═══════════════════════════════════════════════════
   Brutal CC 单连接目标速率
 ═══════════════════════════════════════════════════
-  Brutal 给单条 TCP 死磕设定速率, 不让步. 适合"高 RTT 低
-  丢包"链路 (跨洲专线 / 移动 4G/5G), BBR 这种自适应 CC 在
-  丢包链路上会被拖慢, brutal 反而能跑满.
+  Brutal 给单条 TCP 死磕设定速率, 遇丢包不退让. 适合跨境
+  "高 RTT + 丢包"线路: 实测晚高峰 BBR 在 5~59 Mbps 间大幅摆动,
+  brutal 稳定得多 (见 docs/benchmark-2026-09.md §4).
 
-  v0.4.4-alpha.10 起跟 Python POC 完全对齐 (cwnd_gain=15,
-  无 autofallback, 死磕速率到底). 不适合的链路 (低 RTT 高
-  丢包 / CDN) 上 brutal 反而拖慢吞吐 — 这种链路请设 rate=0
-  关掉, 让系统默认 BBR 自适应.
+  没有自动回落: 设定后始终按此速率发送. 不适合的链路 (低 RTT
+  高丢包 / CDN 前置) 请设 0 关掉, 让系统默认 BBR 自适应.
 
-  推荐取值: 链路带宽的 30~50%.
-    100M 出口  → 30~50 Mbps
-    1G   出口  → 300~500 Mbps
-  太高 → 拥塞导致重传放大. 太低 → 自我限速. 设错就改 config
-  里 brutal_rate_mbps 重启服务即可.
+  取值 = 客户端实际能跑到的跨境带宽 (不是 VPS 端口速率):
+    跨境丢包线路一般 50~150 Mbps, 默认 100.
+    设太高 → 自己灌满线路, 重传放大 (实测 200 时重传 ~30%,
+             吞吐反不如 100); 设太低 → 被硬限在该值.
+  设错就改 config 里 brutal_rate_mbps 重启服务即可.
 ═══════════════════════════════════════════════════
 EOM
-        # 探测公网链路带宽以建议默认值 (失败回退到 50)
-        local default_rate=50
-        brutal_rate_mbps=$(ask "Brutal 单连接目标速率 (Mbps, 推荐链路带宽 30-50%)" "$default_rate")
-        info "Brutal 单连接速率: ${brutal_rate_mbps} Mbps (不适合的链路会自动回落到 BBR)"
+        # 默认 100: 跨境丢包线路实测甜点 (50 被硬限在 ~48, 200 重传 ~30%), 见 docs/benchmark-2026-09.md §4
+        local default_rate=100
+        brutal_rate_mbps=$(ask "Brutal 目标速率 (Mbps, 取客户端实际跨境带宽, 0=关闭)" "$default_rate")
+        info "Brutal 速率: ${brutal_rate_mbps} Mbps (无自动回落; 不合适请改为 0 用 BBR)"
     fi
 
     local brutal_line=""
