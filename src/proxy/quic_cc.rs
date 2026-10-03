@@ -154,8 +154,7 @@ impl Controller for ErasureController {
         // gap-safety 封顶: 按测到的丢包率封顶在途, 使接收端乱序 gap < quinn MAX_CHUNKS(1024)。
         // 干净路径 (p≈0) 无封顶; 丢包路径自动收窄防"too many gaps"关连接。见 GAP_SAFE_CHUNKS 注释。
         if self.samples > 0 && self.p_ewma > 0.02 {
-            let gap_cap = (GAP_SAFE_CHUNKS * self.mtu as f64 / self.p_ewma) as u64;
-            w = w.min(gap_cap.max(self.mtu * 8)); // 别低于最小窗口
+            w = w.min(gap_safe_cap(self.mtu, self.p_ewma));
         }
         w
     }
@@ -181,5 +180,214 @@ impl Controller for ErasureController {
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
+    }
+}
+
+/// gap-safety 封顶 (见 GAP_SAFE_CHUNKS): 丢包率 `p` 下在途字节上限, 使接收端乱序 gap 稳在 quinn
+/// MAX_CHUNKS 之下; 不低于 8 个 MTU 的最小窗口。调用方只在 p > 0.02 时施加。
+fn gap_safe_cap(mtu: u64, p: f64) -> u64 {
+    let gap_cap = (GAP_SAFE_CHUNKS * mtu as f64 / p) as u64;
+    gap_cap.max(mtu * 8)
+}
+
+// ───────────────────────── 定速模式 (brutal 语义) ─────────────────────────
+//
+// 实测 (docs/benchmark-2026-09.md §3.3): erasure CC 仍随链路自适应降速, 晚间同线路 51 Mbps vs
+// hysteria2 定速 81 Mbps。定速模式按配置速率发送、遇丢包不退让 (同 tcp-brutal / hysteria2 brutal):
+//   目标发送速率 = rate / ack_rate   (ack_rate = 最近 ACK_SLOTS 秒的送达率, 下限 MIN_ACK_RATE)
+//   窗口 = 目标发送速率 × smoothed RTT / ack_rate × CWND_GAIN
+// 第二个 / ack_rate: 丢失的包在被判定丢失前 (≈1 RTT) 仍占着窗口, 能发新数据的窗口只剩约 ack_rate 比例,
+// 不补这一项则高丢包下实际发送速率达不到目标 (真机 15-25% 丢包: 只补一次 63-70 Mbps, 补两次后接近
+// hysteria2)。无丢包时两项都是 1, 不会超发; 两项各受 MIN_ACK_RATE 下限, 合计最多 1/0.64 ≈ 1.56 倍。
+// quinn 的 pacer 按 1.25 × window / srtt 放行、在途受 window 封顶, 故窗口即决定实际发送速率。
+// ⚠️ 与 TCP brutal 相同的风险: rate 高于实际可用带宽会自己灌满线路、重传放大 —— rate 须取客户端
+// 实际能跑到的带宽。gap-safety 封顶照常生效 (按原始丢包率), 防乱序 gap 超限被关连接。
+
+/// 送达率统计窗口: ACK_SLOTS 个 1 秒槽 (同 hysteria2 brutal 的 5 秒)。
+const ACK_SLOTS: usize = 5;
+/// 送达率下限: 最多补偿 1/0.8 = 1.25 倍, 烂链路上不无限放大 (同 hysteria2 minAckRate)。
+const MIN_ACK_RATE: f64 = 0.8;
+/// 样本不足 (ack+lost 字节 < 该值个 MTU) 时视为无丢包, 不补偿。
+const MIN_SAMPLE_PACKETS: u64 = 50;
+/// 窗口 = 速率 × RTT × 该增益。pacer 已有 1.25 倍突发余量, 取 1.0 使稳态发送速率 ≈ 目标。
+const CWND_GAIN: f64 = 1.0;
+/// 首个 RTT 样本前的假定 RTT (只影响初始窗口)。
+const INITIAL_RTT: Duration = Duration::from_millis(100);
+
+/// 定速 CC 工厂。`bytes_per_sec` = `brutal_rate_mbps × 125_000`。
+#[derive(Debug)]
+pub struct FixedRateConfig {
+    pub bytes_per_sec: u64,
+}
+
+impl ControllerFactory for FixedRateConfig {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(FixedRateController {
+            rate: self.bytes_per_sec.max(1),
+            rtt: INITIAL_RTT,
+            mtu: current_mtu.max(1200) as u64,
+            stats: AckStats::new(now),
+        })
+    }
+}
+
+/// 最近 ACK_SLOTS 秒的 ack / lost 字节, 按秒分槽滚动。
+#[derive(Clone, Debug)]
+struct AckStats {
+    start: Instant,
+    last: Instant,                       // 最近一次 ack / lost 记账时刻 (window() 无 now, 以此为参照)
+    slots: [(u64, u64, u64); ACK_SLOTS], // (秒序号, acked, lost)
+}
+
+impl AckStats {
+    fn new(start: Instant) -> Self {
+        Self { start, last: start, slots: [(u64::MAX, 0, 0); ACK_SLOTS] }
+    }
+
+    fn slot(&mut self, now: Instant) -> &mut (u64, u64, u64) {
+        self.last = self.last.max(now);
+        let sec = now.saturating_duration_since(self.start).as_secs();
+        let slot = &mut self.slots[(sec % ACK_SLOTS as u64) as usize];
+        if slot.0 != sec {
+            *slot = (sec, 0, 0);
+        }
+        slot
+    }
+
+    fn on_ack(&mut self, now: Instant, bytes: u64) {
+        self.slot(now).1 += bytes;
+    }
+
+    fn on_lost(&mut self, now: Instant, bytes: u64) {
+        self.slot(now).2 += bytes;
+    }
+
+    /// 最近 ACK_SLOTS 秒内的 (acked, lost) 合计 (过期槽不计)。
+    fn totals(&self, now: Instant) -> (u64, u64) {
+        let sec = now.saturating_duration_since(self.start).as_secs();
+        self.slots
+            .iter()
+            .filter(|s| s.0 != u64::MAX && s.0 + ACK_SLOTS as u64 > sec)
+            .fold((0, 0), |(a, l), s| (a + s.1, l + s.2))
+    }
+}
+
+/// 由 (acked, lost) 字节得 (用于补偿的 ack_rate ∈ [MIN_ACK_RATE, 1], 原始丢包率 p)。样本不足 → (1, 0)。
+fn ack_rate_of(acked: u64, lost: u64, mtu: u64) -> (f64, f64) {
+    let total = acked + lost;
+    if total < MIN_SAMPLE_PACKETS * mtu {
+        return (1.0, 0.0);
+    }
+    let raw = acked as f64 / total as f64;
+    (raw.max(MIN_ACK_RATE), 1.0 - raw)
+}
+
+/// 定速窗口 (纯函数, 便于单测): rate × rtt / ack_rate² × CWND_GAIN (见上方说明), 丢包 > 2% 时叠
+/// gap-safety 封顶, 不低于 4 个 MTU。
+fn fixed_rate_window(rate: u64, rtt: Duration, ack_rate: f64, p: f64, mtu: u64) -> u64 {
+    let w = (rate as f64 * rtt.as_secs_f64() / (ack_rate * ack_rate) * CWND_GAIN) as u64;
+    let w = if p > 0.02 { w.min(gap_safe_cap(mtu, p)) } else { w };
+    w.max(mtu * 4)
+}
+
+struct FixedRateController {
+    rate: u64,
+    rtt: Duration,
+    mtu: u64,
+    stats: AckStats,
+}
+
+impl Controller for FixedRateController {
+    fn on_ack(&mut self, now: Instant, _sent: Instant, bytes: u64, _app_limited: bool, rtt: &RttEstimator) {
+        self.rtt = rtt.get();
+        self.stats.on_ack(now, bytes);
+    }
+
+    fn on_congestion_event(&mut self, now: Instant, _sent: Instant, _is_persistent_congestion: bool, lost_bytes: u64) {
+        // 只记账, 不退让 (定速语义)。
+        self.stats.on_lost(now, lost_bytes);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = (new_mtu as u64).max(1200);
+    }
+
+    fn window(&self) -> u64 {
+        // Controller::window 无 now 参数: 以最近一次 ack / lost 记账时刻为参照。
+        let (acked, lost) = self.stats.totals(self.stats.last);
+        let (ack_rate, p) = ack_rate_of(acked, lost, self.mtu);
+        fixed_rate_window(self.rate, self.rtt, ack_rate, p, self.mtu)
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(FixedRateController { rate: self.rate, rtt: self.rtt, mtu: self.mtu, stats: self.stats.clone() })
+    }
+
+    fn initial_window(&self) -> u64 {
+        fixed_rate_window(self.rate, INITIAL_RTT, 1.0, 0.0, self.mtu)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+#[cfg(test)]
+mod fixed_rate_tests {
+    use super::*;
+
+    const MTU: u64 = 1200;
+    const RATE: u64 = 12_500_000; // 100 Mbps
+
+    #[test]
+    fn window_is_rate_times_rtt_without_loss() {
+        let w = fixed_rate_window(RATE, Duration::from_millis(180), 1.0, 0.0, MTU);
+        assert_eq!(w, 2_250_000); // 12.5 MB/s × 0.18 s
+    }
+
+    #[test]
+    fn window_compensates_by_ack_rate_squared() {
+        let near = |w: u64, want: u64| w.abs_diff(want) <= 1; // 浮点取整误差
+        let w = fixed_rate_window(RATE, Duration::from_millis(100), 0.8, 0.0, MTU);
+        assert!(near(w, 1_953_125), "{w}"); // 1.25 MB / 0.8², 即最大补偿 ≈ 1.56 倍
+        let w = fixed_rate_window(RATE, Duration::from_millis(100), 0.9, 0.0, MTU);
+        assert!(near(w, 1_543_209), "{w}"); // 1.25 MB / 0.81
+    }
+
+    #[test]
+    fn window_respects_gap_cap_and_floor() {
+        // 30% 丢包: gap 封顶 = 800 × 1200 / 0.3 = 3.2 MB, 低于 rate × 1s / 0.8
+        let w = fixed_rate_window(RATE, Duration::from_secs(1), 0.8, 0.3, MTU);
+        assert_eq!(w, gap_safe_cap(MTU, 0.3));
+        // 极小 RTT: 不低于 4 个 MTU
+        let w = fixed_rate_window(RATE, Duration::from_micros(10), 1.0, 0.0, MTU);
+        assert_eq!(w, 4 * MTU);
+    }
+
+    #[test]
+    fn ack_rate_needs_samples_and_is_floored() {
+        assert_eq!(ack_rate_of(10 * MTU, 10 * MTU, MTU), (1.0, 0.0)); // 样本不足 → 不补偿
+        let (r, p) = ack_rate_of(90 * MTU, 10 * MTU, MTU);
+        assert!((r - 0.9).abs() < 1e-9 && (p - 0.1).abs() < 1e-9);
+        let (r, p) = ack_rate_of(50 * MTU, 50 * MTU, MTU); // 50% 丢包: 补偿封顶 0.8, p 保留原值
+        assert_eq!(r, MIN_ACK_RATE);
+        assert!((p - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ack_stats_slots_expire() {
+        let t0 = Instant::now();
+        let mut s = AckStats::new(t0);
+        s.on_ack(t0, 1000);
+        s.on_lost(t0 + Duration::from_millis(500), 100);
+        assert_eq!(s.totals(t0 + Duration::from_secs(1)), (1000, 100));
+        s.on_ack(t0 + Duration::from_secs(3), 500);
+        assert_eq!(s.totals(t0 + Duration::from_secs(3)), (1500, 100));
+        // 第 0 秒的槽在第 5 秒起过期
+        assert_eq!(s.totals(t0 + Duration::from_secs(5)), (500, 0));
+        // 同一槽位被新的一秒复用时清零
+        s.on_ack(t0 + Duration::from_secs(8), 7); // 8 % 5 == 3, 覆盖第 3 秒的槽
+        assert_eq!(s.totals(t0 + Duration::from_secs(8)), (7, 0));
+        assert_eq!(s.last, t0 + Duration::from_secs(8));
     }
 }

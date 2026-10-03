@@ -331,6 +331,8 @@ pub enum InboundConfig {
         // 服务端 → 客户端 (下载) 方向的 brutal 速率上限, 单位 Mbps.
         // 不设 (或 = 0) 则不启用 brutal, 走系统默认 CC (BBR/Cubic).
         // Note: 服务端这一侧决定下载速度, 比客户端的 brutal 设置重要得多.
+        // transport=quic 时同一字段启用 QUIC 定速 CC (按此速率发送、遇丢包不退让, 见 quic_cc::FixedRateConfig);
+        // 不设则 QUIC 走 erasure CC (quic_erasure_cc)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_rate_mbps: Option<u64>,
         // 握手 token 的时间戳容忍窗口 (秒). 客户端时钟与本机相差超过它 → auth 失败.
@@ -533,6 +535,7 @@ pub enum OutboundConfig {
         camouflage_host: String,
         #[serde(default = "default_pool_size")]
         pool_size: usize,
+        /// 客户端 → 服务端 (上传) 方向的 brutal 速率 (Mbps)。transport=quic 时改作 QUIC 定速 CC 的上行速率。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_rate_mbps: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

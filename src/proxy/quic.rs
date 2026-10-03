@@ -77,9 +77,31 @@ fn endpoint_config(obfs: bool) -> quinn::EndpointConfig {
     ec
 }
 
-/// QUIC TransportConfig。`window_mb`/`erasure` 来自 config (见 tuning), 环境变量 `MIRAGE_QUIC_WND`
-/// (MB) / `MIRAGE_QUIC_CC=off` 优先覆盖 (供真机 A/B 调参)。
-fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig> {
+/// QUIC 拥塞控制选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicCc {
+    /// quinn 原生 CC。
+    Stock,
+    /// erasure-aware CC (默认, 见 quic_cc::ErasureConfig)。
+    Erasure,
+    /// 定速 (brutal 语义, 见 quic_cc::FixedRateConfig), 字节/秒。
+    FixedRate(u64),
+}
+
+impl QuicCc {
+    /// 由配置推出: 配了 `brutal_rate_mbps` (>0) → 定速 (优先); 否则按 `quic_erasure_cc` 选 erasure / 原生。
+    pub fn from_config(erasure: bool, brutal_bytes_per_sec: Option<u64>) -> Self {
+        match brutal_bytes_per_sec.filter(|r| *r > 0) {
+            Some(r) => QuicCc::FixedRate(r),
+            None if erasure => QuicCc::Erasure,
+            None => QuicCc::Stock,
+        }
+    }
+}
+
+/// QUIC TransportConfig。`window_mb`/`cc` 来自 config, 环境变量 `MIRAGE_QUIC_WND` (MB) /
+/// `MIRAGE_QUIC_CC=off|erasure` 优先覆盖 (供真机 A/B 调参; 覆盖时不走定速)。
+fn transport_config(window_mb: u64, cc: QuicCc) -> Arc<quinn::TransportConfig> {
     let mut tc = quinn::TransportConfig::default();
 
     // 流控窗口: quinn 默认偏小 (~1MB 级), 高 BDP 长肥路径上单流被窗口卡死 (实测 JP↔US 111ms 仅
@@ -96,16 +118,21 @@ fn transport_config(window_mb: u64, erasure: bool) -> Arc<quinn::TransportConfig
     // (quinn 默认 ~100, 高并发代理不够)。这是对端向本端advertise的上限, 故 client+server 都设。
     tc.max_concurrent_bidi_streams(quinn::VarInt::from_u32(2048));
 
-    let erasure = match std::env::var("MIRAGE_QUIC_CC").ok().as_deref() {
-        Some("off" | "bbr" | "default" | "stock") => false,
-        Some("erasure" | "on") => true,
-        _ => erasure,
+    let cc = match std::env::var("MIRAGE_QUIC_CC").ok().as_deref() {
+        Some("off" | "bbr" | "default" | "stock") => QuicCc::Stock,
+        Some("erasure" | "on") => QuicCc::Erasure,
+        _ => cc,
     };
-    if erasure {
-        tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::ErasureConfig::default()));
-        tracing::info!("QUIC: erasure-aware CC 启用 (窗口 {}MB)", wnd_mb);
-    } else {
-        tracing::info!("QUIC: CC = quinn 原生 (erasure 关, 窗口 {}MB)", wnd_mb);
+    match cc {
+        QuicCc::FixedRate(bps) => {
+            tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::FixedRateConfig { bytes_per_sec: bps }));
+            tracing::info!("QUIC: 定速 CC 启用 ({} Mbps, 窗口 {}MB)", bps / 125_000, wnd_mb);
+        }
+        QuicCc::Erasure => {
+            tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::ErasureConfig::default()));
+            tracing::info!("QUIC: erasure-aware CC 启用 (窗口 {}MB)", wnd_mb);
+        }
+        QuicCc::Stock => tracing::info!("QUIC: CC = quinn 原生 (erasure 关, 窗口 {}MB)", wnd_mb),
     }
     Arc::new(tc)
 }
@@ -133,7 +160,7 @@ pub struct QuicMux {
     /// Salamander 混淆密码 (Some = 开混淆, 把 QUIC 藏成随机 UDP; 两端须一致)。默认关。见 quic_obfs。
     obfs: Option<String>,
     window_mb: u64,
-    erasure: bool,
+    cc: QuicCc,
     pin: Option<String>,
 }
 
@@ -153,7 +180,7 @@ impl QuicMux {
         pre_packet: bool,
         obfs: Option<String>,
         window_mb: u64,
-        erasure: bool,
+        cc: QuicCc,
         pin: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -165,7 +192,7 @@ impl QuicMux {
             pre_packet,
             obfs,
             window_mb,
-            erasure,
+            cc,
             pin,
         })
     }
@@ -189,7 +216,7 @@ impl QuicMux {
                 };
                 let addr = resolve(&self.host, self.port).await?;
                 let mut ep = make_client_endpoint(addr, self.low_src_port, self.pre_packet, self.obfs.as_deref())?;
-                ep.set_default_client_config(client_config(self.window_mb, self.erasure, pin)?);
+                ep.set_default_client_config(client_config(self.window_mb, self.cc, pin)?);
                 g.endpoint = Some(ep);
             }
             // 连接不存在或已关 → 重拨。
@@ -224,7 +251,7 @@ impl QuicMux {
     }
 }
 
-pub fn client_config(window_mb: u64, erasure: bool, pin: &str) -> Result<quinn::ClientConfig> {
+pub fn client_config(window_mb: u64, cc: QuicCc, pin: &str) -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into(),
     )
@@ -237,7 +264,7 @@ pub fn client_config(window_mb: u64, erasure: bool, pin: &str) -> Result<quinn::
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .context("QUIC: rustls→quinn 客户端配置转换失败")?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(qcc));
-    cfg.transport_config(transport_config(window_mb, erasure));
+    cfg.transport_config(transport_config(window_mb, cc));
     Ok(cfg)
 }
 
@@ -324,7 +351,7 @@ pub fn load_or_generate_key(path: &std::path::Path) -> Result<rcgen::KeyPair> {
 pub fn server_endpoint(
     listen_addr: SocketAddr,
     window_mb: u64,
-    erasure: bool,
+    cc: QuicCc,
     obfs: Option<&str>,
     key_path: Option<&str>,
 ) -> Result<quinn::Endpoint> {
@@ -353,7 +380,7 @@ pub fn server_endpoint(
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .context("QUIC: rustls→quinn 服务端配置转换失败")?;
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    server_cfg.transport_config(transport_config(window_mb, erasure));
+    server_cfg.transport_config(transport_config(window_mb, cc));
     match obfs {
         Some(pw) => {
             tracing::info!("QUIC: Salamander 混淆已启用 (服务端)");
@@ -570,6 +597,15 @@ pub fn classify_quic_handshake_error(e: quinn::ConnectionError) -> anyhow::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quic_cc_from_config() {
+        assert_eq!(QuicCc::from_config(true, None), QuicCc::Erasure);
+        assert_eq!(QuicCc::from_config(false, None), QuicCc::Stock);
+        assert_eq!(QuicCc::from_config(true, Some(0)), QuicCc::Erasure); // 0 = 未启用
+        assert_eq!(QuicCc::from_config(true, Some(12_500_000)), QuicCc::FixedRate(12_500_000));
+        assert_eq!(QuicCc::from_config(false, Some(12_500_000)), QuicCc::FixedRate(12_500_000));
+    }
     use rustls::client::danger::ServerCertVerifier;
 
     #[test]
@@ -750,7 +786,7 @@ mod tests {
         let key_path_str = key_path.to_str().unwrap();
 
         let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let ep_server = server_endpoint(listen_addr, 2, false, None, Some(key_path_str)).unwrap();
+        let ep_server = server_endpoint(listen_addr, 2, QuicCc::Stock, None, Some(key_path_str)).unwrap();
         let server_addr = ep_server.local_addr().unwrap();
 
         // 读回服务端的正确 pin
@@ -776,7 +812,7 @@ mod tests {
         });
 
         // 1) 正确 pin 客户端: 能握手并读写数据
-        let client_cfg = client_config(2, false, &correct_pin).unwrap();
+        let client_cfg = client_config(2, QuicCc::Stock, &correct_pin).unwrap();
         let mut ep_client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         ep_client.set_default_client_config(client_cfg);
 
@@ -792,7 +828,7 @@ mod tests {
         // 2) 错误 pin 客户端: 握手失败
         let wrong_key = rcgen::KeyPair::generate().unwrap();
         let wrong_pin = spki_pin(&wrong_key.public_key_der());
-        let bad_client_cfg = client_config(2, false, &wrong_pin).unwrap();
+        let bad_client_cfg = client_config(2, QuicCc::Stock, &wrong_pin).unwrap();
         let mut ep_bad = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         ep_bad.set_default_client_config(bad_client_cfg);
 

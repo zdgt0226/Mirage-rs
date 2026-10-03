@@ -22,7 +22,7 @@ pub struct PoolConfig {
     pub underlying: Option<Arc<OutboundNode>>,
     /// 前向保密: 握手做一次性 X25519 ECDH (见 crypto::pfs)。须与服务端 pfs 同开。默认 false。
     pub pfs: bool,
-    /// 底层传输 (tcp 默认 / quic 实验)。quic 时忽略 underlying/brutal (QUIC 自带 UDP 传输 + CC)。
+    /// 底层传输 (tcp 默认 / quic 实验)。quic 时忽略 underlying; brutal_rate_mbps 改作 QUIC 定速 CC 的上行速率。
     pub transport: crate::config::Transport,
     /// QUIC 流控窗口 (MB, 默认 16); erasure CC 开关 (默认 true)。仅 transport=quic 生效。
     pub quic_window_mb: u64,
@@ -466,7 +466,7 @@ impl WarmPool {
                 cfg.quic_pre_packet,
                 cfg.quic_obfs.clone(),
                 cfg.quic_window_mb,
-                cfg.quic_erasure_cc,
+                crate::proxy::quic::QuicCc::from_config(cfg.quic_erasure_cc, brutal_state.configured_rate),
                 cfg.quic_pin.clone(),
             ))
         } else {

@@ -117,12 +117,29 @@ QUIC 落后原因定位（同时段对照，各 3 轮）：
 
 → 瓶颈不在窗口，而在**拥塞控制策略**：hysteria2 按设定带宽定速发送、遇丢包不退让（与 brutal 同思路）；Mirage QUIC 的 erasure CC 仍随链路自适应降速（比默认 BBR 快约 6 倍，但不及定速）。
 
+### 3.4 QUIC 定速模式实测（2026-10-03 22:50–23:45，C1 → S1，丢包 5–35% 波动）
+
+新增 QUIC 定速模式（复用 `brutal_rate_mbps`，见 `docs/quic-transport-design.md` §5.8）后同时段交错对比（Mbps）：
+
+| 组合 | 结果 |
+|---|---|
+| sing-box hysteria2（100） | 77–90，中位 ≈ 87 |
+| **Mirage QUIC 定速 100（最终版，窗口 rate × RTT / ack_rate²）** | **58–76**（13 轮中 1 轮塌陷到 2.3） |
+| Mirage QUIC 定速 100（只补偿一次 / ack_rate） | 63–70 |
+| Mirage QUIC erasure CC（改动前默认） | 31–63 |
+| Mirage TCP + brutal 100 | 4–32 |
+
+调参对照：固定增益 1.5 → 71–81（但干净链路会超发 1.5 倍，弃用）；流控窗口 4MB → 49–71、8MB → 25–80（无稳定提升）。
+服务端 CPU：定速 49–76 s/GB，hysteria2 62–74 s/GB，相当。
+
+结论：定速比 erasure 提升约 30–50%，与 hysteria2 的差距由 37% 缩到约 20–25%；剩余差距不在流控窗口。重丢包（15% 以上）下 QUIC 远胜 TCP。
+
 ### 结论
 
 - **TCP 侧 Mirage 全面不输**：与同为伪装 TLS 的 anytls + REALITY 相比，回环吞吐约 2×、服务端 CPU 约 ½；与无伪装的 ss2022 相比吞吐持平或略高、服务端 CPU 持平、客户端 CPU 少约 25%。
 - **brutal 路径 CPU 省约 55–65%**（sing-box 的 brutal 必须叠 h2mux）。
 - **内存约为 sing-box 的 1/3–1/5**。
-- **QUIC 侧落后 hysteria2**（51 vs 81 Mbps），原因是 CC 策略；改进方案见 README 计划池「QUIC 定速模式」。
+- **QUIC 侧落后 hysteria2**（51 vs 81 Mbps），原因是 CC 策略；新增定速模式后提升到 58–76 vs 77–90（§3.4）。
 
 ---
 

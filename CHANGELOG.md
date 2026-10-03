@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### feat(quic): QUIC 定速模式 (复用 brutal_rate_mbps, 实验) (2026-10-03)
+
+- **新增 `quic_cc::FixedRateConfig`**: transport=quic 时, 服务端入站配了 `brutal_rate_mbps` 即下行按该速率定速发送, 客户端出站配了即上行定速; 不配仍为 erasure CC, 行为不变。一个客户端一条 QUIC 连接 (mux), 速率天然按客户端计。
+- **窗口公式**: rate × smoothed RTT / ack_rate² —— ack_rate 取最近 5 个 1 秒槽的送达率 (下限 0.8, 样本不足 50 个 MTU 视为无丢包), 第一次补偿丢包重发量、第二次补偿丢失包判定前占用的窗口; 无丢包时为 1 不超发, 最多约 1.56 倍。丢包只记账不退让; gap-safety 封顶 (防 quinn 乱序上限关连接) 照常, 抽为 erasure 与定速共用的 `gap_safe_cap`。
+- **`QuicCc` 枚举** 取代原 `erasure: bool` 参数 (Stock / Erasure / FixedRate); `MIRAGE_QUIC_CC=off|erasure` 覆盖时不走定速。
+- **实测** (晚间, 丢包 5–35%): 定速 100 → 58–76 Mbps, erasure 31–63, sing-box hysteria2 77–90, TCP+brutal 100 4–32; 与 hysteria2 差距由 37% 缩到约 20–25%。详见 `docs/benchmark-2026-09.md` §3.4 与 `docs/quic-transport-design.md` §5.8。
+
 ### feat(install): brutal 版本可选 (v2 / v1.0.3) + 脚本语法与显示结构优化 (2026-10-02)
 
 - **`install.sh` 支持选择 Brutal 版本 (v2 最新 / v1.0.3 老内核兼容)**:
