@@ -25,6 +25,14 @@ title() {
     printf "\n\033[1;35m%s\n  %s\n%s\033[0m\n\n" "$line" "$*" "$line" >&2
 }
 
+section_box() {
+    local box_title=$1
+    local line; line=$(printf '═%.0s' {1..51})
+    printf "\n%s\n  %s\n%s\n" "$line" "$box_title" "$line" >&2
+    cat >&2
+    printf "%s\n" "$line" >&2
+}
+
 ask() {
     local prompt=$1 default=${2:-} val
     local hint=""
@@ -56,7 +64,8 @@ _render_choice() {
 
 ask_choice() {
     local prompt=$1; shift
-    local options=("$@") n=${#options[@]} val
+    local options=("$@")
+    local n=${#options[@]} val
     _render_choice "$prompt" "${options[@]}"
     while :; do
         read -rp "    选择 [1-$n] (默认 1): " val </dev/tty
@@ -190,7 +199,10 @@ parse_node_uri() {
     NODE_HOST="${BASH_REMATCH[2]}"
     NODE_PORT="${BASH_REMATCH[3]}"
     local query="${BASH_REMATCH[5]:-}"
-    local IFS='&'; local pairs=($query); unset IFS
+    local pairs=()
+    if [[ -n "$query" ]]; then
+        IFS='&' read -r -a pairs <<< "$query"
+    fi
     for p in "${pairs[@]}"; do
         local k="${p%%=*}" v="${p#*=}"
         case "$k" in
@@ -272,7 +284,8 @@ suggest_camouflage_host() {
   若候选太少, 可按子网掩码扩大 —— 同一家机房常在相邻网段还有别的前缀,
   它们仍属同一 ASN, 照样满足 SNI/IP 一致性。代价是耗时成倍增加。
 EOM
-    local range=$(ask_choice "搜索范围" \
+    local range
+    range=$(ask_choice "搜索范围" \
         "通告前缀 (最快, 约 256 地址)" \
         "扩到 /22 (约 1024 地址, 慢约 3~4 倍)" \
         "扩到 /20 (约 4096 地址, 慢约 10 倍以上)")
@@ -313,9 +326,27 @@ EOM
     echo "$chosen"
 }
 
+readonly BRUTAL_V1_VERSION="v1.0.3"
+
+# 版本比较: $1 >= $2 返回 0, 否则返回 1
+version_ge() {
+    [[ "$1" == "$2" ]] && return 0
+    local lowest
+    lowest=$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)
+    [[ "$lowest" == "$2" ]]
+}
+
 brutal_loaded() {
     [[ -f /proc/sys/net/ipv4/tcp_available_congestion_control ]] && \
         grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control
+}
+
+brutal_version() {
+    local ver=""
+    if [[ -r /sys/module/brutal/version ]]; then
+        ver=$(cat /sys/module/brutal/version 2>/dev/null | tr -d '[:space:]')
+    fi
+    echo "${ver:-未知}"
 }
 
 # 探测本机公网 IP. 顺序尝试多个公共 echo 服务, 取第一个返回合法 IPv4 的.
@@ -341,18 +372,76 @@ detect_public_ip() {
 
 handle_brutal_optional() {
     info "Brutal 是给单条连接定速的内核模块（Hysteria2 思路），极大地优化高丢包线路"
+    local was_loaded=0 cur_ver=""
     if brutal_loaded; then
-        ok "已检测到 Brutal 内核模块"
-        return 0
-    fi
-    if ! ask_yn "未检测到 Brutal 内核模块。需要为本机一键安装吗？（VPS 推荐开启，能跑满带宽）" y; then
-        return 1
+        was_loaded=1
+        cur_ver=$(brutal_version)
+        ok "已检测到 Brutal 内核模块 (版本: ${cur_ver})"
+        if [[ "$cur_ver" =~ ^1\. ]]; then
+            warn "当前为 v1.x 版本，无客户端分组限速 (多连接并发会叠加超发)"
+        fi
+        if ! ask_yn "是否更换 Brutal 版本?" n; then
+            return 0
+        fi
     fi
 
-    info "下载并运行官方一键脚本：curl -fsSL https://tcp.hy2.sh/ | bash"
-    if curl -fsSL https://tcp.hy2.sh/ | bash >&2; then
+    local kernel_ver
+    kernel_ver=$(uname -r)
+    local opt1_text="v2 最新 (推荐: 按客户端分组限总速, 需内核 ≥ 5.10)"
+    if ! version_ge "$kernel_ver" "5.10"; then
+        opt1_text="v2 最新 (本机内核 ${kernel_ver} 不支持, 需内核 ≥ 5.10)"
+    fi
+
+    local choice
+    choice=$(ask_choice "选择 Brutal 安装版本" \
+        "$opt1_text" \
+        "${BRUTAL_V1_VERSION} (兼容内核 < 5.10; 每条连接独立限速, 多连接会叠加)" \
+        "不安装 (使用系统默认 BBR)")
+
+    case "$choice" in
+        1)
+            if ! version_ge "$kernel_ver" "5.10"; then
+                warn "本机内核 ${kernel_ver} 低于 5.10 不支持 v2，自动改用 ${BRUTAL_V1_VERSION}"
+                choice=2
+            fi
+            ;;
+        2)
+            ;;
+        3)
+            if (( was_loaded == 1 )); then
+                info "保持当前已加载的 Brutal (版本: ${cur_ver})"
+                return 0
+            fi
+            info "已跳过 Brutal 安装，将使用系统默认拥塞控制 (BBR)"
+            return 1
+            ;;
+    esac
+
+    local install_args=()
+    if (( choice == 2 )); then
+        install_args+=(--version "$BRUTAL_V1_VERSION")
+    fi
+    if (( was_loaded == 1 )); then
+        install_args+=(-f)
+    fi
+
+    local desc_args=""
+    if (( ${#install_args[@]} > 0 )); then
+        desc_args=" -s -- ${install_args[*]}"
+    fi
+    info "下载并运行官方一键脚本：curl -fsSL https://tcp.hy2.sh/ | bash${desc_args}"
+
+    if curl -fsSL https://tcp.hy2.sh/ | bash -s -- ${install_args[@]+"${install_args[@]}"} >&2; then
         if brutal_loaded; then
-            ok "Brutal 内核模块装好并已加载"
+            local new_ver want_major=2
+            new_ver=$(brutal_version)
+            (( choice == 2 )) && want_major=1
+            if [[ "$new_ver" =~ ^${want_major}\. ]]; then
+                ok "Brutal 内核模块装好并已加载 (版本: ${new_ver})"
+            else
+                # 更换版本时旧模块可能仍被占用 (运行中的服务持有引用), 内核里仍是旧版
+                warn "已安装所选版本, 但当前加载的仍是 ${new_ver}: 需重启服务器, 或停止使用 brutal 的服务后执行 rmmod brutal && modprobe brutal"
+            fi
             return 0
         else
             warn "安装完成但未检测到 brutal，可能是内核不兼容或需要重启。"
@@ -574,7 +663,8 @@ detect_init() {
 
 # 输出 init-aware 的启动/日志命令提示 (供安装完成后打印).
 svc_start_hint() { # role
-    local n=$(svc_name "$1")
+    local n
+    n=$(svc_name "$1")
     case "$INIT_SYS" in
         openrc)   echo "rc-service $n start" ;;
         sysvinit) echo "service $n start" ;;
@@ -582,7 +672,8 @@ svc_start_hint() { # role
     esac
 }
 svc_restart_hint() { # role
-    local n=$(svc_name "$1")
+    local n
+    n=$(svc_name "$1")
     case "$INIT_SYS" in
         openrc)   echo "rc-service $n restart" ;;
         sysvinit) echo "service $n restart" ;;
@@ -656,7 +747,8 @@ remote_version() {
 
 # init-aware 服务控制 (start/stop/restart) 与运行状态查询. 未装服务时静默.
 svc_ctl() { # action role
-    local action=$1 svc=$(svc_name "$2")
+    local action=$1 svc
+    svc=$(svc_name "$2")
     case "$INIT_SYS" in
         openrc)   rc-service "$svc" "$action" 2>/dev/null || true ;;
         sysvinit) service "$svc" "$action" 2>/dev/null || "/etc/init.d/$svc" "$action" 2>/dev/null || true ;;
@@ -665,7 +757,8 @@ svc_ctl() { # action role
     esac
 }
 service_active() { # role
-    local svc=$(svc_name "$1")
+    local svc
+    svc=$(svc_name "$1")
     case "$INIT_SYS" in
         systemd)  systemctl is-active --quiet "$svc" 2>/dev/null ;;
         openrc)   rc-service "$svc" status >/dev/null 2>&1 ;;
@@ -881,7 +974,8 @@ svc_cfg() {
 # 停掉并 disable 旧的 (不删配置, 用户想切回去只需重新跑安装)。
 stop_other_mode_service() {
     local role=$1
-    local other=$(svc_other_name "$role")
+    local other
+    other=$(svc_other_name "$role")
     local found=false
     case "$INIT_SYS" in
         systemd)  [[ -f "/etc/systemd/system/${other}.service" ]] && found=true ;;
@@ -913,7 +1007,9 @@ stop_other_mode_service() {
 setup_service() {
     local role=$1
     stop_other_mode_service "$role"
-    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
+    local _subcmd _cfgpath
+    _subcmd=$(svc_subcmd "$role")
+    _cfgpath=$(svc_cfg "$role")
     case "$INIT_SYS" in
         systemd)  setup_systemd "$role" ;;
         openrc)   setup_openrc  "$role" ;;
@@ -930,8 +1026,10 @@ setup_service() {
 # 注意: SysV 无 supervisor, 崩溃不自动重启 (systemd/OpenRC 才有). 可接受降级.
 setup_sysv() {
     local role=$1
-    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
-    local svc=$(svc_name "$role")
+    local _subcmd _cfgpath svc
+    _subcmd=$(svc_subcmd "$role")
+    _cfgpath=$(svc_cfg "$role")
+    svc=$(svc_name "$role")
     local init_path="/etc/init.d/${svc}"
 
     cat > "$init_path" <<EOF
@@ -1011,8 +1109,10 @@ EOF
 # systemd Restart=on-failure). memlock unlimited 供 eBPF 用.
 setup_openrc() {
     local role=$1
-    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
-    local svc=$(svc_name "$role")
+    local _subcmd _cfgpath svc
+    _subcmd=$(svc_subcmd "$role")
+    _cfgpath=$(svc_cfg "$role")
+    svc=$(svc_name "$role")
     local init_path="/etc/init.d/${svc}"
 
     cat > "$init_path" <<EOF
@@ -1051,8 +1151,10 @@ EOF
 
 setup_systemd() {
     local role=$1
-    local _subcmd=$(svc_subcmd "$role") _cfgpath=$(svc_cfg "$role")
-    local service_path="/etc/systemd/system/$(svc_name "$role").service"
+    local _subcmd _cfgpath service_path
+    _subcmd=$(svc_subcmd "$role")
+    _cfgpath=$(svc_cfg "$role")
+    service_path="/etc/systemd/system/$(svc_name "$role").service"
 
     # proxy_local 客户端: 把 resolv.conf 的改动绑到服务生命周期。ExecStopPost 即便主进程被
     # SIGKILL 也会执行 → 服务一停就还原, 不会留下"指着死 mirage 的 resolv.conf = 机器没 DNS"。
@@ -1112,7 +1214,8 @@ ask_upstream() {
 EOM
     ask_yn "是否配置上游出口?" n || { echo ""; return; }
 
-    local kind=$(ask_choice "上游类型" \
+    local kind
+    kind=$(ask_choice "上游类型" \
         "Shadowsocks (仅 TCP; UDP 默认阻断)" \
         "WireGuard (TCP + UDP 同出口; 还可让 DNS 也走隧道)")
     if [[ "$kind" == "2" ]]; then
@@ -1128,7 +1231,8 @@ EOM
     fi
     ss_port=$(ask "上游 SS 端口" "8388")
     ss_pwd=$(ask "上游 SS 密码" "")
-    local m=$(ask_choice "上游 SS 加密方式" \
+    local m
+    m=$(ask_choice "上游 SS 加密方式" \
         "aes-256-gcm (SIP004, 兼容性最好)" \
         "chacha20-ietf-poly1305 (SIP004, 无 AES 硬件加速时更快)" \
         "aes-128-gcm (SIP004)" \
@@ -1231,9 +1335,10 @@ config_lite_server() {
   轻量服务端可以直接给完整版客户端用。
 EOM
     # 443 伪装效果最好, 但属特权端口; 这里跑在 root 下装 systemd 服务, 故无 bind 问题。
-    local port=$(ask_port "监听端口 [1-65535] (443 伪装最好, 也可自定义)" "443" tcp)
-    local rand_pwd=$(generate_password)
-    local pwd=$(ask "认证密码" "$rand_pwd")
+    local port rand_pwd pwd sni ss_up
+    port=$(ask_port "监听端口 [1-65535] (默认 443; 实测非 443 性能无差异, 被占用可改)" "443" tcp)
+    rand_pwd=$(generate_password)
+    pwd=$(ask "认证密码" "$rand_pwd")
 
     local sni_default="www.apple.com"
     if ask_yn "是否自动搜索同 ASN 的伪装域名候选? (提升 SNI/IP 一致性)" n; then
@@ -1243,9 +1348,9 @@ EOM
             ok "已选定候选: $found"
         fi
     fi
-    local sni=$(ask_camouflage_host "$sni_default")
+    sni=$(ask_camouflage_host "$sni_default")
 
-    local ss_up=$(ask_upstream)
+    ss_up=$(ask_upstream)
     local upstream_line=""
     [[ -n "$ss_up" ]] && upstream_line=",
     \"upstream\": ${ss_up}"
@@ -1327,8 +1432,9 @@ EOM
         sni=$(ask_camouflage_host "www.apple.com")
     fi
 
-    local listen=$(ask "本地 SOCKS5 监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0)" "127.0.0.1")
-    local lport=$(ask_port "本地 SOCKS5 监听端口" "1080" tcp)
+    local listen lport
+    listen=$(ask "本地 SOCKS5 监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0)" "127.0.0.1")
+    lport=$(ask_port "本地 SOCKS5 监听端口" "1080" tcp)
 
     # 与完整版同一策略: 非回环监听必须设认证, 否则是开放代理。
     local auth_json=""
@@ -1379,18 +1485,15 @@ EOF
 config_server() {
     title "配置 Mirage-rs 服务端"
     
-    local port=$(ask_port "监听端口 [1-65535]" "443" tcp)
-    local rand_pwd=$(generate_password)
-    local pwd=$(ask "认证密码" "$rand_pwd")
+    local port rand_pwd pwd
+    port=$(ask_port "监听端口 [1-65535]" "443" tcp)
+    rand_pwd=$(generate_password)
+    pwd=$(ask "认证密码" "$rand_pwd")
 
     # 伪装 SNI: 可先自动搜索"与本机同 ASN"的候选, 搜到的作为默认值,
     # 再走原有的 TLS1.3 探测 + 人工确认流程 (ask_camouflage_host).
     local sni_default="www.apple.com"
-    cat >&2 <<'EOM'
-
-═══════════════════════════════════════════════════
-  伪装 SNI 域名 —— SNI/IP 一致性 (可选自动搜索)
-═══════════════════════════════════════════════════
+    section_box "伪装 SNI 域名 —— SNI/IP 一致性 (可选自动搜索)" <<'EOM'
   伪装域名若与本机 IP 不在同一网络 (例如 SNI 填 speedtest.net
   却打到某小机房 VPS), 企业防火墙的"SNI 归属 ASN vs 目的 IP
   ASN 一致性"检查会盯上它 —— 这是被动关联暴露面。
@@ -1412,35 +1515,29 @@ EOM
             warn "未采用自动搜索结果, 回落手动输入"
         fi
     fi
-    local sni=$(ask_camouflage_host "$sni_default")
+    local sni
+    sni=$(ask_camouflage_host "$sni_default")
     
     local brutal_rate_mbps=0
     if handle_brutal_optional; then
-        cat >&2 <<'EOM'
+        section_box "Brutal CC 单连接目标速率" <<'EOM'
+  Brutal 给单条 TCP 死磕设定速率, 遇丢包不退让. 适合跨境
+  "高 RTT + 丢包"线路: 实测晚高峰 BBR 在 5~59 Mbps 间大幅摆动,
+  brutal 稳定得多 (见 docs/benchmark-2026-09.md §4).
 
-═══════════════════════════════════════════════════
-  Brutal CC 单连接目标速率
-═══════════════════════════════════════════════════
-  Brutal 给单条 TCP 死磕设定速率, 不让步. 适合"高 RTT 低
-  丢包"链路 (跨洲专线 / 移动 4G/5G), BBR 这种自适应 CC 在
-  丢包链路上会被拖慢, brutal 反而能跑满.
+  没有自动回落: 设定后始终按此速率发送. 不适合的链路 (低 RTT
+  高丢包 / CDN 前置) 请设 0 关掉, 让系统默认 BBR 自适应.
 
-  v0.4.4-alpha.10 起跟 Python POC 完全对齐 (cwnd_gain=15,
-  无 autofallback, 死磕速率到底). 不适合的链路 (低 RTT 高
-  丢包 / CDN) 上 brutal 反而拖慢吞吐 — 这种链路请设 rate=0
-  关掉, 让系统默认 BBR 自适应.
-
-  推荐取值: 链路带宽的 30~50%.
-    100M 出口  → 30~50 Mbps
-    1G   出口  → 300~500 Mbps
-  太高 → 拥塞导致重传放大. 太低 → 自我限速. 设错就改 config
-  里 brutal_rate_mbps 重启服务即可.
-═══════════════════════════════════════════════════
+  取值 = 客户端实际能跑到的跨境带宽 (不是 VPS 端口速率):
+    跨境丢包线路一般 50~150 Mbps, 默认 100.
+    设太高 → 自己灌满线路, 重传放大 (实测 200 时重传 ~30%,
+             吞吐反不如 100); 设太低 → 被硬限在该值.
+  设错就改 config 里 brutal_rate_mbps 重启服务即可.
 EOM
-        # 探测公网链路带宽以建议默认值 (失败回退到 50)
-        local default_rate=50
-        brutal_rate_mbps=$(ask "Brutal 单连接目标速率 (Mbps, 推荐链路带宽 30-50%)" "$default_rate")
-        info "Brutal 单连接速率: ${brutal_rate_mbps} Mbps (不适合的链路会自动回落到 BBR)"
+        # 默认 100: 跨境丢包线路实测甜点 (50 被硬限在 ~48, 200 重传 ~30%), 见 docs/benchmark-2026-09.md §4
+        local default_rate=100
+        brutal_rate_mbps=$(ask "Brutal 目标速率 (Mbps, 取客户端实际跨境带宽, 0=关闭)" "$default_rate")
+        info "Brutal 速率: ${brutal_rate_mbps} Mbps (无自动回落; 不合适请改为 0 用 BBR)"
     fi
 
     local brutal_line=""
@@ -1449,7 +1546,8 @@ EOM
     fi
 
     # 上游出口 (中转站模式), 不配则为空串
-    local ss_up_full=$(ask_upstream)
+    local ss_up_full
+    ss_up_full=$(ask_upstream)
     local upstream_line=""
     [[ -n "$ss_up_full" ]] && upstream_line=",
             \"upstream\": ${ss_up_full}"
@@ -1462,7 +1560,8 @@ EOM
         info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
     fi
 
-    local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
+    local log_level
+    log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
@@ -1639,10 +1738,11 @@ config_client() {
         sni=$(ask_camouflage_host "www.apple.com")
     fi
 
-    local inbound_port=$(ask_port "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080" tcp)
+    local inbound_port inbound_listen
+    inbound_port=$(ask_port "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080" tcp)
     # 默认回环: 监听 0.0.0.0 而不鉴权 = 开放代理, 任何能连到的人都能白嫖隧道,
     # 出口 IP 会被滥用/拉黑 (对抗审查部署尤其致命)。要 LAN 共享就必须设凭据。
-    local inbound_listen=$(ask "本地代理监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0, 会要求设账号密码)" "127.0.0.1")
+    inbound_listen=$(ask "本地代理监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0, 会要求设账号密码)" "127.0.0.1")
     local inbound_auth_json=""
     if [[ "$inbound_listen" != "127.0.0.1" && "$inbound_listen" != "::1" && "$inbound_listen" != "localhost" ]]; then
         cat >&2 <<'EOM'
@@ -1767,7 +1867,8 @@ EOM
         }'
     fi
 
-    local pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
+    local pool_size
+    pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
 
     # UDP 多路复用: 多条透明 UDP 流复用少量共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"的带机量硬伤
     # (真机实测并发天花板 20→450+)。默认开 —— 需服务端同版本 (老服务端不认 mux, 那些 UDP 流回落 TCP)。
@@ -1840,7 +1941,8 @@ EOM
             ;;
     esac
     
-    local log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
+    local log_level
+    log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
@@ -2443,7 +2545,8 @@ main() {
         warn "未检测到 systemd / OpenRC / SysV init, 服务将不会自动注册 (可手动前台运行)。"
     fi
 
-    local mode=$(ask_choice "请选择操作" \
+    local mode
+    mode=$(ask_choice "请选择操作" \
         "部署服务端" \
         "部署客户端" \
         "服务端 + 客户端 (同机部署)" \
@@ -2473,7 +2576,8 @@ main() {
 
   拿不准就选完整版 —— 它能做轻量版的一切, 只是要多配几项。
 EOM
-    local form=$(ask_choice "选择部署形态" "完整版 (功能齐全)" "轻量版 (只要能翻墙)")
+    local form
+    form=$(ask_choice "选择部署形态" "完整版 (功能齐全)" "轻量版 (只要能翻墙)")
     [[ "$form" == "2" ]] && LITE_MODE=true
     if [[ "$LITE_MODE" == true ]]; then
         ok "已选择轻量版: SOCKS5 全部转发, 仅 TCP"

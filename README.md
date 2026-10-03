@@ -53,7 +53,7 @@
 
 **alpha.4+ 起提供交互式安装向导 `install.sh`**, 会自动 (需 root):
 - 下载最新预编译二进制到 `/usr/local/bin/mirage-rs` (含 SHA256 双通道校验)
-- 探测公网 IP + 端口占用检测 + Brutal 内核模块
+- 探测公网 IP + 端口占用检测 + Brutal 内核模块 (可选 v2 最新按客户端分组限速 / v1.0.3 兼容 <5.10 老内核)
 - 生成服务端 / 客户端 config, 写 systemd unit —— 完整版 `mirage-rs-{server,client}.service`,
   轻量版 `mirage-rs-lite-{server,client}.service`(名字区分, 一眼看出装的是哪个模式)
 - **选择部署形态**: 完整版 (分流/DNS/透明网关/看板) 或**轻量版** (只要能翻墙, 配置极简)
@@ -423,6 +423,7 @@ mirage-rs config -c config.json
 
 ### ⏳ 未完成 (计划池)
 
+- [ ] **QUIC 定速模式 (待选优化)** —— 实测 (见 [`docs/benchmark-2026-09.md`](docs/benchmark-2026-09.md) §3.3): 晚间同线路 Mirage QUIC 51 Mbps vs sing-box hysteria2 81 Mbps; 窗口 2→8MB 无改善、关 erasure CC 跌到 ≈8 → 瓶颈是 CC 策略 (erasure CC 仍自适应降速, hysteria2 按设定带宽定速不退让)。方案: QUIC 腿增加可选定速发送 (复用 `brutal_rate_mbps` 语义, 按目标速率 pacing + 丢包补偿, 不随丢包退让), 默认仍 erasure CC; 需评估自淹风险 (rate 高于实际带宽时重传放大, 同 TCP brutal) 与 quinn CC 接口可行性。QUIC 仍为实验特性 (release 不含), 优先级低于 TCP 主链路。
 - [ ] **QUIC 腿 ECH GREASE (D, 暂缓, 仅 QUIC 腿)** —— ⚠️ **TCP 主协议 ClientHello 的 ECH GREASE 早已实现** (`crypto/tls_raw.rs` `ech_grease_ext`, Chrome 250B + Firefox 281B, config_id/enc/payload 每连接随机)。此项特指 **QUIC 腿** (rustls QUIC ClientHello) 的 ECH, 用来蹭 GFW 2025 初"不封带 ECH 的 QUIC"盲区。卡点: rustls ECH 的 HPKE 只在 aws-lc-rs provider (Mirage 用 ring, 换 provider 毁 Android/musl 交叉编译); 且 rustls QUIC ClientHello 本就非 Chrome 形状 (Rust 无 uTLS), 单加 ECH 收益有限; QUIC 腿尚未进 release。待手写最小 HPKE (ring 原语) 或 QUIC 腿转正后再评
 - [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
 
