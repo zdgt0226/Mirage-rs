@@ -147,12 +147,27 @@ QUIC 落后原因定位（同时段对照，各 3 轮）：
 
 根因：2MB 流控窗口在丢包时被队头阻塞卡住（≈ 窗口 / 3 RTT），而窗口一放大，quinn 的乱序段上限 `MAX_CHUNKS = 1024` 就会被突破并断连。补丁与取舍见 `docs/quic-transport-design.md` §5.9 与 `third_party/quinn-proto/MIRAGE-PATCH.md`。
 
+### 3.6 补丁后公网复测（2026-10-04 21:06–21:25，v0.15.1-4-ga7eb833，C1 → S1，丢包 5–20%）
+
+QUIC 默认 8MB 窗口 + quinn-proto `MAX_CHUNKS` 补丁后，同时段交错（50MB；前 5 轮丢包 5–10%，后 3 轮 15–20%；Mbps）：
+
+| 组合 | 前 5 轮 | 后 3 轮 | 服务端 CPU s/GB |
+|---|---|---|---|
+| **Mirage QUIC 定速 100** | **78 / 78 / 83 / 80 / 83** | **82 / 79 / 84** | **54–56** |
+| sing-box hysteria2（100） | 67 / 76 / 78 / 77 / 76 | 78 / 76 / 78 | 66–79 |
+| Mirage QUIC erasure | 68 / 64 / 64 / 61 / 65 | 67 / 79 / 79 | 57–70 |
+| Mirage TCP + brutal 100 | 77 / 77 / 18 / 11 / 7 | — | 13–16 |
+
+内存 RSS：Mirage 空闲 11MB、峰值 36MB（8MB 窗口）；sing-box 42MB → 63MB。客户端无连接错误日志。
+
+对比补丁前同线路（§3.4）：定速 58–76 → **78–84**，erasure 31–63 → 61–79；hysteria2 本轮 67–78。**补丁后 Mirage QUIC 定速在公网上反超 hysteria2，服务端 CPU 少约 20%。**
+
 ### 结论
 
 - **TCP 侧 Mirage 全面不输**：与同为伪装 TLS 的 anytls + REALITY 相比，回环吞吐约 2×、服务端 CPU 约 ½；与无伪装的 ss2022 相比吞吐持平或略高、服务端 CPU 持平、客户端 CPU 少约 25%。
 - **brutal 路径 CPU 省约 55–65%**（sing-box 的 brutal 必须叠 h2mux）。
 - **内存约为 sing-box 的 1/3–1/5**。
-- **QUIC 侧**：原先落后 hysteria2（51 vs 81 Mbps）；定速模式后公网 58–76 vs 77–90（§3.4）；定位到 quinn 乱序段上限并打补丁、默认窗口改 8MB 后，实验环境中与 hysteria2 持平（§3.5）。
+- **QUIC 侧**：原先落后 hysteria2（51 vs 81 Mbps）；定速模式后公网 58–76 vs 77–90（§3.4）；定位到 quinn 乱序段上限并打补丁、默认窗口改 8MB 后，实验环境中与 hysteria2 持平（§3.5），公网复测反超（定速 78–84 vs 67–78，服务端 CPU 少约 20%，§3.6）。
 
 ---
 

@@ -14,6 +14,7 @@
 - **新增 `third_party/quinn-proto`**: quinn-proto 0.11.17 原样副本, 经 `[patch.crates-io]` 替换, 只把 `MAX_CHUNKS` 改为 8192; 原因、安全取舍 (未认证对端最坏 defragment CPU 上升, 内存仍受接收窗口约束) 与升级重打步骤见 `MIRAGE-PATCH.md`。端点门禁排除 `third_party/`。
 - **QUIC 默认流控窗口 2MB → 8MB** (`config::DEFAULT_QUIC_WINDOW_MB`, 两端统一; 下载方向起作用的是客户端接收窗口)。`GAP_SAFE_CHUNKS` 同比例 800 → 6400。
 - **效果** (netns, RTT 180ms, 100 Mbps): 10% / 20% 丢包下定速 66–71 / 49–61 Mbps, sing-box hysteria2 63–73 / 50–60, 基本持平 (补丁前 27–31 / 20–23); erasure 也由 27–31 升至 47–66; 无丢包定速 50 实测 43–44 不超发。详见 `docs/benchmark-2026-09.md` §3.5。
+- **公网复测** (晚间, 丢包 5–20%): 定速 78–84 Mbps vs hysteria2 67–78, erasure 61–79 (补丁前 58–76 / 31–63); 服务端 CPU 定速约少 20%。详见 §3.6。
 
 ### feat(quic): QUIC 定速模式 (复用 brutal_rate_mbps, 实验) (2026-10-03)
 
