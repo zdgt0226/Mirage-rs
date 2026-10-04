@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### docs: 多版本实测对比 (v0.5 → v0.15.2) + 测试路径说明 (2026-10-05)
+
+- `docs/benchmark-2026-09.md` 新增 §5: 7 个大版本在两台 VPS 上的直连 (穿 GFW) 长时间观测、处理效率、抗审查静态测试 (主动探测回应 / 原样重放 / OpenGFW fet·trojan / ClientHello·ServerHello 特征)。结论: TCP 性能自 v0.5 起持平; 实测可量化的抗审查提升集中在 v0.15 (非 TLS 探测回应与真站一致、ServerHello key_share 不再跨连接重复)。
+- 测试环境补路径说明: 此前由本地客户端发起的公网测试经局域网网关代理出境、不直接穿过 GFW, 涉及「GFW 如何对待该流量」的结论以国内直连客户端数据为准。
+
 ## [v0.15.2] - release 二进制带上 QUIC + QUIC 高丢包吞吐修复 + install.sh brutal 版本可选 (2026-10-04)
 
 ### 升级须知
