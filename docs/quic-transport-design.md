@@ -254,8 +254,34 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 **真机结果** (2026-10-03 22:50–23:45 CST, 美西 VPS ↔ 国内家宽, RTT ≈ 180ms, 丢包 5–35% 波动, 50MB × 交错; 详见
 `docs/benchmark-2026-09.md` §3.4): 定速 100 → 58–76 Mbps (13 轮中 1 轮塌陷到 2.3, 同期 TCP 也有 3.7 的低点, 疑为突发
 重丢包, 未复现), erasure CC 31–63, hysteria2 79–90, TCP + brutal 100 仅 4–32。比 erasure 提升约 30–50%, 与 hysteria2
-的差距由 37% 缩到约 20–25%。流控窗口 4MB / 8MB 均无稳定提升 (8MB 更不稳), 剩余差距不在窗口, 待查 quinn 丢包恢复 /
-ACK 频率 / 接收侧。干净链路上不超发尚未实机验证 (公式上无丢包时补偿为 1)。
+的差距由 37% 缩到约 20–25%。流控窗口 4MB / 8MB 均无稳定提升 (8MB 更不稳), 剩余差距的根因见 §5.9 (流控窗口队头阻塞 × quinn MAX_CHUNKS)。干净链路上不超发尚未实机验证 (公式上无丢包时补偿为 1)。
+
+### 5.9 根因: 流控窗口队头阻塞 × quinn MAX_CHUNKS (2026-10-04, netns 实验坐实)
+
+§5.8 定速后仍落后 hysteria2 约 20–25%。在本机 netns + netem (RTT 180ms、100 Mbps、可调丢包) 中复现并定位:
+
+- **2MB 窗口时定速与 erasure 同为 ≈28–30 Mbps** (下行丢包 10%) → 瓶颈不在 CC。服务端 `conn.stats()`: cwnd ≈2.75MB
+  符合公式, 实际发送仅 28–45 Mbps。估算: 丢包形成的空洞需 ≈1.5 RTT 才被重传补齐, 期间后续数据只能缓存, 接收窗口推不动,
+  2MB ÷ (≈3 RTT) ≈ 30 Mbps, 与实测吻合 (quinn 不发 DATA_BLOCKED 帧, stats 里该计数恒 0, 不能用来判流控)。
+- **放大窗口即断连**: 8MB 窗口一遇丢包 ≈3 Mbps; 客户端日志 `too many gaps in stream buffer` —— quinn-proto
+  `assembler.rs` 的 `MAX_CHUNKS = 1024` (RUSTSEC-2026-0185 修复): defragment 后乱序段 > 1024 即断开连接。§5.8 真机那次
+  2.3 Mbps 塌陷同源。quinn-proto 0.11.19 仍为 1024。
+- **对照**: hysteria2 (quic-go) 无此上限, 默认窗口 8MB。
+
+**处理**: `third_party/quinn-proto` (0.11.17 原样副本, 经 `[patch.crates-io]`) 只把 `MAX_CHUNKS` 改为 8192, 说明与升级步骤
+见 `third_party/quinn-proto/MIRAGE-PATCH.md`; QUIC 默认流控窗口改为 8MB (`config::DEFAULT_QUIC_WINDOW_MB`, 两端统一 ——
+下载方向起作用的是客户端接收窗口); `GAP_SAFE_CHUNKS` 同比例调为 6400。
+
+**结果** (netns, RTT 180ms, 100 Mbps, 50MB × 3, 单位 Mbps; 详见 `docs/benchmark-2026-09.md` §3.5):
+
+| 条件 | hysteria2 | 补丁前 定速 / erasure (2MB) | 补丁后 定速 / erasure (默认 8MB) |
+|---|---|---|---|
+| 下行丢包 10% / 上行 5% | 63–73 | 27–31 / 27–31 | 66–71 / 47–66 |
+| 下行丢包 20% / 上行 10% | 50–60 | 20–23 / — | 49–61 / 45–51 |
+| 无丢包, 定速 50 | — | — | 43–44 (不超发) |
+
+**安全取舍**: 未认证对端可在 Mirage 口令校验之前发碎片流数据, 上限放大提高最坏情况 defragment CPU (8192 段, 仍有界);
+内存仍受接收窗口约束。QUIC 为实验特性, release 默认不含。长期应推动上游把 MAX_CHUNKS 做成 `TransportConfig` 可配项。
 
 ## 7. P1 抗审查 —— **重定向为 SNI 层** (据 USENIX Security 2025)
 

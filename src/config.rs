@@ -351,9 +351,9 @@ pub enum InboundConfig {
         /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
         #[serde(default)]
         transport: Transport,
-        /// QUIC 流控窗口 (MB, 默认 2)。⚠️ **重排序线路 (部分 CN2 优化线路) 要小窗口** —— 大窗口在途包
-        /// 多、并发乱序 gap 超 quinn MAX_CHUNKS(1024) 会被关连接 (真机: 16MB×重排序→~1MB 就断; 2MB 下完)。
-        /// 干净长肥路径可调大 (16-64) 榨单流吞吐。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
+        /// QUIC 流控窗口 (MB, 默认 8, 见 DEFAULT_QUIC_WINDOW_MB)。丢包时窗口小于 ≈2.5×BDP 会被队头阻塞卡住
+        /// (2MB 在 180ms/10% 丢包下仅 ≈30 Mbps)。上游 quinn MAX_CHUNKS=1024 时大窗口丢包即断连, 本仓库已补丁到
+        /// 8192。干净长肥路径可再调大 (16-64)。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_window_mb: Option<u64>,
         /// QUIC erasure-aware 拥塞控制 (默认开)。丢包路径上无视信道 erasure、补偿窗口 (实测 27% 丢包
@@ -552,8 +552,8 @@ pub enum OutboundConfig {
         /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
         #[serde(default)]
         transport: Transport,
-        /// QUIC 流控窗口 (MB, 默认 2)。⚠️ 重排序线路要小 (2); 大窗口在途多、乱序 gap 超 quinn
-        /// MAX_CHUNKS 会断连。干净长肥可调大 (16-64)。仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
+        /// QUIC 流控窗口 (MB, 默认 8, 见 DEFAULT_QUIC_WINDOW_MB)。下载方向起作用的是客户端这一侧的接收窗口。
+        /// 干净长肥可调大 (16-64)。仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_window_mb: Option<u64>,
         /// QUIC erasure-aware CC (默认开)。仅 transport=quic。`MIRAGE_QUIC_CC=off` 可覆盖。
@@ -1864,6 +1864,11 @@ impl Config {
         issues
     }
 }
+
+/// QUIC 流控窗口默认值 (MB, 未配 `quic_window_mb` 时)。丢包时需 ≈2.5×BDP 才不被队头阻塞卡住
+/// (100Mbps/180ms ≈ 6-8MB); 下载方向起作用的是客户端的接收窗口, 故两端统一 8MB。依赖 third_party/quinn-proto
+/// 的 MAX_CHUNKS 补丁 (上游 1024 时大窗口丢包即断连)。见 docs/quic-transport-design.md §5.9。
+pub const DEFAULT_QUIC_WINDOW_MB: u64 = 8;
 
 /// 校验 quic_pin 是否为合法的 43 位 base64url (无填充) SHA-256 SPKI 指纹
 pub fn is_valid_quic_pin(pin: &str) -> bool {

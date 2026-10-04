@@ -34,10 +34,11 @@ const MIN_INTERVAL: Duration = Duration::from_millis(20);
 // 一个 CC)。真正的跨连接共享瓶颈 (queqiao PathModel) 受 quinn Controller API 无 peer 上下文所限,
 // 也需 mux 才能干净实现。
 const CONGEST_KNEE: f64 = 0.10; // excess 达此值, inflation 完全退回 1x
-// gap-safety: quinn-proto 0.11.17 (RUSTSEC-2026-0185 修复) 给乱序流重组加了 MAX_CHUNKS=1024 硬界,
-// 超了就关连接 ("too many gaps in stream buffer")。在途包 × 丢包率 ≈ 待补 gap 数, 故按测到的丢包率
-// 封顶 cwnd 使 gap 稳在界下 (真机实证: 16MB 窗口 ×13% 丢包 → gap 超限 ~1MB 就断; 加此封顶后下完)。
-const GAP_SAFE_CHUNKS: f64 = 800.0; // MAX_CHUNKS=1024 的安全余量
+// gap-safety: quinn-proto 0.11.17 (RUSTSEC-2026-0185 修复) 给乱序流重组加了 MAX_CHUNKS 硬界 (上游 1024,
+// 本仓库 third_party/quinn-proto 补丁为 8192), 超了就关连接 ("too many gaps in stream buffer")。在途包 ×
+// 丢包率 ≈ 待补 gap 数, 故按测到的丢包率封顶 cwnd 使 gap 稳在界下 (真机实证: 上限 1024 时 16MB 窗口 ×13%
+// 丢包 → gap 超限 ~1MB 就断; 加此封顶后下完)。
+const GAP_SAFE_CHUNKS: f64 = 6400.0; // MAX_CHUNKS=8192 (补丁后) 的安全余量, 同原 800/1024 比例
 
 /// erasure-aware CC 工厂。挂到 quinn `TransportConfig::congestion_controller_factory`。
 #[derive(Debug, Default)]
@@ -356,9 +357,10 @@ mod fixed_rate_tests {
 
     #[test]
     fn window_respects_gap_cap_and_floor() {
-        // 30% 丢包: gap 封顶 = 800 × 1200 / 0.3 = 3.2 MB, 低于 rate × 1s / 0.8
-        let w = fixed_rate_window(RATE, Duration::from_secs(1), 0.8, 0.3, MTU);
-        assert_eq!(w, gap_safe_cap(MTU, 0.3));
+        // 50% 丢包: gap 封顶 = 6400 × 1200 / 0.5 ≈ 15.4 MB, 低于 rate × 1s / 0.8² ≈ 19.5 MB
+        let w = fixed_rate_window(RATE, Duration::from_secs(1), 0.8, 0.5, MTU);
+        assert_eq!(w, gap_safe_cap(MTU, 0.5));
+        assert!(w < (RATE as f64 / 0.64) as u64);
         // 极小 RTT: 不低于 4 个 MTU
         let w = fixed_rate_window(RATE, Duration::from_micros(10), 1.0, 0.0, MTU);
         assert_eq!(w, 4 * MTU);

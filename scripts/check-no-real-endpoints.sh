@@ -15,6 +15,7 @@
 # - 二进制文件 (由 git grep -I 自动跳过)
 # - native/mirage-core/src/vendor/ (只读镜像上游代码)
 # - target/ (编译产物)
+# - third_party/ (上游第三方源码原样副本, 如 quinn-proto 补丁版)
 # - CHANGELOG.md (历史发布说明段落，包含历史上报的 AS906 测速网段等审计记录)
 # ==============================================================================
 set -euo pipefail
@@ -33,6 +34,7 @@ PATH_EXCLUDES=(
     ':!*.dat'
     ':!native/mirage-core/src/vendor/**'
     ':!target/**'
+    ':!third_party/**'
     ':!CHANGELOG.md'
     ':!scripts/endpoint-allowlist.txt'
     ':!scripts/check-no-real-endpoints.sh'

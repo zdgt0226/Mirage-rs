@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### fix(quic): 修复高丢包下吞吐被流控窗口卡住 —— quinn-proto MAX_CHUNKS 补丁 + 默认窗口 8MB (2026-10-04)
+
+- **根因** (本机 netns + netem 实验坐实, 见 `docs/quic-transport-design.md` §5.9): 2MB 流控窗口在丢包时被队头阻塞卡住 (180ms / 10% 丢包下定速与 erasure 都只有 ≈30 Mbps, 与 CC 无关); 而窗口放大后 quinn-proto 的乱序段上限 `MAX_CHUNKS = 1024` 会被突破, 接收端以 `too many gaps in stream buffer` 断开连接 (公网偶发的 2.3 Mbps 塌陷同源)。quinn-proto 0.11.19 仍为 1024。
+- **新增 `third_party/quinn-proto`**: quinn-proto 0.11.17 原样副本, 经 `[patch.crates-io]` 替换, 只把 `MAX_CHUNKS` 改为 8192; 原因、安全取舍 (未认证对端最坏 defragment CPU 上升, 内存仍受接收窗口约束) 与升级重打步骤见 `MIRAGE-PATCH.md`。端点门禁排除 `third_party/`。
+- **QUIC 默认流控窗口 2MB → 8MB** (`config::DEFAULT_QUIC_WINDOW_MB`, 两端统一; 下载方向起作用的是客户端接收窗口)。`GAP_SAFE_CHUNKS` 同比例 800 → 6400。
+- **效果** (netns, RTT 180ms, 100 Mbps): 10% / 20% 丢包下定速 66–71 / 49–61 Mbps, sing-box hysteria2 63–73 / 50–60, 基本持平 (补丁前 27–31 / 20–23); erasure 也由 27–31 升至 47–66; 无丢包定速 50 实测 43–44 不超发。详见 `docs/benchmark-2026-09.md` §3.5。
+
 ### feat(quic): QUIC 定速模式 (复用 brutal_rate_mbps, 实验) (2026-10-03)
 
 - **新增 `quic_cc::FixedRateConfig`**: transport=quic 时, 服务端入站配了 `brutal_rate_mbps` 即下行按该速率定速发送, 客户端出站配了即上行定速; 不配仍为 erasure CC, 行为不变。一个客户端一条 QUIC 连接 (mux), 速率天然按客户端计。

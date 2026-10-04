@@ -24,7 +24,7 @@ pub struct PoolConfig {
     pub pfs: bool,
     /// 底层传输 (tcp 默认 / quic 实验)。quic 时忽略 underlying; brutal_rate_mbps 改作 QUIC 定速 CC 的上行速率。
     pub transport: crate::config::Transport,
-    /// QUIC 流控窗口 (MB, 默认 16); erasure CC 开关 (默认 true)。仅 transport=quic 生效。
+    /// QUIC 流控窗口 (MB, 默认见 config::DEFAULT_QUIC_WINDOW_MB); erasure CC 开关 (默认 true)。仅 transport=quic 生效。
     pub quic_window_mb: u64,
     pub quic_erasure_cc: bool,
     /// QUIC ClientHello SNI (良性域名, 默认 = camouflage_host)。GFW 按 SNI 封 QUIC, 用良性 SNI 规避。

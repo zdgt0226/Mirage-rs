@@ -107,3 +107,7 @@ shadowsocks-crypto = { version = "0.7.0", features = ["v2"] }
 proptest = "1"
 # 限速令牌桶测试用虚拟时钟 (start_paused) —— 不实际 sleep。
 tokio = { version = "1.52.3", features = ["test-util", "macros", "rt"] }
+
+# quinn-proto 本地补丁 (MAX_CHUNKS 1024 -> 8192, 高丢包大窗口不断连), 见 third_party/quinn-proto/MIRAGE-PATCH.md
+[patch.crates-io]
+quinn-proto = { path = "third_party/quinn-proto" }
