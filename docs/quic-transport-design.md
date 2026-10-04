@@ -232,6 +232,59 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 - **最大吞吐配方**: `MIRAGE_QUIC_WND=64` + **~10 并发** + erasure CC。再大窗口在并发+丢包下过冲反伤。
   默认 16MB 是安全值 (并发下不崩); 高 BDP 独占场景手动调到 64 榨单流。⚠️ 大窗口吃内存 (每连接)。
 
+### 5.8 定速模式 (2026-10-03, brutal 语义, opt-in)
+
+**动机**: 晚间实测 (见 `docs/benchmark-2026-09.md` §3.3) 同线路 Mirage QUIC 51 Mbps vs sing-box hysteria2 81 Mbps;
+窗口 2→8MB 无改善、关 erasure CC 跌到 ≈8 → 瓶颈是 CC 策略: erasure CC 仍随链路自适应降速, hysteria2 按设定带宽定速。
+
+**做法** (`quic_cc::FixedRateConfig`): 复用 `brutal_rate_mbps` —— 服务端入站配了即下行定速, 客户端出站配了即上行定速;
+不配仍是 erasure CC (行为不变)。一个客户端一条 QUIC 连接 (mux), 速率天然按客户端计 (同 tcp-brutal 2.0 分组)。
+
+- 目标发送速率 = rate / ack_rate; ack_rate = 最近 5 个 1 秒槽的送达率, 下限 0.8 (最多补偿 1.25×, 同 hysteria2 minAckRate);
+  样本不足 50 个 MTU 时视为无丢包。
+- quinn 的 `Controller` 只能给窗口: pacer 按 `1.25 × window / srtt` 放行、在途受 window 封顶, 故
+  window = rate × srtt / ack_rate² (增益 1.0, pacer 自带 1.25 突发余量), 不低于 4 个 MTU。第二个 / ack_rate 补的是
+  "丢失包在判定丢失前仍占窗口"的那部分: 只补一次时 15–25% 丢包下仅 63–70 Mbps; 改成固定增益 1.5 可到 71–81 但
+  干净链路会超发 1.5 倍, 故改为随丢包变化的 ack_rate² (无丢包时为 1, 最多 1/0.64 ≈ 1.56 倍)。
+- 丢包事件只记账、不退让; gap-safety 封顶 (§5.5) 按原始丢包率照常施加, 防重排序线路被 quinn 关连接。
+- `MIRAGE_QUIC_CC=off|erasure` 环境变量覆盖时不走定速 (A/B 用)。
+
+**风险**: 与 TCP brutal 相同 —— rate 高于实际可用带宽会自己灌满线路、重传放大; rate 取客户端实际能跑到的带宽。
+
+**真机结果** (2026-10-03 22:50–23:45 CST, 美西 VPS ↔ 国内家宽, RTT ≈ 180ms, 丢包 5–35% 波动, 50MB × 交错; 详见
+`docs/benchmark-2026-09.md` §3.4): 定速 100 → 58–76 Mbps (13 轮中 1 轮塌陷到 2.3, 同期 TCP 也有 3.7 的低点, 疑为突发
+重丢包, 未复现), erasure CC 31–63, hysteria2 79–90, TCP + brutal 100 仅 4–32。比 erasure 提升约 30–50%, 与 hysteria2
+的差距由 37% 缩到约 20–25%。流控窗口 4MB / 8MB 均无稳定提升 (8MB 更不稳), 剩余差距的根因见 §5.9 (流控窗口队头阻塞 × quinn MAX_CHUNKS)。干净链路上不超发尚未实机验证 (公式上无丢包时补偿为 1)。
+
+### 5.9 根因: 流控窗口队头阻塞 × quinn MAX_CHUNKS (2026-10-04, netns 实验坐实)
+
+§5.8 定速后仍落后 hysteria2 约 20–25%。在本机 netns + netem (RTT 180ms、100 Mbps、可调丢包) 中复现并定位:
+
+- **2MB 窗口时定速与 erasure 同为 ≈28–30 Mbps** (下行丢包 10%) → 瓶颈不在 CC。服务端 `conn.stats()`: cwnd ≈2.75MB
+  符合公式, 实际发送仅 28–45 Mbps。估算: 丢包形成的空洞需 ≈1.5 RTT 才被重传补齐, 期间后续数据只能缓存, 接收窗口推不动,
+  2MB ÷ (≈3 RTT) ≈ 30 Mbps, 与实测吻合 (quinn 不发 DATA_BLOCKED 帧, stats 里该计数恒 0, 不能用来判流控)。
+- **放大窗口即断连**: 8MB 窗口一遇丢包 ≈3 Mbps; 客户端日志 `too many gaps in stream buffer` —— quinn-proto
+  `assembler.rs` 的 `MAX_CHUNKS = 1024` (RUSTSEC-2026-0185 修复): defragment 后乱序段 > 1024 即断开连接。§5.8 真机那次
+  2.3 Mbps 塌陷同源。quinn-proto 0.11.19 仍为 1024。
+- **对照**: hysteria2 (quic-go) 无此上限, 默认窗口 8MB。
+
+**处理**: `third_party/quinn-proto` (0.11.17 原样副本, 经 `[patch.crates-io]`) 只把 `MAX_CHUNKS` 改为 8192, 说明与升级步骤
+见 `third_party/quinn-proto/MIRAGE-PATCH.md`; QUIC 默认流控窗口改为 8MB (`config::DEFAULT_QUIC_WINDOW_MB`, 两端统一 ——
+下载方向起作用的是客户端接收窗口); `GAP_SAFE_CHUNKS` 同比例调为 6400。
+
+**结果** (netns, RTT 180ms, 100 Mbps, 50MB × 3, 单位 Mbps; 详见 `docs/benchmark-2026-09.md` §3.5):
+
+| 条件 | hysteria2 | 补丁前 定速 / erasure (2MB) | 补丁后 定速 / erasure (默认 8MB) |
+|---|---|---|---|
+| 下行丢包 10% / 上行 5% | 63–73 | 27–31 / 27–31 | 66–71 / 47–66 |
+| 下行丢包 20% / 上行 10% | 50–60 | 20–23 / — | 49–61 / 45–51 |
+| 无丢包, 定速 50 | — | — | 43–44 (不超发) |
+
+**公网复测** (2026-10-04 晚, 美西 VPS ↔ 国内家宽, 丢包 5–20%): 定速 78–84 Mbps vs hysteria2 67–78, erasure 61–79; 服务端 CPU 定速 54–56 s/GB vs hysteria2 66–79 (`docs/benchmark-2026-09.md` §3.6)。
+
+**安全取舍**: 未认证对端可在 Mirage 口令校验之前发碎片流数据, 上限放大提高最坏情况 defragment CPU (8192 段, 仍有界);
+内存仍受接收窗口约束。QUIC 为实验特性 (release 二进制自 v0.15.2 起包含, 运行时 `transport: "quic"` 才启用)。长期应推动上游把 MAX_CHUNKS 做成 `TransportConfig` 可配项。
+
 ## 7. P1 抗审查 —— **重定向为 SNI 层** (据 USENIX Security 2025)
 
 ### 7.0 关键 reframe: GFW 查的是 SNI, 不是 ClientHello 指纹

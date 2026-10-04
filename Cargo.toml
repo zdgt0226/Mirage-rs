@@ -59,7 +59,7 @@ rcgen = { version = "0.13", optional = true }
 default = ["gui"]
 ebpf = ["dep:aya"]
 gui = ["dep:axum", "dep:tower-http", "dep:async-stream"]
-# QUIC 传输 (实验, 默认关)。开启需 --features quic; release 二进制暂不含, 见 quic-transport-design.md P0。
+# QUIC 传输 (实验)。cargo 默认不编; release 二进制已带 (release.yml 加 --features quic), 运行时 transport: "quic" 才启用。
 quic = ["dep:quinn", "dep:quinn-proto", "dep:rustls", "dep:rcgen", "dep:rustls-webpki"]
 
 # Debug examples (require ebpf feature so they don't break default cargo check)
@@ -107,3 +107,7 @@ shadowsocks-crypto = { version = "0.7.0", features = ["v2"] }
 proptest = "1"
 # 限速令牌桶测试用虚拟时钟 (start_paused) —— 不实际 sleep。
 tokio = { version = "1.52.3", features = ["test-util", "macros", "rt"] }
+
+# quinn-proto 本地补丁 (MAX_CHUNKS 1024 -> 8192, 高丢包大窗口不断连), 见 third_party/quinn-proto/MIRAGE-PATCH.md
+[patch.crates-io]
+quinn-proto = { path = "third_party/quinn-proto" }

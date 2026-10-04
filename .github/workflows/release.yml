@@ -139,14 +139,15 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
         run: |
           set -euo pipefail
-          cargo build --release --target ${{ matrix.target }} ${{ matrix.ebpf && '--features ebpf' || '' }}
+          # QUIC 传输随 release 发布 (实验特性, 运行时 transport: "quic" 才启用); 有 eBPF 的目标合并 features。
+          cargo build --release --target ${{ matrix.target }} ${{ matrix.ebpf && '--features quic,ebpf' || '--features quic' }}
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       - name: Build Binary (Musl via Cross)
         if: contains(matrix.target, 'musl')
         run: |
           set -euo pipefail
-          cross build --release --target ${{ matrix.target }} ${{ matrix.ebpf && '--features ebpf' || '' }}
+          cross build --release --target ${{ matrix.target }} ${{ matrix.ebpf && '--features quic,ebpf' || '--features quic' }}
           cp target/${{ matrix.target }}/release/mirage mirage-rs-${{ matrix.arch }}
 
       # Post-build: confirm the resulting binary actually embeds 3 ELF blobs
