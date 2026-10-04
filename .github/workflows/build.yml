@@ -29,6 +29,8 @@ jobs:
     # QUIC 传输 (实验特性, 默认关): CI 默认构建不含 quic, quic_obfs (Salamander 逐段去混淆) /
     # quic_cc 等模块此前 CI **从不编译也从不测试** —— 改一行就可能悄悄坏而无人知。单独一步带
     # --features quic 跑 lib 单测补上覆盖 (lib-only: 不重编全部集成测试, 快)。
+    - name: Clippy (quic feature)
+      run: cargo clippy --all-targets --features quic -- -D warnings
     - name: Run tests (quic feature)
       run: cargo test --features quic --lib --verbose
     # QUIC 端到端集成测试: 真实拉起 mirage 服务端与客户端验证 QUIC 双向流中继、证书 SPKI 指纹 (quic_pin)

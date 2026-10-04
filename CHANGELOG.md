@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### build(release): release 二进制带上 QUIC 传输 (2026-10-04)
+
+- `release.yml` 全部 8 个目标改为 `--features quic` (有 eBPF 的目标为 `quic,ebpf`): QUIC 代码随 release 发布, 但仍是实验特性 —— 只有配置了 `transport: "quic"` 的入站 / 出站才会监听或使用 QUIC, 不配置时行为与之前完全一致。`cargo build` 默认仍不编 QUIC。
+- 依赖面: 新增的均为纯 Rust 库 (quinn / quinn-udp / rcgen 等); aws-lc 在默认构建中本已存在 (经 reqwest → rustls), 交叉编译无新增 C 依赖。
+- CI (`build.yml`) 补 `cargo clippy --all-targets --features quic` 一步 (此前 quic 只跑 lib 单测与 e2e)。
+
 ### fix(quic): 修复高丢包下吞吐被流控窗口卡住 —— quinn-proto MAX_CHUNKS 补丁 + 默认窗口 8MB (2026-10-04)
 
 - **根因** (本机 netns + netem 实验坐实, 见 `docs/quic-transport-design.md` §5.9): 2MB 流控窗口在丢包时被队头阻塞卡住 (180ms / 10% 丢包下定速与 erasure 都只有 ≈30 Mbps, 与 CC 无关); 而窗口放大后 quinn-proto 的乱序段上限 `MAX_CHUNKS = 1024` 会被突破, 接收端以 `too many gaps in stream buffer` 断开连接 (公网偶发的 2.3 Mbps 塌陷同源)。quinn-proto 0.11.19 仍为 1024。

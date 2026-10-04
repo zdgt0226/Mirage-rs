@@ -281,7 +281,7 @@ US 服务端 ↔ JP 客户端, 500MB 下载。路径: **RTT 111ms, 0% 丢包, md
 | 无丢包, 定速 50 | — | — | 43–44 (不超发) |
 
 **安全取舍**: 未认证对端可在 Mirage 口令校验之前发碎片流数据, 上限放大提高最坏情况 defragment CPU (8192 段, 仍有界);
-内存仍受接收窗口约束。QUIC 为实验特性, release 默认不含。长期应推动上游把 MAX_CHUNKS 做成 `TransportConfig` 可配项。
+内存仍受接收窗口约束。QUIC 为实验特性 (release 二进制自 v0.15.2 起包含, 运行时 `transport: "quic"` 才启用)。长期应推动上游把 MAX_CHUNKS 做成 `TransportConfig` 可配项。
 
 ## 7. P1 抗审查 —— **重定向为 SNI 层** (据 USENIX Security 2025)
 

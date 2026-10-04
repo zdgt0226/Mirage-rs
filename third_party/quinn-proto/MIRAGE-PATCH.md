@@ -31,7 +31,7 @@
 - 未认证的对端可以先完成 QUIC 握手，并在 Mirage 口令校验之前发送碎片化的流数据，因此上限放大会提高最坏情况下的
   defragment CPU 开销（8192 段，仍是有界的 O(n log n)）。
 - 内存不受影响：缓存数据仍受接收窗口约束（单流 `quic_window_mb`，连接级为其 4 倍）。
-- QUIC 传输是实验特性，release 二进制默认不含（需 `--features quic`）。
+- QUIC 传输是实验特性：release 二进制包含 QUIC 代码，但只有配置 `transport: "quic"` 的入站 / 出站才会监听或使用 QUIC。
 
 ## 升级 quinn-proto 时
 

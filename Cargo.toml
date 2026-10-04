@@ -59,7 +59,7 @@ rcgen = { version = "0.13", optional = true }
 default = ["gui"]
 ebpf = ["dep:aya"]
 gui = ["dep:axum", "dep:tower-http", "dep:async-stream"]
-# QUIC 传输 (实验, 默认关)。开启需 --features quic; release 二进制暂不含, 见 quic-transport-design.md P0。
+# QUIC 传输 (实验)。cargo 默认不编; release 二进制已带 (release.yml 加 --features quic), 运行时 transport: "quic" 才启用。
 quic = ["dep:quinn", "dep:quinn-proto", "dep:rustls", "dep:rcgen", "dep:rustls-webpki"]
 
 # Debug examples (require ebpf feature so they don't break default cargo check)

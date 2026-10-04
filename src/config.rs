@@ -254,7 +254,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 pub const DNS_HIJACK_INBOUND_TAG: &str = "dns-hijack";
 
 /// Mirage 隧道的底层传输。默认 `tcp` (fake-TLS-over-TCP, 主链路)。`quic` 为实验传输
-/// (P0, 需 `--features quic` 编译; 见 docs/quic-transport-design.md)。两端须同设。
+/// (实验; release 二进制已含, 自行编译需 `--features quic`; 见 docs/quic-transport-design.md)。两端须同设。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
@@ -348,7 +348,7 @@ pub enum InboundConfig {
         /// **两端必须同开** (改了会话密钥派生, 一端开一端没开会解密失败)。默认关 (向后兼容)。
         #[serde(default)]
         pfs: bool,
-        /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
+        /// 底层传输 (默认 tcp)。`quic` 为实验传输 (release 二进制已含, 自行编译需 `--features quic`), 两端须同设。
         #[serde(default)]
         transport: Transport,
         /// QUIC 流控窗口 (MB, 默认 8, 见 DEFAULT_QUIC_WINDOW_MB)。丢包时窗口小于 ≈2.5×BDP 会被队头阻塞卡住
@@ -549,7 +549,7 @@ pub enum OutboundConfig {
         /// 会话密钥派生, 失配会解密失败)。默认关 (向后兼容)。
         #[serde(default)]
         pfs: bool,
-        /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
+        /// 底层传输 (默认 tcp)。`quic` 为实验传输 (release 二进制已含, 自行编译需 `--features quic`), 两端须同设。
         #[serde(default)]
         transport: Transport,
         /// QUIC 流控窗口 (MB, 默认 8, 见 DEFAULT_QUIC_WINDOW_MB)。下载方向起作用的是客户端这一侧的接收窗口。
