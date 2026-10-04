@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [v0.15.2] - release 二进制带上 QUIC + QUIC 高丢包吞吐修复 + install.sh brutal 版本可选 (2026-10-04)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.0 / v0.15.1 两端完全互通, 可单端升级; Android 端无需同步。
+- **release 二进制首次包含 QUIC 传输** (实验特性): 只有配置了 `transport: "quic"` 的入站 / 出站才会监听或使用 QUIC, 不配置时行为与之前完全一致。
+- **QUIC 默认流控窗口 2MB → 8MB** (两端): 已在用 QUIC 且未显式设置 `quic_window_mb` 的部署会自动生效; 依赖本版自带的 quinn-proto 补丁 (乱序段上限 1024 → 8192), 自行编译时请保留 `third_party/quinn-proto` 与 `[patch.crates-io]`。
+- QUIC 入站 / 出站配置 `brutal_rate_mbps` 即启用 QUIC 定速模式 (公网实测 78–84 Mbps, 同线路 sing-box hysteria2 67–78)。
+- `install.sh`: brutal 默认速率 50 → 100 Mbps, 可选 v2 / v1.0.3 版本; 仅影响新安装 / 重新配置。
+
 ### build(release): release 二进制带上 QUIC 传输 (2026-10-04)
 
 - `release.yml` 全部 8 个目标改为 `--features quic` (有 eBPF 的目标为 `quic,ebpf`): QUIC 代码随 release 发布, 但仍是实验特性 —— 只有配置了 `transport: "quic"` 的入站 / 出站才会监听或使用 QUIC, 不配置时行为与之前完全一致。`cargo build` 默认仍不编 QUIC。
