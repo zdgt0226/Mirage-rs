@@ -500,8 +500,9 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 auth_ts_tolerance_secs,
                                 ss_upstream,
                                 pfs,
-                                quic_window_mb.unwrap_or(2),
-                                quic_erasure_cc.unwrap_or(true),
+                                quic_window_mb.unwrap_or(crate::config::DEFAULT_QUIC_WINDOW_MB),
+                                // 配了 brutal_rate_mbps → 下行定速; 否则 erasure / 原生
+                                crate::proxy::quic::QuicCc::from_config(quic_erasure_cc.unwrap_or(true), brutal_bps),
                                 quic_obfs.clone(),
                                 quic_key_path.as_deref(),
                                 allow_local_targets,

@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### build(release): release 二进制带上 QUIC 传输 (2026-10-04)
+
+- `release.yml` 全部 8 个目标改为 `--features quic` (有 eBPF 的目标为 `quic,ebpf`): QUIC 代码随 release 发布, 但仍是实验特性 —— 只有配置了 `transport: "quic"` 的入站 / 出站才会监听或使用 QUIC, 不配置时行为与之前完全一致。`cargo build` 默认仍不编 QUIC。
+- 依赖面: 新增的均为纯 Rust 库 (quinn / quinn-udp / rcgen 等); aws-lc 在默认构建中本已存在 (经 reqwest → rustls), 交叉编译无新增 C 依赖。
+- CI (`build.yml`) 补 `cargo clippy --all-targets --features quic` 一步 (此前 quic 只跑 lib 单测与 e2e)。
+
+### fix(quic): 修复高丢包下吞吐被流控窗口卡住 —— quinn-proto MAX_CHUNKS 补丁 + 默认窗口 8MB (2026-10-04)
+
+- **根因** (本机 netns + netem 实验坐实, 见 `docs/quic-transport-design.md` §5.9): 2MB 流控窗口在丢包时被队头阻塞卡住 (180ms / 10% 丢包下定速与 erasure 都只有 ≈30 Mbps, 与 CC 无关); 而窗口放大后 quinn-proto 的乱序段上限 `MAX_CHUNKS = 1024` 会被突破, 接收端以 `too many gaps in stream buffer` 断开连接 (公网偶发的 2.3 Mbps 塌陷同源)。quinn-proto 0.11.19 仍为 1024。
+- **新增 `third_party/quinn-proto`**: quinn-proto 0.11.17 原样副本, 经 `[patch.crates-io]` 替换, 只把 `MAX_CHUNKS` 改为 8192; 原因、安全取舍 (未认证对端最坏 defragment CPU 上升, 内存仍受接收窗口约束) 与升级重打步骤见 `MIRAGE-PATCH.md`。端点门禁排除 `third_party/`。
+- **QUIC 默认流控窗口 2MB → 8MB** (`config::DEFAULT_QUIC_WINDOW_MB`, 两端统一; 下载方向起作用的是客户端接收窗口)。`GAP_SAFE_CHUNKS` 同比例 800 → 6400。
+- **效果** (netns, RTT 180ms, 100 Mbps): 10% / 20% 丢包下定速 66–71 / 49–61 Mbps, sing-box hysteria2 63–73 / 50–60, 基本持平 (补丁前 27–31 / 20–23); erasure 也由 27–31 升至 47–66; 无丢包定速 50 实测 43–44 不超发。详见 `docs/benchmark-2026-09.md` §3.5。
+
+### feat(quic): QUIC 定速模式 (复用 brutal_rate_mbps, 实验) (2026-10-03)
+
+- **新增 `quic_cc::FixedRateConfig`**: transport=quic 时, 服务端入站配了 `brutal_rate_mbps` 即下行按该速率定速发送, 客户端出站配了即上行定速; 不配仍为 erasure CC, 行为不变。一个客户端一条 QUIC 连接 (mux), 速率天然按客户端计。
+- **窗口公式**: rate × smoothed RTT / ack_rate² —— ack_rate 取最近 5 个 1 秒槽的送达率 (下限 0.8, 样本不足 50 个 MTU 视为无丢包), 第一次补偿丢包重发量、第二次补偿丢失包判定前占用的窗口; 无丢包时为 1 不超发, 最多约 1.56 倍。丢包只记账不退让; gap-safety 封顶 (防 quinn 乱序上限关连接) 照常, 抽为 erasure 与定速共用的 `gap_safe_cap`。
+- **`QuicCc` 枚举** 取代原 `erasure: bool` 参数 (Stock / Erasure / FixedRate); `MIRAGE_QUIC_CC=off|erasure` 覆盖时不走定速。
+- **实测** (晚间, 丢包 5–35%): 定速 100 → 58–76 Mbps, erasure 31–63, sing-box hysteria2 77–90, TCP+brutal 100 4–32; 与 hysteria2 差距由 37% 缩到约 20–25%。详见 `docs/benchmark-2026-09.md` §3.4 与 `docs/quic-transport-design.md` §5.8。
+
 ### feat(install): brutal 版本可选 (v2 / v1.0.3) + 脚本语法与显示结构优化 (2026-10-02)
 
 - **`install.sh` 支持选择 Brutal 版本 (v2 最新 / v1.0.3 老内核兼容)**:

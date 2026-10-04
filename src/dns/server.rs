@@ -1389,7 +1389,7 @@ mod tests {
                 None,
                 false,
                 2,
-                false,
+                crate::proxy::quic::QuicCc::Stock,
                 None,
                 Some(&srv_key_path),
                 true, // 允许回环目标直连 (SSRF 白名单放开本地测试 DNS 桩)

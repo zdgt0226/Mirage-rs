@@ -254,7 +254,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 pub const DNS_HIJACK_INBOUND_TAG: &str = "dns-hijack";
 
 /// Mirage 隧道的底层传输。默认 `tcp` (fake-TLS-over-TCP, 主链路)。`quic` 为实验传输
-/// (P0, 需 `--features quic` 编译; 见 docs/quic-transport-design.md)。两端须同设。
+/// (实验; release 二进制已含, 自行编译需 `--features quic`; 见 docs/quic-transport-design.md)。两端须同设。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
@@ -331,6 +331,8 @@ pub enum InboundConfig {
         // 服务端 → 客户端 (下载) 方向的 brutal 速率上限, 单位 Mbps.
         // 不设 (或 = 0) 则不启用 brutal, 走系统默认 CC (BBR/Cubic).
         // Note: 服务端这一侧决定下载速度, 比客户端的 brutal 设置重要得多.
+        // transport=quic 时同一字段启用 QUIC 定速 CC (按此速率发送、遇丢包不退让, 见 quic_cc::FixedRateConfig);
+        // 不设则 QUIC 走 erasure CC (quic_erasure_cc)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_rate_mbps: Option<u64>,
         // 握手 token 的时间戳容忍窗口 (秒). 客户端时钟与本机相差超过它 → auth 失败.
@@ -346,12 +348,12 @@ pub enum InboundConfig {
         /// **两端必须同开** (改了会话密钥派生, 一端开一端没开会解密失败)。默认关 (向后兼容)。
         #[serde(default)]
         pfs: bool,
-        /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
+        /// 底层传输 (默认 tcp)。`quic` 为实验传输 (release 二进制已含, 自行编译需 `--features quic`), 两端须同设。
         #[serde(default)]
         transport: Transport,
-        /// QUIC 流控窗口 (MB, 默认 2)。⚠️ **重排序线路 (部分 CN2 优化线路) 要小窗口** —— 大窗口在途包
-        /// 多、并发乱序 gap 超 quinn MAX_CHUNKS(1024) 会被关连接 (真机: 16MB×重排序→~1MB 就断; 2MB 下完)。
-        /// 干净长肥路径可调大 (16-64) 榨单流吞吐。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
+        /// QUIC 流控窗口 (MB, 默认 8, 见 DEFAULT_QUIC_WINDOW_MB)。丢包时窗口小于 ≈2.5×BDP 会被队头阻塞卡住
+        /// (2MB 在 180ms/10% 丢包下仅 ≈30 Mbps)。上游 quinn MAX_CHUNKS=1024 时大窗口丢包即断连, 本仓库已补丁到
+        /// 8192。干净长肥路径可再调大 (16-64)。仅 transport=quic 生效。`MIRAGE_QUIC_WND` 环境变量可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_window_mb: Option<u64>,
         /// QUIC erasure-aware 拥塞控制 (默认开)。丢包路径上无视信道 erasure、补偿窗口 (实测 27% 丢包
@@ -533,6 +535,7 @@ pub enum OutboundConfig {
         camouflage_host: String,
         #[serde(default = "default_pool_size")]
         pool_size: usize,
+        /// 客户端 → 服务端 (上传) 方向的 brutal 速率 (Mbps)。transport=quic 时改作 QUIC 定速 CC 的上行速率。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         brutal_rate_mbps: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,11 +549,11 @@ pub enum OutboundConfig {
         /// 会话密钥派生, 失配会解密失败)。默认关 (向后兼容)。
         #[serde(default)]
         pfs: bool,
-        /// 底层传输 (默认 tcp)。`quic` 为实验传输, 需 `--features quic` 编译, 两端须同设。
+        /// 底层传输 (默认 tcp)。`quic` 为实验传输 (release 二进制已含, 自行编译需 `--features quic`), 两端须同设。
         #[serde(default)]
         transport: Transport,
-        /// QUIC 流控窗口 (MB, 默认 2)。⚠️ 重排序线路要小 (2); 大窗口在途多、乱序 gap 超 quinn
-        /// MAX_CHUNKS 会断连。干净长肥可调大 (16-64)。仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
+        /// QUIC 流控窗口 (MB, 默认 8, 见 DEFAULT_QUIC_WINDOW_MB)。下载方向起作用的是客户端这一侧的接收窗口。
+        /// 干净长肥可调大 (16-64)。仅 transport=quic。`MIRAGE_QUIC_WND` 可覆盖。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_window_mb: Option<u64>,
         /// QUIC erasure-aware CC (默认开)。仅 transport=quic。`MIRAGE_QUIC_CC=off` 可覆盖。
@@ -1861,6 +1864,11 @@ impl Config {
         issues
     }
 }
+
+/// QUIC 流控窗口默认值 (MB, 未配 `quic_window_mb` 时)。丢包时需 ≈2.5×BDP 才不被队头阻塞卡住
+/// (100Mbps/180ms ≈ 6-8MB); 下载方向起作用的是客户端的接收窗口, 故两端统一 8MB。依赖 third_party/quinn-proto
+/// 的 MAX_CHUNKS 补丁 (上游 1024 时大窗口丢包即断连)。见 docs/quic-transport-design.md §5.9。
+pub const DEFAULT_QUIC_WINDOW_MB: u64 = 8;
 
 /// 校验 quic_pin 是否为合法的 43 位 base64url (无填充) SHA-256 SPKI 指纹
 pub fn is_valid_quic_pin(pin: &str) -> bool {

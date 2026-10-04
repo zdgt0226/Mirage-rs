@@ -488,7 +488,7 @@ pub async fn start_quic_server(
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
     quic_window_mb: u64,
-    quic_erasure_cc: bool,
+    quic_cc: crate::proxy::quic::QuicCc,
     quic_obfs: Option<String>,
     quic_key_path: Option<&str>,
     allow_local_targets: bool,
@@ -500,7 +500,7 @@ pub async fn start_quic_server(
             return;
         }
     };
-    let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_erasure_cc, quic_obfs.as_deref(), quic_key_path) {
+    let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_cc, quic_obfs.as_deref(), quic_key_path) {
         Ok(ep) => ep,
         Err(e) => {
             error!("Mirage QUIC Server: 绑定失败 {}: {:#}", listen_addr, e);
