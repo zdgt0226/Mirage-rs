@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### docs: 主动探测专项加固评估 (2026-10-05)
+
+- 新增 `docs/active-probing-assessment-2026-10.md`: 基于晚高峰观察到的疑似 GFW 主动探测, 实测探测者能否把 Mirage 与真实伪装站区分开。ServerHello 时延仅多 3–7ms (低风险); **空连接与半截 ClientHello 的关闭时间比真站提前 8–14 秒 (可区分)**, 根因是转发时使用了已存在 0–27 秒的预热连接。给出加固建议: P1 建连即预连伪装站以对齐空闲超时, P2 验证 SNI 与 IP 一致性的作用, P3 探测可观测性, P4 生产服务器升级, P5 伪装站就近。
+
 ### docs: 多版本实测对比 (v0.5 → v0.15.2) + 测试路径说明 (2026-10-05)
 
 - `docs/benchmark-2026-09.md` 新增 §5: 7 个大版本在两台 VPS 上的直连 (穿 GFW) 长时间观测、处理效率、抗审查静态测试 (主动探测回应 / 原样重放 / OpenGFW fet·trojan / ClientHello·ServerHello 特征)。结论: TCP 性能自 v0.5 起持平; 实测可量化的抗审查提升集中在 v0.15 (非 TLS 探测回应与真站一致、ServerHello key_share 不再跨连接重复)。
