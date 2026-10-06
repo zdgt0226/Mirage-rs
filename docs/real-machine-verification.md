@@ -113,23 +113,36 @@
 
 ## C. 内核 / eBPF 数据面
 
-### C1. TCP listener 分水岭 —— 真机复核 ⬜
+### C1. TCP listener 分水岭 —— 真机复核 ✅（netns 三段拓扑，2026-10-06）
 
 - **来源**：`docs/deploy-smoke-test.md` §6。netns 已通过（`examples/verify_tc_divert_tcp.sh`），真机复核。
 - **判据**：代理 TCP 时反查目标 == 原始目的；`[TPROXY].*TCP` 出现，且不是被 MASQUERADE 转发。
+- **实测**（v0.15.2-4-gcf2bb8d，本机 J4105 / kernel 6.1；netns：LAN 设备 — 网关 (mirage client 透明模式, tc_divert + sk_lookup, 8332 段 direct_cidr) — 出口侧 (mirage server + 目标站)，网关 WAN 口 MASQUERADE）：
+  - 裸-IP 走代理（文档地址 `203.0.113.80:8080`）：日志 `[TPROXY] TCP … → 203.0.113.80:8080 → [203.0.113.80:8080]` + `[ROUTE] → [proxy]` + `[TUNNEL] 建立`；目标站看到的对端是服务端本机地址，**不是**网关 WAN 地址 → 未被 MASQUERADE 转发。
+  - fake-IP 走代理（LAN 经网关 DNS 解析得 `198.18.0.x`）：`[TPROXY] TCP … → 198.18.0.2:8080 → [域名:8080]`，经隧道到达目标。
+  - 对照：geoip cn 内地址走直连快路径，目标看到对端 = 网关 WAN 地址（MASQUERADE），无 `[TPROXY]` 日志，符合预期。
+  - 局限：netns 模拟，非实体 LAN 设备 / 实体网卡。
 
-### C2. LPM 是否成为 CPU 热点（决定要不要加 flow cache）⬜
+### C2. LPM 是否成为 CPU 热点（决定要不要加 flow cache）✅ 不加（netns，2026-10-06）
 
 - **来源**：`docs/deploy-smoke-test.md` §7。
 - **内容**：LAN 设备从国内 CDN 持续高速下载（走 `direct_cidr` 直连路径）压满带宽，采样 tc 软中断里
   LPM 查找占比。
 - **判据**：若 LPM 占比 <0.1% 核 → **不加** flow cache（避免无失效缓存的泄漏风险）。
+- **实测**（同 C1 拓扑，LAN→geoip cn 目标 iperf3 直连上行，`perf record -a -g` 10s，两轮）：
+  | 场景 | 吞吐 | gl0 收包 | `trie_lookup_elem` | `tc_divert` 程序 | 对照：内核 `fib_table_lookup` |
+  |---|---|---|---|---|---|
+  | veth 默认 TSO（大段） | 5.1 Gbps | 1.2 万 pps | 0.05% | 0.08% | — |
+  | 关 TSO/GSO/GRO（MTU 包） | 1.44 Gbps | **12 万 pps**（> 千兆线速 8.1 万） | **0.77%** | 0.42~0.48% | 2.3~2.4% |
+  - 百分比为 4 核全部采样的占比，折合约 3% 单核；LPM 查找比每包都要做的内核路由查找还便宜。**结论：不是热点，不加 flow cache。**
+  - `%soft` 单核最高 42~64%、全核 21~23%，但该值包含同机 iperf 收发两端与 veth 转发的全部软中断，不能归因到 LPM，不按 §7 的 `%soft` 档判定。
 
-### C3. ICMP 假 IP 反射（第一步）⬜
+### C3. ICMP 假 IP 反射（第一步）✅（netns，2026-10-06）
 
 - **来源**：`brain/pages/icmp-fakeip-reflect.md`；`brain/roadmap.md`。
 - **内容**：`bpf_redirect` 回弹 + tc ingress 语义本地难复现，需真机确认（校验和已复算）。
 - **判据**：LAN 设备 ping 被代理域名得到来自 fake-IP 的 ICMP 回显，且不泄漏真实目标。
+- **实测**（同 C1 拓扑）：LAN `ping -c3 198.18.0.2` → 3/3 回显，RTT 0.07ms（网关本地反射）；网关 LAN 口抓包见 echo request/reply 成对，**WAN 口同时段 ICMP 抓包为空** → 不泄漏。启动日志 `fake-IP ICMP 反射=198.18.0.0/15`。
 
 ### C4. ICMP 真隧道（第二步）⏸️ 暂缓
 
@@ -140,18 +153,36 @@
 
 ## D. 传输 / 性能
 
-### D1. UDP mux 带机量 bench ⬜
+### D1. UDP mux 带机量 bench ✅ 突破 pool_size（netns + 实链路，2026-10-06；上限未到 4096）
 
 - **来源**：`brain/pages/udp-capacity-findings.md`。
 - **内容**：真机 bench 验证 mux 后并发 UDP 流**突破 `pool_size` 硬伤**（此前真机实测两端
   0.5→0.9 部署并发拐点 20→450）。
 - **判据**：mux 开启下并发流上限由 `MAX_FLOWS`（4096）而非 `pool_size` 决定。
+- **实测**（`scripts/bench_udp_capacity.py`，网关 `pool_size=4`，每流 10 包/秒、64B，拐点 = flow_ok 跌破 95%）：
+  | 环境 | `udp_mux=false` | `udp_mux=true` |
+  |---|---|---|
+  | netns（网关、服务端、echo、压测全在本机 4 核） | 拐点 < 100 | 800 全过，1000 时 71%（拐点 ≈ 1000）；每流 2 包/秒时拐点 ≈ 2000 |
+  | 实链路（本机 netns 网关 → S1，RTT ≈ 175ms，echo 在服务端本机） | 拐点 ≈ 60 | 1000 时 flow_ok 100%（丢包 37%），拐点 ≈ 1400 |
+  - **pool_size 墙已破**：mux 关时几十条即崩，mux 开 1000+。
+  - **但上限不是 4096**：拐点随每流包率移动（10 包/秒 ≈1000，2 包/秒 ≈2000），属吞吐型而非流表数量墙。网关 netns `UdpRcvbufErrors` 累计约 1 万（服务端约 2400）→ **主要丢在网关透明 UDP socket 的接收缓冲**（单 socket 用户态排空速度），过拐点后断崖式跌到约 7%。
+  - 后续可选：网关透明 UDP socket 增大 `SO_RCVBUF` / 多 socket 分担，再复测（本次未改代码）。
 
-### D2. QUIC 定速在干净链路上不超发 ⬜
+### D2. QUIC 定速在干净链路上不超发 ✅（netns + 实链路，2026-10-06）
 
 - **来源**：`docs/quic-transport-design.md` §5.8 末；`docs/benchmark-2026-09.md`。
 - **内容**：定速公式在**无丢包**时补偿应为 1（不超发），此前仅公式推导，未实机验证。
 - **判据**：无丢包链路上实测速率 ≈ 设定速率（不超发）。
+- **实测**（`transport: quic` + `brutal_rate_mbps`，50MB 下载 ×3）：
+  | 链路 | 设定 | goodput | 线上平均（含间隙） | netem 丢弃 |
+  |---|---|---|---|---|
+  | netns 200Mbit / RTT 40ms / 0 丢包 | 30 | 28.6~28.7 | — | 0 |
+  | 同上 | 60 | 50.7~51.4 | 53.3~53.5 | 0 |
+  | 同上 | 120 | 113.3~113.9 | — | 0 |
+  | netns 100Mbit / RTT 180ms / 0 丢包 | 30 / 60 / 90 | 28.6 / 50.5 / 83.2 | 30.1 / 52.9 / 86.9 | 0 |
+  | 实链路 本机 → S1 | 20 / 40 | 18.3~18.6 / 28.2~36.5 | — | — |
+  - **全部 ≤ 设定值，无超发**，瓶颈队列零丢弃。
+  - 附带发现：设定 60 时稳定只到约 85%（51 / 60），30、90、120 为 93~96%；不影响本项判据，原因未查。
 
 ### D3. QUIC 反识别面 ⬜
 
@@ -200,3 +231,4 @@
 |---|---|
 | 2026-10-06 | 建档。汇总 A1–A3（延迟预连）、B1–B3、C1–C4、D1–D3、E1–E2、F1–F2。 |
 | 2026-10-06 | A1/A2 提供采集工具 `examples/probe_close_timing.rs`；A3 提供服务端 opt-in 度量 (`MIRAGE_QUIET_MEASURE=1`)。 |
+| 2026-10-06 | C1/C2/C3、D1/D2 实测回填（v0.15.2-4-gcf2bb8d，netns 三段网关拓扑 + 实链路 S1）。C4 维持暂缓。 |

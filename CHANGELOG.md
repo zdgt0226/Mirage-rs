@@ -36,6 +36,14 @@
   伪装站就近) · C1–C4 内核/eBPF (TCP listener 复核 / LPM CPU 热点 / ICMP 反射) · D1–D3 传输性能
   (UDP mux 带机量 / QUIC 不超发 / QUIC 反识别) · E1–E2 泄漏测试补全 · F1–F2 工程与供应链。
 
+### docs: 实机验证 C1–C3 / D1–D2 回填 (2026-10-06)
+
+- C1 TCP listener 分水岭 ✅ · C2 LPM 非热点 (12 万 pps 下 `trie_lookup_elem` 0.77%, 低于内核路由查找) → 不加 flow cache ✅ ·
+  C3 fake-IP ICMP 本地反射且 WAN 口无 ICMP ✅ (netns 三段网关拓扑)。
+- D2 QUIC 定速在无丢包链路上全部 ≤ 设定值、零队列丢弃 ✅ (netns + 实链路)。
+- D1 UDP mux 突破 pool_size (关 mux 拐点 <100, 开 mux ≈1000–1400) ✅; 但上限不是 MAX_FLOWS 4096,
+  而是网关透明 UDP socket 接收缓冲溢出 (`UdpRcvbufErrors`), 记为后续可选优化。
+
 ### docs: 验证与测试交接指南 `docs/verification-handoff.md` (2026-10-06)
 
 - 面向**接手的 AI 模型 / 协作者**: §1 零成本门禁 (完整命令 + 预期/判据) · §2 本次改动的不变量 ↔
