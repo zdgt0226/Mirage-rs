@@ -2,6 +2,17 @@
 
 > 依据 2026-10-05 晚高峰直连复测中观察到的疑似 GFW 主动探测（`docs/benchmark-2026-09.md` §5.4），评估 Mirage 在被主动探测时还能被区分出来的地方，并给出加固建议。文中服务器与客户端均以代号表示（S1、S2、C2），不含任何真实地址。
 
+> **实施状态 (2026-10-06)**: §4 的 **P1 已实施** —— 预热连接池改为「**延迟预连**」:
+> 转发路径在**判定要转发的时刻即时建连**(池龄恒 ≈ 0), 认证前读取从「单一 5s 总截止」改为
+> 「**静默间隔语义**」且窗口随客户端 RTT 自适应 (`clamp(2×RTT, 100ms, 500ms)`)。§3 描述的
+> 8~14s 关闭时间偏差的根因 (池龄传导给真站 idle-timeout) 随之消除, 预期收敛到「静默窗口
+> + 服务器→伪装站 RTT」(亚秒级)。代码: `src/proxy/mirage_server/{camouflage.rs,
+camouflage_rtt.rs,handshake.rs::read_client_hello}`。静默窗口**可配** (`tuning.client_hello_quiet`,
+> 或环境变量 `MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS` / `MIRAGE_QUIET_MAX_MS`)。
+> **端到端关闭时间对齐仍需真机复测** —— 已连同 auth-succ/auth-fail 时延差核对、T_quiet
+> 标定等一并列入 [`docs/real-machine-verification.md`](real-machine-verification.md) 的 A1–A3
+> (进程内单测已覆盖机制: 按需建连 / 静默语义 / 自适应窗口, 但绝对时序差属部署验证项)。
+
 ## 1. 观察到的探测
 
 - **时间**：2026-10-05 21:28–22:10（晚高峰），持续约 40 分钟。
@@ -24,10 +35,10 @@
 
 此外，伪装站 speedtest.net 的服务器属于 Fastly CDN，而 VPS 的 IP 并不属于 Fastly。这种「SNI 与 IP 对不上」是已知弱点（此前审计已记录，为了 QoS 有意保留），也是被动识别的可能触发点之一。
 
-## 3. T2 / T3 的根因
+## 3. T2 / T3 的根因 (历史 —— 已由「延迟预连」修复, 见文首实施状态)
 
 1. 服务端先最多等 5 秒读取完整的 ClientHello（`src/proxy/mirage_server/handshake.rs` `read_client_hello`）。
-2. 读不到完整的 ClientHello 时，判定为异常，调用 `reflect_to_camouflage`，从伪装站连接池（`src/proxy/mirage_server/camouflage_pool.rs`）**取一条预先建好的连接**，把已收到的字节转发给真站。
+2. 读不到完整的 ClientHello 时，判定为异常，调用 `reflect_to_camouflage`，从伪装站连接池（`src/proxy/mirage_server/camouflage_pool.rs`；**已删除，现为 `camouflage_rtt.rs` + 按需即时建连**）**取一条预先建好的连接**，把已收到的字节转发给真站。
 3. 池中的连接寿命为 15 秒加最多 12 秒的随机抖动（`STREAM_MIN_AGE_S` / `STREAM_AGE_JITTER_S`）。**真站从自己那一侧连接建立时开始计算空闲超时**，所以这条连接在池里放了多久，探测者看到的关闭时间就提前多久，而且每次提前的量都不固定。
 4. 实测相符：真站约 60–64 秒关闭，Mirage 在 46–56 秒关闭，相当于池中连接已存在 9–18 秒。
 
@@ -35,7 +46,7 @@
 
 ## 4. 加固建议（按优先级）
 
-### P1：转发路径的空闲超时与真站对齐（修复 T2 / T3）
+### P1：转发路径的空闲超时与真站对齐（修复 T2 / T3）—— ✅ 已实施 (延迟预连, 2026-10-06)
 
 | 方案 | 做法 | 效果 | 代价 |
 |---|---|---|---|

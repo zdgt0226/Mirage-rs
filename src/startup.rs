@@ -183,6 +183,17 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                         tuning.udp_mux_tunnels
                     );
                 }
+                // ClientHello 静默窗口 (服务端延迟预连): 窗口 = clamp(mult×RTT, min, max)。
+                // 环境变量 MIRAGE_QUIET_* 优先覆盖 (真机 A/B 调参)。
+                {
+                    let q = tuning.client_hello_quiet.as_ref();
+                    let mult = q.map(|q| q.mult).unwrap_or(2);
+                    let min = std::time::Duration::from_millis(q.map(|q| q.min_ms).unwrap_or(100));
+                    let max = std::time::Duration::from_millis(q.map(|q| q.max_ms).unwrap_or(500));
+                    crate::proxy::mirage_server::set_quiet_window(mult, min, max);
+                    let (m, lo, hi) = crate::proxy::mirage_server::quiet_window_params();
+                    info!("ClientHello 静默窗口: {}×RTT, clamp {}~{}ms (MIRAGE_QUIET_* 可覆盖)", m, lo, hi);
+                }
                 if tuning.cipher_agility {
                     // 防呆: 开 agility 后 TIME_SYNC 的 proto_ver 变 0x02, 老客户端 (<v0.7.0)
                     // 不认 0x02 → 丢弃 TIME_SYNC 不同步时钟 → 若本机与服务端时钟偏差超容差

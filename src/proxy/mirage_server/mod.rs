@@ -10,7 +10,7 @@
 
 mod handshake;
 mod camouflage;
-mod camouflage_pool;
+mod camouflage_rtt;
 mod control;
 mod tcp_relay;
 pub(crate) mod udp_relay;
@@ -19,7 +19,10 @@ pub(crate) mod udp_relay;
 #[cfg(test)]
 pub(crate) use control::parse_tcp_target;
 
-use camouflage_pool::CamouflagePool;
+// 服务端 ClientHello 静默窗口 (延迟预连) 参数: 由 startup 从 tuning.client_hello_quiet 设置。
+pub use handshake::{quiet_window_params, set_quiet_window};
+
+use camouflage_rtt::CamouflageRtt;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -413,9 +416,10 @@ pub async fn start_server(
         info!("Brutal CC enabled for downloads (server→client): {} Mbps", bps / 125_000);
     }
 
-    // v0.4.5-alpha.7: 启动 camouflage_host 预热连接池, 消除 auth-fail 分支
-    // TCP 3-way RTT 时序侧信道. 详见 camouflage_pool.rs 顶注释.
-    let cam_pool = CamouflagePool::new(camouflage_host.to_string());
+    // 伪装站 RTT 估计 (取代旧预热连接池). 转发路径改为"判定要转发时即时建连", 池龄恒 ≈ 0
+    // → 真站 idle 计时起点与探测者连上的时刻只差一个服务器→伪装站 RTT, 消除旧池
+    // 8~14s 的关闭时间侧信道. 详见 camouflage_rtt.rs 顶注释.
+    let cam_rtt = CamouflageRtt::new();
 
     // v0.4.5-alpha.15: accept 前主动预热 HandshakeCache. 消除懒预热的冷启动窗口
     // (重启后首个连接不再触发 fetch 或拿 fallback → 时序异常). camouflage 不可达
@@ -462,10 +466,10 @@ pub async fn start_server(
 
                 let creds_c = creds.clone();
                 let cam = camouflage_host.to_string();
-                let pool = cam_pool.clone();
+                let rtt = cam_rtt.clone();
                 let up = upstream.clone();
                 tokio::spawn(async move {
-                    handshake::handle_connection(stream, peer_addr, creds_c, cam, pool, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
+                    handshake::handle_connection(stream, peer_addr, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
                 });
             }
             Err(e) => {
@@ -1106,12 +1110,12 @@ mod quic_limiter_tests {
         ch_record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
         ch_record.extend_from_slice(&hs);
 
-        let pool = std::sync::Arc::new(CamouflagePool::new("example.com".to_string()));
+        let cam_rtt = CamouflageRtt::new();
         let peer_addr: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
 
         let snap = creds_store.load_full();
         let server_task = tokio::spawn(async move {
-            handshake::run_handshake(server, peer_addr, &snap, "example.com", &pool, 60, false).await
+            handshake::run_handshake(server, peer_addr, &snap, "example.com", &cam_rtt, 60, false, None).await
         });
 
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

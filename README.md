@@ -368,7 +368,7 @@ mirage-rs config -c config.json
 | **Geo 规则数据** | `tuning.geo_sources`、`tuning.geo_update_days` 以及本地 `.dat` 文件自动更新 | **自动热重载** | `extract_updater_state` 重建更新调度器，新 `.dat` 文件落地自动重编路由规则集 |
 | **出站 (Outbounds)** | 任何出站节点的增删、改端口/密钥/伪装/传输方式/连接池/组成员 | **需重启服务** | 防止在途连接断裂与连接池任务泄漏，热重载保持既有出站不变 (`config_watcher.rs:132`) |
 | **入站 (Inbounds)** | 监听端口 `port` / `listen`、传输 `transport`、PFS、伪装站、Brutal 限速、`allow_local_targets`、新增/删除入站 | **需重启服务** | 网络监听 socket 与传输栈在启动期绑定，修改后需重启服务才能生效或释放端口 |
-| **核心调优 (Tuning)** | `tls_padding`、`cipher_agility`、`ebpf_mode`、`dns_tcp_resolver` 等 | **需重启服务** | 加密策略与系统级解析器在进程启动初始化阶段生效 (`startup.rs:150`) |
+| **核心调优 (Tuning)** | `tls_padding`、`cipher_agility`、`ebpf_mode`、`dns_tcp_resolver`、`client_hello_quiet` 等 | **需重启服务** | 加密策略与系统级解析器在进程启动初始化阶段生效 (`startup.rs:150`) |
 
 > `mirage-rs config` 按「仅上表列为热重载的字段才热重载、其余一律提示重启」判定 (宁可多提示重启, 不漏报)。仅支持完整版配置, 轻量版 (`lite_*.json`) 请直接编辑。
 > `mirage://` 链接只含 口令 / 地址 / 端口 / SNI 四项: 服务端开了 `pfs`、`transport: "quic"`、`tls_padding` / `cipher_agility` 时, 客户端导入后须手动设置对应参数 (菜单 9 显示链接时会列出)。

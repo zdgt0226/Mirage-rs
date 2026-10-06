@@ -2,6 +2,56 @@
 
 ## [Unreleased]
 
+### feat(anti-probing): 延迟预连取代伪装站预热连接池 + ClientHello 静默间隔读取 (2026-10-06)
+
+- **动机** (见 `docs/active-probing-assessment-2026-10.md`): 旧 `CamouflagePool` 后台常驻 8 条到
+  camouflage_host 的预连, 供 auth-fail / 读取异常路径即时取用。它消除了 auth-fail 分支的 TCP
+  3-way 时延侧信道, 但把**池中连接的已存在时长**继承给了真站的 idle-timeout —— 探测者 (空连接 /
+  半截 ClientHello) 看到的关闭时间比真站提前 8~14s (实测 46.6~56.0s vs 真站 60.3~64.0s), 可区分 (T2/T3)。
+- **延迟预连**: 转发路径改为**判定要转发的时刻即时建连** (失败重试一次 → 回落合成模板),
+  池龄恒 ≈ 0 → 真站 idle 计时起点与探测者连上的时刻只差一个服务器→伪装站 RTT。同时不再有后台
+  常驻连接打伪装站 (旧 ~0.32 conn/s 的 churn 消失, 只有真实探测/异常才建连)。
+- **静默间隔读取**: `read_client_hello` 从 "单一 5s 总截止" 改为 "**最后一次收到数据后静默
+  quiet_timeout 即判异常**" (+ `hard_deadline` 5s 兜底防 slowloris 滴发)。合法慢客户端
+  (ClientHello 分多段 / 丢包重传) 会持续发 → 永不触发静默, 不受高延迟环境影响。
+- **RTT 自适应窗口 (可配)**: `quiet_timeout = clamp(mult × 客户端 RTT, min_ms, max_ms)`, RTT 取自
+  内核 `TCP_INFO.tcpi_rtt` (已建立连接零成本读取, 不发包)。**默认 `2 / 100ms / 500ms`**, 可用
+  `tuning.client_hello_quiet` 或环境变量 `MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS` /
+  `MIRAGE_QUIET_MAX_MS` 覆盖 (后者供真机 A/B 调参, 无需改 config)。低延迟环境窗口小 → 探测偏差小
+  (下限 100ms, 比旧 8~14s 好一个数量级); 高延迟环境窗口随 RTT 放大 → 不误伤慢合法客户端。
+- **auth-succ 时序对齐同步调整**: auth-fail 现为即时建连 (建连 RTT + 转发 RTT = 2 × cam_RTT),
+  故 auth-succ 注入量由 1 × 翻倍到 2 × cam_RTT (T5 无时序侧信道)。RTT EWMA 由每次即时建连测量维护
+  (`camouflage_rtt.rs`, 取代 `camouflage_pool.rs`)。
+- **测试**: 静默语义 (分段到达不误判 / 滴发被 hard deadline 兜底)、自适应窗口、按需建连 (触发前
+  0 连接、触发后恰好 1 条) 均有单测。端到端关闭时间对齐仍需真机复测 (见文档)。
+
+### docs: 新增实机验证任务列表 `docs/real-machine-verification.md` (2026-10-06)
+
+- 汇总**所有需要真机 / 真实网络 / netns 才能完成的验证项** (单测覆盖不到的时序、内核、真实链路
+  行为), 每项给出来源、步骤与判据。首期收录: A1 T2/T3 关闭时间端到端对齐 · A2 **auth-succ 与
+  auth-fail 首字节时延差核对** · A3 `T_quiet` 参数标定 · B1–B3 探测面 (SNI/IP 对照 / 生产升级 /
+  伪装站就近) · C1–C4 内核/eBPF (TCP listener 复核 / LPM CPU 热点 / ICMP 反射) · D1–D3 传输性能
+  (UDP mux 带机量 / QUIC 不超发 / QUIC 反识别) · E1–E2 泄漏测试补全 · F1–F2 工程与供应链。
+
+### docs: 验证与测试交接指南 `docs/verification-handoff.md` (2026-10-06)
+
+- 面向**接手的 AI 模型 / 协作者**: §1 零成本门禁 (完整命令 + 预期/判据) · §2 本次改动的不变量 ↔
+  锁定它的测试 (含"未覆盖、必须真机验"的 I10–I12) · §3 真机项索引 (指向 real-machine-verification)
+  · §4 判据总表 · §5 结果回填模板与验证记录表 · §6 红线与陷阱 (端点护栏 / 协议冻结常量 / 本次
+  特有陷阱) · §7 文件与命令速查 · §8 交接清单。
+
+### test(tooling): 实机探测采集工具 + A3 标定度量 (2026-10-06)
+
+- 新增 `examples/probe_close_timing.rs`: 对多个 target 并发发起 `empty` (空连接) / `partial`
+  (半截 ClientHello) / `badauth` (完整但 token 错误) 三种探测, 逐条记录 `connect_ms` /
+  `first_byte_after_connect_ms` / `close_ms`, 输出 P50/P95/P99, 并对第 2..n 个 target 给出相对
+  第 1 个 (真站基线) 的 Δp50。服务 `docs/real-machine-verification.md` 的 A1 (T2/T3 关闭时间
+  对齐) 与 A2 (auth-succ vs auth-fail 首字节时延)。用法:
+  `cargo run --release --example probe_close_timing -- -t <真站>:443 -t <Mirage>:443 --count 5`。
+- `handshake.rs` 新增 opt-in 度量: 设 env `MIRAGE_QUIET_MEASURE=1` 时, 每个读完整 ClientHello 的
+  连接输出 `[QUIET-MEASURE] ch_read_us=… bytes=… authed=… quiet_us=… rtt_us=…`, 供 A3 用真实流量
+  分布标定 `tuning.client_hello_quiet` 的 min/max。默认关 (零开销)。
+
 ### docs: 主动探测专项加固评估 (2026-10-05)
 
 - 新增 `docs/active-probing-assessment-2026-10.md`: 基于晚高峰观察到的疑似 GFW 主动探测, 实测探测者能否把 Mirage 与真实伪装站区分开。ServerHello 时延仅多 3–7ms (低风险); **空连接与半截 ClientHello 的关闭时间比真站提前 8–14 秒 (可区分)**, 根因是转发时使用了已存在 0–27 秒的预热连接。给出加固建议: P1 建连即预连伪装站以对齐空闲超时, P2 验证 SNI 与 IP 一致性的作用, P3 探测可观测性, P4 生产服务器升级, P5 伪装站就近。
