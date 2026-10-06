@@ -11,16 +11,20 @@
 //! 硬 cap 16384. Fake tail 从 63 (52B body) 改为 64 (53B body) 匹配真实
 //! TLS 1.3 Client Finished 尺寸.
 //!
-//! 2026-09-27 审计修补: 认证前读取改为单一 5s 截止时间的增量缓冲读取。
-//! 任何异常 (buf[0] != 0x16 首字节非 TLS、record_len == 0 或 > 16384、
-//! 记录体或记录头读取超时/EOF读不全) 不再静默断开, 而是将已收到的原始字节
-//! 原样透传给真实伪装站, 消除主动明文探测 (如 HTTP GET 探针秒断/静默丢)
-//! 与真实站点的行为差异; 对端未发字节即关闭时安全释放。所有转发统一受
-//! GLOBAL_UNAUTH、UNAUTH_RATE 速率守卫及 UNAUTH_CONNS 槽位保护。
+//! 2026-09-27 审计修补: 认证前读取不再静默断开。任何异常 (buf[0] != 0x16 首字节非
+//! TLS、record_len == 0 或 > 16384、读取超时/EOF 读不全) 都将已收到的原始字节原样
+//! 透传给真实伪装站, 消除主动明文探测 (如 HTTP GET 探针秒断/静默丢) 与真实站点的
+//! 行为差异; 对端未发字节即关闭时安全释放。所有转发统一受 GLOBAL_UNAUTH、
+//! UNAUTH_RATE 速率守卫及 UNAUTH_CONNS 槽位保护。
+//!
+//! 2026-10 延迟预连: 认证前读取从"单一 5s 总截止"改为**静默间隔语义** (窗口随客户端
+//! RTT 自适应), 且转发路径不再取后台预热连接池而是**判定要转发时即时建连** —— 消除旧池
+//! 把"连接已存在时长"传导给真站 idle-timeout 导致的 8~14s 关闭时间侧信道 (T2/T3)。
+//! 详见 `read_client_hello` / `quiet_timeout_for` 与 `camouflage_rtt.rs` 顶注释。
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,7 +33,7 @@ use tracing::warn;
 
 use super::camouflage;
 use super::control;
-use super::CamouflagePool;
+use super::CamouflageRtt;
 use super::{IpSlotGuard, GLOBAL_UNAUTH, UNAUTH_CONNS};
 
 const TLS_RECORD_HEADER_LEN: usize = 5;
@@ -113,27 +117,46 @@ pub(crate) enum ClientHelloReadResult {
     Close,
 }
 
-/// 增量读取 ClientHello (单一截止时间保持 5s 总体语义)。
-/// 循环 `read` 追加, 任何时刻都知道已读到的全部字节。
-/// 异常时 (首字节非 0x16、record_len==0 或 >16384、读取超时、读不全 EOF)
-/// 返回 Fallback 附带已读字节; 仅当 0 字节 EOF/报错时返回 Close。
+/// A3 标定度量开关 (env `MIRAGE_QUIET_MEASURE=1`), 进程内读一次。开启后对每个读完整
+/// ClientHello 的连接输出 `[QUIET-MEASURE]` 行 (含耗时/字节数/是否认证成功), 真机采集后
+/// 用 awk 统计即可得到"合法客户端 ClientHello 到达时间"分布, 用于定 `min_ms`/`max_ms`。
+/// 默认关 (零开销)。见 docs/real-machine-verification.md A3。
+static QUIET_MEASURE: LazyLock<bool> =
+    LazyLock::new(|| matches!(std::env::var("MIRAGE_QUIET_MEASURE").as_deref(), Ok("1") | Ok("true")));
+
+/// 增量读取 ClientHello —— **静默间隔语义** (取代旧的"单一总截止")。
+///
+/// 判定量纲是"**最后一次收到数据后的静默时长**"而非总时长, 这是延迟预连方案的核心:
+/// - 合法的慢客户端 (ClientHello 大, 分多段 / 丢包重传) 会**持续发** → 数据不断到达 →
+///   永不触发静默 → 读到完整即返回 `Complete`, 不受高延迟环境影响。
+/// - 探测者 (空连接 / 半截 ClientHello) 发完就停 → 静默 `quiet_timeout` 后立即返回
+///   `Fallback` 交伪装站接管 —— **不再等固定 5s**, 于是真站 idle 计时起点与探测者连上的
+///   时刻只差 `quiet_timeout` + 服务器→伪装站 RTT (亚秒级), 而非旧池的 8~14s。
+/// - `hard_deadline` 是总时限兜底, 防"每 quiet_timeout−ε 滴一个字节"的 slowloris。
+///
+/// 其余语义不变: 首字节非 0x16 / record_len 非法**立即** Fallback (不等超时); 只读首个
+/// record 不越过 (管道化字节留在流里); EOF 时分已读非空 → Fallback, 空 → Close。
 pub(crate) async fn read_client_hello<S>(
     stream: &mut S,
-    timeout_dur: Duration,
+    quiet_timeout: Duration,
+    hard_deadline: Duration,
 ) -> ClientHelloReadResult
 where
     S: AsyncRead + Unpin,
 {
-    let deadline = Instant::now() + timeout_dur;
+    let hard_at = Instant::now() + hard_deadline;
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 1024];
 
     loop {
         let now = Instant::now();
-        if now >= deadline {
-            return ClientHelloReadResult::Fallback(buf);
+        let hard_remaining = hard_at.saturating_duration_since(now);
+        if hard_remaining.is_zero() {
+            return ClientHelloReadResult::Fallback(buf); // 总时限到 (slowloris 兜底)
         }
-        let remaining_time = deadline.saturating_duration_since(now);
+        // 单次读取等 min(静默窗口, 距总时限余量): 每次读到数据后此窗口重新起算,
+        // 等价于"最后一次数据后静默 quiet_timeout 即判异常"。
+        let wait = quiet_timeout.min(hard_remaining);
 
         // 单次读取上限: 头未齐只读到 5B, 头齐后只读到记录末尾 —— 绝不越过首个 record,
         // 否则其后的字节 (管道化数据) 会被吞进 buf 丢失或误判。
@@ -144,7 +167,7 @@ where
         };
         let to_read = (target_len - buf.len()).min(tmp.len());
 
-        match tokio::time::timeout(remaining_time, stream.read(&mut tmp[..to_read])).await {
+        match tokio::time::timeout(wait, stream.read(&mut tmp[..to_read])).await {
             Ok(Ok(0)) => {
                 // EOF
                 if buf.is_empty() {
@@ -156,7 +179,7 @@ where
             Ok(Ok(n)) => {
                 buf.extend_from_slice(&tmp[..n]);
 
-                // 规则 3: 一旦首字节非 0x16, 立即回落, 不等满 5B (HTTP 明文探测秒判)
+                // 规则 3: 一旦首字节非 0x16, 立即回落, 不等静默窗口 (HTTP 明文探测秒判)
                 if buf[0] != 0x16 {
                     return ClientHelloReadResult::Fallback(buf);
                 }
@@ -183,11 +206,118 @@ where
                 }
             }
             Err(_) => {
-                // 超时 (交出已读部分, 哪怕 0 字节 —— 让伪装站超时接管)
+                // 静默窗口耗尽 (或总时限到) — 交出已读部分 (哪怕 0 字节) 让伪装站接管
                 return ClientHelloReadResult::Fallback(buf);
             }
         }
     }
+}
+
+/// 客户端握手总时限 (slowloris 兜底): 正常 ClientHello 在 1~2 RTT 内到齐, 5s 对高延迟
+/// 链路 (RTT 700ms × 2 ≈ 1.4s) 也足够宽。
+const CLIENT_HELLO_HARD_DEADLINE: Duration = Duration::from_secs(5);
+
+// ── 静默窗口参数 (启动时从 tuning.client_hello_quiet 设一次; env 可覆盖) ──────────────
+static QUIET_MULT: AtomicU32 = AtomicU32::new(2);
+static QUIET_MIN_US: AtomicU64 = AtomicU64::new(100_000);
+static QUIET_MAX_US: AtomicU64 = AtomicU64::new(500_000);
+
+/// 设置静默窗口参数 (启动时一次)。`MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS` /
+/// `MIRAGE_QUIET_MAX_MS` 环境变量优先覆盖 (供真机 A/B 调参)。min/max 反转自动纠正。
+pub fn set_quiet_window(mult: u32, min: Duration, max: Duration) {
+    let mult = std::env::var("MIRAGE_QUIET_MULT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|m| *m > 0)
+        .unwrap_or(mult.max(1));
+    let fallback_min = min.as_millis() as u64;
+    let fallback_max = max.as_millis() as u64;
+    let min_ms = std::env::var("MIRAGE_QUIET_MIN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(fallback_min);
+    let max_ms = std::env::var("MIRAGE_QUIET_MAX_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(fallback_max);
+    let (min_ms, max_ms) = if min_ms <= max_ms { (min_ms, max_ms) } else { (max_ms, min_ms) };
+    QUIET_MULT.store(mult, Ordering::Relaxed);
+    QUIET_MIN_US.store(min_ms.saturating_mul(1000), Ordering::Relaxed);
+    QUIET_MAX_US.store(max_ms.saturating_mul(1000), Ordering::Relaxed);
+}
+
+/// 当前生效的 `(mult, min_ms, max_ms)` —— 启动日志用。
+pub fn quiet_window_params() -> (u32, u64, u64) {
+    (
+        QUIET_MULT.load(Ordering::Relaxed),
+        QUIET_MIN_US.load(Ordering::Relaxed) / 1000,
+        QUIET_MAX_US.load(Ordering::Relaxed) / 1000,
+    )
+}
+
+/// 纯函数: 窗口 = `clamp(mult × RTT, min, max)`; RTT 未知/0 → **上限** (无 RTT 信息时偏保守,
+/// 宁可多等也不误伤合法客户端; 该值本就是可容忍的最大偏差)。min/max 反转自动纠正。
+///
+/// 依据 (见 docs/active-probing-assessment-2026-10.md P1): TLS ClientHello (1.2~1.4KB) 可能分
+/// 2 个 TCP 段, 段间隔 ≈ 1 RTT, 故默认 `mult = 2`。低延迟环境窗口小 → 探测偏差小;
+/// 高延迟环境窗口随 RTT 放大 → 合法 ClientHello 到齐前不误判; 慢合法客户端即使超窗也安全
+/// (TCP 持续发剩余段, 有数据就重置窗口)。
+pub(crate) fn quiet_window(
+    mult: u32,
+    min: Duration,
+    max: Duration,
+    client_rtt: Option<Duration>,
+) -> Duration {
+    let (floor, ceil) = if min <= max { (min, max) } else { (max, min) };
+    match client_rtt {
+        Some(rtt) if !rtt.is_zero() => (rtt * mult.max(1)).clamp(floor, ceil),
+        _ => ceil,
+    }
+}
+
+/// 用启动时设定的参数计算静默窗口 (见 `set_quiet_window` / `config::ClientHelloQuietConfig`)。
+pub(crate) fn quiet_timeout_for(client_rtt: Option<Duration>) -> Duration {
+    quiet_window(
+        QUIET_MULT.load(Ordering::Relaxed),
+        Duration::from_micros(QUIET_MIN_US.load(Ordering::Relaxed)),
+        Duration::from_micros(QUIET_MAX_US.load(Ordering::Relaxed)),
+        client_rtt,
+    )
+}
+
+/// 从已建立的 TCP 连接读内核 RTT 估计 (`TCP_INFO.tcpi_rtt`, 微秒)。零成本 (不发包, TCP
+/// 握手后即有 SRTT)。失败 / 为 0 → None (调用方回落默认窗口)。
+#[cfg(target_os = "linux")]
+fn tcp_info_rtt(stream: &TcpStream) -> Option<Duration> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let us = info.tcpi_rtt as u64;
+    if us == 0 {
+        return None;
+    }
+    Some(Duration::from_micros(us))
+}
+
+/// 非 Linux 无 TCP_INFO (项目实际只跑 Linux, 此分支仅为编译健全性)。
+#[cfg(not(target_os = "linux"))]
+fn tcp_info_rtt(_stream: &TcpStream) -> Option<Duration> {
+    None
 }
 
 /// 将客户端连接与已接收字节反射给伪装站 (camouflage_host:443) 并双向透传。
@@ -198,7 +328,7 @@ async fn reflect_to_camouflage<S>(
     peer_addr: SocketAddr,
     bytes: &[u8],
     camouflage_host: &str,
-    cam_pool: &Arc<CamouflagePool>,
+    cam_rtt: &Arc<CamouflageRtt>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -235,7 +365,7 @@ async fn reflect_to_camouflage<S>(
         IpSlotGuard(ip)
     };
 
-    camouflage::run_camouflage_forward(stream, bytes, camouflage_host, cam_pool).await;
+    camouflage::run_camouflage_forward(stream, bytes, camouflage_host, cam_rtt).await;
 }
 
 /// 结构化消费 Fake Client Finished Tail:
@@ -283,15 +413,18 @@ pub(super) async fn run_handshake<S>(
     peer_addr: SocketAddr,
     creds: &[super::CredEntry],
     camouflage_host: &str,
-    cam_pool: &Arc<CamouflagePool>,
+    cam_rtt: &Arc<CamouflageRtt>,
     auth_ts_tolerance_secs: u64,
     pfs: bool,
+    client_rtt: Option<Duration>,
 ) -> Option<(S, [u8; 32], [u8; 32], Option<[u8; 32]>, usize)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // 1 & 2. 增量读取 ClientHello (单一 5s 截止时间)
-    let client_hello = match read_client_hello(&mut stream, Duration::from_secs(5)).await {
+    // 1 & 2. 增量读取 ClientHello —— 静默间隔语义, 窗口随客户端 RTT 自适应。
+    let quiet = quiet_timeout_for(client_rtt);
+    let ch_t0 = Instant::now();
+    let client_hello = match read_client_hello(&mut stream, quiet, CLIENT_HELLO_HARD_DEADLINE).await {
         ClientHelloReadResult::Complete(ch) => ch,
         ClientHelloReadResult::Fallback(bytes) => {
             warn!(
@@ -299,7 +432,7 @@ where
                 peer_addr,
                 bytes.len()
             );
-            reflect_to_camouflage(stream, peer_addr, &bytes, camouflage_host, cam_pool).await;
+            reflect_to_camouflage(stream, peer_addr, &bytes, camouflage_host, cam_rtt).await;
             return None;
         }
         ClientHelloReadResult::Close => {
@@ -343,9 +476,22 @@ where
     }
     let authenticated = matched_idx.is_some();
 
+    // A3 标定: opt-in 度量 (env MIRAGE_QUIET_MEASURE=1)。只记"读完整"的样本 —— 合法客户端
+    // (authed=1) 的 ch_read_us 分布就是定 T_quiet 的输入; authed=0 的完整 CH 是探测。
+    if *QUIET_MEASURE {
+        tracing::info!(
+            "[QUIET-MEASURE] ch_read_us={} bytes={} authed={} quiet_us={} rtt_us={}",
+            ch_t0.elapsed().as_micros(),
+            client_hello.len(),
+            authenticated as u8,
+            quiet.as_micros(),
+            client_rtt.map(|r| r.as_micros()).unwrap_or(0),
+        );
+    }
+
     if !authenticated {
         warn!("Mirage Server auth failed from {}", peer_addr);
-        reflect_to_camouflage(stream, peer_addr, &client_hello, camouflage_host, cam_pool).await;
+        reflect_to_camouflage(stream, peer_addr, &client_hello, camouflage_host, cam_rtt).await;
         return None;
     }
 
@@ -382,13 +528,16 @@ where
     // auth-fail 走 camouflage 转发有 ~1 RTT 延迟 (探针→server→camouflage→回),
     // auth-succ 本地模板回放 ~0ms. 差异让 GFW 关联"真实用户秒回、探针慢回"识破
     // 差别对待 = 暴露 Reality 式代理. auth-fail 无法变快 (探针要真实 TLS 握手必须
-    // 转发真站), 故在 auth-succ 注入等量抖动延迟对齐. RTT 由 CamouflagePool 实测,
+    // 转发真站), 故在 auth-succ 注入等量抖动延迟对齐. RTT 由 CamouflageRtt 实测,
     // ±25% 抖动模拟网络方差 (固定延迟太规整反而是特征). WarmPool 预建吸收此延迟,
     // 用户无感.
-    let rtt = cam_pool.rtt_us();
+    //
+    // 延迟预连 (2026-10): auth-fail 现为**即时建连** → 时延 = 建连 RTT + 转发 RTT
+    // = 2 × cam_RTT (旧池时代连接已建好, 只剩 1 × 转发 RTT)。故注入量翻倍到 2 ×。
+    let rtt = cam_rtt.rtt_us();
     if rtt > 0 {
         let jitter_num = 75 + fastrand::u64(0..=50); // 75%~125%
-        let delay_us = rtt.saturating_mul(jitter_num) / 100;
+        let delay_us = rtt.saturating_mul(2).saturating_mul(jitter_num) / 100;
         tokio::time::sleep(Duration::from_micros(delay_us)).await;
     }
 
@@ -439,7 +588,7 @@ pub(super) async fn handle_connection(
     peer_addr: SocketAddr,
     creds: super::CredsSnapshot,
     camouflage_host: String,
-    cam_pool: Arc<CamouflagePool>,
+    cam_rtt: Arc<CamouflageRtt>,
     auth_ts_tolerance_secs: u64,
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
@@ -447,9 +596,11 @@ pub(super) async fn handle_connection(
 ) {
     stream.set_nodelay(true).unwrap_or_default();
     let client_ip = peer_addr.ip();
+    // 客户端 RTT (TCP_INFO, 零成本) → 自适应静默窗口 (见 quiet_timeout_for)。
+    let client_rtt = tcp_info_rtt(&stream);
     let creds_snapshot = creds.load_full();
     if let Some((stream, client_random, server_random, ecdh, idx)) = run_handshake(
-        stream, peer_addr, &creds_snapshot, &camouflage_host, &cam_pool, auth_ts_tolerance_secs, pfs,
+        stream, peer_addr, &creds_snapshot, &camouflage_host, &cam_rtt, auth_ts_tolerance_secs, pfs, client_rtt,
     )
     .await
     {
@@ -591,7 +742,7 @@ mod tests {
         client.write_all(probe).await.unwrap();
 
         let start = Instant::now();
-        let res = read_client_hello(&mut server, Duration::from_secs(5)).await;
+        let res = read_client_hello(&mut server, Duration::from_secs(5), Duration::from_secs(10)).await;
         let elapsed = start.elapsed();
 
         // 必须立即判定, 不等 5s 超时或后续字节
@@ -615,7 +766,7 @@ mod tests {
         let header = [0x16, 0x03, 0x03, 0x4e, 0x20];
         client.write_all(&header).await.unwrap();
 
-        let res = read_client_hello(&mut server, Duration::from_secs(5)).await;
+        let res = read_client_hello(&mut server, Duration::from_secs(5), Duration::from_secs(10)).await;
         match res {
             ClientHelloReadResult::Fallback(bytes) => {
                 assert_eq!(bytes, header, "超长 record_len 必须回落且包含已读字节");
@@ -631,7 +782,7 @@ mod tests {
         let header = [0x16, 0x03, 0x03, 0x00, 0x00];
         client.write_all(&header).await.unwrap();
 
-        let res = read_client_hello(&mut server, Duration::from_secs(5)).await;
+        let res = read_client_hello(&mut server, Duration::from_secs(5), Duration::from_secs(10)).await;
         match res {
             ClientHelloReadResult::Fallback(bytes) => {
                 assert_eq!(bytes, header, "record_len == 0 必须回落且包含已读字节");
@@ -649,7 +800,7 @@ mod tests {
         data.extend(vec![0xAA; 40]);
         client.write_all(&data).await.unwrap();
 
-        let res = read_client_hello(&mut server, Duration::from_millis(50)).await;
+        let res = read_client_hello(&mut server, Duration::from_millis(50), Duration::from_secs(5)).await;
         match res {
             ClientHelloReadResult::Fallback(bytes) => {
                 assert_eq!(bytes, data, "超时后回落字节必须 == 已发送的全部字节 (头+半个体)");
@@ -666,7 +817,7 @@ mod tests {
         ch.extend(vec![0xBB; 150]);
         client.write_all(&ch).await.unwrap();
 
-        let res = read_client_hello(&mut server, Duration::from_secs(5)).await;
+        let res = read_client_hello(&mut server, Duration::from_secs(5), Duration::from_secs(10)).await;
         match res {
             ClientHelloReadResult::Complete(bytes) => {
                 assert_eq!(bytes, ch, "合法 ClientHello 必须完整读出且返回 Complete");
@@ -684,7 +835,7 @@ mod tests {
         sent.extend_from_slice(b"TRAILING"); // 紧随其后的管道化字节
         client.write_all(&sent).await.unwrap();
 
-        let res = read_client_hello(&mut server, Duration::from_secs(5)).await;
+        let res = read_client_hello(&mut server, Duration::from_secs(5), Duration::from_secs(10)).await;
         assert_eq!(res, ClientHelloReadResult::Complete(ch), "只读首个 record, 不吞后续字节");
         let mut rest = [0u8; 8];
         server.read_exact(&mut rest).await.unwrap();
@@ -695,7 +846,7 @@ mod tests {
     async fn test_read_client_hello_zero_bytes_eof_closes() {
         let (client, mut server) = tokio::io::duplex(1024);
         drop(client); // 0 字节立即断开
-        let res = read_client_hello(&mut server, Duration::from_secs(5)).await;
+        let res = read_client_hello(&mut server, Duration::from_secs(5), Duration::from_secs(10)).await;
         assert_eq!(res, ClientHelloReadResult::Close, "未发送任何字节即 EOF 应返回 Close");
     }
 
@@ -703,13 +854,83 @@ mod tests {
     async fn test_read_client_hello_zero_bytes_timeout_fallback() {
         let (_client, mut server) = tokio::io::duplex(1024);
         // 0 字节连接挂起超时
-        let res = read_client_hello(&mut server, Duration::from_millis(50)).await;
+        let res = read_client_hello(&mut server, Duration::from_millis(50), Duration::from_secs(5)).await;
         match res {
             ClientHelloReadResult::Fallback(bytes) => {
                 assert!(bytes.is_empty(), "0 字节超时应交出空字节交由伪装站超时接管");
             }
             other => panic!("expected Fallback, got {:?}", other),
         }
+    }
+
+    /// 自适应静默窗口: `clamp(mult×RTT, min, max)`, RTT 未知 → 上限。
+    #[test]
+    fn quiet_window_adapts_to_rtt() {
+        let (m, lo, hi) = (2u32, Duration::from_millis(100), Duration::from_millis(500));
+        // 低延迟: 2×20ms=40ms → 下限 100ms (低延迟环境偏差只 0.1s)
+        assert_eq!(quiet_window(m, lo, hi, Some(Duration::from_millis(20))), Duration::from_millis(100));
+        // 中延迟: 2×80ms=160ms (不触发上下限)
+        assert_eq!(quiet_window(m, lo, hi, Some(Duration::from_millis(80))), Duration::from_millis(160));
+        // 高延迟: 2×300ms=600ms → 上限 500ms (合法 CH 到齐前不误判)
+        assert_eq!(quiet_window(m, lo, hi, Some(Duration::from_millis(300))), Duration::from_millis(500));
+        // RTT 未知 / 0 → 上限 (保守, 不误伤)
+        assert_eq!(quiet_window(m, lo, hi, None), Duration::from_millis(500));
+        assert_eq!(quiet_window(m, lo, hi, Some(Duration::ZERO)), Duration::from_millis(500));
+        // 可配: 3×RTT / clamp 50~2000ms
+        let (m2, lo2, hi2) = (3u32, Duration::from_millis(50), Duration::from_millis(2000));
+        assert_eq!(quiet_window(m2, lo2, hi2, Some(Duration::from_millis(20))), Duration::from_millis(60));
+        assert_eq!(quiet_window(m2, lo2, hi2, Some(Duration::from_millis(500))), Duration::from_millis(1500));
+        // min/max 反转自动纠正 (floor/ceil 互换)
+        assert_eq!(
+            quiet_window(2, Duration::from_millis(500), Duration::from_millis(100), Some(Duration::from_millis(1000))),
+            Duration::from_millis(500)
+        );
+    }
+
+    /// 核心不变量: 数据分段到达且段间隔 < 静默窗口时, **不得**误判为探测 ——
+    /// 这是延迟预连方案"高延迟环境不误伤慢合法客户端"的依据。
+    #[tokio::test]
+    async fn test_read_client_hello_interval_data_not_treated_as_quiet() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let ch: Vec<u8> = {
+            let mut v = vec![0x16, 0x03, 0x01, 0x00, 0x20]; // len = 32
+            v.extend(vec![0xAA; 32]);
+            v
+        };
+        let first = ch[..10].to_vec();
+        let second = ch[10..].to_vec();
+
+        let writer = tokio::spawn(async move {
+            client.write_all(&first).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await; // < quiet(100ms)
+            client.write_all(&second).await.unwrap();
+            client // 保持连接开启直到读完
+        });
+
+        let res = read_client_hello(&mut server, Duration::from_millis(100), Duration::from_secs(5)).await;
+        assert_eq!(res, ClientHelloReadResult::Complete(ch), "持续有数据到达就不该触发静默判定");
+        let _hold = writer.await;
+    }
+
+    /// slowloris 兜底: 以 < quiet 的间隔持续滴发但总时长超 hard → hard deadline 强制回落。
+    #[tokio::test]
+    async fn test_read_client_hello_drip_feed_hits_hard_deadline() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let header = vec![0x16, 0x03, 0x03, 0x03, 0xE8]; // 声称 body 1000B
+        let writer = tokio::spawn(async move {
+            if client.write_all(&header).await.is_err() { return; }
+            for _ in 0..100 {
+                if client.write_all(&[0xAA]).await.is_err() { return; }
+                tokio::time::sleep(Duration::from_millis(20)).await; // < quiet(50ms)
+            }
+        });
+
+        let start = Instant::now();
+        let res = read_client_hello(&mut server, Duration::from_millis(50), Duration::from_millis(300)).await;
+        let elapsed = start.elapsed();
+        assert!(matches!(res, ClientHelloReadResult::Fallback(_)), "滴发应被 hard deadline 兜底, 实际 {:?}", res);
+        assert!(elapsed >= Duration::from_millis(250), "应在 hard deadline 附近返回, 实际 {:?}", elapsed);
+        writer.abort();
     }
 
     #[tokio::test]
@@ -721,7 +942,7 @@ mod tests {
         let password = "test_handshake_pwd";
         let creds = vec![super::super::CredEntry::new("default", password)];
         let peer_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let pool = CamouflagePool::new("example.com".to_string());
+        let cam_rtt = CamouflageRtt::new();
 
         let client_random = [0x55u8; 32];
         let token = crate::crypto::hello_auth::make_session_token(password, &client_random);
@@ -744,7 +965,7 @@ mod tests {
         ch_record.extend_from_slice(&hs);
 
         let server_task = tokio::spawn(async move {
-            run_handshake(server, peer_addr, &creds, "example.com", &pool, 60, false).await
+            run_handshake(server, peer_addr, &creds, "example.com", &cam_rtt, 60, false, None).await
         });
 
         // 客户端发送 ClientHello

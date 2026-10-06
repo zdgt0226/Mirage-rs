@@ -1268,6 +1268,39 @@ pub struct TuningConfig {
     /// UDP mux 共享隧道条数 K (默认 4)。越大 HoL 连累面越小但占越多池位。仅 udp_mux 开时生效。
     #[serde(default = "default_udp_mux_tunnels")]
     pub udp_mux_tunnels: usize,
+    /// **服务端** ClientHello 静默窗口自适应参数 (延迟预连)。窗口 = `clamp(mult × 客户端RTT,
+    /// min_ms, max_ms)`: 合法慢客户端 (ClientHello 分多段/丢包重传) 持续发就不触发; 探测者
+    /// (空连接/半截) 静默即判异常转伪装站。不设 = 默认 `2 × RTT`, clamp 100~500ms。
+    /// 调参影响探测者看到的关闭时间偏差 (≈ 窗口); 真机 A/B 可用环境变量覆盖 (见结构注释)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hello_quiet: Option<ClientHelloQuietConfig>,
+}
+
+/// 见 `TuningConfig::client_hello_quiet`。
+///
+/// 环境变量覆盖 (优先于 config, 供真机 A/B 调参): `MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS`
+/// / `MIRAGE_QUIET_MAX_MS`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientHelloQuietConfig {
+    /// 窗口 = mult × 客户端 RTT。默认 2 (ClientHello 可能分 2 个 TCP 段, 段间隔 ≈ 1 RTT)。
+    #[serde(default = "default_quiet_mult")]
+    pub mult: u32,
+    /// 窗口下限 (ms)。默认 100。低延迟环境下决定探测偏差量级 (越小偏差越小)。
+    #[serde(default = "default_quiet_min_ms")]
+    pub min_ms: u64,
+    /// 窗口上限 (ms)。默认 500。高延迟环境下防误伤慢合法客户端 (越大越宽容)。
+    #[serde(default = "default_quiet_max_ms")]
+    pub max_ms: u64,
+}
+
+fn default_quiet_mult() -> u32 {
+    2
+}
+fn default_quiet_min_ms() -> u64 {
+    100
+}
+fn default_quiet_max_ms() -> u64 {
+    500
 }
 
 fn default_udp_mux_tunnels() -> usize {
@@ -1861,6 +1894,25 @@ impl Config {
             }
         }
 
+        // tuning.client_hello_quiet (服务端延迟预连静默窗口): 参数反转/过大都会让它失效。
+        if let Some(q) = self.tuning.as_ref().and_then(|t| t.client_hello_quiet.as_ref()) {
+            if q.mult == 0 {
+                issues.push("tuning.client_hello_quiet.mult 不能为 0 (窗口 = mult × RTT)".to_string());
+            }
+            if q.min_ms == 0 || q.min_ms > q.max_ms {
+                issues.push(format!(
+                    "tuning.client_hello_quiet 的 min_ms={} / max_ms={} 非法 (需 0 < min_ms <= max_ms)",
+                    q.min_ms, q.max_ms
+                ));
+            }
+            if q.max_ms > 60_000 {
+                issues.push(format!(
+                    "tuning.client_hello_quiet.max_ms={} 过大 (>60000): 高延迟环境下探测偏差会随之放大",
+                    q.max_ms
+                ));
+            }
+        }
+
         issues
     }
 }
@@ -2337,6 +2389,34 @@ mod validation_tests {
                             "password": "sspw", "method": "chacha20-ietf-poly1305" } }
         ]);
         assert!(issues_of(&v).is_empty(), "合法上游配置不该报问题: {:?}", issues_of(&v));
+    }
+
+    #[test]
+    fn client_hello_quiet_params_validated() {
+        // 不写该字段: 无 issue。
+        let mut v = base();
+        v["tuning"] = serde_json::json!({});
+        assert!(!has(&issues_of(&v), "client_hello_quiet"), "不写不该报: {:?}", issues_of(&v));
+
+        // 合法值: 无 issue + 字段真解析到 (防漂移)。
+        v["tuning"] = serde_json::json!({
+            "client_hello_quiet": { "mult": 3, "min_ms": 50, "max_ms": 2000 }
+        });
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        let q = cfg.tuning.unwrap().client_hello_quiet.expect("字段应真解析到 (防漂移)");
+        assert_eq!((q.mult, q.min_ms, q.max_ms), (3, 50, 2000));
+        assert!(!has(&issues, "client_hello_quiet"), "合法值不该报: {issues:?}");
+
+        // 非法值 → 均报。
+        for bad in [
+            serde_json::json!({ "mult": 0 }),
+            serde_json::json!({ "min_ms": 0 }),
+            serde_json::json!({ "min_ms": 800, "max_ms": 100 }),
+            serde_json::json!({ "max_ms": 120_000 }),
+        ] {
+            v["tuning"] = serde_json::json!({ "client_hello_quiet": bad });
+            assert!(has(&issues_of(&v), "client_hello_quiet"), "非法 {bad} 应报: {:?}", issues_of(&v));
+        }
     }
 
     #[test]

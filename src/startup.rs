@@ -145,6 +145,18 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
         }
 
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
+            // ClientHello 静默窗口 (服务端延迟预连): 窗口 = clamp(mult×RTT, min, max)。
+            // 环境变量 MIRAGE_QUIET_* 优先覆盖 (真机 A/B 调参)。放在 tuning 块外:
+            // 配置未写 tuning 时 env 覆盖与启动日志同样生效。
+            {
+                let q = config.tuning.as_ref().and_then(|t| t.client_hello_quiet.as_ref());
+                let mult = q.map(|q| q.mult).unwrap_or(2);
+                let min = std::time::Duration::from_millis(q.map(|q| q.min_ms).unwrap_or(100));
+                let max = std::time::Duration::from_millis(q.map(|q| q.max_ms).unwrap_or(500));
+                crate::proxy::mirage_server::set_quiet_window(mult, min, max);
+                let (m, lo, hi) = crate::proxy::mirage_server::quiet_window_params();
+                info!("ClientHello 静默窗口: {}×RTT, clamp {}~{}ms (MIRAGE_QUIET_* 可覆盖)", m, lo, hi);
+            }
             if let Some(tuning) = config.tuning {
                 // 服务端 cipher agility 开关 (设进全局, control.rs 读)。
                 crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
