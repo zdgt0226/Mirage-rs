@@ -36,6 +36,13 @@
   伪装站就近) · C1–C4 内核/eBPF (TCP listener 复核 / LPM CPU 热点 / ICMP 反射) · D1–D3 传输性能
   (UDP mux 带机量 / QUIC 不超发 / QUIC 反识别) · E1–E2 泄漏测试补全 · F1–F2 工程与供应链。
 
+### fix(transparent-udp): 网关透明 UDP 主 socket 接收缓冲加大到 4MB (2026-10-06)
+
+- 全部 LAN UDP 汇入一个主 socket, 默认 rmem (~208KB) 在高并发下溢出 (`UdpRcvbufErrors`)。改为
+  `SO_RCVBUFFORCE` 4MB (失败回落 `SO_RCVBUF`), 启动日志打印实际值。
+- 实测 (netns, A/B 各 3 轮): 主 socket 丢包每轮 1405~1776 → 0; 2000 并发数据报丢失 5.6% → 3.1%。
+  并发拐点不变 —— D1 复查确认斜坡拐点来自流翻转累积 (mux sid 槽 K×512, 60s 回收), 单级加压 2000 并发 99.5% 通过。
+
 ### docs: 实机验证 C1–C3 / D1–D2 回填 (2026-10-06)
 
 - C1 TCP listener 分水岭 ✅ · C2 LPM 非热点 (12 万 pps 下 `trie_lookup_elem` 0.77%, 低于内核路由查找) → 不加 flow cache ✅ ·
