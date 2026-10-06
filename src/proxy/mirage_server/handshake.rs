@@ -235,10 +235,12 @@ pub fn set_quiet_window(mult: u32, min: Duration, max: Duration) {
     let min_ms = std::env::var("MIRAGE_QUIET_MIN_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
         .unwrap_or(fallback_min);
     let max_ms = std::env::var("MIRAGE_QUIET_MAX_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
         .unwrap_or(fallback_max);
     let (min_ms, max_ms) = if min_ms <= max_ms { (min_ms, max_ms) } else { (max_ms, min_ms) };
     QUIET_MULT.store(mult, Ordering::Relaxed);

@@ -24,6 +24,9 @@
   (`camouflage_rtt.rs`, 取代 `camouflage_pool.rs`)。
 - **测试**: 静默语义 (分段到达不误判 / 滴发被 hard deadline 兜底)、自适应窗口、按需建连 (触发前
   0 连接、触发后恰好 1 条) 均有单测。端到端关闭时间对齐仍需真机复测 (见文档)。
+- **审查修复 (P2 ×2)**: ① 静默窗口初始化移出 `if let Some(tuning)` 块 —— 配置未写 `tuning` 时
+  `MIRAGE_QUIET_*` 环境变量覆盖与启动日志此前不生效; ② `MIRAGE_QUIET_MIN_MS` / `MAX_MS` 为 0 时忽略
+  (回落配置值), 防止窗口归零把所有合法 ClientHello 判为异常 (与 config `check` 的 `min_ms > 0` 一致)。
 
 ### docs: 新增实机验证任务列表 `docs/real-machine-verification.md` (2026-10-06)
 
