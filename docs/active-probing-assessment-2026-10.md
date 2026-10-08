@@ -2,16 +2,23 @@
 
 > 依据 2026-10-05 晚高峰直连复测中观察到的疑似 GFW 主动探测（`docs/benchmark-2026-09.md` §5.4），评估 Mirage 在被主动探测时还能被区分出来的地方，并给出加固建议。文中服务器与客户端均以代号表示（S1、S2、C2），不含任何真实地址。
 
-> **实施状态 (2026-10-06)**: §4 的 **P1 已实施** —— 预热连接池改为「**延迟预连**」:
-> 转发路径在**判定要转发的时刻即时建连**(池龄恒 ≈ 0), 认证前读取从「单一 5s 总截止」改为
-> 「**静默间隔语义**」且窗口随客户端 RTT 自适应 (`clamp(2×RTT, 100ms, 500ms)`)。§3 描述的
-> 8~14s 关闭时间偏差的根因 (池龄传导给真站 idle-timeout) 随之消除, 预期收敛到「静默窗口
-> + 服务器→伪装站 RTT」(亚秒级)。代码: `src/proxy/mirage_server/{camouflage.rs,
-camouflage_rtt.rs,handshake.rs::read_client_hello}`。静默窗口**可配** (`tuning.client_hello_quiet`,
-> 或环境变量 `MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS` / `MIRAGE_QUIET_MAX_MS`)。
-> **端到端关闭时间对齐仍需真机复测** —— 已连同 auth-succ/auth-fail 时延差核对、T_quiet
-> 标定等一并列入 [`docs/real-machine-verification.md`](real-machine-verification.md) 的 A1–A3
-> (进程内单测已覆盖机制: 按需建连 / 静默语义 / 自适应窗口, 但绝对时序差属部署验证项)。
+> **实施状态 (2026-10-06)**: §4 的 **P1 已实施**，但采用的**不是方案 A** —— 而是「**推测性预连 + 宽容判定期限**」
+> （对齐 / 容错分离）。
+>
+> - **为什么不用 A**：A 是“每条入站连接 accept 即预连”（含占多数的合法客户端）—— 对齐上限与现方案
+>   同量级（都是“到伪装站一个 RTT”），但会把到伪装站的连接量放大到接近入站连接数，与取消预热的
+>   初衷直接冲突。现方案只在“accept 后延迟 `preconnect_delay` 仍未见完整 ClientHello”时才预连，
+>   合法快客户端 **0** 条。详见表与论证见 [`docs/client-hello-timing-design.md`](client-hello-timing-design.md) §7。
+> - **三个时钟**：① `preconnect_delay`（`clamp(2×RTT, 100~500ms)`，负责**对齐**）· ② `judge_silence_ms`
+>   （默认 1000ms，负责**容错**）· ③ `hard_deadline_ms`（默认 5000ms，slowloris 兜底）。
+>   旧实现把 ① 与 ② 合成一个 `2×RTT` 窗口，因为小于 TCP 重传间隔（RTO≥200ms）会**误杀丢段的合法
+>   客户端** —— 这已由 `retransmit_gap_within_judge_is_tolerated` 锁定。
+> - **代码**：`src/proxy/mirage_server/{camouflage.rs, camouflage_rtt.rs, handshake.rs}`；参数
+>   `tuning.client_hello_guard`，环境变量 `MIRAGE_CH_PRECONNECT_MULT/_MIN_MS/_MAX_MS` /
+>   `MIRAGE_CH_JUDGE_MS` / `MIRAGE_CH_HARD_MS`。
+> - **可观测性**：`MIRAGE_CH_MEASURE=1` 输出 `[CH-GUARD]` 行（**含 Fallback 样本**，可数“丢包误杀”）。
+> - **端到端关闭时间对齐仍需真机复测** —— 已连同 auth-succ/auth-fail 时延差核对、计时参数标定
+>   列入 [`docs/real-machine-verification.md`](real-machine-verification.md) 的 A1–A3。
 
 ## 1. 观察到的探测
 
@@ -46,7 +53,7 @@ camouflage_rtt.rs,handshake.rs::read_client_hello}`。静默窗口**可配** (`t
 
 ## 4. 加固建议（按优先级）
 
-### P1：转发路径的空闲超时与真站对齐（修复 T2 / T3）—— ✅ 已实施 (延迟预连, 2026-10-06)
+### P1：转发路径的空闲超时与真站对齐（修复 T2 / T3）—— ✅ 已实施（推测性预连 + 宽容判定期限，非方案 A；见文首实施状态）
 
 | 方案 | 做法 | 效果 | 代价 |
 |---|---|---|---|

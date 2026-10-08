@@ -1268,39 +1268,74 @@ pub struct TuningConfig {
     /// UDP mux 共享隧道条数 K (默认 4)。越大 HoL 连累面越小但占越多池位。仅 udp_mux 开时生效。
     #[serde(default = "default_udp_mux_tunnels")]
     pub udp_mux_tunnels: usize,
-    /// **服务端** ClientHello 静默窗口自适应参数 (延迟预连)。窗口 = `clamp(mult × 客户端RTT,
-    /// min_ms, max_ms)`: 合法慢客户端 (ClientHello 分多段/丢包重传) 持续发就不触发; 探测者
-    /// (空连接/半截) 静默即判异常转伪装站。不设 = 默认 `2 × RTT`, clamp 100~500ms。
-    /// 调参影响探测者看到的关闭时间偏差 (≈ 窗口); 真机 A/B 可用环境变量覆盖 (见结构注释)。
+    /// **服务端** ClientHello 计时与判定参数（对齐 / 容错分离）。详见
+    /// `docs/client-hello-timing-design.md`: `preconnect_*` 决定"何时推测性预连伪装站"（对齐真站
+    /// 空闲计时起点）, `judge_silence_ms` 决定"静默多久判为探测"（丢包容忍）, `hard_deadline_ms`
+    /// 是 slowloris 总兜底。不设 = `2×RTT` (clamp 100~500ms) / 1000ms / 5000ms。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_hello_quiet: Option<ClientHelloQuietConfig>,
+    pub client_hello_guard: Option<ClientHelloGuardConfig>,
 }
 
-/// 见 `TuningConfig::client_hello_quiet`。
+/// 见 `TuningConfig::client_hello_guard` 与 `docs/client-hello-timing-design.md`。
 ///
-/// 环境变量覆盖 (优先于 config, 供真机 A/B 调参): `MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS`
-/// / `MIRAGE_QUIET_MAX_MS`。
+/// 环境变量覆盖 (优先于 config, 供真机 A/B 调参): `MIRAGE_CH_PRECONNECT_MULT` /
+/// `MIRAGE_CH_PRECONNECT_MIN_MS` / `MIRAGE_CH_PRECONNECT_MAX_MS` / `MIRAGE_CH_JUDGE_MS` /
+/// `MIRAGE_CH_HARD_MS` / `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS`。
 #[derive(Debug, Clone, Deserialize)]
-pub struct ClientHelloQuietConfig {
-    /// 窗口 = mult × 客户端 RTT。默认 2 (ClientHello 可能分 2 个 TCP 段, 段间隔 ≈ 1 RTT)。
-    #[serde(default = "default_quiet_mult")]
-    pub mult: u32,
-    /// 窗口下限 (ms)。默认 100。低延迟环境下决定探测偏差量级 (越小偏差越小)。
-    #[serde(default = "default_quiet_min_ms")]
-    pub min_ms: u64,
-    /// 窗口上限 (ms)。默认 500。高延迟环境下防误伤慢合法客户端 (越大越宽容)。
-    #[serde(default = "default_quiet_max_ms")]
-    pub max_ms: u64,
+pub struct ClientHelloGuardConfig {
+    /// 预连触发 = `preconnect_mult × 客户端 RTT`。默认 2。
+    /// (ClientHello ~1786B 分 2 段背靠背发出、正常间隔 ≈ 0; 乘法只为高 RTT 链路留余量。)
+    #[serde(default = "default_preconnect_mult")]
+    pub preconnect_mult: u32,
+    /// 预连触发下限 (ms)。默认 100。决定探测者看到的关闭偏差量级。
+    #[serde(default = "default_preconnect_min_ms")]
+    pub preconnect_min_ms: u64,
+    /// 预连触发上限 (ms)。默认 500。
+    #[serde(default = "default_preconnect_max_ms")]
+    pub preconnect_max_ms: u64,
+    /// 静默判定期限 (ms)。默认 1000。**必须大于 TCP 重传 TLP/RTO** (≥200ms, 退避可达 800ms+),
+    /// 否则丢包的合法客户端会被判成探测。
+    #[serde(default = "default_judge_silence_ms")]
+    pub judge_silence_ms: u64,
+    /// 未认证连接总时限 (ms)。默认 5000。防滴发 slowloris。
+    #[serde(default = "default_hard_deadline_ms")]
+    pub hard_deadline_ms: u64,
+    /// auth-succ 时序注入倍率 (**×10**, 默认 20 = `2.0 × cam_RTT`)。与 `auth_succ_offset_ms`
+    /// 合起来决定 [auth-succ 相对 auth-fail 的时延对齐](#)。
+    #[serde(default = "default_auth_succ_mult_x10")]
+    pub auth_succ_mult_x10: u32,
+    /// auth-succ 时序注入的**固定偏置** (ms, 默认 100)。
+    ///
+    /// **实测依据** (见 `docs/real-machine-verification.md` A2.1/A2.2): auth-fail 的实际耗时为
+    /// `2 × cam_RTT + P` —— `P` 是**伪装站/CDN 对 ClientHello 的固有处理底限** (约 100ms 量级,
+    /// 与 RTT 无关: 证书检索/CPU 处理/回源转发)。只注入 `2×cam_RTT` 时 auth-succ 比 auth-fail
+    /// **快 118~125ms** (S1/S2, n=20); 加 +100ms 偏置后 S2 均值差收敛到 −36ms。实测还显示纯倍率
+    /// (2.5×/2.7×) 在小 RTT 下补不足、大 RTT 下过冲, 因此用"倍率 + 固定偏置"而非单纯加大倍率。
+    #[serde(default = "default_auth_succ_offset_ms")]
+    pub auth_succ_offset_ms: u64,
 }
 
-fn default_quiet_mult() -> u32 {
-    2
+fn default_auth_succ_mult_x10() -> u32 {
+    20
 }
-fn default_quiet_min_ms() -> u64 {
+fn default_auth_succ_offset_ms() -> u64 {
     100
 }
-fn default_quiet_max_ms() -> u64 {
+
+fn default_preconnect_mult() -> u32 {
+    2
+}
+fn default_preconnect_min_ms() -> u64 {
+    100
+}
+fn default_preconnect_max_ms() -> u64 {
     500
+}
+fn default_judge_silence_ms() -> u64 {
+    1000
+}
+fn default_hard_deadline_ms() -> u64 {
+    5000
 }
 
 fn default_udp_mux_tunnels() -> usize {
@@ -1894,21 +1929,53 @@ impl Config {
             }
         }
 
-        // tuning.client_hello_quiet (服务端延迟预连静默窗口): 参数反转/过大都会让它失效。
-        if let Some(q) = self.tuning.as_ref().and_then(|t| t.client_hello_quiet.as_ref()) {
-            if q.mult == 0 {
-                issues.push("tuning.client_hello_quiet.mult 不能为 0 (窗口 = mult × RTT)".to_string());
+        // tuning.client_hello_guard (ClientHello 计时/判定): 参数反转或过小会让它失效。
+        if let Some(q) = self.tuning.as_ref().and_then(|t| t.client_hello_guard.as_ref()) {
+            if q.preconnect_mult == 0 {
+                issues.push("tuning.client_hello_guard.preconnect_mult 不能为 0 (触发 = mult × RTT)".to_string());
             }
-            if q.min_ms == 0 || q.min_ms > q.max_ms {
+            if q.preconnect_min_ms == 0 || q.preconnect_min_ms > q.preconnect_max_ms {
                 issues.push(format!(
-                    "tuning.client_hello_quiet 的 min_ms={} / max_ms={} 非法 (需 0 < min_ms <= max_ms)",
-                    q.min_ms, q.max_ms
+                    "tuning.client_hello_guard 的 preconnect_min_ms={} / preconnect_max_ms={} 非法 (需 0 < min <= max)",
+                    q.preconnect_min_ms, q.preconnect_max_ms
                 ));
             }
-            if q.max_ms > 60_000 {
+            if q.preconnect_max_ms > 5_000 {
                 issues.push(format!(
-                    "tuning.client_hello_quiet.max_ms={} 过大 (>60000): 高延迟环境下探测偏差会随之放大",
-                    q.max_ms
+                    "tuning.client_hello_guard.preconnect_max_ms={} 过大 (>5000): 探测偏差会随之放大",
+                    q.preconnect_max_ms
+                ));
+            }
+            if q.judge_silence_ms < 200 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.judge_silence_ms={} 过小 (<200ms): 小于 TCP 最小 RTO, \
+                     丢包重传的合法客户端会被判成探测 (静默窗口不必再为对齐让步, 建议 >=1000)",
+                    q.judge_silence_ms
+                ));
+            }
+            if q.hard_deadline_ms < q.judge_silence_ms {
+                issues.push(format!(
+                    "tuning.client_hello_guard 的 hard_deadline_ms={} < judge_silence_ms={} (总时限不能短于静默期限)",
+                    q.hard_deadline_ms, q.judge_silence_ms
+                ));
+            }
+            if q.hard_deadline_ms > 60_000 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.hard_deadline_ms={} 过大 (>60000): 未认证连接可被拖很久",
+                    q.hard_deadline_ms
+                ));
+            }
+            // auth-succ 时序注入: 倍率 0 或过大都无意义; 偏置过大则每条合法握手都被拖慢。
+            if q.auth_succ_mult_x10 == 0 || q.auth_succ_mult_x10 > 100 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.auth_succ_mult_x10={} 非法 (需 1..=100, 即 0.1×~10× cam_RTT)",
+                    q.auth_succ_mult_x10
+                ));
+            }
+            if q.auth_succ_offset_ms > 2_000 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.auth_succ_offset_ms={} 过大 (>2000): 每条合法握手都会被拖慢",
+                    q.auth_succ_offset_ms
                 ));
             }
         }
@@ -2392,30 +2459,50 @@ mod validation_tests {
     }
 
     #[test]
-    fn client_hello_quiet_params_validated() {
+    fn client_hello_guard_params_validated() {
         // 不写该字段: 无 issue。
         let mut v = base();
         v["tuning"] = serde_json::json!({});
-        assert!(!has(&issues_of(&v), "client_hello_quiet"), "不写不该报: {:?}", issues_of(&v));
+        assert!(!has(&issues_of(&v), "client_hello_guard"), "不写不该报: {:?}", issues_of(&v));
 
         // 合法值: 无 issue + 字段真解析到 (防漂移)。
         v["tuning"] = serde_json::json!({
-            "client_hello_quiet": { "mult": 3, "min_ms": 50, "max_ms": 2000 }
+            "client_hello_guard": {
+                "preconnect_mult": 3, "preconnect_min_ms": 50, "preconnect_max_ms": 2000,
+                "judge_silence_ms": 1500, "hard_deadline_ms": 6000,
+                "auth_succ_mult_x10": 25, "auth_succ_offset_ms": 100
+            }
         });
         let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
-        let q = cfg.tuning.unwrap().client_hello_quiet.expect("字段应真解析到 (防漂移)");
-        assert_eq!((q.mult, q.min_ms, q.max_ms), (3, 50, 2000));
-        assert!(!has(&issues, "client_hello_quiet"), "合法值不该报: {issues:?}");
+        let q = cfg.tuning.unwrap().client_hello_guard.expect("字段应真解析到 (防漂移)");
+        assert_eq!(
+            (q.preconnect_mult, q.preconnect_min_ms, q.preconnect_max_ms, q.judge_silence_ms, q.hard_deadline_ms),
+            (3, 50, 2000, 1500, 6000)
+        );
+        assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (25, 100));
+        assert!(!has(&issues, "client_hello_guard"), "合法值不该报: {issues:?}");
+
+        // 不写新字段时用实测默认 (2.0× + 100ms)。
+        v["tuning"] = serde_json::json!({ "client_hello_guard": {} });
+        let (cfg, _) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
+        assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (20, 100), "默认应为 2.0× + 100ms");
 
         // 非法值 → 均报。
         for bad in [
-            serde_json::json!({ "mult": 0 }),
-            serde_json::json!({ "min_ms": 0 }),
-            serde_json::json!({ "min_ms": 800, "max_ms": 100 }),
-            serde_json::json!({ "max_ms": 120_000 }),
+            serde_json::json!({ "preconnect_mult": 0 }),
+            serde_json::json!({ "preconnect_min_ms": 0 }),
+            serde_json::json!({ "preconnect_min_ms": 800, "preconnect_max_ms": 100 }),
+            serde_json::json!({ "preconnect_max_ms": 9000 }),
+            serde_json::json!({ "judge_silence_ms": 100 }),
+            serde_json::json!({ "judge_silence_ms": 3000, "hard_deadline_ms": 1000 }),
+            serde_json::json!({ "hard_deadline_ms": 90_000 }),
+            serde_json::json!({ "auth_succ_mult_x10": 0 }),
+            serde_json::json!({ "auth_succ_mult_x10": 101 }),
+            serde_json::json!({ "auth_succ_offset_ms": 5000 }),
         ] {
-            v["tuning"] = serde_json::json!({ "client_hello_quiet": bad });
-            assert!(has(&issues_of(&v), "client_hello_quiet"), "非法 {bad} 应报: {:?}", issues_of(&v));
+            v["tuning"] = serde_json::json!({ "client_hello_guard": bad });
+            assert!(has(&issues_of(&v), "client_hello_guard"), "非法 {bad} 应报: {:?}", issues_of(&v));
         }
     }
 

@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### fix(anti-probing): auth-succ 时序注入按实测定档 —— 「倍率 + 固定偏置」(2026-10-08)
+
+- **来源**: S1/S2 真机 A2 实测 (见 `docs/real-machine-verification.md` A2.1–A2.3): 只注入 `2 × cam_RTT` 时
+  auth-succ 比 auth-fail **系统性快 118~125ms** (Δp50, n=20)。
+- **根因**: auth-fail 的实际耗时 = `2 × cam_RTT + P`, 其中 `P` 是**伪装站/CDN 对 ClientHello 的固有处理底限**
+  (证书检索/CPU/回源, ~100ms), **与 RTT 无关**。纯倍率调节在高 RTT 链路过冲、低 RTT 链路补不足
+  (实测 2.5× 反而把 S1 的 Δp50 从 −224ms 拉到 −397ms)。
+- **改动**: 注入公式改为 `(auth_succ_mult_x10/10 × cam_RTT + auth_succ_offset_ms) × jitter(75%~125%)`,
+  参数入 `tuning.client_hello_guard` (**默认按实测 `2.0× + 100ms`**), `check` 拦非法值
+  (`auth_succ_mult_x10 ∈ 1..=100`、`auth_succ_offset_ms ≤ 2000`)。
+  环境变量: `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS` (旧名 `MIRAGE_DELAY_MULT_TENTHS` /
+  `MIRAGE_DELAY_OFFSET_MS` 仍兼容, 不破坏真机 A/B 脚本)。
+- **顺带修冷启动**: 由于偏置非 0, **无 RTT 样本时也注入偏置** (旧实现 `rtt == 0` 则完全不注入 →
+  刚启动时会重现"合法秒回、探测慢 2×RTT"的 T5 窗口)。
+- **实现细节**: 参数改在**启动时**一次设定 (旧实现在每次握手内联 `std::env::var`, 热路径上加锁+分配);
+  注入公式抽为纯函数 `auth_succ_delay_us` 并加单测 (含饱和、无 RTT 样本两例)。
+- **换伪装站需重校**: `P` 按 Fastly 测定; 换 Cloudflare/Akamai 等应重跑 A2 并调 `auth_succ_offset_ms`
+  (自校准方案记为后续方向, 见设计文档 §6.2)。
+- **待复测**: 用新默认重跑 A2.1 (n ≥ 20), 并以"|Δ| 落在同轮测量噪声 (≲1σ)"为判据 (原"个位数 ms"过严)。
+- **顺带修了一个初始化顺序缺陷** (验证新参数时发现): 默认配置模板的创建原本在
+  `scan_runtime_config` **之后**, 而后者才是把所有全局调参 (含本节的 `MIRAGE_CH_*` 覆盖与启动日志)
+  设进全局静态的地方 → **配置缺失时 (全新安装首启) 这些参数会静默回落到编译期默认值且无生效日志**, 很难排查。
+  已把模板创建提前到 scan 之前 (`lib::ensure_default_config`), 并在服务端模式下 WARN 说明写入的是
+  **客户端**模板 (无需静默降级)。
+
+### fix(anti-probing): 对齐/容错分离 —— 推测性预连 + 宽容判定期限（修丢包误杀合法客户端）(2026-10-06)
+
+- **修 P1（可用性缺陷）**: 上一版把"何时转发"与"静默多久判为探测"合成一个 `clamp(2×RTT, 100ms, 500ms)`
+  窗口。但真实 Chromium ClientHello ~1786B（`tests/test_tls_fingerprint.rs::chromium_size_matches_real`）
+  在 IW10 下**背靠背**发出（段间隔 ≈ 0），真正出现间隔的只有**丢包** —— 那时发送端已无数据可发，只能等
+  TLP(≈2×SRTT)/RTO(≥200ms)，而窗口下限 100ms 扛不住 → **丢段的合法客户端被判成探测转发去真站**。
+- **拆成三个时钟**（详见 `docs/client-hello-timing-design.md`）: ① 预连触发 `clamp(2×RTT, 100~500ms)`
+  （对齐）· ② 静默判定期限默认 1000ms（容错，必须大于 TCP 重传退避）· ③ 总时限 5000ms（slowloris 兜底）。
+- **推测性预连**: accept 后延迟 ① 仍未见完整 ClientHello → 后台连一条伪装站连接备用；真站空闲计时起点
+  ≈ 探测者连上 + ①（**对齐**）；合法快客户端在此之前读完 → 任务被 abort → **零**预连；认证成功则关掉它。
+  **未采用评估文档 §4 的方案 A**（accept 即预连）：对齐上限同量级，但会把到伪装站的连接量放大到接近
+  入站连接数，与取消预热的初衷冲突。
+- **预连自带预算**（独立于反射守卫）: 全局在途 ≤128 + 全局发起速率 30/s；预算不足自动退化为按需建连
+  （只损失对齐）。反射守卫仍在**转发时**计数 —— 用它们给预连计数会惩罚触发预连的合法慢客户端。
+- **修 P2（DNS 进关键路径 / 污染 RTT 样本）**: 伪装站连接改经 `proxy::resolver::resolve_cached`
+  （60s 缓存 + 尊重 `tuning.dns_tcp_resolver`），DNS 排在计时之外 → `cam_RTT` 只含 TCP connect
+  （注入量 `2×cam_RTT` 才准）；顺带修掉"出向 UDP 被封的 VPS 上每次探测都要先等 DNS"。
+- **修 P2（冷启动时序对齐失效）**: 用 `HandshakeCache` 预热/刷新本来就有的那次建连播种 `cam_RTT` 初值
+  （零新增流量，`handshake_cache::last_connect_us()`），并每 30 分钟重播一次防过时。
+- **可观测性（修测量方法的幸存者偏差）**: `MIRAGE_CH_MEASURE=1` 输出 `[CH-GUARD]` 行，**含 Fallback
+  样本**与 `max_gap_us`（只统计"到达之间"的间隔）—— "丢包误杀"因此可计数
+  （`outcome=fallback && pre_tls=1 && max_gap_us≥150ms`），首次出现打 WARN 并给出调参指引。
+- **P3 清理**: `observe_connect` 读-改-写改 CAS（并发丢样本）；重试注释与行为对齐（connect 失败不重试，
+  多候选已在内部试过）；测试裕量放大（30ms/100ms → 200ms/2000ms）。
+- **配置/环境变量**: `tuning.client_hello_guard { preconnect_mult, preconnect_min_ms, preconnect_max_ms,
+  judge_silence_ms, hard_deadline_ms }`；`MIRAGE_CH_*` 覆盖；`check` 拦 `judge_silence_ms < 200`。
+- **测试**: 新增 P1 回归 `retransmit_gap_within_judge_is_tolerated`（重传间隔 < 判定期限必须读完）、
+  对照锚点 `retransmit_gap_beyond_judge_is_forwarded`、`read_timing_excludes_trailing_silence`、
+  预连优先 `preconnected_socket_is_used_without_new_connect`、并发 EWMA 等。**521 lib 测试全绿**。
+
 ### feat(anti-probing): 延迟预连取代伪装站预热连接池 + ClientHello 静默间隔读取 (2026-10-06)
 
 - **动机** (见 `docs/active-probing-assessment-2026-10.md`): 旧 `CamouflagePool` 后台常驻 8 条到
@@ -14,11 +69,11 @@
 - **静默间隔读取**: `read_client_hello` 从 "单一 5s 总截止" 改为 "**最后一次收到数据后静默
   quiet_timeout 即判异常**" (+ `hard_deadline` 5s 兜底防 slowloris 滴发)。合法慢客户端
   (ClientHello 分多段 / 丢包重传) 会持续发 → 永不触发静默, 不受高延迟环境影响。
-- **RTT 自适应窗口 (可配)**: `quiet_timeout = clamp(mult × 客户端 RTT, min_ms, max_ms)`, RTT 取自
-  内核 `TCP_INFO.tcpi_rtt` (已建立连接零成本读取, 不发包)。**默认 `2 / 100ms / 500ms`**, 可用
-  `tuning.client_hello_quiet` 或环境变量 `MIRAGE_QUIET_MULT` / `MIRAGE_QUIET_MIN_MS` /
-  `MIRAGE_QUIET_MAX_MS` 覆盖 (后者供真机 A/B 调参, 无需改 config)。低延迟环境窗口小 → 探测偏差小
-  (下限 100ms, 比旧 8~14s 好一个数量级); 高延迟环境窗口随 RTT 放大 → 不误伤慢合法客户端。
+- **RTT 自适应窗口 (可配)**: 窗口 `= clamp(mult × 客户端 RTT, min_ms, max_ms)`, RTT 取自内核
+  `TCP_INFO.tcpi_rtt` (已建立连接零成本读取, 不发包), 默认 `2 / 100ms / 500ms`, 供真机 A/B 调参。
+  ⚠️ **这个窗口把"对齐"与"容错"合成一个参数 —— 已被上一节（对齐/容错分离）修正**: 窗口下限 100ms
+  小于 TCP 重传退避 (RTO≥200ms), 会把丢段的合法客户端误判成探测。现称 ① `preconnect_delay`,
+  对应 `tuning.client_hello_guard.preconnect_*` / `MIRAGE_CH_PRECONNECT_*`。
 - **auth-succ 时序对齐同步调整**: auth-fail 现为即时建连 (建连 RTT + 转发 RTT = 2 × cam_RTT),
   故 auth-succ 注入量由 1 × 翻倍到 2 × cam_RTT (T5 无时序侧信道)。RTT EWMA 由每次即时建连测量维护
   (`camouflage_rtt.rs`, 取代 `camouflage_pool.rs`)。

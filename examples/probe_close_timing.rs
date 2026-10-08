@@ -5,25 +5,17 @@
 //! 样本并输出 P50/P95/P99 —— 真机跑完直接比对, 无需手工掐表。
 //!
 //! 形态:
-//! - `empty`   连上不发任何数据。真站按自身 idle 超时关闭; Mirage 应在静默窗口后转发真站。
-//! - `partial` 只发真实 ClientHello 的前 N 字节就停 (半截)。
-//! - `badauth` 发**完整** ClientHello 但 session_id 为随机 token (认证必失败 → 转发真站)。
-//!   此形态主要量**首字节时延** (T1/A2), 关闭时间参考意义有限。
+//! - `empty`    连上不发任何数据。真站按自身 idle 超时关闭; Mirage 应在静默窗口后转发真站。
+//! - `partial`  只发真实 ClientHello 的前 N 字节就停 (半截)。
+//! - `badauth`  发**完整** ClientHello 但 session_id 为随机 token (认证必失败 → 转发真站)。
+//! - `authsucc` 发**完整合法** ClientHello (认证通过 → 模板回放)。与 badauth 走完全相同的
+//!              首字节读取测量循环 (严格消除客户端协议栈多算的 Fake Tail/TIME_SYNC 往返)。
 //!
 //! 用法 (真机):
 //! ```text
 //! cargo run --release --example probe_close_timing -- \
 //!   -t <真站>:443 -t <Mirage服务端>:443 --count 5 --sni www.example.com
 //! ```
-//! 若目标机没有 Rust 工具链, 可本机 `cargo build --release --example probe_close_timing`
-//! 后把 `target/release/examples/probe_close_timing` 拷过去 (glibc 动态链接; musl 目标需
-//! 自行加 `--target ...-musl`)。
-//!
-//! **判据 (A1)**: `empty` / `partial` 下 |Mirage 关闭时间 − 真站关闭时间| ≤ 1~2s,
-//! 且重点看**"提前"方向** —— 提前即池龄残留的回归信号。
-//!
-//! **注意**: 结果受链路时段波动影响。同一轮内各 target 交错发起 (本工具已如此), 跨轮取中位数
-//! 更稳; 单轮 n=5 时 P99 意义有限, 看 p50 与 max。
 
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,19 +25,24 @@ use tokio::time::timeout;
 const USAGE: &str = "\
 用法: probe_close_timing -t <host:port> [-t <host:port> ...] [选项]
   -t, --target <host:port>  目标 (可多次)。约定: 第 1 个视作真站基线, 其余与其对比。
-  -c, --count <N>           每个 target 每形态并发探测数 (默认 5)
-      --modes <a,b,c>       形态子集, 默认 empty,partial,badauth
+  -c, --count <N>           每个 target 每形态探测数 (默认 5)
+      --modes <a,b,c>       形态子集, 默认 empty,partial,badauth (可选 authsucc)
+      --password <pwd>      authsucc 认证密码 (默认空)
       --sni <host>          ClientHello 的 SNI (默认 www.apple.com; 对真站填它自己的域名更真实)
       --partial-len <N>     partial 形态发送的字节数 (默认 40)
+      --gap-ms <N>          分段发送间隔毫秒 (默认 0; 用于弱网重传容错与 A3 临界间隙测试)
+      --split-at <N>        分段切割字节数 (默认 40)
+      --interleave          成对交替发起 (每轮 target 依次跑 badauth, authsucc 消除时段网络漂移)
       --cap <secs>          单个探测最长等待 (默认 90; 真站 idle 常 ~60s)
       --connect-timeout <s> TCP 建连超时 (默认 10)
   -h, --help";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Empty,
     Partial,
     BadAuth,
+    AuthSucc,
 }
 
 impl Mode {
@@ -54,6 +51,7 @@ impl Mode {
             Mode::Empty => "empty",
             Mode::Partial => "partial",
             Mode::BadAuth => "badauth",
+            Mode::AuthSucc => "authsucc",
         }
     }
     fn parse(s: &str) -> Option<Mode> {
@@ -61,11 +59,13 @@ impl Mode {
             "empty" => Some(Mode::Empty),
             "partial" => Some(Mode::Partial),
             "badauth" | "bad-auth" => Some(Mode::BadAuth),
+            "authsucc" | "auth-succ" | "succ" => Some(Mode::AuthSucc),
             _ => None,
         }
     }
 }
 
+#[derive(Clone)]
 struct Sample {
     /// TCP 建连耗时 (从发起连接到连接可写)。
     connect_ms: u64,
@@ -77,7 +77,7 @@ struct Sample {
 }
 
 impl Sample {
-    /// 首字节距**建连完成**的耗时 —— 与 `mirage-rs test` 的 `handshake_ms` 同口径 (去掉 TCP 建连段)。
+    /// 首字节距**建连完成**的耗时 —— 纯首字节时延 (去掉 TCP 建连段)。
     fn first_byte_after_connect(&self) -> Option<u64> {
         self.first_byte_ms.map(|fb| fb.saturating_sub(self.connect_ms))
     }
@@ -91,6 +91,9 @@ async fn probe_one(
     partial_len: usize,
     connect_timeout: Duration,
     cap: Duration,
+    password: &str,
+    gap_ms: u64,
+    split_at: usize,
 ) -> Sample {
     let t0 = Instant::now();
     let mut s = match timeout(connect_timeout, TcpStream::connect(target)).await {
@@ -103,7 +106,7 @@ async fn probe_one(
                 close_ms: el,
                 closed_by_peer: false,
                 connect_ok: false,
-            }
+            };
         }
     };
     let connect_ms = t0.elapsed().as_millis() as u64;
@@ -112,7 +115,6 @@ async fn probe_one(
     match mode {
         Mode::Empty => {}
         Mode::Partial | Mode::BadAuth => {
-            // session_id = 随机 token → Mirage 侧认证必失败 (转真站); 对真站则是一次普通 TLS 发起。
             let mut sid = [0u8; 32];
             rand::fill(&mut sid);
             let (ch, _cr) = mirage_rs::crypto::tls_raw::build_client_hello(sni, &sid);
@@ -121,7 +123,64 @@ async fn probe_one(
             } else {
                 &ch
             };
-            if s.write_all(payload).await.is_err() {
+
+            if gap_ms > 0 && payload.len() > split_at {
+                if s.write_all(&payload[..split_at]).await.is_err() {
+                    return Sample {
+                        connect_ms,
+                        first_byte_ms: None,
+                        close_ms: t0.elapsed().as_millis() as u64,
+                        closed_by_peer: false,
+                        connect_ok: true,
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                if s.write_all(&payload[split_at..]).await.is_err() {
+                    return Sample {
+                        connect_ms,
+                        first_byte_ms: None,
+                        close_ms: t0.elapsed().as_millis() as u64,
+                        closed_by_peer: false,
+                        connect_ok: true,
+                    };
+                }
+            } else if s.write_all(payload).await.is_err() {
+                return Sample {
+                    connect_ms,
+                    first_byte_ms: None,
+                    close_ms: t0.elapsed().as_millis() as u64,
+                    closed_by_peer: false,
+                    connect_ok: true,
+                };
+            }
+        }
+        Mode::AuthSucc => {
+            let mut client_random = [0u8; 32];
+            rand::fill(&mut client_random);
+            let token = mirage_rs::crypto::hello_auth::make_session_token(password, &client_random);
+            let hello = mirage_rs::crypto::tls_raw::build_client_hello_with_random(sni, &token, &client_random);
+
+            if gap_ms > 0 && hello.len() > split_at {
+                if s.write_all(&hello[..split_at]).await.is_err() {
+                    return Sample {
+                        connect_ms,
+                        first_byte_ms: None,
+                        close_ms: t0.elapsed().as_millis() as u64,
+                        closed_by_peer: false,
+                        connect_ok: true,
+                    };
+                }
+                tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                if s.write_all(&hello[split_at..]).await.is_err() {
+                    return Sample {
+                        connect_ms,
+                        first_byte_ms: None,
+                        close_ms: t0.elapsed().as_millis() as u64,
+                        closed_by_peer: false,
+                        connect_ok: true,
+                    };
+                }
+            } else if s.write_all(&hello).await.is_err() {
                 return Sample {
                     connect_ms,
                     first_byte_ms: None,
@@ -173,8 +232,12 @@ struct Args {
     targets: Vec<String>,
     modes: Vec<Mode>,
     count: usize,
+    password: String,
     sni: String,
     partial_len: usize,
+    gap_ms: u64,
+    split_at: usize,
+    interleave: bool,
     cap: Duration,
     connect_timeout: Duration,
 }
@@ -184,8 +247,12 @@ fn parse_args() -> Result<Args, String> {
         targets: Vec::new(),
         modes: vec![Mode::Empty, Mode::Partial, Mode::BadAuth],
         count: 5,
+        password: String::new(),
         sni: "www.apple.com".to_string(),
         partial_len: 40,
+        gap_ms: 0,
+        split_at: 40,
+        interleave: false,
         cap: Duration::from_secs(90),
         connect_timeout: Duration::from_secs(10),
     };
@@ -202,17 +269,25 @@ fn parse_args() -> Result<Args, String> {
                 let v = next("--modes")?;
                 let mut ms = Vec::new();
                 for s in v.split(',') {
-                    ms.push(Mode::parse(s).ok_or_else(|| format!("未知形态 `{s}` (empty/partial/badauth)"))?);
+                    ms.push(Mode::parse(s).ok_or_else(|| format!("未知形态 `{s}` (empty/partial/badauth/authsucc)"))?);
                 }
                 if ms.is_empty() {
                     return Err("--modes 为空".into());
                 }
                 a.modes = ms;
             }
+            "--password" => a.password = next("--password")?,
             "--sni" => a.sni = next("--sni")?,
             "--partial-len" => {
                 a.partial_len = next("--partial-len")?.parse().map_err(|_| "--partial-len 需为正整数")?
             }
+            "--gap-ms" => {
+                a.gap_ms = next("--gap-ms")?.parse().map_err(|_| "--gap-ms 需为整数")?
+            }
+            "--split-at" => {
+                a.split_at = next("--split-at")?.parse().map_err(|_| "--split-at 需为正整数")?
+            }
+            "--interleave" => a.interleave = true,
             "--cap" => a.cap = Duration::from_secs(next("--cap")?.parse().map_err(|_| "--cap 需为秒数")?),
             "--connect-timeout" => {
                 a.connect_timeout =
@@ -267,28 +342,59 @@ async fn main() {
         .map(|_| (0..args.modes.len()).map(|_| Vec::new()).collect())
         .collect();
 
-    for (mi, mode) in args.modes.iter().enumerate() {
-        // 交错发起: 每轮给每个 target 各发一个, 避免链路时段波动只落在某一 target 上。
-        let mut set = tokio::task::JoinSet::new();
-        let mut remaining: Vec<usize> = vec![args.count; args.targets.len()];
-        loop {
-            let mut launched = false;
+    if args.interleave {
+        // 成对交替发起: 按轮推进, 每轮对每个 target 依次发起各 mode, 消除长时程网络抖动漂移
+        for _ in 0..args.count {
             for (ti, t) in args.targets.iter().enumerate() {
-                if remaining[ti] > 0 {
-                    remaining[ti] -= 1;
-                    launched = true;
-                    let (t, m, sni) = (t.clone(), *mode, args.sni.clone());
-                    let (pl, cap, ct) = (args.partial_len, args.cap, args.connect_timeout);
-                    set.spawn(async move { (ti, probe_one(&t, m, &sni, pl, ct, cap).await) });
+                for (mi, mode) in args.modes.iter().enumerate() {
+                    let s = probe_one(
+                        t,
+                        *mode,
+                        &args.sni,
+                        args.partial_len,
+                        args.connect_timeout,
+                        args.cap,
+                        &args.password,
+                        args.gap_ms,
+                        args.split_at,
+                    )
+                    .await;
+                    results[ti][mi].push(s);
                 }
             }
-            if !launched {
-                break;
-            }
         }
-        while let Some(res) = set.join_next().await {
-            if let Ok((ti, s)) = res {
-                results[ti][mi].push(s);
+    } else {
+        // 模式并发推进
+        for (mi, mode) in args.modes.iter().enumerate() {
+            let mut set = tokio::task::JoinSet::new();
+            let mut remaining: Vec<usize> = vec![args.count; args.targets.len()];
+            loop {
+                let mut launched = false;
+                for (ti, t) in args.targets.iter().enumerate() {
+                    if remaining[ti] > 0 {
+                        remaining[ti] -= 1;
+                        launched = true;
+                        let (t, m, sni, pwd) = (t.clone(), *mode, args.sni.clone(), args.password.clone());
+                        let (pl, cap, ct, gap, split) = (
+                            args.partial_len,
+                            args.cap,
+                            args.connect_timeout,
+                            args.gap_ms,
+                            args.split_at,
+                        );
+                        set.spawn(async move {
+                            (ti, probe_one(&t, m, &sni, pl, ct, cap, &pwd, gap, split).await)
+                        });
+                    }
+                }
+                if !launched {
+                    break;
+                }
+            }
+            while let Some(res) = set.join_next().await {
+                if let Ok((ti, s)) = res {
+                    results[ti][mi].push(s);
+                }
             }
         }
     }
@@ -307,6 +413,36 @@ async fn main() {
             print_stats("first_byte_after_connect_ms", &fb);
             let cl: Vec<u64> = ss.iter().map(|s| s.close_ms).collect();
             print_stats("close_ms", &cl);
+        }
+
+        // ── 成对配对统计 (当同时包含 badauth 和 authsucc 时) ──
+        let bad_idx = args.modes.iter().position(|m| *m == Mode::BadAuth);
+        let succ_idx = args.modes.iter().position(|m| *m == Mode::AuthSucc);
+        if let (Some(bi), Some(si)) = (bad_idx, succ_idx) {
+            let bad_samples = &results[ti][bi];
+            let succ_samples = &results[ti][si];
+            let mut deltas: Vec<i64> = Vec::new();
+            for (b, s) in bad_samples.iter().zip(succ_samples.iter()) {
+                if let (Some(fb_b), Some(fb_s)) = (b.first_byte_after_connect(), s.first_byte_after_connect()) {
+                    deltas.push(fb_s as i64 - fb_b as i64);
+                }
+            }
+            if !deltas.is_empty() {
+                let n = deltas.len() as f64;
+                let mean = deltas.iter().sum::<i64>() as f64 / n;
+                let var = if deltas.len() > 1 {
+                    deltas.iter().map(|&d| (d as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0)
+                } else {
+                    0.0
+                };
+                let stddev = var.sqrt();
+                let sem = stddev / n.sqrt();
+                let ci_low = mean - 1.96 * sem;
+                let ci_high = mean + 1.96 * sem;
+                println!("\n>>> target={target} 严格同口径首字节成对差 (authsucc - badauth) <<<");
+                println!("  n={} 均值差={:.1}ms 标准差={:.1}ms 95%置信区间=[{:.1}ms, {:.1}ms]", deltas.len(), mean, stddev, ci_low, ci_high);
+                println!("  配对样本: {}", deltas.iter().map(|d| format!("{d:+}")).collect::<Vec<_>>().join(" "));
+            }
         }
     }
 

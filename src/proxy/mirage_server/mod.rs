@@ -19,8 +19,8 @@ pub(crate) mod udp_relay;
 #[cfg(test)]
 pub(crate) use control::parse_tcp_target;
 
-// 服务端 ClientHello 静默窗口 (延迟预连) 参数: 由 startup 从 tuning.client_hello_quiet 设置。
-pub use handshake::{quiet_window_params, set_quiet_window};
+// 服务端 ClientHello 计时/判定参数 (`tuning.client_hello_guard`): 由 startup 设置。
+pub use handshake::{client_hello_guard_params, set_client_hello_guard};
 
 use camouflage_rtt::CamouflageRtt;
 
@@ -385,6 +385,16 @@ impl Drop for QuicHandshakeGuard {
     }
 }
 
+/// 把 `HandshakeCache` 最近一次向伪装站建连的耗时喂给 RTT 估计。
+/// **零新增流量**: 预热 (启动) 与模板刷新 (每 30 分钟) 本来就会连一次伪装站。
+fn seed_rtt_from_cache(cam_rtt: &Arc<CamouflageRtt>) {
+    let us = crate::crypto::handshake_cache::last_connect_us();
+    if us > 0 {
+        cam_rtt.observe_connect(std::time::Duration::from_micros(us));
+        debug!("camouflage RTT 播种/刷新: {}us (来自 HandshakeCache 建连)", us);
+    }
+}
+
 pub async fn start_server(
     listen_addr: &str,
     // 凭据快照 (name, password): [0]=("default", 主密码), 其余=多用户 users。握手每次新连接 load() 最新快照。
@@ -416,15 +426,30 @@ pub async fn start_server(
         info!("Brutal CC enabled for downloads (server→client): {} Mbps", bps / 125_000);
     }
 
-    // 伪装站 RTT 估计 (取代旧预热连接池). 转发路径改为"判定要转发时即时建连", 池龄恒 ≈ 0
-    // → 真站 idle 计时起点与探测者连上的时刻只差一个服务器→伪装站 RTT, 消除旧池
-    // 8~14s 的关闭时间侧信道. 详见 camouflage_rtt.rs 顶注释.
+    // 伪装站 RTT 估计 (取代旧预热连接池, 见 camouflage_rtt.rs 与 docs/client-hello-timing-design.md)。
+    // 转发路径改为"需要时才建连", 池龄恒 ≈ 0 → 真站 idle 计时起点与探测者连上的时刻只差一个
+    // 服务器→伪装站 RTT, 消除旧池 8~14s 的关闭时间侧信道。
     let cam_rtt = CamouflageRtt::new();
 
     // v0.4.5-alpha.15: accept 前主动预热 HandshakeCache. 消除懒预热的冷启动窗口
     // (重启后首个连接不再触发 fetch 或拿 fallback → 时序异常). camouflage 不可达
     // 时最多阻塞 ~5s 后放行 (懒路径兜底), 不长期挂起启动.
     crate::crypto::handshake_cache::prewarm(camouflage_host).await;
+
+    // auth-succ 时序对齐 (`2 × cam_RTT` 注入) 的正样本来源。
+    // ① 冷启动播种: prewarm 刚刚已经连过伪装站 (零新增流量), 拿它的 connect 耗时当 EWMA 初值 ——
+    //    否则 "刚重启后合法用户秒回、最早几次探测却慢 2×RTT" 本身就是 T5 侧信道。
+    // ② 过时防护: 同一个值在模板刷新 (30 分钟) 后重播一次, 避免少见探测的机器上初值长期不动。
+    seed_rtt_from_cache(&cam_rtt);
+    {
+        let rtt = cam_rtt.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+                seed_rtt_from_cache(&rtt);
+            }
+        });
+    }
 
     loop {
         match listener.accept().await {

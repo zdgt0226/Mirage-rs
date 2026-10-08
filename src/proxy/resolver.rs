@@ -65,7 +65,11 @@ fn dns_semaphore() -> &'static tokio::sync::Semaphore {
 }
 
 /// 解析 host → Vec<IpAddr>, 命中缓存则 0 网络开销. 返回的 Vec 已经 IPv4 优先排序.
-async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
+/// 解析 host → Vec<IpAddr>, 命中缓存则 0 网络开销. 返回的 Vec 已经 IPv4 优先排序.
+///
+/// `pub(crate)`: 伪装站转发路径 (`mirage_server::camouflage`) 也走这里 —— 拿缓存解析 + 尊重
+/// `tuning.dns_tcp_resolver`, 并把 DNS 耗时排在计时之外 (RTT 样本只含 TCP connect).
+pub(crate) async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
     // 1. 查缓存
     if let Ok(cache) = dns_cache().lock() {
         if let Some(entry) = cache.get(host) {
@@ -118,7 +122,8 @@ async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
 }
 
 /// 解析 "host:port" 为 (host, port). 支持 IPv6 字面量 "[::1]:443".
-fn split_host_port(target: &str) -> Option<(&str, u16)> {
+/// `pub(crate)`: 伪装站转发路径复用 (伪装站 host 可能配了端口, 如 `127.0.0.1:4443`).
+pub(crate) fn split_host_port(target: &str) -> Option<(&str, u16)> {
     let parts: Vec<&str> = target.rsplitn(2, ':').collect();
     if parts.len() != 2 {
         return None;

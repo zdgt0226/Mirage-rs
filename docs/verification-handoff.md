@@ -17,13 +17,17 @@
 
 ## 0. 30 秒背景
 
-**本次改动 = 用「延迟预连」取代伪装站的「预热连接池」+ ClientHello 读取改为静默间隔语义。**
+**本次改动 = 「对齐 / 容错分离」：推测性预连负责对齐，宽容判定期限负责容错（取代伪装站预热连接池）。**
 
 - **为什么**：旧池后台常驻 8 条预连到伪装站，探测者（空连接 / 半截 ClientHello）看到的关闭时间比真站
   **提前 8~14 秒**，可区分（T2/T3）。根因是"池中连接的已存在时长"被真站的 idle-timeout 继承。
-- **怎么改**：转发路径改为"**判定要转发的此刻即时建连**"；读取改为"**最后一次收到数据后静默
-  `quiet_timeout` 即判异常**"，窗口随客户端 RTT 自适应（可配）。
-- **改动的权威清单**：`CHANGELOG.md` → `### feat(anti-probing): 延迟预连取代伪装站预热连接池 ...`
+- **怎么改**（详见 `docs/client-hello-timing-design.md`）：
+  ① **推测性预连**（对齐）：accept 后延迟 `preconnect_delay`（`clamp(2×RTT,100~500ms)`）仍未见完整
+  ClientHello → 后台连一条伪装站连接备用；合法快客户端在此之前就读完 → 定时器被 abort → **零**预连。
+  ② **判定期限**（容错）：改为"最后一次数据后静默 `judge_silence_ms`（默认 1000ms）即判异常"，
+  **不再用 `2×RTT` 当判定期限** —— 那个值小于 TCP 重传间隔（RTO≥200ms），会把丢段的合法客户端误杀。
+  ③ `hard_deadline_ms`（默认 5000ms）为 slowloris 总兜底。
+- **改动的权威清单**：`CHANGELOG.md` → `### feat(anti-probing): 对齐/容错分离 ...`
 
 **接手方第一件事**：跑 §1 的零成本门禁（约 3~5 分钟，无需真机）。全绿才进入 §3 的真机项。
 
@@ -80,19 +84,24 @@ cargo test --release aes_chacha_throughput_ratio_sentinel -- --ignored --nocaptu
 |---|---|---|---|
 | I1 | 转发路径**无后台预连**：触发前 0 连接，触发后恰好 1 条 | `camouflage.rs::run_camouflage_forward` | `camouflage::tests::forward_connects_on_demand_not_before` |
 | I2 | `CamouflageRtt` 无后台任务；EWMA 首样本即初值、平滑、毛刺截断 | `camouflage_rtt.rs` | `camouflage_rtt::tests::{no_sample_returns_zero,first_sample_seeds_ewma,ewma_smooths_and_stays_positive,spike_is_capped}` |
-| I3 | ClientHello 读取为**静默间隔**：数据持续到达不触发；静默即 Fallback | `handshake.rs::read_client_hello` | `handshake::tests::test_read_client_hello_interval_data_not_treated_as_quiet` |
-| I4 | `hard_deadline` 兜底 slowloris（滴发间隔 < 静默窗口也强制回落） | 同上 | `handshake::tests::test_read_client_hello_drip_feed_hits_hard_deadline` |
+| I3 | ClientHello 读取为**静默间隔**：间隔小于判定期限则读完；静默则 Fallback | `handshake.rs::read_client_hello` | `handshake::tests::test_read_client_hello_interval_data_not_treated_as_quiet` |
+| I4 | `hard_deadline` 兜底 slowloris（滴发间隔 < judge 也强制回落） | 同上 | `handshake::tests::test_read_client_hello_drip_feed_hits_hard_deadline` |
 | I5 | 半截 / 0 字节超时 → Fallback **且携带已读全部字节** | 同上 | `test_read_client_hello_partial_body_timeout_fallback` / `test_read_client_hello_zero_bytes_timeout_fallback` |
 | I6 | 只读首个 record，不吞管道化后续字节 | 同上 | `test_read_client_hello_does_not_overread_past_record` |
-| I7 | 窗口 = `clamp(mult×RTT, min, max)`；未知 RTT → `max`；min/max 反转自动纠正 | `handshake.rs::quiet_window` | `handshake::tests::quiet_window_adapts_to_rtt` |
-| I8 | 窗口参数可配（config），非法值被 `check` 拦下 | `config.rs::ClientHelloQuietConfig` | `config::validation_tests::client_hello_quiet_params_validated` |
+| I7 | ① 预连延迟 = `clamp(mult×RTT, min, max)`；未知 RTT → `max`；min/max 反转自动纠正 | `handshake.rs::preconnect_delay` | `handshake::tests::preconnect_delay_adapts_to_rtt` |
+| I8 | 计时参数可配（config），非法值（含 `judge_silence_ms < 200`）被 `check` 拦下 | `config.rs::ClientHelloGuardConfig` | `config::validation_tests::client_hello_guard_params_validated` |
 | I9 | 转发目标头 `[2B len][host:port]` 与**服务端真解析函数**一致 | `handshake.rs::tunnel_target_header`（DNS 侧） | `dns::server::tests::tunnel_target_header_matches_server_parse` |
+| I10 | **重传间隔 < 判定期限 → 必须读完**（P1 回归：丢段的合法客户端不被误杀） | `handshake.rs::read_client_hello` | `handshake::tests::retransmit_gap_within_judge_is_tolerated` |
+| I11 | 对照锚点：间隔 > 判定期限 → 半截被交出（且内部间隔为 0，与真探测同形） | 同上 | `handshake::tests::retransmit_gap_beyond_judge_is_forwarded` |
+| I12 | `max_internal_gap_us` 只记**到达之间**的间隔，不含末尾静默（否则度量失效） | `handshake.rs::ReadTiming` | `handshake::tests::read_timing_excludes_trailing_silence` |
+| I13 | 已有预连 socket 时**不得**再新建连接（对齐依赖它）；预连前无后台连接 | `camouflage.rs::run_camouflage_forward` | `camouflage::tests::preconnected_socket_is_used_without_new_connect` / `forward_connects_on_demand_not_before` |
 
 **未被单测覆盖、必须真机验的**（见 §3）：
 
-- **I10** auth-succ 注入量为 `2 × cam_RTT`（`handshake.rs` 注入处）—— 纯时序，单测无法判定对错。
-- **I11** 三种探测形态的**绝对关闭时间**与真站对齐（≤1~2s）。
-- **I12** `T_quiet` 的 `min_ms`/`max_ms` 取值是否覆盖真实链路的 P99。
+- **I14** auth-succ 注入量为 `2 × cam_RTT`（`handshake.rs` 注入处）—— 纯时序，单测无法判定对错。
+- **I15** 三种探测形态的**绝对关闭时间**与真站对齐（空连接 ≈ ①，半截残留 ≈ ②）。
+- **I16** ①/② 取值是否覆盖真实链路（合法 ClientHello 到达分布 / 重传退避）—— 靠 A3 的 `[CH-GUARD]` 度量。
+- **I17** 真站在“收到数据”时是否重置空闲计时（决定半截场景的残余偏差是 ① 还是 ②）—— 靠 A1。
 
 ---
 
@@ -119,8 +128,8 @@ cargo run --release --example probe_close_timing -- \
   -t 203.0.113.10:443 -t 198.51.100.20:443 --count 5 --sni www.example.com
 #   ⚠️ 上面是 RFC 5737 占位地址, 仅示意; 真机参数由操作者经命令行传入, 严禁写进仓库 (见 §6)
 
-# A3: 服务端 opt-in 度量 (输出 [QUIET-MEASURE] 行; 量完取消该 env 重启)
-MIRAGE_QUIET_MEASURE=1 <server 启动命令>
+# A3: 服务端 opt-in 度量 (输出 [CH-GUARD] 行; 量完取消该 env 重启)
+MIRAGE_CH_MEASURE=1 <server 启动命令>
 ```
 
 **若接手方只能做零成本验证**：把 §3 标 ⭐ 的三项标为"未跑（需真机）"，**不要**判为通过。
@@ -186,6 +195,7 @@ MIRAGE_QUIET_MEASURE=1 <server 启动命令>
 | 日期 | 版本/commit | 执行者 | check-endpoints | clippy(default) | cargo test | clippy(quic) | 备注 |
 |---|---|---|---|---|---|---|---|
 | 2026-10-06 | v0.15.2 + 延迟预连 | 初始实现方 | ✅ 0 | ✅ 0 | ✅ 516/0/3 | ✅ 0 | tools + 度量同批 |
+| 2026-10-06 | 对齐/容错分离 | 实现方 | ✅ 0 | ✅ 0 | ✅ 521/0/3 | ✅ 0 | 预连 + 判定期限 + 可观测性 |
 | 2026-10-06 | v0.15.2 / ec4a4c5 + 工作区 (随本提交) | Antigravity AI | ✅ 0 | ✅ 0 | ✅ 516/0/3 | ✅ 0 | 零成本门禁全绿 + I1~I9全过 |
 
 ---
@@ -211,9 +221,11 @@ MIRAGE_QUIET_MEASURE=1 <server 启动命令>
 
 | 陷阱 | 后果 | 正确做法 |
 |---|---|---|
-| 把 `quiet_timeout_for` 的"未知 RTT → `max`"改回硬编码 300ms | 与可配语义不一致 | 保持 §2 I7 的测试断言 |
-| 只改发端/只改配置而不跑 §1 ④ | 破坏 I8 的 check 拦截 | 改 config 字段后必跑 `config::validation_tests` |
+| 把判定期限（② `judge_silence_ms`）改小（或把 `2×RTT` 当判定期限） | **丢包的合法客户端被误杀**（P1 回归；阈值 < RTO(200ms) 就会中招） | 保持 ≥ 重传退避；改后跑 §1 且看 I10 测试与 `[CH-GUARD]` 的误杀计数 |
+| 把 ① 预连延迟与 ② 判定期限又合成一个参数 | 重新变成"对齐/容错互相迁就"（本设计要拆开的正是这个） | 保持两个独立旋钮，见 `docs/client-hello-timing-design.md` §2 |
+| 在预连路径上绕过预算/守卫 | 扫描可放大成对本机→伪装站的连接洪水 | 预连只走 `PRECONNECT_MAX_INFLIGHT` + 全局速率；真正的反射才计入 `UNAUTH_*` |
 | 把 `2 × cam_RTT` 改回 `1 ×` 而不核对 A2 | T1/T5 时序侧信道回归 | 改系数必须在报告里附 A2 数据 |
+| 把 `[CH-GUARD]` 度量的 Fallback 样本去掉（只记“读完整”） | 幸存者偏差 → 度量无法证伪窗口 | 保留两类样本（见 I12） |
 | 为"省几毫秒"重新引入常驻预热池 | T2/T3 侧信道回归（本改动的初衷） | 若要小池，只允许**按需**建连；常驻池需重新评估并附 A1 数据 |
 | 用 `--count 1` 跑一次就下结论 | 单样本噪声淹没结论 | 跨轮重复取中位数（文档 A1 已写明） |
 
@@ -232,12 +244,13 @@ MIRAGE_QUIET_MEASURE=1 <server 启动命令>
 
 | 文件 | 角色 |
 |---|---|
-| `src/proxy/mirage_server/camouflage.rs` | 转发路径（去池 → 即时建连，重试 1 次 → 合成模板） |
-| `src/proxy/mirage_server/camouflage_rtt.rs` | RTT EWMA 估计器（**新增**，取代 `camouflage_pool.rs`） |
-| `src/proxy/mirage_server/handshake.rs` | `read_client_hello`（静默语义）/ `quiet_window` / `set_quiet_window` / auth-succ 注入 / `[QUIET-MEASURE]` 度量 |
-| `src/proxy/mirage_server/mod.rs` | 模块接线 + `set_quiet_window` re-export |
-| `src/config.rs` | `TuningConfig::client_hello_quiet` + 语义校验 |
-| `src/startup.rs` | 启动时应用窗口参数（含 env 覆盖） |
+| `src/proxy/mirage_server/camouflage.rs` | 转发路径（预连 socket 优先 → 按需建连 → 合成模板）；`connect_camouflage` 走 resolver 缓存 |
+| `src/proxy/mirage_server/camouflage_rtt.rs` | RTT EWMA 估计器（取代 `camouflage_pool.rs`） |
+| `src/proxy/mirage_server/handshake.rs` | `read_client_hello`（判定期限）/ `ReadTiming` / `Preconnect` / `preconnect_delay` / `log_ch_guard` / auth-succ 注入 |
+| `src/proxy/mirage_server/mod.rs` | 模块接线 + re-export + 用 `last_connect_us` 播种 `cam_RTT` |
+| `src/crypto/handshake_cache.rs` | `last_connect_us()`（零新增流量的 RTT 样本源） |
+| `src/config.rs` | `TuningConfig::client_hello_guard` + 语义校验 |
+| `src/startup.rs` | 启动时应用三个时钟（含 env 覆盖） |
 | `examples/probe_close_timing.rs` | A1/A2 采集工具（**新增**） |
 | `docs/real-machine-verification.md` | 真机验证任务列表（**新增**） |
 | `docs/active-probing-assessment-2026-10.md` | 动因 + P1 实施状态 |
@@ -256,7 +269,7 @@ cargo test --lib <测试名>
 cargo run --release --example probe_close_timing -- -t <真站>:443 -t <Mirage>:443 --count 5
 
 # A3 度量
-MIRAGE_QUIET_MEASURE=1 <server>
+MIRAGE_CH_MEASURE=1 <server>
 
 # 配置校验闸门 (改配置/规则后)
 <binary> check -c <config.json> && systemctl restart mirage-rs
@@ -266,12 +279,13 @@ MIRAGE_QUIET_MEASURE=1 <server>
 
 | 概念 | 一句话 |
 |---|---|
-| `quiet_timeout` | "最后一次收到数据后静默多久即判异常"；默认 `clamp(2×RTT, 100ms, 500ms)` |
-| `hard_deadline` | 5s 总时限，防"滴发"slowloris |
-| 延迟预连 | 判定要转发的**那一刻**才建连（池龄 ≈ 0），而非后台常驻预连 |
+| ① `preconnect_delay` | 对齐：accept 后多久未见完整 CH 就后台预连伪装站；默认 `clamp(2×RTT, 100ms, 500ms)` |
+| ② `judge_silence_ms` | 容错：最后一次数据后静默多久判为探测；默认 1000ms，**必须 > TCP 重传退避** |
+| ③ `hard_deadline_ms` | 5s 总时限，防“滴发”slowloris |
+| 推测性预连 | 早建、不用则关（合法快客户端零预连）；与“常驻预热池”是两回事 |
 | `cam_RTT` | 服务器 → 伪装站的 RTT（EWMA），用于 auth-succ 时序对齐 |
+| `[CH-GUARD]` | A3 度量行（env 门控，默认关）；含 Fallback 样本，可数“丢包误杀” |
 | T2/T3 | 真站 idle 超时对齐（空连接 / 半截）；本次改动的主验收目标 |
-| `[QUIET-MEASURE]` | A3 标定用的服务端度量行（env 门控，默认关） |
 
 ---
 

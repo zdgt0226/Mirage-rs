@@ -159,8 +159,67 @@ pub(crate) fn build_upstream(
     }
 }
 
+/// 配置文件缺失时写一份最小模板, 避免启动直接崩溃。
+///
+/// ⚠️ **必须在 `scan_runtime_config` 之前调用**（见 `start_proxy` 里的说明）：那个函数负责把
+/// config + 环境变量里的全局调参设进全局静态；文件缺失时它会读不到配置，于是所有参数静默回落
+/// 到编译期默认值且不打印生效日志，排查很难。
+///
+/// 模板是**客户端**形态（SOCKS5 入站）。服务端模式会额外 WARN：服务端应走 `install.sh` 或手写
+/// 含 `mirage_server` 入站的配置。
+fn ensure_default_config(config_path: &str, is_server: bool) -> Result<()> {
+    if std::path::Path::new(config_path).exists() {
+        return Ok(());
+    }
+    if is_server {
+        warn!(
+            "{} 不存在: 将写入一份**客户端**默认模板 (SOCKS5 入站)。服务端请改用 install.sh 或手写 \
+             含 mirage_server 入站的配置。",
+            config_path
+        );
+    } else {
+        info!("{} 不存在, 写入客户端默认模板", config_path);
+    }
+    let default_cfg = r#"{
+    "log_level": "info",
+    "inbounds": [
+        {
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "port": 1080
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "direct",
+            "tag": "direct"
+        },
+        {
+            "type": "block",
+            "tag": "block"
+        }
+    ],
+    "routing": {
+        "default_outbound": "direct",
+        "rules": []
+    }
+}"#;
+    if let Err(e) = std::fs::write(config_path, default_cfg) {
+        tracing::error!("Failed to write default config to {}: {}", config_path, e);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     crate::startup::init_logging(config_path);
+
+    // ⚠️ 必须在 `scan_runtime_config` **之前**保证配置文件存在: 该函数负责把所有全局调参
+    // (含 `tuning.client_hello_guard` 与 `MIRAGE_CH_*` 环境变量覆盖) 设进全局静态。若文件缺失,
+    // 它会读不到配置 → 这些参数静默回落到编译期默认值（且不打印生效日志）—— 在"全新安装首启"
+    // 这种场景下很难排查。旧实现把默认模板的创建放在 scan 之后 (见 git 历史), 此处提前。
+    ensure_default_config(config_path, is_server)?;
 
     // v0.4 协议: 时间同步从 NTP/HTTP 改为 server 在 handshake 后通过加密 channel
     // 主动下发 (见 src/proxy/mirage_server.rs 和 src/proxy/pool.rs). 这里不再
@@ -204,40 +263,6 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
     // 自定义 fake-TLS 指纹模板 (client_hello_template): 装入 tls_raw 全局, 出站握手复刻其 JA3/JA4。
     crate::startup::load_tls_fingerprint_template(config_path);
 
-    // 如果 config.json 不存在，我们先写一个基础模板，避免启动直接崩溃
-    if !std::path::Path::new(config_path).exists() {
-        info!("config.json not found, creating a default template...");
-        let default_cfg = r#"{
-    "log_level": "info",
-    "inbounds": [
-        {
-            "type": "socks",
-            "tag": "socks-in",
-            "listen": "127.0.0.1",
-            "port": 1080
-        }
-    ],
-    "outbounds": [
-        {
-            "type": "direct",
-            "tag": "direct"
-        },
-        {
-            "type": "block",
-            "tag": "block"
-        }
-    ],
-    "routing": {
-        "default_outbound": "direct",
-        "rules": []
-    }
-}"#;
-        if let Err(e) = std::fs::write(config_path, default_cfg) {
-            tracing::error!("Failed to write default config to {}: {}", config_path, e);
-            return Err(e.into());
-        }
-    }
-    
     // ConfigWatcher::new() 会立刻解析配置并加载 Router 和 Outbounds，同时启动后台文件监控线程
     let watcher = match crate::config_watcher::ConfigWatcher::new(config_path, &geodata_dir, updater_handle.clone()) {
         Ok(w) => w,
