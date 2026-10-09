@@ -553,6 +553,18 @@ impl Preconnect {
             _ => None,
         }
     }
+    /// 非阻塞尝试取用已就绪的预连连接 (CH 秒到时预连仍在 delay 中 → 立即返回 None 以便即时建连并精确采样 F)
+    fn take_ready_socket(&mut self) -> Option<TcpStream> {
+        let mut rx = self.rx.take()?;
+        match rx.try_recv() {
+            Ok(sock) => sock,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.rx = Some(rx);
+                None
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
+        }
+    }
 }
 
 impl Drop for Preconnect {
@@ -799,11 +811,12 @@ where
 
     if !authenticated {
         warn!("Mirage Server auth failed from {}", peer_addr);
-        // 完整 CH 但认证失败: 也用预连 socket (若有) —— 让真站空闲计时起点与探测者连上对齐。
-        let armed = pre.armed();
-        let sock = pre.take_socket().await;
+        // 完整 CH 但认证失败: 若预连已经连好则直接用; 若仍在延时中则不白等 (即时建连 preconnect=0, 采样 F 并消除人为附加延迟)
+        let sock = pre.take_ready_socket();
         let used = sock.is_some();
-        let connected = pre.was_connected();
+        if !used {
+            drop(pre);
+        }
         log_ch_guard(
             "complete",
             Some(false),
@@ -811,7 +824,7 @@ where
             &timing,
             judge,
             client_rtt,
-            preconnect_status(armed, used, connected),
+            if used { "1" } else { "0" },
         );
         reflect_to_camouflage(stream, peer_addr, &client_hello, camouflage_host, cam_rtt, sock).await;
         return None;

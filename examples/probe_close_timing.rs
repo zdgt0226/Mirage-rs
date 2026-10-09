@@ -33,6 +33,7 @@ const USAGE: &str = "\
       --gap-ms <N>          分段发送间隔毫秒 (默认 0; 用于弱网重传容错与 A3 临界间隙测试)
       --split-at <N>        分段切割字节数 (默认 40)
       --interleave          成对交替发起 (每轮 target 依次跑 badauth, authsucc 消除时段网络漂移)
+      --first-byte-only     首字节到达后立即结束探测 (A2/分隙探测无需等待长达90s的真站空闲关闭)
       --cap <secs>          单个探测最长等待 (默认 90; 真站 idle 常 ~60s)
       --connect-timeout <s> TCP 建连超时 (默认 10)
   -h, --help";
@@ -94,6 +95,7 @@ async fn probe_one(
     password: &str,
     gap_ms: u64,
     split_at: usize,
+    first_byte_only: bool,
 ) -> Sample {
     let t0 = Instant::now();
     let mut s = match timeout(connect_timeout, TcpStream::connect(target)).await {
@@ -205,6 +207,9 @@ async fn probe_one(
                 if first_byte_ms.is_none() {
                     first_byte_ms = Some(t0.elapsed().as_millis() as u64);
                 }
+                if first_byte_only {
+                    break;
+                }
             }
             Ok(Err(_)) => break, // RST / 错误
             Err(_) => break,     // cap 到 (本地放弃, 未收到 FIN)
@@ -238,6 +243,7 @@ struct Args {
     gap_ms: u64,
     split_at: usize,
     interleave: bool,
+    first_byte_only: bool,
     cap: Duration,
     connect_timeout: Duration,
 }
@@ -253,6 +259,7 @@ fn parse_args() -> Result<Args, String> {
         gap_ms: 0,
         split_at: 40,
         interleave: false,
+        first_byte_only: false,
         cap: Duration::from_secs(90),
         connect_timeout: Duration::from_secs(10),
     };
@@ -288,6 +295,7 @@ fn parse_args() -> Result<Args, String> {
                 a.split_at = next("--split-at")?.parse().map_err(|_| "--split-at 需为正整数")?
             }
             "--interleave" => a.interleave = true,
+            "--first-byte-only" => a.first_byte_only = true,
             "--cap" => a.cap = Duration::from_secs(next("--cap")?.parse().map_err(|_| "--cap 需为秒数")?),
             "--connect-timeout" => {
                 a.connect_timeout =
@@ -357,6 +365,7 @@ async fn main() {
                         &args.password,
                         args.gap_ms,
                         args.split_at,
+                        args.first_byte_only,
                     )
                     .await;
                     results[ti][mi].push(s);
@@ -375,15 +384,16 @@ async fn main() {
                         remaining[ti] -= 1;
                         launched = true;
                         let (t, m, sni, pwd) = (t.clone(), *mode, args.sni.clone(), args.password.clone());
-                        let (pl, cap, ct, gap, split) = (
+                        let (pl, cap, ct, gap, split, fb_only) = (
                             args.partial_len,
                             args.cap,
                             args.connect_timeout,
                             args.gap_ms,
                             args.split_at,
+                            args.first_byte_only,
                         );
                         set.spawn(async move {
-                            (ti, probe_one(&t, m, &sni, pl, ct, cap, &pwd, gap, split).await)
+                            (ti, probe_one(&t, m, &sni, pl, ct, cap, &pwd, gap, split, fb_only).await)
                         });
                     }
                 }
