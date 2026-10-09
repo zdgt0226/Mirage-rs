@@ -98,6 +98,16 @@ where
         return Err(());
     }
 
+    if client_hello.is_empty() {
+        // 空连接探测: 伪装站不会主动推送数据, 直接进入双向透传等待对端或真站超时关闭
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            tokio::io::copy_bidirectional(probe, &mut cam),
+        )
+        .await;
+        return Ok(());
+    }
+
     // 显式读取伪装站的首块数据: 得到首字节确切到达时刻 T1 (F = T1 - T0)
     let mut first_buf = [0u8; 4096];
     let n = match cam.read(&mut first_buf).await {
@@ -112,7 +122,7 @@ where
     }
 
     if probe.write_all(&first_buf[..n]).await.is_err() {
-        return Err(());
+        return Ok(());
     }
 
     let _ = tokio::time::timeout(
