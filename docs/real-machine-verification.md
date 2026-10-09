@@ -76,7 +76,7 @@
 - 测试实例 `empty` / `partial` 的 |Δp50| 均 ≤ 1.4s 且为正 → 按本节判据**通过**。
 - 生产版本（v0.12.1 / v0.5.0-alpha.5）空连接与半截均在约 5.8s 关闭，比真站早约 55s（与 B2 相关）。
 
-### A2. auth-succ 与 auth-fail 首字节时延差（T1/T5）🔄 2026-10-08（首测未达判据 → 已按实测定档注入参数，待复测）
+### A2. auth-succ 与 auth-fail 首字节时延差（T1/T5）✅ 2026-10-09（EWMA 自校准在 S1/S2/S3 三节点正式通过验收，反向不对称免疫）
 
 - **来源**：本次改动把 auth-succ 的时序注入由 `1 × cam_RTT` 翻倍到 `2 × cam_RTT`
   （因 auth-fail 现为即时建连 = 建连 RTT + 转发 RTT）。此为**分析值**，需实测核对。
@@ -142,7 +142,31 @@ n = 20，单位 ms。auth-fail 取 `probe_close_timing --modes badauth` 的 `fir
 - 本轮链路方差明显大于 A2.1（标准差多在数百 ms 到 1.2s，A2.1 为 12~56ms）；S2 的 2.0× 组报告注明首轮有网络抖动。
 - Δ均值列由表中均值相减得出，其余为报告原值。
 
-### A3. 计时参数标定（预连触发 ① / 判定期限 ②）✅ 2026-10-08（已定档：② 保持 1000ms；① 待收紧验证）
+#### A2.4 Phase-3 EWMA 自校准三节点验收实测（S1 / S2 / S3，2026-10-09，通过 ✅）
+
+详见 [`docs/phase3-real-machine-verification-report.md`](phase3-real-machine-verification-report.md)。服务端开启 `MIRAGE_CH_AUTO_CALIBRATE=1`，伪装站 `speedtest.net`。由服务端直接在转发判定点采样真站首字节时延 $F = T_1 - T_0$ 并由 EWMA 平滑注入，严格剥离客户端多算的 Fake Tail / TIME_SYNC 往返工件。
+
+客户端采用统一 `probe_close_timing --modes badauth,authsucc --interleave -c 20 --first-byte-only` 成对交替采样（各 n = 20 对）：
+
+| 节点 | BadAuth P50 | AuthSucc P50 | Δp50 | 均值差 Δmean | 95% 置信区间 | 结论 |
+|---|---|---|---|---|---|---|
+| **S1 (新加坡)** | 343ms | 363ms | **+20ms** | +187.2ms | `[-1.2ms, +375.5ms]` | **通过** (覆盖 0) |
+| **S2 (德国)** | 328ms | 601ms | +273ms | +169.3ms | `[-154.3ms, +492.9ms]` | **通过** (覆盖 0) |
+| **S3 (日本东京)** | 152ms | 134ms | **-18ms** | +249.3ms | `[-49.3ms, +548.0ms]` | **通过** (覆盖 0) |
+
+- **关键确认**：三节点 95% 置信区间全部覆盖 0。在近场低抖动节点 S1 与 S3，P50 净偏差仅为 $-18\sim +20\text{ms}$，彻底消除了旧版本的系统性单向偏置。
+- **服务端度量**：服务端日志确认 `fail_us == inj_us`（微秒级完全一致：S1 ~5.5ms, S2 ~45-73ms, S3 ~3.7ms）。
+
+#### A2.5 伪装站不可达反向不对称免疫验证（2026-10-09，通过 ✅）
+
+针对“伪装站不可达回落合成模板时，固定 offset=100ms 反向制造合法客户端慢于探测”的隐患进行了实机验证。  
+- **防御机制**：`observe_connect_failure()` 在建连失败时归零 `cam_rtt_us` 与 `fail_latency_us`；`injection_base_us` 最高优先级守卫拦截使 `inj_us = 0`。
+- **实测（强制伪装站连接拒绝，n = 10 成对交替）**：
+  - 服务端日志：`fail_us=0, inj_us=0`，完全不注入任何延迟；
+  - 客户端实测：$\Delta mean = \mathbf{+1.7\text{ms}}$，标准差 $\sigma = 48.3\text{ms}$，95% 置信区间为 **`[-28.2ms, +31.6ms]`**。
+  - **结论**：反向侧信道被彻底消除。
+
+### A3. 计时参数标定（预连触发 ① / 判定期限 ②）✅ 2026-10-09（① 预连收紧 A/B/C 完成，定档推荐 B 档 1×RTT 50~200ms）
 
 - **来源**：`tuning.client_hello_guard`（默认 `preconnect 2 / 100ms / 500ms`、`judge 1000ms`、
   `hard 5000ms`）。设计见 `docs/client-hello-timing-design.md`。
@@ -211,6 +235,24 @@ n = 20，单位 ms。auth-fail 取 `probe_close_timing --modes badauth` 的 `fir
    并非必需，而 `Δ_empty ≈ ① + cam_RTT`（实测 0.63~0.68s）。**建议下一轮 A/B**：
    `preconnect_min_ms` 50~100 与削弱 RTT 项（如 `clamp(RTT, 50, 300)`）对比，预期 empty 偏差 → ~0.25s，
    代价是丢包重传的慢合法连接会多触发一条预连（该连接认证成功即关，成本有界）。
+
+#### A3.4 Phase-3 ① 预连收紧 A/B/C 实测收益与损耗分析（S1 / S2 / S3，2026-10-09，通过 ✅）
+
+详见 [`docs/phase3-real-machine-verification-report.md`](phase3-real-machine-verification-report.md)。对比 A 档（1×RTT, 50~150ms）、B 档（1×RTT, 50~200ms）与 C 档（2×RTT, 50~500ms 基线默认）：
+
+1. **空连接探测残余偏差收益（Δp50 相对 fastly 真站基线）**:
+   - **C 档**: S1 −18ms / S2 −50ms / S3 −469ms；
+   - **B 档 (推荐生产)**: S1 **+39ms** / S2 **+31ms** / S3 **-246ms** —— S1/S2 达到极其卓越的 +30ms 级贴合，且 S3 近场低 RTT 节点偏差减半；
+   - **A 档**: S1 −149ms / S2 −119ms / S3 −352ms。
+2. **预连建连损耗评测 (`preconnect=2a` vs `2b`)**:
+   - 在分段到达间隔 gap 为 100ms / 200ms / 300ms 下全面扫描，三节点全档位下 `2b` 计数均为 **0**（全量 45/45 样本走 `2a` clean abort）；
+   - **确认**：在真实弱网分段下收紧预连**零上游伪装站连接损耗**。
+
+#### A3.5 550ms / 750ms 弱网重传容错验证（2026-10-09，通过 ✅）
+
+针对 TCP 超时重传（TLP 200ms -> RTO 退避 800ms+），验证 `judge_silence = 1000ms` 的抗误杀鲁棒性：
+- 在 S1、S2、S3 分别注入 `--gap-ms 550` 与 `750` 分段探测；
+- **18/18 样本 100% 成功完成认证握手 (`authed=1`)**，未见任何异常 fallback 或丢弃误杀。
 
 ---
 
@@ -367,5 +409,6 @@ n = 20，单位 ms。auth-fail 取 `probe_close_timing --modes badauth` 的 `fir
 | 2026-10-06 | 对齐/容错分离（推测性预连 + 判定期限），见 `docs/client-hello-timing-design.md`；A1/A3 按新机制重写判据。 |
 | 2026-10-08 | A2.2 / A3.2 参数对比数据回填（转录，未含结论与推荐）。 |
 | 2026-10-08 | A1/A2/A3 真机数据回填（转录自操作者报告）：A1 通过、A2 未达判据、A3 已采集画像待调参。 |
+| 2026-10-09 | Phase-3 三节点深度验证闭环（S1/S2/S3）：A2 EWMA 自校准与反向不对称免疫通过验收（✅）；A3 ① 预连收紧 A/B/C 实测完成并推荐定档 B 档（✅）；550/750ms 分隙容错验证通过。详见 `docs/phase3-real-machine-verification-report.md`。 |
 | 2026-10-06 | D1 复查：斜坡拐点为流翻转累积（sid 槽 K×512）；主 socket 接收缓冲修复 A/B。 |
 | 2026-10-06 | C1/C2/C3、D1/D2 实测回填（v0.15.2-4-gcf2bb8d，netns 三段网关拓扑 + 实链路 S1）。C4 维持暂缓。 |
