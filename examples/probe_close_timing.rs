@@ -253,7 +253,7 @@ fn parse_args() -> Result<Args, String> {
         targets: Vec::new(),
         modes: vec![Mode::Empty, Mode::Partial, Mode::BadAuth],
         count: 5,
-        password: String::new(),
+        password: std::env::var("MIRAGE_PROBE_PASSWORD").unwrap_or_default(),
         sni: "www.apple.com".to_string(),
         partial_len: 40,
         gap_ms: 0,

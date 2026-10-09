@@ -1313,6 +1313,10 @@ pub struct ClientHelloGuardConfig {
     /// (2.5×/2.7×) 在小 RTT 下补不足、大 RTT 下过冲, 因此用"倍率 + 固定偏置"而非单纯加大倍率。
     #[serde(default = "default_auth_succ_offset_ms")]
     pub auth_succ_offset_ms: u64,
+    /// 自校准: 用实测的 auth-fail 全程耗时 F 的 EWMA 作为 auth-succ 注入基准（取代静态
+    /// `mult×cam_RTT + offset`）。默认 false。
+    #[serde(default)]
+    pub auto_calibrate: bool,
 }
 
 fn default_auth_succ_mult_x10() -> u32 {
@@ -2480,13 +2484,22 @@ mod validation_tests {
             (3, 50, 2000, 1500, 6000)
         );
         assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (25, 100));
+        assert!(!q.auto_calibrate);
         assert!(!has(&issues, "client_hello_guard"), "合法值不该报: {issues:?}");
 
-        // 不写新字段时用实测默认 (2.0× + 100ms)。
+        // 不写新字段时用实测默认 (2.0× + 100ms, auto_calibrate=false)。
         v["tuning"] = serde_json::json!({ "client_hello_guard": {} });
         let (cfg, _) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
         let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
         assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (20, 100), "默认应为 2.0× + 100ms");
+        assert!(!q.auto_calibrate, "默认应为 false");
+
+        // 显式开启 auto_calibrate: true
+        v["tuning"] = serde_json::json!({ "client_hello_guard": { "auto_calibrate": true } });
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
+        assert!(q.auto_calibrate);
+        assert!(!has(&issues, "client_hello_guard"), "auto_calibrate=true 不应报错误: {issues:?}");
 
         // 非法值 → 均报。
         for bad in [

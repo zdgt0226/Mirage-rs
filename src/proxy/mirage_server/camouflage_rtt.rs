@@ -89,6 +89,13 @@ impl CamouflageRtt {
     pub fn fail_latency_us(&self) -> u64 {
         self.fail_latency_us.load(Ordering::Relaxed)
     }
+
+    /// 伪装站所有候选建连均失败 (不可达 / 故障): 复位 RTT 与 fail_latency 估计为 0。
+    /// 防"曾连通后不可达"时 auth-succ 仍按旧样本注入延迟而 auth-fail 秒回落合成模板的反向时延侧信道。
+    pub fn observe_connect_failure(&self) {
+        self.rtt_us.store(0, Ordering::Relaxed);
+        self.fail_latency_us.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +162,18 @@ mod tests {
         // 上限 3s 截断
         r.observe_fail_forward(10_000_000);
         assert!(r.fail_latency_us() <= 3_000_000);
+    }
+
+    #[test]
+    fn failure_resets_rtt_and_fail_latency() {
+        let r = CamouflageRtt::new();
+        r.observe_connect(Duration::from_millis(50));
+        r.observe_fail_forward(300_000);
+        assert!(r.rtt_us() > 0);
+        assert!(r.fail_latency_us() > 0);
+
+        r.observe_connect_failure();
+        assert_eq!(r.rtt_us(), 0, "建连全失败后应复位为 0");
+        assert_eq!(r.fail_latency_us(), 0, "建连全失败后应复位为 0");
     }
 }

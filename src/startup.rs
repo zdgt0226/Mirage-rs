@@ -157,14 +157,15 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                 let hard = std::time::Duration::from_millis(q.map(|q| q.hard_deadline_ms).unwrap_or(5000));
                 let auth_mult = q.map(|q| q.auth_succ_mult_x10).unwrap_or(20);
                 let auth_off = std::time::Duration::from_millis(q.map(|q| q.auth_succ_offset_ms).unwrap_or(100));
+                let auto = q.map(|q| q.auto_calibrate).unwrap_or(false);
                 crate::proxy::mirage_server::set_client_hello_guard(
-                    mult, pc_min, pc_max, judge, hard, auth_mult, auth_off,
+                    mult, pc_min, pc_max, judge, hard, auth_mult, auth_off, auto,
                 );
-                let (m, lo, hi, j, h, am, ao) = crate::proxy::mirage_server::client_hello_guard_params();
+                let (m, lo, hi, j, h, am, ao, ac) = crate::proxy::mirage_server::client_hello_guard_params();
                 info!(
                     "ClientHello 守卫: 预连 {}×RTT (clamp {}~{}ms) · 静默判定 {}ms · 总时限 {}ms · \
-                     auth-succ 注入 {}.{}×cam_RTT+{}ms (MIRAGE_CH_* 可覆盖)",
-                    m, lo, hi, j, h, am / 10, am % 10, ao
+                     auth-succ 注入 {}.{}×cam_RTT+{}ms · 自校准={} (MIRAGE_CH_* 可覆盖)",
+                    m, lo, hi, j, h, am / 10, am % 10, ao, if ac { "on" } else { "off" }
                 );
             }
             if let Some(tuning) = config.tuning {

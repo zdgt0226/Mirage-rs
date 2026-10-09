@@ -277,6 +277,7 @@ static HARD_DEADLINE_US: AtomicU64 = AtomicU64::new(5_000_000);
 /// auth-succ 时序注入: `(mult_x10/10 × cam_RTT + offset_us) × jitter`。见 `auth_succ_delay_us`。
 static AUTH_MULT_X10: AtomicU32 = AtomicU32::new(20);
 static AUTH_OFFSET_US: AtomicU64 = AtomicU64::new(100_000);
+static AUTO_CALIBRATE: AtomicBool = AtomicBool::new(false);
 
 /// env 覆盖 (优先于 config)。**0 视为无效** → 回落: 0 长度的窗口会让所有连接被判异常。
 fn env_ms(name: &str) -> Option<u64> {
@@ -285,6 +286,15 @@ fn env_ms(name: &str) -> Option<u64> {
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()).filter(|v| *v > 0)
 }
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|v| {
+        match v.to_ascii_lowercase().trim() {
+            "1" | "true" | "on" | "yes" => Some(true),
+            "0" | "false" | "off" | "no" => Some(false),
+            _ => None,
+        }
+    })
+}
 /// 环境变量优先取新名, 再回落到旧名 (真机 A/B 脚本用过 `MIRAGE_DELAY_*`, 兼容不破坏)。
 fn env_u32_alias(new: &str, old: &str) -> Option<u32> {
     env_u32(new).or_else(|| env_u32(old))
@@ -292,7 +302,7 @@ fn env_u32_alias(new: &str, old: &str) -> Option<u32> {
 
 /// 设置 ClientHello 计时/判定参数 (启动时一次)。环境变量 `MIRAGE_CH_PRECONNECT_MULT` /
 /// `MIRAGE_CH_PRECONNECT_MIN_MS` / `MIRAGE_CH_PRECONNECT_MAX_MS` / `MIRAGE_CH_JUDGE_MS` /
-/// `MIRAGE_CH_HARD_MS` / `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS` 优先覆盖
+/// `MIRAGE_CH_HARD_MS` / `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS` / `MIRAGE_CH_AUTO_CALIBRATE` 优先覆盖
 /// (供真机 A/B 调参; 旧名 `MIRAGE_DELAY_MULT_TENTHS` / `MIRAGE_DELAY_OFFSET_MS` 仍兼容)。
 /// min/max 反转自动纠正。
 pub fn set_client_hello_guard(
@@ -303,6 +313,7 @@ pub fn set_client_hello_guard(
     hard_deadline: Duration,
     auth_succ_mult_x10: u32,
     auth_succ_offset: Duration,
+    auto_calibrate: bool,
 ) {
     let mult = env_u32("MIRAGE_CH_PRECONNECT_MULT").unwrap_or(preconnect_mult.max(1));
     let mut pc_min =
@@ -329,6 +340,7 @@ pub fn set_client_hello_guard(
                 .and_then(|v| v.parse::<u64>().ok())
         })
         .unwrap_or(auth_succ_offset.as_millis() as u64);
+    let auto = env_bool("MIRAGE_CH_AUTO_CALIBRATE").unwrap_or(auto_calibrate);
 
     PC_MULT.store(mult, Ordering::Relaxed);
     PC_MIN_US.store(pc_min.saturating_mul(1000), Ordering::Relaxed);
@@ -337,6 +349,7 @@ pub fn set_client_hello_guard(
     HARD_DEADLINE_US.store(hard.saturating_mul(1000), Ordering::Relaxed);
     AUTH_MULT_X10.store(auth_mult, Ordering::Relaxed);
     AUTH_OFFSET_US.store(auth_off_ms.saturating_mul(1000), Ordering::Relaxed);
+    AUTO_CALIBRATE.store(auto, Ordering::Relaxed);
 }
 
 /// auth-succ 时序注入基准 (微秒, 未含抖动): `(mult_x10/10 × cam_RTT) + offset`。
@@ -356,8 +369,28 @@ pub(crate) fn auth_succ_delay_us(mult_x10: u32, offset_us: u64, cam_rtt_us: u64)
         .saturating_add(offset_us)
 }
 
+/// 选 auth-succ 注入基准 (微秒, 未含抖动):
+/// 1. 伪装站未连通 / 不可达 (cam_rtt_us == 0): 恒为 0 (避免反向不对称);
+/// 2. auto_calibrate 开启且已有 F 样本: 采用实测的 F(EWMA);
+/// 3. 否则回落静态公式: (mult_x10/10 × cam_RTT) + offset。
+pub(crate) fn injection_base_us(
+    auto_calibrate: bool,
+    fail_us: u64,
+    mult_x10: u32,
+    offset_us: u64,
+    cam_rtt_us: u64,
+) -> u64 {
+    if cam_rtt_us == 0 {
+        return 0;
+    }
+    if auto_calibrate && fail_us > 0 {
+        return fail_us;
+    }
+    auth_succ_delay_us(mult_x10, offset_us, cam_rtt_us)
+}
+
 /// 当前生效的参数 —— 启动日志用。
-pub fn client_hello_guard_params() -> (u32, u64, u64, u64, u64, u32, u64) {
+pub fn client_hello_guard_params() -> (u32, u64, u64, u64, u64, u32, u64, bool) {
     (
         PC_MULT.load(Ordering::Relaxed),
         PC_MIN_US.load(Ordering::Relaxed) / 1000,
@@ -366,6 +399,7 @@ pub fn client_hello_guard_params() -> (u32, u64, u64, u64, u64, u32, u64) {
         HARD_DEADLINE_US.load(Ordering::Relaxed) / 1000,
         AUTH_MULT_X10.load(Ordering::Relaxed),
         AUTH_OFFSET_US.load(Ordering::Relaxed) / 1000,
+        AUTO_CALIBRATE.load(Ordering::Relaxed),
     )
 }
 
@@ -424,12 +458,14 @@ fn log_ch_guard(
     judge: Duration,
     client_rtt: Option<Duration>,
     preconnect: &'static str,
+    cam_rtt: &CamouflageRtt,
+    inj_us: u64,
 ) {
     let pre_tls = bytes.first() == Some(&0x16);
     if *CH_MEASURE {
         tracing::info!(
             "[CH-GUARD] outcome={} ch_read_us={} bytes={} max_gap_us={} pre_tls={} authed={} \
-             judge_us={} preconnect={} rtt_us={}",
+             judge_us={} preconnect={} rtt_us={} fail_us={} inj_us={}",
             outcome,
             timing.total_us,
             timing.bytes,
@@ -439,6 +475,8 @@ fn log_ch_guard(
             judge.as_micros(),
             preconnect,
             client_rtt.map(|r| r.as_micros()).unwrap_or(0),
+            cam_rtt.fail_latency_us(),
+            inj_us,
         );
     }
     // 丢包误杀检测: 已收到 TLS 记录头, 且“到达之间”出现过 ≥150ms 间隔 —— 合法客户端丢段后
@@ -755,6 +793,8 @@ where
                 judge,
                 client_rtt,
                 preconnect_status(armed, used, connected),
+                cam_rtt,
+                0,
             );
             reflect_to_camouflage(stream, peer_addr, &bytes, camouflage_host, cam_rtt, sock).await;
             return None;
@@ -769,6 +809,8 @@ where
                 judge,
                 client_rtt,
                 preconnect_status(pre.armed(), false, pre.was_connected()),
+                cam_rtt,
+                0,
             );
             return None;
         }
@@ -825,6 +867,8 @@ where
             judge,
             client_rtt,
             if used { "1" } else { "0" },
+            cam_rtt,
+            0,
         );
         reflect_to_camouflage(stream, peer_addr, &client_hello, camouflage_host, cam_rtt, sock).await;
         return None;
@@ -835,6 +879,18 @@ where
     let was_armed = pre.armed();
     let was_connected = pre.was_connected();
     drop(pre);
+
+    let mult_x10 = AUTH_MULT_X10.load(Ordering::Relaxed);
+    let offset_us = AUTH_OFFSET_US.load(Ordering::Relaxed);
+    let auto_calib = AUTO_CALIBRATE.load(Ordering::Relaxed);
+    let inj_us = injection_base_us(
+        auto_calib,
+        cam_rtt.fail_latency_us(),
+        mult_x10,
+        offset_us,
+        cam_rtt.rtt_us(),
+    );
+
     log_ch_guard(
         "complete",
         Some(true),
@@ -843,6 +899,8 @@ where
         judge,
         client_rtt,
         preconnect_status(was_armed, false, was_connected),
+        cam_rtt,
+        inj_us,
     );
 
     // PFS: 生成服务端一次性 X25519 对。公钥注入回放模板的 ServerHello.random 发给客户端,
@@ -875,35 +933,10 @@ where
     }
 
     // v0.4.5-alpha.13: 消除 auth-succ vs auth-fail 时序侧信道.
-    // auth-fail 走 camouflage 转发有 ~1 RTT 延迟 (探针→server→camouflage→回),
-    // auth-succ 本地模板回放 ~0ms. 差异让 GFW 关联"真实用户秒回、探针慢回"识破
-    // 差别对待 = 暴露 Reality 式代理. auth-fail 无法变快 (探针要真实 TLS 握手必须
-    // 转发真站), 故在 auth-succ 注入等量抖动延迟对齐. RTT 由 CamouflageRtt 实测,
-    // ±25% 抖动模拟网络方差 (固定延迟太规整反而是特征). WarmPool 预建吸收此延迟,
-    // 用户无感.
-    //
-    // 延迟预连 (2026-10): auth-fail 现为**即时建连** → 时延 = 建连 RTT + 转发 RTT
-    // = 2 × cam_RTT **再加上伪装站/CDN 的固有处理底限 P** (约 100ms, 与 RTT 无关)。
-    // 实机实测 (docs/real-machine-verification.md A2.1/A2.2): 只注入 2×cam_RTT 时 auth-succ
-    // 比 auth-fail 快 118~125ms; 加入 +100ms 偏置后收敛到数十 ms 内; 纯倍率 (2.5×/2.7×) 反而
-    // 在小 RTT 下补不足、大 RTT 下过冲。故用 `auth_succ_delay_us` (倍率 + 固定偏置)。
-    //
-    // 自校准 (Auto-Calibration): 若开 MIRAGE_CH_AUTO_CALIBRATE=1, 且实测过 auth-fail 全程耗时 F,
-    // 直接采用该 EWMA 均值作为基准注入 (彻底免除 per-site 静态 offset 调参)。
-    let mult_x10 = AUTH_MULT_X10.load(Ordering::Relaxed);
-    let offset_us = AUTH_OFFSET_US.load(Ordering::Relaxed);
-    let auto_calib = std::env::var("MIRAGE_CH_AUTO_CALIBRATE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-    let auto_us = if auto_calib { cam_rtt.fail_latency_us() } else { 0 };
-    let base_us = if auto_us > 0 {
-        auto_us
-    } else {
-        auth_succ_delay_us(mult_x10, offset_us, cam_rtt.rtt_us())
-    };
-    if base_us > 0 {
+    // 注入由 injection_base_us 统一决定的延迟基准 (含 ±25% 抖动模拟网络方差).
+    if inj_us > 0 {
         let jitter_num = 75 + fastrand::u64(0..=50); // 75%~125%
-        let delay_us = base_us.saturating_mul(jitter_num) / 100;
+        let delay_us = inj_us.saturating_mul(jitter_num) / 100;
         tokio::time::sleep(Duration::from_micros(delay_us)).await;
     }
 
@@ -1524,5 +1557,18 @@ mod tests {
         bad_len[10] = 52; // 52B != 53 && != 69
         let res = consume_fake_client_tail(&mut Cursor::new(bad_len)).await;
         assert!(res.is_err(), "非法体长应被拒绝");
+    }
+
+    #[test]
+    fn test_injection_base_selection() {
+        // 1. auto 开且已有 F 样本 → 采用实测的 F(EWMA)
+        assert_eq!(injection_base_us(true, 460_000, 20, 100_000, 180_000), 460_000);
+        // 2. auto 开但无 F 样本 (冷启动) → 静态公式兜底
+        assert_eq!(injection_base_us(true, 0, 20, 100_000, 180_000), 460_000);
+        // 3. auto 关 → 静态公式 (即使已有 F)
+        assert_eq!(injection_base_us(false, 460_000, 20, 100_000, 180_000), 460_000);
+        // 4. 关键安全守卫: 伪装站不可达 (cam_rtt_us == 0) → 恒为 0 (绝不注入, 避免反向时延不对称)
+        assert_eq!(injection_base_us(true, 460_000, 20, 100_000, 0), 0);
+        assert_eq!(injection_base_us(false, 0, 20, 100_000, 0), 0);
     }
 }

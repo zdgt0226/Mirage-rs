@@ -76,6 +76,7 @@ pub(super) async fn connect_camouflage(
         }
     }
     warn!("camouflage_host `{h}` 所有候选均未能建连 (预算 {CONNECT_TOTAL_TIMEOUT:?})");
+    cam_rtt.observe_connect_failure();
     None
 }
 
