@@ -137,18 +137,33 @@
    伪装站侧无对应连接；也确认了"除启动 prewarm 外无后台持续性连接"。
 4. **旧实现在真实探测面前是灾难级的**：生产版 v0.12.1 / v0.5.0-alpha.5 的 `empty`/`partial` 均在约 **5.8s** 关闭，
    比真站早 **~55s**（不是之前评估的 8~14s——那是另一代实现）。这反向确认了本方案的诊断与收益。
+5. **（Phase-3）② 的取值已被实测锤实**：`judge_silence_ms = 1000` 在 550ms / 750ms 弱网重传间隔下
+   **18/18 零误杀**；而 `500ms` 档在 gap ≥ 550ms 时 **0/5 全部误杀** ⇒ **`500ms` 档已实测证伪**，
+   不再作为"可选高隐蔽档"候选（取代了 §6.2 旧第 1 条的"待 netm 验证"）。
+6. **（Phase-3）反向不对称已免疫**：`CamouflageRtt::observe_connect_failure()` 在建连失败时归零 `cam_rtt`
+   与 F，配合 `injection_base_us` 的 `cam_rtt_us == 0 → 0` 守卫；S3 强制建连拒绝下实测 `inj_us = 0`、
+   Δmean **+1.7ms**（95% CI [−28.2, +31.6] ∋ 0）⇒ §6.2 旧第 4 条的"自校准待评估"已落地并验收（见下）。
+7. **（Phase-3）自校准已实现并验收（机制层）**：`tuning.client_hello_guard.auto_calibrate`（默认 `false`）
+   + env `MIRAGE_CH_AUTO_CALIBRATE`；`[CH-GUARD]` 增 `fail_us=` / `inj_us=`，实测 `fail_us == inj_us`（µs 级）。
+   注意：**`T0` 取在 `connect_camouflage` 之前**，故 F 含一次建连（`F = 2×cam_rtt + P`），与"注入目标 =
+   auth-fail 全程"自洽。
+
+> **⚠️ Phase-3 发现的测量局限（影响"Δ 类指标"的用法）**：
+> `Δ = ① + cam_rtt + (cam_idle − baseline_idle)` —— 当 baseline 是"**客户端→真站**"而转发路径是"**VPS→真站**"时，
+> 两者可能落在不同 CDN 边缘、空闲超时不同，Δ 里会混入这个差异（S3 实测 Δ 为**负**即此因，达数百 ms）。
+> **结论：评估 ① 的收益前必须先让 baseline 同源**（见 `docs/plan-phase4-verification.md` P0.7/T1′）。
 
 ### 6.2 未解决 / 需继续跟进
 
-1. **`judge_silence_ms = 500` 的"紧凑档"缺乏丢包容错证据**：实测 5/5 通过是在**无丢包**链路上（合法 CH 仅 70µs），
-   根本未触及 ② 存在的唯一理由（> TCP 重传 TLP/RTO）。在 RTO 可退避到 800ms+ 的链路下，500ms 判定期限**会**误杀丢段的合法客户端（即已修的 P1）。
-   → 若要提供该档：必须先在 `tc netem loss 5~20%` 下复测确认零误杀；否则生产默认保持 1000ms。
+1. ~~**`judge_silence_ms = 500` 的"紧凑档"缺乏丢包容错证据**~~ → **已实测证伪（Phase-3）**：
+   gap ≥ 550ms（真实 RTO 退避区间）时 500ms 档 **0/5 全部误杀**；1000ms 档在 550/750ms 下 18/18 零误杀。
+   ⇒ **结论：`500ms` 不作为候选档，生产默认保持 1000ms**。
 2. **预连的状态机复杂度**：每条"未在 ① 内完成 CH"的连接多一条到伪装站的生命周期；关连接会在伪装站侧留下
    "accept 后无数据即关"的短连接（旧池同类行为更强，但非零）。
 3. **预连预算只做全局粒度**：单个恶意 IP 可占满全局额度，导致他人"对齐"降级（可用性不受影响）。未做 per-IP，属有意简化。
-4. **注入量仍是"估算 + 定档"，不是自校准**：`P` 按 Fastly 测定为 100ms，换伪装站要重测。
-   更彻底的方案：在 auth-fail 路径上**直接测量** `判定时刻 → 收到真站首字节` 的耗时（EWMA），用它替代 `2×cam_RTT + offset` ——
-   天然适配任何伪装站，无需 per-site 调参。待评估（需处理"预连 socket 让该耗时变短"的交互）。
+4. ~~**注入量仍是"估算 + 定档"，不是自校准**~~ → **已实现并验收（Phase-3）**：见 §6.1 第 6、7 条。
+   `auto_calibrate` 默认仍为 `false`（静态公式兜底），因其客户端侧验收的置信区间仍偏宽（σ_paired 400~700ms）、
+   且需要先排除"静态兜底样本混入"的干扰（见 `docs/plan-phase4-verification.md` T3′）。
 5. **`badauth` 的关闭时间未被真正观测**：五个目标全部撞 90s 采集上限。若关心"完整 CH 认证失败"后的长连接行为差异，
    需把 `--cap` 提到真站握手超时之上（并查阅真站自己的握手超时值）。
 6. **合法的"滴发"与探测无法从形态上区分**：②/③ 只把代价压到有界（≤ ③ 的一条连接占用）。
@@ -208,3 +223,11 @@ cargo clippy --all-targets -- -D warnings && bash scripts/check-no-real-endpoint
 ```
 
 真机验证（`docs/real-machine-verification.md`）：**A1**（三种形态关闭时间对齐，重点看"提前"方向）、**A2**（auth-succ vs auth-fail 首字节时延差）、**A3**（用 §5 的度量定 ① / ② 取值；先确认 `max_gap_us ≥ 150000 且 pre_tls=1` 的计数为 0）。
+
+### 9.1 实机验证进展（截至 2026-10-10）
+
+| 阶段 | 文件 | 结论 |
+|---|---|---|
+| Phase-1/2 | `docs/real-machine-verification.md` A1–A3 | 关闭时间对齐达标；`P` 非全局常量（两节点 CI 不相交）⇒ 需要自校准 |
+| Phase-3（三节点） | `docs/phase3-real-machine-verification-report.md` | ② 保持 1000ms（500ms 证伪）；反向不对称免疫验收；自校准机制验收（`fail_us == inj_us`） |
+| **Phase-4（待执行）** | `docs/plan-phase4-verification.md` | 同源 baseline 下重定 ① 档；`2b` 归因重测；自校准逐条复核 |

@@ -122,6 +122,7 @@ where
     }
 
     if probe.write_all(&first_buf[..n]).await.is_err() {
+        // 向探针客户端写回伪装站首包失败 (客户端已断开), 无需再向上游伪装站换连接重试, 直接结束
         return Ok(());
     }
 

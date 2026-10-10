@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### feat(anti-probing): Phase-3 三节点实测闭环 —— 自校准验收 / 反向不对称免疫 (2026-10-10)
+
+- **反向不对称免疫**（`9fd42d8`）: 新增 `CamouflageRtt::observe_connect_failure()`——建连彻底失败时
+  **归零** `cam_rtt` 与注入用的 F（EWMA），配合 `injection_base_us` 首行 `cam_rtt_us == 0 → 0` 守卫，
+  消除"伪装站不可达时 auth-succ 反而比 auth-fail 慢"的反向侧信道（旧实现无条件注入 offset）。
+  实测（S3 强制建连拒绝，n=10 成对）：`inj_us = 0`、Δmean **+1.7ms**、95% CI [−28.2, +31.6] ∋ 0。
+- **度量字段**（`9fd42d8`）: `[CH-GUARD]` 增 `fail_us=`（自校准 F 的 EWMA）与 `inj_us=`（本次注入基准），
+  使"自校准是否生效"在**服务端可证**（`fail_us == inj_us`，µs 级），不依赖客户端侧推算。
+- **`auto_calibrate` 入 config**: `tuning.client_hello_guard.auto_calibrate`（默认 **false**，静态公式兜底），
+  env `MIRAGE_CH_AUTO_CALIBRATE` 仍可覆盖（不再每握手 `std::env::var`）。
+- **空连接探测优化**（`a189030`）: 空 ClientHello 不再等待"真站首字节"（它永不主动推送），直接进入双向透传，
+  避免 idle 重试；⚠️ 同一提交把非空 CH 的 `probe.write_all` 失败由 `Err` 改为 `Ok`（不再换连接重试/回落
+  合成模板）——**待 Phase-4 复核是否有意为之**，见 `docs/plan-phase4-verification.md` §0-B。
+- **实测结论（详见 `docs/phase3-real-machine-verification-report.md`）**:
+  - `judge_silence = 1000ms` **保持**（550/750ms 弱网重传下 18/18 零误杀）；`500ms` 档**已实测证伪**（gap≥550ms 时 0/5 误杀）。
+  - `①` 预连收紧的**收益排序未能与测量噪声区分**（baseline 跨轮跨度 656ms > A/B/C 间差异）→
+    **默认档保持 `2×, 100~500ms`**，是否收窄到 `1×, 50~200ms` 由 Phase-4 的**同源 baseline** 复测定档。
+  - `Δ = ① + cam_rtt + (cam_idle − baseline_idle)`：baseline 与转发路径**不同源**时会混入 CDN 边缘的空闲超时差异
+    （S3 实测 Δ 为负即此因），故 Δ 类指标必须先同源化。
+
 ### fix(anti-probing): auth-succ 时序注入按实测定档 —— 「倍率 + 固定偏置」(2026-10-08)
 
 - **来源**: S1/S2 真机 A2 实测 (见 `docs/real-machine-verification.md` A2.1–A2.3): 只注入 `2 × cam_RTT` 时

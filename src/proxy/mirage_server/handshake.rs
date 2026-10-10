@@ -460,12 +460,14 @@ fn log_ch_guard(
     preconnect: &'static str,
     cam_rtt: &CamouflageRtt,
     inj_us: u64,
+    pc_fire_us: u64,
+    pc_ready_us: u64,
 ) {
     let pre_tls = bytes.first() == Some(&0x16);
     if *CH_MEASURE {
         tracing::info!(
             "[CH-GUARD] outcome={} ch_read_us={} bytes={} max_gap_us={} pre_tls={} authed={} \
-             judge_us={} preconnect={} rtt_us={} fail_us={} inj_us={}",
+             judge_us={} preconnect={} rtt_us={} fail_us={} inj_us={} pc_fire_us={} pc_ready_us={}",
             outcome,
             timing.total_us,
             timing.bytes,
@@ -477,6 +479,8 @@ fn log_ch_guard(
             client_rtt.map(|r| r.as_micros()).unwrap_or(0),
             cam_rtt.fail_latency_us(),
             inj_us,
+            pc_fire_us,
+            pc_ready_us,
         );
     }
     // 丢包误杀检测: 已收到 TLS 记录头, 且“到达之间”出现过 ≥150ms 间隔 —— 合法客户端丢段后
@@ -543,6 +547,8 @@ struct Preconnect {
     handle: Option<tokio::task::JoinHandle<()>>,
     rx: Option<tokio::sync::oneshot::Receiver<Option<TcpStream>>>,
     has_connected: Arc<AtomicBool>,
+    fire_us: Arc<AtomicU64>,
+    ready_us: Arc<AtomicU64>,
 }
 
 impl Preconnect {
@@ -551,13 +557,21 @@ impl Preconnect {
             handle: None,
             rx: None,
             has_connected: Arc::new(AtomicBool::new(false)),
+            fire_us: Arc::new(AtomicU64::new(0)),
+            ready_us: Arc::new(AtomicU64::new(0)),
         }
     }
     fn armed(&self) -> bool {
         self.rx.is_some()
     }
     fn was_connected(&self) -> bool {
-        self.has_connected.load(Ordering::Relaxed)
+        self.has_connected.load(Ordering::Acquire)
+    }
+    fn fire_us(&self) -> u64 {
+        self.fire_us.load(Ordering::Relaxed)
+    }
+    fn ready_us(&self) -> u64 {
+        self.ready_us.load(Ordering::Acquire)
     }
     /// 预算不足 → 禁用 (只损失对齐, 不影响可用性: 判定时退回按需即时建连)。
     fn arm(delay: Duration, host: &str, cam_rtt: &Arc<CamouflageRtt>) -> Self {
@@ -569,19 +583,26 @@ impl Preconnect {
         let rtt = cam_rtt.clone();
         let has_connected = Arc::new(AtomicBool::new(false));
         let hc = has_connected.clone();
+        let fire_us = Arc::new(AtomicU64::new(0));
+        let fu = fire_us.clone();
+        let ready_us = Arc::new(AtomicU64::new(0));
+        let ru = ready_us.clone();
+        let t_arm = Instant::now();
         let handle = tokio::spawn(async move {
             let _permit = permit; // 持到任务结束 (含 abort) → 在途数有界
             tokio::time::sleep(delay).await;
+            fu.store(t_arm.elapsed().as_micros() as u64, Ordering::Relaxed);
             if !preconnect_rate_ok() {
                 return;
             }
             let sock = camouflage::connect_camouflage(&host, &rtt).await;
             if sock.is_some() {
-                hc.store(true, Ordering::Relaxed);
+                ru.store(t_arm.elapsed().as_micros() as u64, Ordering::Release);
+                hc.store(true, Ordering::Release);
             }
             let _ = tx.send(sock); // 接收端已 drop → socket 随之关闭, 不泄漏到伪装站
         });
-        Self { handle: Some(handle), rx: Some(rx), has_connected }
+        Self { handle: Some(handle), rx: Some(rx), has_connected, fire_us, ready_us }
     }
     /// 判定为异常时取用预连连接: 已 armed 则等它就绪 (有界), 否则 None (调用方按需建连)。
     async fn take_socket(&mut self) -> Option<TcpStream> {
@@ -782,9 +803,11 @@ where
                 bytes.len()
             );
             let armed = pre.armed();
+            let fire_us = pre.fire_us();
             let sock = pre.take_socket().await;
             let used = sock.is_some();
             let connected = pre.was_connected();
+            let ready_us = if connected { pre.ready_us() } else { 0 };
             log_ch_guard(
                 "fallback",
                 None,
@@ -795,12 +818,18 @@ where
                 preconnect_status(armed, used, connected),
                 cam_rtt,
                 0,
+                fire_us,
+                ready_us,
             );
             reflect_to_camouflage(stream, peer_addr, &bytes, camouflage_host, cam_rtt, sock).await;
             return None;
         }
         ClientHelloReadResult::Close => {
             // 对端在发送任何字节前就 EOF/报错关闭, 连接已死直接退出 (pre drop → 定时器 abort)
+            let armed = pre.armed();
+            let connected = pre.was_connected();
+            let fire_us = pre.fire_us();
+            let ready_us = if connected { pre.ready_us() } else { 0 };
             log_ch_guard(
                 "close",
                 None,
@@ -808,9 +837,11 @@ where
                 &timing,
                 judge,
                 client_rtt,
-                preconnect_status(pre.armed(), false, pre.was_connected()),
+                preconnect_status(armed, false, connected),
                 cam_rtt,
                 0,
+                fire_us,
+                ready_us,
             );
             return None;
         }
@@ -854,8 +885,11 @@ where
     if !authenticated {
         warn!("Mirage Server auth failed from {}", peer_addr);
         // 完整 CH 但认证失败: 若预连已经连好则直接用; 若仍在延时中则不白等 (即时建连 preconnect=0, 采样 F 并消除人为附加延迟)
+        let fire_us = pre.fire_us();
         let sock = pre.take_ready_socket();
         let used = sock.is_some();
+        let connected = pre.was_connected();
+        let ready_us = if connected { pre.ready_us() } else { 0 };
         if !used {
             drop(pre);
         }
@@ -869,6 +903,8 @@ where
             if used { "1" } else { "0" },
             cam_rtt,
             0,
+            fire_us,
+            ready_us,
         );
         reflect_to_camouflage(stream, peer_addr, &client_hello, camouflage_host, cam_rtt, sock).await;
         return None;
@@ -878,6 +914,8 @@ where
     // 开销"的落点 —— 绝大多数连接在预连触发前就读完了, 从未向伪装站发出过连接。
     let was_armed = pre.armed();
     let was_connected = pre.was_connected();
+    let fire_us = pre.fire_us();
+    let ready_us = if was_connected { pre.ready_us() } else { 0 };
     drop(pre);
 
     let mult_x10 = AUTH_MULT_X10.load(Ordering::Relaxed);
@@ -901,6 +939,8 @@ where
         preconnect_status(was_armed, false, was_connected),
         cam_rtt,
         inj_us,
+        fire_us,
+        ready_us,
     );
 
     // PFS: 生成服务端一次性 X25519 对。公钥注入回放模板的 ServerHello.random 发给客户端,

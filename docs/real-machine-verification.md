@@ -236,7 +236,16 @@ n = 20，单位 ms。auth-fail 取 `probe_close_timing --modes badauth` 的 `fir
    `preconnect_min_ms` 50~100 与削弱 RTT 项（如 `clamp(RTT, 50, 300)`）对比，预期 empty 偏差 → ~0.25s，
    代价是丢包重传的慢合法连接会多触发一条预连（该连接认证成功即关，成本有界）。
 
-#### A3.4 Phase-3 ① 预连收紧 A/B/C 实测收益与损耗分析（S1 / S2 / S3，2026-10-09，通过 ✅）
+#### A3.4 Phase-3 ① 预连收紧 A/B/C 实测收益与损耗分析（S1 / S2 / S3，2026-10-09，**待 Phase-4 复测定档** ⚠️）
+
+> ⚠️ **强度限定（2026-10-10 复核）**：本节结论**不可直接用作定档依据**，原因见
+> [`docs/phase3-real-machine-verification-report.md`](phase3-real-machine-verification-report.md) §5 勘误 E1–E6：
+> ① `Δ = ① + cam_rtt + (cam_idle − baseline_idle)` —— baseline（客户端→真站）与转发路径（VPS→真站）**不同源**，
+> 会混入 CDN 边缘空闲超时差异（S3 实测 Δ 为**负**即此因）；
+> ② 每格 n=5、baseline 跨轮跨度达 656ms，而档位间差异仅几十 ms ⇒ **排序不具统计意义**；
+> ③ “2b=0 零损耗”与机制矛盾（① ≤ 200ms < gap 300ms 本该建连），且 `0/5` 的 95% 上界约 45%。
+> ⇒ **定档待 [`docs/plan-phase4-verification.md`](plan-phase4-verification.md) T1′（同源 baseline + n≥20 + 中位数 CI）与 T2′ 完成**；
+> 在那之前默认档保持 `2×, 100~500ms`。下列原始数据供参考。
 
 详见 [`docs/phase3-real-machine-verification-report.md`](phase3-real-machine-verification-report.md)。对比 A 档（1×RTT, 50~150ms）、B 档（1×RTT, 50~200ms）与 C 档（2×RTT, 50~500ms 基线默认）：
 

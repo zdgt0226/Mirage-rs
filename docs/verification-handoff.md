@@ -102,6 +102,21 @@ cargo test --release aes_chacha_throughput_ratio_sentinel -- --ignored --nocaptu
 - **I15** 三种探测形态的**绝对关闭时间**与真站对齐（空连接 ≈ ①，半截残留 ≈ ②）。
 - **I16** ①/② 取值是否覆盖真实链路（合法 ClientHello 到达分布 / 重传退避）—— 靠 A3 的 `[CH-GUARD]` 度量。
 - **I17** 真站在“收到数据”时是否重置空闲计时（决定半截场景的残余偏差是 ① 还是 ②）—— 靠 A1。
+  【已实测：Fastly **会重置** ⇒ 半截残留 = ② + cam_RTT】
+
+**Phase-3 追加（2026-10-10）**——自校准与反向免疫带来的新不变量：
+
+| # | 不变量 | 代码位置 | 锁定它的方式 |
+|---|---|---|---|
+| I18 | 伪装站**建连失败时必须归零** `cam_rtt` 与 F（否则 auth-succ 会比 auth-fail 慢） | `camouflage_rtt.rs::observe_connect_failure` | `camouflage_rtt::tests`（EWMA 归零用例） |
+| I19 | `cam_rtt_us == 0 ⇒ 注入 0`（不进静态 offset） | `handshake.rs::injection_base_us` | `handshake::tests::injection_base_selection` |
+| I20 | auto 开且有 F 样本 → 注入 = `fail_us`；否则静态公式兜底 | 同上 | 同上 |
+| I21 | `2a`（arm 后 abort，0 连接）与 `2b`（已建连后丢弃，1 连接）必须可区分 | `handshake.rs::preconnect_status` + `Preconnect::was_connected` | `[CH-GUARD] preconnect=2a/2b` 度量（真机） |
+| I22 | `[CH-GUARD]` 必须同时输出 `fail_us=` 与 `inj_us=`（否则自校准无法在服务端验证） | `handshake.rs::log_ch_guard` | 真机日志核对（`fail_us == inj_us`） |
+
+> ⚠️ **接手方必读**：`docs/plan-phase4-verification.md` §0 列了 Phase-3 数据里**四条尚未自洽的点**
+> （Δ 混入 CDN 边缘空闲超时 / `2b=0` 归因不自洽 / 统计功效不足 / T3 的 CI 是弱判据）。
+> 引用 Phase-3 结论时**不得**把“B 档 +31ms 卓越收敛”“零上游连接损耗”当作已确立事实。
 
 ---
 
@@ -197,6 +212,8 @@ MIRAGE_CH_MEASURE=1 <server 启动命令>
 | 2026-10-06 | v0.15.2 + 延迟预连 | 初始实现方 | ✅ 0 | ✅ 0 | ✅ 516/0/3 | ✅ 0 | tools + 度量同批 |
 | 2026-10-06 | 对齐/容错分离 | 实现方 | ✅ 0 | ✅ 0 | ✅ 521/0/3 | ✅ 0 | 预连 + 判定期限 + 可观测性 |
 | 2026-10-06 | v0.15.2 / ec4a4c5 + 工作区 (随本提交) | Antigravity AI | ✅ 0 | ✅ 0 | ✅ 516/0/3 | ✅ 0 | 零成本门禁全绿 + I1~I9全过 |
+| 2026-10-09 | `9fd42d8` + `a189030` | 实机操作者 | ✅ 0 | — | ✅ 525/0/3 | — | Phase-3 三节点实机；报告 `docs/phase3-real-machine-verification-report.md`（含勘误 E1~E7） |
+| 2026-10-10 | `cfb1721` + 文档回写 | 本会话 | ✅ 0 | — | ✅ 525/0/3 | — | 补 CHANGELOG / 协议文档回写 / README 字段名 / 本文件 I18~I22；新建 Phase-4 复测计划 |
 
 ---
 
@@ -252,8 +269,11 @@ MIRAGE_CH_MEASURE=1 <server 启动命令>
 | `src/config.rs` | `TuningConfig::client_hello_guard` + 语义校验 |
 | `src/startup.rs` | 启动时应用三个时钟（含 env 覆盖） |
 | `examples/probe_close_timing.rs` | A1/A2 采集工具（**新增**） |
-| `docs/real-machine-verification.md` | 真机验证任务列表（**新增**） |
+| `docs/real-machine-verification.md` | 真机验证任务列表（A1–A3 + 变更记录） |
 | `docs/active-probing-assessment-2026-10.md` | 动因 + P1 实施状态 |
+| `docs/phase3-real-machine-verification-report.md` | Phase-3 三节点实机报告（**含§5 勘误 E1~E7**） |
+| `docs/plan-phase4-verification.md` | **Phase-4 复测计划**（同源 baseline / 2b 归因 / 自校准复核） |
+| `src/proxy/mirage_server/camouflage_rtt.rs` | `observe_fail_forward`（F 的 EWMA）与 `observe_connect_failure`（失败归零） |
 
 ### 7.2 常用命令
 
@@ -286,6 +306,11 @@ MIRAGE_CH_MEASURE=1 <server>
 | `cam_RTT` | 服务器 → 伪装站的 RTT（EWMA），用于 auth-succ 时序对齐 |
 | `[CH-GUARD]` | A3 度量行（env 门控，默认关）；含 Fallback 样本，可数“丢包误杀” |
 | T2/T3 | 真站 idle 超时对齐（空连接 / 半截）；本次改动的主验收目标 |
+| `fail_us` | 服务端实测的 auth-fail 全程耗时 F（EWMA，仅在 `preconnect==0` 采样）——自校准的注入基准 |
+| `inj_us` | 本条连接实际使用的注入基准（auto 时为 `fail_us`，否则静态公式） |
+| `preconnect=1/2a/2b` | 1=用了预连；2a=armed 后 abort（**0** 上游连接）；2b=已建连后丢弃（**1** 上游连接） |
+| `auto_calibrate` | `tuning.client_hello_guard.auto_calibrate`（默认 false）；开则注入=F，否则静态 `2×cam_RTT+offset` |
+| Phase-3 未自洽点 | 见 `plan-phase4-verification.md` §0：Δ 混入边缘 idle 差 / 2b 归因 / 统计功效 / T3 的 CI 弱判据 |
 
 ---
 
