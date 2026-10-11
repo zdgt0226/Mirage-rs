@@ -195,7 +195,10 @@
     "judge_silence_ms": 1000,      // ② 必须 > TCP 重传退避 (RTO≥200ms, 退避可达 800ms+)
     "hard_deadline_ms": 5000,      // ③ slowloris 总兜底
     "auth_succ_mult_x10": 20,      // auth-succ 注入 = (20/10 × cam_RTT + offset) × jitter → 2.0×
-    "auth_succ_offset_ms": 100     // 伪装站/CDN 处理底限 P (实测定档, 与 RTT 无关)
+    "auth_succ_offset_ms": 100,    // 伪装站/CDN 处理底限 P (实测定档, 与 RTT 无关)
+                                   //   **仅 auto_calibrate=false 时生效**
+    "auto_calibrate": false        // true: 用实测 F(EWMA) 取代静态公式;
+                                   //   冷启动(尚无 F 样本)用纯倍率, 不加 offset
   }
 }
 ```
@@ -230,4 +233,5 @@ cargo clippy --all-targets -- -D warnings && bash scripts/check-no-real-endpoint
 |---|---|---|
 | Phase-1/2 | `docs/real-machine-verification.md` A1–A3 | 关闭时间对齐达标；`P` 非全局常量（两节点 CI 不相交）⇒ 需要自校准 |
 | Phase-3（三节点） | `docs/phase3-real-machine-verification-report.md` | ② 保持 1000ms（500ms 证伪）；反向不对称免疫验收；自校准机制验收（`fail_us == inj_us`） |
-| **Phase-4（待执行）** | `docs/plan-phase4-verification.md` | 同源 baseline 下重定 ① 档；`2b` 归因重测；自校准逐条复核 |
+| **Phase-4（已执行）** | `docs/phase4-real-machine-verification-report.md` | 同源 baseline 确立（三节点 idle 61.0~61.2s，极差 146ms）；`2b` 归因定案（gap ≥ 750ms 时 95~100%，**Phase-3 的 `2b=0` 被推翻**）；自校准逐条复核 auto 占比 100%、Δp50 11.5~39ms；定档 Tier B（理由=机制上界+不劣性，见报告 §4.3/§8） |
+| **Phase-5（待办）** | 报告 §8.1 | Tier A S1 行复测；`Δ ≈ pc_ready_us` 同连接对齐核对；baseline/转发的解析 IP 一致性 |

@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### fix(anti-probing): 冷启动注入虚高 + 降级态可观测 + Phase-4 报告归因勘误 (2026-10-11)
+
+- **冷启动不再叠加 `offset`**（`injection_base_us`）: `auto_calibrate` 开启但尚无 F 样本时，注入从
+  `2×cam_RTT + offset` 改为**纯倍率** `2×cam_RTT`。依据：实测 `F ≈ 2×cam_RTT + P` 且 `P ≪ offset`
+  （静态偏置是按某一节点定档的），叠加会凭空引入 ~100ms 虚高。`offset` 自此**只在
+  `auto_calibrate=false` 时生效**（含单测）。
+- **出站边缘可观测**（`camouflage.rs`）: 伪装站连接落到的边缘 IP **变更时打印**（`伪装站出站边缘: <ip>`）。
+  同源 baseline 复核时，baseline 探针与转发连接必须落同一 IP，否则 `Δ = T_mirage − B_srv` 会混入
+  “不同 CDN 边缘的空闲超时差”（Phase-4 的残差 `K` ≈ 300~600ms 疑因此）。
+- **降级态启动提示**（`startup.rs`）: `auto_calibrate=false` 时启动 **WARNING**（静态 `P` 换节点/换伪装站
+  后会残留）；auto 开启时打印“有 F→F；冷启动→纯倍率”的语义。
+- **Phase-4 报告勘误 E8–E12**（`docs/phase4-real-machine-verification-report.md` §8）:
+  “B 比 C 优化 41%”归因撤销（三档实测的**客户端 RTT 并不同**，且 `Δ_C−Δ_B` ≫ `①_C−①_B`），
+  定档理由改为**机制上界收紧 + 实测不劣性**；`ch_read_us` 列与 Tier A S1 行标记待核/待复测；
+  因果硬门改述为 `T_ready < gap_actual`；新增“同连接对齐（`Δ ≈ pc_ready_us`）”复测口径。
+- **修 CI 门禁**（`examples/probe_close_timing.rs`）: Phase-4 追加参数/缩进后 `clippy --all-targets -D warnings`
+  变红（`too_many_arguments` / `doc_overindented_list_items`），已修复。
+- 待复测（代码默认值**暂不翻转**）: Tier A S1 行复测、`Δ ≈ pc_ready_us` 同连接核对、解析 IP 一致性。
+- **新增复测规范与分析器**: `docs/plan-phase5-verification.md`（判据预注册：同会话交替、baseline 同边缘 IP、`rtt_us==0 ⇒ ① 取上限` 的分支说明）+ `scripts/phase5-analyze.sh`
+  （只读日志，输出中位数/IQR/Wilson/中位数 bootstrap 与 PASS/WEAK/FAIL；含空列表与条数不一致守卫，mawk 兼容）。
+
 ### feat(anti-probing): Phase-3 三节点实测闭环 —— 自校准验收 / 反向不对称免疫 (2026-10-10)
 
 - **反向不对称免疫**（`9fd42d8`）: 新增 `CamouflageRtt::observe_connect_failure()`——建连彻底失败时

@@ -9,7 +9,7 @@
 //! - `partial`  只发真实 ClientHello 的前 N 字节就停 (半截)。
 //! - `badauth`  发**完整** ClientHello 但 session_id 为随机 token (认证必失败 → 转发真站)。
 //! - `authsucc` 发**完整合法** ClientHello (认证通过 → 模板回放)。与 badauth 走完全相同的
-//!              首字节读取测量循环 (严格消除客户端协议栈多算的 Fake Tail/TIME_SYNC 往返)。
+//!   首字节读取测量循环 (严格消除客户端协议栈多算的 Fake Tail/TIME_SYNC 往返)。
 //!
 //! 用法 (真机):
 //! ```text
@@ -85,6 +85,7 @@ impl Sample {
 }
 
 /// 一次探测: 建连 → 按形态发送 → 读到 EOF/超时, 记录首字节与关闭时刻。
+#[allow(clippy::too_many_arguments)] // 测试工具, 参数直白优于再包一层结构体
 async fn probe_one(
     target: &str,
     mode: Mode,

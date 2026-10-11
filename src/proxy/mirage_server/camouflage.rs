@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::CamouflageRtt;
 
@@ -69,6 +69,7 @@ pub(super) async fn connect_camouflage(
             Ok(Ok(s)) => {
                 // 只测 TCP connect (解析在计时之外) → RTT 样本纯净。
                 cam_rtt.observe_connect(t0.elapsed());
+                log_cam_edge(sa.ip());
                 return Some(s);
             }
             Ok(Err(e)) => debug!("camouflage connect {sa} failed: {e}"),
@@ -78,6 +79,23 @@ pub(super) async fn connect_camouflage(
     warn!("camouflage_host `{h}` 所有候选均未能建连 (预算 {CONNECT_TOTAL_TIMEOUT:?})");
     cam_rtt.observe_connect_failure();
     None
+}
+
+/// 记录出站伪装站连接**实际落到的边缘 IP**, 仅在变更时打印一次。
+///
+/// 用途: 同源 baseline 口径核对 —— 转发连接与"服务端本机直连伪装站"的 baseline 探针
+/// **必须落在同一 IP/边缘**, 否则实测 `Δ = T_mirage − B_srv` 会混入"不同 CDN 边缘的空闲超时差",
+/// 使 `Δ ≈ ① + cam_RTT` 的模型核对失效 (见 `docs/phase4-real-machine-verification-report.md` §8)。
+fn log_cam_edge(ip: IpAddr) {
+    static LAST: std::sync::Mutex<Option<IpAddr>> = std::sync::Mutex::new(None);
+    let mut last = match LAST.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if *last != Some(ip) {
+        info!("伪装站出站边缘: {ip} (变更时打印; 与同源 baseline 探针比对需同一 IP)");
+        *last = Some(ip);
+    }
 }
 
 /// 尝试用一条 camouflage 连接转发探针握手. 成功发出 client_hello (证明连接活着)

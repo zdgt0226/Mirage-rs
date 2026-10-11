@@ -117,6 +117,10 @@ cargo test --release aes_chacha_throughput_ratio_sentinel -- --ignored --nocaptu
 > ⚠️ **接手方必读**：`docs/plan-phase4-verification.md` §0 列了 Phase-3 数据里**四条尚未自洽的点**
 > （Δ 混入 CDN 边缘空闲超时 / `2b=0` 归因不自洽 / 统计功效不足 / T3 的 CI 是弱判据）。
 > 引用 Phase-3 结论时**不得**把“B 档 +31ms 卓越收敛”“零上游连接损耗”当作已确立事实。
+>
+> ⚠️ **引用 Phase-4 时**：`docs/phase4-real-machine-verification-report.md` §8 已撤销“B 比 C 优化 41%”的
+> 归因（三档实测的客户端 RTT 不同，`Δ_C−Δ_B` ≫ `①_C−①_B`）；Tier A S1 行与 `ch_read_us` 列标注待核/待复测。
+> 定档 Tier B 的依据仅为**机制上界 + 实测不劣性**；复测按 `docs/plan-phase5-verification.md`（判据已预注册）。
 
 ---
 
@@ -273,6 +277,9 @@ MIRAGE_CH_MEASURE=1 <server 启动命令>
 | `docs/active-probing-assessment-2026-10.md` | 动因 + P1 实施状态 |
 | `docs/phase3-real-machine-verification-report.md` | Phase-3 三节点实机报告（**含§5 勘误 E1~E7**） |
 | `docs/plan-phase4-verification.md` | **Phase-4 复测计划**（同源 baseline / 2b 归因 / 自校准复核） |
+| `docs/phase4-real-machine-verification-report.md` | Phase-4 三节点实机报告（**含§8 勘误 E8~E12 与待复测项**） |
+| `docs/plan-phase5-verification.md` | **Phase-5 复测规范**（判据预注册；同会话交替 / baseline 同边缘 IP / `rtt_us==0 ⇒ ① 取上限`） |
+| `scripts/phase5-analyze.sh` | Phase-5 只读分析器（中位数/IQR/Wilson/中位数 bootstrap；输出 PASS/WEAK/FAIL） |
 | `src/proxy/mirage_server/camouflage_rtt.rs` | `observe_fail_forward`（F 的 EWMA）与 `observe_connect_failure`（失败归零） |
 
 ### 7.2 常用命令

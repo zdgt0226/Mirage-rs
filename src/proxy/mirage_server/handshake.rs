@@ -372,7 +372,10 @@ pub(crate) fn auth_succ_delay_us(mult_x10: u32, offset_us: u64, cam_rtt_us: u64)
 /// 选 auth-succ 注入基准 (微秒, 未含抖动):
 /// 1. 伪装站未连通 / 不可达 (cam_rtt_us == 0): 恒为 0 (避免反向不对称);
 /// 2. auto_calibrate 开启且已有 F 样本: 采用实测的 F(EWMA);
-/// 3. 否则回落静态公式: (mult_x10/10 × cam_RTT) + offset。
+/// 3. auto_calibrate 开启但尚无 F 样本 (冷启动): 纯倍率 `mult×cam_RTT`, **不叠加固定 offset**
+///    —— 实测 `F ≈ 2×cam_RTT + P` 且 `P` 远小于 offset, 叠加会凭空引入 ~100ms 虚高
+///    (见 `docs/phase4-real-machine-verification-report.md` §8);
+/// 4. auto_calibrate 关闭: 静态公式 `(mult_x10/10 × cam_RTT) + offset` (此时 `offset` 才生效)。
 pub(crate) fn injection_base_us(
     auto_calibrate: bool,
     fail_us: u64,
@@ -383,8 +386,12 @@ pub(crate) fn injection_base_us(
     if cam_rtt_us == 0 {
         return 0;
     }
-    if auto_calibrate && fail_us > 0 {
-        return fail_us;
+    if auto_calibrate {
+        return if fail_us > 0 {
+            fail_us
+        } else {
+            auth_succ_delay_us(mult_x10, 0, cam_rtt_us)
+        };
     }
     auth_succ_delay_us(mult_x10, offset_us, cam_rtt_us)
 }
@@ -1603,9 +1610,10 @@ mod tests {
     fn test_injection_base_selection() {
         // 1. auto 开且已有 F 样本 → 采用实测的 F(EWMA)
         assert_eq!(injection_base_us(true, 460_000, 20, 100_000, 180_000), 460_000);
-        // 2. auto 开但无 F 样本 (冷启动) → 静态公式兜底
-        assert_eq!(injection_base_us(true, 0, 20, 100_000, 180_000), 460_000);
-        // 3. auto 关 → 静态公式 (即使已有 F)
+        // 2. auto 开但无 F 样本 (冷启动) → **纯倍率**, 忽略 offset (实测 P ≪ offset, 叠加即虚高)
+        assert_eq!(injection_base_us(true, 0, 20, 100_000, 180_000), 360_000);
+        assert_eq!(injection_base_us(true, 0, 20, 999_000, 180_000), 360_000);
+        // 3. auto 关 → 静态公式 (即使已有 F), offset 生效
         assert_eq!(injection_base_us(false, 460_000, 20, 100_000, 180_000), 460_000);
         // 4. 关键安全守卫: 伪装站不可达 (cam_rtt_us == 0) → 恒为 0 (绝不注入, 避免反向时延不对称)
         assert_eq!(injection_base_us(true, 460_000, 20, 100_000, 0), 0);

@@ -167,6 +167,23 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                      auth-succ 注入 {}.{}×cam_RTT+{}ms · 自校准={} (MIRAGE_CH_* 可覆盖)",
                     m, lo, hi, j, h, am / 10, am % 10, ao, if ac { "on" } else { "off" }
                 );
+                if ac {
+                    info!(
+                        "自校准已开: 有 F 样本→注入 F; 冷启动(尚无 F 样本)→纯倍率 {}.{}×cam_RTT, 不加 offset",
+                        am / 10,
+                        am % 10
+                    );
+                } else {
+                    warn!(
+                        "ClientHello 守卫未启用自校准 (auto_calibrate=false): auth-succ 注入用静态公式 \
+                         {}.{}×cam_RTT+{}ms。其固定偏置 P 是按某一伪装站实测定档的, 换节点/换伪装站后 \
+                         Δ 会残留该节点的 P 偏差 (两节点 P 的 95% CI 实测不相交) → 建议开 \
+                         tuning.client_hello_guard.auto_calibrate 或 MIRAGE_CH_AUTO_CALIBRATE=1。",
+                        am / 10,
+                        am % 10,
+                        ao
+                    );
+                }
             }
             if let Some(tuning) = config.tuning {
                 // 服务端 cipher agility 开关 (设进全局, control.rs 读)。

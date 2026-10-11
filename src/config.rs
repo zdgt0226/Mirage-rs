@@ -1311,6 +1311,9 @@ pub struct ClientHelloGuardConfig {
     /// 与 RTT 无关: 证书检索/CPU 处理/回源转发)。只注入 `2×cam_RTT` 时 auth-succ 比 auth-fail
     /// **快 118~125ms** (S1/S2, n=20); 加 +100ms 偏置后 S2 均值差收敛到 −36ms。实测还显示纯倍率
     /// (2.5×/2.7×) 在小 RTT 下补不足、大 RTT 下过冲, 因此用"倍率 + 固定偏置"而非单纯加大倍率。
+    ///
+    /// **仅当 `auto_calibrate = false` 时生效**。auto 开时: 有 F 样本用 F; 冷启动用纯倍率
+    /// (不加 offset —— 实测 `P ≪ offset`, 叠加会造成 ~100ms 虚高)。
     #[serde(default = "default_auth_succ_offset_ms")]
     pub auth_succ_offset_ms: u64,
     /// 自校准: 用实测的 auth-fail 全程耗时 F 的 EWMA 作为 auth-succ 注入基准（取代静态
