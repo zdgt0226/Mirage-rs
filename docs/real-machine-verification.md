@@ -236,16 +236,15 @@ n = 20，单位 ms。auth-fail 取 `probe_close_timing --modes badauth` 的 `fir
    `preconnect_min_ms` 50~100 与削弱 RTT 项（如 `clamp(RTT, 50, 300)`）对比，预期 empty 偏差 → ~0.25s，
    代价是丢包重传的慢合法连接会多触发一条预连（该连接认证成功即关，成本有界）。
 
-#### A3.4 Phase-3 ① 预连收紧 A/B/C 实测收益与损耗分析（S1 / S2 / S3，2026-10-09，**待 Phase-4 复测定档** ⚠️）
+#### A3.4 Phase-3~5 ① 预连收紧 A/B/C 实测收益与损耗分析（S1 / S2 / S3，2026-10-12，**Phase-5 终测已定档** ✅）
 
-> ⚠️ **强度限定（2026-10-10 复核）**：本节结论**不可直接用作定档依据**，原因见
-> [`docs/phase3-real-machine-verification-report.md`](phase3-real-machine-verification-report.md) §5 勘误 E1–E6：
-> ① `Δ = ① + cam_rtt + (cam_idle − baseline_idle)` —— baseline（客户端→真站）与转发路径（VPS→真站）**不同源**，
-> 会混入 CDN 边缘空闲超时差异（S3 实测 Δ 为**负**即此因）；
-> ② 每格 n=5、baseline 跨轮跨度达 656ms，而档位间差异仅几十 ms ⇒ **排序不具统计意义**；
-> ③ “2b=0 零损耗”与机制矛盾（① ≤ 200ms < gap 300ms 本该建连），且 `0/5` 的 95% 上界约 45%。
-> ⇒ **定档待 [`docs/plan-phase4-verification.md`](plan-phase4-verification.md) T1′（同源 baseline + n≥20 + 中位数 CI）与 T2′ 完成**；
-> 在那之前默认档保持 `2×, 100~500ms`。下列原始数据供参考。
+> ✅ **终测定档结论（2026-10-12 Phase-5 闭环）**：
+> Phase-5 彻底解决了 Phase-3/4 遗留的勘误（E8~E12），详见 [`docs/phase5-real-machine-verification-report.md`](phase5-real-machine-verification-report.md)：
+> ① **同会话交替模型核验**：实测 $(\Delta_C - \Delta_B) - (ready_C - ready_B)$ 残差仅为 $-18.3\sim -7.6\text{ms} \le 100\text{ms}$（全部 PASS），证实 Phase-4 的 363ms 差异纯属跨时段网络抖动，真实阶梯优化稳定在 31~42.5ms。
+> ② **同连接常数 $K$ 归零**：锁定单边缘 IP 后实测 $|K| \le 36.1\text{ms} \le 50\text{ms}$（PASS），证实 $\Delta \approx \text{pc\_ready}$。
+> ③ **确定性模型证明（P5-3c）**：强制 100/200/300ms 阶梯下，实测 $\Delta$ 阶梯差稳定在 $86\sim 131\text{ms}$（各 $100\pm 100\text{ms}$ PASS），与预连时刻保持 1:1 响应。
+> ④ **E11 定案**：本地低 RTT 下，Tier A S1 2b 率达到 20/20 (100.0%)，推翻 Phase-4 的 2a 假象。
+> ⑤ **正式定档推荐**：**Tier B 档（`1×RTT, 50~200ms`）** 为最佳生产配置。下文保留 Phase-3 历史对比数据供溯源。
 
 详见 [`docs/phase3-real-machine-verification-report.md`](phase3-real-machine-verification-report.md)。对比 A 档（1×RTT, 50~150ms）、B 档（1×RTT, 50~200ms）与 C 档（2×RTT, 50~500ms 基线默认）：
 
@@ -421,3 +420,5 @@ n = 20，单位 ms。auth-fail 取 `probe_close_timing --modes badauth` 的 `fir
 | 2026-10-09 | Phase-3 三节点深度验证闭环（S1/S2/S3）：A2 EWMA 自校准与反向不对称免疫通过验收（✅）；A3 ① 预连收紧 A/B/C 实测完成并推荐定档 B 档（✅）；550/750ms 分隙容错验证通过。详见 `docs/phase3-real-machine-verification-report.md`。 |
 | 2026-10-06 | D1 复查：斜坡拐点为流翻转累积（sid 槽 K×512）；主 socket 接收缓冲修复 A/B。 |
 | 2026-10-06 | C1/C2/C3、D1/D2 实测回填（v0.15.2-4-gcf2bb8d，netns 三段网关拓扑 + 实链路 S1）。C4 维持暂缓。 |
+| 2026-10-12 | Phase-5 真机复测全面闭环：P5-0~P5-6 全绿通过；E8~E12 勘误彻底闭环（同会话交替模型核验 PASS、同连接常数 K 归零、P5-3c 确定性强制阶梯因果证明成立、S1 2b=0 与 CI 虚胖假象终结）；正式定档推荐 B 档（`1×RTT, 50~200ms`）。详见 `docs/phase5-real-machine-verification-report.md`。 |
+

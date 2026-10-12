@@ -48,9 +48,9 @@ samples_of() {
 }
 
 # 从日志抽字段（默认全部行；$3 = grep -E 过滤）
-log_field() { grep -E "${3:-.}" "$1" | grep -oE "$2=[0-9-]+" | sed "s/^$2=//" || true; }
+log_field() { grep -aE "${3:-.}" "$1" | grep -aoE "$2=[0-9-]+" | sed "s/^$2=//" || true; }
 # 同上，但字段可为 `2a/2b/1/0` 这类非纯数字
-log_chr()   { grep -E "${3:-.}" "$1" | grep -oE "$2=[0-9a-z-]+" | sed "s/^$2=//" || true; }
+log_chr()   { grep -aE "${3:-.}" "$1" | grep -aoE "$2=[0-9a-z-]+" | sed "s/^$2=//" || true; }
 
 # 中位数 / 四分位（stdin: 一行一个数）
 stats_of() {
@@ -97,8 +97,8 @@ n_of() { printf '%s' "$1" | wc -w | tr -d ' '; }
 
 # 服务端启动日志里的 ① 参数：输出 "mult min_ms max_ms"
 guard_params() {
-  { grep -m1 "ClientHello 守卫" "$1" || true; } |
-    sed -n 's/.*预连 \([0-9]\{1,\}\)×RTT (clamp \([0-9]\{1,\}\)~\([0-9]\{1,\}\)ms).*/\1 \2 \3/p' || true
+  { grep -am1 "ClientHello 守卫" "$1" || true; } |
+    sed -n 's/.*预连 \([0-9]\{1,\}\)×RTT (\(clamp \)\{0,1\}\([0-9]\{1,\}\)~\([0-9]\{1,\}\)ms).*/\1 \3 \4/p' || true
 }
 
 # ── P5-1：同连接常数 K ──────────────────────────────────────────────────────
@@ -243,7 +243,7 @@ cmd_t3() {
   [ $# -eq 2 ] || die "t3 需要 2 个参数"
   local pri="$1" lg="$2"
   local as asn
-  as="$( { grep 'authed=1' "$lg" || true; } | awk '
+  as="$( { grep -a 'authed=1' "$lg" || true; } | awk '
     { inj=""; fail=""
       for (i=1;i<=NF;i++) { if ($i ~ /^inj_us=/)  { split($i,a,"="); inj=a[2] }
                             if ($i ~ /^fail_us=/) { split($i,b,"="); fail=b[2] } }
@@ -254,9 +254,9 @@ cmd_t3() {
 
   # 逐样本成对差（工具打印的"配对样本: +12 -3 ..."行）
   local line
-  line="$(grep -m1 "配对样本:" "$pri" || true)"
+  line="$(grep -am1 "配对样本:" "$pri" || true)"
   [ -n "$line" ] || die "探针输出里找不到 '配对样本:' 行（需 --modes badauth,authsucc --interleave）"
-  printf '%s\n' "$line" | sed 's/.*配对样本: //' | tr ' ' '\n' | sed 's/^+//' | grep -E '^-?[0-9]+$' > "$TMP/dt"
+  printf '%s\n' "$line" | sed 's/.*配对样本: //' | tr ' ' '\n' | sed 's/^+//' | grep -aE '^-?[0-9]+$' > "$TMP/dt"
 
   local n med ci iqr outl
   n="$(wc -l < "$TMP/dt" | tr -d ' ')"
@@ -277,7 +277,7 @@ cmd_t3() {
 cmd_count() {
   [ $# -eq 3 ] || die "count 需要 3 个参数"
   local lg="$1" pat="$2" want="$3"
-  local k; k="$(grep -cE "$pat" "$lg" || true)"
+  local k; k="$(grep -acE "$pat" "$lg" || true)"
   echo "== 计数 =="
   echo "  匹配 '${pat}': ${k} / 期望 ${want}  $(wilson "$k" "$want")"
   [ "$k" = "$want" ] && echo "  → PASS" || echo "  → FAIL (与期望不符)"

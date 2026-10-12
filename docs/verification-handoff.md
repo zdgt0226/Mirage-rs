@@ -317,7 +317,7 @@ MIRAGE_CH_MEASURE=1 <server>
 | `inj_us` | 本条连接实际使用的注入基准（auto 时为 `fail_us`，否则静态公式） |
 | `preconnect=1/2a/2b` | 1=用了预连；2a=armed 后 abort（**0** 上游连接）；2b=已建连后丢弃（**1** 上游连接） |
 | `auto_calibrate` | `tuning.client_hello_guard.auto_calibrate`（默认 false）；开则注入=F，否则静态 `2×cam_RTT+offset` |
-| Phase-3 未自洽点 | 见 `plan-phase4-verification.md` §0：Δ 混入边缘 idle 差 / 2b 归因 / 统计功效 / T3 的 CI 弱判据 |
+| Phase-3/4 未自洽点 | **Phase-5 已全面闭环**（见 `phase5-real-machine-verification-report.md`）：E8~E12 勘误消解、常数 K 归零、P5-3c 阶梯因果证明成立、推荐定档 B 档 |
 
 ---
 

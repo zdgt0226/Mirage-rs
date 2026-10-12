@@ -222,27 +222,24 @@ bash scripts/check-no-real-endpoints.sh
 
 ---
 
-## 6. 结果回填模板（只填代号；原始日志另附）
+## 6. 结果回填模板与实测记录（2026-10-12 / Commit `a0f39a1` / S1、S2、S3）
 
-```markdown
-### Phase-5（执行日期 / 版本 <commit> / 节点 S1、S2、S3）
+完整真机报告详见 [`docs/phase5-real-machine-verification-report.md`](phase5-real-machine-verification-report.md)。
 
-| 项 | 判据 | 实测 | 判定 |
-|---|---|---|---|
-| P5-0 门禁 | 525/0/0 · clippy 0 · gate 0 | | |
-| P5-1 K | `K = [med(close−connect)_mirage − med(pc_ready)] − med(close−connect)_base`，\|K\| ≤50ms | med_base=... med_mirage=... ready=... K=... | |
-| P5-2 边缘 | 变更行数 = 0 | $CAM_IP=... 变更=... | |
-| P5-3a ① 自洽 | ≥95% | 每档: rtt_us=... fire=... 期望=... | |
-| P5-3a E9 | max_gap≈750±100 且 ch_read≥675, 各≥95% | max_gap p50=... ch_read p50=... | |
-| P5-3a 2b | ≥95% (Wilson≥76%) | A/B/C = .../.../... | |
-| P5-3b 模型 | \|(Δ_C−Δ_B)−(ready_C−ready_B)\| ≤100ms | Δ=... ready=... 差=... | |
-| P5-3b 不劣 | Δ_B ≤ Δ_C+50 且 \|Δ_B−Δ_A\| ≤100 | | |
-| P5-3c 对照 | 各 ≈100ms ±100ms | | |
-| P5-4 自校准 | auto≥95% 且 \|median Δ_T\|≤50ms | auto=.../20 Δ_T=... CI=[...] 离群=... | |
-| P5-5 回归 | 20/20 (550/750) | | |
-```
-
-**回填去向**：本文件附录 + `docs/real-machine-verification.md`（A3.4 / A2.4-5 的“待复测”标记）+ 必要时新增 `docs/phase5-real-machine-verification-report.md`。回填时**附上 `scripts/phase5-analyze.sh` 的原始输出**（保证判据与算术可复算）。
+| 项 | 判据 | 实测 (S1 / S2 / S3) | 判定 |
+|---|---|---|:---:|
+| **P5-0 门禁** | 525/0/0 · clippy 0 · gate 0 | 525 pass / 0 fail / clippy 0 warn / gate 0 hit | **PASS** |
+| **P5-1 K** | $\|K\| \le 50\text{ms}$（同连接中位数口径） | S1: -36.1ms / S2: +2.9ms / S3: +20.8ms | **PASS** |
+| **P5-2 边缘** | 变更行数 = 0 | S1: 0 行 / S2: 0 行 / S3: 0 行（全程单 IP 锁定） | **PASS** |
+| **P5-3a ① 自洽** | $\ge 95\%$ | 三节点各档 fire_us 落于 floor 下限，全量 60/60 (100.0%) | **PASS** |
+| **P5-3a E9** | max_gap≈750±100 且 ch_read≥675, 各≥95% | 全节点 ch_read_us≈751ms, max_gap≈751ms (60/60, 100.0%) | **PASS** |
+| **P5-3a 2b** | $\ge 95\%$ (Wilson $\ge 76\%$) | A/B/C 三档均为 20/20 (100.0%, Wilson下界 83.9%) | **PASS** |
+| **P5-3b 模型** | $\|(\Delta_C-\Delta_B)-(ready_C-ready_B)\| \le 100\text{ms}$ | S1: -18.3ms / S2: -7.6ms / S3: -9.5ms | **PASS** |
+| **P5-3b 不劣** | $\Delta_B \le \Delta_C+50$ 且 $\|\Delta_B-\Delta_A\| \le 100$ | S1: PASS / S2: PASS / S3: PASS | **PASS** |
+| **P5-3c 对照** | 各 $\approx 100\text{ms} \pm 100\text{ms}$ | S1: 67.0 / 131.0ms; S2: 90.5 / 115.5ms; S3: 86.0 / 105.5ms | **PASS** |
+| **P5-4 自校准** | auto $\ge 95\%$ 且 $\|\text{median} \Delta_T\| \le 50\text{ms}$ | auto 100%(60/60) · S1: -15.5ms CI=[-29.5,-3.0] / S2: +1.0ms / S3: +1.0ms (离群=0) | **PASS** |
+| **P5-5 回归** | 20/20 (550/750ms) | gap 550ms: 20/20 PASS; gap 750ms: 20/20 PASS (误杀率 0.0%) | **PASS** |
+| **P5-6 清理** | 端口释放且生产端口活跃 | 9444~9449 全解绑，8443 / 443 / 9443 持续正常运行 | **PASS** |
 
 ---
 
