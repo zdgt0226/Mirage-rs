@@ -9,7 +9,7 @@
 >   同量级（都是“到伪装站一个 RTT”），但会把到伪装站的连接量放大到接近入站连接数，与取消预热的
 >   初衷直接冲突。现方案只在“accept 后延迟 `preconnect_delay` 仍未见完整 ClientHello”时才预连，
 >   合法快客户端 **0** 条。详见表与论证见 [`docs/client-hello-timing-design.md`](client-hello-timing-design.md) §7。
-> - **三个时钟**：① `preconnect_delay`（`clamp(2×RTT, 100~500ms)`，负责**对齐**）· ② `judge_silence_ms`
+> - **三个时钟**：① `preconnect_delay`（默认 Tier B：`clamp(1×RTT, 50~200ms)`，负责**对齐**）· ② `judge_silence_ms`
 >   （默认 1000ms，负责**容错**）· ③ `hard_deadline_ms`（默认 5000ms，slowloris 兜底）。
 >   旧实现把 ① 与 ② 合成一个 `2×RTT` 窗口，因为小于 TCP 重传间隔（RTO≥200ms）会**误杀丢段的合法
 >   客户端** —— 这已由 `retransmit_gap_within_judge_is_tolerated` 锁定。

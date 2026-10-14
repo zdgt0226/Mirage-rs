@@ -279,7 +279,9 @@ MIRAGE_CH_MEASURE=1 <server 启动命令>
 | `docs/plan-phase4-verification.md` | **Phase-4 复测计划**（同源 baseline / 2b 归因 / 自校准复核） |
 | `docs/phase4-real-machine-verification-report.md` | Phase-4 三节点实机报告（**含§8 勘误 E8~E12 与待复测项**） |
 | `docs/plan-phase5-verification.md` | **Phase-5 复测规范**（判据预注册；同会话交替 / baseline 同边缘 IP / `rtt_us==0 ⇒ ① 取上限`） |
-| `scripts/phase5-analyze.sh` | Phase-5 只读分析器（中位数/IQR/Wilson/中位数 bootstrap；输出 PASS/WEAK/FAIL） |
+| `docs/phase5-real-machine-verification-report.md` | **Phase-5 真机终测与勘误闭环验证报告**（含 E8~E13 勘误全面闭环、P5-3c 阶梯证明） |
+| `docs/plan-phase6-dns-optimization.md` | **Phase-6 规范与实测回填**（伪装站 DNS 关键路径消除 E13 闭环、生产默认 Tier B 翻转） |
+| `scripts/phase5-analyze.sh` | Phase-5/6 只读分析器（中位数/IQR/Wilson/中位数 bootstrap；输出 PASS/WEAK/FAIL） |
 | `src/proxy/mirage_server/camouflage_rtt.rs` | `observe_fail_forward`（F 的 EWMA）与 `observe_connect_failure`（失败归零） |
 
 ### 7.2 常用命令
@@ -306,7 +308,7 @@ MIRAGE_CH_MEASURE=1 <server>
 
 | 概念 | 一句话 |
 |---|---|
-| ① `preconnect_delay` | 对齐：accept 后多久未见完整 CH 就后台预连伪装站；默认 `clamp(2×RTT, 100ms, 500ms)` |
+| ① `preconnect_delay` | 对齐：accept 后多久未见完整 CH 就后台预连伪装站；默认 Tier B `clamp(1×RTT, 50ms, 200ms)` |
 | ② `judge_silence_ms` | 容错：最后一次数据后静默多久判为探测；默认 1000ms，**必须 > TCP 重传退避** |
 | ③ `hard_deadline_ms` | 5s 总时限，防“滴发”slowloris |
 | 推测性预连 | 早建、不用则关（合法快客户端零预连）；与“常驻预热池”是两回事 |
@@ -316,8 +318,8 @@ MIRAGE_CH_MEASURE=1 <server>
 | `fail_us` | 服务端实测的 auth-fail 全程耗时 F（EWMA，仅在 `preconnect==0` 采样）——自校准的注入基准 |
 | `inj_us` | 本条连接实际使用的注入基准（auto 时为 `fail_us`，否则静态公式） |
 | `preconnect=1/2a/2b` | 1=用了预连；2a=armed 后 abort（**0** 上游连接）；2b=已建连后丢弃（**1** 上游连接） |
-| `auto_calibrate` | `tuning.client_hello_guard.auto_calibrate`（默认 false）；开则注入=F，否则静态 `2×cam_RTT+offset` |
-| Phase-3/4 未自洽点 | **Phase-5 已全面闭环**（见 `phase5-real-machine-verification-report.md`）：E8~E12 勘误消解、常数 K 归零、P5-3c 阶梯因果证明成立、推荐定档 B 档 |
+| `auto_calibrate` | `tuning.client_hello_guard.auto_calibrate`（默认 true）；开则注入=F，否则静态 `2×cam_RTT+offset` |
+| Phase-3/4/5/6 闭环 | **Phase-5/6 已全面闭环**：E8~E13 勘误全部消解、常数 K 归零（|K|≤50ms）、DNS 耗时归零（≤21µs）、生产默认翻转为 Tier B 与 auto_calibrate=true |
 
 ---
 

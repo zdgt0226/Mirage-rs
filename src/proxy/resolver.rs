@@ -20,9 +20,15 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::warn;
 
 const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 保活刷新失败时, 旧 IP 最长可继续用的时长 (此后不再延长, 避免域名 IP 已漂移仍长期生效)。
+const DNS_STALE_CAP: Duration = Duration::from_secs(3600);
+/// 保活首次解析的等待上限。正常 3~153ms; 解析器挂死时不至于把启动拖过久
+/// (之后 prewarm 本就有 5s 上限, 两者叠起来要可控)。
+const KEEP_WARM_FIRST_WAIT: Duration = Duration::from_secs(2);
 /// 缓存容量上限. 超过时清理过期项; 仍超过则整体清空 (粗暴但有界, 家用/网关
 /// 域名基数不会持续爆这个数).
 const CACHE_MAX_ENTRIES: usize = 8192;
@@ -52,6 +58,8 @@ fn tcp_resolver() -> Option<SocketAddr> {
 struct CacheEntry {
     ips: Vec<IpAddr>,
     expiry: Instant,
+    /// 最近一次**成功解析**的时刻。仅用于保活刷新失败时判断还能容忍多久的陈旧。
+    resolved_at: Instant,
 }
 
 fn dns_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
@@ -65,22 +73,43 @@ fn dns_semaphore() -> &'static tokio::sync::Semaphore {
 }
 
 /// 解析 host → Vec<IpAddr>, 命中缓存则 0 网络开销. 返回的 Vec 已经 IPv4 优先排序.
-/// 解析 host → Vec<IpAddr>, 命中缓存则 0 网络开销. 返回的 Vec 已经 IPv4 优先排序.
-///
-/// `pub(crate)`: 伪装站转发路径 (`mirage_server::camouflage`) 也走这里 —— 拿缓存解析 + 尊重
-/// `tuning.dns_tcp_resolver`, 并把 DNS 耗时排在计时之外 (RTT 样本只含 TCP connect).
-pub(crate) async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
-    // 1. 查缓存
-    if let Ok(cache) = dns_cache().lock() {
-        if let Some(entry) = cache.get(host) {
-            if entry.expiry > Instant::now() {
-                return Ok(entry.ips.clone());
-            }
-        }
-    }
+/// 保活刷新间隔 = `TTL × [0.65, 0.85]`（**必须 < TTL**, 才能在上次条目过期前刷完）。
+/// 抖动是刻意的: 固定周期的 DNS 心跳本身就是可观测的时序指纹（本项目主题是反指纹）。
+fn keep_warm_interval() -> Duration {
+    use rand::RngExt;
+    DNS_CACHE_TTL.mul_f64(rand::rng().random_range(0.65..0.85))
+}
 
-    // 2. miss / 过期 → 解析. 先拿信号量封顶并发, 防洪泛打满阻塞池. permit 解析完即释放.
-    //    配了 dns_tcp_resolver 则走 DNS-over-TCP (UDP 被封的 VPS 用); 否则系统 getaddrinfo.
+/// 刷新失败时延长旧条目的有效期。返回新的 expiry; `None` = 已超 `DNS_STALE_CAP`, 不再延长。
+/// 抽成纯函数便于单测（不碰全局缓存）。
+fn stale_extended_expiry(now: Instant, resolved_at: Instant, current_expiry: Instant) -> Option<Instant> {
+    if now.saturating_duration_since(resolved_at) >= DNS_STALE_CAP {
+        return None;
+    }
+    Some((now + DNS_CACHE_TTL).max(current_expiry))
+}
+
+/// 缓存里是否有 `host` 的**未过期**条目（供"依赖缓存已热"的动作做前置门禁）。
+pub(crate) fn cache_fresh(host: &str) -> bool {
+    let (h, _) = split_host_port(host).unwrap_or((host, 0));
+    let now = Instant::now();
+    dns_cache()
+        .lock()
+        .map(|c| c.get(h).map(|e| e.expiry > now).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// 伪装站 DNS 保活: 立即解析一次 (await, 有 2s 上限), 之后按 TTL 抖动后台刷新。幂等。
+///
+/// **为什么需要** (见 `docs/phase5-real-machine-verification-report.md` E13): `resolve_cached`
+/// 的 60s TTL 对"连接间隔 > 60s"的场景必然过期 —— `empty` 探测、`badauth` 转发后等真站
+/// idle 关闭、安静服务器的偶发合法连接都是这种。而解析耗时会被算进 `Preconnect` 的就绪时刻
+/// (`pc_ready_us`) 与 auth-fail 的 F ⇒ **真站 idle 计时起点与首字节时延整体后移**, 1:1 传导到
+/// 探测者可观测的关闭时间偏差。实测 S1 解析 ≈153ms（该节点系统解析器慢）、S2/S3 ≈3ms ⇒
+/// S1 的 Δ 从 ~53ms 涨到 ~206ms。保活后两条路径的解析开销恒 ≈0。
+/// 强制发起一次网络解析并写回缓存, 刷新 TTL 与 resolved_at.
+/// 供保活任务 (`keep_warm_dns`) 与缓存穿透使用.
+async fn resolve_fresh(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
     let _permit = dns_semaphore().acquire().await.ok();
     let mut ips: Vec<IpAddr> = match tcp_resolver() {
         Some(upstream) => resolve_via_tcp(host, upstream).await?,
@@ -97,10 +126,8 @@ pub(crate) async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAd
         ));
     }
 
-    // 3. IPv4 优先 (受限 IPv6 网络不 hang 在 v6). stable sort 保留同族内原顺序.
     ips.sort_by_key(|ip| if ip.is_ipv4() { 0 } else { 1 });
 
-    // 4. 写缓存
     if let Ok(mut cache) = dns_cache().lock() {
         if cache.len() >= CACHE_MAX_ENTRIES {
             let now = Instant::now();
@@ -114,11 +141,84 @@ pub(crate) async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAd
             CacheEntry {
                 ips: ips.clone(),
                 expiry: Instant::now() + DNS_CACHE_TTL,
+                resolved_at: Instant::now(),
             },
         );
     }
 
     Ok(ips)
+}
+
+/// 调用点须在 `handshake_cache::prewarm` **之前** —— 否则 prewarm 的 F 播种会带上解析耗时。
+pub async fn keep_warm_dns(host: &str, port: u16) {
+    let (h, p) = split_host_port(host).unwrap_or((host, port));
+    if h.parse::<IpAddr>().is_ok() {
+        return; // IP 字面量: 本就不解析
+    }
+    // 首次解析: await, 保证调用方返回时"缓存已热"是确定状态 (即便失败也返回, 不阻断开机)。
+    if tokio::time::timeout(KEEP_WARM_FIRST_WAIT, resolve_fresh(h, p))
+        .await
+        .is_err()
+    {
+        warn!("伪装站 DNS 保活首次解析超时 ({:?}), 启动不受阻; 后台继续重试", KEEP_WARM_FIRST_WAIT);
+    }
+
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return; // 已有保活任务 (start_server 可能被多次调用)
+    }
+    let host = h.to_string();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(keep_warm_interval()).await;
+            if resolve_fresh(&host, p).await.is_ok() {
+                continue;
+            }
+            // 失败: 保留旧 IP 并有限延长 —— 否则一次解析抖动就让后续连接全部退化成
+            // 关键路径解析 (E13 复发)。
+            let now = Instant::now();
+            let extended = {
+                match dns_cache().lock() {
+                    Ok(mut c) => c
+                        .get_mut(&host)
+                        .and_then(|e| stale_extended_expiry(now, e.resolved_at, e.expiry)),
+                    Err(_) => None,
+                }
+            };
+            match extended {
+                Some(x) => {
+                    if let Ok(mut c) = dns_cache().lock() {
+                        if let Some(e) = c.get_mut(&host) {
+                            e.expiry = x;
+                        }
+                    }
+                }
+                None => warn!(
+                    "伪装站 DNS 保活已连续失败超 {}s, 不再延长旧 IP (等解析恢复)",
+                    DNS_STALE_CAP.as_secs()
+                ),
+            }
+        }
+    });
+}
+
+/// 解析 host → Vec<IpAddr>, 命中缓存则 0 网络开销. 返回的 Vec 已经 IPv4 优先排序.
+///
+/// `pub(crate)`: 伪装站转发路径 (`mirage_server::camouflage`) 也走这里 —— 拿缓存解析 + 尊重
+/// `tuning.dns_tcp_resolver`, 并把 DNS 耗时排在计时之外 (RTT 样本只含 TCP connect).
+pub(crate) async fn resolve_cached(host: &str, port: u16) -> io::Result<Vec<IpAddr>> {
+    // 1. 查缓存
+    if let Ok(cache) = dns_cache().lock() {
+        if let Some(entry) = cache.get(host) {
+            if entry.expiry > Instant::now() {
+                return Ok(entry.ips.clone());
+            }
+        }
+    }
+
+    // 2. miss / 过期 → 解析. 先拿信号量封顶并发, 防洪泛打满阻塞池. permit 解析完即释放.
+    //    配了 dns_tcp_resolver 则走 DNS-over-TCP (UDP 被封的 VPS 用); 否则系统 getaddrinfo.
+    resolve_fresh(host, port).await
 }
 
 /// 解析 "host:port" 为 (host, port). 支持 IPv6 字面量 "[::1]:443".
@@ -389,6 +489,48 @@ fn skip_name(buf: &[u8], mut pos: usize) -> usize {
         pos += 1 + len as usize;
     }
     pos
+}
+
+#[cfg(test)]
+mod keep_warm_tests {
+    use super::*;
+
+    /// 保活间隔必须**严格小于** TTL, 否则刷新赶不上过期; 且必须在抖动区间内。
+    #[test]
+    fn keep_warm_interval_is_below_ttl_with_jitter() {
+        let lo = DNS_CACHE_TTL.mul_f64(0.6);
+        for _ in 0..200 {
+            let d = keep_warm_interval();
+            assert!(d < DNS_CACHE_TTL, "保活间隔必须 < TTL: {d:?}");
+            assert!(d >= lo, "间隔超出抖动区间: {d:?}");
+        }
+    }
+
+    /// 陈旧延长的边界: 未超 cap 就延长, 超了不延 (防 IP 漂移后长期用旧地址)。
+    #[test]
+    fn stale_extension_is_bounded() {
+        let now = Instant::now();
+        let fresh = now - Duration::from_secs(10);
+        assert!(stale_extended_expiry(now, fresh, now).is_some());
+        let too_old = now - (DNS_STALE_CAP + Duration::from_secs(1));
+        assert!(stale_extended_expiry(now, too_old, now).is_none());
+        // 新 expiry 不得倒退 (至少不早于原 expiry)。
+        let later = now + DNS_CACHE_TTL * 2;
+        assert_eq!(stale_extended_expiry(now, fresh, later), Some(later));
+    }
+
+    /// IP 字面量: 保活应立即返回, 不解析、不起后台任务 (可精确断言: 不报错也不阻塞)。
+    /// 用 RFC 5737 文档保留地址 (不会真连)。
+    #[tokio::test]
+    async fn keep_warm_dns_skips_ip_literal() {
+        keep_warm_dns("203.0.113.7:443", 443).await;
+        keep_warm_dns("2001:db8::1", 443).await;
+    }
+
+    #[test]
+    fn cache_fresh_false_when_absent() {
+        assert!(!cache_fresh("203.0.113.9:443"), "未解析过应为 false");
+    }
 }
 
 #[cfg(test)]

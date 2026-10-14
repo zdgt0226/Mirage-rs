@@ -28,6 +28,9 @@ pub struct CamouflageRtt {
     rtt_us: AtomicU64,
     /// auth-fail 路径 (即时建连模式 preconnect==0) 收到真站首字节的往返全时延 EWMA (微秒, 0 = 尚无样本)。
     fail_latency_us: AtomicU64,
+    /// 伪装站域名**解析**耗时 EWMA (微秒, 0 = 尚无样本)。仅用于可观测/门禁:
+    /// 解析耗时会计入预连就绪时刻与 F ⇒ 直接抬高可观测 Δ (见 `resolver::keep_warm_dns`)。
+    resolve_us: AtomicU64,
 }
 
 impl CamouflageRtt {
@@ -36,6 +39,7 @@ impl CamouflageRtt {
         Arc::new(Self {
             rtt_us: AtomicU64::new(0),
             fail_latency_us: AtomicU64::new(0),
+            resolve_us: AtomicU64::new(0),
         })
     }
 
@@ -90,6 +94,30 @@ impl CamouflageRtt {
         self.fail_latency_us.load(Ordering::Relaxed)
     }
 
+    /// 记录一次伪装站域名解析耗时 (微秒, EWMA 1/8)。
+    /// 保活 (`resolver::keep_warm_dns`) 生效后应恒 ≈ 0; 非 0 且偏大说明解析回到了关键路径。
+    pub fn observe_resolve(&self, elapsed: Duration) {
+        let sample = (elapsed.as_micros() as u64).min(RTT_MAX_US);
+        let mut prev = self.resolve_us.load(Ordering::Relaxed);
+        loop {
+            let ewma = if prev == 0 { sample } else { (prev * 7 + sample) / 8 };
+            match self.resolve_us.compare_exchange_weak(
+                prev,
+                ewma,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+
+    /// 当前估计的伪装站域名解析耗时 (微秒, 0 = 尚无样本)。
+    pub fn resolve_us(&self) -> u64 {
+        self.resolve_us.load(Ordering::Relaxed)
+    }
+
     /// 伪装站所有候选建连均失败 (不可达 / 故障): 复位 RTT 与 fail_latency 估计为 0。
     /// 防"曾连通后不可达"时 auth-succ 仍按旧样本注入延迟而 auth-fail 秒回落合成模板的反向时延侧信道。
     pub fn observe_connect_failure(&self) {
@@ -101,6 +129,16 @@ impl CamouflageRtt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_ewma_tracks_and_is_reported() {
+        let r = CamouflageRtt::new();
+        assert_eq!(r.resolve_us(), 0, "无样本应为 0");
+        r.observe_resolve(Duration::from_millis(153));
+        assert_eq!(r.resolve_us(), 153_000, "首个样本直接播种");
+        r.observe_resolve(Duration::from_micros(0));
+        assert!(r.resolve_us() < 153_000, "后续小样本应把 EWMA 拉低 (缓存命中)");
+    }
 
     #[test]
     fn no_sample_returns_zero() {

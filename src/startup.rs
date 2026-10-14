@@ -150,14 +150,20 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
             // 配置未写 tuning 时 env 覆盖与启动日志同样生效。
             {
                 let q = config.tuning.as_ref().and_then(|t| t.client_hello_guard.as_ref());
-                let mult = q.map(|q| q.preconnect_mult).unwrap_or(2);
-                let pc_min = std::time::Duration::from_millis(q.map(|q| q.preconnect_min_ms).unwrap_or(100));
-                let pc_max = std::time::Duration::from_millis(q.map(|q| q.preconnect_max_ms).unwrap_or(500));
+                let mult = q.map(|q| q.preconnect_mult).unwrap_or_else(crate::config::default_preconnect_mult);
+                let pc_min = std::time::Duration::from_millis(
+                    q.map(|q| q.preconnect_min_ms).unwrap_or_else(crate::config::default_preconnect_min_ms),
+                );
+                let pc_max = std::time::Duration::from_millis(
+                    q.map(|q| q.preconnect_max_ms).unwrap_or_else(crate::config::default_preconnect_max_ms),
+                );
                 let judge = std::time::Duration::from_millis(q.map(|q| q.judge_silence_ms).unwrap_or(1000));
                 let hard = std::time::Duration::from_millis(q.map(|q| q.hard_deadline_ms).unwrap_or(5000));
-                let auth_mult = q.map(|q| q.auth_succ_mult_x10).unwrap_or(20);
-                let auth_off = std::time::Duration::from_millis(q.map(|q| q.auth_succ_offset_ms).unwrap_or(100));
-                let auto = q.map(|q| q.auto_calibrate).unwrap_or(false);
+                let auth_mult = q.map(|q| q.auth_succ_mult_x10).unwrap_or_else(crate::config::default_auth_succ_mult_x10);
+                let auth_off = std::time::Duration::from_millis(
+                    q.map(|q| q.auth_succ_offset_ms).unwrap_or_else(crate::config::default_auth_succ_offset_ms),
+                );
+                let auto = q.map(|q| q.auto_calibrate).unwrap_or_else(crate::config::default_auto_calibrate);
                 crate::proxy::mirage_server::set_client_hello_guard(
                     mult, pc_min, pc_max, judge, hard, auth_mult, auth_off, auto,
                 );

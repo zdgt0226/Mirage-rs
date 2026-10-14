@@ -269,15 +269,15 @@ where
 // ── ClientHello 计时/判定参数 (启动时从 tuning.client_hello_guard 设一次; env 可覆盖) ──
 // 三个时钟分离, 见 docs/client-hello-timing-design.md §2:
 // ① 预连触发 (对齐) ② 判定期限 (容错) ③ 总时限 (slowloris 兜底)。
-static PC_MULT: AtomicU32 = AtomicU32::new(2);
-static PC_MIN_US: AtomicU64 = AtomicU64::new(100_000);
-static PC_MAX_US: AtomicU64 = AtomicU64::new(500_000);
+static PC_MULT: AtomicU32 = AtomicU32::new(1);
+static PC_MIN_US: AtomicU64 = AtomicU64::new(50_000);
+static PC_MAX_US: AtomicU64 = AtomicU64::new(200_000);
 static JUDGE_SILENCE_US: AtomicU64 = AtomicU64::new(1_000_000);
 static HARD_DEADLINE_US: AtomicU64 = AtomicU64::new(5_000_000);
 /// auth-succ 时序注入: `(mult_x10/10 × cam_RTT + offset_us) × jitter`。见 `auth_succ_delay_us`。
 static AUTH_MULT_X10: AtomicU32 = AtomicU32::new(20);
 static AUTH_OFFSET_US: AtomicU64 = AtomicU64::new(100_000);
-static AUTO_CALIBRATE: AtomicBool = AtomicBool::new(false);
+static AUTO_CALIBRATE: AtomicBool = AtomicBool::new(true);
 
 /// env 覆盖 (优先于 config)。**0 视为无效** → 回落: 0 长度的窗口会让所有连接被判异常。
 fn env_ms(name: &str) -> Option<u64> {
@@ -369,13 +369,19 @@ pub(crate) fn auth_succ_delay_us(mult_x10: u32, offset_us: u64, cam_rtt_us: u64)
         .saturating_add(offset_us)
 }
 
+/// 自校准注入上限护栏 (500ms): 避免异常网络抖动或保活失效导致合法连接等待过久。
+pub(crate) const MAX_AUTH_SUCC_INJECTION_US: u64 = 500_000;
+
 /// 选 auth-succ 注入基准 (微秒, 未含抖动):
+///
 /// 1. 伪装站未连通 / 不可达 (cam_rtt_us == 0): 恒为 0 (避免反向不对称);
-/// 2. auto_calibrate 开启且已有 F 样本: 采用实测的 F(EWMA);
+/// 2. auto_calibrate 开启且已有 F 样本: 采用实测的 F(EWMA), 若 F > 500ms 护栏则回落静态公式;
 /// 3. auto_calibrate 开启但尚无 F 样本 (冷启动): 纯倍率 `mult×cam_RTT`, **不叠加固定 offset**
 ///    —— 实测 `F ≈ 2×cam_RTT + P` 且 `P` 远小于 offset, 叠加会凭空引入 ~100ms 虚高
 ///    (见 `docs/phase4-real-machine-verification-report.md` §8);
 /// 4. auto_calibrate 关闭: 静态公式 `(mult_x10/10 × cam_RTT) + offset` (此时 `offset` 才生效)。
+///
+/// 最终注入值封顶 500ms 护栏。
 pub(crate) fn injection_base_us(
     auto_calibrate: bool,
     fail_us: u64,
@@ -386,14 +392,25 @@ pub(crate) fn injection_base_us(
     if cam_rtt_us == 0 {
         return 0;
     }
-    if auto_calibrate {
-        return if fail_us > 0 {
-            fail_us
+    let base = if auto_calibrate {
+        if fail_us > 0 {
+            if fail_us > MAX_AUTH_SUCC_INJECTION_US {
+                tracing::warn!(
+                    "自校准 F 样本异常过大 ({}ms > {}ms 上限), 回落静态公式避免合法握手延迟失控",
+                    fail_us / 1000,
+                    MAX_AUTH_SUCC_INJECTION_US / 1000
+                );
+                auth_succ_delay_us(mult_x10, offset_us, cam_rtt_us)
+            } else {
+                fail_us
+            }
         } else {
             auth_succ_delay_us(mult_x10, 0, cam_rtt_us)
-        };
-    }
-    auth_succ_delay_us(mult_x10, offset_us, cam_rtt_us)
+        }
+    } else {
+        auth_succ_delay_us(mult_x10, offset_us, cam_rtt_us)
+    };
+    base.min(MAX_AUTH_SUCC_INJECTION_US)
 }
 
 /// 当前生效的参数 —— 启动日志用。
@@ -474,7 +491,8 @@ fn log_ch_guard(
     if *CH_MEASURE {
         tracing::info!(
             "[CH-GUARD] outcome={} ch_read_us={} bytes={} max_gap_us={} pre_tls={} authed={} \
-             judge_us={} preconnect={} rtt_us={} fail_us={} inj_us={} pc_fire_us={} pc_ready_us={}",
+             judge_us={} preconnect={} rtt_us={} fail_us={} inj_us={} pc_fire_us={} pc_ready_us={} \
+             cam_rtt_us={} resolve_us={}",
             outcome,
             timing.total_us,
             timing.bytes,
@@ -488,6 +506,8 @@ fn log_ch_guard(
             inj_us,
             pc_fire_us,
             pc_ready_us,
+            cam_rtt.rtt_us(),
+            cam_rtt.resolve_us(),
         );
     }
     // 丢包误杀检测: 已收到 TLS 记录头, 且“到达之间”出现过 ≥150ms 间隔 —— 合法客户端丢段后
@@ -1618,5 +1638,36 @@ mod tests {
         // 4. 关键安全守卫: 伪装站不可达 (cam_rtt_us == 0) → 恒为 0 (绝不注入, 避免反向时延不对称)
         assert_eq!(injection_base_us(true, 460_000, 20, 100_000, 0), 0);
         assert_eq!(injection_base_us(false, 0, 20, 100_000, 0), 0);
+        // 5. 护栏: auto 开但 F 样本超限 (> 500ms) → 回落静态公式
+        assert_eq!(injection_base_us(true, 600_000, 20, 100_000, 180_000), 460_000);
+        // 6. 护栏: 无论静态还是自校准, 最终注入封顶 500ms
+        assert_eq!(injection_base_us(false, 0, 30, 200_000, 200_000), 500_000);
+    }
+
+    #[test]
+    fn test_config_startup_defaults_consistency() {
+        assert_eq!(crate::config::default_preconnect_mult(), 1);
+        assert_eq!(crate::config::default_preconnect_min_ms(), 50);
+        assert_eq!(crate::config::default_preconnect_max_ms(), 200);
+        assert!(crate::config::default_auto_calibrate());
+    }
+
+    #[test]
+    fn test_tier_b_implicit_vs_explicit_config_identical() {
+        let implicit: crate::config::ClientHelloGuardConfig = serde_json::from_str("{}").unwrap();
+        let explicit: crate::config::ClientHelloGuardConfig = serde_json::from_str(
+            r#"{
+                "preconnect_mult": 1,
+                "preconnect_min_ms": 50,
+                "preconnect_max_ms": 200,
+                "auto_calibrate": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(implicit.preconnect_mult, explicit.preconnect_mult);
+        assert_eq!(implicit.preconnect_min_ms, explicit.preconnect_min_ms);
+        assert_eq!(implicit.preconnect_max_ms, explicit.preconnect_max_ms);
+        assert_eq!(implicit.auto_calibrate, explicit.auto_calibrate);
     }
 }

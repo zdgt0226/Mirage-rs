@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### feat(anti-probing): 生产默认值翻转至 Tier B（1×RTT 50~200ms）+ 开启 auto_calibrate (2026-10-14)
+
+- **生产默认定档翻转**：
+  - `src/config.rs`：`default_preconnect_mult` 2→**1**、`default_preconnect_min_ms` 100→**50**、`default_preconnect_max_ms` 500→**200**、`default_auto_calibrate` false→**true**。
+  - `src/startup.rs`：未配置 `tuning` 时的回退默认值与 `config.rs` 保持严格一致（使用 `unwrap_or_else` 绑定）。
+  - `src/proxy/mirage_server/handshake.rs`：全局原子初始值同步翻转（`PC_MULT`=1, `PC_MIN_US`=50_000, `PC_MAX_US`=200_000, `AUTO_CALIBRATE`=true）。
+- **自校准上限护栏**（`handshake.rs::injection_base_us`）：
+  - 增设 `MAX_AUTH_SUCC_INJECTION_US = 500_000` (500ms) 护栏；若全局 EWMA 采样的 F 样本大于 500ms，触发 WARN 并回落静态公式，最终注入值严格封顶 500ms，防止异常慢链路导致合法握手延迟失控。
+- **真机验收定案（Phase-6）**：
+  - S1 / S2 / S3 三节点真机验证全绿通过：`resolve_us` (EWMA) 收敛至 **1~21µs**（S1 降幅 99.98%），`pc_ready_us - ①` 收敛至 **1.86~3.26ms**（S1 从历史 +156.1ms 彻底归零），同连接常数 $K$ 收敛至 **+2.2ms / -20.9ms / -8.0ms**（满足 $|K| \le 50\text{ms}$），`authsucc` 热缓存对照 20/20 PASS。
+- **测试**：新增 `test_config_startup_defaults_consistency` 与 `test_tier_b_implicit_vs_explicit_config_identical`，单测 531 passed，门禁 0 命中。
+
+### perf(anti-probing): 伪装站 DNS 保活（E13 闭环）+ 解析/连接耗时分裂度量 (2026-10-13)
+
+- **DNS 保活**（`resolver::keep_warm_dns`）: 伪装站域名按 `TTL × [0.65,0.85]` **抖动**后台刷新，幂等、启动不阻塞（首次解析 await 2s 上限）、解析失败保留旧 IP 且**陈旧上限 1h**。
+  动机与实测（Phase-5 §E13）: 60s TTL 对"连接间隔 > 60s"的场景必然过期（`empty` 探测、`badauth` 等真站 idle 关闭、安静服务器的偶发合法连接），而解析耗时会被算进 `pc_ready_us` 与 F ⇒ **1:1 抬高可观测的关闭时间偏差**。S1 解析 ≈153ms ⇒ 其 Δ 从 ~53ms 涨到 ~206ms（S2/S3 仅 ≈3~5ms）。
+- **度量**（`handshake.rs` / `camouflage_rtt.rs`）: `[CH-GUARD]` 增 `cam_rtt_us=`（纯 connect EWMA）与 `resolve_us=`（解析 EWMA）⇒ "解析是否回到关键路径"与 `P_edge` 从此**逐连接可证**，不再依赖推断。
+- **F 冷启动播种**（`handshake_cache::last_fail_latency_us` + `mod.rs::seed_fail_latency_from_cache`）: 用 prewarm 取模板的"connect + 真站首包"全时延（**零新增流量**）播种自校准的 F，使 `auto_calibrate` 从首个连接起即覆盖；**门禁 `resolver::cache_fresh`** —— DNS 未热则跳过播种并 WARN（避免把解析耗时灌进 EWMA）。
+  ⚠️ 顺序：`keep_warm_dns(...).await` **必须**排在 `prewarm` 之前。
+- **分析器**（`scripts/phase5-analyze.sh`）: `tiers`/`gap750` 补每档 **①参数自检** 与 `fail/cam_rtt/resolve` 中位数（空字段显示 `n/a`）。
+- **测试**: +5 单测（保活间隔 < TTL 且落在抖动区间 / 陈旧延长边界 / IP 字面量短路 / 缓存热度查询 / resolve EWMA）⇒ 530 passed。
+- **计划**: `docs/plan-phase6-dns-optimization.md`（判据预注册：服务端因果量 + 冷/热穿插对照 + 负例；默认值翻转三处位置与护栏）。
+
 ### fix(anti-probing): 冷启动注入虚高 + 降级态可观测 + Phase-4 报告归因勘误 (2026-10-11)
 
 - **冷启动不再叠加 `offset`**（`injection_base_us`）: `auto_calibrate` 开启但尚无 F 样本时，注入从

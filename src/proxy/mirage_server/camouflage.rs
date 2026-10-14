@@ -30,10 +30,10 @@ const MAX_CANDIDATES: usize = 3;
 
 /// 连一条伪装站连接 (推测性预连与按需转发共用)。
 ///
-/// - **解析**走 `proxy::resolver` 的 60s 缓存 (并尊重 `tuning.dns_tcp_resolver`), 且**排在计时
-///   之外**; 于是 `observe_connect` 收到的是**纯 TCP connect RTT** —— auth-succ 的时序注入量
-///   (`2 × cam_RTT`) 才准。旧实现每次 `TcpStream::connect(host:443)` 都走 `getaddrinfo`(无 nscd
-///   时不缓存), 既把 DNS 塞进探测转发的关键路径, 又把 DNS 耗时混进了 RTT 样本。
+/// - **解析**走 `proxy::resolver` 的缓存与保活 (并尊重 `tuning.dns_tcp_resolver`), 且**不计入
+///   `cam_rtt` 样本 (`observe_connect`)**; 于是 `observe_connect` 收到的是**纯 TCP connect RTT** ——
+///   auth-succ 的时序注入量 (`2 × cam_RTT`) 才准。注意: 解析耗时曾计入 `pc_ready_us` 与 F
+///   (在 S1 导致 ~156ms 偏差), 现已由 `resolver::keep_warm_dns` 主动保活使其开销恒 ≈ 0 (E13 闭环)。
 /// - 返回 None = 解析失败 / 所有候选连接失败 (调用方回落合成模板)。
 pub(super) async fn connect_camouflage(
     host: &str,
@@ -43,17 +43,24 @@ pub(super) async fn connect_camouflage(
 
     let candidates: Vec<IpAddr> = match h.parse::<IpAddr>() {
         Ok(ip) => vec![ip], // IP 字面量: 无需解析
-        Err(_) => match crate::proxy::resolver::resolve_cached(h, port).await {
-            Ok(v) if !v.is_empty() => v,
-            Ok(_) => {
-                warn!("camouflage_host `{h}` 解析结果为空");
-                return None;
+        Err(_) => {
+            let t_res = Instant::now();
+            let resolved = crate::proxy::resolver::resolve_cached(h, port).await;
+            // 解析耗时会被算进预连就绪时刻 (ready_us) 与 auth-fail 的 F ⇒ 1:1 传导到可观测
+            // 的关闭时间偏差。由 `resolver::keep_warm_dns` 保活后应恒 ≈0 (E13)。
+            cam_rtt.observe_resolve(t_res.elapsed());
+            match resolved {
+                Ok(v) if !v.is_empty() => v,
+                Ok(_) => {
+                    warn!("camouflage_host `{h}` 解析结果为空");
+                    return None;
+                }
+                Err(e) => {
+                    warn!("camouflage_host `{h}` 解析失败: {e}");
+                    return None;
+                }
             }
-            Err(e) => {
-                warn!("camouflage_host `{h}` 解析失败: {e}");
-                return None;
-            }
-        },
+        }
     };
 
     let deadline = Instant::now() + CONNECT_TOTAL_TIMEOUT;

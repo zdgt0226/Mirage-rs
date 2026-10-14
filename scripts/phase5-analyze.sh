@@ -94,6 +94,11 @@ need_eq() {
 # 非空守卫（防静默给出错误数值）
 req_n() { [ "$(n_of "$1")" -gt 0 ] || die "$2 为空 —— 检查日志过滤条件 / MIRAGE_QUIET_MEASURE=1 / 探针是否真跑过"; }
 n_of() { printf '%s' "$1" | wc -w | tr -d ' '; }
+# 多行数字的中位数并带单位; 空 → n/a (日志里可能没有该字段)
+med_us() {
+  case "${1//[[:space:]]/}" in "") printf 'n/a'; return;; esac
+  printf '%sus' "$(printf '%s\n' "$1" | med_of)"
+}
 
 # 服务端启动日志里的 ① 参数：输出 "mult min_ms max_ms"
 guard_params() {
@@ -169,8 +174,9 @@ cmd_tiers() {
     local mr;   mr="$(printf '%s\n' $rd | awk '{printf "%.1f\n", $1/1000}' | med_of)"
     st="$(printf '%s\n' $rd | awk '{printf "%.1f\n", $1/1000}' | stats_of)"
     delta[$i]="$md"; ready[$i]="$mr"
-    echo "  档 ${names[$((i-1))]}: p50(close)=${mc_r}ms  Δ=${md}ms  median(pc_ready)=${mr}ms  [$st]"
-    echo "         rtt_us/fire_us: rtt med=$(log_field "$lg" rtt_us 'outcome=fallback' | med_of)us  fire med=$(log_field "$lg" pc_fire_us 'outcome=fallback' | med_of)us"
+    local gp0; gp0="$(guard_params "$lg")"
+    echo "  档 ${names[$((i-1))]}: p50(close)=${mc_r}ms  Δ=${md}ms  median(pc_ready)=${mr}ms  [$st]  ①参数 ${gp0:-n/a}"
+    echo "         服务端量: rtt med=$(med_us "$(log_field "$lg" rtt_us 'outcome=fallback')")  fire med=$(med_us "$(log_field "$lg" pc_fire_us 'outcome=fallback')")  fail med=$(med_us "$(log_field "$lg" fail_us 'outcome=fallback')")  cam_rtt med=$(med_us "$(log_field "$lg" cam_rtt_us 'outcome=fallback')")  resolve med=$(med_us "$(log_field "$lg" resolve_us 'outcome=fallback')")"
   done
 
   local g1 g2 nw
@@ -212,6 +218,7 @@ cmd_gap750() {
     need_eq "$n" "$(n_of "$pc")" "${names[$i]} ready/preconnect"
     echo "  档 ${names[$i]}: n=${n}  ①参数 ${mult}×RTT clamp ${mn}~${mx}ms"
     echo "         rtt_us  med=$(printf '%s\n' $rt | med_of)  fire_us med=$(printf '%s\n' $fr | med_of)  ready_us med=$(printf '%s\n' $rd | med_of)"
+    echo "         服务端量: fail med=$(med_us "$(log_field "$lg" fail_us 'authed=1')")  cam_rtt med=$(med_us "$(log_field "$lg" cam_rtt_us 'authed=1')")  resolve med=$(med_us "$(log_field "$lg" resolve_us 'authed=1')")"
     echo "         preconnect 分布: $(printf '%s\n' $pc | sort | uniq -c | tr '\n' ' ')"
 
     # ① 自洽：期望 = (rtt_us==0 ? max : clamp(mult*rtt, min, max))，与 pc_fire_us(/1000) 比

@@ -1283,14 +1283,14 @@ pub struct TuningConfig {
 /// `MIRAGE_CH_HARD_MS` / `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientHelloGuardConfig {
-    /// 预连触发 = `preconnect_mult × 客户端 RTT`。默认 2。
+    /// 预连触发 = `preconnect_mult × 客户端 RTT`。默认 1 (Tier B)。
     /// (ClientHello ~1786B 分 2 段背靠背发出、正常间隔 ≈ 0; 乘法只为高 RTT 链路留余量。)
     #[serde(default = "default_preconnect_mult")]
     pub preconnect_mult: u32,
-    /// 预连触发下限 (ms)。默认 100。决定探测者看到的关闭偏差量级。
+    /// 预连触发下限 (ms)。默认 50 (Tier B)。决定探测者看到的关闭偏差量级。
     #[serde(default = "default_preconnect_min_ms")]
     pub preconnect_min_ms: u64,
-    /// 预连触发上限 (ms)。默认 500。
+    /// 预连触发上限 (ms)。默认 200 (Tier B)。
     #[serde(default = "default_preconnect_max_ms")]
     pub preconnect_max_ms: u64,
     /// 静默判定期限 (ms)。默认 1000。**必须大于 TCP 重传 TLP/RTO** (≥200ms, 退避可达 800ms+),
@@ -1317,26 +1317,30 @@ pub struct ClientHelloGuardConfig {
     #[serde(default = "default_auth_succ_offset_ms")]
     pub auth_succ_offset_ms: u64,
     /// 自校准: 用实测的 auth-fail 全程耗时 F 的 EWMA 作为 auth-succ 注入基准（取代静态
-    /// `mult×cam_RTT + offset`）。默认 false。
-    #[serde(default)]
+    /// `mult×cam_RTT + offset`）。默认 true。
+    #[serde(default = "default_auto_calibrate")]
     pub auto_calibrate: bool,
 }
 
-fn default_auth_succ_mult_x10() -> u32 {
+pub(crate) fn default_auto_calibrate() -> bool {
+    true
+}
+
+pub(crate) fn default_auth_succ_mult_x10() -> u32 {
     20
 }
-fn default_auth_succ_offset_ms() -> u64 {
+pub(crate) fn default_auth_succ_offset_ms() -> u64 {
     100
 }
 
-fn default_preconnect_mult() -> u32 {
-    2
+pub(crate) fn default_preconnect_mult() -> u32 {
+    1
 }
-fn default_preconnect_min_ms() -> u64 {
-    100
+pub(crate) fn default_preconnect_min_ms() -> u64 {
+    50
 }
-fn default_preconnect_max_ms() -> u64 {
-    500
+pub(crate) fn default_preconnect_max_ms() -> u64 {
+    200
 }
 fn default_judge_silence_ms() -> u64 {
     1000
@@ -2487,22 +2491,27 @@ mod validation_tests {
             (3, 50, 2000, 1500, 6000)
         );
         assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (25, 100));
-        assert!(!q.auto_calibrate);
+        assert!(q.auto_calibrate);
         assert!(!has(&issues, "client_hello_guard"), "合法值不该报: {issues:?}");
 
-        // 不写新字段时用实测默认 (2.0× + 100ms, auto_calibrate=false)。
+        // 不写新字段时用实测默认 (2.0× + 100ms, Tier B: 1× 50~200ms, auto_calibrate=true)。
         v["tuning"] = serde_json::json!({ "client_hello_guard": {} });
         let (cfg, _) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
         let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
+        assert_eq!(
+            (q.preconnect_mult, q.preconnect_min_ms, q.preconnect_max_ms),
+            (1, 50, 200),
+            "默认应为 Tier B: 1×, 50~200ms"
+        );
         assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (20, 100), "默认应为 2.0× + 100ms");
-        assert!(!q.auto_calibrate, "默认应为 false");
+        assert!(q.auto_calibrate, "默认应为 true");
 
-        // 显式开启 auto_calibrate: true
-        v["tuning"] = serde_json::json!({ "client_hello_guard": { "auto_calibrate": true } });
+        // 显式关闭 auto_calibrate: false
+        v["tuning"] = serde_json::json!({ "client_hello_guard": { "auto_calibrate": false } });
         let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
         let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
-        assert!(q.auto_calibrate);
-        assert!(!has(&issues, "client_hello_guard"), "auto_calibrate=true 不应报错误: {issues:?}");
+        assert!(!q.auto_calibrate);
+        assert!(!has(&issues, "client_hello_guard"), "auto_calibrate=false 不应报错误: {issues:?}");
 
         // 非法值 → 均报。
         for bad in [
