@@ -78,13 +78,11 @@
 
 ```text
 注入 = (auth_succ_mult_x10 / 10 × cam_RTT + auth_succ_offset_ms) × jitter(75%~125%)
-默认  auth_succ_mult_x10 = 20 (2.0×)   auth_succ_offset_ms = 100
+默认  auth_succ_mult_x10 = 20 (2.0×)   auth_succ_offset_ms = 0
 ```
 
-- **偏置不可省**：它是与 RTT 无关的常量部分（CDN 处理底限），倍率改不了它。
-- **附带修了冷启动**：由于偏置本身非 0，**即使尚无 RTT 样本也会注入偏置**（旧实现 `rtt == 0` 则完全不注入）。
-- **换伪装站需重校**：`P` 是按 Fastly 测的；换 Cloudflare/Akamai 等应重跑 A2 并按结果调 `auth_succ_offset_ms`。
-  更彻底的后续方向见 §6.2 第 4 条（自校准）。
+- **偏置默认归零**：早期测得的 ~100ms 偏置经 Phase-5/6 诊断证实系 DNS 解析阻塞（S1 153ms）污染所致。伪装站 DNS 常青保活后，Fastly 边缘真实处理底限 `P_edge ≈ 1~4ms`，纯 2.0× 倍率即可将残差控制在 ~1.5ms 安全网络噪声内（见 Phase-6 验证报告）。
+- **自校准与纯倍率冷启动**：默认开启 `auto_calibrate = true`。冷启动时采用 2.0× 纯倍率，当收到首个真实 auth-fail 探测时，由实测时延 F 的 EWMA 自校准基准。
 
 ---
 
@@ -187,16 +185,16 @@
 ```json
 "tuning": {
   "client_hello_guard": {
-    "preconnect_mult": 2,          // ① = clamp(preconnect_mult × RTT, preconnect_min_ms, preconnect_max_ms)
-    "preconnect_min_ms": 100,
-    "preconnect_max_ms": 500,
+    "preconnect_mult": 1,          // ① Tier B 默认: clamp(1 × RTT, 50, 200)
+    "preconnect_min_ms": 50,
+    "preconnect_max_ms": 200,
     "judge_silence_ms": 1000,      // ② 必须 > TCP 重传退避 (RTO≥200ms, 退避可达 800ms+)
     "hard_deadline_ms": 5000,      // ③ slowloris 总兜底
-    "auth_succ_mult_x10": 20,      // auth-succ 注入 = (20/10 × cam_RTT + offset) × jitter → 2.0×
-    "auth_succ_offset_ms": 100,    // 伪装站/CDN 处理底限 P (实测定档, 与 RTT 无关)
+    "auth_succ_mult_x10": 20,      // auth-succ 注入 = 2.0×
+    "auth_succ_offset_ms": 0,      // 默认 0 (P_edge≈1~4ms, 早期 100ms 系 DNS 污染)
                                    //   **仅 auto_calibrate=false 时生效**
-    "auto_calibrate": false        // true: 用实测 F(EWMA) 取代静态公式;
-                                   //   冷启动(尚无 F 样本)用纯倍率, 不加 offset
+    "auto_calibrate": true         // true (默认开): 用实测 F(EWMA) 自校准;
+                                   //   冷启动(尚无 F 样本)用纯倍率 2.0×cam_RTT, 不加 offset
   }
 }
 ```

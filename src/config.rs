@@ -1304,16 +1304,19 @@ pub struct ClientHelloGuardConfig {
     /// 合起来决定 [auth-succ 相对 auth-fail 的时延对齐](#)。
     #[serde(default = "default_auth_succ_mult_x10")]
     pub auth_succ_mult_x10: u32,
-    /// auth-succ 时序注入的**固定偏置** (ms, 默认 100)。
+    /// auth-succ 时序注入的**固定偏置** (ms, 默认 0)。
     ///
-    /// **实测依据** (见 `docs/real-machine-verification.md` A2.1/A2.2): auth-fail 的实际耗时为
-    /// `2 × cam_RTT + P` —— `P` 是**伪装站/CDN 对 ClientHello 的固有处理底限** (约 100ms 量级,
-    /// 与 RTT 无关: 证书检索/CPU 处理/回源转发)。只注入 `2×cam_RTT` 时 auth-succ 比 auth-fail
-    /// **快 118~125ms** (S1/S2, n=20); 加 +100ms 偏置后 S2 均值差收敛到 −36ms。实测还显示纯倍率
-    /// (2.5×/2.7×) 在小 RTT 下补不足、大 RTT 下过冲, 因此用"倍率 + 固定偏置"而非单纯加大倍率。
+    /// **实测依据** (见 Phase-6 验证与 `docs/plan-phase6-dns-optimization.md`):
+    /// 早期曾测得 auth-fail 比纯倍率多约 100ms，后经 Phase-5/6 诊断证实该 100ms 实质为
+    /// **DNS 关键路径解析阻塞** (S1 解析耗时 153ms) 污染所致。
+    /// 在伪装站 DNS 常青保活 (`keep_warm_dns`) 且排除解析耗时后，真实边缘处理时延
+    /// `P_edge = F - cam_rtt ≈ 1~4ms` (S1 4.2ms, S3 1.4ms)。若叠加 +100ms offset 会导致
+    /// auth-succ 比真实失败路径虚高 ~99ms (造成可区分正偏)。
+    /// 因此默认翻转为 0，保留 2.0× 纯倍率 (`2×cam_rtt ≈ 5~6ms` vs 真实 `F ≈ 7.5ms`，
+    /// 残差仅 ~1.5ms，完全落入网络抖动安全区间)。
     ///
-    /// **仅当 `auto_calibrate = false` 时生效**。auto 开时: 有 F 样本用 F; 冷启动用纯倍率
-    /// (不加 offset —— 实测 `P ≪ offset`, 叠加会造成 ~100ms 虚高)。
+    /// **仅当 `auto_calibrate = false` 时生效**。auto 开时: 有 F 样本用实测 F;
+    /// 冷启动时直接用纯倍率 (不加 offset)。
     #[serde(default = "default_auth_succ_offset_ms")]
     pub auth_succ_offset_ms: u64,
     /// 自校准: 用实测的 auth-fail 全程耗时 F 的 EWMA 作为 auth-succ 注入基准（取代静态
@@ -1330,7 +1333,7 @@ pub(crate) fn default_auth_succ_mult_x10() -> u32 {
     20
 }
 pub(crate) fn default_auth_succ_offset_ms() -> u64 {
-    100
+    0
 }
 
 pub(crate) fn default_preconnect_mult() -> u32 {
@@ -2503,7 +2506,7 @@ mod validation_tests {
             (1, 50, 200),
             "默认应为 Tier B: 1×, 50~200ms"
         );
-        assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (20, 100), "默认应为 2.0× + 100ms");
+        assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (20, 0), "默认应为 2.0× + 0ms");
         assert!(q.auto_calibrate, "默认应为 true");
 
         // 显式关闭 auto_calibrate: false

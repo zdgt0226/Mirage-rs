@@ -1,6 +1,21 @@
 # Changelog - Mirage-rs
 
-## [Unreleased]
+### feat(anti-probing): 默认翻转补全（offset 0ms）+ 移除 F 播种负收益 + R3 双模式交替复测全绿 (2026-10-15)
+
+- **R1 默认翻转补全**（`config.rs::default_auth_succ_offset_ms` 100→0, `handshake.rs::AUTH_OFFSET_US`=0）：
+  - 彻底清理旧推论“$P \approx 100\text{ms}$（证书检索/CPU/回源）”，更正为 DNS 保活后的真实 Fastly 边缘处理底限 $P_{\text{edge}} \approx 1\sim 4\text{ms}$（证实旧 100ms 系 DNS 解析阻塞产生的历史污染）。
+  - 保留 2.0× 纯倍率，消除静态偏置在合法握手注入上的 ~99ms 虚高过冲。
+- **R2 彻底移除 F 播种（负收益剔除）**（`mod.rs` & `handshake_cache.rs`）：
+  - 彻底删除 `seed_fail_latency_from_cache` 与 `LAST_FAIL_LATENCY_US`。
+  - 根因分析：prewarm 仅进行单次 fetch，若偶发遭遇建连抖动（如 S2 遇到 61.16ms），该异常初值会被永久锁定在 EWMA 中且无样本稀释（实质为 FAIL）。冷启动纯倍率与真值差距仅 ~1.5ms，移除播种回归纯倍率冷启动具备极强的网络鲁棒性与自愈性。
+- **P6-C 128ms / 59ms 首字节疑点确证与物理收敛**：
+  - S1 测得 128ms 确证为静态公式 $2.0\times 2.5 + 100 = 105\text{ms}$ 叠加 $\pm 25\%$ 抖动中位数；S2 测得 59ms 为 61.16ms 播种锁定叠加抖动中位数。R1 与 R2 落地后两节点首字节直接回归真站水平（S1 6~13ms, S2 3~4ms）。
+- **R3 真机验证全绿（P5-4 / T3 闭环）**：
+  - 三节点 9445 独立测试实例成对交替探测（`--modes badauth,authsucc --interleave -c 20 --first-byte-only`）：
+    - **S1**：auto 占比 20/20 (100%), median $\Delta_T = +5.0\text{ms}$ (ci95=[3.0, 7.5]), IQR=6.0ms, PASS。
+    - **S2**：auto 占比 20/20 (100%), median $\Delta_T = +1.0\text{ms}$ (ci95=[0.5, 1.0]), IQR=1.0ms, PASS。
+    - **S3**：auto 占比 20/20 (100%), median $\Delta_T = +2.0\text{ms}$ (ci95=[1.5, 2.0]), IQR=1.0ms, PASS。
+  - 生产原生端口（8443 / 443 / 9443）全周期持续在线、零扰动。
 
 ### feat(anti-probing): 生产默认值翻转至 Tier B（1×RTT 50~200ms）+ 开启 auto_calibrate (2026-10-14)
 

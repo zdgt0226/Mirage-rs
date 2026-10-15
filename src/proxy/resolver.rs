@@ -90,6 +90,7 @@ fn stale_extended_expiry(now: Instant, resolved_at: Instant, current_expiry: Ins
 }
 
 /// 缓存里是否有 `host` 的**未过期**条目（供"依赖缓存已热"的动作做前置门禁）。
+#[allow(dead_code)]
 pub(crate) fn cache_fresh(host: &str) -> bool {
     let (h, _) = split_host_port(host).unwrap_or((host, 0));
     let now = Instant::now();

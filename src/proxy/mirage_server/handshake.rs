@@ -276,7 +276,7 @@ static JUDGE_SILENCE_US: AtomicU64 = AtomicU64::new(1_000_000);
 static HARD_DEADLINE_US: AtomicU64 = AtomicU64::new(5_000_000);
 /// auth-succ 时序注入: `(mult_x10/10 × cam_RTT + offset_us) × jitter`。见 `auth_succ_delay_us`。
 static AUTH_MULT_X10: AtomicU32 = AtomicU32::new(20);
-static AUTH_OFFSET_US: AtomicU64 = AtomicU64::new(100_000);
+static AUTH_OFFSET_US: AtomicU64 = AtomicU64::new(0);
 static AUTO_CALIBRATE: AtomicBool = AtomicBool::new(true);
 
 /// env 覆盖 (优先于 config)。**0 视为无效** → 回落: 0 长度的窗口会让所有连接被判异常。
@@ -354,10 +354,10 @@ pub fn set_client_hello_guard(
 
 /// auth-succ 时序注入基准 (微秒, 未含抖动): `(mult_x10/10 × cam_RTT) + offset`。
 ///
-/// **为什么是"倍率 + 固定偏置"而不是纯倍率** (实测 S1/S2, 见 docs/real-machine-verification.md
-/// A2.1/A2.2): auth-fail 的耗时 = `2 × cam_RTT + P`, 其中 `P` 是伪装站/CDN 对 ClientHello 的
-/// 固有处理底限 (证书检索/CPU/回源, 与 RTT 无关, 约 100ms)。只按 `2×cam_RTT` 注入时 auth-succ
-/// 比 auth-fail 快 118~125ms; 纯加大倍率 (2.5×/2.7×) 在小 RTT 下补不足、大 RTT 下过冲。
+/// **时延对齐依据** (见 Phase-6 验证与 `docs/plan-phase6-dns-optimization.md`):
+/// 伪装站常青保活排除 DNS 耗时后，实测 Fastly 边缘处理底限 `P_edge ≈ 1~4ms` (S1 4.2ms, S3 1.4ms)。
+/// 故默认 offset = 0ms，纯 2.0× 倍率即可将残差控制在 ~1.5ms 安全网络噪声内；
+/// 当 `auto_calibrate = true` 时，则直接由实测 auth-fail 时延 F 的 EWMA 自校准。
 pub(crate) fn auth_succ_delay_us(mult_x10: u32, offset_us: u64, cam_rtt_us: u64) -> u64 {
     if cam_rtt_us == 0 {
         // 伪装站未连通 / 不可达 (回落合成模板 F ≈ 0): 不注入固定 offset, 避免反向不对称
@@ -1649,6 +1649,7 @@ mod tests {
         assert_eq!(crate::config::default_preconnect_mult(), 1);
         assert_eq!(crate::config::default_preconnect_min_ms(), 50);
         assert_eq!(crate::config::default_preconnect_max_ms(), 200);
+        assert_eq!(crate::config::default_auth_succ_offset_ms(), 0);
         assert!(crate::config::default_auto_calibrate());
     }
 
@@ -1660,6 +1661,7 @@ mod tests {
                 "preconnect_mult": 1,
                 "preconnect_min_ms": 50,
                 "preconnect_max_ms": 200,
+                "auth_succ_offset_ms": 0,
                 "auto_calibrate": true
             }"#,
         )
@@ -1668,6 +1670,7 @@ mod tests {
         assert_eq!(implicit.preconnect_mult, explicit.preconnect_mult);
         assert_eq!(implicit.preconnect_min_ms, explicit.preconnect_min_ms);
         assert_eq!(implicit.preconnect_max_ms, explicit.preconnect_max_ms);
+        assert_eq!(implicit.auth_succ_offset_ms, explicit.auth_succ_offset_ms);
         assert_eq!(implicit.auto_calibrate, explicit.auto_calibrate);
     }
 }

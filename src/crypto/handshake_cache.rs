@@ -19,17 +19,6 @@ pub fn last_connect_us() -> u64 {
     LAST_CONNECT_US.load(Ordering::Relaxed)
 }
 
-/// 最近一次向伪装站取模板的**全时延** (从发起建连到收到真站首包, 微秒, 0=尚无)。
-/// 语义与 `CamouflageRtt::observe_fail_forward` 的 F 一致 ⇒ 启动后可拿它播种 F,
-/// 使 `auto_calibrate` 从首个连接起就有样本 (否则冷启动窗口只能用纯倍率)。
-/// **前置**: 伪装站 DNS 必须已缓存, 否则这份样本会带上解析耗时 —— 由 caller 用
-/// `resolver::cache_fresh` 门禁。
-static LAST_FAIL_LATENCY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 见 `LAST_FAIL_LATENCY_US`。返回微秒, 0 = 尚未测到。
-pub fn last_fail_latency_us() -> u64 {
-    LAST_FAIL_LATENCY_US.load(Ordering::Relaxed)
-}
 /// 30 分钟刷新后台任务只 spawn 一次 (主动预热或懒预热谁先谁 spawn).
 static REFRESH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
@@ -251,8 +240,6 @@ async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
             header[0]
         ));
     }
-    // 真站首包到达时刻 ⇒ F 的语义 (含 connect + 真站处理)。播种自校准用。
-    LAST_FAIL_LATENCY_US.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
     buf.extend_from_slice(&header);
     let len = u16::from_be_bytes([header[3], header[4]]) as usize;
     let mut body = vec![0u8; len];

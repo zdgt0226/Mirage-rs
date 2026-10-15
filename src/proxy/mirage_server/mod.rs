@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 pub use std::sync::atomic::AtomicBool;
 
@@ -395,19 +395,6 @@ fn seed_rtt_from_cache(cam_rtt: &Arc<CamouflageRtt>) {
     }
 }
 
-/// 把 `HandshakeCache` 最近一次取模板的**全时延** (connect + 真站首包) 播种进 F。
-/// 与 `seed_rtt_from_cache` 同一份零新增流量来源; 目的是让 `auto_calibrate` 从首个连接起就有
-/// F 样本, 消除“冷启动窗口只能用纯倍率”的盲区 (实测 `P_edge ≤ 2ms`, 见 Phase-5 报告 E13)。
-/// **前置**: 调用方须先确认伪装站 DNS 已缓存 (`resolver::cache_fresh`) —— 否则这份样本会带上
-/// 解析耗时 (S1 实测 ≈153ms), 反而把 EWMA 推向过冲。
-fn seed_fail_latency_from_cache(cam_rtt: &Arc<CamouflageRtt>) {
-    let us = crate::crypto::handshake_cache::last_fail_latency_us();
-    if us > 0 {
-        cam_rtt.observe_fail_forward(us);
-        debug!("auth-fail 时延 F 播种/刷新: {}us (来自 HandshakeCache 取模板)", us);
-    }
-}
-
 pub async fn start_server(
     listen_addr: &str,
     // 凭据快照 (name, password): [0]=("default", 主密码), 其余=多用户 users。握手每次新连接 load() 最新快照。
@@ -459,22 +446,12 @@ pub async fn start_server(
     //    否则 "刚重启后合法用户秒回、最早几次探测却慢 2×RTT" 本身就是 T5 侧信道。
     // ② 过时防护: 同一个值在模板刷新 (30 分钟) 后重播一次, 避免少见探测的机器上初值长期不动。
     seed_rtt_from_cache(&cam_rtt);
-    // F 播种 (让 auto_calibrate 从首个连接就有样本)。门禁: DNS 缓存已热 —— 否则样本含解析耗时。
-    if crate::proxy::resolver::cache_fresh(camouflage_host) {
-        seed_fail_latency_from_cache(&cam_rtt);
-    } else {
-        warn!(
-            "伪装站 DNS 缓存未热: 跳过 F 播种 (避免把解析耗时灌进自校准 EWMA); \
-             首个 auth-fail 样本会自行播种"
-        );
-    }
     {
         let rtt = cam_rtt.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
                 seed_rtt_from_cache(&rtt);
-                seed_fail_latency_from_cache(&rtt);
             }
         });
     }
