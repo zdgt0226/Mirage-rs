@@ -28,11 +28,12 @@
 | `src/proxy/mirage_server/camouflage_rtt.rs` | 新增 `resolve_us` EWMA + `observe_resolve()` + `resolve_us()` | 单测：首样本播种 + 小样本拉低 |
 | `src/proxy/mirage_server/camouflage.rs` | `connect_camouflage` 里给 `resolve_cached` 计时并 `observe_resolve` | `resolve_us` 非 0 ⇒ 解析回到关键路径 |
 | `src/proxy/mirage_server/handshake.rs` | `[CH-GUARD]` 增 `cam_rtt_us=`（纯 connect EWMA）与 `resolve_us=` | 真机判据 P6-A 的输入 |
-| `src/crypto/handshake_cache.rs` | 增 `LAST_FAIL_LATENCY_US`（取模板"connect + 真站首包"全时延）+ `last_fail_latency_us()` | 与 `observe_fail_forward` 同语义 |
-| `src/proxy/mirage_server/mod.rs` | `keep_warm_dns` **排在 `prewarm` 之前**；新增 `seed_fail_latency_from_cache`，**门禁 `cache_fresh`**（未热则跳过并 WARN）；30 分钟刷新时一并重播 F | F 播种不含解析耗时；`auto_calibrate` 从首个连接即覆盖 |
+| `src/crypto/handshake_cache.rs` | 增 `LAST_FAIL_LATENCY_US`（取模板"connect + 真站首包"全时延）+ `last_fail_latency_us()` —— **已在 R2 中彻底移除**（负收益，见 §6.1 注） | 曾与 `observe_fail_forward` 同语义 |
+| `src/proxy/mirage_server/mod.rs` | `keep_warm_dns` 与 `prewarm` **并发执行 (`tokio::join!`)**（`cache_fresh` 门禁与 F 播种**已在 R2 移除**） | 消除串行等待，启动耗时由 2s + 5s 降至 max(2s, 5s) |
 | `scripts/phase5-analyze.sh` | `tiers`/`gap750` 打印每档 **①参数**自检 + `fail/cam_rtt/resolve` 中位数；新增 `med_us`（空字段显示 n/a） | 档位/env 是否真生效当场可见 |
 
-> ⚠️ **顺序是成败关键**：`keep_warm_dns(...).await` 必须先于 `prewarm`，且 F 播种必须过 `cache_fresh` 门禁 —— 否则 S1 的 prewarm 会把 153ms 解析耗时种进 EWMA（α=1/8 ⇒ 前 8~24 个握手持续过冲最多 ~150ms），与"消除冷启动不对称"的目标正好相反。
+> ⚠️ **启动时序优化**：`keep_warm_dns` 与 `prewarm` 采用 `tokio::join!` 并发执行。
+> 由于 **F 播种已在 R2 彻底移除**，不再存在"启动期解析耗时被播种污染 EWMA"的风险，串行门禁已解除；并发启动不仅缩短常态启动时间，更将 DNS 异常或抖动时的最差启动超时从 $2\text{s} + 5\text{s} = 7\text{s}$ 压减至 $\max(2\text{s}, 5\text{s}) = 5\text{s}$。
 
 ---
 
@@ -181,4 +182,23 @@ S3:
 2. **$\Delta_T$ 残余偏差极度收敛**：三节点 $|\text{median } \Delta_T| \le 5.0\text{ms}$，95% 置信区间最宽仅 $[3.0, 7.5]\text{ms}$，全部在网络自然抖动安全区间内（远优于 $\le 50\text{ms}$ 判据）。
 3. **自校准覆盖率 100%**：三节点 auto 占比均为 20/20（100%），首个 badauth 采样后 EWMA 即平滑收敛，零离群点。
 4. **全周期生产端口零扰动**：8443 / 443 / 9443 全程平稳在线。
+
+> **评测口径说明**：
+> - **热缓存口径**：R3 探针采用 `--first-byte-only`，测试的是连接建立与首包交互完成即关闭的**热缓存口径**；
+> - **冷缓存口径**：长周期/TTL 过期后的常青保活机制有效性（冷缓存口径）已由 §6.1 完整覆盖（在 >65s 空闲间隔下实测 `resolve_us ≈ 21µs`，证实保活协程成功使解析脱离握手关键路径）。两者互为印证。
+
+---
+
+### 6.6 运维与 CDN 迁移指引（切换伪装站 / CDN 注意事项）
+
+当前生产默认 `auth_succ_offset_ms = 0` 依托于 Fastly CDN 边缘处理极低（实测 $P_{\text{edge}} = F - \text{cam\_rtt} \approx 1\sim 4\text{ms}$，经验关系满足 $F \approx 2 \times \text{cam\_rtt}$）这一特定网络/CDN 架构。
+
+**若后续更换伪装站域名或迁移至其它 CDN 服务商**（如 Cloudflare、Cloudfront、Akamai 或自建反向代理），其边缘节点的回源延迟、证书提取或 CPU 握手开销可能产生额外底限耗时 $P$。运维人员应按照以下步骤重新校验与标定：
+1. **实测边缘底限耗时**：
+   $$P = \text{fail\_us} - \text{cam\_rtt\_us}$$
+   （可通过真机环境抓取 `[CH-GUARD]` 日志中的中位数计算）；
+2. **判断是否需要重新配置偏置**：
+   - 若 $P \le 5\text{ms}$（仍为轻量边缘）：维持默认 `auth_succ_offset_ms = 0`，依托纯 2.0× 倍率与自校准即可；
+   - 若 $P \gg 10\text{ms}$（例如自建反代存在回源瓶颈）：应在服务端配置中将 `auth_succ_offset_ms` 显式设置为对应的值，避免因伪装站固有耗时过大导致合法用户响应快于探测失败响应。
+
 

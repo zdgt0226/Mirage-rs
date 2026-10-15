@@ -16,6 +16,12 @@
     - **S2**：auto 占比 20/20 (100%), median $\Delta_T = +1.0\text{ms}$ (ci95=[0.5, 1.0]), IQR=1.0ms, PASS。
     - **S3**：auto 占比 20/20 (100%), median $\Delta_T = +2.0\text{ms}$ (ci95=[1.5, 2.0]), IQR=1.0ms, PASS。
   - 生产原生端口（8443 / 443 / 9443）全周期持续在线、零扰动。
+- **启动时序并发优化**（`mirage_server::mod.rs`）：
+  - 伴随 R2 移除 F 播种，"串行等待 DNS 保活防 EWMA 污染"的门禁约束解除。
+  - `keep_warm_dns` 与 `prewarm` 改由 `tokio::join!` 并发执行，将最差异常启动等待从 $2\text{s} + 5\text{s} = 7\text{s}$ 压减至 $\max(2\text{s}, 5\text{s}) = 5\text{s}$。
+- **评测口径与运维指引补充**（`docs/plan-phase6-dns-optimization.md`）：
+  - 显式澄清 R3（`--first-byte-only`）针对热缓存口径，冷缓存保活有效性由 §6.1 覆盖（>65s 间隔下 `resolve_us ≈ 21µs`）。
+  - 追加 CDN 迁移运维指引：当前默认 `offset=0` 依托于 Fastly $F \approx 2\times\text{cam\_rtt}$ 特征；迁移其他 CDN 时须按 $P = \text{fail\_us} - \text{cam\_rtt\_us}$ 重新实测定级。
 
 ### feat(anti-probing): 生产默认值翻转至 Tier B（1×RTT 50~200ms）+ 开启 auto_calibrate (2026-10-14)
 

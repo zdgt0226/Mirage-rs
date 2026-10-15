@@ -431,15 +431,13 @@ pub async fn start_server(
     // 服务器→伪装站 RTT, 消除旧池 8~14s 的关闭时间侧信道。
     let cam_rtt = CamouflageRtt::new();
 
-    // E13: 伪装站 DNS 保活 —— 解析耗时否则会被算进预连就绪时刻 (`pc_ready_us`) 与 F,
-    // 1:1 传导到探测者可观测的关闭时间偏差 (实测 S1 解析 ≈153ms vs S2/S3 ≈3ms)。
-    // **必须排在 prewarm 之前**: 否则下面播种的 F 会把解析耗时一起种子进去。
-    crate::proxy::resolver::keep_warm_dns(camouflage_host, 443).await;
-
-    // v0.4.5-alpha.15: accept 前主动预热 HandshakeCache. 消除懒预热的冷启动窗口
-    // (重启后首个连接不再触发 fetch 或拿 fallback → 时序异常). camouflage 不可达
-    // 时最多阻塞 ~5s 后放行 (懒路径兜底), 不长期挂起启动.
-    crate::crypto::handshake_cache::prewarm(camouflage_host).await;
+    // E13 & R2: 伪装站 DNS 常青保活与握手模板预热并发执行 (tokio::join!).
+    // R2 移除 F 播种后，"防解析耗时污染 EWMA" 的串行约束已不复存在；
+    // 并发执行可将解析异常/网络抖动时的最差启动等待耗时从 2s + 5s 降至 max(2s, 5s)。
+    tokio::join!(
+        crate::proxy::resolver::keep_warm_dns(camouflage_host, 443),
+        crate::crypto::handshake_cache::prewarm(camouflage_host),
+    );
 
     // auth-succ 时序对齐 (`2 × cam_RTT` 注入) 的正样本来源。
     // ① 冷启动播种: prewarm 刚刚已经连过伪装站 (零新增流量), 拿它的 connect 耗时当 EWMA 初值 ——
