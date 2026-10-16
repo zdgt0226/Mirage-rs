@@ -77,7 +77,9 @@ pub fn compute_period_start(now_secs: u64, reset_day: u8) -> u64 {
         (y, m - 1)
     };
     let start_days = days_from_civil(start_y, start_m, reset_day);
-    (start_days as u64) * 86400
+    // 时钟接近 1970 年 (无 RTC 设备未授时) 时可能算出 1969 年的负天数; 截为 0, 否则 `as u64`
+    // 回绕成极大值, 周期起点永远大于后续时间 → 该用户再也不会滚动到新周期。
+    (start_days.max(0) as u64) * 86400
 }
 
 // ───────────────────────── 用户限速与配额句柄 ─────────────────────────
@@ -512,6 +514,16 @@ mod tests {
         // 闰年: 2024-02-29
         let leap_days = days_from_civil(2024, 2, 29);
         assert_eq!(civil_from_days(leap_days), (2024, 2, 29));
+    }
+
+    #[test]
+    fn period_start_near_epoch_does_not_wrap() {
+        // 1970-01-05, 账单日 15 → 上一周期起点在 1969-12-15 (负天数), 应截为 0。
+        let now = 4 * 86400 + 3600;
+        assert_eq!(compute_period_start(now, 15), 0);
+        // 正常授时后能滚动到新周期 (起点不大于当前时间)。
+        let later = days_from_civil(2026, 10, 17) as u64 * 86400;
+        assert!(compute_period_start(later, 15) <= later);
     }
 
     #[test]
