@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### fix(ci): rustls 升级修复 4 个安全公告 + 适配新版 Rust 弃用告警 (2026-10-16)
+
+- `rustls` 0.23.45 → 0.23.46：修复 RUSTSEC-2026-0346 / 0347 / 0348 / 0349（cargo-deny 门禁报红）。
+- `src/proxy/user_limits.rs`：新版 Rust 将 `AtomicU64::fetch_update` 改名 `try_update` 并标记弃用，CI 的 `-D warnings` 因此报错；该处加 `#[allow(deprecated)]`，保留旧名以兼容旧工具链。
+
 ### docs: 多版本实测对比 (v0.5 → v0.15.2) + 测试路径说明 (2026-10-05)
 
 - `docs/benchmark-2026-09.md` 新增 §5: 7 个大版本在两台 VPS 上的直连 (穿 GFW) 长时间观测、处理效率、抗审查静态测试 (主动探测回应 / 原样重放 / OpenGFW fet·trojan / ClientHello·ServerHello 特征)。结论: TCP 性能自 v0.5 起持平; 实测可量化的抗审查提升集中在 v0.15 (非 TLS 探测回应与真站一致、ServerHello key_share 不再跨连接重复)。
