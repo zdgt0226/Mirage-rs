@@ -10,6 +10,15 @@ use ring::rand::SystemRandom;
 
 static HANDSHAKE_CACHE: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
 static WARMING_UP: AtomicBool = AtomicBool::new(false);
+/// 最近一次向伪装站建连的 TCP connect 耗时 (微秒, 0=尚无)。供 auth-succ 时序对齐的 RTT 初值:
+/// 这条路径本来就在启动预热 + 30 分钟刷新时各跑一次 → 拿它播种 EWMA **零新增流量**。
+static LAST_CONNECT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 见 `LAST_CONNECT_US`。返回微秒, 0 = 尚未测到。
+pub fn last_connect_us() -> u64 {
+    LAST_CONNECT_US.load(Ordering::Relaxed)
+}
+
 /// 30 分钟刷新后台任务只 spawn 一次 (主动预热或懒预热谁先谁 spawn).
 static REFRESH_SPAWNED: AtomicBool = AtomicBool::new(false);
 
@@ -178,16 +187,29 @@ pub async fn get_server_hello_pfs(
 }
 
 async fn fetch_real_server_hello(host: &str) -> anyhow::Result<Vec<u8>> {
-    let target = crate::net_util::host_with_default_port(host, 443);
-
+    // 解析与连接: 走 resolver 缓存 (尊重 `tuning.dns_tcp_resolver`) 后连 IP。
+    // 旧实现直接 `TcpStream::connect(host:443)` 每次走 getaddrinfo —— 出向 UDP 被封的 VPS 上
+    // 根本取不到真模板 (只能回落合成模板)。这里顺带把 **connect 耗时**记进全局, 作为 auth-succ
+    // 时序对齐的 RTT 初值 (解析排在计时之外 → 样本只含 TCP connect)。
+    let hostname = crate::net_util::extract_hostname(host);
+    let (h, port) = crate::proxy::resolver::split_host_port(host).unwrap_or((hostname, 443));
+    let ip = match h.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => *crate::proxy::resolver::resolve_cached(h, port)
+            .await?
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no address for {h}"))?,
+    };
+    let t0 = std::time::Instant::now();
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        TcpStream::connect(&target)
-    ).await??;
+        TcpStream::connect(std::net::SocketAddr::new(ip, port)),
+    )
+    .await??;
+    LAST_CONNECT_US.store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     let mut session_id = [0u8; 32];
     rand::fill(&mut session_id);
-    let hostname = crate::net_util::extract_hostname(host);
     // 模板 fetch **固定用 OkHttp CH** (无 MLKEM, 只提供 X25519/P256/P384) —— 这三个曲线是
     // 所有 profile (Chrome/FF/OkHttp) 的**交集**, camouflage 站据此协商出的曲线 (通常 X25519)
     // 任何 profile 的客户端都提供过 → 回放的 ServerHello 恒自洽、不会"选了没提供的曲线"= 非法 TLS。

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use nix::sys::socket::{
-    bind, recvmsg, setsockopt, socket, sockopt, AddressFamily, ControlMessageOwned, MsgFlags,
-    SockFlag, SockType, SockaddrIn,
+    bind, getsockopt, recvmsg, setsockopt, socket, sockopt, AddressFamily, ControlMessageOwned,
+    MsgFlags, SockFlag, SockType, SockaddrIn,
 };
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -42,6 +42,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // 收到任一下行后转 IDLE_TIMEOUT —— 正常 UDP 会话可长期存活。8s 远宽于隧道往返首响。
 const FIRST_DOWNLINK_TIMEOUT: Duration = Duration::from_secs(8);
 const UDP_BUF: usize = 65536;
+/// 主收包 socket 的内核接收缓冲。全部 LAN UDP 汇入这一个 socket, 默认 rmem (~208KB)
+/// 只够缓冲约 200 个包: 收包循环一次调度延迟就溢出 (`UdpRcvbufErrors`)。实测 2000 并发
+/// 流时该 socket 丢包由上千降到 0 (docs/real-machine-verification.md D1)。
+const MAIN_RCVBUF: usize = 4 * 1024 * 1024;
 // uplink 机会式合帧上限: 一次 send_data 前把此刻已排队的 UDP 数据报榨干打包, 直到累计
 // 超过此阈值。拉大/打散 TLS 记录尺寸 (对抗"UDP-over-TCP 记录众数卡在 ~MTU"的长度指纹),
 // 只合并本已在 channel 里的突发包 → 近乎零新增延迟。超阈值/超大帧交 send_data 自行切记录,
@@ -188,6 +192,15 @@ fn build_main_socket(bind_addr: SocketAddrV4) -> anyhow::Result<UdpSocket> {
     setsockopt(&fd, sockopt::ReuseAddr, &true)?;
     setsockopt(&fd, sockopt::IpTransparent, &true)?;
     setsockopt(&fd, sockopt::Ipv4OrigDstAddr, &true)?; // IP_RECVORIGDSTADDR
+
+    // SO_RCVBUFFORCE 不受 net.core.rmem_max 限制 (需 CAP_NET_ADMIN, 透明网关本就要);
+    // 失败回落 SO_RCVBUF (被 rmem_max 截断, 聊胜于无)。非致命。
+    if setsockopt(&fd, sockopt::RcvBufForce, &MAIN_RCVBUF).is_err() {
+        let _ = setsockopt(&fd, sockopt::RcvBuf, &MAIN_RCVBUF);
+    }
+    if let Ok(n) = getsockopt(&fd, sockopt::RcvBuf) {
+        info!("Transparent UDP 主 socket 接收缓冲 {} KB", n / 1024);
+    }
     bind(fd.as_raw_fd(), &SockaddrIn::from(bind_addr))?;
     let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd.into_raw_fd()) };
     std_sock.set_nonblocking(true)?;

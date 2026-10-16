@@ -2,6 +2,220 @@
 
 ## [Unreleased]
 
+### feat(anti-probing): 默认翻转补全（offset 0ms）+ 移除 F 播种负收益 + R3 双模式交替复测全绿 (2026-10-15)
+
+- **R1 默认翻转补全**（`config.rs::default_auth_succ_offset_ms` 100→0, `handshake.rs::AUTH_OFFSET_US`=0）：
+  - 彻底清理旧推论“$P \approx 100\text{ms}$（证书检索/CPU/回源）”，更正为 DNS 保活后的真实 Fastly 边缘处理底限 $P_{\text{edge}} \approx 1\sim 4\text{ms}$（证实旧 100ms 系 DNS 解析阻塞产生的历史污染）。
+  - 保留 2.0× 纯倍率，消除静态偏置在合法握手注入上的 ~99ms 虚高过冲。
+- **R2 彻底移除 F 播种（负收益剔除）**（`mod.rs` & `handshake_cache.rs`）：
+  - 彻底删除 `seed_fail_latency_from_cache` 与 `LAST_FAIL_LATENCY_US`。
+  - 根因分析：prewarm 仅进行单次 fetch，若偶发遭遇建连抖动（如 S2 遇到 61.16ms），该异常初值会被永久锁定在 EWMA 中且无样本稀释（实质为 FAIL）。冷启动纯倍率与真值差距仅 ~1.5ms，移除播种回归纯倍率冷启动具备极强的网络鲁棒性与自愈性。
+- **P6-C 128ms / 59ms 首字节疑点确证与物理收敛**：
+  - S1 测得 128ms 确证为静态公式 $2.0\times 2.5 + 100 = 105\text{ms}$ 叠加 $\pm 25\%$ 抖动中位数；S2 测得 59ms 为 61.16ms 播种锁定叠加抖动中位数。R1 与 R2 落地后两节点首字节直接回归真站水平（S1 6~13ms, S2 3~4ms）。
+- **R3 真机验证全绿（P5-4 / T3 闭环）**：
+  - 三节点 9445 独立测试实例成对交替探测（`--modes badauth,authsucc --interleave -c 20 --first-byte-only`）：
+    - **S1**：auto 占比 20/20 (100%), median $\Delta_T = +5.0\text{ms}$ (ci95=[3.0, 7.5]), IQR=6.0ms, PASS。
+    - **S2**：auto 占比 20/20 (100%), median $\Delta_T = +1.0\text{ms}$ (ci95=[0.5, 1.0]), IQR=1.0ms, PASS。
+    - **S3**：auto 占比 20/20 (100%), median $\Delta_T = +2.0\text{ms}$ (ci95=[1.5, 2.0]), IQR=1.0ms, PASS。
+  - 生产原生端口（8443 / 443 / 9443）全周期持续在线、零扰动。
+- **启动时序并发优化**（`mirage_server::mod.rs`）：
+  - 伴随 R2 移除 F 播种，"串行等待 DNS 保活防 EWMA 污染"的门禁约束解除。
+  - `keep_warm_dns` 与 `prewarm` 改由 `tokio::join!` 并发执行，将最差异常启动等待从 $2\text{s} + 5\text{s} = 7\text{s}$ 压减至 $\max(2\text{s}, 5\text{s}) = 5\text{s}$。
+- **评测口径与运维指引补充**（`docs/plan-phase6-dns-optimization.md`）：
+  - 显式澄清 R3（`--first-byte-only`）针对热缓存口径，冷缓存保活有效性由 §6.1 覆盖（>65s 间隔下 `resolve_us ≈ 21µs`）。
+  - 追加 CDN 迁移运维指引：当前默认 `offset=0` 依托于 Fastly $F \approx 2\times\text{cam\_rtt}$ 特征；迁移其他 CDN 时须按 $P = \text{fail\_us} - \text{cam\_rtt\_us}$ 重新实测定级。
+
+### feat(anti-probing): 生产默认值翻转至 Tier B（1×RTT 50~200ms）+ 开启 auto_calibrate (2026-10-14)
+
+- **生产默认定档翻转**：
+  - `src/config.rs`：`default_preconnect_mult` 2→**1**、`default_preconnect_min_ms` 100→**50**、`default_preconnect_max_ms` 500→**200**、`default_auto_calibrate` false→**true**。
+  - `src/startup.rs`：未配置 `tuning` 时的回退默认值与 `config.rs` 保持严格一致（使用 `unwrap_or_else` 绑定）。
+  - `src/proxy/mirage_server/handshake.rs`：全局原子初始值同步翻转（`PC_MULT`=1, `PC_MIN_US`=50_000, `PC_MAX_US`=200_000, `AUTO_CALIBRATE`=true）。
+- **自校准上限护栏**（`handshake.rs::injection_base_us`）：
+  - 增设 `MAX_AUTH_SUCC_INJECTION_US = 500_000` (500ms) 护栏；若全局 EWMA 采样的 F 样本大于 500ms，触发 WARN 并回落静态公式，最终注入值严格封顶 500ms，防止异常慢链路导致合法握手延迟失控。
+- **真机验收定案（Phase-6）**：
+  - S1 / S2 / S3 三节点真机验证全绿通过：`resolve_us` (EWMA) 收敛至 **1~21µs**（S1 降幅 99.98%），`pc_ready_us - ①` 收敛至 **1.86~3.26ms**（S1 从历史 +156.1ms 彻底归零），同连接常数 $K$ 收敛至 **+2.2ms / -20.9ms / -8.0ms**（满足 $|K| \le 50\text{ms}$），`authsucc` 热缓存对照 20/20 PASS。
+- **测试**：新增 `test_config_startup_defaults_consistency` 与 `test_tier_b_implicit_vs_explicit_config_identical`，单测 531 passed，门禁 0 命中。
+
+### perf(anti-probing): 伪装站 DNS 保活（E13 闭环）+ 解析/连接耗时分裂度量 (2026-10-13)
+
+- **DNS 保活**（`resolver::keep_warm_dns`）: 伪装站域名按 `TTL × [0.65,0.85]` **抖动**后台刷新，幂等、启动不阻塞（首次解析 await 2s 上限）、解析失败保留旧 IP 且**陈旧上限 1h**。
+  动机与实测（Phase-5 §E13）: 60s TTL 对"连接间隔 > 60s"的场景必然过期（`empty` 探测、`badauth` 等真站 idle 关闭、安静服务器的偶发合法连接），而解析耗时会被算进 `pc_ready_us` 与 F ⇒ **1:1 抬高可观测的关闭时间偏差**。S1 解析 ≈153ms ⇒ 其 Δ 从 ~53ms 涨到 ~206ms（S2/S3 仅 ≈3~5ms）。
+- **度量**（`handshake.rs` / `camouflage_rtt.rs`）: `[CH-GUARD]` 增 `cam_rtt_us=`（纯 connect EWMA）与 `resolve_us=`（解析 EWMA）⇒ "解析是否回到关键路径"与 `P_edge` 从此**逐连接可证**，不再依赖推断。
+- **F 冷启动播种**（`handshake_cache::last_fail_latency_us` + `mod.rs::seed_fail_latency_from_cache`）: 用 prewarm 取模板的"connect + 真站首包"全时延（**零新增流量**）播种自校准的 F，使 `auto_calibrate` 从首个连接起即覆盖；**门禁 `resolver::cache_fresh`** —— DNS 未热则跳过播种并 WARN（避免把解析耗时灌进 EWMA）。
+  ⚠️ 顺序：`keep_warm_dns(...).await` **必须**排在 `prewarm` 之前。
+- **分析器**（`scripts/phase5-analyze.sh`）: `tiers`/`gap750` 补每档 **①参数自检** 与 `fail/cam_rtt/resolve` 中位数（空字段显示 `n/a`）。
+- **测试**: +5 单测（保活间隔 < TTL 且落在抖动区间 / 陈旧延长边界 / IP 字面量短路 / 缓存热度查询 / resolve EWMA）⇒ 530 passed。
+- **计划**: `docs/plan-phase6-dns-optimization.md`（判据预注册：服务端因果量 + 冷/热穿插对照 + 负例；默认值翻转三处位置与护栏）。
+
+### fix(anti-probing): 冷启动注入虚高 + 降级态可观测 + Phase-4 报告归因勘误 (2026-10-11)
+
+- **冷启动不再叠加 `offset`**（`injection_base_us`）: `auto_calibrate` 开启但尚无 F 样本时，注入从
+  `2×cam_RTT + offset` 改为**纯倍率** `2×cam_RTT`。依据：实测 `F ≈ 2×cam_RTT + P` 且 `P ≪ offset`
+  （静态偏置是按某一节点定档的），叠加会凭空引入 ~100ms 虚高。`offset` 自此**只在
+  `auto_calibrate=false` 时生效**（含单测）。
+- **出站边缘可观测**（`camouflage.rs`）: 伪装站连接落到的边缘 IP **变更时打印**（`伪装站出站边缘: <ip>`）。
+  同源 baseline 复核时，baseline 探针与转发连接必须落同一 IP，否则 `Δ = T_mirage − B_srv` 会混入
+  “不同 CDN 边缘的空闲超时差”（Phase-4 的残差 `K` ≈ 300~600ms 疑因此）。
+- **降级态启动提示**（`startup.rs`）: `auto_calibrate=false` 时启动 **WARNING**（静态 `P` 换节点/换伪装站
+  后会残留）；auto 开启时打印“有 F→F；冷启动→纯倍率”的语义。
+- **Phase-4 报告勘误 E8–E12**（`docs/phase4-real-machine-verification-report.md` §8）:
+  “B 比 C 优化 41%”归因撤销（三档实测的**客户端 RTT 并不同**，且 `Δ_C−Δ_B` ≫ `①_C−①_B`），
+  定档理由改为**机制上界收紧 + 实测不劣性**；`ch_read_us` 列与 Tier A S1 行标记待核/待复测；
+  因果硬门改述为 `T_ready < gap_actual`；新增“同连接对齐（`Δ ≈ pc_ready_us`）”复测口径。
+- **修 CI 门禁**（`examples/probe_close_timing.rs`）: Phase-4 追加参数/缩进后 `clippy --all-targets -D warnings`
+  变红（`too_many_arguments` / `doc_overindented_list_items`），已修复。
+- 待复测（代码默认值**暂不翻转**）: Tier A S1 行复测、`Δ ≈ pc_ready_us` 同连接核对、解析 IP 一致性。
+- **新增复测规范与分析器**: `docs/plan-phase5-verification.md`（判据预注册：同会话交替、baseline 同边缘 IP、`rtt_us==0 ⇒ ① 取上限` 的分支说明）+ `scripts/phase5-analyze.sh`
+  （只读日志，输出中位数/IQR/Wilson/中位数 bootstrap 与 PASS/WEAK/FAIL；含空列表与条数不一致守卫，mawk 兼容）。
+
+### feat(anti-probing): Phase-3 三节点实测闭环 —— 自校准验收 / 反向不对称免疫 (2026-10-10)
+
+- **反向不对称免疫**（`9fd42d8`）: 新增 `CamouflageRtt::observe_connect_failure()`——建连彻底失败时
+  **归零** `cam_rtt` 与注入用的 F（EWMA），配合 `injection_base_us` 首行 `cam_rtt_us == 0 → 0` 守卫，
+  消除"伪装站不可达时 auth-succ 反而比 auth-fail 慢"的反向侧信道（旧实现无条件注入 offset）。
+  实测（S3 强制建连拒绝，n=10 成对）：`inj_us = 0`、Δmean **+1.7ms**、95% CI [−28.2, +31.6] ∋ 0。
+- **度量字段**（`9fd42d8`）: `[CH-GUARD]` 增 `fail_us=`（自校准 F 的 EWMA）与 `inj_us=`（本次注入基准），
+  使"自校准是否生效"在**服务端可证**（`fail_us == inj_us`，µs 级），不依赖客户端侧推算。
+- **`auto_calibrate` 入 config**: `tuning.client_hello_guard.auto_calibrate`（默认 **false**，静态公式兜底），
+  env `MIRAGE_CH_AUTO_CALIBRATE` 仍可覆盖（不再每握手 `std::env::var`）。
+- **空连接探测优化**（`a189030`）: 空 ClientHello 不再等待"真站首字节"（它永不主动推送），直接进入双向透传，
+  避免 idle 重试；⚠️ 同一提交把非空 CH 的 `probe.write_all` 失败由 `Err` 改为 `Ok`（不再换连接重试/回落
+  合成模板）——**待 Phase-4 复核是否有意为之**，见 `docs/plan-phase4-verification.md` §0-B。
+- **实测结论（详见 `docs/phase3-real-machine-verification-report.md`）**:
+  - `judge_silence = 1000ms` **保持**（550/750ms 弱网重传下 18/18 零误杀）；`500ms` 档**已实测证伪**（gap≥550ms 时 0/5 误杀）。
+  - `①` 预连收紧的**收益排序未能与测量噪声区分**（baseline 跨轮跨度 656ms > A/B/C 间差异）→
+    **默认档保持 `2×, 100~500ms`**，是否收窄到 `1×, 50~200ms` 由 Phase-4 的**同源 baseline** 复测定档。
+  - `Δ = ① + cam_rtt + (cam_idle − baseline_idle)`：baseline 与转发路径**不同源**时会混入 CDN 边缘的空闲超时差异
+    （S3 实测 Δ 为负即此因），故 Δ 类指标必须先同源化。
+
+### fix(anti-probing): auth-succ 时序注入按实测定档 —— 「倍率 + 固定偏置」(2026-10-08)
+
+- **来源**: S1/S2 真机 A2 实测 (见 `docs/real-machine-verification.md` A2.1–A2.3): 只注入 `2 × cam_RTT` 时
+  auth-succ 比 auth-fail **系统性快 118~125ms** (Δp50, n=20)。
+- **根因**: auth-fail 的实际耗时 = `2 × cam_RTT + P`, 其中 `P` 是**伪装站/CDN 对 ClientHello 的固有处理底限**
+  (证书检索/CPU/回源, ~100ms), **与 RTT 无关**。纯倍率调节在高 RTT 链路过冲、低 RTT 链路补不足
+  (实测 2.5× 反而把 S1 的 Δp50 从 −224ms 拉到 −397ms)。
+- **改动**: 注入公式改为 `(auth_succ_mult_x10/10 × cam_RTT + auth_succ_offset_ms) × jitter(75%~125%)`,
+  参数入 `tuning.client_hello_guard` (**默认按实测 `2.0× + 100ms`**), `check` 拦非法值
+  (`auth_succ_mult_x10 ∈ 1..=100`、`auth_succ_offset_ms ≤ 2000`)。
+  环境变量: `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS` (旧名 `MIRAGE_DELAY_MULT_TENTHS` /
+  `MIRAGE_DELAY_OFFSET_MS` 仍兼容, 不破坏真机 A/B 脚本)。
+- **顺带修冷启动**: 由于偏置非 0, **无 RTT 样本时也注入偏置** (旧实现 `rtt == 0` 则完全不注入 →
+  刚启动时会重现"合法秒回、探测慢 2×RTT"的 T5 窗口)。
+- **实现细节**: 参数改在**启动时**一次设定 (旧实现在每次握手内联 `std::env::var`, 热路径上加锁+分配);
+  注入公式抽为纯函数 `auth_succ_delay_us` 并加单测 (含饱和、无 RTT 样本两例)。
+- **换伪装站需重校**: `P` 按 Fastly 测定; 换 Cloudflare/Akamai 等应重跑 A2 并调 `auth_succ_offset_ms`
+  (自校准方案记为后续方向, 见设计文档 §6.2)。
+- **待复测**: 用新默认重跑 A2.1 (n ≥ 20), 并以"|Δ| 落在同轮测量噪声 (≲1σ)"为判据 (原"个位数 ms"过严)。
+- **顺带修了一个初始化顺序缺陷** (验证新参数时发现): 默认配置模板的创建原本在
+  `scan_runtime_config` **之后**, 而后者才是把所有全局调参 (含本节的 `MIRAGE_CH_*` 覆盖与启动日志)
+  设进全局静态的地方 → **配置缺失时 (全新安装首启) 这些参数会静默回落到编译期默认值且无生效日志**, 很难排查。
+  已把模板创建提前到 scan 之前 (`lib::ensure_default_config`), 并在服务端模式下 WARN 说明写入的是
+  **客户端**模板 (无需静默降级)。
+
+### fix(anti-probing): 对齐/容错分离 —— 推测性预连 + 宽容判定期限（修丢包误杀合法客户端）(2026-10-06)
+
+- **修 P1（可用性缺陷）**: 上一版把"何时转发"与"静默多久判为探测"合成一个 `clamp(2×RTT, 100ms, 500ms)`
+  窗口。但真实 Chromium ClientHello ~1786B（`tests/test_tls_fingerprint.rs::chromium_size_matches_real`）
+  在 IW10 下**背靠背**发出（段间隔 ≈ 0），真正出现间隔的只有**丢包** —— 那时发送端已无数据可发，只能等
+  TLP(≈2×SRTT)/RTO(≥200ms)，而窗口下限 100ms 扛不住 → **丢段的合法客户端被判成探测转发去真站**。
+- **拆成三个时钟**（详见 `docs/client-hello-timing-design.md`）: ① 预连触发 `clamp(2×RTT, 100~500ms)`
+  （对齐）· ② 静默判定期限默认 1000ms（容错，必须大于 TCP 重传退避）· ③ 总时限 5000ms（slowloris 兜底）。
+- **推测性预连**: accept 后延迟 ① 仍未见完整 ClientHello → 后台连一条伪装站连接备用；真站空闲计时起点
+  ≈ 探测者连上 + ①（**对齐**）；合法快客户端在此之前读完 → 任务被 abort → **零**预连；认证成功则关掉它。
+  **未采用评估文档 §4 的方案 A**（accept 即预连）：对齐上限同量级，但会把到伪装站的连接量放大到接近
+  入站连接数，与取消预热的初衷冲突。
+- **预连自带预算**（独立于反射守卫）: 全局在途 ≤128 + 全局发起速率 30/s；预算不足自动退化为按需建连
+  （只损失对齐）。反射守卫仍在**转发时**计数 —— 用它们给预连计数会惩罚触发预连的合法慢客户端。
+- **修 P2（DNS 进关键路径 / 污染 RTT 样本）**: 伪装站连接改经 `proxy::resolver::resolve_cached`
+  （60s 缓存 + 尊重 `tuning.dns_tcp_resolver`），DNS 排在计时之外 → `cam_RTT` 只含 TCP connect
+  （注入量 `2×cam_RTT` 才准）；顺带修掉"出向 UDP 被封的 VPS 上每次探测都要先等 DNS"。
+- **修 P2（冷启动时序对齐失效）**: 用 `HandshakeCache` 预热/刷新本来就有的那次建连播种 `cam_RTT` 初值
+  （零新增流量，`handshake_cache::last_connect_us()`），并每 30 分钟重播一次防过时。
+- **可观测性（修测量方法的幸存者偏差）**: `MIRAGE_CH_MEASURE=1` 输出 `[CH-GUARD]` 行，**含 Fallback
+  样本**与 `max_gap_us`（只统计"到达之间"的间隔）—— "丢包误杀"因此可计数
+  （`outcome=fallback && pre_tls=1 && max_gap_us≥150ms`），首次出现打 WARN 并给出调参指引。
+- **P3 清理**: `observe_connect` 读-改-写改 CAS（并发丢样本）；重试注释与行为对齐（connect 失败不重试，
+  多候选已在内部试过）；测试裕量放大（30ms/100ms → 200ms/2000ms）。
+- **配置/环境变量**: `tuning.client_hello_guard { preconnect_mult, preconnect_min_ms, preconnect_max_ms,
+  judge_silence_ms, hard_deadline_ms }`；`MIRAGE_CH_*` 覆盖；`check` 拦 `judge_silence_ms < 200`。
+- **测试**: 新增 P1 回归 `retransmit_gap_within_judge_is_tolerated`（重传间隔 < 判定期限必须读完）、
+  对照锚点 `retransmit_gap_beyond_judge_is_forwarded`、`read_timing_excludes_trailing_silence`、
+  预连优先 `preconnected_socket_is_used_without_new_connect`、并发 EWMA 等。**521 lib 测试全绿**。
+
+### feat(anti-probing): 延迟预连取代伪装站预热连接池 + ClientHello 静默间隔读取 (2026-10-06)
+
+- **动机** (见 `docs/active-probing-assessment-2026-10.md`): 旧 `CamouflagePool` 后台常驻 8 条到
+  camouflage_host 的预连, 供 auth-fail / 读取异常路径即时取用。它消除了 auth-fail 分支的 TCP
+  3-way 时延侧信道, 但把**池中连接的已存在时长**继承给了真站的 idle-timeout —— 探测者 (空连接 /
+  半截 ClientHello) 看到的关闭时间比真站提前 8~14s (实测 46.6~56.0s vs 真站 60.3~64.0s), 可区分 (T2/T3)。
+- **延迟预连**: 转发路径改为**判定要转发的时刻即时建连** (失败重试一次 → 回落合成模板),
+  池龄恒 ≈ 0 → 真站 idle 计时起点与探测者连上的时刻只差一个服务器→伪装站 RTT。同时不再有后台
+  常驻连接打伪装站 (旧 ~0.32 conn/s 的 churn 消失, 只有真实探测/异常才建连)。
+- **静默间隔读取**: `read_client_hello` 从 "单一 5s 总截止" 改为 "**最后一次收到数据后静默
+  quiet_timeout 即判异常**" (+ `hard_deadline` 5s 兜底防 slowloris 滴发)。合法慢客户端
+  (ClientHello 分多段 / 丢包重传) 会持续发 → 永不触发静默, 不受高延迟环境影响。
+- **RTT 自适应窗口 (可配)**: 窗口 `= clamp(mult × 客户端 RTT, min_ms, max_ms)`, RTT 取自内核
+  `TCP_INFO.tcpi_rtt` (已建立连接零成本读取, 不发包), 默认 `2 / 100ms / 500ms`, 供真机 A/B 调参。
+  ⚠️ **这个窗口把"对齐"与"容错"合成一个参数 —— 已被上一节（对齐/容错分离）修正**: 窗口下限 100ms
+  小于 TCP 重传退避 (RTO≥200ms), 会把丢段的合法客户端误判成探测。现称 ① `preconnect_delay`,
+  对应 `tuning.client_hello_guard.preconnect_*` / `MIRAGE_CH_PRECONNECT_*`。
+- **auth-succ 时序对齐同步调整**: auth-fail 现为即时建连 (建连 RTT + 转发 RTT = 2 × cam_RTT),
+  故 auth-succ 注入量由 1 × 翻倍到 2 × cam_RTT (T5 无时序侧信道)。RTT EWMA 由每次即时建连测量维护
+  (`camouflage_rtt.rs`, 取代 `camouflage_pool.rs`)。
+- **测试**: 静默语义 (分段到达不误判 / 滴发被 hard deadline 兜底)、自适应窗口、按需建连 (触发前
+  0 连接、触发后恰好 1 条) 均有单测。端到端关闭时间对齐仍需真机复测 (见文档)。
+- **审查修复 (P2 ×2)**: ① 静默窗口初始化移出 `if let Some(tuning)` 块 —— 配置未写 `tuning` 时
+  `MIRAGE_QUIET_*` 环境变量覆盖与启动日志此前不生效; ② `MIRAGE_QUIET_MIN_MS` / `MAX_MS` 为 0 时忽略
+  (回落配置值), 防止窗口归零把所有合法 ClientHello 判为异常 (与 config `check` 的 `min_ms > 0` 一致)。
+
+### docs: 新增实机验证任务列表 `docs/real-machine-verification.md` (2026-10-06)
+
+- 汇总**所有需要真机 / 真实网络 / netns 才能完成的验证项** (单测覆盖不到的时序、内核、真实链路
+  行为), 每项给出来源、步骤与判据。首期收录: A1 T2/T3 关闭时间端到端对齐 · A2 **auth-succ 与
+  auth-fail 首字节时延差核对** · A3 `T_quiet` 参数标定 · B1–B3 探测面 (SNI/IP 对照 / 生产升级 /
+  伪装站就近) · C1–C4 内核/eBPF (TCP listener 复核 / LPM CPU 热点 / ICMP 反射) · D1–D3 传输性能
+  (UDP mux 带机量 / QUIC 不超发 / QUIC 反识别) · E1–E2 泄漏测试补全 · F1–F2 工程与供应链。
+
+### fix(transparent-udp): 网关透明 UDP 主 socket 接收缓冲加大到 4MB (2026-10-06)
+
+- 全部 LAN UDP 汇入一个主 socket, 默认 rmem (~208KB) 在高并发下溢出 (`UdpRcvbufErrors`)。改为
+  `SO_RCVBUFFORCE` 4MB (失败回落 `SO_RCVBUF`), 启动日志打印实际值。
+- 实测 (netns, A/B 各 3 轮): 主 socket 丢包每轮 1405~1776 → 0; 2000 并发数据报丢失 5.6% → 3.1%。
+  并发拐点不变 —— D1 复查确认斜坡拐点来自流翻转累积 (mux sid 槽 K×512, 60s 回收), 单级加压 2000 并发 99.5% 通过。
+
+### docs: 实机验证 C1–C3 / D1–D2 回填 (2026-10-06)
+
+- C1 TCP listener 分水岭 ✅ · C2 LPM 非热点 (12 万 pps 下 `trie_lookup_elem` 0.77%, 低于内核路由查找) → 不加 flow cache ✅ ·
+  C3 fake-IP ICMP 本地反射且 WAN 口无 ICMP ✅ (netns 三段网关拓扑)。
+- D2 QUIC 定速在无丢包链路上全部 ≤ 设定值、零队列丢弃 ✅ (netns + 实链路)。
+- D1 UDP mux 突破 pool_size (关 mux 拐点 <100, 开 mux ≈1000–1400) ✅; 但上限不是 MAX_FLOWS 4096,
+  而是网关透明 UDP socket 接收缓冲溢出 (`UdpRcvbufErrors`), 记为后续可选优化。
+
+### docs: 验证与测试交接指南 `docs/verification-handoff.md` (2026-10-06)
+
+- 面向**接手的 AI 模型 / 协作者**: §1 零成本门禁 (完整命令 + 预期/判据) · §2 本次改动的不变量 ↔
+  锁定它的测试 (含"未覆盖、必须真机验"的 I10–I12) · §3 真机项索引 (指向 real-machine-verification)
+  · §4 判据总表 · §5 结果回填模板与验证记录表 · §6 红线与陷阱 (端点护栏 / 协议冻结常量 / 本次
+  特有陷阱) · §7 文件与命令速查 · §8 交接清单。
+
+### test(tooling): 实机探测采集工具 + A3 标定度量 (2026-10-06)
+
+- 新增 `examples/probe_close_timing.rs`: 对多个 target 并发发起 `empty` (空连接) / `partial`
+  (半截 ClientHello) / `badauth` (完整但 token 错误) 三种探测, 逐条记录 `connect_ms` /
+  `first_byte_after_connect_ms` / `close_ms`, 输出 P50/P95/P99, 并对第 2..n 个 target 给出相对
+  第 1 个 (真站基线) 的 Δp50。服务 `docs/real-machine-verification.md` 的 A1 (T2/T3 关闭时间
+  对齐) 与 A2 (auth-succ vs auth-fail 首字节时延)。用法:
+  `cargo run --release --example probe_close_timing -- -t <真站>:443 -t <Mirage>:443 --count 5`。
+- `handshake.rs` 新增 opt-in 度量: 设 env `MIRAGE_QUIET_MEASURE=1` 时, 每个读完整 ClientHello 的
+  连接输出 `[QUIET-MEASURE] ch_read_us=… bytes=… authed=… quiet_us=… rtt_us=…`, 供 A3 用真实流量
+  分布标定 `tuning.client_hello_quiet` 的 min/max。默认关 (零开销)。
+
+### docs: 主动探测专项加固评估 (2026-10-05)
+
+- 新增 `docs/active-probing-assessment-2026-10.md`: 基于晚高峰观察到的疑似 GFW 主动探测, 实测探测者能否把 Mirage 与真实伪装站区分开。ServerHello 时延仅多 3–7ms (低风险); **空连接与半截 ClientHello 的关闭时间比真站提前 8–14 秒 (可区分)**, 根因是转发时使用了已存在 0–27 秒的预热连接。给出加固建议: P1 建连即预连伪装站以对齐空闲超时, P2 验证 SNI 与 IP 一致性的作用, P3 探测可观测性, P4 生产服务器升级, P5 伪装站就近。
+
 ### docs+feat: 版本兼容性矩阵、install.sh 并行迁移向导与 CI 发布版本互通测试 (2026-10-16)
 
 - **版本兼容矩阵与迁移指南**（`docs/version-compatibility.md`）：新增客户端 × 服务端版本兼容矩阵（v0.14 及更早 / v0.15.x / v0.15.2 之后），阐明 v0.15 密码学断代原因与老版本双端口平滑迁移步骤；README 同步兼容性说明与路线图状态位。

@@ -1,0 +1,217 @@
+//! Camouflage 站 RTT 估计 (原 `CamouflagePool` 的替代)。
+//!
+//! **历史与动机**: v0.4.5-alpha.7 引入 `CamouflagePool` —— 后台常驻 8 条到
+//! `camouflage_host` 的预连 TCP, 供 auth-fail / 读取异常路径即时取用, 消除"临时建连
+//! 多一个 3-way RTT"的时延侧信道。但它把**池中连接的已存在时长**继承给了真站的
+//! idle-timeout 计时: 探测者看到的关闭时间 = 真站超时 − 池龄, 实测提前 8~14 秒, 可区分
+//! (见 `docs/active-probing-assessment-2026-10.md` T2/T3); 且后台 ~0.32 conn/s 的持续
+//! churn 对伪装站表现为 bot 式定时连接。
+//!
+//! **现在 (延迟预连)**: 转发路径改为"判定要转发的那一刻即时建连"(`camouflage.rs`),
+//! 池龄恒 ≈ 0, 真站 idle 计时起点与探测者连上的时刻只差一个服务器→伪装站 RTT。
+//! 本模块只保留 **RTT 估计** —— auth-succ 分支仍需按"服务器→伪装站 RTT"注入等价抖动,
+//! 对齐 auth-fail 的时延 (T5 无时序侧信道)。样本由每次即时建连测量
+//! (`connect` 耗时 ≈ 1 RTT) 更新 EWMA; 无样本时 `rtt_us() == 0`, 调用方不注入
+//! (与旧行为一致)。
+//!
+//! **有意的副作用**: 不再有后台常驻流量打伪装站 —— 只有真实探测 / 异常才产生连接。
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// RTT EWMA 上限, 防测量毛刺注入荒谬延迟 (远 camouflage 是坏部署, 另行建议就近选)。
+const RTT_MAX_US: u64 = 1_000_000;
+
+pub struct CamouflageRtt {
+    /// 到 camouflage_host 的 RTT EWMA (微秒, 0 = 未知 / 尚无样本)。
+    rtt_us: AtomicU64,
+    /// auth-fail 路径 (即时建连模式 preconnect==0) 收到真站首字节的往返全时延 EWMA (微秒, 0 = 尚无样本)。
+    fail_latency_us: AtomicU64,
+    /// 伪装站域名**解析**耗时 EWMA (微秒, 0 = 尚无样本)。仅用于可观测/门禁:
+    /// 解析耗时会计入预连就绪时刻与 F ⇒ 直接抬高可观测 Δ (见 `resolver::keep_warm_dns`)。
+    resolve_us: AtomicU64,
+}
+
+impl CamouflageRtt {
+    /// 构造 (无后台任务; 与旧 `CamouflagePool::new` 同形状返回 `Arc` 以便调用点不变)。
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            rtt_us: AtomicU64::new(0),
+            fail_latency_us: AtomicU64::new(0),
+            resolve_us: AtomicU64::new(0),
+        })
+    }
+
+    /// 用一次即时建连的耗时 (≈ 1 RTT) 更新 EWMA (1/8 新样本), 上限防毛刺。
+    /// 只在真正发生转发/预连时被调用 —— 无探测即无样本, 无后台流量。
+    ///
+    /// 用 CAS 循环而非 `load`→`store`: 后者是读-改-写, 并发样本会互相覆盖 (丢样本)。
+    pub fn observe_connect(&self, elapsed: Duration) {
+        let rtt = (elapsed.as_micros() as u64).min(RTT_MAX_US);
+        let mut prev = self.rtt_us.load(Ordering::Relaxed);
+        loop {
+            let ewma = if prev == 0 { rtt } else { (prev * 7 + rtt) / 8 };
+            match self.rtt_us.compare_exchange_weak(
+                prev,
+                ewma,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+
+    /// 记录 auth-fail 在即时建连 (preconnect==0) 下从发起建连到收到真站首字节的全程耗时 F (微秒)。
+    /// 供 auth-succ 自校准 (Auto-Calibration) 无需 per-site 静态 offset 即可精准对齐真站。
+    pub fn observe_fail_forward(&self, elapsed_us: u64) {
+        // 上限 3s, 防假死连接污染均值
+        let sample = elapsed_us.min(3_000_000);
+        let mut prev = self.fail_latency_us.load(Ordering::Relaxed);
+        loop {
+            let ewma = if prev == 0 { sample } else { (prev * 7 + sample) / 8 };
+            match self.fail_latency_us.compare_exchange_weak(
+                prev,
+                ewma,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+
+    /// 当前估计的 camouflage_host RTT (微秒, 0 = 尚未测到)。供 auth-succ 时序对齐用。
+    pub fn rtt_us(&self) -> u64 {
+        self.rtt_us.load(Ordering::Relaxed)
+    }
+
+    /// 当前估计的 auth-fail 真站首字节回包全时延 F (微秒, 0 = 尚未测到)。
+    pub fn fail_latency_us(&self) -> u64 {
+        self.fail_latency_us.load(Ordering::Relaxed)
+    }
+
+    /// 记录一次伪装站域名解析耗时 (微秒, EWMA 1/8)。
+    /// 保活 (`resolver::keep_warm_dns`) 生效后应恒 ≈ 0; 非 0 且偏大说明解析回到了关键路径。
+    pub fn observe_resolve(&self, elapsed: Duration) {
+        let sample = (elapsed.as_micros() as u64).min(RTT_MAX_US);
+        let mut prev = self.resolve_us.load(Ordering::Relaxed);
+        loop {
+            let ewma = if prev == 0 { sample } else { (prev * 7 + sample) / 8 };
+            match self.resolve_us.compare_exchange_weak(
+                prev,
+                ewma,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(cur) => prev = cur,
+            }
+        }
+    }
+
+    /// 当前估计的伪装站域名解析耗时 (微秒, 0 = 尚无样本)。
+    pub fn resolve_us(&self) -> u64 {
+        self.resolve_us.load(Ordering::Relaxed)
+    }
+
+    /// 伪装站所有候选建连均失败 (不可达 / 故障): 复位 RTT 与 fail_latency 估计为 0。
+    /// 防"曾连通后不可达"时 auth-succ 仍按旧样本注入延迟而 auth-fail 秒回落合成模板的反向时延侧信道。
+    pub fn observe_connect_failure(&self) {
+        self.rtt_us.store(0, Ordering::Relaxed);
+        self.fail_latency_us.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ewma_tracks_and_is_reported() {
+        let r = CamouflageRtt::new();
+        assert_eq!(r.resolve_us(), 0, "无样本应为 0");
+        r.observe_resolve(Duration::from_millis(153));
+        assert_eq!(r.resolve_us(), 153_000, "首个样本直接播种");
+        r.observe_resolve(Duration::from_micros(0));
+        assert!(r.resolve_us() < 153_000, "后续小样本应把 EWMA 拉低 (缓存命中)");
+    }
+
+    #[test]
+    fn no_sample_returns_zero() {
+        let r = CamouflageRtt::new();
+        assert_eq!(r.rtt_us(), 0, "无样本应为 0 (调用方据此跳过注入)");
+    }
+
+    #[test]
+    fn first_sample_seeds_ewma() {
+        let r = CamouflageRtt::new();
+        r.observe_connect(Duration::from_millis(10));
+        assert_eq!(r.rtt_us(), 10_000, "首样本直接作为 EWMA 初值 (微秒)");
+    }
+
+    #[test]
+    fn ewma_smooths_and_stays_positive() {
+        let r = CamouflageRtt::new();
+        r.observe_connect(Duration::from_millis(10));
+        // 第 2 个样本 20ms: ewma = (10000*7 + 20000)/8 = 11250
+        r.observe_connect(Duration::from_millis(20));
+        assert_eq!(r.rtt_us(), 11_250);
+    }
+
+    #[test]
+    fn spike_is_capped() {
+        let r = CamouflageRtt::new();
+        // 5 秒毛刺 → 截到 RTT_MAX_US
+        r.observe_connect(Duration::from_secs(5));
+        assert_eq!(r.rtt_us(), RTT_MAX_US, "毛刺应被上限截断");
+    }
+
+    /// 并发更新不得丢成非法值 (CAS 循环; 旧 load→store 会互相覆盖)。
+    #[test]
+    fn concurrent_observe_stays_sane() {
+        let r = std::sync::Arc::new(CamouflageRtt::new());
+        let hs: Vec<_> = (0..8)
+            .map(|i| {
+                let r = r.clone();
+                std::thread::spawn(move || r.observe_connect(Duration::from_micros(1000 + i)))
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let v = r.rtt_us();
+        assert!(v > 0 && v <= RTT_MAX_US, "并发后应落在 (0, 上限]: {v}");
+    }
+
+    #[test]
+    fn fail_latency_ewma_tracks_and_caps() {
+        let r = CamouflageRtt::new();
+        assert_eq!(r.fail_latency_us(), 0);
+        // 首样本
+        r.observe_fail_forward(400_000);
+        assert_eq!(r.fail_latency_us(), 400_000);
+        // 平滑: (400000*7 + 480000)/8 = 410000
+        r.observe_fail_forward(480_000);
+        assert_eq!(r.fail_latency_us(), 410_000);
+        // 上限 3s 截断
+        r.observe_fail_forward(10_000_000);
+        assert!(r.fail_latency_us() <= 3_000_000);
+    }
+
+    #[test]
+    fn failure_resets_rtt_and_fail_latency() {
+        let r = CamouflageRtt::new();
+        r.observe_connect(Duration::from_millis(50));
+        r.observe_fail_forward(300_000);
+        assert!(r.rtt_us() > 0);
+        assert!(r.fail_latency_us() > 0);
+
+        r.observe_connect_failure();
+        assert_eq!(r.rtt_us(), 0, "建连全失败后应复位为 0");
+        assert_eq!(r.fail_latency_us(), 0, "建连全失败后应复位为 0");
+    }
+}

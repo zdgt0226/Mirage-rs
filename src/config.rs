@@ -1268,6 +1268,88 @@ pub struct TuningConfig {
     /// UDP mux 共享隧道条数 K (默认 4)。越大 HoL 连累面越小但占越多池位。仅 udp_mux 开时生效。
     #[serde(default = "default_udp_mux_tunnels")]
     pub udp_mux_tunnels: usize,
+    /// **服务端** ClientHello 计时与判定参数（对齐 / 容错分离）。详见
+    /// `docs/client-hello-timing-design.md`: `preconnect_*` 决定"何时推测性预连伪装站"（对齐真站
+    /// 空闲计时起点）, `judge_silence_ms` 决定"静默多久判为探测"（丢包容忍）, `hard_deadline_ms`
+    /// 是 slowloris 总兜底。不设 = `2×RTT` (clamp 100~500ms) / 1000ms / 5000ms。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hello_guard: Option<ClientHelloGuardConfig>,
+}
+
+/// 见 `TuningConfig::client_hello_guard` 与 `docs/client-hello-timing-design.md`。
+///
+/// 环境变量覆盖 (优先于 config, 供真机 A/B 调参): `MIRAGE_CH_PRECONNECT_MULT` /
+/// `MIRAGE_CH_PRECONNECT_MIN_MS` / `MIRAGE_CH_PRECONNECT_MAX_MS` / `MIRAGE_CH_JUDGE_MS` /
+/// `MIRAGE_CH_HARD_MS` / `MIRAGE_CH_AUTH_MULT_X10` / `MIRAGE_CH_AUTH_OFFSET_MS`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClientHelloGuardConfig {
+    /// 预连触发 = `preconnect_mult × 客户端 RTT`。默认 1 (Tier B)。
+    /// (ClientHello ~1786B 分 2 段背靠背发出、正常间隔 ≈ 0; 乘法只为高 RTT 链路留余量。)
+    #[serde(default = "default_preconnect_mult")]
+    pub preconnect_mult: u32,
+    /// 预连触发下限 (ms)。默认 50 (Tier B)。决定探测者看到的关闭偏差量级。
+    #[serde(default = "default_preconnect_min_ms")]
+    pub preconnect_min_ms: u64,
+    /// 预连触发上限 (ms)。默认 200 (Tier B)。
+    #[serde(default = "default_preconnect_max_ms")]
+    pub preconnect_max_ms: u64,
+    /// 静默判定期限 (ms)。默认 1000。**必须大于 TCP 重传 TLP/RTO** (≥200ms, 退避可达 800ms+),
+    /// 否则丢包的合法客户端会被判成探测。
+    #[serde(default = "default_judge_silence_ms")]
+    pub judge_silence_ms: u64,
+    /// 未认证连接总时限 (ms)。默认 5000。防滴发 slowloris。
+    #[serde(default = "default_hard_deadline_ms")]
+    pub hard_deadline_ms: u64,
+    /// auth-succ 时序注入倍率 (**×10**, 默认 20 = `2.0 × cam_RTT`)。与 `auth_succ_offset_ms`
+    /// 合起来决定 [auth-succ 相对 auth-fail 的时延对齐](#)。
+    #[serde(default = "default_auth_succ_mult_x10")]
+    pub auth_succ_mult_x10: u32,
+    /// auth-succ 时序注入的**固定偏置** (ms, 默认 0)。
+    ///
+    /// **实测依据** (见 Phase-6 验证与 `docs/plan-phase6-dns-optimization.md`):
+    /// 早期曾测得 auth-fail 比纯倍率多约 100ms，后经 Phase-5/6 诊断证实该 100ms 实质为
+    /// **DNS 关键路径解析阻塞** (S1 解析耗时 153ms) 污染所致。
+    /// 在伪装站 DNS 常青保活 (`keep_warm_dns`) 且排除解析耗时后，真实边缘处理时延
+    /// `P_edge = F - cam_rtt ≈ 1~4ms` (S1 4.2ms, S3 1.4ms)。若叠加 +100ms offset 会导致
+    /// auth-succ 比真实失败路径虚高 ~99ms (造成可区分正偏)。
+    /// 因此默认翻转为 0，保留 2.0× 纯倍率 (`2×cam_rtt ≈ 5~6ms` vs 真实 `F ≈ 7.5ms`，
+    /// 残差仅 ~1.5ms，完全落入网络抖动安全区间)。
+    ///
+    /// **仅当 `auto_calibrate = false` 时生效**。auto 开时: 有 F 样本用实测 F;
+    /// 冷启动时直接用纯倍率 (不加 offset)。
+    #[serde(default = "default_auth_succ_offset_ms")]
+    pub auth_succ_offset_ms: u64,
+    /// 自校准: 用实测的 auth-fail 全程耗时 F 的 EWMA 作为 auth-succ 注入基准（取代静态
+    /// `mult×cam_RTT + offset`）。默认 true。
+    #[serde(default = "default_auto_calibrate")]
+    pub auto_calibrate: bool,
+}
+
+pub(crate) fn default_auto_calibrate() -> bool {
+    true
+}
+
+pub(crate) fn default_auth_succ_mult_x10() -> u32 {
+    20
+}
+pub(crate) fn default_auth_succ_offset_ms() -> u64 {
+    0
+}
+
+pub(crate) fn default_preconnect_mult() -> u32 {
+    1
+}
+pub(crate) fn default_preconnect_min_ms() -> u64 {
+    50
+}
+pub(crate) fn default_preconnect_max_ms() -> u64 {
+    200
+}
+fn default_judge_silence_ms() -> u64 {
+    1000
+}
+fn default_hard_deadline_ms() -> u64 {
+    5000
 }
 
 fn default_udp_mux_tunnels() -> usize {
@@ -1861,6 +1943,57 @@ impl Config {
             }
         }
 
+        // tuning.client_hello_guard (ClientHello 计时/判定): 参数反转或过小会让它失效。
+        if let Some(q) = self.tuning.as_ref().and_then(|t| t.client_hello_guard.as_ref()) {
+            if q.preconnect_mult == 0 {
+                issues.push("tuning.client_hello_guard.preconnect_mult 不能为 0 (触发 = mult × RTT)".to_string());
+            }
+            if q.preconnect_min_ms == 0 || q.preconnect_min_ms > q.preconnect_max_ms {
+                issues.push(format!(
+                    "tuning.client_hello_guard 的 preconnect_min_ms={} / preconnect_max_ms={} 非法 (需 0 < min <= max)",
+                    q.preconnect_min_ms, q.preconnect_max_ms
+                ));
+            }
+            if q.preconnect_max_ms > 5_000 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.preconnect_max_ms={} 过大 (>5000): 探测偏差会随之放大",
+                    q.preconnect_max_ms
+                ));
+            }
+            if q.judge_silence_ms < 200 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.judge_silence_ms={} 过小 (<200ms): 小于 TCP 最小 RTO, \
+                     丢包重传的合法客户端会被判成探测 (静默窗口不必再为对齐让步, 建议 >=1000)",
+                    q.judge_silence_ms
+                ));
+            }
+            if q.hard_deadline_ms < q.judge_silence_ms {
+                issues.push(format!(
+                    "tuning.client_hello_guard 的 hard_deadline_ms={} < judge_silence_ms={} (总时限不能短于静默期限)",
+                    q.hard_deadline_ms, q.judge_silence_ms
+                ));
+            }
+            if q.hard_deadline_ms > 60_000 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.hard_deadline_ms={} 过大 (>60000): 未认证连接可被拖很久",
+                    q.hard_deadline_ms
+                ));
+            }
+            // auth-succ 时序注入: 倍率 0 或过大都无意义; 偏置过大则每条合法握手都被拖慢。
+            if q.auth_succ_mult_x10 == 0 || q.auth_succ_mult_x10 > 100 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.auth_succ_mult_x10={} 非法 (需 1..=100, 即 0.1×~10× cam_RTT)",
+                    q.auth_succ_mult_x10
+                ));
+            }
+            if q.auth_succ_offset_ms > 2_000 {
+                issues.push(format!(
+                    "tuning.client_hello_guard.auth_succ_offset_ms={} 过大 (>2000): 每条合法握手都会被拖慢",
+                    q.auth_succ_offset_ms
+                ));
+            }
+        }
+
         issues
     }
 }
@@ -2337,6 +2470,68 @@ mod validation_tests {
                             "password": "sspw", "method": "chacha20-ietf-poly1305" } }
         ]);
         assert!(issues_of(&v).is_empty(), "合法上游配置不该报问题: {:?}", issues_of(&v));
+    }
+
+    #[test]
+    fn client_hello_guard_params_validated() {
+        // 不写该字段: 无 issue。
+        let mut v = base();
+        v["tuning"] = serde_json::json!({});
+        assert!(!has(&issues_of(&v), "client_hello_guard"), "不写不该报: {:?}", issues_of(&v));
+
+        // 合法值: 无 issue + 字段真解析到 (防漂移)。
+        v["tuning"] = serde_json::json!({
+            "client_hello_guard": {
+                "preconnect_mult": 3, "preconnect_min_ms": 50, "preconnect_max_ms": 2000,
+                "judge_silence_ms": 1500, "hard_deadline_ms": 6000,
+                "auth_succ_mult_x10": 25, "auth_succ_offset_ms": 100
+            }
+        });
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        let q = cfg.tuning.unwrap().client_hello_guard.expect("字段应真解析到 (防漂移)");
+        assert_eq!(
+            (q.preconnect_mult, q.preconnect_min_ms, q.preconnect_max_ms, q.judge_silence_ms, q.hard_deadline_ms),
+            (3, 50, 2000, 1500, 6000)
+        );
+        assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (25, 100));
+        assert!(q.auto_calibrate);
+        assert!(!has(&issues, "client_hello_guard"), "合法值不该报: {issues:?}");
+
+        // 不写新字段时用实测默认 (2.0× + 100ms, Tier B: 1× 50~200ms, auto_calibrate=true)。
+        v["tuning"] = serde_json::json!({ "client_hello_guard": {} });
+        let (cfg, _) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
+        assert_eq!(
+            (q.preconnect_mult, q.preconnect_min_ms, q.preconnect_max_ms),
+            (1, 50, 200),
+            "默认应为 Tier B: 1×, 50~200ms"
+        );
+        assert_eq!((q.auth_succ_mult_x10, q.auth_succ_offset_ms), (20, 0), "默认应为 2.0× + 0ms");
+        assert!(q.auto_calibrate, "默认应为 true");
+
+        // 显式关闭 auto_calibrate: false
+        v["tuning"] = serde_json::json!({ "client_hello_guard": { "auto_calibrate": false } });
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        let q = cfg.tuning.unwrap().client_hello_guard.unwrap();
+        assert!(!q.auto_calibrate);
+        assert!(!has(&issues, "client_hello_guard"), "auto_calibrate=false 不应报错误: {issues:?}");
+
+        // 非法值 → 均报。
+        for bad in [
+            serde_json::json!({ "preconnect_mult": 0 }),
+            serde_json::json!({ "preconnect_min_ms": 0 }),
+            serde_json::json!({ "preconnect_min_ms": 800, "preconnect_max_ms": 100 }),
+            serde_json::json!({ "preconnect_max_ms": 9000 }),
+            serde_json::json!({ "judge_silence_ms": 100 }),
+            serde_json::json!({ "judge_silence_ms": 3000, "hard_deadline_ms": 1000 }),
+            serde_json::json!({ "hard_deadline_ms": 90_000 }),
+            serde_json::json!({ "auth_succ_mult_x10": 0 }),
+            serde_json::json!({ "auth_succ_mult_x10": 101 }),
+            serde_json::json!({ "auth_succ_offset_ms": 5000 }),
+        ] {
+            v["tuning"] = serde_json::json!({ "client_hello_guard": bad });
+            assert!(has(&issues_of(&v), "client_hello_guard"), "非法 {bad} 应报: {:?}", issues_of(&v));
+        }
     }
 
     #[test]

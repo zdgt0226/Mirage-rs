@@ -145,6 +145,52 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
         }
 
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
+            // ClientHello 计时/判定参数 (服务端; 见 docs/client-hello-timing-design.md)。
+            // 环境变量 MIRAGE_CH_* 优先覆盖 (真机 A/B 调参)。放在 tuning 块外:
+            // 配置未写 tuning 时 env 覆盖与启动日志同样生效。
+            {
+                let q = config.tuning.as_ref().and_then(|t| t.client_hello_guard.as_ref());
+                let mult = q.map(|q| q.preconnect_mult).unwrap_or_else(crate::config::default_preconnect_mult);
+                let pc_min = std::time::Duration::from_millis(
+                    q.map(|q| q.preconnect_min_ms).unwrap_or_else(crate::config::default_preconnect_min_ms),
+                );
+                let pc_max = std::time::Duration::from_millis(
+                    q.map(|q| q.preconnect_max_ms).unwrap_or_else(crate::config::default_preconnect_max_ms),
+                );
+                let judge = std::time::Duration::from_millis(q.map(|q| q.judge_silence_ms).unwrap_or(1000));
+                let hard = std::time::Duration::from_millis(q.map(|q| q.hard_deadline_ms).unwrap_or(5000));
+                let auth_mult = q.map(|q| q.auth_succ_mult_x10).unwrap_or_else(crate::config::default_auth_succ_mult_x10);
+                let auth_off = std::time::Duration::from_millis(
+                    q.map(|q| q.auth_succ_offset_ms).unwrap_or_else(crate::config::default_auth_succ_offset_ms),
+                );
+                let auto = q.map(|q| q.auto_calibrate).unwrap_or_else(crate::config::default_auto_calibrate);
+                crate::proxy::mirage_server::set_client_hello_guard(
+                    mult, pc_min, pc_max, judge, hard, auth_mult, auth_off, auto,
+                );
+                let (m, lo, hi, j, h, am, ao, ac) = crate::proxy::mirage_server::client_hello_guard_params();
+                info!(
+                    "ClientHello 守卫: 预连 {}×RTT (clamp {}~{}ms) · 静默判定 {}ms · 总时限 {}ms · \
+                     auth-succ 注入 {}.{}×cam_RTT+{}ms · 自校准={} (MIRAGE_CH_* 可覆盖)",
+                    m, lo, hi, j, h, am / 10, am % 10, ao, if ac { "on" } else { "off" }
+                );
+                if ac {
+                    info!(
+                        "自校准已开: 有 F 样本→注入 F; 冷启动(尚无 F 样本)→纯倍率 {}.{}×cam_RTT, 不加 offset",
+                        am / 10,
+                        am % 10
+                    );
+                } else {
+                    warn!(
+                        "ClientHello 守卫未启用自校准 (auto_calibrate=false): auth-succ 注入用静态公式 \
+                         {}.{}×cam_RTT+{}ms。其固定偏置 P 是按某一伪装站实测定档的, 换节点/换伪装站后 \
+                         Δ 会残留该节点的 P 偏差 (两节点 P 的 95% CI 实测不相交) → 建议开 \
+                         tuning.client_hello_guard.auto_calibrate 或 MIRAGE_CH_AUTO_CALIBRATE=1。",
+                        am / 10,
+                        am % 10,
+                        ao
+                    );
+                }
+            }
             if let Some(tuning) = config.tuning {
                 // 服务端 cipher agility 开关 (设进全局, control.rs 读)。
                 crate::crypto::cipher::set_server_cipher_agility(tuning.cipher_agility);
