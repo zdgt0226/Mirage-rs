@@ -799,6 +799,265 @@ except Exception:
     fi
 }
 
+# ── 并行迁移: 老版本 (< v0.15.0) 保持运行, 新版本部署到另一端口 ──
+migrate_parallel_v15() {
+    local lv=$1 rv=${2:-}
+    title "Mirage-rs 跨版本并行迁移部署"
+
+    local old_cfg="" is_lite=false old_port=""
+    if [[ -f "${ETC_DIR}/config_server.json" ]]; then
+        old_cfg="${ETC_DIR}/config_server.json"
+        old_port=$(json_get "$old_cfg" port)
+    elif [[ -f "${ETC_DIR}/lite_server.json" ]]; then
+        old_cfg="${ETC_DIR}/lite_server.json"
+        is_lite=true
+        old_port=$(json_get "$old_cfg" port)
+    fi
+    [[ -z "$old_port" ]] && old_port="443"
+    info "检测到老版本服务监听端口: ${old_port} (老服务将保持运行)"
+
+    # 寻找默认未占用的候选端口
+    local p suggested_port=""
+    for p in 9443 8443 8444 10443 20443 30443; do
+        if [[ "$p" != "$old_port" ]] && ! port_in_use "$p" tcp; then
+            suggested_port="$p"
+            break
+        fi
+    done
+    [[ -z "$suggested_port" ]] && suggested_port="9443"
+
+    local new_port
+    new_port=$(ask_port "新版本监听端口" "$suggested_port" tcp)
+
+    # 下载新版本二进制到独立路径
+    local new_bin="/usr/local/bin/mirage-rs-v15"
+    local tmp_bin
+    tmp_bin=$(mktemp "${new_bin}.new.XXXXXX")
+    info "下载新版本二进制 (${rv:-最新版})..."
+    if ! fetch_release_binary "$tmp_bin"; then
+        rm -f "$tmp_bin"
+        err "下载失败，老版本服务未受任何影响。"
+    fi
+    chmod 755 "$tmp_bin"
+    mv -f "$tmp_bin" "$new_bin"
+    ok "新版本二进制已就绪: ${new_bin}"
+
+    # 生成新版本配置文件
+    local new_cfg="${ETC_DIR}/config_server_v15.json"
+    if [[ "$is_lite" == true ]]; then
+        new_cfg="${ETC_DIR}/lite_server_v15.json"
+    fi
+
+    if [[ -f "$old_cfg" ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            OLD_CFG="$old_cfg" NEW_CFG="$new_cfg" NEW_PORT="$new_port" python3 -c '
+import json, os
+old_cfg = os.environ["OLD_CFG"]
+new_cfg = os.environ["NEW_CFG"]
+new_port = int(os.environ["NEW_PORT"])
+try:
+    with open(old_cfg, "r") as f:
+        d = json.load(f)
+    if "inbounds" in d and len(d["inbounds"]) > 0:
+        d["inbounds"][0]["port"] = new_port
+    if "port" in d:
+        d["port"] = new_port
+    if "log_file" in d:
+        d["log_file"] = "/var/log/mirage-rs/server_v15.log"
+    if "gui" in d and isinstance(d["gui"], dict) and d["gui"].get("enabled"):
+        listen = d["gui"].get("listen", "")
+        if ":" in listen:
+            addr, port = listen.rsplit(":", 1)
+            try:
+                d["gui"]["listen"] = f"{addr}:{int(port)+1}"
+            except ValueError:
+                pass
+        if "stats_persist_path" in d["gui"]:
+            d["gui"]["stats_persist_path"] = "/var/lib/mirage-rs/stats_server_v15.json"
+    with open(new_cfg, "w") as f:
+        json.dump(d, f, indent=4)
+except Exception:
+    import shutil
+    shutil.copyfile(old_cfg, new_cfg)
+'
+        else
+            cp "$old_cfg" "$new_cfg"
+            sed -i -E "s/\"port\"[[:space:]]*:[[:space:]]*[0-9]+/\"port\": ${new_port}/" "$new_cfg"
+        fi
+        chmod 600 "$new_cfg"
+        ok "新版本配置已创建: ${new_cfg}"
+    else
+        warn "未找到老版本配置，请使用新端口手动配置 ${new_cfg}"
+    fi
+
+    local subcmd="server"
+    local old_svc_name="mirage-rs-server"
+    if [[ "$is_lite" == true ]]; then
+        subcmd="lite-server"
+        old_svc_name="mirage-rs-lite-server"
+    fi
+
+    # 注册并启动新版本独立服务
+    case "$INIT_SYS" in
+        systemd)
+            local unit_path="/etc/systemd/system/mirage-rs-server-v15.service"
+            cat > "$unit_path" <<EOF
+[Unit]
+Description=Mirage-rs High-Performance Proxy (server v15 parallel)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=${STATE_DIR}
+ExecStart=${new_bin} ${subcmd} -c ${new_cfg}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable --now mirage-rs-server-v15 2>/dev/null || true
+            ;;
+        openrc)
+            local rc_path="/etc/init.d/mirage-rs-server-v15"
+            cat > "$rc_path" <<EOF
+#!/sbin/openrc-run
+description="Mirage-rs Proxy (server v15 parallel)"
+supervisor=supervise-daemon
+command="${new_bin}"
+command_args="${subcmd} -c ${new_cfg}"
+directory="${STATE_DIR}"
+output_log="${LOG_DIR}/server_v15.log"
+error_log="${LOG_DIR}/server_v15.log"
+EOF
+            chmod 755 "$rc_path"
+            rc-update add mirage-rs-server-v15 default 2>/dev/null || true
+            rc-service mirage-rs-server-v15 start 2>/dev/null || true
+            ;;
+        sysvinit)
+            local init_path="/etc/init.d/mirage-rs-server-v15"
+            cat > "$init_path" <<EOF
+#!/bin/sh
+# chkconfig: 2345 20 80
+# description: Mirage-rs Proxy (server v15 parallel)
+### BEGIN INIT INFO
+# Provides:          mirage-rs-server-v15
+# Required-Start:    \$network \$remote_fs
+# Required-Stop:     \$network \$remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Mirage-rs Proxy (server v15 parallel)
+### END INIT INFO
+
+NAME="mirage-rs-server-v15"
+BIN="${new_bin}"
+ARGS="${subcmd} -c ${new_cfg}"
+PIDFILE="/var/run/mirage-rs-server-v15.pid"
+LOGFILE="${LOG_DIR}/server_v15.log"
+WORKDIR="${STATE_DIR}"
+
+is_running() {
+    [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE" 2>/dev/null)" 2>/dev/null
+}
+
+start() {
+    if is_running; then echo "\$NAME already running (pid \$(cat "\$PIDFILE"))"; return 0; fi
+    echo "Starting \$NAME..."
+    cd "\$WORKDIR" 2>/dev/null || true
+    ulimit -n 1048576 2>/dev/null || true
+    ulimit -l unlimited 2>/dev/null || true
+    nohup "\$BIN" \$ARGS >> "\$LOGFILE" 2>&1 &
+    echo \$! > "\$PIDFILE"
+    sleep 1
+    if is_running; then echo "\$NAME started (pid \$(cat "\$PIDFILE"))"; else
+        echo "\$NAME failed to start, see \$LOGFILE"; rm -f "\$PIDFILE"; return 1; fi
+}
+
+stop() {
+    if ! is_running; then echo "\$NAME not running"; rm -f "\$PIDFILE"; return 0; fi
+    echo "Stopping \$NAME..."
+    kill "\$(cat "\$PIDFILE")" 2>/dev/null
+    i=0; while is_running && [ \$i -lt 5 ]; do sleep 1; i=\$((i+1)); done
+    is_running && kill -9 "\$(cat "\$PIDFILE")" 2>/dev/null
+    rm -f "\$PIDFILE"
+    echo "\$NAME stopped"
+}
+
+case "\$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)  if is_running; then echo "\$NAME running (pid \$(cat "\$PIDFILE"))"; else echo "\$NAME stopped"; exit 3; fi ;;
+    *)       echo "Usage: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+EOF
+            chmod 755 "$init_path"
+            if command -v update-rc.d >/dev/null 2>&1; then
+                update-rc.d mirage-rs-server-v15 defaults >/dev/null 2>&1 || true
+            elif command -v chkconfig >/dev/null 2>&1; then
+                chkconfig --add mirage-rs-server-v15 >/dev/null 2>&1 || true
+                chkconfig mirage-rs-server-v15 on >/dev/null 2>&1 || true
+            else
+                warn "无 update-rc.d/chkconfig, 已装 init 脚本但未注册开机自启。"
+            fi
+            service mirage-rs-server-v15 start 2>/dev/null || "$init_path" start 2>/dev/null || true
+            ;;
+        *)
+            info "未识别 init 系统，可前台运行: ${new_bin} ${subcmd} -c ${new_cfg}"
+            ;;
+    esac
+
+    ok "新版本服务部署完成并尝试启动 (端口: ${new_port})"
+    info "老版本服务 (${old_svc_name}, 端口: ${old_port}) 保持运行中"
+    warn "请在防火墙 / 云安全组放行新端口: ${new_port} (TCP；用 QUIC 传输时还需 UDP)"
+
+    # 打印迁移步骤与停老服务命令
+    title "🎉 并行迁移部署完成"
+    cat >&2 <<EOM
+  ======================================================================
+  已完成新版本并行部署！当前服务状态：
+    - 老版本服务: 端口 ${old_port} (保持运行，现有客户端不受影响)
+    - 新版本服务: 端口 ${new_port} (已启动，供 ≥ v0.15 客户端接入)
+
+  【防火墙 / 云安全组配置】
+  请在防火墙 / 云安全组放行新端口 ${new_port}（TCP；用 QUIC 传输时还需 UDP）。
+
+  【平滑迁移步骤】
+  1. 升级客户端：
+     将所有客户端（PC、网关及 Android App）升级至最新版 (≥ v0.15)。
+  2. 切换连接端口：
+     将客户端节点配置中的连接端口修改为新端口: ${new_port}。
+  3. 逐台验证：
+     确认所有客户端在新端口上连接与转发正常。
+  4. 停用老版本服务：
+     全部客户端换新完毕后，执行以下命令停用并禁用老版本服务：
+EOM
+    case "$INIT_SYS" in
+        systemd)
+            echo "       systemctl stop ${old_svc_name} && systemctl disable ${old_svc_name}" >&2
+            ;;
+        openrc)
+            echo "       rc-service ${old_svc_name} stop && rc-update del ${old_svc_name} default" >&2
+            ;;
+        sysvinit)
+            echo "       service ${old_svc_name} stop && chkconfig ${old_svc_name} off" >&2
+            ;;
+        *)
+            echo "       killall mirage-rs" >&2
+            ;;
+    esac
+    cat >&2 <<'EOM'
+
+  5. （可选）换回原端口：
+     停用老服务后，若希望新服务换回原端口，可修改
+     新版配置文件中的端口为原端口并重启新服务。
+  ======================================================================
+EOM
+}
+
 # ── 二进制更新: 识别本地版本 → 对比仓库版本 → 校验下载 → 原子替换 → 重启活动服务 ──
 update_binary() {
     title "Mirage-rs 二进制更新"
@@ -839,6 +1098,32 @@ update_binary() {
                 warn "本地版本 ($lv) 似乎比仓库 ($rv) 更新 (开发构建?)。"
             fi
             ask_yn "确认更新到 ${rv:-仓库版本} ?" y || { info "已取消更新。"; return; }
+        fi
+    fi
+
+    # 检测从 < v0.15.0 升级到 ≥ v0.15.0 的协议断代升级 (本机 < v0.15.0 且目标未知或目标 ≥ v0.15.0)
+    if [[ -n "$lv" ]] && ! version_ge "${lv#v}" "0.15.0" && { [[ -z "$rv" ]] || version_ge "${rv#v}" "0.15.0"; }; then
+        warn "⚠️ 检测到本机已安装的 mirage 版本 ($lv) < v0.15.0"
+        warn "协议不兼容，所有客户端（含 Android）必须同步升级到 ≥ v0.15"
+        if [[ -t 0 || -t 1 ]] && [[ -r /dev/tty ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ "${DEBIAN_FRONTEND:-}" != "noninteractive" ]]; then
+            local mig_choice
+            mig_choice=$(ask_choice "检测到老版本升级，请选择升级方案" \
+                "原地升级 (继续现有流程，停用老服务并替换)" \
+                "并行迁移 (新版装到另一端口，老服务保持运行)" \
+                "取消更新")
+            case "$mig_choice" in
+                1)
+                    info "选择原地升级，继续现有流程..."
+                    ;;
+                2)
+                    migrate_parallel_v15 "$lv" "$rv"
+                    return 0
+                    ;;
+                3)
+                    info "已取消更新。"
+                    return 0
+                    ;;
+            esac
         fi
     fi
 

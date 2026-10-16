@@ -193,6 +193,8 @@ impl UserLimitHandle {
             .compare_exchange(cur_start, expected_start, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
+            // 新版 Rust 将 fetch_update 改名 try_update 并标记弃用; 保留旧名以兼容旧工具链。
+            #[allow(deprecated)]
             let _ = self.period_used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| Some(u.saturating_sub(old_used)));
             self.reevaluate_exhausted();
             info!(

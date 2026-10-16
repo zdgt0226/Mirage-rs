@@ -1,5 +1,7 @@
 # Changelog - Mirage-rs
 
+## [Unreleased]
+
 ### feat(anti-probing): 默认翻转补全（offset 0ms）+ 移除 F 播种负收益 + R3 双模式交替复测全绿 (2026-10-15)
 
 - **R1 默认翻转补全**（`config.rs::default_auth_succ_offset_ms` 100→0, `handshake.rs::AUTH_OFFSET_US`=0）：
@@ -213,6 +215,17 @@
 ### docs: 主动探测专项加固评估 (2026-10-05)
 
 - 新增 `docs/active-probing-assessment-2026-10.md`: 基于晚高峰观察到的疑似 GFW 主动探测, 实测探测者能否把 Mirage 与真实伪装站区分开。ServerHello 时延仅多 3–7ms (低风险); **空连接与半截 ClientHello 的关闭时间比真站提前 8–14 秒 (可区分)**, 根因是转发时使用了已存在 0–27 秒的预热连接。给出加固建议: P1 建连即预连伪装站以对齐空闲超时, P2 验证 SNI 与 IP 一致性的作用, P3 探测可观测性, P4 生产服务器升级, P5 伪装站就近。
+
+### docs+feat: 版本兼容性矩阵、install.sh 并行迁移向导与 CI 发布版本互通测试 (2026-10-16)
+
+- **版本兼容矩阵与迁移指南**（`docs/version-compatibility.md`）：新增客户端 × 服务端版本兼容矩阵（v0.14 及更早 / v0.15.x / v0.15.2 之后），阐明 v0.15 密码学断代原因与老版本双端口平滑迁移步骤；README 同步兼容性说明与路线图状态位。
+- **install.sh 升级向导加固**：检测到本机 mirage 版本 < v0.15.0 时提示协议不兼容与客户端同步升级警告；提供原地升级、新端口并行迁移（老服务保持运行、新版独立配置与服务、打印后续迁移与下线老服务命令）及取消选项；非交互模式保持默认行为并记录警告。
+- **CI 跨版本互通兼容性测试**（`scripts/interop-prev-release.sh` & `.github/workflows/build.yml`）：自动拉取上一个已发布 Release 的客户端二进制（校验 SHA256SUMS），与当前源码构建服务端在 127.0.0.1 回环经 SOCKS 穿透下载多兆字节文件 3 次，全量校验文件尺寸与哈希一致性；CI 中作为独立 job 门禁运行。
+
+### fix(ci): rustls 升级修复 4 个安全公告 + 适配新版 Rust 弃用告警 (2026-10-16)
+
+- `rustls` 0.23.45 → 0.23.46：修复 RUSTSEC-2026-0346 / 0347 / 0348 / 0349（cargo-deny 门禁报红）。
+- `src/proxy/user_limits.rs`：新版 Rust 将 `AtomicU64::fetch_update` 改名 `try_update` 并标记弃用，CI 的 `-D warnings` 因此报错；该处加 `#[allow(deprecated)]`，保留旧名以兼容旧工具链。
 
 ### docs: 多版本实测对比 (v0.5 → v0.15.2) + 测试路径说明 (2026-10-05)
 
