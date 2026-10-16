@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### fix(api): 非本机监听且未配 token 时补上 DNS rebinding 防护 (2026-10-17)
+
+- 此前仅 `gui.listen` 为回环地址时校验 Host; 监听 `0.0.0.0` / LAN IP 且未配 `gui.token` 时完全不校验, 恶意网页可经 DNS rebinding 借局域网访问者的浏览器读写配置与用户。
+- 现在未配 token 时一律校验: 回环监听保持原有严格白名单; 非回环监听额外放行任意 IP 字面量 Host (LAN IP 管理不受影响), 域名 Host 返回 403。用主机名访问需配 `gui.token` (install.sh 选「全网开放」已自动生成)。
+- 新增单测 `rebinding_host_ok_by_listen_scope`。
+
 ## [v0.15.3] - 服务端主动探测加固 + 版本兼容矩阵与迁移向导 + rustls 安全更新 (2026-10-16)
 
 ### 升级须知
