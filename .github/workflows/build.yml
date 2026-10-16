@@ -185,3 +185,22 @@ jobs:
         name: mirage-jni-so
         path: jniLibs/**/*.so
         if-no-files-found: error
+
+  # 跨版本互通兼容性: 上一个已发布 Release 客户端 ↔ 当前源码构建服务端
+  interop-prev-release:
+    name: 跨版本兼容性 (老客户端 ↔ 当前源码服务端)
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check no real endpoints or hardcoded secrets
+      run: bash scripts/check-no-real-endpoints.sh
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev linux-headers-generic
+    - name: Build server binary
+      run: cargo build --release --bin mirage
+    - name: Run interop test with previous release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: bash scripts/interop-prev-release.sh
+

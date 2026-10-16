@@ -11,7 +11,7 @@
 > - 🔴 **v0.15 协议断代 (BREAKING)**: 握手 token 与会话密钥派生已升级 (token 绑定 `ClientHello.random`、
 >   会话密钥混入服务端新鲜随机数, 堵住会话重放; 修复 cipher agility 协商 ChaCha 时的 nonce 复用)。
 >   **与 v0.14 及更早的服务端/客户端 (含 Android 客户端) 互不兼容, 必须两端同时升级**, 否则认证失败。
->   不提供兼容开关。设计与论证见 `docs/protocol-freshness-design.md`。
+>   不提供兼容开关。详细版本兼容矩阵与平滑迁移步骤见 [`docs/version-compatibility.md`](docs/version-compatibility.md)；设计与论证见 [`docs/protocol-freshness-design.md`](docs/protocol-freshness-design.md)。
 > - **未经专业安全审计**。加密分帧 (ChaCha20-Poly1305) 与握手认证由项目自研, 仅经过多轮 LLM
 >   复核与真机验证, **没有**独立安全公司审计。请据此评估信任度, 不要用于生命安全级场景。
 > - **前向保密 (PFS) 可选, 默认关**: 默认会话密钥由**共享口令 + 双方随机数**派生 (v0.15 起服务端贡献
@@ -429,6 +429,7 @@ mirage-rs config -c config.json
 
 ### 评估后决定不做（避免重复提）
 
+- **v1/v2 协议版本开关 / 兼容旧协议** —— v0.15 断代彻底消除会话重放与新鲜度隐患；v0.15.2 之后的改动只涉及服务端行为优化，线上协议完全一致（已实测互通）；老版本走并行端口迁移（详见 [`docs/version-compatibility.md`](docs/version-compatibility.md)），不在新代码保留双重协议栈技术债
 - **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
 - **TLS session resumption 仿真** —— 抓包 + 统计实测证明: 真 Chrome 的 `legacy_session_id` 也每次全新随机, 我们与之不可区分, 立项前提不成立
 - **追平 sing-box 全部协议/规则** —— 定位是零配置 eBPF 网关, 不是通用代理框架
@@ -438,7 +439,7 @@ mirage-rs config -c config.json
 
 ## 📜 版本迭代概览 (Changelog)
 
-Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`](CHANGELOG.md)。
+Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`](CHANGELOG.md)，跨版本兼容矩阵与迁移步骤请参阅 [`docs/version-compatibility.md`](docs/version-compatibility.md)。
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
