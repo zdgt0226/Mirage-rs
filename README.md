@@ -307,7 +307,8 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 > **务必设 `gui.token`** —— 看板能读日志/配置**并可视化改路由规则**, 无鉴权暴露 = 任何可达者
 > 都能把你的流量重定向。设了之后 `/api/*` 需带 token (`Authorization: Bearer <token>` /
 > `mirage_token` cookie / `?token=`, 常量时间校验防时序侧信道)。install.sh 选「全网开放」会自动
-> 生成随机 token 并打印。不设仍可用 (向后兼容), 但非本机暴露时会 WARN。生产建议叠 Nginx TLS。
+> 生成随机 token 并打印。不设仍可用 (向后兼容), 但非本机暴露时会 WARN, 且只能用 IP 地址或
+> `localhost` 访问 (用域名/主机名访问会被 403, 防 DNS rebinding)。生产建议叠 Nginx TLS。
 
 > **出向 UDP 被封的 VPS**: 系统 `getaddrinfo` (glibc) 默认用 **UDP:53** 查 DNS, 封了 UDP
 > 就解析不了代理目标域名 (代理域名全挂)。加 `"tuning": {"dns_tcp_resolver": "1.1.1.1"}` 让

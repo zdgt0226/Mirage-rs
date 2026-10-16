@@ -148,11 +148,27 @@ pub(crate) fn is_valid_host(host_header: &str, listen_ip: Option<std::net::IpAdd
     false
 }
 
+/// 未配 token 时的 DNS rebinding 判定 (纯函数, 便于单测)。
+/// - 监听 loopback: Host 必须是本机 (localhost / 回环 / 监听 IP), 与旧行为一致。
+/// - 监听非 loopback (含 0.0.0.0 / ::): 额外放行任意 **IP 字面量** Host —— 管理员用 LAN IP 访问照常可用;
+///   DNS rebinding 必然经攻击者域名, Host 是域名而非 IP 字面量, 因此被拦。用主机名访问需配 gui.token。
+pub(crate) fn rebinding_host_ok(host_header: &str, listen_ip: Option<std::net::IpAddr>) -> bool {
+    if is_valid_host(host_header, listen_ip) {
+        return true;
+    }
+    let loopback_bind = listen_ip.is_some_and(|ip| ip.is_loopback());
+    if loopback_bind {
+        return false;
+    }
+    let raw = extract_host_part(host_header);
+    raw.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_ok()
+}
+
 /// 鉴权 + CSRF + DNS Rebinding 防护中间件。
-/// - **DNS Rebinding**: 未配 gui.token 且监听 loopback (默认部署) 时, 严格校验 Host header 主机部分为
-///   本机 (localhost / 127.0.0.1 / [::1] / 监听 IP), 否则 403 (包括 GET)。不校验的话, 恶意网页让
-///   evil.tld 解析到 127.0.0.1 后 Host 与 Origin 都是 evil.tld, same_origin 被直接绕过 → 读日志/配置、
-///   改路由/用户。非 loopback 监听不做此校验 (见 auth_mw 内注释)。
+/// - **DNS Rebinding**: 未配 gui.token 时校验 Host header (见 `rebinding_host_ok`), 否则 403 (包括 GET)。
+///   不校验的话, 恶意网页让 evil.tld 解析到网关地址后 Host 与 Origin 都是 evil.tld, same_origin 被直接
+///   绕过 → 借访问者浏览器读日志/配置、改路由/用户。非 loopback 监听同样要防: 没有 rebinding 时远程网页
+///   够不到 LAN 上的 API, 有了就能。
 /// - **鉴权**: gui.token 设了才拦, 校验 Authorization/cookie/query 任一; 配了 token 时 Host
 ///   header 校验免除 (信任持有合法 token 的请求)。未配 token 时放行合法本机访问。
 /// - **CSRF** (方案 B): 变更方法 (POST/PUT/DELETE/PATCH) 且**非 Bearer-header 认证**时, 要求同源
@@ -164,21 +180,18 @@ async fn auth_mw(
     req: Request,
     next: Next,
 ) -> Response {
-    // 0. DNS Rebinding 防护: 未配 token 且**监听在 loopback** 时, 所有请求 (含 GET) 的 Host 必须是本机。
-    //    只对 loopback 生效: 非 loopback 无 token 本就对 LAN 直接敞开 (启动已告警), rebinding 不增加攻击面,
-    //    而那种部署下管理员用 LAN IP/主机名访问, 强校验只会误伤。
-    let loopback_bind = app.gui_listen_ip.is_some_and(|ip| ip.is_loopback());
-    if app.gui_token.is_none() && loopback_bind {
+    // 0. DNS Rebinding 防护: 未配 token 时, 所有请求 (含 GET) 的 Host 须通过 `rebinding_host_ok`。
+    if app.gui_token.is_none() {
         let host = req
             .headers()
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .or_else(|| req.uri().authority().map(|a| a.as_str()));
-        let host_ok = host.map(|h| is_valid_host(h, app.gui_listen_ip)).unwrap_or(false);
+        let host_ok = host.map(|h| rebinding_host_ok(h, app.gui_listen_ip)).unwrap_or(false);
         if !host_ok {
             return (
                 StatusCode::FORBIDDEN,
-                "dns-rebinding: request host not permitted without api token (must be localhost / loopback / listen IP)",
+                "dns-rebinding: request host not permitted without api token (use localhost / an IP address, or set gui.token)",
             )
                 .into_response();
         }
@@ -568,5 +581,31 @@ mod tests {
         assert!(!is_valid_host("localhost.attacker.com:9090", None));
         assert!(!is_valid_host("1.2.3.4:9090", None));
         assert!(!is_valid_host("", None));
+    }
+
+    #[test]
+    fn rebinding_host_ok_by_listen_scope() {
+        let lo: Option<std::net::IpAddr> = Some("127.0.0.1".parse().unwrap());
+        let any4: Option<std::net::IpAddr> = Some("0.0.0.0".parse().unwrap());
+        let any6: Option<std::net::IpAddr> = Some("::".parse().unwrap());
+        let lan: Option<std::net::IpAddr> = Some("192.0.2.10".parse().unwrap());
+
+        // loopback 监听: 维持严格本机校验, 其他 IP 字面量也拒
+        assert!(rebinding_host_ok("localhost:9090", lo));
+        assert!(rebinding_host_ok("127.0.0.1:9090", lo));
+        assert!(!rebinding_host_ok("192.0.2.10:9090", lo));
+        assert!(!rebinding_host_ok("evil.example:9090", lo));
+
+        // 非 loopback 监听: IP 字面量放行 (LAN 管理), 域名拒 (rebinding)
+        for l in [any4, any6, lan] {
+            assert!(rebinding_host_ok("192.0.2.10:9090", l));
+            assert!(rebinding_host_ok("198.51.100.7", l));
+            assert!(rebinding_host_ok("[2001:db8::1]:9090", l));
+            assert!(rebinding_host_ok("localhost", l));
+            assert!(!rebinding_host_ok("evil.example", l));
+            assert!(!rebinding_host_ok("evil.example:9090", l));
+            assert!(!rebinding_host_ok("192.0.2.10.evil.example", l));
+            assert!(!rebinding_host_ok("", l));
+        }
     }
 }
