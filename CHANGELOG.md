@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [v0.15.3] - 服务端主动探测加固 + 版本兼容矩阵与迁移向导 + rustls 安全更新 (2026-10-16)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.0 ~ v0.15.2 两端完全互通, 可单端升级 (CI 跨版本兼容性 job 已验证 v0.15.2 客户端 ↔ 本版服务端); Android 端无需同步。
+- 服务端新增可选调参项 `tuning.client_hello_guard`, 不配置即用默认值; 详见下方条目。
+- `rustls` 升至 0.23.46, 修复 RUSTSEC-2026-0346 ~ 0349。
+- 仍在 v0.14 及更早版本的部署: 见 `docs/version-compatibility.md` 与 `install.sh` 的并行迁移选项。
+
 ### feat(anti-probing): 默认翻转补全（offset 0ms）+ 移除 F 播种负收益 + R3 双模式交替复测全绿 (2026-10-15)
 
 - **R1 默认翻转补全**（`config.rs::default_auth_succ_offset_ms` 100→0, `handshake.rs::AUTH_OFFSET_US`=0）：
