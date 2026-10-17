@@ -19,9 +19,23 @@ use super::super::state::AppState;
 use super::super::{config_version, err_resp};
 use super::profiles::DryQuery;
 
-/// 找第一个 type=mirage_server 的入站 (下标)。多用户凭据挂在服务端入站上。
-fn find_mirage_server(inbounds: &[Value]) -> Option<usize> {
-    inbounds.iter().position(|ib| ib.get("type").and_then(|t| t.as_str()) == Some("mirage_server"))
+/// 全部 type=mirage_server 入站的下标。多用户凭据挂在服务端入站上, 每个入站各自认证,
+/// 所以用户管理必须覆盖全部入站 —— 只改第一个时, 删用户 / 改口令在其他入站上不生效。
+fn mirage_server_indices(inbounds: &[Value]) -> Vec<usize> {
+    inbounds
+        .iter()
+        .enumerate()
+        .filter(|(_, ib)| ib.get("type").and_then(|t| t.as_str()) == Some("mirage_server"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn inbound_tag(ib: &Value) -> &str {
+    ib.get("tag").and_then(|t| t.as_str()).unwrap_or("")
+}
+
+fn user_named<'a>(users: &'a [Value], name: &str) -> Option<&'a Value> {
+    users.iter().find(|u| u.get("name").and_then(|n| n.as_str()) == Some(name))
 }
 
 #[derive(Default, Clone, Copy)]
@@ -43,25 +57,34 @@ pub async fn get_users(State(app_state): State<AppState>) -> Response {
     // 配置里的用户名: "default" (主密码) + mirage_server.users[].name。**不取 password**。
     let mut names: Vec<String> = vec!["default".to_string()];
     let mut config_limits: std::collections::HashMap<String, UserConfigLimits> = std::collections::HashMap::new();
+    // 跨全部 mirage_server 入站合并: 按首次出现排序; 限额取首个出现处 (与限额注册表的"先出现者为准"一致);
+    // 记下每个用户所在的入站 tag。
+    let mut user_inbounds: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut all_tags: Vec<String> = Vec::new();
     if let Some(arr) = v.get("inbounds").and_then(|i| i.as_array()) {
-        if let Some(idx) = find_mirage_server(arr) {
-            if let Some(users) = arr[idx].get("users").and_then(|u| u.as_array()) {
-                for u in users {
-                    if let Some(n) = u.get("name").and_then(|n| n.as_str()) {
-                        names.push(n.to_string());
-                        let kbps = u.get("rate_limit_kbps").and_then(|x| x.as_u64());
-                        let quota = u.get("quota_gb").and_then(|x| x.as_f64());
-                        let rday = u.get("quota_reset_day").and_then(|x| x.as_u64()).map(|d| d as u8);
-                        config_limits.insert(n.to_string(), UserConfigLimits {
-                            rate_limit_kbps: kbps,
-                            quota_gb: quota,
-                            quota_reset_day: rday,
-                        });
-                    }
+        for idx in mirage_server_indices(arr) {
+            let tag = inbound_tag(&arr[idx]).to_string();
+            all_tags.push(tag.clone());
+            let Some(users) = arr[idx].get("users").and_then(|u| u.as_array()) else { continue };
+            for u in users {
+                let Some(n) = u.get("name").and_then(|n| n.as_str()) else { continue };
+                user_inbounds.entry(n.to_string()).or_default().push(tag.clone());
+                if config_limits.contains_key(n) {
+                    continue;
                 }
+                names.push(n.to_string());
+                let kbps = u.get("rate_limit_kbps").and_then(|x| x.as_u64());
+                let quota = u.get("quota_gb").and_then(|x| x.as_f64());
+                let rday = u.get("quota_reset_day").and_then(|x| x.as_u64()).map(|d| d as u8);
+                config_limits.insert(n.to_string(), UserConfigLimits {
+                    rate_limit_kbps: kbps,
+                    quota_gb: quota,
+                    quota_reset_day: rday,
+                });
             }
         }
     }
+    user_inbounds.insert("default".to_string(), all_tags);
 
     // 用量 (per-user 统计) → 按 name 索引。
     let usage: std::collections::HashMap<String, crate::monitor::UserStat> =
@@ -87,6 +110,7 @@ pub async fn get_users(State(app_state): State<AppState>) -> Response {
             "down": down,
             "active": active,
             "in_config": true,
+            "inbounds": user_inbounds.get(name).cloned().unwrap_or_default(),
             "rate_limit_kbps": limits.rate_limit_kbps,
             "quota_gb": limits.quota_gb,
             "quota_reset_day": limits.quota_reset_day,
@@ -105,6 +129,7 @@ pub async fn get_users(State(app_state): State<AppState>) -> Response {
                 "down": s.down,
                 "active": s.active,
                 "in_config": false,
+                "inbounds": Vec::<String>::new(),
                 "rate_limit_kbps": None::<u64>,
                 "quota_gb": None::<f64>,
                 "quota_reset_day": None::<u8>,
@@ -125,19 +150,35 @@ pub async fn get_users(State(app_state): State<AppState>) -> Response {
 
 /// 一条用户操作。**op-based (增量) 而非整表替换** —— 因为 GET 不回显 password, 前端拿不到
 /// 既有用户的密码, 无法做整表替换 (会把未改用户的密码清空)。故只发变更: 增/改密/删/改限额/清配额。
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 pub struct UserOp {
     /// "upsert" (增或改密, 需 password) | "remove" (删, 忽略 password) | "set_limits" (设限速/配额) | "reset_quota" (清本周期用量)
     pub action: String,
     pub name: String,
     #[serde(default)]
     pub password: Option<String>,
-    #[serde(default)]
+    /// 限额字段: `None` = 请求里没出现 (set_limits 保留原值); `Some(Null)` = 显式 null (清空);
+    /// `Some(数字)` = 设置。用 `present` 反序列化, 否则 serde 会把 null 也读成 None, 两者无法区分。
+    #[serde(default, deserialize_with = "present")]
     pub rate_limit_kbps: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     pub quota_gb: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present")]
     pub quota_reset_day: Option<Value>,
+    /// 只作用于该 tag 的 mirage_server 入站; 不传 = 作用于全部 mirage_server 入站。
+    #[serde(default)]
+    pub inbound: Option<String>,
+}
+
+/// 字段出现即 `Some(值)` (含 `Some(Null)`); 缺省由 `#[serde(default)]` 给 `None`。
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+impl UserOp {
+    fn has_limit_fields(&self) -> bool {
+        self.rate_limit_kbps.is_some() || self.quota_gb.is_some() || self.quota_reset_day.is_some()
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -150,7 +191,7 @@ pub struct UpdateReq {
 
 /// 对当前 users 数组应用增量操作。纯函数 (无 IO), 便于单测。Err = (错误码, 消息)。
 /// 保留名 "default" (主密码) 拒绝; upsert 需非空 password (存在则改密, 否则新增); remove 按名删。
-/// set_limits 设置或清空限额与配额; reset_quota 仅校验用户存在, 不改 config 中的 users 数组。
+/// set_limits 局部更新限额 (未传保留 / null 清空); upsert 带限额字段报错; reset_quota 仅校验用户存在, 不改 config。
 /// 结果的 name 唯一/非空/密码非空由上层 semantic_issues 兜底校验 (此处只挡明显的 op 级错误)。
 fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'static str, String)> {
     for op in ops {
@@ -159,6 +200,12 @@ fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'sta
         }
         match op.action.as_str() {
             "upsert" => {
+                if op.has_limit_fields() {
+                    return Err((
+                        "limits_not_allowed",
+                        format!("upsert 只设置口令; 用户 `{}` 的限速/配额请用 set_limits 设置 (可放在同一请求的后一个 op)", op.name),
+                    ));
+                }
                 let pw = op.password.clone().unwrap_or_default();
                 if pw.is_empty() {
                     return Err(("empty_password", format!("user `{}` 的 password 为空", op.name)));
@@ -175,9 +222,10 @@ fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'sta
                 };
                 let map = user_obj.as_object_mut().ok_or(("invalid_user", "用户结构非 JSON 对象".into()))?;
 
-                // rate_limit_kbps: None 或 Null 则清空; 数字 > 0 则更新; <= 0 或非数字则报错
+                // 局部更新: 未传保留; null 清空; 数字 > 0 则更新; <= 0 或非数字则报错
                 match &op.rate_limit_kbps {
-                    None | Some(Value::Null) => {
+                    None => {} // 未传: 保留原值
+                    Some(Value::Null) => {
                         map.remove("rate_limit_kbps");
                     }
                     Some(Value::Number(n)) => {
@@ -193,9 +241,10 @@ fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'sta
                     Some(_) => return Err(("invalid_limit", format!("user `{}` 的 rate_limit_kbps 非法", op.name))),
                 }
 
-                // quota_gb: None 或 Null 则清空; 数字 > 0 则更新; <= 0 或非数字则报错
+                // quota_gb: 未传保留; null 清空; 有限正数则更新; 其它报错
                 match &op.quota_gb {
-                    None | Some(Value::Null) => {
+                    None => {} // 未传: 保留原值
+                    Some(Value::Null) => {
                         map.remove("quota_gb");
                     }
                     Some(Value::Number(n)) => {
@@ -211,9 +260,10 @@ fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'sta
                     Some(_) => return Err(("invalid_limit", format!("user `{}` 的 quota_gb 非法", op.name))),
                 }
 
-                // quota_reset_day: None 或 Null 则清空; 1..=28 则更新; 其它则报错
+                // quota_reset_day: 未传保留; null 清空; 1..=28 则更新; 其它报错
                 match &op.quota_reset_day {
-                    None | Some(Value::Null) => {
+                    None => {} // 未传: 保留原值
+                    Some(Value::Null) => {
                         map.remove("quota_reset_day");
                     }
                     Some(Value::Number(n)) => {
@@ -240,6 +290,56 @@ fn apply_ops(mut users: Vec<Value>, ops: &[UserOp]) -> Result<Vec<Value>, (&'sta
     Ok(users)
 }
 
+/// 把 ops 应用到 mirage_server 入站的 `users[]` (纯函数, 便于单测)。
+/// - `op.inbound` 不传 = 全部 mirage_server 入站; 传了 = 只该 tag 的入站 (不存在 → `unknown_inbound`)。
+/// - upsert / remove: 对每个目标入站都生效, 保证口令与成员在各入站一致。
+/// - set_limits / reset_quota: 只作用于含该用户的目标入站; 都不含 → `user_not_found`。
+/// - 某入站结果未变 (如对没有 users 的入站执行 remove) 时不写入, 避免凭空加 `"users": []`。
+fn apply_ops_inbounds(inbounds: &mut [Value], ops: &[UserOp]) -> Result<(), (&'static str, String)> {
+    let idxs = mirage_server_indices(inbounds);
+    if idxs.is_empty() {
+        return Err(("no_mirage_server", "当前配置无 mirage_server 入站, 无处挂多用户凭据".into()));
+    }
+    for op in ops {
+        if op.name == "default" {
+            return Err(("reserved_name", "保留名 `default` 是主密码, 不通过 /api/users 管理".into()));
+        }
+        if !matches!(op.action.as_str(), "upsert" | "remove" | "set_limits" | "reset_quota") {
+            return Err(("bad_op", format!("未知操作 `{}` (仅 upsert/remove/set_limits/reset_quota)", op.action)));
+        }
+        let targets: Vec<usize> = match &op.inbound {
+            None => idxs.clone(),
+            Some(t) => {
+                let v: Vec<usize> = idxs.iter().copied().filter(|&i| inbound_tag(&inbounds[i]) == t).collect();
+                if v.is_empty() {
+                    return Err(("unknown_inbound", format!("不存在 tag 为 `{t}` 的 mirage_server 入站")));
+                }
+                v
+            }
+        };
+        let needs_user = matches!(op.action.as_str(), "set_limits" | "reset_quota");
+        let mut applied = false;
+        for i in targets {
+            let ib = inbounds[i]
+                .as_object_mut()
+                .ok_or(("corrupt_config", "mirage_server 入站非对象".to_string()))?;
+            let cur: Vec<Value> = ib.get("users").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+            if needs_user && user_named(&cur, &op.name).is_none() {
+                continue;
+            }
+            let next = apply_ops(cur.clone(), std::slice::from_ref(op))?;
+            applied = true;
+            if next != cur {
+                ib.insert("users".to_string(), Value::Array(next));
+            }
+        }
+        if needs_user && !applied {
+            return Err(("user_not_found", format!("user `{}` 不存在", op.name)));
+        }
+    }
+    Ok(())
+}
+
 pub async fn update_users(
     State(app_state): State<AppState>,
     Query(q): Query<DryQuery>,
@@ -261,20 +361,11 @@ pub async fn update_users(
     let Some(inbounds) = v.get_mut("inbounds").and_then(|i| i.as_array_mut()) else {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "corrupt_config", "当前配置缺少 inbounds", vec![]);
     };
-    let Some(idx) = find_mirage_server(inbounds) else {
-        return err_resp(StatusCode::UNPROCESSABLE_ENTITY, "no_mirage_server", "当前配置无 mirage_server 入站, 无处挂多用户凭据", vec![]);
-    };
-    let Some(ib) = inbounds[idx].as_object_mut() else {
-        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "corrupt_config", "mirage_server 入站非对象", vec![]);
-    };
-
-    // 取当前 users 数组 (缺则空), 应用增量操作 —— 不需要既有密码。
-    let cur: Vec<Value> = ib.get("users").and_then(|u| u.as_array()).cloned().unwrap_or_default();
-    let users = match apply_ops(cur, &req.ops) {
-        Ok(u) => u,
-        Err((code, msg)) => return err_resp(StatusCode::UNPROCESSABLE_ENTITY, code, msg, vec![]),
-    };
-    ib.insert("users".to_string(), Value::Array(users));
+    // 对全部 mirage_server 入站应用增量操作 —— 不需要既有密码。
+    if let Err((code, msg)) = apply_ops_inbounds(inbounds, &req.ops) {
+        let status = if code == "corrupt_config" { StatusCode::INTERNAL_SERVER_ERROR } else { StatusCode::UNPROCESSABLE_ENTITY };
+        return err_resp(status, code, msg, vec![]);
+    }
 
     let Ok(candidate) = serde_json::to_string_pretty(&v) else {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "serialize_error", "候选配置序列化失败", vec![]);
@@ -348,6 +439,7 @@ mod tests {
             rate_limit_kbps: None,
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         }
     }
     fn names(v: &[Value]) -> Vec<String> {
@@ -392,25 +484,124 @@ mod tests {
             rate_limit_kbps: Some(json!(1000)),
             quota_gb: Some(json!(50.5)),
             quota_reset_day: Some(json!(15)),
+            inbound: None,
         };
         let u = apply_ops(start, &[op_set]).unwrap();
         assert_eq!(u[0]["rate_limit_kbps"], 1000);
         assert_eq!(u[0]["quota_gb"], 50.5);
         assert_eq!(u[0]["quota_reset_day"], 15);
 
-        // 清空
-        let op_clear = UserOp {
+        // 局部: 显式 null 清空, 未传保留
+        let op_partial = UserOp {
             action: "set_limits".into(),
             name: "alice".into(),
-            password: None,
             rate_limit_kbps: Some(Value::Null),
-            quota_gb: None,
             quota_reset_day: Some(Value::Null),
+            ..Default::default()
         };
-        let u2 = apply_ops(u, &[op_clear]).unwrap();
-        assert!(u2[0].get("rate_limit_kbps").is_none());
-        assert!(u2[0].get("quota_gb").is_none());
-        assert!(u2[0].get("quota_reset_day").is_none());
+        let u2 = apply_ops(u, &[op_partial]).unwrap();
+        assert!(u2[0].get("rate_limit_kbps").is_none(), "null 应清空");
+        assert!(u2[0].get("quota_reset_day").is_none(), "null 应清空");
+        assert_eq!(u2[0]["quota_gb"], 50.5, "未传的字段应保留原值");
+
+        // 只改一项, 其余保留
+        let op_one = UserOp {
+            action: "set_limits".into(),
+            name: "alice".into(),
+            quota_gb: Some(json!(80)),
+            ..Default::default()
+        };
+        let u3 = apply_ops(u2, &[op_one]).unwrap();
+        assert_eq!(u3[0]["quota_gb"], 80.0);
+        assert!(u3[0].get("rate_limit_kbps").is_none());
+    }
+
+    #[test]
+    fn op_json_distinguishes_missing_and_null() {
+        let a: UserOp = serde_json::from_str(r#"{"action":"set_limits","name":"x","quota_gb":null}"#).unwrap();
+        assert_eq!(a.quota_gb, Some(Value::Null), "显式 null 应保留为 Some(Null)");
+        assert_eq!(a.rate_limit_kbps, None, "未传应为 None");
+    }
+
+    #[test]
+    fn upsert_with_limit_fields_rejected() {
+        let op_bad = UserOp {
+            action: "upsert".into(),
+            name: "alice".into(),
+            password: Some("p".into()),
+            quota_gb: Some(json!(10)),
+            ..Default::default()
+        };
+        assert_eq!(apply_ops(vec![], &[op_bad]).unwrap_err().0, "limits_not_allowed");
+        // 显式 null 也算"带了"限额字段
+        let op_null: UserOp = serde_json::from_str(r#"{"action":"upsert","name":"a","password":"p","rate_limit_kbps":null}"#).unwrap();
+        assert_eq!(apply_ops(vec![], &[op_null]).unwrap_err().0, "limits_not_allowed");
+    }
+
+    fn two_inbounds() -> Vec<Value> {
+        vec![
+            json!({"type":"mirage_server","tag":"tcp","users":[{"name":"alice","password":"pa"}]}),
+            json!({"type":"mixed","tag":"m"}),
+            json!({"type":"mirage_server","tag":"quic","users":[{"name":"alice","password":"pa"},{"name":"bob","password":"pb"}]}),
+        ]
+    }
+    fn users_of(ibs: &[Value], i: usize) -> Vec<String> {
+        ibs[i].get("users").and_then(|u| u.as_array()).map(|a| names(a)).unwrap_or_default()
+    }
+
+    #[test]
+    fn ops_apply_to_all_mirage_server_inbounds_by_default() {
+        // 改口令: 两个入站都改
+        let mut ibs = two_inbounds();
+        apply_ops_inbounds(&mut ibs, &[op("upsert", "alice", Some("new"))]).unwrap();
+        assert_eq!(ibs[0]["users"][0]["password"], "new");
+        assert_eq!(ibs[2]["users"][0]["password"], "new");
+        assert!(ibs[1].get("users").is_none(), "非 mirage_server 入站不动");
+
+        // 删用户: 两个入站都删
+        apply_ops_inbounds(&mut ibs, &[op("remove", "alice", None)]).unwrap();
+        assert_eq!(users_of(&ibs, 0), Vec::<String>::new());
+        assert_eq!(users_of(&ibs, 2), vec!["bob"]);
+
+        // 新增: 两个入站都加
+        apply_ops_inbounds(&mut ibs, &[op("upsert", "carol", Some("pc"))]).unwrap();
+        assert_eq!(users_of(&ibs, 0), vec!["carol"]);
+        assert_eq!(users_of(&ibs, 2), vec!["bob", "carol"]);
+    }
+
+    #[test]
+    fn ops_with_inbound_tag_and_partial_presence() {
+        // 指定入站: 只改该入站
+        let mut ibs = two_inbounds();
+        let mut o = op("upsert", "dave", Some("pd"));
+        o.inbound = Some("quic".into());
+        apply_ops_inbounds(&mut ibs, &[o]).unwrap();
+        assert_eq!(users_of(&ibs, 0), vec!["alice"]);
+        assert_eq!(users_of(&ibs, 2), vec!["alice", "bob", "dave"]);
+
+        // 不存在的 tag
+        let mut o = op("remove", "alice", None);
+        o.inbound = Some("nope".into());
+        assert_eq!(apply_ops_inbounds(&mut ibs, &[o]).unwrap_err().0, "unknown_inbound");
+
+        // set_limits 只作用于含该用户的入站 (bob 只在 quic)
+        let lim = UserOp { action: "set_limits".into(), name: "bob".into(), quota_gb: Some(json!(5)), ..Default::default() };
+        apply_ops_inbounds(&mut ibs, &[lim]).unwrap();
+        assert_eq!(ibs[2]["users"][1]["quota_gb"], 5.0);
+        assert!(user_named(ibs[0]["users"].as_array().unwrap(), "bob").is_none(), "不应在 tcp 入站凭空建出 bob");
+
+        // 所有入站都没有该用户 → user_not_found
+        let lim = UserOp { action: "set_limits".into(), name: "ghost".into(), quota_gb: Some(json!(5)), ..Default::default() };
+        assert_eq!(apply_ops_inbounds(&mut ibs, &[lim]).unwrap_err().0, "user_not_found");
+
+        // 对没有 users 键的入站执行 remove 不写入空数组
+        let mut ibs2 = vec![json!({"type":"mirage_server","tag":"a"})];
+        apply_ops_inbounds(&mut ibs2, &[op("remove", "x", None)]).unwrap();
+        assert!(ibs2[0].get("users").is_none());
+
+        // 无 mirage_server 入站
+        let mut none = vec![json!({"type":"mixed","tag":"m"})];
+        assert_eq!(apply_ops_inbounds(&mut none, &[op("remove", "x", None)]).unwrap_err().0, "no_mirage_server");
     }
 
     #[test]
@@ -423,6 +614,7 @@ mod tests {
             rate_limit_kbps: Some(json!(100)),
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         };
         assert_eq!(apply_ops(vec![], &[op_def]).unwrap_err().0, "reserved_name");
 
@@ -433,6 +625,7 @@ mod tests {
             rate_limit_kbps: None,
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         };
         assert_eq!(apply_ops(vec![], &[op_rq_def]).unwrap_err().0, "reserved_name");
 
@@ -444,6 +637,7 @@ mod tests {
             rate_limit_kbps: Some(json!(100)),
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         };
         assert_eq!(apply_ops(vec![], &[op_no]).unwrap_err().0, "user_not_found");
 
@@ -454,6 +648,7 @@ mod tests {
             rate_limit_kbps: None,
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         };
         assert_eq!(apply_ops(vec![], &[op_rq_no]).unwrap_err().0, "user_not_found");
     }
@@ -470,6 +665,7 @@ mod tests {
             rate_limit_kbps: Some(json!(0)),
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         };
         assert_eq!(apply_ops(start.clone(), &[op_zero_kbps]).unwrap_err().0, "invalid_limit");
 
@@ -481,6 +677,7 @@ mod tests {
             rate_limit_kbps: None,
             quota_gb: Some(json!(0.0)),
             quota_reset_day: None,
+            inbound: None,
         };
         assert_eq!(apply_ops(start.clone(), &[op_zero_q]).unwrap_err().0, "invalid_limit");
 
@@ -492,6 +689,7 @@ mod tests {
             rate_limit_kbps: None,
             quota_gb: None,
             quota_reset_day: Some(json!(29)),
+            inbound: None,
         };
         assert_eq!(apply_ops(start.clone(), &[op_bad_day]).unwrap_err().0, "invalid_limit");
     }
@@ -506,6 +704,7 @@ mod tests {
             rate_limit_kbps: None,
             quota_gb: None,
             quota_reset_day: None,
+            inbound: None,
         };
         let u = apply_ops(start.clone(), &[op_rq]).unwrap();
         assert_eq!(u, start, "reset_quota 不修改 config 中的 users 结构");
@@ -592,6 +791,7 @@ mod tests {
                 rate_limit_kbps: None,
                 quota_gb: None,
                 quota_reset_day: None,
+                inbound: None,
             }],
         };
         let resp = update_users(State(app_state.clone()), Query(q_dry), Json(req_reset.clone())).await;
@@ -673,7 +873,7 @@ mod tests {
             gui_listen_ip: None,
         };
 
-        // 1. set_limits 修改 alice 的限额: 即使两入站限额不一致, 仍应成功 (200), 且 issues 含提示
+        // 1. 只改 srv1 的 alice 限额 (指定入站): 两入站限额不一致, 仍应成功 (200), 且 issues 含提示
         let req_set = UpdateReq {
             version: None,
             ops: vec![UserOp {
@@ -683,6 +883,7 @@ mod tests {
                 rate_limit_kbps: Some(serde_json::json!(5000)),
                 quota_gb: None,
                 quota_reset_day: None,
+                inbound: Some("srv1".into()),
             }],
         };
         let resp = update_users(State(app_state.clone()), Query(DryQuery { dry_run: false }), Json(req_set)).await;
@@ -702,10 +903,40 @@ mod tests {
                 rate_limit_kbps: None,
                 quota_gb: None,
                 quota_reset_day: None,
+                inbound: None,
             }],
         };
         let resp_dup = update_users(State(app_state.clone()), Query(DryQuery { dry_run: false }), Json(req_dup_pw)).await;
         assert_eq!(resp_dup.status(), StatusCode::UNPROCESSABLE_ENTITY, "重复口令应返回 422");
+
+        // 3. 不指定入站的 set_limits 同步到两个入站 → 限额一致, 不再有不一致提示
+        let req_all = UpdateReq {
+            version: None,
+            ops: vec![UserOp {
+                action: "set_limits".into(),
+                name: "alice".into(),
+                rate_limit_kbps: Some(serde_json::json!(3000)),
+                ..Default::default()
+            }],
+        };
+        let resp = update_users(State(app_state.clone()), Query(DryQuery { dry_run: false }), Json(req_all)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let issues = body.get("issues").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+        assert!(!issues.iter().any(|i| i.as_str().unwrap_or("").contains("限额配置与入站")), "同步后不应再不一致: {issues:?}");
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg_file).unwrap()).unwrap();
+        assert_eq!(written["inbounds"][0]["users"][0]["rate_limit_kbps"], 3000);
+        assert_eq!(written["inbounds"][1]["users"][0]["rate_limit_kbps"], 3000);
+
+        // 4. GET 合并两个入站, 并标出 alice 所在入站
+        let resp = get_users(State(app_state.clone())).await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let users = body["users"].as_array().unwrap();
+        let alice: Vec<&serde_json::Value> = users.iter().filter(|u| u["name"] == "alice").collect();
+        assert_eq!(alice.len(), 1, "跨入站同名用户只列一次");
+        assert_eq!(alice[0]["inbounds"], serde_json::json!(["srv1", "srv2"]));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

@@ -91,7 +91,9 @@
 > rules/profiles 两端点共用 `config.json` + 同名 `.tmp`, 后端已用 `CONFIG_WRITE_LOCK` 串行化, 前端并发保存安全。
 
 ### 4.5 用户管理 (多用户 / 限速 / 配额, 服务端)
-- **GET `/api/users`** → `{ users: [ { name, conns, up, down, active, in_config, rate_limit_kbps, quota_gb, quota_reset_day, period_used_bytes, period_start, exhausted } ] }`
+- **GET `/api/users`** → `{ users: [ { name, conns, up, down, active, in_config, inbounds, rate_limit_kbps, quota_gb, quota_reset_day, period_used_bytes, period_start, exhausted } ] }`
+  - 合并**全部** `mirage_server` 入站的用户, 同名用户只列一次; 限额取首个出现的入站。
+  - `inbounds`: 该用户所在的 `mirage_server` 入站 tag 列表 (`default` = 全部入站; 已从配置删除的历史用户为空)。
   - 绝不返回 password。
   - `name`: 用户名 (`default` 为主口令用户)。
   - `rate_limit_kbps`: 限速 (kbps), `null` 表示不限速。
@@ -101,11 +103,12 @@
   - `period_start`: 当前配额周期的起始 Unix 时间戳 (秒, UTC)。
   - `exhausted`: 当前是否已超额。超额新握手伪装回落, 存量连接即刻断开。
 - **POST `/api/users`** `{ ops: [ UserOp... ], version?: u64 }` (`?dry_run=true` 只校验不写) → 写响应 (成功 `{ status: "success", written: true, issues: [...], version }`)
-  - `UserOp = { action, name, password?, rate_limit_kbps?, quota_gb?, quota_reset_day? }`, `action` 取值:
-  - `upsert`: `{ action: "upsert", name, password }` — 新增用户, 或修改已有用户的口令 (需 password)。
+  - `UserOp = { action, name, password?, rate_limit_kbps?, quota_gb?, quota_reset_day?, inbound? }`, `action` 取值:
+  - **作用范围**: 不传 `inbound` = 作用于**全部** `mirage_server` 入站 (各入站口令 / 成员 / 限额保持一致, 删用户与改口令在所有入站同时生效); 传 `inbound: "<tag>"` = 只作用于该入站 (tag 不存在 → 422 `unknown_inbound`)。
+  - `upsert`: `{ action: "upsert", name, password }` — 新增用户, 或修改已有用户的口令 (需 password)。**不接受限额字段** (带了任一限额字段, 含 `null` → 422 `limits_not_allowed`); 要带限额创建用户, 在同一请求里紧跟一个 `set_limits`。
   - `remove`: `{ action: "remove", name }` — 删除用户。
   - `set_limits`: `{ action: "set_limits", name, rate_limit_kbps?, quota_gb?, quota_reset_day? }` — 设置限速与月度配额。
-    **三个字段整体替换**: 某字段不传或传 `null` 即清空该限制, 所以修改时须把三个字段的最终值一起发 (未改的也要带当前值)。
+    **局部更新**: 字段**不传 = 保留原值**; 传 `null` = 清空该限制; 传数字 = 设置。只作用于含该用户的目标入站, 都不含 → 422 `user_not_found`。
     取值: `rate_limit_kbps` >0 整数; `quota_gb` >0 有限数; `quota_reset_day` 1..=28 整数。走现有配置原子写 + 热重载。
   - `reset_quota`: `{ action: "reset_quota", name }` — 清零该用户本周期用量与超额状态, 立即落盘, **不改动 config 文件**。
   - 保留名 `default` (主口令用户) 不接受任何操作; 非法值 / 不存在的用户 → 422。

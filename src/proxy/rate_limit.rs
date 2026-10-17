@@ -139,6 +139,9 @@ pub struct RateLimiter {
     cidrs: Vec<(IpNet, u64)>,
     /// 源 IP → 共享桶 (懒建)。
     live: Mutex<HashMap<IpAddr, LiveBucketEntry>>,
+    /// 表满且所有条目都有活跃连接时, 新 IP 按命中网段共用的溢出桶 (速率 = 该网段限速)。
+    /// 不挤掉别人的活跃条目: 否则被挤掉的 IP 下个连接拿新桶, 与旧连接的旧桶各算各的 → 速率翻倍。
+    overflow: Mutex<HashMap<IpNet, Arc<DeviceBuckets>>>,
 }
 
 impl RateLimiter {
@@ -160,7 +163,35 @@ impl RateLimiter {
                 }
             }
         }
-        Self { cidrs, live: Mutex::new(HashMap::new()) }
+        Self { cidrs, live: Mutex::new(HashMap::new()), overflow: Mutex::new(HashMap::new()) }
+    }
+
+    /// 热重载用: 按新配置建, 并沿用旧限速器里**限速未变**的活跃桶 (与用户配额热重载同理)。
+    ///
+    /// 桶在连接建立时取得; 若热重载换成全新的表, 已有连接留着旧桶、新连接拿新桶, 同一 IP 两个桶各自放行
+    /// → 速率翻倍, 且每次热重载再叠一代。限速变了的 IP 才换新桶 (其已有连接按旧速率跑到断开)。
+    pub fn rebuild_from(dps: &[crate::config::DeviceProfile], old: Option<&RateLimiter>) -> Self {
+        let new = Self::from_device_profiles(dps);
+        let Some(old) = old else { return new };
+        {
+            let old_live = old.live.lock().unwrap_or_else(|e| e.into_inner());
+            let mut live = new.live.lock().unwrap_or_else(|e| e.into_inner());
+            for (ip, e) in old_live.iter() {
+                if new.resolve(*ip).is_some_and(|(_, r)| e.buckets.up.rate as u64 == r) {
+                    live.insert(*ip, LiveBucketEntry { buckets: e.buckets.clone(), last: e.last });
+                }
+            }
+        }
+        {
+            let old_of = old.overflow.lock().unwrap_or_else(|e| e.into_inner());
+            let mut of = new.overflow.lock().unwrap_or_else(|e| e.into_inner());
+            for (net, b) in old_of.iter() {
+                if new.cidrs.iter().any(|(n, r)| n == net && b.up.rate as u64 == *r) {
+                    of.insert(*net, b.clone());
+                }
+            }
+        }
+        new
     }
 
     /// 全局无任何限速配置 → 可在热路径上直接跳过。
@@ -169,9 +200,9 @@ impl RateLimiter {
         self.cidrs.is_empty()
     }
 
-    /// 源 IP 命中的限速 (bytes/s); 未命中 → None。首个匹配网段生效。
-    fn resolve(&self, ip: IpAddr) -> Option<u64> {
-        self.cidrs.iter().find(|(net, _)| net.contains(&ip)).map(|(_, r)| *r)
+    /// 源 IP 命中的 (网段, 限速 bytes/s); 未命中 → None。首个匹配网段生效。
+    fn resolve(&self, ip: IpAddr) -> Option<(IpNet, u64)> {
+        self.cidrs.iter().find(|(net, _)| net.contains(&ip)).copied()
     }
 
     /// 取某源 IP 的共享桶对; 该 IP 无限速配置 → None (调用方跳过整形)。
@@ -179,7 +210,7 @@ impl RateLimiter {
         if self.cidrs.is_empty() {
             return None;
         }
-        let rate = self.resolve(ip)?;
+        let (net, rate) = self.resolve(ip)?;
         let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
@@ -189,18 +220,22 @@ impl RateLimiter {
         }
 
         if live.len() >= RATE_LIMIT_CAP {
-            // 满 + 新 IP: 优先淘汰无活跃连接 (strong_count <= 1) 中最久未活跃的一条;
-            // 若全部都在活跃连接中, 则淘汰最久未活跃的一条。
+            // 满 + 新 IP: 只淘汰无活跃连接 (strong_count <= 1, 仅表本身持有) 中最久未活跃的一条。
+            // 全部都有活跃连接时不挤掉任何条目, 新 IP 改用该网段的溢出共享桶 (偏严: 只会更慢, 不会超限)。
             let evict_key = live
                 .iter()
                 .filter(|(_, e)| Arc::strong_count(&e.buckets) <= 1)
                 .min_by_key(|(_, e)| e.last)
-                .map(|(k, _)| *k)
-                .or_else(|| {
-                    live.iter().min_by_key(|(_, e)| e.last).map(|(k, _)| *k)
-                });
-            if let Some(k) = evict_key {
-                live.remove(&k);
+                .map(|(k, _)| *k);
+            match evict_key {
+                Some(k) => {
+                    live.remove(&k);
+                }
+                None => {
+                    drop(live);
+                    let mut of = self.overflow.lock().unwrap_or_else(|e| e.into_inner());
+                    return Some(of.entry(net).or_insert_with(|| Arc::new(DeviceBuckets::new(rate))).clone());
+                }
             }
         }
 
@@ -236,6 +271,11 @@ pub fn set_server_limiter(rl: Arc<RateLimiter>) {
     server_slot().store(Some(rl));
 }
 
+/// 当前装着的服务端 limiter (热重载时作为 `rebuild_from` 的旧表)。
+pub fn current_server_limiter() -> Option<Arc<RateLimiter>> {
+    server_slot().load_full()
+}
+
 /// 服务端 relay 泵按客户端 IP 取共享桶; 未装/未命中 → None (跳过整形)。
 pub fn server_buckets_for(ip: IpAddr) -> Option<Arc<DeviceBuckets>> {
     server_slot().load_full().and_then(|rl| rl.buckets_for(ip))
@@ -266,7 +306,7 @@ mod tests {
             rate_limit_kbps: Some(8000), // 8000 kbps = 1 MB/s
         }];
         let rl = RateLimiter::from_device_profiles(&dps);
-        assert_eq!(rl.resolve("192.168.1.50".parse().unwrap()), Some(1_000_000));
+        assert_eq!(rl.resolve("192.168.1.50".parse().unwrap()).map(|(_, r)| r), Some(1_000_000));
         assert_eq!(rl.resolve("10.0.0.1".parse().unwrap()), None);
         assert!(rl.buckets_for("192.168.1.50".parse().unwrap()).is_some());
         assert!(rl.buckets_for("10.0.0.1".parse().unwrap()).is_none());
@@ -311,5 +351,61 @@ mod tests {
         }
         let live = rl.live.lock().unwrap();
         assert_eq!(live.len(), RATE_LIMIT_CAP, "超出容量后 live 长度应严格封顶在 RATE_LIMIT_CAP");
+    }
+
+    fn dp(cidr: &str, kbps: u64) -> crate::config::DeviceProfile {
+        crate::config::DeviceProfile {
+            source_ip_cidr: vec![cidr.into()],
+            profile: "p".into(),
+            name: None,
+            rate_limit_kbps: Some(kbps),
+        }
+    }
+
+    /// 表满且全部有活跃连接: 不挤掉活跃条目, 新 IP 共用溢出桶 (同一个 Arc)。
+    #[test]
+    fn full_table_with_active_entries_uses_overflow_bucket() {
+        let rl = RateLimiter::from_device_profiles(&[dp("10.0.0.0/8", 1000)]);
+        // 填满并持有全部桶 (模拟活跃连接)
+        let held: Vec<_> = (0..RATE_LIMIT_CAP as u32)
+            .map(|i| rl.buckets_for(IpAddr::V4(std::net::Ipv4Addr::from(0x0a000000 + i))).unwrap())
+            .collect();
+        let first_ip = IpAddr::V4(std::net::Ipv4Addr::from(0x0a000000));
+        let a = rl.buckets_for(IpAddr::V4(std::net::Ipv4Addr::new(10, 200, 0, 1))).unwrap();
+        let b = rl.buckets_for(IpAddr::V4(std::net::Ipv4Addr::new(10, 200, 0, 2))).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "溢出的新 IP 应共用同一个桶");
+        // 原有活跃条目没被挤掉: 同一 IP 再取仍是原桶
+        assert!(Arc::ptr_eq(&rl.buckets_for(first_ip).unwrap(), &held[0]));
+        assert_eq!(rl.live.lock().unwrap().len(), RATE_LIMIT_CAP);
+        drop(held);
+        // 有空闲条目后, 新 IP 回到独立桶
+        let c = rl.buckets_for(IpAddr::V4(std::net::Ipv4Addr::new(10, 200, 0, 3))).unwrap();
+        assert!(!Arc::ptr_eq(&c, &a));
+    }
+
+    /// 热重载沿用限速未变的桶; 限速变了换新桶; 网段被删则不再限速。
+    #[test]
+    fn rebuild_keeps_buckets_when_rate_unchanged() {
+        let ip_a: IpAddr = "10.1.0.1".parse().unwrap();
+        let ip_b: IpAddr = "192.168.5.5".parse().unwrap();
+        let old = RateLimiter::from_device_profiles(&[dp("10.0.0.0/8", 1000), dp("192.168.0.0/16", 2000)]);
+        let ba = old.buckets_for(ip_a).unwrap();
+        let bb = old.buckets_for(ip_b).unwrap();
+
+        // 无关改动 (限速都不变): 两个都沿用
+        let same = RateLimiter::rebuild_from(&[dp("10.0.0.0/8", 1000), dp("192.168.0.0/16", 2000)], Some(&old));
+        assert!(Arc::ptr_eq(&same.buckets_for(ip_a).unwrap(), &ba));
+        assert!(Arc::ptr_eq(&same.buckets_for(ip_b).unwrap(), &bb));
+
+        // 改了 192.168/16 的限速: A 沿用, B 换新桶且速率是新值
+        let changed = RateLimiter::rebuild_from(&[dp("10.0.0.0/8", 1000), dp("192.168.0.0/16", 4000)], Some(&old));
+        assert!(Arc::ptr_eq(&changed.buckets_for(ip_a).unwrap(), &ba));
+        let nb = changed.buckets_for(ip_b).unwrap();
+        assert!(!Arc::ptr_eq(&nb, &bb));
+        assert_eq!(nb.up.rate as u64, 4000 * 125);
+
+        // 删掉 10/8: A 不再限速
+        let removed = RateLimiter::rebuild_from(&[dp("192.168.0.0/16", 2000)], Some(&old));
+        assert!(removed.buckets_for(ip_a).is_none());
     }
 }
