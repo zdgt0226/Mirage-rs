@@ -202,6 +202,10 @@ async fn update_one(
     update_days: u32,
     meta: &mut MetaFile,
 ) -> Result<()> {
+    // name 直接拼进文件路径: 拒绝空名、路径分隔符与 "..", 防止写出 geodata_dir 之外。
+    if !crate::config::geo_source_name_ok(&source.name) {
+        anyhow::bail!("geo_sources.name `{}` 非法 (不得为空、含路径分隔符或 \"..\")", source.name);
+    }
     let filename = format!("{}.dat", source.name);
     let path = Path::new(dir).join(&filename);
     let tmp_path = Path::new(dir).join(format!("{}.tmp", filename));

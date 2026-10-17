@@ -311,8 +311,10 @@ pub async fn update_users(
         }
     };
 
-    // 若配置未发生改动 (如仅 reset_quota 操作), 无需落盘配置
-    if candidate == content {
+    // 若配置未发生改动 (如仅 reset_quota 操作), 无需落盘配置。比较解析后的 JSON 而非原文:
+    // 原文件缩进/格式与 to_string_pretty 不同时, 不应被当成改动而重写配置、触发热重载。
+    let unchanged = serde_json::from_str::<Value>(&content).ok().as_ref() == Some(&v);
+    if unchanged {
         apply_reset_quota();
         return Json(json!({
             "status": "success", "written": false, "issues": issues,

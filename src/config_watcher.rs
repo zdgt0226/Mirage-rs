@@ -154,8 +154,11 @@ impl ConfigWatcher {
         for (i, r) in all_rule_cfgs.into_iter().enumerate() {
             let mut ip_cidr = Vec::new();
             for cidr_str in r.ip_cidr {
-                if let Ok(net) = cidr_str.parse() {
+                if let Ok(net) = cidr_str.parse::<IpNet>() {
                     ip_cidr.push(net);
+                } else if let Ok(ip) = cidr_str.parse::<std::net::IpAddr>() {
+                    // 裸 IP 按 /32 (/128) 处理, 与 source_ip_cidr 一致; 此前会被静默丢弃。
+                    ip_cidr.push(IpNet::from(ip));
                 }
             }
             
@@ -1069,6 +1072,33 @@ mod leak_guard_tests {
 #[cfg(test)]
 mod watcher_event_tests {
     use super::*;
+
+    /// 规则 `ip_cidr` 写裸 IP 时按 /32 处理 (此前会被静默丢弃, 规则失效)。
+    #[test]
+    fn rule_ip_cidr_accepts_bare_ip() {
+        let dir = std::env::temp_dir().join(format!("mirage_cidr_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        std::fs::write(&cfg, r#"{
+            "inbounds": [{"type": "mixed", "tag": "m", "listen": "127.0.0.1", "port": 28499}],
+            "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}],
+            "routing": {"default_outbound": "direct", "rules": [{"outbound": "block", "ip_cidr": ["192.0.2.5"]}]}
+        }"#).unwrap();
+        let st = ConfigWatcher::build_state(cfg.to_str().unwrap(), dir.to_str().unwrap(), None).unwrap();
+        let req = |ip: &str| crate::router::RoutingRequest {
+            domain: None,
+            ip: Some(ip.parse().unwrap()),
+            port: 80,
+            protocol: "tcp",
+            source_ip: None,
+            source_mac: None,
+            inbound: None,
+            process_name: None,
+        };
+        assert_eq!(st.router.route(req("192.0.2.5")), "block");
+        assert_eq!(st.router.route(req("192.0.2.6")), "direct");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_is_config_event_relative_and_absolute() {

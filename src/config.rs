@@ -27,7 +27,7 @@ where
     })
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct GuiConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -275,6 +275,18 @@ pub struct MirageUser {
     pub quota_gb: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_reset_day: Option<u8>,
+}
+
+impl std::fmt::Debug for GuiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuiConfig")
+            .field("enabled", &self.enabled)
+            .field("listen", &self.listen)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .field("stats_persist_path", &self.stats_persist_path)
+            .field("cors_origins", &self.cors_origins)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for MirageUser {
@@ -1364,6 +1376,11 @@ pub enum EbpfMode {
     Off,
 }
 
+/// `geo_sources.name` 会拼进文件路径, 只允许不含路径分隔符与 ".." 的非空名字。
+pub fn geo_source_name_ok(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct GeoSource {
     /// 文件名 (不含 .dat 后缀, 自动加). 必须在 geo_sources 内唯一.
@@ -1944,6 +1961,16 @@ impl Config {
         }
 
         // tuning.client_hello_guard (ClientHello 计时/判定): 参数反转或过小会让它失效。
+        if let Some(t) = self.tuning.as_ref() {
+            for s in &t.geo_sources {
+                if !geo_source_name_ok(&s.name) {
+                    issues.push(format!(
+                        "tuning.geo_sources.name `{}` 非法: 不得为空、含路径分隔符或 \"..\" (会写出 geodata_dir 之外)",
+                        s.name
+                    ));
+                }
+            }
+        }
         if let Some(q) = self.tuning.as_ref().and_then(|t| t.client_hello_guard.as_ref()) {
             if q.preconnect_mult == 0 {
                 issues.push("tuning.client_hello_guard.preconnect_mult 不能为 0 (触发 = mult × RTT)".to_string());
@@ -2470,6 +2497,24 @@ mod validation_tests {
                             "password": "sspw", "method": "chacha20-ietf-poly1305" } }
         ]);
         assert!(issues_of(&v).is_empty(), "合法上游配置不该报问题: {:?}", issues_of(&v));
+    }
+
+    #[test]
+    fn gui_config_debug_redacts_token() {
+        let g: crate::config::GuiConfig =
+            serde_json::from_str(r#"{"enabled":true,"listen":"127.0.0.1:9090","token":"s3cret-token-value"}"#).unwrap();
+        let dbg = format!("{g:?}");
+        assert!(!dbg.contains("s3cret-token-value"), "Debug 不得输出 token 明文: {dbg}");
+        assert!(dbg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn geo_source_name_rejects_path_traversal() {
+        assert!(crate::config::geo_source_name_ok("geoip"));
+        assert!(crate::config::geo_source_name_ok("geosite-cn"));
+        for bad in ["", "../evil", "a/b", "a\\b", "..", "x..y"] {
+            assert!(!crate::config::geo_source_name_ok(bad), "应拒绝 `{bad}`");
+        }
     }
 
     #[test]

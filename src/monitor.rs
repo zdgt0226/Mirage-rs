@@ -301,6 +301,11 @@ pub fn flush_stats(path: &str) {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // 软链接: 写到其指向的真实文件旁再 rename 到真实路径, 保持软链接本身不变 (同 atomic_write_config)。
+    let resolved = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let path: &str = &resolved;
     let tmp = format!("{path}.tmp");
 
     #[cfg(unix)]
@@ -695,11 +700,37 @@ fn archive_name(path: &std::path::Path, i: usize) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// 以追加模式打开日志文件; unix 上新建为 0600, 已存在的旧文件 (历史 0644) 也收紧为 0600。
+/// 日志含客户端源 IP、访问域名等, 不应对同机其他账户可读。
+fn open_log_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        let f = opts.open(path)?;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        Ok(f)
+    }
+    #[cfg(not(unix))]
+    {
+        opts.open(path)
+    }
+}
+
 /// gzip 压缩 src → dst (纯 Rust flate2/miniz_oxide, 无外部 gzip 依赖)。
 fn gzip_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     let input = std::fs::File::open(src)?;
     let mut reader = std::io::BufReader::new(input);
-    let output = std::fs::File::create(dst)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let output = opts.open(dst)?;
     let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
     std::io::copy(&mut reader, &mut encoder)?;
     encoder.finish()?;
@@ -745,7 +776,7 @@ impl RotatingFile {
             self.written = 0; // 复位避免每条日志都重试滚动刷屏
             return;
         }
-        match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        match open_log_append(&path) {
             Ok(f) => {
                 self.file = f;
                 self.written = 0;
@@ -801,7 +832,7 @@ impl FileLogger {
 
     fn with_rotate_bytes(path: impl Into<std::path::PathBuf>, rotate_at: u64) -> std::io::Result<Self> {
         let path = path.into();
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_log_append(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self(std::sync::Arc::new(std::sync::Mutex::new(RotatingFile {
             path,
@@ -900,6 +931,27 @@ mod log_rotate_tests {
         let p = std::path::Path::new("/var/log/mirage/server.log");
         assert_eq!(archive_name(p, 1), std::path::PathBuf::from("/var/log/mirage/server.log.1.gz"));
         assert_eq!(archive_name(p, 10), std::path::PathBuf::from("/var/log/mirage/server.log.10.gz"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_created_0600_and_legacy_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // 新建日志: 0600
+        let log = tmp_path("perm.log");
+        drop(open_log_append(&log).unwrap());
+        assert_eq!(mode(&log), 0o600);
+        // 历史 0644 日志: 打开即收紧
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_log_append(&log).unwrap());
+        assert_eq!(mode(&log), 0o600);
+        // 压缩归档: 0600
+        let gz = tmp_path("perm.log.1.gz");
+        gzip_file(&log, &gz).unwrap();
+        assert_eq!(mode(&gz), 0o600);
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(&gz);
     }
 
     #[test]
@@ -1073,6 +1125,24 @@ mod conn_registry_tests {
 #[cfg(test)]
 mod stats_persist_tests {
     use super::*;
+
+    /// 统计文件是软链接时, 落盘写到链接指向的真实文件, 软链接本身保留。
+    #[cfg(unix)]
+    #[test]
+    fn flush_stats_keeps_symlink() {
+        let dir = std::env::temp_dir().join(format!("mirage_stats_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        let link = dir.join("link.json");
+        std::fs::write(&real, "{}").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        flush_stats(link.to_str().unwrap());
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "软链接应保留");
+        let content = std::fs::read_to_string(&real).unwrap();
+        assert!(content.contains("global_up"), "真实文件应被写入统计");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // 纯 serde roundtrip (不碰全局态, 并行安全): 验证持久化数据模型自洽, 包含所有六部分状态
     #[test]

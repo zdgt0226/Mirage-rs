@@ -22,7 +22,8 @@ pub fn spawn(app_state: AppState) {
             // 采样当前时刻的绝对数值
             let up = crate::monitor::GLOBAL_UP.load(Ordering::Relaxed);
             let down = crate::monitor::GLOBAL_DOWN.load(Ordering::Relaxed);
-            let mut bpf_success = 0;
+            // 拿锁失败 / 读失败时沿用上次读数 (本秒流速记 0), 不归零 —— 否则下一秒差值 = 累计总量, 图上出现假尖峰。
+            let mut bpf_success = last_bpf;
 
             // 尝试获取 eBPF 引擎的统计信息
             if let Some(engine) = &app_state.ebpf_engine {
