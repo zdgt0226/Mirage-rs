@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [v0.15.4] - 全局审计修复: API DNS rebinding / 多入站用户管理 / 限速桶热重载 (2026-10-17)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.0 ~ v0.15.3 两端完全互通, 可单端升级; Android 端无需同步。
+- `gui.listen` 非本机且**未配 `gui.token`** 时, WebUI 只能用 IP 地址或 `localhost` 访问 (用域名/主机名访问返回 403, 防 DNS rebinding); 需要主机名访问请配置 token。
+- `/api/users` 行为变化 (WebUI 与 `mirage-rs config` 不受影响): 不带 `inbound` 的操作作用于全部 `mirage_server` 入站; `set_limits` 省略字段改为保留原值; `upsert` 带限额字段返回 422。详见 `docs/api-contract.md`。
+- 日志与压缩归档改为 0600 权限, 已存在的旧日志会在打开时收紧。
+
 ### fix: 用户管理 API 与按 IP 限速 —— 审计遗留 5 处 (2026-10-17)
 
 - **`/api/users` 覆盖全部 `mirage_server` 入站** (P2): 此前只读写第一个入站, 多入站部署 (如 TCP + QUIC) 下删用户 / 改口令在其他入站不生效, 旧口令仍可登录。现在不传 `inbound` 的操作同步到全部入站, 可用 `inbound: "<tag>"` 只改指定入站; GET 合并全部入站并新增 `inbounds` 字段。
