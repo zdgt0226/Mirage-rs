@@ -287,9 +287,12 @@ impl ConfigWatcher {
             geodata_dir,
         );
 
-        let rate_limiter = Arc::new(
-            crate::proxy::rate_limit::RateLimiter::from_device_profiles(&config.routing.device_profiles),
-        );
+        // 沿用上一张表里限速未变的活跃桶, 否则热重载会让同一 IP 新旧连接各用一个桶 (速率翻倍、逐次叠加)。
+        let old_limiter = crate::proxy::rate_limit::current_server_limiter();
+        let rate_limiter = Arc::new(crate::proxy::rate_limit::RateLimiter::rebuild_from(
+            &config.routing.device_profiles,
+            old_limiter.as_deref(),
+        ));
         if !rate_limiter.is_empty() {
             info!("限速: device_profiles 已配置带宽上限 (按源 IP TCP 整形)");
         }
