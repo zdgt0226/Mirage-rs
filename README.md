@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.15.3-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.15.4-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
 
@@ -444,6 +444,7 @@ Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`
 
 | 版本 | 发布日期 | 核心重大特性 |
 | :--- | :--- | :--- |
+| **v0.15.4** | 2026-10-17 | **无协议变更 (可单端升级)**: 全局审计修复 · API 非本机监听且无 token 时补 DNS rebinding 防护 · `/api/users` 覆盖全部 `mirage_server` 入站 (多入站下删用户 / 改口令真正生效), `set_limits` 局部更新, `upsert` 带限额报错 · 按 IP 限速桶跨热重载保留 (修复热重载后速率翻倍), 满表时溢出共享桶 · 日志 0600、统计文件软链接、`ip_cidr` 支持裸 IP、`geo_sources.name` 防路径穿越等 |
 | **v0.15.3** | 2026-10-16 | **无协议变更 (可单端升级, CI 验证 v0.15.2 客户端互通)**: 服务端主动探测加固 (伪装站改为按需建连, 移除预热连接池; 新增 `tuning.client_hello_guard`) · 版本兼容矩阵 `docs/version-compatibility.md` 与 `install.sh` 老版本并行迁移向导 · CI 跨版本互通测试 · `rustls` 安全更新 (RUSTSEC-2026-0346 ~ 0349) · 网关透明 UDP 接收缓冲 4MB |
 | **v0.15.2** | 2026-10-04 | **无协议变更 (可单端升级)**: release 二进制首次带上 **QUIC 传输** (实验, `transport: "quic"` 才启用) · **QUIC 定速模式** (复用 `brutal_rate_mbps`) · 定位并修复 QUIC 高丢包吞吐瓶颈 (quinn-proto 乱序段上限补丁 1024→8192 + 默认窗口 8MB; 公网定速 78–84 Mbps vs hysteria2 67–78, 服务端 CPU 少约 20%) · `install.sh` brutal 默认 100 Mbps、可选 v2 / v1.0.3 · 实测记录 `docs/benchmark-2026-09.md` |
 | **v0.15.1** | 2026-10-02 | **无协议变更 (可单端升级)**: 新增 `mirage-rs config` 交互式配置编辑 (节点增删改 / 协议参数 / 服务端多用户, 保存时校验 + 原子写回, 能热重载的自动生效、其余提示并协助重启) · 实测修复: 服务端每连接日志降 debug (隐私) · brutal 多入站速率隔离 · QUIC 出站 UDP 快速失败, 远程 DNS 与健康检查改走 QUIC 流 · QUIC pin / 口令错误明确提示 · 配置校验区分 TCP / UDP 同端口 |
