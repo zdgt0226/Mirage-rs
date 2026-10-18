@@ -44,6 +44,9 @@ const TLS_RECORD_MAX_BODY: usize = 16384; // 2^14, RFC 8446 §5.1
 /// UNAUTH 限流 key: IPv6 归一到 /64 前缀 (清零低 64 位), 防攻击者用一个 /64
 /// 段造 2^64 个"独立 IP" 逃逸限流. IPv4 原样返回 (单地址已是最细粒度).
 pub(crate) fn rate_limit_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    // 双栈监听 (`[::]`) 下 IPv4 客户端以 `::ffff:a.b.c.d` 出现; 不先还原为 v4, 下面的 /64 归一
+    // 会把所有 v4 来源清零成同一个 `::` 桶 —— 限流/限额对它们变成 "全体共享一个额度"。
+    let ip = ip.to_canonical();
     match ip {
         std::net::IpAddr::V4(_) => ip,
         std::net::IpAddr::V6(v6) => {
@@ -1116,6 +1119,15 @@ mod tests {
         let a = rate_limit_key("2001:db8::1".parse().unwrap());
         let b = rate_limit_key("2001:db8::dead:beef".parse().unwrap());
         assert_eq!(a, b, "同 /64 应归一为同 key");
+    }
+
+    #[test]
+    fn rate_limit_key_unmaps_ipv4_mapped_addresses() {
+        // 双栈监听下 v4 客户端是 ::ffff:a.b.c.d: 必须还原成各自的 v4 key, 不能塌成同一个 `::`。
+        let a = rate_limit_key("::ffff:192.0.2.1".parse().unwrap());
+        let b = rate_limit_key("::ffff:192.0.2.2".parse().unwrap());
+        assert_ne!(a, b, "不同 v4 来源不得共享同一桶");
+        assert_eq!(a, "192.0.2.1".parse::<std::net::IpAddr>().unwrap());
     }
 
     #[test]

@@ -6,6 +6,9 @@
 
 - **DNS 回包/上游发包失败可观测** (A8, `dns/server.rs`): 两处原本的 `let _ = send_to(...)` 改为计数 + 采样告警（每 500 次一条，带对端地址与排查提示）—— 回程 UDP 被防火墙丢弃时不再“DNS 时好时坏但零日志”。其余 `let _ =` 按性质归类为有意忽略，不逐个改动。
 
+- **服务端单来源连接上限** (A5 补强, `mirage_server/mod.rs`): 全局 8192 上限之上新增按来源 IP 的子上限 `max(16, min(1024, 全局/4))` (IPv6 归一 /64)，accept 时先过来源上限再取全局名额，单一来源不能再独占全部名额把合法新连接挤掉 (否则 DoS 只是从 "内存被打满" 变成 "可用性被打满")。`MIRAGE_MAX_CONNS` 非法值现在会 WARN 而不是静默忽略，启动日志打印夹取后的实际生效值。
+- **`rate_limit_key` 还原 IPv4-mapped 地址** (`mirage_server/handshake.rs`): 监听 `[::]` 的双栈部署里 v4 客户端以 `::ffff:a.b.c.d` 出现，原先 /64 归一会把它们全部清零成同一个 `::` 桶 —— `UNAUTH_RATE` 等按来源的限流/限额对所有 v4 来源共用一个额度。现先 `to_canonical()` 再归一。
+
 - **DNS 上游查询单飞** (A7, `dns/server.rs`): 新增通用 `singleflight()`（`OnceCell` 表，初始化完成即摘；leader 被 cancel 时下一个接替），接入 `direct_query`（key 含 **上游集合指纹**）与 `dns_over_tunnel`（key 含隧道 host/port）。同 key 并发 miss 的上游查询与**隧道消耗**从 N 降为 1。等待者用公共 `patch_for_query()` 换上自己的 tx_id/question（否则客户端丢包）；key 含上游集合避免把 CN/境外解析器的不同答案合并。
 
 - **DNS 缓存按 DO/CD 分维 + 大小适配** (A6, `dns/server.rs`): 缓存 key 从 `(domain, qtype)` 改为 `(domain, qtype, DO, CD)`，并新增 `edns_info()`（OPT 的 `CLASS`=客户端 UDP 上限/`TTL` bit15=DO/header byte3 `0x10`=CD，畸形安全回退）。命中时若条目超过当前客户端声明的大小 → 视为 miss 现查。修复三件事：`DO=1` 客户端拿到无 RRSIG 的条目（DNSSEC 降级）、`CD=1` 的上游未验证结果被发给 `CD=0` 客户端（绕过校验）、`4096` 字节条目下发给只声明 `512` 的客户端（越过协议上限）。因本服务只监听 UDP（无 TCP 重试），不用 `TC=1` 截断而是改走现查（代价：key 空间 ×4，命中率略降）。

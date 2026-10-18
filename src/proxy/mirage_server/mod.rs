@@ -22,7 +22,7 @@ pub(crate) use control::parse_tcp_target;
 // 服务端 ClientHello 计时/判定参数 (`tuning.client_hello_guard`): 由 startup 设置。
 pub use handshake::{client_hello_guard_params, set_client_hello_guard};
 
-// ── 全局并发连接上限 (B1) ────────────────────────────────────────────────
+// ── 全局并发连接上限 (A5) ────────────────────────────────────────────────
 /// 默认最大并发连接数。
 ///
 /// 取 8192: 典型 VPS (1~2 vCPU / 1~2GB) 下每连接占用主要是两个 socket 缓冲 + 任务栈,
@@ -44,6 +44,11 @@ fn max_connections() -> usize {
     clamp_max_conns(MAX_CONNS_CFG.load(Ordering::Relaxed))
 }
 
+/// 配置值换算为实际生效的全局上限 (供启动日志如实打印夹取后的值)。
+pub fn effective_max_connections(n: usize) -> usize {
+    clamp_max_conns(n)
+}
+
 /// 上限归一化: `0` = 默认; 其余夹到 `[16, 1e6]` (与 config check 的范围一致)。
 fn clamp_max_conns(n: usize) -> usize {
     match n {
@@ -59,6 +64,54 @@ fn conn_sem() -> &'static Arc<tokio::sync::Semaphore> {
 /// 取一个连接名额; 取不到返回 None (调用方直接关闭连接)。
 fn try_accept_slot() -> Option<tokio::sync::OwnedSemaphorePermit> {
     conn_sem().clone().try_acquire_owned().ok()
+}
+
+/// 单个来源 (IPv6 归一到 /64, IPv4-mapped 还原为 v4) 可同时占用的连接数上限: 全局上限的 1/4,
+/// 夹到 `[16, 1024]`。
+///
+/// 没有它时, 单一来源就能独占全部全局名额: 认证前窗口 ≤ `hard_deadline`(5s), 约
+/// `上限/5` 条连接每秒即可占满, 所有合法新连接被拒 —— 全局上限把 "内存被打满" 换成了
+/// "可用性被打满"。1024 远高于正常用户并发 (浏览器 6~8 条/站点, 重度下载/BT 数百条)。
+fn max_conns_per_ip() -> usize {
+    per_ip_cap_for(max_connections())
+}
+
+fn per_ip_cap_for(global: usize) -> usize {
+    (global / 4).clamp(16, 1024)
+}
+
+static CONN_PER_IP: LazyLock<Mutex<HashMap<IpAddr, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 来源 IP 名额守卫: drop 时归还。
+struct ConnIpGuard(IpAddr);
+
+impl Drop for ConnIpGuard {
+    fn drop(&mut self) {
+        // 与 IpSlotGuard 同理: Drop 里不 unwrap 锁, 容忍中毒。
+        let mut map = CONN_PER_IP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = map.get_mut(&self.0) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// 取来源 IP 名额; 该来源已达 `max_conns_per_ip()` 返回 None。
+fn try_acquire_ip_slot(ip: IpAddr) -> Option<ConnIpGuard> {
+    try_acquire_ip_slot_with(ip, max_conns_per_ip())
+}
+
+fn try_acquire_ip_slot_with(ip: IpAddr, limit: usize) -> Option<ConnIpGuard> {
+    let key = handshake::rate_limit_key(ip);
+    let mut map = CONN_PER_IP.lock().unwrap_or_else(|e| e.into_inner());
+    let cur = map.get(&key).copied().unwrap_or(0);
+    if cur >= limit {
+        return None;
+    }
+    map.insert(key, cur + 1);
+    Some(ConnIpGuard(key))
 }
 
 use camouflage_rtt::CamouflageRtt;
@@ -714,15 +767,20 @@ pub async fn start_server(
                 let cam = camouflage_host.to_string();
                 let rtt = cam_rtt.clone();
                 let up = upstream.clone();
-                // B1: 全局并发上限。认证前的窗口只受 hard_deadline 约束, 无上限时 flood 可把
-                // 任务表与 socket 打满 (见 docs/codebase-audit-2026-10.md B1)。
+                // A5: 全局并发上限。认证前的窗口只受 hard_deadline 约束, 无上限时 flood 可把
+                // 任务表与 socket 打满 (见 docs/codebase-audit-2026-10.md A5)。
                 // 超限 → 直接关闭 (与真站过载行为一致: 不握手、不给响应), 计数 + 采样告警。
-                let Some(permit) = try_accept_slot() else {
+                // 先过来源 IP 子上限, 再取全局名额: 单一来源最多占全局的 1/4, 不会独占全部名额。
+                let slots = try_acquire_ip_slot(peer_addr.ip()).and_then(|ip_guard| {
+                    try_accept_slot().map(|permit| (ip_guard, permit))
+                });
+                let Some((ip_guard, permit)) = slots else {
                     let n = ACCEPT_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % 500 == 1 {
                         warn!(
-                            "连接数达上限 {} (累计拒绝 {n}), 直接关闭 {} — 调大 tuning.max_connections 或排查 flood",
+                            "连接数达上限 (全局 {} / 单来源 {}; 累计拒绝 {n}), 直接关闭 {} — 调大 tuning.max_connections 或排查 flood",
                             max_connections(),
+                            max_conns_per_ip(),
                             peer_addr.ip()
                         );
                     }
@@ -731,6 +789,7 @@ pub async fn start_server(
                 };
                 tokio::spawn(async move {
                     let _permit = permit; // 名额持到连接结束 (含握手失败 / 转发全程)
+                    let _ip_guard = ip_guard;
                     handshake::handle_connection(stream, peer_addr, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
                 });
             }
@@ -1647,5 +1706,52 @@ mod conn_cap_tests {
         assert_eq!(clamp_max_conns(15), 16);
         assert_eq!(clamp_max_conns(1024), 1024);
         assert_eq!(clamp_max_conns(usize::MAX), 1_000_000);
+    }
+
+    #[test]
+    fn per_ip_cap_scales_with_global_and_is_clamped() {
+        use super::{per_ip_cap_for, DEFAULT_MAX_CONNECTIONS};
+        // 默认全局 8192 → 8192/4=2048 → 夹到 1024; 全局上限随配置变化时同比缩放但不低于 16。
+        // (纯函数测试: 不改全局配置, 避免影响并发测试里的全局信号量。)
+        assert_eq!(per_ip_cap_for(DEFAULT_MAX_CONNECTIONS), 1024);
+        assert_eq!(per_ip_cap_for(16), 16);
+        assert_eq!(per_ip_cap_for(100), 25);
+        assert_eq!(per_ip_cap_for(1_000_000), 1024);
+    }
+
+    #[test]
+    fn single_source_cannot_exhaust_per_ip_budget() {
+        use super::try_acquire_ip_slot_with;
+        let a: std::net::IpAddr = "192.0.2.201".parse().unwrap();
+        let b: std::net::IpAddr = "192.0.2.202".parse().unwrap();
+
+        let g1 = try_acquire_ip_slot_with(a, 2).unwrap();
+        let _g2 = try_acquire_ip_slot_with(a, 2).unwrap();
+        assert!(try_acquire_ip_slot_with(a, 2).is_none(), "同一来源达上限必须被拒");
+        // 别的来源不受影响
+        assert!(try_acquire_ip_slot_with(b, 2).is_some(), "其它来源仍可获取名额");
+        // 归还后可再取
+        drop(g1);
+        assert!(try_acquire_ip_slot_with(a, 2).is_some(), "drop 后名额应归还");
+    }
+
+    #[test]
+    fn per_ip_cap_shares_ipv6_64_and_unmaps_ipv4() {
+        use super::try_acquire_ip_slot_with;
+        // 同 /64 的不同地址共享一个额度
+        let v6a: std::net::IpAddr = "2001:db8:cafe:1::1".parse().unwrap();
+        let v6b: std::net::IpAddr = "2001:db8:cafe:1::2".parse().unwrap();
+        let _g = try_acquire_ip_slot_with(v6a, 1).unwrap();
+        assert!(try_acquire_ip_slot_with(v6b, 1).is_none(), "同 /64 应共享额度");
+
+        // 双栈下的 IPv4-mapped 来源各自独立, 且与其原生 v4 地址同桶
+        let m1: std::net::IpAddr = "::ffff:192.0.2.211".parse().unwrap();
+        let m2: std::net::IpAddr = "::ffff:192.0.2.212".parse().unwrap();
+        let _g1 = try_acquire_ip_slot_with(m1, 1).unwrap();
+        assert!(try_acquire_ip_slot_with(m2, 1).is_some(), "不同 v4 来源不得塌进同一个桶");
+        assert!(
+            try_acquire_ip_slot_with("192.0.2.211".parse().unwrap(), 1).is_none(),
+            "mapped 与原生 v4 应是同一来源"
+        );
     }
 }

@@ -37,6 +37,7 @@
 - **问题**：每个已接受连接直接 `tokio::spawn`。保护只覆盖“**未认证转发**”（`UNAUTH_CONNS` 100/IP、`UNAUTH_RATE`、`GLOBAL_UNAUTH` 5000），而**认证前窗口**仅受 `hard_deadline`（5s）约束 ⇒ flood 可持有 `速率 × 5s` 个任务与 socket，把任务表/内存打满；且 QUIC 侧有 `rt_limiter`、**TCP 侧没有**（不对称）。
 - **修复**：新增进程级 `Semaphore`（`tuning.max_connections`，默认 **8192**，env `MIRAGE_MAX_CONNS` 可覆盖，`0`=默认；夹到 `[16, 1e6]`）。accept 即 `try_acquire_owned`，拿不到就**直接关闭连接**并计数（每 500 次采样 WARN，提示调大上限或排查 flood）；名额持到连接结束（含握手失败与转发全程）。配置若 `<16` 由 `check` 报错（正常浏览器就有 6~8 并发，会议/下载器更多）。
 - **语义**：作用域=**全进程**（多个 `mirage_server` 入站共享）；**重启生效**（信号量在首次 accept 时按配置创建）。
+- **补强（复审后）**：全局上限单独存在时，单一来源约 `上限/5` 条连接每秒即可占满全部名额（认证前窗口 ≤5s），把 “内存被打满” 变成 “可用性被打满”。故 accept 时先过**来源 IP 子上限** `max(16, min(1024, 全局/4))`（IPv6 归一 /64，IPv4-mapped 先还原为 v4），再取全局名额；`rate_limit_key` 同步修正 IPv4-mapped 塌桶问题。`MIRAGE_MAX_CONNS` 非法值 WARN，启动日志打印夹取后的生效值。
 - **未覆盖**：QUIC 入站仍用自身的 `rt_limiter`（按 stream 计），未共享此上限 —— 若要统一，把 permit 传给 `start_quic_server` 即可（后续项）。
 
 ### A6（中，DNS 正确性）缓存 key 缺 DO/CD 维度 + 越界下发大响应
