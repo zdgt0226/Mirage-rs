@@ -21,17 +21,15 @@
 - **问题**：只比对 16-bit txid 与 QR 位。虽然每条查询用独立临时端口（源端口随机，实质提高了难度），但**question 比对是免费的**；一旦被接受，响应还会进 `DnsCache` **缓存一整个 TTL** ⇒ 放大为持久投毒（Kaminsky 型）。
 - **修复**：新增 `response_matches()`：`txid + QR + QDCOUNT==1 + question(名/型/类) 逐字节、ASCII 大小写无关` 全等；UDP 与 TCP 两条路径都用它。附 8 条断言的单测（含"txid 对但 qname 不同必须拒""0x20 大小写随机不破匹配""截断响应拒"）。
 
-### A3（中低，竞态）`shutdown()` 用的 raw fd 会与半句柄 drop 竞争
+### A3（中低，竞态）`shutdown()` 用的 raw fd 会与半句柄 drop 竞争 —— **已撤回**
 
-- **位置**：`mirage_server/tcp_relay.rs`（`upstream.into_split()` 之后仍保存 `upstream.as_raw_fd()`）
-- **问题**：读写半句柄先后 drop，fd 被关闭后可能被新 socket 复用；此时对端分支的 `libc::shutdown(fd)` 会打到**无关连接**上（或 EBADF）。
-- **修复**：`dup()` 一份专用 fd 存进 `AtomicI32`，由第一个 `swap(-1)` 的 task 负责 `shutdown + close`；`dup` 失败保持 `-1`（闭包整体 no-op，安全降级）。
+- **状态**：已撤回。推演前提不成立：只有第一个 `swap(-1)` 的任务会调用 shutdown，此时它自己持有的半句柄仍存活，第二个任务看到 -1 直接跳过，故不存在 fd 复用窗口。原写法安全；dup 写法反而引入 dup 无 CLOEXEC、future 取消时 fd 泄漏令底层 socket 无法真正关闭、EMFILE 时静默失效等风险。
 
 ### A4（中，反指纹）握手模板：陈旧无告警 + 部分刷新导致多样性塌缩
 
 - **位置**：`crypto/handshake_cache.rs::spawn_refresh_task`
 - **问题**：① 刷新失败**静默保留旧模板**——若伪装站已轮换证书/密钥，回放的 ServerHello 与真站当前状态不一致（可区分），且无任何告警；② 部分成功时 `*cache = templates` **整体替换**：5 路 fetch 只回 1 条时，全部客户端会收到**同一个** ServerHello（被动侧可识别）。
-- **修复**：`install_templates()` —— 新集更小则**与旧集合并**（保多样性 + WARN）；新增 `LAST_OK_SECS`，超过 `STALE_WARN_SECS`（6h，即连续失败 12 次）周期性 WARN 提示可能已轮换。
+- **修复**：`install_templates()` —— 设定 `BATCH=5` 与池上限 `MAX_TEMPLATES=10`；新模板数达到 BATCH（整批成功）则整体替换，部分成功则新在前旧在后拼接并截断淘汰最旧（保多样性 + WARN）；新增 `LAST_OK_SECS`，在 prewarm 与首连按需填充时补写，初值 0 防御不告警，超过 `STALE_WARN_SECS`（6h，即连续失败 12 次）周期性 WARN 提示可能已轮换。
 
 ### A5（高，可用性）TCP accept 层无全局并发上限
 
@@ -46,22 +44,23 @@
 - **位置**：`dns/server.rs::DnsCache`
 - **问题**：key 只有 `(domain, qtype)` ⇒ ① `DO=1`（要 DNSSEC 签名）的客户端可能命中 `DO=0` 建立的条目（无 RRSIG）⇒ 客户端视作“无签名”/校验降级；② `CD=1`（表示“我自己校验”）的条目含上游**未验证**数据，给 `CD=0` 的客户端就是**绕过校验**；③ 条目大小按“当时那个客户端”的 EDNS 缓冲决定，`4096` 的条目可能下发给只声明 `512` 的客户端（无 EDNS/旧 resolver）⇒ 越过协议上限。附带：响应大小取决于**别的客户端**的 flags，本身构成可观测差异。
 - **修复**：
-  1. key 改为 `(domain, qtype, DO, CD)`；新增 `edns_info()`（边界安全的 OPT 解析：`CLASS`=声明的 UDP payload，`TTL` bit15 = DO；`CD` 取 header byte3 的 `0x10`；无 OPT → `DO=0, 512`；畸形/截断安全回退）。
-  2. 命中时若 `response.len() > client.max_udp` ⇒ **当作 miss**（让调用方现查一次，拿适合该客户端大小的响应）。
+  1. 缓存与单飞 key 含 UDP 缓冲档位, TC=1 响应不缓存：key 增加第 5 维 `udp_bucket`（`<=512 → 0`, `<=1232 → 1`, 否则 `2`），`put` 遇 `TC=1` 响应直接 return 不入缓存。
+  2. key 包含 `(domain, qtype, DO, CD, bucket)`；新增 `edns_info()`（边界安全的 OPT 解析：`CLASS`=声明的 UDP payload，`TTL` bit15 = DO；`CD` 取 header byte3 的 `0x10`；无 OPT → `DO=0, 512`；畸形/截断安全回退）。
+  3. 命中时若 `response.len() > client.max_udp` ⇒ **当作 miss**（让调用方现查一次，拿适合该客户端大小的响应）。
 - **为何不用 `TC=1` 截断**：本 DNS 服务**只监听 UDP**（无 TCP:53），置 `TC` 会让客户端改走 TCP 后直接失败。故采用“宁多一次上游查询，不越界下发”。若后续补上 TCP DNS 监听，可改成标准截断 + `TC=1`。
-- **代价**：key 空间 ×4（DO×CD），命中率下降；但只在同一域名被“不同 DNSSEC 意图”的客户端访问时发生，正确性优先。
+- **代价**：key 空间增加，命中率略降；但只在同一域名被“不同 DNSSEC 意图”或不同缓冲档位的客户端访问时发生，正确性优先。
 
 ### A7（中，上游放大）DNS 查询无 single-flight
 
 - **位置**：`dns/server.rs::direct_query` / `DnsForwarder::dns_over_tunnel`
 - **问题**：N 个并发 miss 打 N 次上游；而 `udp_query` 每轮还向**所有**上游各发一份 ⇒ 放大 N×M。隧道路径更贵：**每次 miss 从 `WarmPool` 取一条隧道**，同名并发 miss 就是成倍的隧道消耗（冷启动 / 热点域名最明显）。
-- **修复**：新增通用 `singleflight()`（`OnceCell` + 表，初始化完成即摘除；leader 被 cancel 时下一个等待者接替，不会卡死），两处接入：
-  1. `direct_query`：key = `(域名, qtype, DO, CD, **上游集合指纹**)`；
-  2. `dns_over_tunnel`：key = `(域名, qtype, DO, CD, 隧道 host, port)`。
+- **修复**：新增通用 `singleflight()`（`OnceCell` + 表，初始化完成即摘除；leader 被 cancel 时下一个等待者接替，不会卡死），缓存与单飞 key 含 UDP 缓冲档位, TC=1 响应不缓存，两处接入：
+  1. `direct_query`：key = `(域名, qtype, DO, CD, bucket, 上游集合指纹)`；
+  2. `dns_over_tunnel`：key = `(域名, qtype, DO, CD, bucket, 隧道 host, port, pool)`，补充出口 WarmPool 节点标识防跨出口串答案。
 - **两个易错点（已处理）**：
   - 等待者拿到的是**别人 query 的**响应字节 ⇒ 必须用 `patch_for_query()` 把 tx_id + question 段换成自己的（与缓存命中同一套逻辑，顺手抽成公共函数），否则客户端因 tx_id 不匹配丢包。
-  - key **必须含上游集合**：同一域名经 CN 解析器与境外解析器会给出不同答案（分流/就近调度的前提），合并就是错答案。
-- **效果**：同 key 并发 miss 的上游查询数 / 隧道消耗从 N 降为 1（单测：5 并发 → 上游计数 = 1，且各自拿回自己的 tx_id；不同上游集合 → 各查 1 次、不合并）。
+  - key **必须含上游集合与出站节点**：同一域名经 CN 解析器与境外解析器或不同出站节点会给出不同答案（分流/就近调度的前提），合并就是错答案。
+- **效果**：同 key 并发 miss 的上游查询数 / 隧道消耗从 N 降为 1（单测：5 并发 → 上游计数 = 1，且各自拿回自己的 tx_id；不同上游集合 → 各查 1 次、不合并；不同 bucket → 不合并）。
 
 ### A8（中低，可观测性）DNS 回包/上游发包失败无声
 
@@ -104,22 +103,27 @@
 ## 4. 门禁
 
 ```
-cargo test --lib                                  556 passed / 0 failed / 3 ignored
+cargo test --lib                                  563 passed / 0 failed / 3 ignored
+cargo test --features quic --lib                  593 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings          0 warning（含 --features quic）
 bash scripts/check-no-real-endpoints.sh            0 命中
 ```
 
 新增单测：`dns::server::tests::response_matches_requires_question_equality`（8 条断言）、
 `edns_info_parses_do_and_bufsize`、`cache_separates_do_and_cd`、
-`cache_rejects_entry_larger_than_client_budget`、`direct_query_singleflight_coalesces_concurrent_misses`、
-`singleflight_does_not_merge_different_upstream_sets`、`mirage_server::conn_cap_tests::max_conns_normalization`。
+`cache_rejects_entry_larger_than_client_budget`、`cache_skips_truncated_tc_response`、
+`cache_isolates_512_and_4096_clients`、`direct_query_singleflight_coalesces_concurrent_misses`、
+`singleflight_does_not_merge_different_upstream_sets`、`singleflight_does_not_merge_different_buckets`、
+`crypto::handshake_cache::tests::test_merge_templates_*`（覆盖整批替换/部分合并截断/连续部分刷新/整批收缩）、
+`mirage_server::conn_cap_tests::max_conns_normalization`。
 
 ---
 
 ## 5. 复跑核对清单（零成本，改完就跑）
 
 ```bash
-cargo test --lib                                            # 556 passed / 0 failed / 3 ignored
+cargo test --lib                                            # 563 passed / 0 failed / 3 ignored
+cargo test --features quic --lib                            # 593 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings                   # 0
 cargo clippy --all-targets --features quic -- -D warnings   # 0
 bash scripts/check-no-real-endpoints.sh                     # 0 命中

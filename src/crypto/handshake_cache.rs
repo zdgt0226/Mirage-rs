@@ -45,6 +45,22 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 单批并发拉取的模板数。
+pub(crate) const BATCH: usize = 5;
+/// 缓存保留的模板上限 (淘汰最旧)。
+pub(crate) const MAX_TEMPLATES: usize = 10;
+
+/// 合并新旧模板集。整批成功(>= BATCH)整体替换; 部分成功新在前旧在后, 上限 MAX_TEMPLATES 淘汰最旧。
+pub(crate) fn merge_templates(old: Vec<Vec<u8>>, mut new: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    if new.len() >= BATCH {
+        new
+    } else {
+        new.extend(old);
+        new.truncate(MAX_TEMPLATES);
+        new
+    }
+}
+
 /// 装上一批新模板。
 ///
 /// 两个不变量 (都关系到反指纹):
@@ -56,26 +72,21 @@ fn now_secs() -> u64 {
 async fn install_templates(new: Vec<Vec<u8>>) {
     if new.is_empty() {
         let last = LAST_OK_SECS.load(Ordering::Relaxed);
-        let age = now_secs().saturating_sub(last);
-        if age > STALE_WARN_SECS {
-            warn!(
-                "HandshakeCache 已 {age}s 未更新 (伪装站不可达?): 继续回放旧模板 — \
-                 若伪装站已轮换证书/密钥, 回放的 ServerHello 与真站不一致 ⇒ 可区分"
-            );
+        if last != 0 {
+            let age = now_secs().saturating_sub(last);
+            if age > STALE_WARN_SECS {
+                warn!(
+                    "HandshakeCache 已 {age}s 未更新 (伪装站不可达?): 继续回放旧模板 — \
+                     若伪装站已轮换证书/密钥, 回放的 ServerHello 与真站不一致 ⇒ 可区分"
+                );
+            }
         }
         return;
     }
     let mut guard = cache().lock().await;
-    let kept_old = !guard.is_empty() && new.len() < guard.len();
-    if kept_old {
-        for t in new {
-            if !guard.iter().any(|o| o == &t) {
-                guard.push(t);
-            }
-        }
-    } else {
-        *guard = new;
-    }
+    let kept_old = new.len() < BATCH;
+    let old = std::mem::take(&mut *guard);
+    *guard = merge_templates(old, new);
     let n = guard.len();
     drop(guard);
     LAST_OK_SECS.store(now_secs(), Ordering::Relaxed);
@@ -118,7 +129,7 @@ pub(crate) fn template_is_complete(t: &[u8]) -> bool {
 /// 并发拉 5 个真实 ServerHello 模板, 收集成功的.
 async fn fetch_batch(host: &str) -> Vec<Vec<u8>> {
     let mut set = tokio::task::JoinSet::new();
-    for _ in 0..5 {
+    for _ in 0..BATCH {
         let h = host.to_string();
         set.spawn(async move { fetch_real_server_hello(&h).await });
     }
@@ -166,6 +177,7 @@ pub async fn prewarm(camouflage_host: &str) {
         let mut guard = cache().lock().await;
         guard.extend(templates);
         info!("HandshakeCache prewarmed with {} real templates", guard.len());
+        LAST_OK_SECS.store(now_secs(), Ordering::Relaxed);
     } else {
         warn!(
             "HandshakeCache prewarm got no templates from {} — will retry lazily on first connection",
@@ -204,6 +216,7 @@ pub async fn get_server_hello_pfs(
             let mut guard = cache().lock().await;
             if !templates.is_empty() {
                 guard.extend(templates);
+                LAST_OK_SECS.store(now_secs(), Ordering::Relaxed);
             } else {
                 // WARN 而非 ERROR: 这是**优雅降级**, 非故障 —— 拉不到真模板 (无外网/camouflage
                 // 不可达的 VPS/容器很常见) 就用恒完整的合成 fallback, 握手照常。降级为 WARN 免得
@@ -1099,5 +1112,54 @@ mod tests {
         });
         let res = fetch_real_server_hello(&addr.to_string()).await;
         assert!(res.is_err(), "未知 key_share group 模板必须被拒: {:?}", res);
+    }
+
+    use super::{merge_templates, BATCH, MAX_TEMPLATES};
+
+    #[test]
+    fn test_merge_templates_batch_replace() {
+        let old = vec![vec![1], vec![2], vec![3]];
+        let new = vec![vec![10], vec![11], vec![12], vec![13], vec![14]];
+        assert!(new.len() >= BATCH);
+        let merged = merge_templates(old, new.clone());
+        assert_eq!(merged, new, "整批成功应整体替换旧池");
+    }
+
+    #[test]
+    fn test_merge_templates_partial_cap_max() {
+        let old = vec![vec![1], vec![2], vec![3], vec![4], vec![5], vec![6], vec![7], vec![8]];
+        let new = vec![vec![100], vec![101], vec![102]];
+        let merged = merge_templates(old, new);
+        assert!(merged.len() <= MAX_TEMPLATES, "合并后长度必须 <= MAX_TEMPLATES");
+        assert_eq!(merged.len(), MAX_TEMPLATES);
+        assert_eq!(merged[0], vec![100]);
+        assert_eq!(merged[1], vec![101]);
+        assert_eq!(merged[2], vec![102]);
+        assert_eq!(merged[3], vec![1]);
+    }
+
+    #[test]
+    fn test_merge_templates_consecutive_partial_refreshes() {
+        let mut pool = vec![vec![0; 4]];
+        for i in 1..=20 {
+            let new = vec![vec![i as u8, 1], vec![i as u8, 2]];
+            pool = merge_templates(pool, new.clone());
+            assert!(pool.len() <= MAX_TEMPLATES, "池长度必须始终 <= MAX_TEMPLATES");
+            assert_eq!(pool[0], new[0], "最新批的第 0 项必须在最前");
+            assert_eq!(pool[1], new[1], "最新批的第 1 项必须在最前");
+        }
+    }
+
+    #[test]
+    fn test_merge_templates_partial_then_full_shrinks() {
+        let mut pool = vec![vec![1], vec![2], vec![3], vec![4], vec![5]];
+        // 部分刷新扩充到超过 BATCH
+        pool = merge_templates(pool, vec![vec![6], vec![7], vec![8]]);
+        assert_eq!(pool.len(), 8);
+        // 整批成功刷新
+        let full = (10..10 + BATCH).map(|i| vec![i as u8]).collect::<Vec<_>>();
+        pool = merge_templates(pool, full.clone());
+        assert_eq!(pool.len(), BATCH, "整批成功后池收缩回整批大小");
+        assert_eq!(pool, full);
     }
 }

@@ -25,8 +25,8 @@ const DNS_UDP_BUF: usize = 4096;
 // DNS 入站并发查询封顶: 每查询 spawn 一个任务且向上游多发+重传, 无封顶时 LAN 洪水/伪源可
 // 无界 spawn + 放大上游流量。满了丢本查询 (客户端会重试)。
 const DNS_MAX_CONCURRENT: usize = 256;
-/// 直连上游单飞 key: `(域名, qtype, DO, CD, 上游集合指纹)`。
-type FlightKey = (String, u16, bool, bool, u64);
+/// 直连上游单飞 key: `(域名, qtype, DO, CD, bucket, 上游集合指纹)`。
+type FlightKey = (String, u16, bool, bool, u8, u64);
 
 /// 上游查询单飞表 (直连)。
 static INFLIGHT_UPSTREAM: FlightTable<FlightKey> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -47,7 +47,8 @@ fn warn_sampled(counter: &std::sync::atomic::AtomicU64, msg: impl FnOnce(u64) ->
     }
 }
 
-static DNS_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(DNS_MAX_CONCURRENT));
+static DNS_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(DNS_MAX_CONCURRENT));
 
 fn extract_domain(data: &[u8]) -> Option<String> {
     if data.len() < 12 {
@@ -500,7 +501,8 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
                 warn_sampled(&DNS_UPSTREAM_SEND_FAIL, |n| {
                     format!("DNS 上游发包失败 {up}: {e} (累计 {n}) —— 持续出现请检查出向 UDP/防火墙")
                 });
-            }        }
+            }
+        }
         // 本轮内循环收包, 丢弃 tx_id 不匹配的串扰/迟到响应, 直到匹配或本轮超时
         let deadline = tokio::time::Instant::now() + DNS_RETRANSMIT_INTERVAL;
         loop {
@@ -551,12 +553,12 @@ where
 }
 
 async fn direct_query(req: &[u8], upstreams: &[(SocketAddr, crate::config::DnsProtocol)]) -> Option<Vec<u8>> {
-    let Some((domain, qtype, do_bit, cd_bit)) = singleflight_key(req) else {
+    let Some((domain, qtype, do_bit, cd_bit, bucket)) = singleflight_key(req) else {
         return direct_query_once(req, upstreams).await;
     };
     // key 必须包含**上游集合**的指纹: 同一域名经 CN 解析器与境外解析器会拿到不同答案
     // (分流/就近调度的前提), 把它们合并就是错答案。
-    let key: FlightKey = (domain, qtype, do_bit, cd_bit, upstream_sig(upstreams));
+    let key: FlightKey = (domain, qtype, do_bit, cd_bit, bucket, upstream_sig(upstreams));
     let resp = singleflight(&INFLIGHT_UPSTREAM, key, || direct_query_once(req, upstreams)).await;
     resp.map(|r| patch_for_query(r, req))
 }
@@ -572,15 +574,26 @@ fn upstream_sig(upstreams: &[(SocketAddr, crate::config::DnsProtocol)]) -> u64 {
     h.finish()
 }
 
-/// 单飞 key: `(小写域名, qtype, DO, CD)`。取不到域名/问题段 → None (不合并)。
-fn singleflight_key(req: &[u8]) -> Option<(String, u16, bool, bool)> {
+/// 按客户端 EDNS 缓冲大小分档: <=512 → 0, <=1232 → 1, 否则 2。
+fn udp_bucket(max_udp: usize) -> u8 {
+    if max_udp <= 512 {
+        0
+    } else if max_udp <= 1232 {
+        1
+    } else {
+        2
+    }
+}
+
+/// 单飞 key: `(小写域名, qtype, DO, CD, bucket)`。取不到域名/问题段 → None (不合并)。
+fn singleflight_key(req: &[u8]) -> Option<(String, u16, bool, bool, u8)> {
     let domain = extract_domain(req)?;
     if domain.is_empty() {
         return None;
     }
     let qtype = get_qtype(req)?;
     let e = edns_info(req);
-    Some((domain.to_lowercase(), qtype, e.do_bit, e.cd_bit))
+    Some((domain.to_lowercase(), qtype, e.do_bit, e.cd_bit, udp_bucket(e.max_udp)))
 }
 
 /// 把 `resp` 的 tx_id 与 question 段换成 `req` 的（0x20 大小写随机 + 客户端自己的 id）。
@@ -701,7 +714,7 @@ struct EdnsInfo {
     max_udp: usize,
 }
 
-type CacheKey = (String, u16, bool, bool); // (小写域名, qtype, DO, CD)
+type CacheKey = (String, u16, bool, bool, u8); // (小写域名, qtype, DO, CD, bucket)
 
 /// 从附加段找 OPT(type=41)：`CLASS` = 客户端 UDP payload 大小，`TTL` 的 bit15 = DO。
 /// 无 OPT / 畸形 → 退回 RFC 1035 语义 (`DO=false, max_udp=512`)。
@@ -773,13 +786,14 @@ impl DnsCache {
     /// 命中且未过期 → 返回按当前 query patch 好的响应 (tx_id + question 段, 兼容 0x20 大小写
     /// 随机 + id; 保留响应头/flags/答案不变)。
     ///
-    /// key 含 `(DO, CD)`；另若条目超出**当前客户端**声明的 UDP 上限 → 视为 miss（让调用方
+    /// key 含 `(DO, CD, bucket)`；另若条目超出**当前客户端**声明的 UDP 上限 → 视为 miss（让调用方
     /// 现查一次，拿适合该客户端大小的响应）。本服务只监听 UDP，所以不能靠置 `TC=1` 让客户端
     /// 改走 TCP（它会重试 UDP 仍失败）——宁可多一次上游查询。
     fn get(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
         let edns = edns_info(query);
+        let bucket = udp_bucket(edns.max_udp);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit);
+        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let e = m.get(&key)?;
         if e.expiry <= std::time::Instant::now() {
             m.remove(&key);
@@ -793,12 +807,16 @@ impl DnsCache {
 
     /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
     fn put(&self, domain: &str, qtype: u16, query: &[u8], response: &[u8]) {
+        if response.get(2).is_some_and(|b| b & 0x02 != 0) {
+            return;
+        }
         let ttl = match min_answer_ttl(response) {
             Some(t) => t.clamp(1, 3600),
             None => return,
         };
         let edns = edns_info(query);
-        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit);
+        let bucket = udp_bucket(edns.max_udp);
+        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= self.max_entries && !m.contains_key(&key) {
             let now = std::time::Instant::now();
@@ -1398,10 +1416,10 @@ impl DnsForwarder {
         remote_host: &str,
         remote_port: u16,
     ) -> Option<Vec<u8>> {
-        let Some((domain, qtype, do_bit, cd_bit)) = singleflight_key(req) else {
+        let Some((domain, qtype, do_bit, cd_bit, bucket)) = singleflight_key(req) else {
             return Self::dns_over_tunnel_once(req, pool, remote_host, remote_port).await;
         };
-        let key = format!("{domain}|{qtype}|{}|{}|{remote_host}|{remote_port}", do_bit as u8, cd_bit as u8);
+        let key = format!("{domain}|{qtype}|{}|{}|{bucket}|{remote_host}|{remote_port}|{:p}", do_bit as u8, cd_bit as u8, pool);
         let resp = singleflight(&INFLIGHT_TUNNEL, key, || {
             Self::dns_over_tunnel_once(req, pool, remote_host, remote_port)
         })
@@ -2132,8 +2150,37 @@ mod tests {
             cache.get("x.com", 1, &cache_a_query([7, 7])).is_none(),
             "超过客户端声明大小的条目必须 miss 而不是越界下发"
         );
-        // 1232 也不够 (响应 ~535B + patch 后仍 > 1232? 535 < 1232 → 应命中)
-        assert!(cache.get("x.com", 1, &query_with_opt([7, 7], 1232, false)).is_some());
+        // 2048 与 4096 同属 bucket 2 且响应 535B < 2048 → 应命中
+        assert!(cache.get("x.com", 1, &query_with_opt([7, 7], 2048, false)).is_some());
+    }
+
+    #[test]
+    fn cache_skips_truncated_tc_response() {
+        let cache = DnsCache::new(10);
+        let q = cache_a_query([1, 1]);
+        let mut tc_resp = cache_a_response([1, 1], 300);
+        tc_resp[2] |= 0x02; // TC=1 (truncated)
+        cache.put("x.com", 1, &q, &tc_resp);
+        assert!(cache.get("x.com", 1, &q).is_none(), "TC=1 响应绝不能入缓存");
+    }
+
+    #[test]
+    fn cache_isolates_512_and_4096_clients() {
+        let cache = DnsCache::new(10);
+        let q512 = cache_a_query([1, 2]); // 无 OPT, max_udp=512, bucket=0
+        let q4096 = query_with_opt([1, 2], 4096, false); // max_udp=4096, bucket=2
+
+        let r512 = cache_a_response([1, 2], 300);
+        let r4096 = cache_a_response([1, 2], 600);
+
+        // 存 512 客户端的响应
+        cache.put("x.com", 1, &q512, &r512);
+        assert!(cache.get("x.com", 1, &q512).is_some(), "512 客户端应命中自己的缓存");
+        assert!(cache.get("x.com", 1, &q4096).is_none(), "4096 客户端不能命中 512 客户端的缓存");
+
+        // 存 4096 客户端的响应
+        cache.put("x.com", 1, &q4096, &r4096);
+        assert!(cache.get("x.com", 1, &q4096).is_some(), "4096 客户端应命中自己的缓存");
     }
 
     #[test]
@@ -2232,6 +2279,40 @@ mod tests {
         assert!(r1.is_some() && r2.is_some());
         assert_eq!(h1.load(Ordering::SeqCst), 1);
         assert_eq!(h2.load(Ordering::SeqCst), 1, "不同上游集合各自查一次, 不得合并");
+    }
+
+    /// 不同 bucket 的并发查询**不**应被单飞合并。
+    #[tokio::test]
+    async fn singleflight_does_not_merge_different_buckets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let up = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 1500];
+            while let Ok((n, from)) = up.recv_from(&mut b).await {
+                h.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let mut resp = b[..n].to_vec();
+                resp[2] |= 0x80;
+                let _ = up.send_to(&resp, from).await;
+            }
+        });
+
+        let ups = vec![(addr, crate::config::DnsProtocol::Udp)];
+        let q1 = cache_a_query([0x55, 0x66]); // bucket 0 (512)
+        let q2 = query_with_opt([0x77, 0x88], 4096, false); // bucket 2 (4096)
+        let (r1, r2) = tokio::join!(
+            direct_query(&q1, &ups),
+            direct_query(&q2, &ups)
+        );
+        assert!(r1.is_some() && r2.is_some());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "不同 bucket 的并发查询不得被单飞合并"
+        );
     }
 
     #[test]

@@ -14,9 +14,12 @@
 
 - **抗探测预连改为有界等待** (A1, `mirage_server/handshake.rs`): 移除不减少总连接数却拉大关闭时间偏差的 `PRECONNECT_RATE_PER_SEC`(30/s) 限速，保留 `PRECONNECT_MAX_INFLIGHT=128` 并将配额获取改为 `preconnect_permit(800ms)` 有界等待，过载时仅降级为部分对齐而非完全不对齐，新增降级计数与每 500 次采样告警。
 - **DNS 上游响应强制校验 Question 段** (A2, `dns/server.rs`): 新增 `response_matches()`，在 UDP 与 TCP 上游查询路径同时校验 `txid + QR + QDCOUNT==1 + question(域名 ASCII 大小写无关 / QTYPE / QCLASS)` 全等，防止恶意响应污染 `DnsCache`；新增 8 条断言的单元测试。
-- **TCP 中继 `shutdown` 独立持有 `dup(fd)`** (A3, `mirage_server/tcp_relay.rs`): 对 `upstream_fd` 执行 `libc::dup` 交由双向停止闭包 `shutdown + close`，消除与读写半句柄 `drop` 之间的 fd 复用竞态。
+- **TCP 中继 `shutdown` 独立持有 `dup(fd)`** (A3, `mirage_server/tcp_relay.rs`): 已撤回: 原写法安全 (见 docs/codebase-audit-2026-10.md A3)。
 - **握手模板刷新防多样性塌缩与陈旧告警** (A4, `crypto/handshake_cache.rs`): `install_templates()` 在新抓取模板数少于现有缓存时与旧集合并，避免回放退化为单一 ServerHello；连续超过 6 小时（12 个周期）未成功刷新时周期性输出陈旧告警。
-- **WebUI 事件委托与脚本/CI 权限加固** (`src/api/index.html` / `install.sh` / `.github/workflows/build.yml`): WebUI 移除动态列表内联事件并统一改为 `data-action` 事件委托；`install.sh` 在 `/dev/urandom` 熵不足时直接报错退出、Brutal 安装改为下载到临时文件校验 SHA256 并经交互确认后执行；CI workflow 声明 `permissions: contents: read`。
+- **握手模板刷新单向棘轮与陈旧告警防御** (`crypto/handshake_cache.rs`): 设定 `BATCH=5` 与池上限 `MAX_TEMPLATES=10`；整批拉取成功时整体替换，部分成功时新在前旧在后拼接并截断淘汰最旧，消除单向棘轮导致模板只增不减与旧模板永不淘汰问题；在 `prewarm` 与 `get_server_hello_pfs` 首次成功填充缓存后记录 `LAST_OK_SECS`，并增加初值为 0 时防御不告警，避免初次刷新失败误报已 1.7e9s 未更新。
+- **DNS 缓存与单飞按 EDNS 缓冲大小分档** (`dns/server.rs`): 新增 `udp_bucket`（`<=512 / <=1232 / 其它`）并入 `CacheKey` 与 `FlightKey`，避免 512B 客户端与 4096B 客户端的缓存条目互串与并发单飞错误合并；`DnsCache::put` 开头对 `TC=1` 截断响应直接拒绝缓存。
+- **dns_over_tunnel 单飞 key 补全出站节点标识** (`dns/server.rs`): 单飞 key 加入出站 `WarmPool` 节点指针标识，防止不同出口节点查同一远端 DNS 被错误合并而串用出口地域相关答案。
+- **WebUI 事件委托与脚本/CI 权限加固** (`src/api/index.html` / `install.sh` / `.github/workflows/build.yml`): WebUI 移除动态列表内联事件并统一改为 `data-action` 事件委托；`install.sh` 在 `/dev/urandom` 熵不足时直接报错退出、Brutal 安装改为下载到临时文件、打印其 SHA256 供人工核对, 并经交互确认后执行 (非交互环境直接跳过; 不与任何已知哈希比对)；CI workflow 声明 `permissions: contents: read`。
 - 新增全库审计报告 `docs/codebase-audit-2026-10.md`。
 
 ### fix: QUIC 单飞/UDP 中继本地改动与全局审计遗留修复 (2026-10-18)

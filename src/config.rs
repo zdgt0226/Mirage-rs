@@ -1244,7 +1244,7 @@ pub struct TuningConfig {
     ///
     /// 为什么必须有上限: 认证前的连接窗口由 `client_hello_guard.hard_deadline_ms` 限住 (默认 5s),
     /// 但**没有全局并发上限时** flood 仍可持有 `速率 × 5s` 个任务与 socket ⇒ 内存/任务表被打满
-    /// (见 `docs/codebase-audit-2026-10.md` B1)。超限的连接**直接关闭** (与真站过载行为一致)
+    /// (见 `docs/codebase-audit-2026-10.md` A5)。超限的连接**直接关闭** (与真站过载行为一致)
     /// 并计数告警。作用域 = **全进程** (多个 mirage_server 入站共享同一上限)。
     /// 注意: 重载配置不会改变已建的信号量 ⇒ **重启生效**。
     #[serde(default)]
