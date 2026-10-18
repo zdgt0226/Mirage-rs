@@ -8,6 +8,8 @@
 
 - **服务端单来源连接上限** (A5 补强, `mirage_server/mod.rs`): 全局 8192 上限之上新增按来源 IP 的子上限 `max(16, min(1024, 全局/4))` (IPv6 归一 /64)，accept 时先过来源上限再取全局名额，单一来源不能再独占全部名额把合法新连接挤掉 (否则 DoS 只是从 "内存被打满" 变成 "可用性被打满")。`MIRAGE_MAX_CONNS` 非法值现在会 WARN 而不是静默忽略，启动日志打印夹取后的实际生效值。
 - **`rate_limit_key` 还原 IPv4-mapped 地址** (`mirage_server/handshake.rs`): 监听 `[::]` 的双栈部署里 v4 客户端以 `::ffff:a.b.c.d` 出现，原先 /64 归一会把它们全部清零成同一个 `::` 桶 —— `UNAUTH_RATE` 等按来源的限流/限额对所有 v4 来源共用一个额度。现先 `to_canonical()` 再归一。
+- **QUIC 客户端对 "服务端拒绝" 的退避与诊断** (`quic.rs`): 服务端为抗探测已把认证失败统一成应用层 close(0) 且不再有专用错误码，客户端原先不退避 —— 口令/时钟配错时每条新流都会重做一次完整 QUIC 握手。现在 `QuicMux` 识别 "刚建连 (<10s) 即被应用层 close(0)" 为服务端拒绝，指数冷却 1s/2s/4s…封顶 30s (冷却内 `open_stream` 立即失败)，首次输出一条 WARN 列出可能原因 (口令不符 / 时钟偏差 / IP 被屏蔽 / 凭据吊销 / 服务端配置了上游中继)。长会话后被关、空闲超时等不计入。注意: 此前的专用码 `QUIC_AUTH_FAILED_CODE` 及 `is_quic_auth_failed_io` 等公开 API 已在上一提交移除，Android 同步时需留意。
+- **QUIC 服务端状态门控补集成测试** (`mirage_server/mod.rs`): 起真 `start_quic_server` + 真 `QuicMux`，覆盖 错 token 首流立即关整条连接且客户端进入冷却 / 握手后 5s 无首流被回收 / 合法 token 首流与后续流正常中继。
 
 - **DNS 上游查询单飞** (A7, `dns/server.rs`): 新增通用 `singleflight()`（`OnceCell` 表，初始化完成即摘；leader 被 cancel 时下一个接替），接入 `direct_query`（key 含 **上游集合指纹**）与 `dns_over_tunnel`（key 含隧道 host/port）。同 key 并发 miss 的上游查询与**隧道消耗**从 N 降为 1。等待者用公共 `patch_for_query()` 换上自己的 tx_id/question（否则客户端丢包）；key 含上游集合避免把 CN/境外解析器的不同答案合并。
 

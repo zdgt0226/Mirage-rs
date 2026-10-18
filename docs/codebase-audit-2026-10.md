@@ -104,8 +104,8 @@
 ## 4. 门禁
 
 ```
-cargo test --lib                                  563 passed / 0 failed / 3 ignored
-cargo test --features quic --lib                  593 passed / 0 failed / 3 ignored
+cargo test --lib                                  567 passed / 0 failed / 3 ignored
+cargo test --features quic --lib                  602 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings          0 warning（含 --features quic）
 bash scripts/check-no-real-endpoints.sh            0 命中
 ```
@@ -123,8 +123,8 @@ bash scripts/check-no-real-endpoints.sh            0 命中
 ## 5. 复跑核对清单（零成本，改完就跑）
 
 ```bash
-cargo test --lib                                            # 563 passed / 0 failed / 3 ignored
-cargo test --features quic --lib                            # 593 passed / 0 failed / 3 ignored
+cargo test --lib                                            # 567 passed / 0 failed / 3 ignored
+cargo test --features quic --lib                            # 602 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings                   # 0
 cargo clippy --all-targets --features quic -- -D warnings   # 0
 bash scripts/check-no-real-endpoints.sh                     # 0 命中

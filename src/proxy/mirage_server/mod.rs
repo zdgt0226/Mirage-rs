@@ -1755,3 +1755,157 @@ mod conn_cap_tests {
         );
     }
 }
+
+/// QUIC 服务端状态门控 (Unauthenticated -> Authenticated) 的进程内集成测试:
+/// 起真的 `start_quic_server`, 用真的 `QuicMux` 当客户端。
+#[cfg(all(test, feature = "quic"))]
+mod quic_gate_tests {
+    use super::*;
+    use crate::proxy::quic::{load_or_generate_key, spki_pin, QuicCc, QuicMux};
+
+    struct Gate {
+        port: u16,
+        pin: String,
+        dir: std::path::PathBuf,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 起一个 QUIC 服务端 (回环、随机 UDP 端口、`default` 用户口令 = `password`)。
+    async fn start_gate(password: &str) -> Gate {
+        let dir = std::env::temp_dir().join(format!("mirage_gate_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("quic_key.pem");
+        let pin = spki_pin(&load_or_generate_key(&key_path).unwrap().public_key_der());
+        // 先占一个空闲 UDP 端口再释放: start_quic_server 只接受 `IP:port` 字符串, 取不回 :0 的实际端口。
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let creds = register_creds(&format!("gate-test-{port}"), build_creds(password, &[]));
+        let addr = format!("127.0.0.1:{port}");
+        let key_str = key_path.to_str().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            start_quic_server(
+                &addr,
+                creds,
+                "example.com",
+                3600, // 宽容差: 避免与改全局时钟偏移的并发测试互相干扰
+                None,
+                false,
+                2,
+                QuicCc::Stock,
+                None,
+                Some(&key_str),
+                true, // 允许回环目标: relay 测试的 echo 在 127.0.0.1
+            )
+            .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        Gate { port, pin, dir, server }
+    }
+
+    fn mux_for(g: &Gate) -> std::sync::Arc<QuicMux> {
+        QuicMux::new("127.0.0.1", g.port, "localhost", false, false, None, 2, QuicCc::Stock, Some(g.pin.clone()))
+    }
+
+    fn token(password: &str) -> [u8; 32] {
+        // 生成 token 读全局 TIME_OFFSET: 与会改 offset 的测试串行 (锁不跨 await)。
+        let _t = crate::time_sync::tests::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::crypto::hello_auth::make_session_token(password, crate::crypto::hello_auth::QUIC_LEAN_BIND)
+    }
+
+    async fn read_until_closed(recv: &mut quinn::RecvStream, within: std::time::Duration) -> bool {
+        let mut b = [0u8; 16];
+        match tokio::time::timeout(within, recv.read(&mut b)).await {
+            Ok(Ok(Some(_))) => false, // 收到了数据 = 没被关
+            Ok(Ok(None)) => false,    // 对端正常 FIN
+            Ok(Err(_)) => true,       // reset / 连接关闭
+            Err(_) => false,          // 超时仍未关
+        }
+    }
+
+    /// 首流 token 错误: 服务端立即关整条连接 (不是只结束这一条流), 客户端随后进入拒绝冷却。
+    #[tokio::test]
+    async fn wrong_token_on_first_stream_closes_connection_and_client_backs_off() {
+        let g = start_gate("correct-password").await;
+        let mux = mux_for(&g);
+
+        let (mut send, mut recv) = mux.open_stream().await.expect("QUIC 握手本身应成功");
+        let mut hdr = token("wrong-password").to_vec();
+        hdr.extend_from_slice(&[0, 3]);
+        hdr.extend_from_slice(b"a:1");
+        send.write_all(&hdr).await.unwrap();
+        assert!(
+            read_until_closed(&mut recv, std::time::Duration::from_secs(2)).await,
+            "错 token 的首流必须在 2s 内被服务端关闭"
+        );
+
+        // 连接已被关: 客户端应识别为 "服务端拒绝" 并快速失败, 而不是对每条新流重做握手。
+        let t0 = std::time::Instant::now();
+        let err = mux.open_stream().await.unwrap_err();
+        assert!(t0.elapsed() < std::time::Duration::from_millis(300), "冷却内应立即失败");
+        assert!(err.to_string().contains("服务端拒绝"), "应提示服务端拒绝: {err}");
+    }
+
+    /// 握手后一直不发首流: 5s 后服务端回收整条连接 (防占位型慢速攻击)。
+    #[tokio::test]
+    async fn no_first_stream_within_5s_closes_connection() {
+        let g = start_gate("correct-password").await;
+        let mux = mux_for(&g);
+
+        // 开流但什么都不写: QUIC 里流在首个 STREAM 帧到达前对服务端不可见 ⇒ accept_bi 不会返回。
+        let (_send, mut recv) = mux.open_stream().await.expect("QUIC 握手本身应成功");
+        let t0 = std::time::Instant::now();
+        assert!(
+            read_until_closed(&mut recv, std::time::Duration::from_secs(9)).await,
+            "无首流时服务端必须在 9s 内回收连接"
+        );
+        let waited = t0.elapsed();
+        assert!(waited >= std::time::Duration::from_secs(4), "不应早于 ~5s 超时就关: {waited:?}");
+    }
+
+    /// 合法 token: 门控放行, 首流与后续流都能正常中继到目标。
+    #[tokio::test]
+    async fn valid_token_passes_gate_and_relays_first_and_later_streams() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let g = start_gate("correct-password").await;
+
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mux = mux_for(&g);
+        let target = format!("127.0.0.1:{echo_port}");
+        // 第 1 条 (走首流认证路径) 与第 2 条 (走已认证连接上的逐流校验路径)
+        for round in 0..2 {
+            let (mut send, mut recv) = mux.open_stream().await.expect("应能开流");
+            let mut hdr = token("correct-password").to_vec();
+            hdr.extend_from_slice(&(target.len() as u16).to_be_bytes());
+            hdr.extend_from_slice(target.as_bytes());
+            hdr.extend_from_slice(b"ping");
+            send.write_all(&hdr).await.unwrap();
+            let mut out = [0u8; 4];
+            tokio::time::timeout(std::time::Duration::from_secs(3), recv.read_exact(&mut out))
+                .await
+                .unwrap_or_else(|_| panic!("第 {round} 条流 3s 内应收到回显"))
+                .unwrap();
+            assert_eq!(&out, b"ping", "第 {round} 条流应回显");
+        }
+        echo_task.abort();
+    }
+}

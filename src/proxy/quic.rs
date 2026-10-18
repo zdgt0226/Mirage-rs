@@ -190,6 +190,62 @@ struct MuxInner {
     dialing: Option<DialWatchRx>,
     /// 最近一次建连失败的时间戳与错误消息 (供 DIAL_FAIL_BACKOFF 退避窗口快速失败)。
     last_failure: Option<(std::time::Instant, String)>,
+    /// 当前连接的建立时刻; 连接被观察到关闭并结算后清空 (防同一连接被重复计入拒绝)。
+    conn_since: Option<std::time::Instant>,
+    /// 连续被服务端拒绝 (刚建连就被应用层 close(0)) 的次数, 驱动 `reject_until` 指数退避。
+    reject_streak: u32,
+    /// 被服务端拒绝后的冷却截止时刻: 期间 `get_or_dial_conn` 直接快速失败, 不再重做握手。
+    reject_until: Option<std::time::Instant>,
+}
+
+/// 刚建连就被服务端应用层 close(0) 的判定窗口: 超过它才被关说明会话曾正常工作 (如中途吊销), 不算拒绝。
+const REJECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// 拒绝退避上限。
+const REJECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 服务端拒绝类关闭: 应用层 close 且错误码 0 (服务端对 口令/时钟不符、IP 被屏蔽、凭据吊销、
+/// 配了上游中继的 lean 路径 都用同一个通用码 0, 以免给主动探测者留下可区分的指纹), 且是刚建连不久。
+fn is_server_rejection(reason: &quinn::ConnectionError, lived: std::time::Duration) -> bool {
+    matches!(reason, quinn::ConnectionError::ApplicationClosed(ac) if ac.error_code == quinn::VarInt::from_u32(0))
+        && lived < REJECT_WINDOW
+}
+
+/// 第 `streak` 次连续拒绝后的冷却时长: 1s, 2s, 4s ... 封顶 30s。
+fn reject_backoff(streak: u32) -> std::time::Duration {
+    let secs = 1u64 << streak.saturating_sub(1).min(5);
+    std::time::Duration::from_secs(secs).min(REJECT_BACKOFF_MAX)
+}
+
+impl MuxInner {
+    /// 连接被观察到已关闭时结算一次: 刚建连即被服务端拒绝 → 连续计数 + 启动冷却; 其它关闭 (空闲超时、
+    /// 长会话后被关等) → 清零。
+    ///
+    /// 为什么需要: 服务端为抗探测把认证失败的 reset 码统一成通用 0 并直接关整条连接, 客户端不再能靠专用
+    /// 错误码识别 "口令不符"。若不退避, 口令/时钟配错时每条新流都会重做一次完整 QUIC 握手 (两端都耗 CPU)。
+    fn note_conn_closed(&mut self, reason: &quinn::ConnectionError) {
+        let Some(since) = self.conn_since.take() else {
+            return; // 已结算过
+        };
+        if is_server_rejection(reason, since.elapsed()) {
+            self.reject_streak = self.reject_streak.saturating_add(1);
+            let wait = reject_backoff(self.reject_streak);
+            self.reject_until = Some(std::time::Instant::now() + wait);
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let msg = format!(
+                "QUIC: 服务端刚建连就关闭了连接 (连续第 {} 次, {}s 后重试): 常见原因 口令不符 / 时钟偏差超容差 / 本机 IP 被服务端屏蔽 / 凭据已吊销 / 服务端配置了上游中继 (QUIC 暂不支持)",
+                self.reject_streak,
+                wait.as_secs()
+            );
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("{msg}");
+            } else {
+                tracing::debug!("{msg}");
+            }
+        } else {
+            self.reject_streak = 0;
+            self.reject_until = None;
+        }
+    }
 }
 
 /// 单飞建连 Leader 取消守卫: 若发起拨号的任务在 await DNS/握手期间被取消 (drop),
@@ -262,16 +318,31 @@ impl QuicMux {
         loop {
             let action = {
                 let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(c) = &g.conn {
-                    if c.close_reason().is_none() {
-                        return Ok((c.clone(), true));
-                    }
+                let closed = match &g.conn {
+                    Some(c) => match c.close_reason() {
+                        None => return Ok((c.clone(), true)),
+                        Some(r) => Some(r),
+                    },
+                    None => None,
+                };
+                if let Some(reason) = closed {
+                    g.note_conn_closed(&reason);
                     g.conn = None;
                     g.endpoint = None;
                 }
                 if let Some(rx) = &g.dialing {
                     MuxAcquireAction::Wait(rx.clone())
                 } else {
+                    if let Some(until) = g.reject_until {
+                        let now = std::time::Instant::now();
+                        if now < until {
+                            anyhow::bail!(
+                                "QUIC: 服务端拒绝了本客户端的连接 (口令不符 / 时钟偏差 / IP 被屏蔽 / 凭据吊销), 冷却中, {}s 后重试",
+                                (until - now).as_secs() + 1
+                            );
+                        }
+                        g.reject_until = None;
+                    }
                     if let Some((failed_at, err_msg)) = &g.last_failure {
                         if failed_at.elapsed() < DIAL_FAIL_BACKOFF {
                             anyhow::bail!("{err_msg}");
@@ -329,6 +400,7 @@ impl QuicMux {
                             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                             g.endpoint = Some(ep);
                             g.conn = Some(conn.clone());
+                            g.conn_since = Some(std::time::Instant::now());
                             g.last_failure = None;
                             g.dialing = None;
                             drop(g);
@@ -360,6 +432,9 @@ impl QuicMux {
                 Err(e) => {
                     let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if g.conn.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+                        if let Some(reason) = conn.close_reason() {
+                            g.note_conn_closed(&reason);
+                        }
                         g.conn = None;
                         g.endpoint = None;
                     }
@@ -1104,6 +1179,87 @@ mod tests {
         assert!(t0.elapsed() < DIAL_FAIL_BACKOFF, "退避窗口内应立即快速失败");
         assert!(err1.to_string().contains("服务端证书指纹与 quic_pin 不符"));
         assert_eq!(err1.to_string(), err2.to_string());
+
+        srv_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn rejection_predicate_and_backoff_schedule() {
+        use std::time::Duration;
+        let app = |code: u32| {
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(code),
+                reason: Default::default(),
+            })
+        };
+        assert!(is_server_rejection(&app(0), Duration::from_secs(1)), "刚建连就被 close(0) 算拒绝");
+        assert!(!is_server_rejection(&app(0), Duration::from_secs(11)), "长会话后被关不算拒绝");
+        assert!(!is_server_rejection(&app(7), Duration::from_secs(1)), "非 0 码不算拒绝");
+        assert!(!is_server_rejection(&quinn::ConnectionError::TimedOut, Duration::from_secs(1)), "空闲超时不算拒绝");
+
+        let secs = |n| reject_backoff(n).as_secs();
+        assert_eq!((secs(1), secs(2), secs(3), secs(4)), (1, 2, 4, 8));
+        assert_eq!((secs(6), secs(7), secs(50)), (30, 30, 30), "封顶 30s");
+    }
+
+    #[tokio::test]
+    async fn test_quic_mux_backs_off_after_server_rejects_connection() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_mux_rej_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("quic_key.pem");
+        let key_path_str = key_path.to_str().unwrap();
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let ep_server = server_endpoint(listen_addr, 2, QuicCc::Stock, None, Some(key_path_str)).unwrap();
+        let server_addr = ep_server.local_addr().unwrap();
+        let pin = spki_pin(&load_or_generate_key(&key_path).unwrap().public_key_der());
+
+        // 假服务端: 与真服务端认证失败时一致 —— 收到首条流就用通用码 0 关整条连接。
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_srv = accepted.clone();
+        let srv_handle = tokio::spawn(async move {
+            while let Some(incoming) = ep_server.accept().await {
+                let cnt = accepted_srv.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if conn.accept_bi().await.is_ok() {
+                            conn.close(quinn::VarInt::from_u32(0), b"");
+                        }
+                    }
+                });
+            }
+        });
+
+        let mux = QuicMux::new("127.0.0.1", server_addr.port(), "localhost", false, false, None, 2, QuicCc::Stock, Some(pin));
+
+        let (mut send, mut recv) = mux.open_stream().await.expect("首次建连应成功");
+        tokio::io::AsyncWriteExt::write_all(&mut send, b"x").await.unwrap(); // 让服务端看到这条流
+        let mut b = [0u8; 1];
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::io::AsyncReadExt::read(&mut recv, &mut b))
+            .await
+            .expect("服务端应在 2s 内关闭连接");
+        assert!(r.is_err(), "连接被服务端关闭后读取应报错");
+
+        // 冷却窗口内: 立即快速失败, 不再重做 QUIC 握手 (服务端只见过 1 条连接)。
+        let t0 = std::time::Instant::now();
+        let err = mux.open_stream().await.unwrap_err();
+        assert!(t0.elapsed() < std::time::Duration::from_millis(300), "冷却内应立即失败, 实际 {:?}", t0.elapsed());
+        assert!(err.to_string().contains("服务端拒绝"), "错误应提示服务端拒绝: {err}");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "冷却期内不得重新拨号");
+
+        // 冷却 (第 1 次 = 1s) 结束后可以重新建连。
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let _ = mux.open_stream().await.expect("冷却结束后应能重新建连");
+        // 服务端的 accept 计数与客户端握手完成之间有先后差, 轮询等它追上 (上限 1s)。
+        for _ in 0..100 {
+            if accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         srv_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
