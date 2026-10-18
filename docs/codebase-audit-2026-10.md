@@ -41,6 +41,16 @@
 - **语义**：作用域=**全进程**（多个 `mirage_server` 入站共享）；**重启生效**（信号量在首次 accept 时按配置创建）。
 - **未覆盖**：QUIC 入站仍用自身的 `rt_limiter`（按 stream 计），未共享此上限 —— 若要统一，把 permit 传给 `start_quic_server` 即可（后续项）。
 
+### A6（中，DNS 正确性）缓存 key 缺 DO/CD 维度 + 越界下发大响应
+
+- **位置**：`dns/server.rs::DnsCache`
+- **问题**：key 只有 `(domain, qtype)` ⇒ ① `DO=1`（要 DNSSEC 签名）的客户端可能命中 `DO=0` 建立的条目（无 RRSIG）⇒ 客户端视作“无签名”/校验降级；② `CD=1`（表示“我自己校验”）的条目含上游**未验证**数据，给 `CD=0` 的客户端就是**绕过校验**；③ 条目大小按“当时那个客户端”的 EDNS 缓冲决定，`4096` 的条目可能下发给只声明 `512` 的客户端（无 EDNS/旧 resolver）⇒ 越过协议上限。附带：响应大小取决于**别的客户端**的 flags，本身构成可观测差异。
+- **修复**：
+  1. key 改为 `(domain, qtype, DO, CD)`；新增 `edns_info()`（边界安全的 OPT 解析：`CLASS`=声明的 UDP payload，`TTL` bit15 = DO；`CD` 取 header byte3 的 `0x10`；无 OPT → `DO=0, 512`；畸形/截断安全回退）。
+  2. 命中时若 `response.len() > client.max_udp` ⇒ **当作 miss**（让调用方现查一次，拿适合该客户端大小的响应）。
+- **为何不用 `TC=1` 截断**：本 DNS 服务**只监听 UDP**（无 TCP:53），置 `TC` 会让客户端改走 TCP 后直接失败。故采用“宁多一次上游查询，不越界下发”。若后续补上 TCP DNS 监听，可改成标准截断 + `TC=1`。
+- **代价**：key 空间 ×4（DO×CD），命中率下降；但只在同一域名被“不同 DNSSEC 意图”的客户端访问时发生，正确性优先。
+
 ---
 
 ## 2. 待决策（已定位，未改）
@@ -50,7 +60,7 @@
 | # | 严重度 | 问题 | 证据 | 建议 |
 |---|---|---|---|---|
 | ~~**B1**~~ | ~~高（可用性）~~ | **已修复，见 §1 A5** | — | — |
-| **B2** | 中（正确性） | **DNS 缓存 key 只含 (domain, qtype)**，未含 DO/CD 位与客户端 EDNS 缓冲大小。DO=1 的客户端可能命中 DO=0 建立的缓存（无 RRSIG、`AD` 位不对）⇒ DNSSEC 校验失败/降级；非 EDNS 客户端可能收到 >512B 的缓存响应（协议越界）。附带：响应大小取决于**别的客户端**的 flags ⇒ 可观测差异。 | `DnsCache::put/get` 仅 `(String, u16)` 作 key | key 加 DO 位（可选加 CD）；发送前按客户端 `bufsize` 截断并置 `TC=1`。 |
+| ~~**B2**~~ | ~~中（正确性）~~ | **已修复，见 §1 A6** | — | — |
 | **B3** | 中（放大） | **同名查询无 single-flight**：N 个并发 miss 会打 N 次上游（`udp_query` 还向**所有**上游各发一份）。冷启动/热点域名下对上游放大明显。 | `udp_query` 每轮 `for up in upstreams { send_to }` | in-flight 合并：按 (domain,qtype,DO) 记 `Notify`/broadcast，后到者等首个结果。 |
 | **B4** | 中低（可观测性） | **`let _ =` 忽略关键路径错误 126 处**，其中含 DNS 回包 `send_to`、上游转发等；失败无计数、无日志 ⇒ 静默降级（例：回包 socket `ENETUNREACH`、上游 `EMSGSIZE`）。 | `grep -c 'let _ = ' src/proxy src/crypto src/api` = 126 | 对"发包/转发/写盘"三类加失败计数 + 采样 WARN；纯清理型（drop/close）保持忽略。 |
 | **B5** | 低 | 凭据热重载去重比较用 `==`（`mod.rs:150/158`，`o.password == new.password`）——非恒定时间、且长度不等早退。**不在鉴权判定路径**（鉴权用 `hello_auth` 的 `ct_eq`），影响很小。 | `mod.rs:150,158` | 若追求一致，改为对定长摘要（如 SHA-256）做 `ct_eq`。 |
@@ -76,10 +86,11 @@
 ## 4. 门禁
 
 ```
-cargo test --lib                                  551 passed / 0 failed / 3 ignored
+cargo test --lib                                  554 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings          0 warning（含 --features quic）
 bash scripts/check-no-real-endpoints.sh            0 命中
 ```
 
 新增单测：`dns::server::tests::response_matches_requires_question_equality`（8 条断言）、
-`mirage_server::conn_cap_tests::max_conns_normalization`。
+`edns_info_parses_do_and_bufsize`、`cache_separates_do_and_cd`、
+`cache_rejects_entry_larger_than_client_budget`、`mirage_server::conn_cap_tests::max_conns_normalization`。

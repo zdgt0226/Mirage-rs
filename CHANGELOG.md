@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-### fix: 全库审计修复 (A1~A5) —— 抗探测预连对齐 / DNS 完整性 / fd 竞态 / 模板多样性 / 并发上限 (2026-10-18)
+### fix: 全库审计修复 (A1~A6) —— 抗探测预连对齐 / DNS 完整性 / fd 竞态 / 模板多样性 / 并发上限 / DNS 缓存维度 (2026-10-18)
+
+- **DNS 缓存按 DO/CD 分维 + 大小适配** (A6, `dns/server.rs`): 缓存 key 从 `(domain, qtype)` 改为 `(domain, qtype, DO, CD)`，并新增 `edns_info()`（OPT 的 `CLASS`=客户端 UDP 上限/`TTL` bit15=DO/header byte3 `0x10`=CD，畸形安全回退）。命中时若条目超过当前客户端声明的大小 → 视为 miss 现查。修复三件事：`DO=1` 客户端拿到无 RRSIG 的条目（DNSSEC 降级）、`CD=1` 的上游未验证结果被发给 `CD=0` 客户端（绕过校验）、`4096` 字节条目下发给只声明 `512` 的客户端（越过协议上限）。因本服务只监听 UDP（无 TCP 重试），不用 `TC=1` 截断而是改走现查（代价：key 空间 ×4，命中率略降）。
 
 - **服务端全局并发连接上限** (A5, `mirage_server/mod.rs` + `config.rs` + `startup.rs`): 认证前窗口只受 `hard_deadline`(5s) 约束, 而 accept 循环无任何全局上限 ⇒ flood 可持有 `速率×5s` 个任务与 socket 打满内存/任务表 (QUIC 有 `rt_limiter`, TCP 没有)。现新增进程级 `Semaphore`：`tuning.max_connections`（默认 **8192**，`MIRAGE_MAX_CONNS` 可覆盖，`0`=默认，夹到 `[16,1e6]`），accept 即占名额, 超限**直接关闭连接**并计数（每 500 次采样 WARN）。作用域=全进程（多入站共享），**重启生效**；`check` 对 `<16` 直接报错。
 

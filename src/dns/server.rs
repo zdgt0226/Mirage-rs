@@ -580,9 +580,81 @@ struct CacheEntry {
     expiry: std::time::Instant,
 }
 
+/// 客户端的 EDNS 语义: `(DO, CD, 声明的 UDP payload 上限)`。
+///
+/// **为什么缓存要区分这三个**: 响应内容随它们变化 ——
+/// - `DO=1` 会让上游附带 RRSIG（响应大很多，且含 DNSSEC 语义）；把 DO=0 的响应给
+///   DO=1 的客户端 → 客户端认为"无签名"（降级/校验失败）。
+/// - `CD=1` 表示客户端愿自行校验（上游可能返回**未验证**数据）：把这种结果给 CD=0 的
+///   客户端就是绕过校验（安全风险）。
+/// - `bufsize` 决定客户端能收多大的 UDP 响应；把 4096 字节的条目给一个只说 512 的客户端
+///   （无 EDNS / 旧 resolver）会越过协议上限。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EdnsInfo {
+    do_bit: bool,
+    cd_bit: bool,
+    /// 客户端声明的 UDP payload 上限（无 OPT 时为 512）。
+    max_udp: usize,
+}
+
+type CacheKey = (String, u16, bool, bool); // (小写域名, qtype, DO, CD)
+
+/// 从附加段找 OPT(type=41)：`CLASS` = 客户端 UDP payload 大小，`TTL` 的 bit15 = DO。
+/// 无 OPT / 畸形 → 退回 RFC 1035 语义 (`DO=false, max_udp=512`)。
+/// 全程边界安全（任何截断都返回默认值，不 panic）。
+fn edns_info(req: &[u8]) -> EdnsInfo {
+    let cd_bit = req.get(3).is_some_and(|b| b & 0x10 != 0);
+    parse_opt(req).unwrap_or(EdnsInfo { do_bit: false, cd_bit, max_udp: 512 })
+}
+
+fn parse_opt(req: &[u8]) -> Option<EdnsInfo> {
+    let cd_bit = req.get(3).is_some_and(|b| b & 0x10 != 0);
+    if req.len() < 12 {
+        return None;
+    }
+    let (qd, an, ns, ar) = (
+        u16::from_be_bytes([req[4], req[5]]) as usize,
+        u16::from_be_bytes([req[6], req[7]]) as usize,
+        u16::from_be_bytes([req[8], req[9]]) as usize,
+        u16::from_be_bytes([req[10], req[11]]) as usize,
+    );
+    let mut pos = 12usize;
+    // 跳过 question + answer + authority，落到 additional。
+    for _ in 0..qd {
+        pos = skip_name(req, pos)?.checked_add(4)?;
+    }
+    for _ in 0..(an + ns) {
+        pos = skip_rr(req, pos)?;
+    }
+    for _ in 0..ar {
+        let rrtype_at = skip_name(req, pos)?;
+        let rrtype = u16::from_be_bytes([*req.get(rrtype_at)?, *req.get(rrtype_at + 1)?]);
+        let class = u16::from_be_bytes([*req.get(rrtype_at + 2)?, *req.get(rrtype_at + 3)?]);
+        let ttl = u32::from_be_bytes([
+            *req.get(rrtype_at + 4)?,
+            *req.get(rrtype_at + 5)?,
+            *req.get(rrtype_at + 6)?,
+            *req.get(rrtype_at + 7)?,
+        ]);
+        if rrtype == 41 {
+            let max = (class as usize).clamp(512, DNS_UDP_BUF);
+            return Some(EdnsInfo { do_bit: ttl & 0x8000 != 0, cd_bit, max_udp: max });
+        }
+        pos = skip_rr(req, pos)?;
+    }
+    None
+}
+
+fn skip_rr(data: &[u8], pos: usize) -> Option<usize> {
+    let after_name = skip_name(data, pos)?;
+    let rdlen_at = after_name.checked_add(8)?; // type2 + class2 + ttl4
+    let rdlen = u16::from_be_bytes([*data.get(rdlen_at)?, *data.get(rdlen_at + 1)?]) as usize;
+    rdlen_at.checked_add(2)?.checked_add(rdlen)
+}
+
 /// TTL-aware DNS 响应缓存。key=(小写域名, qtype), 只缓存有 answer 的正响应。
 struct DnsCache {
-    map: std::sync::Mutex<std::collections::HashMap<(String, u16), CacheEntry>>,
+    map: std::sync::Mutex<std::collections::HashMap<CacheKey, CacheEntry>>,
     max_entries: usize,
 }
 
@@ -596,13 +668,21 @@ impl DnsCache {
 
     /// 命中且未过期 → 返回按当前 query patch 好的响应 (tx_id + question 段, 兼容 0x20 大小写
     /// 随机 + id; 保留响应头/flags/答案不变)。
+    ///
+    /// key 含 `(DO, CD)`；另若条目超出**当前客户端**声明的 UDP 上限 → 视为 miss（让调用方
+    /// 现查一次，拿适合该客户端大小的响应）。本服务只监听 UDP，所以不能靠置 `TC=1` 让客户端
+    /// 改走 TCP（它会重试 UDP 仍失败）——宁可多一次上游查询。
     fn get(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
+        let edns = edns_info(query);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (domain.to_string(), qtype);
+        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit);
         let e = m.get(&key)?;
         if e.expiry <= std::time::Instant::now() {
             m.remove(&key);
             return None;
+        }
+        if e.response.len() > edns.max_udp {
+            return None; // 超客户端上限: 不截断 (无 TCP 可退)，现查
         }
         let mut resp = e.response.clone();
         let q_end = question_end(query);
@@ -615,12 +695,13 @@ impl DnsCache {
     }
 
     /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
-    fn put(&self, domain: &str, qtype: u16, response: &[u8]) {
+    fn put(&self, domain: &str, qtype: u16, query: &[u8], response: &[u8]) {
         let ttl = match min_answer_ttl(response) {
             Some(t) => t.clamp(1, 3600),
             None => return,
         };
-        let key = (domain.to_string(), qtype);
+        let edns = edns_info(query);
+        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= self.max_entries && !m.contains_key(&key) {
             let now = std::time::Instant::now();
@@ -797,7 +878,7 @@ impl DnsForwarder {
         }
         let resp = direct_query(req, cn_dns).await;
         if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-            cache.put(&dk, qtype, r);
+            cache.put(&dk, qtype, req, r);
         }
         resp.or_else(|| Some(make_nxdomain(req)))
     }
@@ -1015,7 +1096,7 @@ impl DnsForwarder {
                         }
                     }
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                        cache.put(&dk, qtype, r);
+                        cache.put(&dk, qtype, req, r);
                     }
                     return Some(resp.unwrap_or_else(|| make_nxdomain(req)));
                 }
@@ -1071,7 +1152,7 @@ impl DnsForwarder {
                         Some(ip) if ac.is_cn(ip.into()) => {
                             debug!("[DNS] auto    [{}] → 首个A {} 属CN → 直连返回", domain, ip);
                             if let (Some(cache), Some(r)) = (&self.cache, &probe) {
-                                cache.put(&dk, qtype, r);
+                                cache.put(&dk, qtype, req, r);
                             }
                             // 非阻塞交叉校验: 国内判 CN, 后台经隧道可信解析确认; 可信判海外 → 疑污染,
                             // 标记海外供**下次** (本次已返回, 不受保护 —— 非阻塞的固有取舍)。
@@ -1137,7 +1218,7 @@ impl DnsForwarder {
                     debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
                     let resp = direct_query(req, &cn_dns).await;
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                        cache.put(&dk, qtype, r);
+                        cache.put(&dk, qtype, req, r);
                     }
                     resp
                 }
@@ -1174,7 +1255,7 @@ impl DnsForwarder {
                     debug!("[DNS] proxy   [{}] → 隧道查 (failover {} 上游) via {}", domain, remote_servers.len().max(1), n.tag());
                     let resp = Self::dns_over_tunnel_ha(req, pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                        cache.put(&dk, qtype, r);
+                        cache.put(&dk, qtype, req, r);
                     }
                     Some(resp.unwrap_or_else(|| make_nxdomain(req)))
                 }
@@ -1843,10 +1924,100 @@ mod tests {
         assert!(response_matches(&q, &r[..question_end(&q)]));
     }
 
+    /// 带 OPT 的查询: `(bufsize, do_bit)`；`ar=1`。
+    fn query_with_opt(tx: [u8; 2], bufsize: u16, do_bit: bool) -> Vec<u8> {
+        let mut q = cache_a_query(tx);
+        q[10] = 0; q[11] = 1; // ARCOUNT = 1
+        q.push(0); // OPT 的根名
+        q.extend_from_slice(&[0, 41]); // TYPE = OPT
+        q.extend_from_slice(&bufsize.to_be_bytes()); // CLASS = 客户端 UDP payload
+        let ttl: u32 = if do_bit { 0x8000 } else { 0 };
+        q.extend_from_slice(&ttl.to_be_bytes()); // TTL: bit15 = DO
+        q.extend_from_slice(&[0, 0]); // RDLEN = 0
+        q
+    }
+
+    /// 大于 512 字节的响应 (rdata 500B) —— 用于验证"非 EDNS 客户端不会拿到大缓存条目"。
+    fn big_a_response(tx: [u8; 2]) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        r.push(1); r.push(b'x');
+        r.push(3); r.extend_from_slice(b"com");
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]); // A IN
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]); // ptr, A, IN
+        r.extend_from_slice(&300u32.to_be_bytes());
+        r.extend_from_slice(&500u16.to_be_bytes()); // rdlen = 500
+        r.extend(std::iter::repeat_n(0xABu8, 500));
+        r
+    }
+
+    #[test]
+    fn edns_info_parses_do_and_bufsize() {
+        // 无 OPT → RFC 1035 语义
+        let plain = edns_info(&cache_a_query([1, 2]));
+        assert!(!plain.do_bit && plain.max_udp == 512, "无 OPT 应用 512 上限");
+
+        let opt = edns_info(&query_with_opt([1, 2], 1232, true));
+        assert!(opt.do_bit, "OPT TTL bit15 = DO");
+        assert_eq!(opt.max_udp, 1232);
+
+        // 低于 512 的声明被抬到 512 (协议下限), 高于缓冲上限被夹到 DNS_UDP_BUF
+        assert_eq!(edns_info(&query_with_opt([1, 2], 100, false)).max_udp, 512);
+        assert_eq!(edns_info(&query_with_opt([1, 2], 65535, false)).max_udp, DNS_UDP_BUF);
+
+        // CD 位在 header byte3 的 0x10
+        let mut cd = query_with_opt([1, 2], 1232, false);
+        cd[3] |= 0x10;
+        assert!(edns_info(&cd).cd_bit);
+
+        // 畸形/截断 → 安全回退, 不 panic
+        assert_eq!(edns_info(&[0u8; 5]).max_udp, 512);
+        let mut trunc = query_with_opt([1, 2], 4096, true);
+        trunc.truncate(trunc.len() - 3);
+        assert!(!edns_info(&trunc).do_bit, "截断的 OPT 不应被当成 DO=1");
+    }
+
+    #[test]
+    fn cache_separates_do_and_cd() {
+        let cache = DnsCache::new(10);
+        let plain = cache_a_query([9, 9]);
+        cache.put("x.com", 1, &plain, &cache_a_response([9, 9], 300));
+
+        // DO=1 的客户端不能拿 DO=0 的条目 (缺 RRSIG)
+        let do_q = query_with_opt([9, 9], 4096, true);
+        assert!(cache.get("x.com", 1, &do_q).is_none(), "DO 不同必须 miss");
+        assert!(cache.get("x.com", 1, &plain).is_some(), "同 DO 命中");
+
+        // CD=1 的条目 (可能未验证) 不能给 CD=0 的客户端
+        let mut cd_q = query_with_opt([9, 9], 4096, false);
+        cd_q[3] |= 0x10;
+        cache.put("x.com", 1, &cd_q, &cache_a_response([9, 9], 300));
+        assert!(cache.get("x.com", 1, &cd_q).is_some(), "CD=1 自命中");
+        assert!(cache.get("x.com", 1, &plain).is_some(), "CD=0 仍只看到自己那份");
+        assert_eq!(cache.get("x.com", 1, &cd_q).map(|r| r.len()), Some(cache_a_response([9, 9], 300).len()));
+    }
+
+    #[test]
+    fn cache_rejects_entry_larger_than_client_budget() {
+        let cache = DnsCache::new(10);
+        let big_q = query_with_opt([7, 7], 4096, false);
+        cache.put("x.com", 1, &big_q, &big_a_response([7, 7]));
+
+        // 同一客户端 (4096) 命中
+        assert!(cache.get("x.com", 1, &big_q).is_some(), "4096 客户端应命中");
+        // 非 EDNS (512) 客户端 → miss (本服务只监听 UDP, 不能靠 TC 让客户端改走 TCP)
+        assert!(
+            cache.get("x.com", 1, &cache_a_query([7, 7])).is_none(),
+            "超过客户端声明大小的条目必须 miss 而不是越界下发"
+        );
+        // 1232 也不够 (响应 ~535B + patch 后仍 > 1232? 535 < 1232 → 应命中)
+        assert!(cache.get("x.com", 1, &query_with_opt([7, 7], 1232, false)).is_some());
+    }
+
     #[test]
     fn cache_hit_patches_txid_and_question() {
         let cache = DnsCache::new(10);
-        cache.put("x.com", 1, &cache_a_response([0xAA, 0xBB], 300));
+        cache.put("x.com", 1, &cache_a_query([0xAA, 0xBB]), &cache_a_response([0xAA, 0xBB], 300));
         let q = cache_a_query([0x99, 0x88]);
         let hit = cache.get("x.com", 1, &q).expect("应命中");
         assert_eq!(&hit[0..2], &[0x99, 0x88], "tx_id 应 patch 成 query 的");
@@ -1863,7 +2034,7 @@ mod tests {
         let cache = DnsCache::new(10);
         let mut r = cache_a_response([0, 0], 100);
         r[6] = 0; r[7] = 0; // ancount=0 (NODATA/NXDOMAIN)
-        cache.put("x.com", 1, &r);
+        cache.put("x.com", 1, &cache_a_query([0, 0]), &r);
         assert!(cache.get("x.com", 1, &cache_a_query([1, 2])).is_none(), "无 answer 不缓存");
     }
 
