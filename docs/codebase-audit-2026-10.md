@@ -33,6 +33,14 @@
 - **问题**：① 刷新失败**静默保留旧模板**——若伪装站已轮换证书/密钥，回放的 ServerHello 与真站当前状态不一致（可区分），且无任何告警；② 部分成功时 `*cache = templates` **整体替换**：5 路 fetch 只回 1 条时，全部客户端会收到**同一个** ServerHello（被动侧可识别）。
 - **修复**：`install_templates()` —— 新集更小则**与旧集合并**（保多样性 + WARN）；新增 `LAST_OK_SECS`，超过 `STALE_WARN_SECS`（6h，即连续失败 12 次）周期性 WARN 提示可能已轮换。
 
+### A5（高，可用性）TCP accept 层无全局并发上限
+
+- **位置**：`mirage_server/mod.rs` accept 循环
+- **问题**：每个已接受连接直接 `tokio::spawn`。保护只覆盖“**未认证转发**”（`UNAUTH_CONNS` 100/IP、`UNAUTH_RATE`、`GLOBAL_UNAUTH` 5000），而**认证前窗口**仅受 `hard_deadline`（5s）约束 ⇒ flood 可持有 `速率 × 5s` 个任务与 socket，把任务表/内存打满；且 QUIC 侧有 `rt_limiter`、**TCP 侧没有**（不对称）。
+- **修复**：新增进程级 `Semaphore`（`tuning.max_connections`，默认 **8192**，env `MIRAGE_MAX_CONNS` 可覆盖，`0`=默认；夹到 `[16, 1e6]`）。accept 即 `try_acquire_owned`，拿不到就**直接关闭连接**并计数（每 500 次采样 WARN，提示调大上限或排查 flood）；名额持到连接结束（含握手失败与转发全程）。配置若 `<16` 由 `check` 报错（正常浏览器就有 6~8 并发，会议/下载器更多）。
+- **语义**：作用域=**全进程**（多个 `mirage_server` 入站共享）；**重启生效**（信号量在首次 accept 时按配置创建）。
+- **未覆盖**：QUIC 入站仍用自身的 `rt_limiter`（按 stream 计），未共享此上限 —— 若要统一，把 permit 传给 `start_quic_server` 即可（后续项）。
+
 ---
 
 ## 2. 待决策（已定位，未改）
@@ -41,7 +49,7 @@
 
 | # | 严重度 | 问题 | 证据 | 建议 |
 |---|---|---|---|---|
-| **B1** | 高（可用性） | **TCP accept 层无全局并发/接入速率上限**。每个已接受连接直接 `tokio::spawn`；保护只覆盖"**未认证转发**"（`UNAUTH_CONNS` 100/IP、`UNAUTH_RATE`、`GLOBAL_UNAUTH` 5000）。认证前窗口仅受 `hard_deadline` 5s 约束 ⇒ flood 可持有 `速率 × 5s` 的任务与 socket。QUIC 侧有 `rt_limiter.try_acquire_stream`，**TCP 侧没有**（不对称）。 | `mod.rs` accept 循环；`rt_limiter` 仅见于 QUIC 分支 | accept 前加全局 `Semaphore`（默认 10k、可配）+ 每 IP 接入速率；超限直接 RST 并计数。顺带把"未认证并发"从"转发时计数"提前到"accept 时预占"，避免 pre-judge 段无界。 |
+| ~~**B1**~~ | ~~高（可用性）~~ | **已修复，见 §1 A5** | — | — |
 | **B2** | 中（正确性） | **DNS 缓存 key 只含 (domain, qtype)**，未含 DO/CD 位与客户端 EDNS 缓冲大小。DO=1 的客户端可能命中 DO=0 建立的缓存（无 RRSIG、`AD` 位不对）⇒ DNSSEC 校验失败/降级；非 EDNS 客户端可能收到 >512B 的缓存响应（协议越界）。附带：响应大小取决于**别的客户端**的 flags ⇒ 可观测差异。 | `DnsCache::put/get` 仅 `(String, u16)` 作 key | key 加 DO 位（可选加 CD）；发送前按客户端 `bufsize` 截断并置 `TC=1`。 |
 | **B3** | 中（放大） | **同名查询无 single-flight**：N 个并发 miss 会打 N 次上游（`udp_query` 还向**所有**上游各发一份）。冷启动/热点域名下对上游放大明显。 | `udp_query` 每轮 `for up in upstreams { send_to }` | in-flight 合并：按 (domain,qtype,DO) 记 `Notify`/broadcast，后到者等首个结果。 |
 | **B4** | 中低（可观测性） | **`let _ =` 忽略关键路径错误 126 处**，其中含 DNS 回包 `send_to`、上游转发等；失败无计数、无日志 ⇒ 静默降级（例：回包 socket `ENETUNREACH`、上游 `EMSGSIZE`）。 | `grep -c 'let _ = ' src/proxy src/crypto src/api` = 126 | 对"发包/转发/写盘"三类加失败计数 + 采样 WARN；纯清理型（drop/close）保持忽略。 |
@@ -68,9 +76,10 @@
 ## 4. 门禁
 
 ```
-cargo test --lib                                  550 passed / 0 failed / 3 ignored
+cargo test --lib                                  551 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings          0 warning（含 --features quic）
 bash scripts/check-no-real-endpoints.sh            0 命中
 ```
 
-新增单测：`dns::server::tests::response_matches_requires_question_equality`（8 条断言）。
+新增单测：`dns::server::tests::response_matches_requires_question_equality`（8 条断言）、
+`mirage_server::conn_cap_tests::max_conns_normalization`。

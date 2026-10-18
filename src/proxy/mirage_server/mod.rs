@@ -22,6 +22,45 @@ pub(crate) use control::parse_tcp_target;
 // 服务端 ClientHello 计时/判定参数 (`tuning.client_hello_guard`): 由 startup 设置。
 pub use handshake::{client_hello_guard_params, set_client_hello_guard};
 
+// ── 全局并发连接上限 (B1) ────────────────────────────────────────────────
+/// 默认最大并发连接数。
+///
+/// 取 8192: 典型 VPS (1~2 vCPU / 1~2GB) 下每连接占用主要是两个 socket 缓冲 + 任务栈,
+/// 8192 已能给到 ~1k 活跃代理连接 + 大量短命连接的空间; 更大的机器可用
+/// `tuning.max_connections` 调高。
+pub const DEFAULT_MAX_CONNECTIONS: usize = 8192;
+
+static MAX_CONNS_CFG: AtomicUsize = AtomicUsize::new(0); // 0 = 未显式配置
+static CONN_SEM: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static ACCEPT_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// 设最大并发连接数 (启动时一次; `0` = 用默认)。必须在 accept 开始前调用 ——
+/// 信号量按第一次 accept 时的值创建, 之后不再变动 (重载配置不生效)。
+pub fn set_max_connections(n: usize) {
+    MAX_CONNS_CFG.store(n, Ordering::Relaxed);
+}
+
+fn max_connections() -> usize {
+    clamp_max_conns(MAX_CONNS_CFG.load(Ordering::Relaxed))
+}
+
+/// 上限归一化: `0` = 默认; 其余夹到 `[16, 1e6]` (与 config check 的范围一致)。
+fn clamp_max_conns(n: usize) -> usize {
+    match n {
+        0 => DEFAULT_MAX_CONNECTIONS,
+        n => n.clamp(16, 1_000_000),
+    }
+}
+
+fn conn_sem() -> &'static Arc<tokio::sync::Semaphore> {
+    CONN_SEM.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(max_connections())))
+}
+
+/// 取一个连接名额; 取不到返回 None (调用方直接关闭连接)。
+fn try_accept_slot() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    conn_sem().clone().try_acquire_owned().ok()
+}
+
 use camouflage_rtt::CamouflageRtt;
 
 use std::collections::HashMap;
@@ -30,7 +69,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub use std::sync::atomic::AtomicBool;
 
@@ -675,7 +714,23 @@ pub async fn start_server(
                 let cam = camouflage_host.to_string();
                 let rtt = cam_rtt.clone();
                 let up = upstream.clone();
+                // B1: 全局并发上限。认证前的窗口只受 hard_deadline 约束, 无上限时 flood 可把
+                // 任务表与 socket 打满 (见 docs/codebase-audit-2026-10.md B1)。
+                // 超限 → 直接关闭 (与真站过载行为一致: 不握手、不给响应), 计数 + 采样告警。
+                let Some(permit) = try_accept_slot() else {
+                    let n = ACCEPT_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n % 500 == 1 {
+                        warn!(
+                            "连接数达上限 {} (累计拒绝 {n}), 直接关闭 {} — 调大 tuning.max_connections 或排查 flood",
+                            max_connections(),
+                            peer_addr.ip()
+                        );
+                    }
+                    drop(stream);
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _permit = permit; // 名额持到连接结束 (含握手失败 / 转发全程)
                     handshake::handle_connection(stream, peer_addr, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
                 });
             }
@@ -1579,5 +1634,18 @@ mod quic_limiter_tests {
         assert!(zero_rt.try_acquire_stream(ip1).is_none());
         assert!(zero_rt.conn_per_ip.lock().unwrap().is_empty());
         assert!(zero_rt.stream_per_ip.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod conn_cap_tests {
+    #[test]
+    fn max_conns_normalization() {
+        use super::{clamp_max_conns, DEFAULT_MAX_CONNECTIONS};
+        assert_eq!(clamp_max_conns(0), DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(clamp_max_conns(1), 16);
+        assert_eq!(clamp_max_conns(15), 16);
+        assert_eq!(clamp_max_conns(1024), 1024);
+        assert_eq!(clamp_max_conns(usize::MAX), 1_000_000);
     }
 }

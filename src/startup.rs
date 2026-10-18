@@ -190,6 +190,18 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                         ao
                     );
                 }
+                // B1: 服务端全局并发连接上限。env 优先 (运维临时调参); 信号量在首次 accept 时创建
+                // ⇒ 此处必须早于 start_server。0 / 未配 = 默认。
+                let max_conns = std::env::var("MIRAGE_MAX_CONNS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .or_else(|| config.tuning.as_ref().and_then(|t| t.max_connections))
+                    .unwrap_or(crate::proxy::mirage_server::DEFAULT_MAX_CONNECTIONS);
+                crate::proxy::mirage_server::set_max_connections(max_conns);
+                info!(
+                    "服务端并发连接上限: {} (tuning.max_connections / MIRAGE_MAX_CONNS; 超限直接关闭并计数)",
+                    if max_conns == 0 { crate::proxy::mirage_server::DEFAULT_MAX_CONNECTIONS } else { max_conns }
+                );
             }
             if let Some(tuning) = config.tuning {
                 // 服务端 cipher agility 开关 (设进全局, control.rs 读)。
