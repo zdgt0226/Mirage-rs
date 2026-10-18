@@ -482,9 +482,7 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
         loop {
             match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
                 // 合法 DNS 响应: ≥12B 头 + tx_id 与查询一致 + QR=1
-                Ok(Ok((size, _)))
-                    if size >= 12 && buf[0] == req[0] && buf[1] == req[1] && (buf[2] & 0x80) != 0 =>
-                {
+                Ok(Ok((size, _))) if response_matches(req, &buf[..size]) => {
                     return Some(buf[..size].to_vec());
                 }
                 Ok(Ok(_)) => continue, // 不匹配/畸形, 本轮继续等
@@ -562,8 +560,8 @@ async fn tcp_query_one(req: &[u8], up: SocketAddr) -> Option<Vec<u8>> {
         }
         let mut buf = vec![0u8; n];
         s.read_exact(&mut buf).await.ok()?;
-        // 合法响应: tx_id 与查询一致 + QR=1 (req 已在 process_query 上游保证 ≥12B)。
-        if buf[0] == req[0] && buf[1] == req[1] && (buf[2] & 0x80) != 0 {
+        // 合法响应: tx_id + QR + question 段一致 (防构造/串扰响应被缓存)。
+        if response_matches(req, &buf) {
             Some(buf)
         } else {
             None
@@ -641,6 +639,29 @@ impl DnsCache {
             },
         );
     }
+}
+
+/// 响应是否**确实对应当前查询**: tx_id + QR + question 段(名/型/类)逐字节(ASCII 大小写无关)一致。
+///
+/// 只校验 tx_id 是 Kaminsky 式投毒的薄弱点 —— 16bit 猜中即可让攻击响应被接受, 并随后被
+/// `DnsCache` 缓存一整个 TTL。每个查询虽用独立临时端口(源端口随机)提高了时序难度, 但
+/// **question 比对是免费的**, 应当做。同时要求响应 QDCOUNT=1, 防止构造型响应。
+fn response_matches(req: &[u8], resp: &[u8]) -> bool {
+    if req.len() < 12 || resp.len() < 12 {
+        return false;
+    }
+    if resp[0] != req[0] || resp[1] != req[1] || (resp[2] & 0x80) == 0 {
+        return false;
+    }
+    if u16::from_be_bytes([resp[4], resp[5]]) != 1 {
+        return false;
+    }
+    let q_end = question_end(req);
+    // 0x20 大小写随机在服务端侧: 只有问句长度一致才能比 (同一域名必一致)。
+    q_end > 12
+        && resp.len() >= q_end
+        && u16::from_be_bytes([resp[4], resp[5]]) == u16::from_be_bytes([req[4], req[5]])
+        && req[12..q_end].eq_ignore_ascii_case(&resp[12..q_end])
 }
 
 /// 跳过一个 DNS 域名 (处理压缩指针), 返回其后偏移。
@@ -1777,6 +1798,49 @@ mod tests {
         let mut r = cache_a_response([0, 0], 100);
         r[6] = 0; r[7] = 0;
         assert_eq!(min_answer_ttl(&r), None);
+    }
+
+    #[test]
+    fn response_matches_requires_question_equality() {
+        let q = cache_a_query([0x12, 0x34]);
+        let r = cache_a_response([0x12, 0x34], 300);
+        assert!(response_matches(&q, &r), "同 txid + 同 question 应接受");
+
+        // ① txid 不同 → 拒
+        let mut bad_txid = r.clone();
+        bad_txid[0] = 0x99;
+        assert!(!response_matches(&q, &bad_txid));
+
+        // ② txid 相同但 question 名字不同 → 拒 (Kaminsky 式投毒的关键一步)
+        let q2 = { let mut v = q.clone(); v[13] = b'y'; v };
+        assert!(!response_matches(&q2, &r), "txid 对但 qname 不同必须拒");
+
+        // ③ txid 相同但 qtype 不同 → 拒 (qtype 在 question 末 4B 的前 2B)
+        let mut bad_type = r.clone();
+        let qt = question_end(&q) - 4;
+        bad_type[qt] = 0;
+        bad_type[qt + 1] = 28; // AAAA
+        assert!(!response_matches(&q, &bad_type));
+
+        // ④ QR=0 (把响应当查询) → 拒
+        let mut bad_qr = r.clone();
+        bad_qr[2] &= 0x7F;
+        assert!(!response_matches(&q, &bad_qr));
+
+        // ⑤ 0x20 大小写随机不破匹配 (服务端侧大小写可能不同)
+        let mut upper = r.clone();
+        upper[13] = upper[13].to_ascii_uppercase();
+        assert!(response_matches(&q, &upper));
+
+        // ⑥ QDCOUNT != 1 → 拒
+        let mut qd2 = r.clone();
+        qd2[4] = 0; qd2[5] = 2;
+        assert!(!response_matches(&q, &qd2));
+
+        // ⑦ 截断响应 → 拒
+        assert!(!response_matches(&q, &r[..q.len() - 1]));
+        // ⑧ 只有 question 段、无 answer 的响应仍应接受 (question 已完整可比)
+        assert!(response_matches(&q, &r[..question_end(&q)]));
     }
 
     #[test]

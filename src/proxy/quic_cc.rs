@@ -26,6 +26,7 @@ const MARGIN: f64 = 0.05; // p 超 floor 多少才算真拥塞
 const FLOOR_CAP: f64 = 0.7; // 补偿封顶 (1/(1-0.7)=3.3x)。真机 27% 丢包 75x 靠此激进补偿, 勿降
                             // (过冲防护交给下面的 damping, 纯 erasure 路径不受影响)
 const MIN_INTERVAL: Duration = Duration::from_millis(20);
+const MIN_INTERVAL_PACKETS: u64 = 10; // 单测量间隔至少累计 10 个 MTU 才结算, 防握手/保活单包拉偏 floor
 // P4a 抗过冲 (加法安全, 不改纯 erasure 路径): 拥塞信号 (excess = p-floor) 出现时把窗口补偿从满
 // inflation 收敛回 1x (纯 BBR)。纯 erasure (excess≈0, 如 china-us 27% 独立丢包) 满补偿不变、75x 保住;
 // 队列建立 (excess>0) 时退补偿, 减少单控制器过冲。
@@ -48,19 +49,26 @@ pub struct ErasureConfig {
 
 impl ControllerFactory for ErasureConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(ErasureController {
-            inner: self.bbr.clone().build(now, current_mtu),
-            p_ewma: 0.0,
-            floor: 1.0, // 未知: 先高, 由首批下包络拉下来
-            recent_excess: 0.0,
-            samples: 0,
-            acked_acc: 0,
-            lost_acc: 0,
-            interval_start: now,
-            last_rtt: Duration::from_millis(100),
-            mtu: current_mtu.max(1200) as u64,
-        })
+        Box::new(ErasureController::with_inner(
+            self.bbr.clone().build(now, current_mtu),
+            now,
+            current_mtu,
+        ))
     }
+}
+
+/// 同时间戳 (`now`) 批次结算快照: quinn-proto 在单次 `on_ack_received(now)` 中先逐包调 `on_ack(now)`、
+/// 最后才调 `on_congestion_event(now)`。保存首次跨过间隔边界时的前态快照, 使同 `now` 后续到达的
+/// ACK 与丢包字节并入同一测量间隔重算, 避免首包 ACK 提前以 `lost=0` 结算。
+#[derive(Clone, Copy)]
+struct FinalizedSnapshot {
+    at: Instant,
+    prev_p_ewma: f64,
+    prev_floor: f64,
+    prev_recent_excess: f64,
+    prev_samples: u32,
+    acked: u64,
+    lost: u64,
 }
 
 struct ErasureController {
@@ -74,33 +82,107 @@ struct ErasureController {
     interval_start: Instant,
     last_rtt: Duration,
     mtu: u64, // 当前 MTU, 用于 gap-safety 封顶换算包数
+    last_finalized: Option<FinalizedSnapshot>,
 }
 
 impl ErasureController {
+    fn with_inner(inner: Box<dyn Controller>, now: Instant, current_mtu: u16) -> Self {
+        Self {
+            inner,
+            p_ewma: 0.0,
+            floor: 1.0, // 未知: 先高, 由首批下包络拉下来
+            recent_excess: 0.0,
+            samples: 0,
+            acked_acc: 0,
+            lost_acc: 0,
+            interval_start: now,
+            last_rtt: Duration::from_millis(100),
+            mtu: current_mtu.max(1200) as u64,
+            last_finalized: None,
+        }
+    }
+
+    fn record_ack(&mut self, now: Instant, bytes: u64, current_rtt: Duration) {
+        self.last_rtt = current_rtt;
+        self.acked_acc += bytes;
+        self.maybe_finalize(now);
+    }
+
+    fn apply_sample(&mut self, acked: u64, lost: u64) {
+        let total = acked + lost;
+        if total == 0 {
+            return;
+        }
+        if acked == 0 {
+            // 100% 丢包黑洞: 更新 p_ewma 并施加拥塞退补偿压力, 但不更新 floor 也不计入校准样本
+            self.p_ewma = if self.samples == 0 {
+                1.0
+            } else {
+                (1.0 - ALPHA) * self.p_ewma + ALPHA * 1.0
+            };
+            self.recent_excess = (1.0 - ALPHA) * self.recent_excess + ALPHA * CONGEST_KNEE;
+            return;
+        }
+        let p = lost as f64 / total as f64;
+        self.p_ewma = if self.samples == 0 {
+            p
+        } else {
+            (1.0 - ALPHA) * self.p_ewma + ALPHA * p
+        };
+        // 下包络: 遇新低立即抓; 否则慢慢上漏, 但不超当前 p。
+        if self.p_ewma < self.floor {
+            self.floor = self.p_ewma;
+        } else {
+            self.floor = (self.floor + LEAK).min(self.p_ewma);
+        }
+        // 拥塞压力 = 超出 floor 的丢包 (纯 erasure 时≈0, 队列建立时>0)。EWMA 平滑。
+        let excess = (self.p_ewma - self.floor).max(0.0);
+        self.recent_excess = (1.0 - ALPHA) * self.recent_excess + ALPHA * excess;
+        self.samples = self.samples.saturating_add(1);
+    }
+
     /// 一个测量间隔 (≈1 RTT) 结束: 算 p、更新 EWMA + floor 下包络。
     fn maybe_finalize(&mut self, now: Instant) {
+        if let Some(mut snap) = self.last_finalized {
+            if snap.at == now {
+                if self.acked_acc > 0 || self.lost_acc > 0 {
+                    snap.acked += self.acked_acc;
+                    snap.lost += self.lost_acc;
+                    self.acked_acc = 0;
+                    self.lost_acc = 0;
+                    self.p_ewma = snap.prev_p_ewma;
+                    self.floor = snap.prev_floor;
+                    self.recent_excess = snap.prev_recent_excess;
+                    self.samples = snap.prev_samples;
+                    self.apply_sample(snap.acked, snap.lost);
+                    self.last_finalized = Some(snap);
+                }
+                return;
+            }
+        }
         let interval = self.last_rtt.max(MIN_INTERVAL);
-        if now.duration_since(self.interval_start) < interval {
+        if now.saturating_duration_since(self.interval_start) < interval {
             return;
         }
         let total = self.acked_acc + self.lost_acc;
-        if total > 0 {
-            let p = self.lost_acc as f64 / total as f64;
-            self.p_ewma = if self.samples == 0 { p } else { (1.0 - ALPHA) * self.p_ewma + ALPHA * p };
-            // 下包络: 遇新低立即抓; 否则慢慢上漏, 但不超当前 p。
-            if self.p_ewma < self.floor {
-                self.floor = self.p_ewma;
-            } else {
-                self.floor = (self.floor + LEAK).min(self.p_ewma);
-            }
-            // 拥塞压力 = 超出 floor 的丢包 (纯 erasure 时≈0, 队列建立时>0)。EWMA 平滑。
-            let excess = (self.p_ewma - self.floor).max(0.0);
-            self.recent_excess = (1.0 - ALPHA) * self.recent_excess + ALPHA * excess;
-            self.samples = self.samples.saturating_add(1);
+        if total < MIN_INTERVAL_PACKETS * self.mtu {
+            return;
         }
+        let snap = FinalizedSnapshot {
+            at: now,
+            prev_p_ewma: self.p_ewma,
+            prev_floor: self.floor,
+            prev_recent_excess: self.recent_excess,
+            prev_samples: self.samples,
+            acked: self.acked_acc,
+            lost: self.lost_acc,
+        };
+        let (acked, lost) = (self.acked_acc, self.lost_acc);
         self.acked_acc = 0;
         self.lost_acc = 0;
         self.interval_start = now;
+        self.apply_sample(acked, lost);
+        self.last_finalized = Some(snap);
     }
 
     fn calibrated(&self) -> bool {
@@ -114,9 +196,7 @@ impl Controller for ErasureController {
     }
 
     fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, app_limited: bool, rtt: &RttEstimator) {
-        self.last_rtt = rtt.get();
-        self.acked_acc += bytes;
-        self.maybe_finalize(now);
+        self.record_ack(now, bytes, rtt.get());
         self.inner.on_ack(now, sent, bytes, app_limited, rtt);
     }
 
@@ -127,9 +207,25 @@ impl Controller for ErasureController {
     fn on_congestion_event(&mut self, now: Instant, sent: Instant, is_persistent_congestion: bool, lost_bytes: u64) {
         self.lost_acc += lost_bytes;
         self.maybe_finalize(now);
+        // quinn-proto 单次 ACK 处理流水线以 on_congestion_event 收尾; 清空快照以防跨轮次粘连。
+        self.last_finalized = None;
+
+        if is_persistent_congestion {
+            self.recent_excess = self.recent_excess.max(CONGEST_KNEE);
+        }
 
         // 持续拥塞 (真) 或未校准 → 照常传给 BBR。纯 erasure (p 未超 floor+margin) → 吞掉。
-        let excess = self.p_ewma - self.floor;
+        let mut excess = self.p_ewma - self.floor;
+        let live_total = self.acked_acc + self.lost_acc;
+        if live_total >= MIN_INTERVAL_PACKETS * self.mtu {
+            let live_p = self.lost_acc as f64 / live_total as f64;
+            let live_ewma = if self.samples == 0 {
+                live_p
+            } else {
+                (1.0 - ALPHA) * self.p_ewma + ALPHA * live_p
+            };
+            excess = excess.max(live_ewma - self.floor);
+        }
         let real_congestion = is_persistent_congestion || !self.calibrated() || excess > MARGIN;
         if real_congestion {
             self.inner.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
@@ -152,7 +248,7 @@ impl Controller for ErasureController {
             let inflation = 1.0 + (full_inflation - 1.0) * damp;
             w = ((w as f64) * inflation) as u64;
         }
-        // gap-safety 封顶: 按测到的丢包率封顶在途, 使接收端乱序 gap < quinn MAX_CHUNKS(1024)。
+        // gap-safety 封顶: 按测到的丢包率封顶在途, 使接收端乱序 gap < quinn MAX_CHUNKS(8192)。
         // 干净路径 (p≈0) 无封顶; 丢包路径自动收窄防"too many gaps"关连接。见 GAP_SAFE_CHUNKS 注释。
         if self.samples > 0 && self.p_ewma > 0.02 {
             w = w.min(gap_safe_cap(self.mtu, self.p_ewma));
@@ -172,6 +268,7 @@ impl Controller for ErasureController {
             interval_start: self.interval_start,
             last_rtt: self.last_rtt,
             mtu: self.mtu,
+            last_finalized: self.last_finalized,
         })
     }
 
@@ -391,5 +488,248 @@ mod fixed_rate_tests {
         s.on_ack(t0 + Duration::from_secs(8), 7); // 8 % 5 == 3, 覆盖第 3 秒的槽
         assert_eq!(s.totals(t0 + Duration::from_secs(8)), (7, 0));
         assert_eq!(s.last, t0 + Duration::from_secs(8));
+    }
+}
+
+#[cfg(test)]
+mod erasure_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const MTU: u16 = 1200;
+    const BASE_WINDOW: u64 = 100_000;
+    const RTT: Duration = Duration::from_millis(50);
+
+    #[derive(Clone)]
+    struct MockController {
+        window: u64,
+        congestion_events: Arc<AtomicUsize>,
+    }
+
+    impl MockController {
+        fn new(window: u64) -> (Self, Arc<AtomicUsize>) {
+            let events = Arc::new(AtomicUsize::new(0));
+            (Self { window, congestion_events: events.clone() }, events)
+        }
+    }
+
+    impl Controller for MockController {
+        fn on_congestion_event(
+            &mut self,
+            _now: Instant,
+            _sent: Instant,
+            _is_persistent_congestion: bool,
+            _lost_bytes: u64,
+        ) {
+            self.congestion_events.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+        fn window(&self) -> u64 {
+            self.window
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(self.clone())
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.window
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    fn feed_interval(
+        ctrl: &mut ErasureController,
+        now: &mut Instant,
+        acked_bytes: u64,
+        lost_bytes: u64,
+        is_persistent: bool,
+    ) {
+        if lost_bytes > 0 {
+            ctrl.record_ack(*now, acked_bytes, RTT);
+            *now += RTT;
+            ctrl.on_congestion_event(*now, *now, is_persistent, lost_bytes);
+        } else {
+            *now += RTT;
+            ctrl.record_ack(*now, acked_bytes, RTT);
+        }
+    }
+
+    #[test]
+    fn uncalibrated_passes_through_congestion_and_does_not_inflate_window() {
+        let mut now = Instant::now();
+        let (mock, events) = MockController::new(BASE_WINDOW);
+        let mut ctrl = ErasureController::with_inner(Box::new(mock), now, MTU);
+
+        for _ in 0..10 {
+            feed_interval(&mut ctrl, &mut now, 75 * MTU as u64, 25 * MTU as u64, false);
+        }
+
+        assert_eq!(ctrl.samples, 10);
+        assert!(!ctrl.calibrated());
+        assert_eq!(events.load(Ordering::Relaxed), 10);
+        assert_eq!(ctrl.window(), BASE_WINDOW);
+    }
+
+    #[test]
+    fn pure_erasure_calibrates_floor_swallows_loss_and_inflates_window() {
+        let mut now = Instant::now();
+        let (mock, events) = MockController::new(BASE_WINDOW);
+        let mut ctrl = ErasureController::with_inner(Box::new(mock), now, MTU);
+
+        for _ in 0..MIN_SAMPLES {
+            feed_interval(&mut ctrl, &mut now, 75 * MTU as u64, 25 * MTU as u64, false);
+        }
+
+        assert!(ctrl.calibrated());
+        assert!((ctrl.floor - 0.25).abs() < 1e-9, "floor={}", ctrl.floor);
+        assert!((ctrl.p_ewma - 0.25).abs() < 1e-9, "p_ewma={}", ctrl.p_ewma);
+        assert!(ctrl.recent_excess.abs() < 1e-9, "recent_excess={}", ctrl.recent_excess);
+
+        let before = events.load(Ordering::Relaxed);
+        for _ in 0..10 {
+            feed_interval(&mut ctrl, &mut now, 75 * MTU as u64, 25 * MTU as u64, false);
+        }
+        // 纯独立丢包 (p == floor) 应被吞掉，不再触发内层 BBR 退避
+        assert_eq!(events.load(Ordering::Relaxed), before);
+
+        let expected = ((BASE_WINDOW as f64) * (1.0 / (1.0 - 0.25))) as u64;
+        assert_eq!(ctrl.window(), expected);
+    }
+
+    #[test]
+    fn real_congestion_above_margin_or_persistent_triggers_backoff_and_damps_window() {
+        let mut now = Instant::now();
+        let (mock, events) = MockController::new(BASE_WINDOW);
+        let mut ctrl = ErasureController::with_inner(Box::new(mock), now, MTU);
+
+        // 先在 20% 独立丢包下完成校准 (补偿 1 / 0.8 = 1.25x)
+        for _ in 0..MIN_SAMPLES {
+            feed_interval(&mut ctrl, &mut now, 80 * MTU as u64, 20 * MTU as u64, false);
+        }
+        assert_eq!(ctrl.window(), 125_000);
+
+        // 即使丢包率未超 floor，持续拥塞 (is_persistent_congestion = true) 也必须透传给内层控制器并将膨胀压回 1.0x
+        let before_persistent = events.load(Ordering::Relaxed);
+        feed_interval(&mut ctrl, &mut now, 80 * MTU as u64, 20 * MTU as u64, true);
+        assert_eq!(events.load(Ordering::Relaxed), before_persistent + 1);
+        assert_eq!(ctrl.window(), BASE_WINDOW);
+
+        // 突发真实拥塞 (60% 丢包, 超出 floor + MARGIN): 透传拥塞事件并把窗口补偿收敛回 1.0x
+        let before_spike = events.load(Ordering::Relaxed);
+        for _ in 0..15 {
+            feed_interval(&mut ctrl, &mut now, 40 * MTU as u64, 60 * MTU as u64, false);
+        }
+        assert!(events.load(Ordering::Relaxed) > before_spike);
+        assert!(ctrl.recent_excess >= CONGEST_KNEE, "recent_excess={}", ctrl.recent_excess);
+        assert_eq!(ctrl.window(), BASE_WINDOW);
+    }
+
+    #[test]
+    fn path_recovery_leaks_floor_and_restores_uninflated_window() {
+        let mut now = Instant::now();
+        let (mock, _events) = MockController::new(BASE_WINDOW);
+        let mut ctrl = ErasureController::with_inner(Box::new(mock), now, MTU);
+
+        for _ in 0..MIN_SAMPLES {
+            feed_interval(&mut ctrl, &mut now, 75 * MTU as u64, 25 * MTU as u64, false);
+        }
+        assert!((ctrl.floor - 0.25).abs() < 1e-9);
+
+        // 当 p_ewma 略高于 floor 时，floor 每间隔仅按 LEAK (0.003) 缓慢上漏
+        feed_interval(&mut ctrl, &mut now, 71 * MTU as u64, 29 * MTU as u64, false);
+        assert!((ctrl.floor - (0.25 + LEAK)).abs() < 1e-9, "floor={}", ctrl.floor);
+
+        // 路径恢复为 0% 丢包后，p_ewma 衰减并拉低 floor 至接近 0，窗口恢复无补偿基线
+        for _ in 0..45 {
+            feed_interval(&mut ctrl, &mut now, 100 * MTU as u64, 0, false);
+        }
+        assert!(ctrl.floor < 1e-4, "floor={}", ctrl.floor);
+        assert_eq!(ctrl.window(), BASE_WINDOW);
+    }
+
+    #[test]
+    fn floor_cap_and_gap_safe_cap_bound_inflated_window() {
+        let mut now = Instant::now();
+        // 1. 极端高丢包 (80% > FLOOR_CAP=70%) 时，补偿倍数封顶在 1 / (1 - FLOOR_CAP)
+        let (small_mock, _) = MockController::new(10_000);
+        let mut small_ctrl = ErasureController::with_inner(Box::new(small_mock), now, MTU);
+        for _ in 0..MIN_SAMPLES {
+            feed_interval(&mut small_ctrl, &mut now, 20 * MTU as u64, 80 * MTU as u64, false);
+        }
+        let capped_inflation = (10_000.0 * (1.0 / (1.0 - FLOOR_CAP))) as u64;
+        assert_eq!(small_ctrl.window(), capped_inflation);
+
+        // 2. 大窗口下，在途窗口受 gap_safe_cap 封顶，防止接收端乱序重组超 MAX_CHUNKS
+        let (large_mock, _) = MockController::new(50_000_000);
+        let mut large_ctrl = ErasureController::with_inner(Box::new(large_mock), now, MTU);
+        for _ in 0..MIN_SAMPLES {
+            feed_interval(&mut large_ctrl, &mut now, 75 * MTU as u64, 25 * MTU as u64, false);
+        }
+        assert_eq!(large_ctrl.window(), gap_safe_cap(MTU as u64, 0.25));
+    }
+
+    #[test]
+    fn quinn_proto_same_timestamp_ack_batch_and_loss_coalesces_correctly() {
+        let mut now = Instant::now();
+        let (mock, events) = MockController::new(BASE_WINDOW);
+        let mut ctrl = ErasureController::with_inner(Box::new(mock), now, MTU);
+
+        // 模拟真实 quinn-proto `Connection::on_ack_received(now)` 调用时序:
+        // 每个 RTT 边界上，同一个 `now` 先逐包调用 75 次 `on_ack(now)`，最后调用 1 次 `on_congestion_event(now)`
+        for _ in 0..MIN_SAMPLES {
+            now += RTT;
+            for _ in 0..75 {
+                ctrl.record_ack(now, MTU as u64, RTT);
+            }
+            ctrl.on_congestion_event(now, now, false, 25 * MTU as u64);
+        }
+
+        assert!(ctrl.calibrated());
+        assert!((ctrl.floor - 0.25).abs() < 1e-9, "floor={}", ctrl.floor);
+        assert!((ctrl.p_ewma - 0.25).abs() < 1e-9, "p_ewma={}", ctrl.p_ewma);
+        assert!(ctrl.recent_excess.abs() < 1e-9, "recent_excess={}", ctrl.recent_excess);
+
+        let before = events.load(Ordering::Relaxed);
+        now += RTT;
+        for _ in 0..75 {
+            ctrl.record_ack(now, MTU as u64, RTT);
+        }
+        ctrl.on_congestion_event(now, now, false, 25 * MTU as u64);
+        assert_eq!(events.load(Ordering::Relaxed), before);
+        assert_eq!(ctrl.window(), ((BASE_WINDOW as f64) / 0.75) as u64);
+    }
+
+    #[test]
+    fn sub_threshold_packets_and_total_blackout_do_not_corrupt_floor() {
+        let mut now = Instant::now();
+        let (mock, _events) = MockController::new(BASE_WINDOW);
+        let mut ctrl = ErasureController::with_inner(Box::new(mock), now, MTU);
+
+        for _ in 0..MIN_SAMPLES {
+            feed_interval(&mut ctrl, &mut now, 75 * MTU as u64, 25 * MTU as u64, false);
+        }
+        assert!((ctrl.floor - 0.25).abs() < 1e-9);
+
+        // 1. 空载/保活期连续 4 个 RTT 仅有单包 (低于 MIN_INTERVAL_PACKETS=10)，不应触发结算把 floor 拉低
+        for _ in 0..4 {
+            now += RTT;
+            ctrl.record_ack(now, MTU as u64, RTT);
+        }
+        assert!((ctrl.floor - 0.25).abs() < 1e-9, "floor={}", ctrl.floor);
+        assert_eq!(ctrl.samples, MIN_SAMPLES);
+
+        // 清空前面累计的 4 个包，再测试 100% 丢包黑洞 (acked == 0, lost == 20 * MTU)
+        ctrl.acked_acc = 0;
+        now += RTT;
+        ctrl.on_congestion_event(now, now, false, 20 * MTU as u64);
+        // 100% 丢包黑洞不应抬高 floor，且应注入 recent_excess 压低膨胀
+        assert!((ctrl.floor - 0.25).abs() < 1e-9, "floor={}", ctrl.floor);
+        assert!(ctrl.recent_excess > 0.0);
     }
 }

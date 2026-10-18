@@ -330,12 +330,12 @@ impl QuicHandshakeLimiter {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let count = map.entry(key).or_insert(0);
-        if *count >= self.max_per_ip {
+        let cur_ip = map.get(&key).copied().unwrap_or(0);
+        if cur_ip >= self.max_per_ip {
             self.global_count.fetch_sub(1, Ordering::SeqCst);
             return None;
         }
-        *count += 1;
+        map.insert(key, cur_ip + 1);
 
         Some(QuicHandshakeGuard {
             limiter: self.clone(),
@@ -382,6 +382,185 @@ pub(crate) struct QuicHandshakeGuard {
 impl Drop for QuicHandshakeGuard {
     fn drop(&mut self) {
         self.limiter.release(self.key);
+    }
+}
+
+/// QUIC 活跃连接与双向流预算管理器: 覆盖"首流认证通过后"的整个连接与流生命周期。
+/// - 连接预算: 限制每 IP (IPv6 归一到 /64) 与全局同时保持的活跃 QUIC 连接数;
+/// - 流预算: 限制每 IP 与全局同时在途的双向流 task 数, 防止单连接开满 2048 流导致全局任务膨胀。
+#[derive(Debug)]
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) struct QuicRuntimeLimiter {
+    max_conn_per_ip: usize,
+    max_conn_global: usize,
+    max_streams_per_ip: usize,
+    max_streams_global: usize,
+    conn_global: AtomicUsize,
+    stream_global: AtomicUsize,
+    conn_per_ip: Mutex<HashMap<IpAddr, usize>>,
+    stream_per_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+impl QuicRuntimeLimiter {
+    pub const DEFAULT_MAX_CONN_PER_IP: usize = 64;
+    pub const DEFAULT_MAX_CONN_GLOBAL: usize = 4096;
+    pub const DEFAULT_MAX_STREAMS_PER_IP: usize = 512;
+    pub const DEFAULT_MAX_STREAMS_GLOBAL: usize = 16384;
+
+    pub fn new(
+        max_conn_per_ip: usize,
+        max_conn_global: usize,
+        max_streams_per_ip: usize,
+        max_streams_global: usize,
+    ) -> Self {
+        Self {
+            max_conn_per_ip,
+            max_conn_global,
+            max_streams_per_ip,
+            max_streams_global,
+            conn_global: AtomicUsize::new(0),
+            stream_global: AtomicUsize::new(0),
+            conn_per_ip: Mutex::new(HashMap::new()),
+            stream_per_ip: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn default_limits() -> Self {
+        Self::new(
+            Self::DEFAULT_MAX_CONN_PER_IP,
+            Self::DEFAULT_MAX_CONN_GLOBAL,
+            Self::DEFAULT_MAX_STREAMS_PER_IP,
+            Self::DEFAULT_MAX_STREAMS_GLOBAL,
+        )
+    }
+
+    pub fn try_acquire_conn(self: &Arc<Self>, ip: IpAddr) -> Option<QuicConnGuard> {
+        let norm_ip = handshake::rate_limit_key(ip);
+        let cur = self.conn_global.fetch_add(1, Ordering::SeqCst);
+        if cur >= self.max_conn_global {
+            self.conn_global.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        let mut map = match self.conn_per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let cur_ip = map.get(&norm_ip).copied().unwrap_or(0);
+        if cur_ip >= self.max_conn_per_ip {
+            self.conn_global.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        map.insert(norm_ip, cur_ip + 1);
+        Some(QuicConnGuard {
+            limiter: self.clone(),
+            norm_ip,
+        })
+    }
+
+    pub fn try_acquire_stream(self: &Arc<Self>, ip: IpAddr) -> Option<QuicStreamGuard> {
+        let norm_ip = handshake::rate_limit_key(ip);
+        let cur = self.stream_global.fetch_add(1, Ordering::SeqCst);
+        if cur >= self.max_streams_global {
+            self.stream_global.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        let mut map = match self.stream_per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let cur_ip = map.get(&norm_ip).copied().unwrap_or(0);
+        if cur_ip >= self.max_streams_per_ip {
+            self.stream_global.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        map.insert(norm_ip, cur_ip + 1);
+        Some(QuicStreamGuard {
+            limiter: self.clone(),
+            norm_ip,
+        })
+    }
+
+    fn release_conn(&self, norm_ip: IpAddr) {
+        self.conn_global.fetch_sub(1, Ordering::SeqCst);
+        let mut map = match self.conn_per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(c) = map.get_mut(&norm_ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&norm_ip);
+            }
+        }
+    }
+
+    fn release_stream(&self, norm_ip: IpAddr) {
+        self.stream_global.fetch_sub(1, Ordering::SeqCst);
+        let mut map = match self.stream_per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(c) = map.get_mut(&norm_ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                map.remove(&norm_ip);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn current_conn_global(&self) -> usize {
+        self.conn_global.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn current_conn_for_ip(&self, ip: IpAddr) -> usize {
+        let norm_ip = handshake::rate_limit_key(ip);
+        let map = match self.conn_per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(&norm_ip).copied().unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn current_stream_global(&self) -> usize {
+        self.stream_global.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn current_stream_for_ip(&self, ip: IpAddr) -> usize {
+        let norm_ip = handshake::rate_limit_key(ip);
+        let map = match self.stream_per_ip.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.get(&norm_ip).copied().unwrap_or(0)
+    }
+}
+
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) struct QuicConnGuard {
+    limiter: Arc<QuicRuntimeLimiter>,
+    norm_ip: IpAddr,
+}
+
+impl Drop for QuicConnGuard {
+    fn drop(&mut self) {
+        self.limiter.release_conn(self.norm_ip);
+    }
+}
+
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) struct QuicStreamGuard {
+    limiter: Arc<QuicRuntimeLimiter>,
+    norm_ip: IpAddr,
+}
+
+impl Drop for QuicStreamGuard {
+    fn drop(&mut self) {
+        self.limiter.release_stream(self.norm_ip);
     }
 }
 
@@ -544,6 +723,7 @@ pub async fn start_quic_server(
     let _ = (camouflage_host, pfs); // Model X 精简: QUIC 路径不用 camouflage/fake-TLS/pfs
 
     let limiter = Arc::new(QuicHandshakeLimiter::default_limits());
+    let runtime_limiter = Arc::new(QuicRuntimeLimiter::default_limits());
 
     while let Some(incoming) = endpoint.accept().await {
         let peer_addr = incoming.remote_address();
@@ -571,12 +751,12 @@ pub async fn start_quic_server(
             continue;
         }
 
-        // 3. 尝试获取握手并发槽位 (硬上限检查)
+        // 3. 尝试获取未认证握手并发槽位 (硬上限检查: 覆盖至首条双向流完成 32B token 认证)
         let guard = match limiter.try_acquire(peer_ip, incoming.remote_address_validated()) {
             Some(g) => g,
             None => {
                 debug!(
-                    "Mirage QUIC Server: 握手并发超限 (每IP上限 {} 或全局上限 {}), 拒绝来自 {} 的连接",
+                    "Mirage QUIC Server: 握手/未认证并发超限 (每IP上限 {} 或全局上限 {}), 拒绝来自 {} 的连接",
                     limiter.max_per_ip(),
                     limiter.max_global(),
                     peer_ip
@@ -588,35 +768,117 @@ pub async fn start_quic_server(
 
         let creds_c = creds.clone();
         let up = upstream.clone();
+        let rt_limiter = runtime_limiter.clone();
         tokio::spawn(async move {
             let conn = match tokio::time::timeout(std::time::Duration::from_secs(10), incoming).await {
                 Ok(Ok(c)) => c,
                 _ => return, // QUIC 握手失败或超时 (10s), guard 在此 drop 释放槽位
             };
-            // 握手完成, 释放握手阶段并发计数 (计数仅覆盖至底层 QUIC/TLS 连接握手完成, 防握手阶段 CPU DoS)
-            drop(guard);
 
             let peer = conn.remote_address();
-            if crate::blocklist::is_blocked(&peer.ip()) {
-                debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {}", peer.ip());
+            let peer_ip = peer.ip();
+            if crate::blocklist::is_blocked(&peer_ip) {
+                debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {}", peer_ip);
+                conn.close(quinn::VarInt::from_u32(0), b"");
                 return;
             }
-            // 一条 QUIC 连接可承载多条双向流 (每条 = 一条隧道)。逐条 accept_bi, 各自成 task。
-            // Model X 精简: 每流 [token][target][data], 无 per-stream fake-TLS、无内层 AEAD (QUIC 自加密)。
-            // 每连接一个失败计数: 单流认证失败只结束该流; 累计失败 >= 3 次才关闭整条连接。
+            if up.is_some() {
+                debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
+                conn.close(quinn::VarInt::from_u32(0), b"");
+                return;
+            }
+
+            // 状态门控 (Unauthenticated -> Authenticated):
+            // 握手槽位 guard 保持到首条双向流在 5s 内完成 32B token 校验为止。
+            // 首流认证前并发度=1, 任何超时、EOF 或认证失败立即关闭整条连接。
+            let (mut first_send, mut first_recv) =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi()).await {
+                    Ok(Ok(bi)) => bi,
+                    _ => {
+                        conn.close(quinn::VarInt::from_u32(0), b"");
+                        return;
+                    }
+                };
+
             let fail_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let Some((first_user, first_session_auth)) = authenticate_quic_stream_token(
+                &mut first_send,
+                &mut first_recv,
+                peer_ip,
+                &creds_c,
+                auth_ts_tolerance_secs,
+                &conn,
+                &fail_count,
+                true,
+            )
+            .await
+            else {
+                conn.close(quinn::VarInt::from_u32(0), b"");
+                return;
+            };
+
+            // 首流认证通过: 转移至已认证活跃连接预算与流预算, 随后释放未认证握手槽位 guard
+            let Some(_conn_guard) = rt_limiter.try_acquire_conn(peer_ip) else {
+                debug!("Mirage QUIC Server: 活跃连接预算超限, 关闭来自 {} 的连接", peer_ip);
+                let _ = first_send.reset(quinn::VarInt::from_u32(0));
+                let _ = first_recv.stop(quinn::VarInt::from_u32(0));
+                conn.close(quinn::VarInt::from_u32(0), b"");
+                return;
+            };
+            let Some(first_stream_guard) = rt_limiter.try_acquire_stream(peer_ip) else {
+                debug!("Mirage QUIC Server: 活跃流预算超限, 关闭来自 {} 的首条流", peer_ip);
+                let _ = first_send.reset(quinn::VarInt::from_u32(0));
+                let _ = first_recv.stop(quinn::VarInt::from_u32(0));
+                conn.close(quinn::VarInt::from_u32(0), b"");
+                return;
+            };
+            drop(guard);
+
+            tokio::spawn(async move {
+                relay_authenticated_quic_stream(
+                    first_send,
+                    first_recv,
+                    peer_ip,
+                    first_user,
+                    first_session_auth,
+                    allow_local_targets,
+                    first_stream_guard,
+                )
+                .await;
+            });
+
+            // 已认证连接主循环 (_conn_guard 随本循环生命周期保持):
+            // 后续每条双向流仍需获取流预算守卫并逐流校验 32B token (保留热重载、吊销与多用户配额语义)。
             loop {
                 match conn.accept_bi().await {
-                    Ok((send, recv)) => {
+                    Ok((mut send, mut recv)) => {
+                        let Some(stream_guard) = rt_limiter.try_acquire_stream(peer_ip) else {
+                            debug!("Mirage QUIC Server: 活跃流预算超限, 拒绝来自 {} 的新流", peer_ip);
+                            let _ = send.reset(quinn::VarInt::from_u32(0));
+                            let _ = recv.stop(quinn::VarInt::from_u32(0));
+                            continue;
+                        };
                         let creds2 = creds_c.clone();
                         let up2 = up.clone();
                         let conn2 = conn.clone();
                         let fc = fail_count.clone();
                         tokio::spawn(async move {
-                            handle_quic_stream_lean(send, recv, peer.ip(), creds2, auth_ts_tolerance_secs, up2, allow_local_targets, conn2, fc).await;
+                            handle_quic_stream_lean(
+                                send,
+                                recv,
+                                peer_ip,
+                                creds2,
+                                auth_ts_tolerance_secs,
+                                up2,
+                                allow_local_targets,
+                                conn2,
+                                fc,
+                                stream_guard,
+                            )
+                            .await;
                         });
                     }
-                    Err(_) => break, // 连接关闭
+                    Err(_) => break, // 连接关闭, _conn_guard 在此释放
                 }
             }
         });
@@ -629,30 +891,32 @@ pub(crate) fn record_stream_auth_failure(fail_count: &std::sync::atomic::AtomicU
     fail_count.fetch_add(1, Ordering::SeqCst) + 1 >= 3
 }
 
-/// Model X 精简 QUIC 流处理: `[token(32B)][2B target_len][target][data...]`, 无 per-stream fake-TLS、
-/// 无内层 AEAD (QUIC 自己的 TLS1.3 已加密所有流)。token 为无状态每流认证 (HMAC 密码+时间, 32B 无往返)。
-/// 直连出口 (upstream=SS/WG 的 lean 路径暂不支持, 有则拒)。
+/// 读取并校验 QUIC 流首部 32B token。
+/// - 超时、提前 EOF 或 HMAC 校验失败均使用通用重置码 `0` 重置流, 并计入连接 `fail_count`;
+/// - 若 `is_first_stream` 为 true 或累计失败 >= 3 次, 立即关闭整条连接。
 #[cfg(feature = "quic")]
-async fn handle_quic_stream_lean(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+#[allow(clippy::too_many_arguments)]
+async fn authenticate_quic_stream_token(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
     peer_ip: IpAddr,
-    creds: CredsSnapshot,
+    creds: &CredsSnapshot,
     tol: u64,
-    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
-    allow_local_targets: bool,
-    conn: quinn::Connection,
-    fail_count: Arc<std::sync::atomic::AtomicU32>,
-) {
-    if upstream.is_some() {
-        debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
-        return;
-    }
-    // 1. token (32B) — 无状态每流认证 (每条新流 load() 最新快照认出是哪个凭据)。
+    conn: &quinn::Connection,
+    fail_count: &std::sync::atomic::AtomicU32,
+    is_first_stream: bool,
+) -> Option<(String, SessionAuth)> {
     let mut token = [0u8; 32];
     match tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_exact(&mut token)).await {
         Ok(Ok(_)) => {}
-        _ => return,
+        _ => {
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            if is_first_stream || record_stream_auth_failure(fail_count) {
+                conn.close(quinn::VarInt::from_u32(0), b"");
+            }
+            return None;
+        }
     }
     let creds_snapshot = creds.load_full();
     let (user, cred_revoked) = match creds_snapshot.iter().position(|entry| {
@@ -670,34 +934,110 @@ async fn handle_quic_stream_lean(
         None => {
             static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !HINTED.swap(true, Ordering::Relaxed) {
-                tracing::warn!("Mirage QUIC(lean): token 认证失败 from {} ({})", peer_ip,
-                    crate::crypto::hello_auth::session_decrypt_failure_hint());
+                tracing::warn!(
+                    "Mirage QUIC(lean): token 认证失败 from {} ({})",
+                    peer_ip,
+                    crate::crypto::hello_auth::session_decrypt_failure_hint()
+                );
+            } else {
+                tracing::debug!("Mirage QUIC(lean): token 认证失败 from {}", peer_ip);
             }
-            let _ = send.reset(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_AUTH_FAILED_CODE));
-            let _ = recv.stop(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_AUTH_FAILED_CODE));
-            if record_stream_auth_failure(&fail_count) {
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            if is_first_stream || record_stream_auth_failure(fail_count) {
                 conn.close(quinn::VarInt::from_u32(0), b"");
             }
-            return;
+            return None;
         }
     };
     if cred_revoked.load(Ordering::Relaxed) {
         tracing::debug!("Mirage QUIC(lean): 凭据已吊销 from {}", peer_ip);
-        return;
+        let _ = send.reset(quinn::VarInt::from_u32(0));
+        let _ = recv.stop(quinn::VarInt::from_u32(0));
+        conn.close(quinn::VarInt::from_u32(0), b"");
+        return None;
     }
-    // 握手门控: 超额用户按认证失败处理
+    // 握手门控: 超额用户按认证失败处理 (首流立即关连接, 后续流累计达阈值关连接)
     if crate::proxy::user_limits::is_user_exhausted(&user) {
         tracing::warn!("Mirage QUIC(lean): user `{}` quota exhausted from {}", user, peer_ip);
-        return;
+        let _ = send.reset(quinn::VarInt::from_u32(0));
+        let _ = recv.stop(quinn::VarInt::from_u32(0));
+        if is_first_stream || record_stream_auth_failure(fail_count) {
+            conn.close(quinn::VarInt::from_u32(0), b"");
+        }
+        return None;
     }
-    // 分发前一次性取出用户限额句柄: 非 default 用户若取到 None (说明已被删除或不存在), 拒绝并断开流。
+    // 分发前一次性取出用户限额句柄: 非 default 用户若取到 None (说明已被删除或不存在), 拒绝并断开整条连接。
     // 消除与后续 connect 之间的 TOCTOU 窗口。
     let user_limit = crate::proxy::user_limits::get_user_limit(&user);
     if user != "default" && user_limit.is_none() {
-        tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除或不存在, 拒绝并断开流", user);
+        tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除或不存在, 拒绝并断开连接", user);
+        let _ = send.reset(quinn::VarInt::from_u32(0));
+        let _ = recv.stop(quinn::VarInt::from_u32(0));
+        conn.close(quinn::VarInt::from_u32(0), b"");
+        return None;
+    }
+    Some((user, SessionAuth::new(user_limit, cred_revoked)))
+}
+
+/// Model X 精简 QUIC 流处理: `[token(32B)][2B target_len][target][data...]`, 无 per-stream fake-TLS、
+/// 无内层 AEAD (QUIC 自己的 TLS1.3 已加密所有流)。token 为无状态每流认证 (HMAC 密码+时间, 32B 无往返)。
+/// 直连出口 (upstream=SS/WG 的 lean 路径暂不支持, 有则拒)。
+#[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_quic_stream_lean(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    peer_ip: IpAddr,
+    creds: CredsSnapshot,
+    tol: u64,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    allow_local_targets: bool,
+    conn: quinn::Connection,
+    fail_count: Arc<std::sync::atomic::AtomicU32>,
+    stream_guard: QuicStreamGuard,
+) {
+    if upstream.is_some() {
+        debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
         return;
     }
-    let session_auth = SessionAuth::new(user_limit, cred_revoked);
+    let Some((user, session_auth)) = authenticate_quic_stream_token(
+        &mut send,
+        &mut recv,
+        peer_ip,
+        &creds,
+        tol,
+        &conn,
+        &fail_count,
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+    relay_authenticated_quic_stream(
+        send,
+        recv,
+        peer_ip,
+        user,
+        session_auth,
+        allow_local_targets,
+        stream_guard,
+    )
+    .await;
+}
+
+/// 已完成 32B token 校验的 QUIC 流后续处理: 读取 `[2B len][target]` 并建立双向直连转发 (`_stream_guard` 随流生命周期释放)。
+#[cfg(feature = "quic")]
+async fn relay_authenticated_quic_stream(
+    send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    peer_ip: IpAddr,
+    user: String,
+    session_auth: SessionAuth,
+    allow_local_targets: bool,
+    _stream_guard: QuicStreamGuard,
+) {
     // 2. target: [2B len][host:port]
     let mut lenb = [0u8; 2];
     if tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_exact(&mut lenb)).await.map(|r| r.is_err()).unwrap_or(true) {
@@ -740,9 +1080,11 @@ async fn handle_quic_stream_lean(
     // 半关闭语义同原 copy_bidirectional: 一侧 EOF 只关对端写方向 (传 FIN), 另一方向继续传完;
     // 只有出错、用户超额或凭据吊销才发 stop 让两个方向都立刻退出。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let t0 = tokio::time::Instant::now();
+    let last_active = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     tokio::join!(
-        quic_pump(q_read, up_write, dev_buckets.clone(), session_auth.clone(), true, stop_tx.clone(), stop_rx.clone()),
-        quic_pump(up_read, q_write, dev_buckets, session_auth, false, stop_tx, stop_rx),
+        quic_pump(q_read, up_write, dev_buckets.clone(), session_auth.clone(), true, stop_tx.clone(), stop_rx.clone(), t0, last_active.clone()),
+        quic_pump(up_read, q_write, dev_buckets, session_auth, false, stop_tx, stop_rx, t0, last_active),
     );
 }
 
@@ -750,8 +1092,9 @@ pub(crate) const REVOKE_CHECK_INTERVAL: std::time::Duration = std::time::Duratio
 
 /// QUIC lean 单向泵: 带客户端 IP 桶 + 用户桶限速与配额计数 (`up` = 客户端→目标)。
 /// - EOF: `shutdown` 对端写方向后返回, **不打断另一方向** (半关闭, 否则客户端先关写时目标的响应会被丢)。
-/// - 读写出错 / 用户超额 / 凭据吊销: 发 stop, 另一方向随之退出。
+/// - 读写出错 / 用户超额 / 凭据吊销 / 双向总空闲达 `relay_idle`: 发 stop, 另一方向随之退出。
 #[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
 async fn quic_pump<R, W>(
     mut r: R,
     mut w: W,
@@ -760,6 +1103,8 @@ async fn quic_pump<R, W>(
     up: bool,
     stop_tx: tokio::sync::watch::Sender<bool>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    t0: tokio::time::Instant,
+    last_active: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -781,13 +1126,24 @@ async fn quic_pump<R, W>(
                     return;
                 }
             },
-            // 周期唤醒检查 auth.should_stop(): 避免两个方向均空闲时已吊销流无法断开
-            _ = tokio::time::sleep(REVOKE_CHECK_INTERVAL) => continue,
+            // 周期唤醒检查 auth.should_stop() 与双向总空闲超时:
+            // 只要任一方向有数据流动 (如单向长下载), last_active 持续刷新不会误断;
+            // 两个方向均静默达 relay_idle 时发 stop 回收孤儿流。
+            _ = tokio::time::sleep(REVOKE_CHECK_INTERVAL) => {
+                let now_secs = t0.elapsed().as_secs();
+                let idle_secs = now_secs.saturating_sub(last_active.load(Ordering::Relaxed));
+                if idle_secs >= crate::proxy::relay_idle().as_secs() {
+                    let _ = stop_tx.send(true);
+                    return;
+                }
+                continue;
+            }
         };
         if n == 0 {
             let _ = w.shutdown().await; // EOF → 半关闭
             return;
         }
+        last_active.store(t0.elapsed().as_secs(), Ordering::Relaxed);
         if let Some(b) = &ip {
             if up { b.up.consume(n).await } else { b.down.consume(n).await }
         }
@@ -1170,5 +1526,58 @@ mod quic_limiter_tests {
         ]);
 
         assert!(session_auth.should_stop(), "改口令后在用会话的 should_stop() 必须为 true");
+    }
+
+    #[test]
+    fn test_quic_runtime_limiter_conn_and_stream_budgets() {
+        let rt = Arc::new(QuicRuntimeLimiter::new(2, 3, 2, 3));
+        let ip1: IpAddr = "192.0.2.10".parse().unwrap();
+        let ip2: IpAddr = "192.0.2.11".parse().unwrap();
+        let v6_a: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6_b: IpAddr = "2001:db8::2".parse().unwrap();
+
+        // 1. 每 IP 连接预算与全局连接预算
+        let c1 = rt.try_acquire_conn(ip1).unwrap();
+        let c2 = rt.try_acquire_conn(ip1).unwrap();
+        assert!(rt.try_acquire_conn(ip1).is_none(), "单 IP 连接上限 2 已满");
+        assert_eq!(rt.current_conn_for_ip(ip1), 2);
+        assert_eq!(rt.current_conn_global(), 2);
+
+        let c3 = rt.try_acquire_conn(ip2).unwrap();
+        assert_eq!(rt.current_conn_global(), 3);
+        assert!(rt.try_acquire_conn(v6_a).is_none(), "全局连接上限 3 已满");
+
+        drop(c1);
+        assert_eq!(rt.current_conn_for_ip(ip1), 1);
+        assert_eq!(rt.current_conn_global(), 2);
+
+        drop(c2);
+        drop(c3);
+        assert_eq!(rt.current_conn_global(), 0);
+
+        // 2. IPv6 /64 共享流预算与全局流预算
+        let s1 = rt.try_acquire_stream(v6_a).unwrap();
+        let s2 = rt.try_acquire_stream(v6_b).unwrap();
+        assert_eq!(rt.current_stream_for_ip(v6_a), 2, "同 /64 IPv6 共享流预算");
+        assert!(rt.try_acquire_stream(v6_a).is_none(), "同 /64 流预算上限 2 已满");
+
+        let s3 = rt.try_acquire_stream(ip1).unwrap();
+        assert_eq!(rt.current_stream_global(), 3);
+        assert!(rt.try_acquire_stream(ip2).is_none(), "全局流预算上限 3 已满");
+
+        drop(s1);
+        drop(s2);
+        drop(s3);
+        assert_eq!(rt.current_stream_global(), 0);
+        assert_eq!(rt.current_stream_for_ip(v6_a), 0);
+        assert!(rt.conn_per_ip.lock().unwrap().is_empty());
+        assert!(rt.stream_per_ip.lock().unwrap().is_empty());
+
+        // 3. max_per_ip == 0 时拒绝请求不应在 HashMap 中残留 0 值键
+        let zero_rt = Arc::new(QuicRuntimeLimiter::new(0, 10, 0, 10));
+        assert!(zero_rt.try_acquire_conn(ip1).is_none());
+        assert!(zero_rt.try_acquire_stream(ip1).is_none());
+        assert!(zero_rt.conn_per_ip.lock().unwrap().is_empty());
+        assert!(zero_rt.stream_per_ip.lock().unwrap().is_empty());
     }
 }

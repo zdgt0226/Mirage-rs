@@ -50,6 +50,7 @@ impl ObfsSocket {
 /// 各段是**独立 salt+XOR** 混淆的。逐段用各自的 salt 解、剥掉 8B salt 前移压实, 返回压实后的有效长度。
 /// 段 < `SALT_LEN` 视为非法直接丢弃 (不计入输出)。`stride` 由调用方解析 (0 → 单段, 见 poll_recv)。
 fn deobfs_datagram(key: &[u8; 32], buf: &mut [u8], len: usize, stride: usize) -> usize {
+    let stride = if stride == 0 { len } else { stride };
     let mut read = 0usize;
     let mut write = 0usize;
     while read < len {
@@ -253,5 +254,16 @@ mod tests {
         let mut buf = seg.clone();
         let n = deobfs_datagram(&key("wrong-pw"), &mut buf, seg.len(), seg.len());
         assert_ne!(&buf[..n], payload, "错 key 解出必为腐化数据 (QUIC 层随后丢弃)");
+    }
+
+    #[test]
+    fn deobfs_zero_stride_treated_as_single_segment() {
+        let k = key("pw");
+        let payload = b"zero stride should fallback to len";
+        let seg = obf_seg(&k, [9u8; SALT_LEN], payload);
+        let mut buf = seg.clone();
+        let n = deobfs_datagram(&k, &mut buf, seg.len(), 0);
+        assert_eq!(&buf[..n], payload, "stride=0 应退化为单段处理且不死循环");
+        assert_eq!(deobfs_datagram(&k, &mut buf, 0, 0), 0);
     }
 }

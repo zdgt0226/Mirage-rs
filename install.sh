@@ -147,9 +147,9 @@ ask_gui() {
     local port
     port=$(ask_port "GUI 端口" "$default_port" tcp)
     if [[ "$listen_addr" == "0.0.0.0" ]]; then
-        # url-safe 32 位随机 token; /dev/urandom 不可用时退回时间戳哈希
+        # url-safe 32 位随机 token; /dev/urandom 不可用或随机源不足时报错退出
         token=$(tr -dc 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c 32)
-        [[ ${#token} -lt 16 ]] && token=$(date +%s%N | sha256sum | head -c 32)
+        [[ ${#token} -lt 16 ]] && err "生成 API token 失败 (/dev/urandom 不可用或熵不足)"
         info "GUI 开放到 0.0.0.0 —— 已自动生成 API token: ${token}"
         info "  浏览器首次访问 http://<本机IP>:${port}/?token=${token} 即种 cookie, 之后免带"
         info "  CLI: curl -H 'Authorization: Bearer ${token}' http://<本机IP>:${port}/api/overview"
@@ -429,9 +429,38 @@ handle_brutal_optional() {
     if (( ${#install_args[@]} > 0 )); then
         desc_args=" -s -- ${install_args[*]}"
     fi
-    info "下载并运行官方一键脚本：curl -fsSL https://tcp.hy2.sh/ | bash${desc_args}"
+    local script_file
+    script_file=$(mktemp) || err "创建临时文件失败"
+    info "下载官方一键脚本到临时文件..."
+    if ! curl -fsSL https://tcp.hy2.sh/ -o "$script_file"; then
+        rm -f "$script_file"
+        warn "安装脚本下载失败，请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
+        return 1
+    fi
 
-    if curl -fsSL https://tcp.hy2.sh/ | bash -s -- ${install_args[@]+"${install_args[@]}"} >&2; then
+    local script_hash
+    script_hash=$(sha256sum "$script_file" | cut -d' ' -f1)
+    info "脚本 SHA256: ${script_hash}"
+
+    if [[ ! -t 0 && ! -t 1 ]] || [[ ! -r /dev/tty ]] || [[ -n "${NONINTERACTIVE:-}" ]] || [[ "${DEBIAN_FRONTEND:-}" == "noninteractive" ]]; then
+        rm -f "$script_file"
+        warn "非交互模式下拒绝执行外部脚本，跳过 Brutal 安装。"
+        return 1
+    fi
+
+    if ! ask_yn "是否确认执行上述 Brutal 安装脚本?" n; then
+        rm -f "$script_file"
+        info "已取消执行安装脚本，跳过 Brutal 安装。"
+        return 1
+    fi
+
+    local run_ret=0
+    if bash "$script_file" ${install_args[@]+"${install_args[@]}"} >&2; then
+        run_ret=1
+    fi
+    rm -f "$script_file"
+
+    if (( run_ret == 1 )); then
         if brutal_loaded; then
             local new_ver want_major=2
             new_ver=$(brutal_version)

@@ -1,6 +1,6 @@
-# quinn-proto 0.11.17 —— Mirage 补丁
+# quinn-proto 0.11.19 —— Mirage 补丁
 
-本目录是 crates.io 上 `quinn-proto 0.11.17` 的原样副本（`src/`、`Cargo.toml`、许可证），经根 `Cargo.toml` 的
+本目录是 crates.io 上 `quinn-proto 0.11.19` 的原样副本（`src/`、`Cargo.toml`、许可证），经根 `Cargo.toml` 的
 `[patch.crates-io]` 替换上游版本。**只改了一处**：
 
 | 文件 | 改动 |
@@ -11,7 +11,8 @@
 
 `MAX_CHUNKS` 是接收端单条流可缓存的乱序数据段数上限（defragment 之后仍超限即 `TooManyChunks`，以
 `INTERNAL_ERROR "too many gaps in stream buffer"` 断开连接）。上游为修复 RUSTSEC-2026-0185 引入该上限，
-防止恶意对端用碎片帧迫使接收端反复整理内存。0.11.19 仍为 1024。
+防止恶意对端用碎片帧迫使接收端反复整理内存。0.11.19 仍为 1024（同时已包含 0.11.18 对 RUSTSEC-2026-0343
+outgoing DATAGRAM 记账问题的修复，以及 0.11.19 对小分片 `MIN_RETAINED_CHUNK_SIZE` 合并与流发送缓冲释放的修复）。
 
 在高 RTT + 高丢包链路上，要跑满带宽，流控窗口需约 2.5 × BDP（100 Mbps、180ms RTT 时约 6–8MB）：丢包形成的空洞需约
 1.5 个 RTT 才能被重传补齐，期间后续数据只能缓存。空洞数约等于「丢包率 × 窗口内的包数」，1024 在 10% 以上丢包时

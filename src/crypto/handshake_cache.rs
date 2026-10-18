@@ -9,6 +9,8 @@ use ring::agreement::{self, EphemeralPrivateKey};
 use ring::rand::SystemRandom;
 
 static HANDSHAKE_CACHE: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+/// 模板超过此时长未成功刷新就告警 (刷新周期 30min; 6h = 连续失败 12 次)。
+const STALE_WARN_SECS: u64 = 6 * 3600;
 static WARMING_UP: AtomicBool = AtomicBool::new(false);
 /// 最近一次向伪装站建连的 TCP connect 耗时 (微秒, 0=尚无)。供 auth-succ 时序对齐的 RTT 初值:
 /// 这条路径本来就在启动预热 + 30 分钟刷新时各跑一次 → 拿它播种 EWMA **零新增流量**。
@@ -31,6 +33,55 @@ impl Drop for WarmGuard {
 
 fn cache() -> &'static Mutex<Vec<Vec<u8>>> {
     HANDSHAKE_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 最近一次**成功**装上模板的 Unix 秒。用于陈旧告警 (见 `install_templates`)。
+static LAST_OK_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 装上一批新模板。
+///
+/// 两个不变量 (都关系到反指纹):
+/// 1. **不漏多样性**: 部分成功 (如 5 个并发 fetch 只回了 1 个) 不应把旧模板集整体替换成 1 条 ——
+///    那样所有客户端会收到**同一个** ServerHello (可被被动侧识别), 故改为与旧集合并。
+/// 2. **陈旧可观测**: 刷新失败时旧模板会一直被回放。若伪装站已轮换证书/密钥, 回放的
+///    ServerHello 会与真站当前状态不一致（可区分）。无法自动判定轮换, 故一旦超过
+///    `STALE_WARN_SECS` 就周期性告警, 由运维介入。
+async fn install_templates(new: Vec<Vec<u8>>) {
+    if new.is_empty() {
+        let last = LAST_OK_SECS.load(Ordering::Relaxed);
+        let age = now_secs().saturating_sub(last);
+        if age > STALE_WARN_SECS {
+            warn!(
+                "HandshakeCache 已 {age}s 未更新 (伪装站不可达?): 继续回放旧模板 — \
+                 若伪装站已轮换证书/密钥, 回放的 ServerHello 与真站不一致 ⇒ 可区分"
+            );
+        }
+        return;
+    }
+    let mut guard = cache().lock().await;
+    let kept_old = !guard.is_empty() && new.len() < guard.len();
+    if kept_old {
+        for t in new {
+            if !guard.iter().any(|o| o == &t) {
+                guard.push(t);
+            }
+        }
+    } else {
+        *guard = new;
+    }
+    let n = guard.len();
+    drop(guard);
+    LAST_OK_SECS.store(now_secs(), Ordering::Relaxed);
+    if kept_old {
+        warn!("模板刷新只取到部分集, 已与旧集合并 (现 {n} 条) — 避免回放多样性塔缩");
+    }
 }
 
 /// 模板是否**含齐客户端握手所需的三种 content-type**: 0x16 (ServerHello) + 0x14
@@ -90,9 +141,7 @@ fn spawn_refresh_task(camouflage_host: &str) {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
             let templates = fetch_batch(&host).await;
-            if !templates.is_empty() {
-                *cache().lock().await = templates;
-            }
+            install_templates(templates).await;
         }
     });
 }

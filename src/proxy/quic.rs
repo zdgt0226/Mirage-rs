@@ -118,6 +118,10 @@ fn transport_config(window_mb: u64, cc: QuicCc) -> Arc<quinn::TransportConfig> {
     // mux 架构: 一个连接承载多条流 (每条=一条隧道), 服务端须允许客户端开足够多的并发双向流
     // (quinn 默认 ~100, 高并发代理不够)。这是对端向本端advertise的上限, 故 client+server 都设。
     tc.max_concurrent_bidi_streams(quinn::VarInt::from_u32(2048));
+    tc.max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+    if let Ok(idle) = std::time::Duration::from_secs(60).try_into() {
+        tc.max_idle_timeout(Some(idle));
+    }
 
     let cc = match std::env::var("MIRAGE_QUIC_CC").ok().as_deref() {
         Some("off" | "bbr" | "default" | "stock") => QuicCc::Stock,
@@ -140,13 +144,26 @@ fn transport_config(window_mb: u64, cc: QuicCc) -> Arc<quinn::TransportConfig> {
 
 // ───────────────────────── 客户端 ─────────────────────────
 
+/// 拨号失败后的短暂退避窗口: 防止并发或连续新流在网络故障/配置错误时紧密重拨形成风暴。
+const DIAL_FAIL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Clone)]
+enum DialOutcome {
+    Connected(quinn::Connection),
+    Failed(String),
+    Cancelled,
+}
+type DialWatchRx = tokio::sync::watch::Receiver<Option<DialOutcome>>;
+type DialWatchTx = tokio::sync::watch::Sender<Option<DialOutcome>>;
+
 /// QUIC mux (P4/mux 架构): **一个共享 QUIC 连接承载多条 bi-stream** (每条 = 一条 Mirage 隧道),
 /// 取代 P0 的"一隧道一连接"。收益: 服务端每客户端只见一个连接 = 一个 CC = 天然共享瓶颈, 连接级
 /// receive_window 封顶聚合在途量 (治多连接过冲/128MB 崩溃); 省 per-conn crypto/CC/UDP-flow 开销。
 ///
 /// endpoint + 当前连接存在内部, 跨 open_stream 复用; 连接死了 (close_reason) 下次 open_stream 重拨。
+/// 建连采用单飞 (Singleflight) 状态机: 锁仅保护内存状态切换, 不跨 DNS/握手网络等待。
 pub struct QuicMux {
-    inner: tokio::sync::Mutex<MuxInner>,
+    inner: std::sync::Mutex<MuxInner>,
     host: String,
     port: u16,
     /// QUIC ClientHello 里发的 SNI —— **良性域名 (camouflage_host)**, 而非 server 的真 IP/域名。
@@ -169,6 +186,33 @@ pub struct QuicMux {
 struct MuxInner {
     endpoint: Option<quinn::Endpoint>,
     conn: Option<quinn::Connection>,
+    /// 正在进行中的单飞建连广播通道: Follower 订阅此 Receiver 共享同一次建连结果 (含失败结果)。
+    dialing: Option<DialWatchRx>,
+    /// 最近一次建连失败的时间戳与错误消息 (供 DIAL_FAIL_BACKOFF 退避窗口快速失败)。
+    last_failure: Option<(std::time::Instant, String)>,
+}
+
+/// 单飞建连 Leader 取消守卫: 若发起拨号的任务在 await DNS/握手期间被取消 (drop),
+/// 自动清理 `dialing` 槽位并广播 `DialOutcome::Cancelled`, 让等待中的 Follower 自动选出新 Leader 继续建连。
+struct DialLeaderGuard<'a> {
+    mux: &'a QuicMux,
+    tx: Option<DialWatchTx>,
+}
+
+impl Drop for DialLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let mut g = self.mux.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.dialing = None;
+            drop(g);
+            let _ = tx.send(Some(DialOutcome::Cancelled));
+        }
+    }
+}
+
+enum MuxAcquireAction {
+    Wait(DialWatchRx),
+    Dial(DialWatchTx),
 }
 
 impl QuicMux {
@@ -185,7 +229,7 @@ impl QuicMux {
         pin: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inner: tokio::sync::Mutex::new(MuxInner::default()),
+            inner: std::sync::Mutex::new(MuxInner::default()),
             host: host.to_string(),
             port,
             sni: sni.to_string(),
@@ -198,57 +242,136 @@ impl QuicMux {
         })
     }
 
-    /// 在共享连接上开一条 bi-stream。首次/断线时惰性建 endpoint + 拨号。
-    pub async fn open_stream(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        let conn = {
-            let mut g = self.inner.lock().await;
-            // 惰性建 endpoint。默认绑通配临时口; low_src_port 时尝试绑 ≤ 目标端口的源口。
-            if g.endpoint.is_none() {
-                let pin = match &self.pin {
-                    Some(p) if crate::config::is_valid_quic_pin(p) => p.as_str(),
-                    Some(p) => {
-                        tracing::error!("QUIC: quic_pin 格式非法 (`{p}`), 拒绝建立连接 (fail-closed)");
-                        anyhow::bail!("QUIC: quic_pin 格式非法，拒绝建立连接 (fail-closed)");
-                    }
-                    None => {
-                        tracing::error!("QUIC: 未配置 quic_pin (服务端证书 SPKI 指纹必填, fail-closed)");
-                        anyhow::bail!("QUIC: 未配置 quic_pin，拒绝建立连接 (fail-closed)");
-                    }
-                };
-                let addr = resolve(&self.host, self.port).await?;
-                let mut ep = make_client_endpoint(addr, self.low_src_port, self.pre_packet, self.obfs.as_deref())?;
-                ep.set_default_client_config(client_config(self.window_mb, self.cc, pin)?);
-                g.endpoint = Some(ep);
+    fn validate_pin(&self) -> Result<&str> {
+        match &self.pin {
+            Some(p) if crate::config::is_valid_quic_pin(p) => Ok(p.as_str()),
+            Some(p) => {
+                tracing::error!("QUIC: quic_pin 格式非法 (`{p}`), 拒绝建立连接 (fail-closed)");
+                anyhow::bail!("QUIC: quic_pin 格式非法，拒绝建立连接 (fail-closed)");
             }
-            // 连接不存在或已关 → 重拨。
-            let need_dial = match &g.conn {
-                None => true,
-                Some(c) => c.close_reason().is_some(),
-            };
-            if need_dial {
-                let addr = resolve(&self.host, self.port).await?;
-                let ep = g.endpoint.as_ref().unwrap();
-                let conn = ep
-                    .connect(addr, &self.sni) // SNI = 良性 camouflage_host, 非 server 真身
-                    .context("QUIC: connect 配置无效")?
-                    .await
-                    .map_err(classify_quic_handshake_error)?;
-                g.conn = Some(conn);
-            }
-            g.conn.as_ref().unwrap().clone() // Connection 是 Arc, clone 廉价
-        }; // 释放锁再 await open_bi (可能因对端 MAX_STREAMS 挂起, 不能占锁)
-
-        match conn.open_bi().await {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                // 连接死了 → 清掉, 下次 open_stream 重拨。
-                let mut g = self.inner.lock().await;
-                if g.conn.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
-                    g.conn = None;
-                }
-                Err(anyhow::anyhow!("QUIC: open_bi 失败 (连接已断): {e}"))
+            None => {
+                tracing::error!("QUIC: 未配置 quic_pin (服务端证书 SPKI 指纹必填, fail-closed)");
+                anyhow::bail!("QUIC: 未配置 quic_pin，拒绝建立连接 (fail-closed)");
             }
         }
+    }
+
+    /// 获取或单飞建立共享 QUIC 连接 (锁仅保护内存状态切换, 不跨网络等待)。
+    /// 返回 `(Connection, was_cached)`。
+    async fn get_or_dial_conn(&self) -> Result<(quinn::Connection, bool)> {
+        loop {
+            let action = {
+                let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(c) = &g.conn {
+                    if c.close_reason().is_none() {
+                        return Ok((c.clone(), true));
+                    }
+                    g.conn = None;
+                    g.endpoint = None;
+                }
+                if let Some(rx) = &g.dialing {
+                    MuxAcquireAction::Wait(rx.clone())
+                } else {
+                    if let Some((failed_at, err_msg)) = &g.last_failure {
+                        if failed_at.elapsed() < DIAL_FAIL_BACKOFF {
+                            anyhow::bail!("{err_msg}");
+                        }
+                        g.last_failure = None;
+                    }
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    g.dialing = Some(rx);
+                    MuxAcquireAction::Dial(tx)
+                }
+            };
+
+            match action {
+                MuxAcquireAction::Wait(mut rx) => loop {
+                    if let Some(outcome) = rx.borrow_and_update().clone() {
+                        match outcome {
+                            DialOutcome::Connected(conn) => return Ok((conn, false)),
+                            DialOutcome::Failed(msg) => anyhow::bail!("{msg}"),
+                            DialOutcome::Cancelled => break, // Leader 任务被取消，重新循环竞争新 Leader
+                        }
+                    }
+                    if rx.changed().await.is_err() {
+                        break; // 通道关闭，重新循环竞争新 Leader
+                    }
+                },
+                MuxAcquireAction::Dial(tx) => {
+                    let mut leader_guard = DialLeaderGuard {
+                        mux: self,
+                        tx: Some(tx),
+                    };
+
+                    let dial_res: Result<(quinn::Endpoint, quinn::Connection)> = async {
+                        let pin = self.validate_pin()?;
+                        // 单次 DNS 解析: 每次建连按当前解析结果新建 Endpoint (匹配 IPv4/IPv6 地址族、刷新本地源端口四元组并发送 pre-packet)
+                        let addr = resolve(&self.host, self.port).await?;
+                        let mut ep = make_client_endpoint(
+                            addr,
+                            self.low_src_port,
+                            self.pre_packet,
+                            self.obfs.as_deref(),
+                        )?;
+                        ep.set_default_client_config(client_config(self.window_mb, self.cc, pin)?);
+                        let conn = ep
+                            .connect(addr, &self.sni) // SNI = 良性 camouflage_host, 非 server 真身
+                            .context("QUIC: connect 配置无效")?
+                            .await
+                            .map_err(classify_quic_handshake_error)?;
+                        Ok((ep, conn))
+                    }
+                    .await;
+
+                    let tx = leader_guard.tx.take().unwrap();
+                    return match dial_res {
+                        Ok((ep, conn)) => {
+                            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                            g.endpoint = Some(ep);
+                            g.conn = Some(conn.clone());
+                            g.last_failure = None;
+                            g.dialing = None;
+                            drop(g);
+                            let _ = tx.send(Some(DialOutcome::Connected(conn.clone())));
+                            Ok((conn, false))
+                        }
+                        Err(e) => {
+                            let msg = format!("{e:#}");
+                            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                            g.last_failure = Some((std::time::Instant::now(), msg.clone()));
+                            g.dialing = None;
+                            drop(g);
+                            let _ = tx.send(Some(DialOutcome::Failed(msg)));
+                            Err(e)
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    /// 在共享连接上开一条 bi-stream。首次/断线时惰性单飞建 endpoint + 拨号;
+    /// 若复用的缓存连接静默失效导致 `open_bi` 报错，自动清理并透明重连重试 1 次。
+    pub async fn open_stream(&self) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+        for attempt in 0..2 {
+            let (conn, was_cached) = self.get_or_dial_conn().await?;
+            match conn.open_bi().await {
+                Ok(s) => return Ok(s),
+                Err(e) => {
+                    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.conn.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+                        g.conn = None;
+                        g.endpoint = None;
+                    }
+                    drop(g);
+                    if !was_cached || attempt == 1 {
+                        return Err(anyhow::anyhow!("QUIC: open_bi 失败 (连接已断): {e}"));
+                    }
+                    tracing::debug!("QUIC: 缓存连接已失效 ({e})，自动重连重试...");
+                }
+            }
+        }
+        unreachable!()
     }
 }
 
@@ -382,6 +505,7 @@ pub fn server_endpoint(
         .context("QUIC: rustls→quinn 服务端配置转换失败")?;
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
     server_cfg.transport_config(transport_config(window_mb, cc));
+    server_cfg.max_incoming(4096);
     match obfs {
         Some(pw) => {
             tracing::info!("QUIC: Salamander 混淆已启用 (服务端)");
@@ -415,56 +539,9 @@ impl QuicBiStream {
     }
 }
 
-/// QUIC lean 流认证失败应用层错误码。
-///
-/// ⚠️ 安全取舍说明: 流级 reset 发生在已建立的 QUIC 加密连接内部, 不改变 QUIC 握手面 (ClientHello/ServerHello)
-/// 的指纹; 但能完成 QUIC 握手的对端探测者如果主动发送 stream 并触发认证失败, 可以观察到该应用层流重置错误码。
-pub const QUIC_AUTH_FAILED_CODE: u32 = 0x41555448; // 'AUTH'
-
-/// 判定 `io::Error` 是否为服务端因 QUIC 认证失败重置流引起的错误 (`ReadError::Reset(QUIC_AUTH_FAILED_CODE)`).
-pub fn is_quic_auth_failed_io(e: &std::io::Error) -> bool {
-    if let Some(quinn::ReadError::Reset(code)) = e.get_ref().and_then(|err| err.downcast_ref::<quinn::ReadError>()) {
-        return *code == quinn::VarInt::from_u32(QUIC_AUTH_FAILED_CODE);
-    }
-    let s = e.to_string();
-    s.contains(&format!("error {}", QUIC_AUTH_FAILED_CODE))
-}
-
-/// 进程内限频告警: 首次输出 warn, 之后输出 debug。
-pub fn warn_quic_auth_failed() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!("QUIC 认证失败: 口令不符或时钟偏差超容差");
-    } else {
-        tracing::debug!("QUIC 认证失败: 口令不符或时钟偏差超容差");
-    }
-}
-
-/// 若该 io::Error 是 QUIC 认证失败, 则触发限频告警并返回 true。
-pub fn check_and_warn_quic_auth_failure(e: &std::io::Error) -> bool {
-    if is_quic_auth_failed_io(e) {
-        warn_quic_auth_failed();
-        true
-    } else {
-        false
-    }
-}
-
 impl AsyncRead for QuicBiStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        match Pin::new(&mut self.recv).poll_read(cx, buf) {
-            Poll::Ready(Err(e)) => {
-                if check_and_warn_quic_auth_failure(&e) {
-                    Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "QUIC 认证失败: 口令不符或时钟偏差超容差",
-                    )))
-                } else {
-                    Poll::Ready(Err(e))
-                }
-            }
-            res => res,
-        }
+        Pin::new(&mut self.recv).poll_read(cx, buf)
     }
 }
 
@@ -906,24 +983,129 @@ mod tests {
         assert!(classified_timeout.to_string().contains("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)"));
     }
 
-    #[test]
-    fn test_quic_auth_failed_io_detection() {
-        let reset_io = std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            quinn::ReadError::Reset(quinn::VarInt::from_u32(QUIC_AUTH_FAILED_CODE)),
-        );
-        assert!(is_quic_auth_failed_io(&reset_io));
-        assert!(check_and_warn_quic_auth_failure(&reset_io));
+    #[tokio::test]
+    async fn test_quic_mux_singleflight_shares_connection_and_backoff() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_mux_sf_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("quic_key.pem");
+        let key_path_str = key_path.to_str().unwrap();
 
-        let other_reset = std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            quinn::ReadError::Reset(quinn::VarInt::from_u32(0)),
-        );
-        assert!(!is_quic_auth_failed_io(&other_reset));
-        assert!(!check_and_warn_quic_auth_failure(&other_reset));
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let ep_server = server_endpoint(listen_addr, 2, QuicCc::Stock, None, Some(key_path_str)).unwrap();
+        let server_addr = ep_server.local_addr().unwrap();
+        let server_key = load_or_generate_key(&key_path).unwrap();
+        let correct_pin = spki_pin(&server_key.public_key_der());
 
-        let regular_io = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe broken");
-        assert!(!is_quic_auth_failed_io(&regular_io));
-        assert!(!check_and_warn_quic_auth_failure(&regular_io));
+        // 统计服务端实际接受的 QUIC 连接数: 并发 open_stream 必须只产生 1 条连接
+        let accepted_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_conns_srv = accepted_conns.clone();
+        let srv_handle = tokio::spawn(async move {
+            while let Some(incoming) = ep_server.accept().await {
+                let c_cnt = accepted_conns_srv.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        c_cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        while let Ok((mut send, _recv)) = conn.accept_bi().await {
+                            let _ = tokio::io::AsyncWriteExt::write_all(&mut send, b"ok").await;
+                            let _ = tokio::io::AsyncWriteExt::shutdown(&mut send).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mux = QuicMux::new(
+            "127.0.0.1",
+            server_addr.port(),
+            "localhost",
+            false,
+            false,
+            None,
+            2,
+            QuicCc::Stock,
+            Some(correct_pin.clone()),
+        );
+
+        // 8 个并发调用同时触发冷启动建连
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let m = mux.clone();
+            tasks.push(tokio::spawn(async move {
+                let (mut send, mut recv) = m.open_stream().await.expect("并发 open_stream 应成功");
+                let _ = tokio::io::AsyncWriteExt::shutdown(&mut send).await;
+                let mut out = [0u8; 2];
+                tokio::io::AsyncReadExt::read_exact(&mut recv, &mut out).await.unwrap();
+                out
+            }));
+        }
+        for t in tasks {
+            assert_eq!(&t.await.unwrap(), b"ok");
+        }
+        assert_eq!(
+            accepted_conns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "并发 open_stream 必须通过单飞共享同一条 QUIC 连接"
+        );
+
+        // 验证 Leader 取消接力: 模拟 Leader 在拨号期间被取消 (DialOutcome::Cancelled), 等待中的 Follower 应自动接力完成建连
+        let cancel_mux = QuicMux::new(
+            "127.0.0.1",
+            server_addr.port(),
+            "localhost",
+            false,
+            false,
+            None,
+            2,
+            QuicCc::Stock,
+            Some(correct_pin),
+        );
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        cancel_mux.inner.lock().unwrap().dialing = Some(rx);
+        let m_wait = cancel_mux.clone();
+        let waiter = tokio::spawn(async move {
+            let (mut send, mut recv) = m_wait.open_stream().await.expect("Leader 取消后 Follower 应自动接力建连");
+            let _ = tokio::io::AsyncWriteExt::shutdown(&mut send).await;
+            let mut out = [0u8; 2];
+            tokio::io::AsyncReadExt::read_exact(&mut recv, &mut out).await.unwrap();
+            out
+        });
+        for _ in 0..100 {
+            if tx.receiver_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::task::yield_now().await;
+        {
+            let guard = DialLeaderGuard {
+                mux: &cancel_mux,
+                tx: Some(tx),
+            };
+            drop(guard); // 触发 DialOutcome::Cancelled
+        }
+        assert_eq!(&waiter.await.unwrap(), b"ok");
+
+        // 验证失败退避: 错误 pin 建连失败后, 退避窗口内的紧随调用立即失败且复用错误消息
+        let wrong_pin = spki_pin(&rcgen::KeyPair::generate().unwrap().public_key_der());
+        let bad_mux = QuicMux::new(
+            "127.0.0.1",
+            server_addr.port(),
+            "localhost",
+            false,
+            false,
+            None,
+            2,
+            QuicCc::Stock,
+            Some(wrong_pin),
+        );
+        let err1 = bad_mux.open_stream().await.unwrap_err();
+        let t0 = std::time::Instant::now();
+        let err2 = bad_mux.open_stream().await.unwrap_err();
+        assert!(t0.elapsed() < DIAL_FAIL_BACKOFF, "退避窗口内应立即快速失败");
+        assert!(err1.to_string().contains("服务端证书指纹与 quic_pin 不符"));
+        assert_eq!(err1.to_string(), err2.to_string());
+
+        srv_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

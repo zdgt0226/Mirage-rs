@@ -107,7 +107,11 @@ pub(super) async fn handle_tcp_relay(
 
     // 共享 atomic: 第一个 swap 到 -1 的 task 负责 shutdown, 另一方自然 break.
     // SUM_RDWR 让两个方向都立刻报 EOF/Err, 双向同时退出.
-    let stop_fd = Arc::new(AtomicI32::new(upstream_fd));
+    // shutdown 用的 fd 必须**独立持有**: 若直接存 upstream 的 raw fd, 分裂后的读写半句柄
+    // drop 时会关掉它, 之后 fd 可能被新 socket 复用 ⇒ shutdown 打到了无关连接上。
+    // dup 一份, 由第一个 swap 的 task 负责 shutdown + close; dup 失败则保持 -1 (闭包整体 no-op, 安全降级)。
+    let shutdown_fd = unsafe { libc::dup(upstream_fd) };
+    let stop_fd = Arc::new(AtomicI32::new(shutdown_fd));
     let stop_fd_up = stop_fd.clone();
     let stop_fd_down = stop_fd.clone();
 
@@ -115,8 +119,11 @@ pub(super) async fn handle_tcp_relay(
         let fd = stop.swap(-1, Ordering::SeqCst);
         if fd >= 0 {
             // SHUT_RDWR forces both directions to fail; idempotent — second
-            // caller hits -1 swap and skips.
-            unsafe { libc::shutdown(fd, libc::SHUT_RDWR); }
+            // caller hits -1 swap and skips. close() 释放我们 dup 的那一份句柄。
+            unsafe {
+                libc::shutdown(fd, libc::SHUT_RDWR);
+                libc::close(fd);
+            }
         }
     };
 

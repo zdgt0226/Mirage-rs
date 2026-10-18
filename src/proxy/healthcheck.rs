@@ -1,9 +1,9 @@
 use crate::proxy::outbound::OutboundNode;
-use std::sync::Arc;
+use std::sync::Weak;
 use tokio::time::{sleep, Duration, Instant, timeout};
 use tracing::debug;
 
-pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64) {
+pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64) {
     if interval == 0 {
         return;
     }
@@ -13,6 +13,9 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
         sleep(Duration::from_secs(2)).await;
 
         loop {
+            let Some(node) = node.upgrade() else {
+                break;
+            };
             if let OutboundNode::Mirage { pool, tag, .. } = &*node {
                 let start = Instant::now();
                 
@@ -63,6 +66,7 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
                         pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                         debug!("HealthCheck [{}] failed (quic stream open timeout/err)", tag);
                     }
+                    drop(node);
                     sleep(Duration::from_secs(interval)).await;
                     continue;
                 }
@@ -109,6 +113,7 @@ pub fn start_health_checker(node: Arc<OutboundNode>, url: String, interval: u64)
                     debug!("HealthCheck [{}] failed (pool get timeout/err)", tag);
                 }
             }
+            drop(node);
             sleep(Duration::from_secs(interval)).await;
         }
     });

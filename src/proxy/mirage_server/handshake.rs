@@ -539,32 +539,44 @@ fn log_ch_guard(
 /// 被关掉 (不是反射), 用 `UNAUTH_*` 给它计数会惩罚“触发预连的合法慢客户端”; 但它毕竟是
 /// “由未认证输入触发的出向连接”, 必须自带上限, 否则一次空连接扫描就能让本机对伪装站
 /// 狂开连接 (正是旧预热池被谪病的问题, 且这里可被攻击者放大)。
+/// 预连并发上限。**这是真正的保护**: 尚未认证的连接可能对伪装站发起出向连接, 必须自带上限,
+/// 否则一次空连接扫描就能让本机对伪装站狂开连接。
+///
+/// 注: 曾经的 `PRECONNECT_RATE_PER_SEC`(30/s) 已移除 —— 它并**不能减少**对伪装站的总连接数
+/// (被限速的空/半截探测在判定期 ② 仍会按需建连一次), 只把建连从 ① 推迟到 ②, 结果是
+/// 探测者看到的关闭偏差从 ~① 变成 ~②(约 1s), 反而**更容易被区分** (见 docs/codebase-audit-2026-10.md A1)。
+/// 保留在途上限 + 有界等待后, 过载时只会降级“部分对齐”而不是“完全不对齐”。
 const PRECONNECT_MAX_INFLIGHT: usize = 128;
-const PRECONNECT_RATE_PER_SEC: u32 = 30;
 /// 判定时等待“已 armed 的预连”就绪的上限。
 const PRECONNECT_TAKE_WAIT: Duration = Duration::from_millis(800);
 
 static PRECONNECT_INFLIGHT: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(PRECONNECT_MAX_INFLIGHT)));
-static PRECONNECT_RATE: LazyLock<Mutex<(Instant, u32)>> =
-    LazyLock::new(|| Mutex::new((Instant::now(), 0)));
+/// 预连因预算耗尽而降级的次数 (可观测: 非 0 即说明该节点探测速率超过预算)。
+static PRECONNECT_DEGRADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// 预连**发起**速率 (在真正要连之前判, 见 `Preconnect::arm` 的 spawn 内) ——
-/// 按“真正要连”计数, 于是 CH 很快到齐、定时器被 abort 的快客户端不消耗配额。
-fn preconnect_rate_ok() -> bool {
-    let mut g = match PRECONNECT_RATE.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    let now = Instant::now();
-    if now.duration_since(g.0) >= Duration::from_secs(1) {
-        *g = (now, 0);
+/// 取一个预连名额: 先 try, 再在 `budget` 内等待 (名额由先完成的预连释放)。
+/// 等不到 → None (调用方记降级并放弃对齐, 判定时按需建连)。
+async fn preconnect_permit(
+    budget: Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match PRECONNECT_INFLIGHT.clone().try_acquire_owned() {
+        Ok(p) => Some(p),
+        Err(_) => {
+            let n = PRECONNECT_DEGRADED.fetch_add(1, Ordering::Relaxed) + 1;
+            // 采样告警: 避免扫描时刷满日志
+            if n % 500 == 1 {
+                tracing::warn!(
+                    "预连预算耗尽, 第 {n} 次降级 (在途上限 {PRECONNECT_MAX_INFLIGHT}); \
+                     该连接将退回判定时按需建连 ⇒ 关闭时间对齐变差"
+                );
+            }
+            tokio::time::timeout(budget, PRECONNECT_INFLIGHT.clone().acquire_owned())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        }
     }
-    if g.1 >= PRECONNECT_RATE_PER_SEC {
-        return false;
-    }
-    g.1 += 1;
-    true
 }
 
 /// 推测性预连: accept 后延迟 `delay` 仍未见完整 ClientHello 就后台连一条伪装站连接备用 ——
@@ -579,15 +591,6 @@ struct Preconnect {
 }
 
 impl Preconnect {
-    fn disabled() -> Self {
-        Self {
-            handle: None,
-            rx: None,
-            has_connected: Arc::new(AtomicBool::new(false)),
-            fire_us: Arc::new(AtomicU64::new(0)),
-            ready_us: Arc::new(AtomicU64::new(0)),
-        }
-    }
     fn armed(&self) -> bool {
         self.rx.is_some()
     }
@@ -600,11 +603,8 @@ impl Preconnect {
     fn ready_us(&self) -> u64 {
         self.ready_us.load(Ordering::Acquire)
     }
-    /// 预算不足 → 禁用 (只损失对齐, 不影响可用性: 判定时退回按需即时建连)。
+    /// 预算不足 → 降级 (只损失对齐, 不影响可用性: 判定时退回按需即时建连)。
     fn arm(delay: Duration, host: &str, cam_rtt: &Arc<CamouflageRtt>) -> Self {
-        let Ok(permit) = PRECONNECT_INFLIGHT.clone().try_acquire_owned() else {
-            return Self::disabled();
-        };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let host = host.to_string();
         let rtt = cam_rtt.clone();
@@ -616,12 +616,13 @@ impl Preconnect {
         let ru = ready_us.clone();
         let t_arm = Instant::now();
         let handle = tokio::spawn(async move {
-            let _permit = permit; // 持到任务结束 (含 abort) → 在途数有界
             tokio::time::sleep(delay).await;
             fu.store(t_arm.elapsed().as_micros() as u64, Ordering::Relaxed);
-            if !preconnect_rate_ok() {
+            // 预算: 允许排到“判定后仍能被取用”的时刻 (delay + take_wait), 于是过载时只是
+            // “晚一点连”而不是“完全不连” —— 保留部分对齐 (见 PRECONNECT_MAX_INFLIGHT 注释)。
+            let Some(_permit) = preconnect_permit(PRECONNECT_TAKE_WAIT).await else {
                 return;
-            }
+            };
             let sock = camouflage::connect_camouflage(&host, &rtt).await;
             if sock.is_some() {
                 ru.store(t_arm.elapsed().as_micros() as u64, Ordering::Release);

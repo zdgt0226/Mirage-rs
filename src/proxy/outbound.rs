@@ -237,8 +237,8 @@ impl OutboundNode {
             OutboundNode::Mirage { pool, .. } => {
                 let hp = target.host_port();
                 let tb = hp.as_bytes();
-                if tb.len() > u16::MAX as usize {
-                    anyhow::bail!("target 过长: {} 字节", tb.len());
+                if tb.is_empty() || tb.len() > 512 {
+                    anyhow::bail!("target 长度非法 ({} 字节, 需 1..=512)", tb.len());
                 }
                 // Model X 精简 (transport=quic): 共享连接开一条流, 写 [token(32B)][2B len][host:port],
                 // 之后裸转发 (QUIC 自加密, 无内层 fake-TLS/AEAD)。
@@ -593,6 +593,7 @@ impl OutboundManager {
 
         // Pass 2: Group nodes (Urltest, Fallback) - simplified fixpoint resolution
         let mut pending = deferred;
+        let mut hc_started = std::collections::HashSet::new();
         while !pending.is_empty() {
             let mut progress = false;
             let mut next_round = Vec::new();
@@ -663,8 +664,14 @@ impl OutboundManager {
                 if resolved {
                     if hc_interval > 0 && !hc_url.is_empty() {
                         for child in &children {
-                            if let OutboundNode::Mirage { .. } = &**child {
-                                crate::proxy::healthcheck::start_health_checker(child.clone(), hc_url.clone(), hc_interval);
+                            if let OutboundNode::Mirage { tag: ctag, .. } = &**child {
+                                if hc_started.insert(ctag.clone()) {
+                                    crate::proxy::healthcheck::start_health_checker(
+                                        Arc::downgrade(child),
+                                        hc_url.clone(),
+                                        hc_interval,
+                                    );
+                                }
                             }
                         }
                     }

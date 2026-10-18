@@ -324,7 +324,7 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                         } else if ct == 0x16 {
                             // 首个 ServerHello: 捕获 random (body[6..38]) 与 cipher_suite。ServerHello body 布局:
                             // [0x02 type][3B len][2B version][32B random][1B sid_len][sid][2B cipher]...
-                            if !saw_sh && body.len() >= 38 {
+                            if !saw_sh && body.first() == Some(&0x02) && body.len() >= 38 {
                                 server_random.copy_from_slice(&body[6..38]);
                                 if body.len() >= 39 {
                                     let sid_len = body[38] as usize;
@@ -335,8 +335,8 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
                                         ]);
                                     }
                                 }
+                                saw_sh = true;
                             }
-                            saw_sh = true;
                         } else if ct == 0x14 {
                             saw_ccs = true;
                         } else if ct == 0x17 {
@@ -428,8 +428,8 @@ impl WarmPool {
     #[cfg(feature = "quic")]
     pub async fn open_quic_lean(&self, host_port: &str) -> anyhow::Result<crate::proxy::quic::QuicBiStream> {
         let tb = host_port.as_bytes();
-        if tb.len() > u16::MAX as usize {
-            anyhow::bail!("target 过长: {} 字节", tb.len());
+        if tb.is_empty() || tb.len() > 512 {
+            anyhow::bail!("target 长度非法 (须 1..=512 字节): {} 字节", tb.len());
         }
         let mux = self.quic_mux().ok_or_else(|| anyhow::anyhow!("quic mux 未初始化"))?;
         let (send, recv) = mux.open_stream().await?;

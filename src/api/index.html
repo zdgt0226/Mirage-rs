@@ -418,7 +418,7 @@
   document.getElementById('langBtn').onclick=()=>{lang=lang==='zh'?'en':'zh';localStorage.setItem('mirage_lang',lang);applyI18n();refreshAll();};
 
   const css=v=>getComputedStyle(root).getPropertyValue(v).trim();
-  const esc=s=>{const d=document.createElement('div');d.textContent=String(s??'');return d.innerHTML;};
+  const esc=s=>{const d=document.createElement('div');d.textContent=String(s??'');return d.innerHTML.replace(/"/g,'&quot;').replace(/'/g,'&#39;');};
   function fmtB(n){n=Number(n)||0;if(n<1024)return n+' B';const u=['KB','MB','GB','TB'];let i=-1,v=n;do{v/=1024;i++;}while(v>=1024&&i<u.length-1);return (v<10?v.toFixed(1):Math.round(v))+' '+u[i];}
   function fmtRateParts(n){n=Number(n)||0;if(n<1024)return[String(Math.round(n)),'B/s'];const u=['KB/s','MB/s','GB/s'];let i=-1,v=n;do{v/=1024;i++;}while(v>=1024&&i<u.length-1);return[(v<10?v.toFixed(1):Math.round(v)).toString(),u[i]];}
   function fmtAge(ms){const s=Math.floor((Number(ms)||0)/1000);if(s<60)return s+'s';const m=Math.floor(s/60);if(m<60)return m+'m'+(s%60)+'s';const h=Math.floor(m/60);return h+'h'+(m%60)+'m';}
@@ -575,8 +575,8 @@
     document.getElementById('cliN').textContent=rows.length+(d.blocked&&d.blocked.length?(' · '+d.blocked.length+' '+t('srv.blockedTag')):'');
     document.getElementById('cliBody').innerHTML=rows.length?rows.map(x=>{
       const btn=x.blocked
-        ?`<button class="btn-add" style="color:var(--ok);border-color:var(--ok)" onclick="blockClient('${esc(x.ip)}',false)">${t('srv.unblock')}</button>`
-        :`<button class="btn-add" style="color:var(--crit);border-color:var(--crit)" onclick="blockClient('${esc(x.ip)}',true)">${t('srv.block')}</button>`;
+        ?`<button class="btn-add" style="color:var(--ok);border-color:var(--ok)" data-action="block-client" data-ip="${esc(x.ip)}" data-blocked="false">${t('srv.unblock')}</button>`
+        :`<button class="btn-add" style="color:var(--crit);border-color:var(--crit)" data-action="block-client" data-ip="${esc(x.ip)}" data-blocked="true">${t('srv.block')}</button>`;
       const ver=x.version?`<span class="badge tcp">${esc(x.version)}</span>`:'<span class="dim">—</span>';
       return `<tr${x.blocked?' style="opacity:.5"':''}><td class="target mono">${esc(x.ip)}${x.blocked?' <span class="badge block">'+t('srv.blockedTag')+'</span>':''}</td><td>${ver}</td><td class="r mono dim">${x.conns.toLocaleString()}</td><td class="r mono">↑${fmtB(x.up)} <span class="dim">/</span> ↓${fmtB(x.down)}</td><td class="r mono dim">${fmtIdle(x.idle_ms)}</td><td class="r">${btn}</td></tr>`;
     }).join(''):`<tr><td colspan="6" class="empty">${t('srv.noClients')}</td></tr>`;
@@ -606,7 +606,7 @@
     const opts=availableOutbounds.map(o=>`<option value="${esc(o)}">${esc(o)}</option>`).join('');
     document.getElementById('devBody').innerHTML=rows.length?rows.map(x=>
       `<tr><td class="target mono">${esc(x.ip)}</td><td class="r mono dim">${x.conns.toLocaleString()}</td><td class="r mono">↑${fmtB(x.up)} <span class="dim">/</span> ↓${fmtB(x.down)}</td><td class="r mono dim">${fmtIdle(x.idle_ms)}</td>`+
-      `<td class="r"><span style="display:inline-flex;gap:5px;justify-content:flex-end"><select id="devob_${esc(x.ip)}" class="devsel">${opts}</select><button class="btn-add" onclick="routeDevice('${esc(x.ip)}')">${t('dev.route')}</button></span></td></tr>`).join('')
+      `<td class="r"><span style="display:inline-flex;gap:5px;justify-content:flex-end"><select id="devob_${esc(x.ip)}" class="devsel">${opts}</select><button class="btn-add" data-action="route-device" data-ip="${esc(x.ip)}">${t('dev.route')}</button></span></td></tr>`).join('')
       :`<tr><td colspan="5" class="empty">${t('dev.none')}</td></tr>`;
   }
   window.routeDevice=async(ip)=>{
@@ -634,7 +634,7 @@
     c.innerHTML=d.proxies.map(p=>`<div class="proxy-group"><div class="proxy-group-title">${esc(p.tag)} <span class="badge direct">${esc(p.type)}</span></div><div class="node-list">`+
       p.children.map(ch=>{
         const act=ch.tag===p.selected?'active':'';
-        const oc=p.type==='Selector'?`onclick="switchProxy('${esc(p.tag)}','${esc(ch.tag)}')"`:'';
+        const oc=p.type==='Selector'?`data-action="switch-proxy" data-group="${esc(p.tag)}" data-target="${esc(ch.tag)}"`:'';
         let lat='';
         if(ch.latency_rtt_ms!=null){const cl=ch.latency_rtt_ms<100?'var(--ok)':(ch.latency_rtt_ms<300?'var(--warn)':'var(--crit)');lat+=`<div class="mono" style="font-size:11px;color:${cl};margin-top:4px">BPF ${ch.latency_rtt_ms} ms</div>`;}
         if(ch.latency_http_ms!=null){const cl=ch.latency_http_ms<100?'var(--ok)':(ch.latency_http_ms<300?'var(--warn)':'var(--crit)');lat+=`<div class="mono" style="font-size:11px;color:${cl};margin-top:2px">HTTP ${ch.latency_http_ms} ms</div>`;}
@@ -668,12 +668,12 @@
     const c=document.getElementById('visualRulesContainer');
     if(!currentRules.length){c.innerHTML=`<div class="empty">${t('empty.noRules')}</div>`;return;}
     const dl=`<datalist id="outboundOptions">${availableOutbounds.map(t=>`<option value="${esc(t)}"></option>`).join('')}</datalist>`;
-    const field=(idx,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span onclick="removeRuleItem(${idx},'${key}',${vi})">×</span></div>`).join('');
-      return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="input_${idx}_${key}" placeholder="${t('fld.add')}" onkeypress="if(event.key==='Enter')addRuleItem(${idx},'${key}')"><button class="btn-add" onclick="addRuleItem(${idx},'${key}')">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
+    const field=(idx,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span data-action="remove-rule-item" data-idx="${idx}" data-key="${esc(key)}" data-item-idx="${vi}">×</span></div>`).join('');
+      return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="input_${idx}_${key}" placeholder="${t('fld.add')}" data-action="input-rule-item" data-idx="${idx}" data-key="${esc(key)}"><button class="btn-add" data-action="add-rule-item" data-idx="${idx}" data-key="${esc(key)}">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
     c.innerHTML=dl+currentRules.map((rule,idx)=>{
-      const up=idx>0?`<button class="btn-add" title="Up" onclick="moveRule(${idx},-1)">↑</button>`:'';
-      const dn=idx<currentRules.length-1?`<button class="btn-add" title="Down" onclick="moveRule(${idx},1)">↓</button>`:'';
-      return `<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(idx+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<div style="margin-left:auto;display:flex;gap:6px">${up}${dn}<button class="btn-remove" onclick="removeRule(${idx})">${t('btn.delete')}</button></div></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="outboundOptions" value="${esc(rule.outbound||'')}" onchange="updateRuleOutbound(${idx},this.value)" placeholder="e.g. proxy, direct"></div>${RF.map(([k,l])=>field(idx,rule,k,l)).join('')}</div></div>`;
+      const up=idx>0?`<button class="btn-add" title="Up" data-action="move-rule" data-idx="${idx}" data-dir="-1">↑</button>`:'';
+      const dn=idx<currentRules.length-1?`<button class="btn-add" title="Down" data-action="move-rule" data-idx="${idx}" data-dir="1">↓</button>`:'';
+      return `<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(idx+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<div style="margin-left:auto;display:flex;gap:6px">${up}${dn}<button class="btn-remove" data-action="remove-rule" data-idx="${idx}">${t('btn.delete')}</button></div></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="outboundOptions" value="${esc(rule.outbound||'')}" data-action="update-rule-outbound" data-idx="${idx}" placeholder="e.g. proxy, direct"></div>${RF.map(([k,l])=>field(idx,rule,k,l)).join('')}</div></div>`;
     }).join('');
   }
   async function postRules(dry){const r=await fetch('/api/rules'+(dry?'?dry_run=1':''),{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'XMLHttpRequest'},body:JSON.stringify({rules:currentRules})});return r.json();}
@@ -719,16 +719,16 @@
     const names=Object.keys(profiles);
     html+=names.length?names.map(name=>{
       const rules=profiles[name]||[];
-      const field=(i,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span onclick="rmProfItem('${esc(name)}',${i},'${key}',${vi})">×</span></div>`).join('');
-        return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="pin_${esc(name)}_${i}_${key}" placeholder="${t('fld.add')}" onkeypress="if(event.key==='Enter')addProfItem('${esc(name)}',${i},'${key}')"><button class="btn-add" onclick="addProfItem('${esc(name)}',${i},'${key}')">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
-      const rulesHtml=rules.map((rule,i)=>`<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(i+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<button class="btn-remove" style="margin-left:auto" onclick="removeProfileRule('${esc(name)}',${i})">${t('btn.delete')}</button></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="profObOpts" value="${esc(rule.outbound||'')}" onchange="setProfRuleOb('${esc(name)}',${i},this.value)"></div>${PRF.map(([k,l])=>field(i,rule,k,l)).join('')}</div></div>`).join('');
-      return `<div class="rule-card" style="border-color:var(--accent);"><div class="rule-top"><span class="rule-n" style="color:var(--accent)">▣</span><input value="${esc(name)}" onchange="renameProfile('${esc(name)}',this)" style="max-width:180px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:inherit;font-weight:600"><div style="margin-left:auto;display:flex;gap:6px"><button class="btn-add" onclick="addProfileRule('${esc(name)}')">+ rule</button><button class="btn-remove" onclick="removeProfile('${esc(name)}')">${t('btn.delete')}</button></div></div>${rulesHtml||`<div class="dim" style="font-size:12px">no rules</div>`}</div>`;
+      const field=(i,rule,key,label)=>{const vals=rule[key]||[];const tags=vals.map((v,vi)=>`<div class="rule-tag">${esc(String(v))} <span data-action="rm-prof-item" data-name="${esc(name)}" data-rule-idx="${i}" data-key="${esc(key)}" data-item-idx="${vi}">×</span></div>`).join('');
+        return `<div class="rule-field"><label>${label}</label><div style="display:flex;gap:6px"><input id="pin_${esc(name)}_${i}_${key}" placeholder="${t('fld.add')}" data-action="input-prof-item" data-name="${esc(name)}" data-rule-idx="${i}" data-key="${esc(key)}"><button class="btn-add" data-action="add-prof-item" data-name="${esc(name)}" data-rule-idx="${i}" data-key="${esc(key)}">+</button></div><div class="rule-tags-container">${tags}</div></div>`;};
+      const rulesHtml=rules.map((rule,i)=>`<div class="rule-card"><div class="rule-top"><span class="rule-n">${String(i+1).padStart(2,'0')}</span>${badge(rule.outbound||'direct')}<button class="btn-remove" style="margin-left:auto" data-action="remove-profile-rule" data-name="${esc(name)}" data-rule-idx="${i}">${t('btn.delete')}</button></div><div class="rule-fields"><div class="rule-field"><label>Outbound</label><input list="profObOpts" value="${esc(rule.outbound||'')}" data-action="set-prof-rule-ob" data-name="${esc(name)}" data-rule-idx="${i}"></div>${PRF.map(([k,l])=>field(i,rule,k,l)).join('')}</div></div>`).join('');
+      return `<div class="rule-card" style="border-color:var(--accent);"><div class="rule-top"><span class="rule-n" style="color:var(--accent)">▣</span><input value="${esc(name)}" data-action="rename-profile" data-name="${esc(name)}" style="max-width:180px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:6px;font-family:inherit;font-weight:600"><div style="margin-left:auto;display:flex;gap:6px"><button class="btn-add" data-action="add-profile-rule" data-name="${esc(name)}">+ rule</button><button class="btn-remove" data-action="remove-profile" data-name="${esc(name)}">${t('btn.delete')}</button></div></div>${rulesHtml||`<div class="dim" style="font-size:12px">no rules</div>`}</div>`;
     }).join(''):`<div class="empty">${t('prof.noProfiles')}</div>`;
     // device assignments
     const psel=(cur)=>`<option value="">—</option>`+names.map(n=>`<option value="${esc(n)}"${n===cur?' selected':''}>${esc(n)}</option>`).join('');
-    html+=`<div class="sub-head" style="margin-top:20px">${t('prof.assignments')} <button class="btn-add" style="margin-left:8px" onclick="addDeviceAssign()">+</button></div>`;
+    html+=`<div class="sub-head" style="margin-top:20px">${t('prof.assignments')} <button class="btn-add" style="margin-left:8px" data-action="add-device-assign">+</button></div>`;
     html+=deviceProfiles.length?`<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>${t('prof.devName')}</th><th>${t('prof.devCidr')}</th><th>${t('prof.devProfile')}</th><th>${t('prof.devRate')}</th><th class="r"></th></tr></thead><tbody>`+
-      deviceProfiles.map((d,i)=>`<tr><td><input value="${esc(d.name||'')}" placeholder="—" oninput="setDevName(${i},this.value)" class="devsel" style="width:120px"></td><td><input value="${esc((d.source_ip_cidr||[]).join(', '))}" placeholder="192.168.1.20/32" oninput="setDevCidr(${i},this.value)" class="devsel mono" style="width:180px"></td><td><select class="devsel" onchange="setDevProfile(${i},this.value)">${psel(d.profile)}</select></td><td><input type="number" min="0" value="${d.rate_limit_kbps||''}" placeholder="—" oninput="setDevRate(${i},this.value)" class="devsel" style="width:90px" title="${t('prof.devRateHint')}"></td><td class="r"><button class="btn-remove" onclick="rmDeviceAssign(${i})">${t('btn.delete')}</button></td></tr>`).join('')+
+      deviceProfiles.map((d,i)=>`<tr><td><input value="${esc(d.name||'')}" placeholder="—" data-action="set-dev-name" data-idx="${i}" class="devsel" style="width:120px"></td><td><input value="${esc((d.source_ip_cidr||[]).join(', '))}" placeholder="192.168.1.20/32" data-action="set-dev-cidr" data-idx="${i}" class="devsel mono" style="width:180px"></td><td><select class="devsel" data-action="set-dev-profile" data-idx="${i}">${psel(d.profile)}</select></td><td><input type="number" min="0" value="${d.rate_limit_kbps||''}" placeholder="—" data-action="set-dev-rate" data-idx="${i}" class="devsel" style="width:90px" title="${t('prof.devRateHint')}"></td><td class="r"><button class="btn-remove" data-action="rm-device-assign" data-idx="${i}">${t('btn.delete')}</button></td></tr>`).join('')+
       `</tbody></table></div>`:`<div class="empty">${t('prof.noAssign')}</div>`;
     c.innerHTML=html;
   }
@@ -742,6 +742,87 @@
     if(d.status==='success'){const b=document.getElementById('profSaveBtn'),o=b.textContent;b.textContent=t('saved');setTimeout(()=>b.textContent=o,2000);fetchProfiles();}
     else alert(d.message||t('save.failed'));
   }catch(e){alert(t('save.failed'));}};
+
+  // ── event delegation ──
+  const cb=document.getElementById('cliBody');
+  if(cb)cb.addEventListener('click',e=>{
+    const b=e.target.closest('[data-action="block-client"]');
+    if(b)blockClient(b.dataset.ip,b.dataset.blocked==='true');
+  });
+  const db=document.getElementById('devBody');
+  if(db)db.addEventListener('click',e=>{
+    const b=e.target.closest('[data-action="route-device"]');
+    if(b)routeDevice(b.dataset.ip);
+  });
+  const pc=document.getElementById('proxiesContainer');
+  if(pc)pc.addEventListener('click',e=>{
+    const b=e.target.closest('[data-action="switch-proxy"]');
+    if(b)switchProxy(b.dataset.group,b.dataset.target);
+  });
+  const vrc=document.getElementById('visualRulesContainer');
+  if(vrc){
+    vrc.addEventListener('click',e=>{
+      const rmItem=e.target.closest('[data-action="remove-rule-item"]');
+      if(rmItem){removeRuleItem(Number(rmItem.dataset.idx),rmItem.dataset.key,Number(rmItem.dataset.itemIdx));return;}
+      const addItem=e.target.closest('[data-action="add-rule-item"]');
+      if(addItem){addRuleItem(Number(addItem.dataset.idx),addItem.dataset.key);return;}
+      const mv=e.target.closest('[data-action="move-rule"]');
+      if(mv){moveRule(Number(mv.dataset.idx),Number(mv.dataset.dir));return;}
+      const rm=e.target.closest('[data-action="remove-rule"]');
+      if(rm){removeRule(Number(rm.dataset.idx));return;}
+    });
+    vrc.addEventListener('change',e=>{
+      const ob=e.target.closest('[data-action="update-rule-outbound"]');
+      if(ob)updateRuleOutbound(Number(ob.dataset.idx),ob.value);
+    });
+    vrc.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){
+        const inp=e.target.closest('[data-action="input-rule-item"]');
+        if(inp){e.preventDefault();addRuleItem(Number(inp.dataset.idx),inp.dataset.key);}
+      }
+    });
+  }
+  const pc2=document.getElementById('profilesContainer2');
+  if(pc2){
+    pc2.addEventListener('click',e=>{
+      const rmItem=e.target.closest('[data-action="rm-prof-item"]');
+      if(rmItem){rmProfItem(rmItem.dataset.name,Number(rmItem.dataset.ruleIdx),rmItem.dataset.key,Number(rmItem.dataset.itemIdx));return;}
+      const addItem=e.target.closest('[data-action="add-prof-item"]');
+      if(addItem){addProfItem(addItem.dataset.name,Number(addItem.dataset.ruleIdx),addItem.dataset.key);return;}
+      const rmRule=e.target.closest('[data-action="remove-profile-rule"]');
+      if(rmRule){removeProfileRule(rmRule.dataset.name,Number(rmRule.dataset.ruleIdx));return;}
+      const addRule=e.target.closest('[data-action="add-profile-rule"]');
+      if(addRule){addProfileRule(addRule.dataset.name);return;}
+      const rmProf=e.target.closest('[data-action="remove-profile"]');
+      if(rmProf){removeProfile(rmProf.dataset.name);return;}
+      const addDev=e.target.closest('[data-action="add-device-assign"]');
+      if(addDev){addDeviceAssign();return;}
+      const rmDev=e.target.closest('[data-action="rm-device-assign"]');
+      if(rmDev){rmDeviceAssign(Number(rmDev.dataset.idx));return;}
+    });
+    pc2.addEventListener('change',e=>{
+      const ob=e.target.closest('[data-action="set-prof-rule-ob"]');
+      if(ob){setProfRuleOb(ob.dataset.name,Number(ob.dataset.ruleIdx),ob.value);return;}
+      const ren=e.target.closest('[data-action="rename-profile"]');
+      if(ren){renameProfile(ren.dataset.name,ren);return;}
+      const p=e.target.closest('[data-action="set-dev-profile"]');
+      if(p){setDevProfile(Number(p.dataset.idx),p.value);return;}
+    });
+    pc2.addEventListener('input',e=>{
+      const n=e.target.closest('[data-action="set-dev-name"]');
+      if(n){setDevName(Number(n.dataset.idx),n.value);return;}
+      const c=e.target.closest('[data-action="set-dev-cidr"]');
+      if(c){setDevCidr(Number(c.dataset.idx),c.value);return;}
+      const r=e.target.closest('[data-action="set-dev-rate"]');
+      if(r){setDevRate(Number(r.dataset.idx),r.value);return;}
+    });
+    pc2.addEventListener('keydown',e=>{
+      if(e.key==='Enter'){
+        const inp=e.target.closest('[data-action="input-prof-item"]');
+        if(inp){e.preventDefault();addProfItem(inp.dataset.name,Number(inp.dataset.ruleIdx),inp.dataset.key);}
+      }
+    });
+  }
 
   // ── polling ──
   setInterval(fetchOverview,1000);

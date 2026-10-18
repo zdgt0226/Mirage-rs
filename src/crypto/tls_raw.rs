@@ -685,49 +685,70 @@ pub fn ja4(ch: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let h12 = |s: &str| -> String { hex::encode(&Sha256::digest(s.as_bytes())[..6]) };
 
-    // 解析
+    // 解析 (带完整边界检查, 畸形或截断输入退化为已解析部分指纹, 永不 panic)
     let mut i = 5 + 4 + 2 + 32;
-    let sid = ch[i] as usize;
-    i += 1 + sid;
-    let cl = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
-    i += 2;
-    let ciphers: Vec<u16> = (0..cl)
-        .step_by(2)
-        .map(|j| u16::from_be_bytes([ch[i + j], ch[i + j + 1]]))
-        .filter(|c| !is_grease_val(*c))
-        .collect();
-    i += cl;
-    let cm = ch[i] as usize;
-    i += 1 + cm;
-    let el = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
-    i += 2;
-    let end = i + el;
-
+    let mut ciphers: Vec<u16> = Vec::new();
     let mut exts: Vec<u16> = Vec::new();
     let mut sni = false;
     let mut alpn: Option<String> = None;
     let mut sigalgs: Vec<u16> = Vec::new();
     let mut max_ver: u16 = 0x0303;
-    while i < end {
-        let et = u16::from_be_bytes([ch[i], ch[i + 1]]);
-        let le = u16::from_be_bytes([ch[i + 2], ch[i + 3]]) as usize;
-        let data = &ch[i + 4..i + 4 + le];
-        i += 4 + le;
-        if is_grease_val(et) {
-            continue;
+
+    'parse: {
+        let Some(&sid_b) = ch.get(i) else { break 'parse };
+        let sid = sid_b as usize;
+        i += 1 + sid;
+        if i + 2 > ch.len() {
+            break 'parse;
         }
-        exts.push(et);
-        match et {
-            0x0000 => sni = true,
-            0x0010
-                if data.len() >= 3 => {
+        let cl = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
+        i += 2;
+        if i + cl > ch.len() {
+            break 'parse;
+        }
+        ciphers = (0..cl)
+            .step_by(2)
+            .filter_map(|j| {
+                if j + 1 < cl {
+                    Some(u16::from_be_bytes([ch[i + j], ch[i + j + 1]]))
+                } else {
+                    None
+                }
+            })
+            .filter(|c| !is_grease_val(*c))
+            .collect();
+        i += cl;
+        let Some(&cm_b) = ch.get(i) else { break 'parse };
+        let cm = cm_b as usize;
+        i += 1 + cm;
+        if i + 2 > ch.len() {
+            break 'parse;
+        }
+        let el = u16::from_be_bytes([ch[i], ch[i + 1]]) as usize;
+        i += 2;
+        let end = (i + el).min(ch.len());
+
+        while i + 4 <= end {
+            let et = u16::from_be_bytes([ch[i], ch[i + 1]]);
+            let le = u16::from_be_bytes([ch[i + 2], ch[i + 3]]) as usize;
+            if i + 4 + le > end {
+                break;
+            }
+            let data = &ch[i + 4..i + 4 + le];
+            i += 4 + le;
+            if is_grease_val(et) {
+                continue;
+            }
+            exts.push(et);
+            match et {
+                0x0000 => sni = true,
+                0x0010 if data.len() >= 3 => {
                     let pl = data[2] as usize;
                     if data.len() >= 3 + pl {
                         alpn = Some(String::from_utf8_lossy(&data[3..3 + pl]).to_string());
                     }
                 }
-            0x002b
-                if !data.is_empty() => {
+                0x002b if !data.is_empty() => {
                     let vl = data[0] as usize;
                     let mut k = 1;
                     while k + 1 < 1 + vl && k + 1 < data.len() {
@@ -738,8 +759,7 @@ pub fn ja4(ch: &[u8]) -> String {
                         k += 2;
                     }
                 }
-            0x000d
-                if data.len() >= 2 => {
+                0x000d if data.len() >= 2 => {
                     let sl = u16::from_be_bytes([data[0], data[1]]) as usize;
                     let mut k = 2;
                     while k + 1 < 2 + sl && k + 1 < data.len() {
@@ -747,7 +767,8 @@ pub fn ja4(ch: &[u8]) -> String {
                         k += 2;
                     }
                 }
-            _ => {}
+                _ => {}
+            }
         }
     }
 
@@ -897,5 +918,21 @@ mod template_tests {
         assert_eq!(&tail_1303[..6], b"\x14\x03\x03\x00\x01\x01");
         assert_eq!(&tail_1303[6..9], b"\x17\x03\x03");
         assert_eq!(u16::from_be_bytes([tail_1303[9], tail_1303[10]]), 53);
+    }
+
+    #[test]
+    fn ja4_handles_truncated_and_malformed_inputs_without_panic() {
+        let sid = [0x11u8; 32];
+        let rnd = [0x22u8; 32];
+        let full = build_chromium(b"example.com", &sid, &rnd);
+        // 任意位置截断 (包括空切片、半截头部、半截扩展) 均不得 panic
+        for cut in 0..=full.len() {
+            let fp = ja4(&full[..cut]);
+            assert!(fp.starts_with('t'));
+        }
+        // 全 0xFF 畸形长度字段亦不得 panic
+        let malformed = [0xFFu8; 128];
+        let fp = ja4(&malformed);
+        assert!(fp.starts_with('t'));
     }
 }

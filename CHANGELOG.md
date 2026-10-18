@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### fix: 全库审计修复 (A1~A4) —— 抗探测预连对齐 / DNS 完整性 / fd 竞态 / 模板多样性 (2026-10-18)
+
+- **抗探测预连改为有界等待** (A1, `mirage_server/handshake.rs`): 移除不减少总连接数却拉大关闭时间偏差的 `PRECONNECT_RATE_PER_SEC`(30/s) 限速，保留 `PRECONNECT_MAX_INFLIGHT=128` 并将配额获取改为 `preconnect_permit(800ms)` 有界等待，过载时仅降级为部分对齐而非完全不对齐，新增降级计数与每 500 次采样告警。
+- **DNS 上游响应强制校验 Question 段** (A2, `dns/server.rs`): 新增 `response_matches()`，在 UDP 与 TCP 上游查询路径同时校验 `txid + QR + QDCOUNT==1 + question(域名 ASCII 大小写无关 / QTYPE / QCLASS)` 全等，防止恶意响应污染 `DnsCache`；新增 8 条断言的单元测试。
+- **TCP 中继 `shutdown` 独立持有 `dup(fd)`** (A3, `mirage_server/tcp_relay.rs`): 对 `upstream_fd` 执行 `libc::dup` 交由双向停止闭包 `shutdown + close`，消除与读写半句柄 `drop` 之间的 fd 复用竞态。
+- **握手模板刷新防多样性塌缩与陈旧告警** (A4, `crypto/handshake_cache.rs`): `install_templates()` 在新抓取模板数少于现有缓存时与旧集合并，避免回放退化为单一 ServerHello；连续超过 6 小时（12 个周期）未成功刷新时周期性输出陈旧告警。
+- **WebUI 事件委托与脚本/CI 权限加固** (`src/api/index.html` / `install.sh` / `.github/workflows/build.yml`): WebUI 移除动态列表内联事件并统一改为 `data-action` 事件委托；`install.sh` 在 `/dev/urandom` 熵不足时直接报错退出、Brutal 安装改为下载到临时文件校验 SHA256 并经交互确认后执行；CI workflow 声明 `permissions: contents: read`。
+- 新增全库审计报告 `docs/codebase-audit-2026-10.md`。
+
+### fix: QUIC 单飞/UDP 中继本地改动与全局审计遗留修复 (2026-10-18)
+
+- **TCP 叶子节点转发支持 `Shadowsocks` 出站** (P1, `handler.rs`): `proxy_tcp_target` 此前漏匹配 `OutboundNode::Shadowsocks`，导致直接路由或经 `urltest`/`selector`/`fallback` 选到 SS 出站的 TCP 流量被静默丢弃；现已补齐 `Shadowsocks` 分支并接入连接字节统计。
+- **Mirage 出站目标地址长度统一前置校验 (`1..=512` 字节)** (P2/P3, `handler.rs` / `outbound.rs`): 在 `proxy_tcp_target` 与 `OutboundNode::connect` 入口统一拦截空目标或超过 512 字节的目标地址，避免 QUIC lean 分支消耗流配额或在 TCP 隧道 `target_header` 构造时发生 `as u16` 截断。
+- **健康检查改持 `Weak<OutboundNode>` 并按节点去重** (P2, `healthcheck.rs` / `outbound.rs`): `start_health_checker` 改为持有弱引用并在每次探测后释放强引用，配置热重载替换旧 `OutboundManager` 后旧探测任务自动退出、不再泄漏 `WarmPool`；同一 `Mirage` 节点被多个策略组引用时仅启动一个探测任务。
+- **`tls_raw::ja4` 补齐完整切片边界检查** (P2, `tls_raw.rs`): 对截断或畸形的 ClientHello 切片安全退化，不再因越界索引触发 panic。
+- **`quic_obfs::deobfs_datagram` 防御 `stride == 0`** (P2, `quic_obfs.rs`): 当传入 `stride == 0` 时退化为单段长度 `len`，消除死循环风险。
+- **`quic_cc` 时钟单调性防御** (P3, `quic_cc.rs`): `ErasureController::maybe_finalize` 改用 `saturating_duration_since`，与文件内其余时间戳差值计算保持一致。
+- **QUIC lean 流认证失败日志与双向空闲超时回收** (P3, `mirage_server/mod.rs`): `authenticate_quic_stream_token` 在首次 `WARN` 之后增加 `DEBUG` 级别追踪；`quic_pump` 共享双向 `last_active` 时间戳，在任一方向活跃时不断流、双向均静默达 `relay_idle()` 时自动发 stop 回收孤儿流。
+- **Fake-TLS `read_server_handshake` 校验握手消息类型** (P3, `pool.rs`): 仅在 `ct == 0x16` 且 `body[0] == 0x02` (ServerHello) 时提取 `server_random` 与 `cipher_suite`。
+- **单飞测试确定性等待** (P3, `quic.rs`): `test_quic_mux_singleflight_shares_connection_and_backoff` 改为等待 `tx.receiver_count() >= 2` 后再触发 Leader 取消，消除高负载下的时序抖动。
+
 ## [v0.15.4] - 全局审计修复: API DNS rebinding / 多入站用户管理 / 限速桶热重载 (2026-10-17)
 
 ### 升级须知

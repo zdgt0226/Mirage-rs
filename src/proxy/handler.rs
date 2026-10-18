@@ -267,6 +267,14 @@ pub async fn proxy_tcp_target(
     drop(current_state);
     match &*leaf {
         OutboundNode::Mirage { pool, .. } => {
+            let target_bytes = target.as_bytes();
+            if target_bytes.is_empty() || target_bytes.len() > 512 {
+                error!(
+                    "Mirage: target 长度非法 (须 1..=512 字节): {} 字节",
+                    target_bytes.len()
+                );
+                return;
+            }
             // Model X 精简 (transport=quic): 共享连接开一条流, 写 [token(32B)][2B len][host:port]
             // [initial_payload], 之后裸转发 (QUIC 自加密, 无内层 fake-TLS/AEAD)。
             #[cfg(feature = "quic")]
@@ -284,11 +292,10 @@ pub async fn proxy_tcp_target(
                     pool.password(),
                     crate::crypto::hello_auth::QUIC_LEAN_BIND,
                 );
-                let tb = target.as_bytes();
-                let mut hdr = Vec::with_capacity(32 + 2 + tb.len());
+                let mut hdr = Vec::with_capacity(32 + 2 + target_bytes.len());
                 hdr.extend_from_slice(&token);
-                hdr.extend_from_slice(&(tb.len() as u16).to_be_bytes());
-                hdr.extend_from_slice(tb);
+                hdr.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
+                hdr.extend_from_slice(target_bytes);
                 let (mut send, mut recv) = (send, recv);
                 if AsyncWriteExt::write_all(&mut send, &hdr).await.is_err() { return; }
                 if !initial_payload.is_empty() {
@@ -318,12 +325,7 @@ pub async fn proxy_tcp_target(
                     let mut buf = vec![0u8; 65536];
                     loop {
                         match tokio::time::timeout(relay_idle(), AsyncReadExt::read(&mut recv, &mut buf)).await {
-                            Ok(Ok(0)) => break,
-                            Ok(Err(e)) => {
-                                crate::proxy::quic::check_and_warn_quic_auth_failure(&e);
-                                break;
-                            }
-                            Err(_) => break,
+                            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
                             Ok(Ok(n)) => {
                                 if lw.write_all(&buf[..n]).await.is_err() { break; }
                                 dn_c.down(n as u64);
@@ -336,7 +338,6 @@ pub async fn proxy_tcp_target(
                 return;
             }
 
-            let target_bytes = target.as_bytes();
             let mut target_header = Vec::with_capacity(2 + target_bytes.len());
             target_header.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
             target_header.extend_from_slice(target_bytes);
@@ -667,6 +668,42 @@ pub async fn proxy_tcp_target(
                     );
                 }
                 Err(e) => debug!("[WG] {} 出错: {}", target, e),
+            }
+        }
+        OutboundNode::Shadowsocks { tag, .. } => {
+            let t_start = std::time::Instant::now();
+            let Ok(addr) = crate::proxy::outbound::Address::parse(&target) else {
+                error!("[SS:{}] 目标地址非法: {}", tag, target);
+                return;
+            };
+            let mut remote = match leaf.connect(&addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("[SS:{}] {} 连接失败: {}", tag, target, e);
+                    return;
+                }
+            };
+            debug!("[SS:{}] {} 已连通 ({}ms)", tag, target, t_start.elapsed().as_millis());
+            if !initial_payload.is_empty() {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = remote.write_all(&initial_payload).await {
+                    error!("[SS:{}] {} 首包写入失败: {}", tag, target, e);
+                    return;
+                }
+                _conn.counter().up(initial_payload.len() as u64);
+            }
+            let mut local = local;
+            match tokio::io::copy_bidirectional(&mut local, &mut remote).await {
+                Ok((up, down)) => {
+                    _conn.counter().up(up);
+                    _conn.counter().down(down);
+                    debug!(
+                        "[SS:{}] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                        tag, target, human_bytes(up), human_bytes(down),
+                        t_start.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) => debug!("[SS:{}] {} 出错: {}", tag, target, e),
             }
         }
         OutboundNode::Block { .. } => {

@@ -89,28 +89,41 @@ pub fn frame_mux_addr(sid: u32, addr: SocketAddr, payload: &[u8]) -> Option<Vec<
     wrap_frame(sid, &a, addr.port(), payload)
 }
 
-/// 从累积 buffer 解一帧 mux, 返回 (sid, payload, 消费字节数)。不完整返回 None。
-/// 畸形内层 (帧太短放不下 sid / 坏 ATYP / 越界) 仍消费整帧以重同步, payload 空、
-/// sid 尽力取 (放不下时 0)。
-pub fn parse_mux_frame(buf: &[u8]) -> Option<(u32, Vec<u8>, usize)> {
+/// 客户端下行 mux 帧解析状态: 显式区分"未收全"、"畸形帧跳过"与"合法数据报 (含零长度负载)"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MuxFrameDecode {
+    /// 缓冲区字节不足一整帧, 等待更多数据。
+    Incomplete,
+    /// 帧长度前缀完整但内层结构畸形 (不足 4B sid / 非法 ATYP / 地址或端口越界),
+    /// 调用方消费 `consumed` 字节以保持流重同步, 但不投递数据报。
+    Malformed { consumed: usize },
+    /// 合法下行帧 (`payload` 允许为空, 代表合法零长度 UDP 数据报)。
+    Frame {
+        sid: u32,
+        payload: Vec<u8>,
+        consumed: usize,
+    },
+}
+
+/// 从累积 buffer 解一帧 mux, 返回显式 [`MuxFrameDecode`] 状态。
+pub fn parse_mux_frame(buf: &[u8]) -> MuxFrameDecode {
     if buf.len() < 2 {
-        return None;
+        return MuxFrameDecode::Incomplete;
     }
     let flen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
     let total = 2 + flen;
     if buf.len() < total {
-        return None; // 帧未收全
+        return MuxFrameDecode::Incomplete; // 帧未收全
     }
     let frame = &buf[2..total];
     // 帧太短放不下 4B sid → 消费整帧重同步
     if frame.len() < 4 {
-        return Some((0, Vec::new(), total));
+        return MuxFrameDecode::Malformed { consumed: total };
     }
     let sid = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
-    let empty = (sid, Vec::new(), total);
     let inner = &frame[4..]; // ATYP..
     if inner.is_empty() {
-        return Some(empty);
+        return MuxFrameDecode::Malformed { consumed: total };
     }
     let mut off = 1usize; // 跳 ATYP
     match inner[0] {
@@ -118,18 +131,22 @@ pub fn parse_mux_frame(buf: &[u8]) -> Option<(u32, Vec<u8>, usize)> {
         4 => off += 16,
         3 => {
             if inner.len() < off + 1 {
-                return Some(empty);
+                return MuxFrameDecode::Malformed { consumed: total };
             }
             let dl = inner[off] as usize;
             off += 1 + dl;
         }
-        _ => return Some(empty),
+        _ => return MuxFrameDecode::Malformed { consumed: total },
     }
     off += 2; // port
     if off > inner.len() {
-        return Some(empty);
+        return MuxFrameDecode::Malformed { consumed: total };
     }
-    Some((sid, inner[off..].to_vec(), total))
+    MuxFrameDecode::Frame {
+        sid,
+        payload: inner[off..].to_vec(),
+        consumed: total,
+    }
 }
 
 /// 服务端上行解析: 与 [`parse_mux_frame`] 同帧, 但额外解出目标 (域名/IP 字面量) 与端口,
@@ -280,19 +297,33 @@ impl MuxTunnel {
                     _ => break,
                 };
                 acc.extend_from_slice(&chunk);
-                while let Some((sid, payload, consumed)) = parse_mux_frame(&acc) {
-                    if !payload.is_empty() {
-                        let entry = flows_d
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&sid)
-                            .map(|e| (e.reply.clone(), e.client, e.got_downlink.clone()));
-                        if let Some((reply, client, got)) = entry {
-                            got.store(true, Ordering::Relaxed); // 标记有下行, 解除 per-flow 快拆
-                            let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
+                let mut cursor = 0usize;
+                loop {
+                    match parse_mux_frame(&acc[cursor..]) {
+                        MuxFrameDecode::Incomplete => break,
+                        MuxFrameDecode::Malformed { consumed } => {
+                            cursor += consumed;
+                        }
+                        MuxFrameDecode::Frame {
+                            sid,
+                            payload,
+                            consumed,
+                        } => {
+                            cursor += consumed;
+                            let entry = flows_d
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&sid)
+                                .map(|e| (e.reply.clone(), e.client, e.got_downlink.clone()));
+                            if let Some((reply, client, got)) = entry {
+                                got.store(true, Ordering::Relaxed); // 标记有下行 (含合法零长报文), 解除 per-flow 快拆
+                                let _ = reply.send_to(&payload, SocketAddr::V4(client)).await;
+                            }
                         }
                     }
-                    acc.drain(0..consumed);
+                }
+                if cursor > 0 {
+                    acc.drain(0..cursor);
                 }
                 if acc.len() > 65536 * 2 {
                     break;
@@ -591,6 +622,71 @@ mod tests {
         server.abort();
     }
 
+    /// 零长度 UDP 数据报端到端验证: 合法 0 字节回包必须被解析为 `MuxFrameDecode::Frame`
+    /// (而非 `Malformed`), 由客户端 demux 正常投递并将 `got_downlink` 置为 true。
+    #[tokio::test]
+    async fn zero_length_datagram_delivers_and_sets_got_downlink() {
+        use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = lis.local_addr().unwrap();
+        let cli = TcpStream::connect(addr).await.unwrap();
+        let (srv, _) = lis.accept().await.unwrap();
+
+        let (_sr, mut sw) = {
+            let (r, w) = srv.into_split();
+            crate::crypto::aead::create_crypto_pair(
+                crate::proxy::tunnel::TunnelRead::Tcp(r),
+                crate::proxy::tunnel::TunnelWrite::Tcp(w),
+                "pw",
+                &[0u8; 32],
+                &[1u8; 32],
+                false,
+            )
+        };
+        let (cr, cw) = {
+            let (r, w) = cli.into_split();
+            crate::crypto::aead::create_crypto_pair(
+                crate::proxy::tunnel::TunnelRead::Boxed(Box::new(r)),
+                crate::proxy::tunnel::TunnelWrite::Boxed(Box::new(w)),
+                "pw",
+                &[0u8; 32],
+                &[1u8; 32],
+                true,
+            )
+        };
+
+        let mtun = MuxTunnel::from_tunnel(crate::proxy::tunnel::Tunnel::new(cr, cw));
+        let catcher = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let catcher_v4 = match catcher.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            _ => unreachable!(),
+        };
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (_sid_guard, got_downlink) = mtun.try_register(77, reply, catcher_v4).unwrap();
+        assert!(!got_downlink.load(Ordering::Relaxed));
+
+        // 服务端下行直接发一帧合法的零长度 UDP 报文 (sid=77, payload=b"")
+        let zero_frame = frame_mux_addr(
+            77,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 53)),
+            b"",
+        )
+        .unwrap();
+        sw.send_data(&zero_frame).await.unwrap();
+
+        let mut b = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), catcher.recv(&mut b))
+            .await
+            .expect("零长度 UDP 报文应被客户端 demux 投递")
+            .unwrap();
+        assert_eq!(n, 0, "收到的 UDP 数据报长度应为 0");
+        assert!(
+            got_downlink.load(Ordering::Relaxed),
+            "合法零长度回包必须置位 got_downlink, 防止流被误判快拆"
+        );
+    }
+
     #[test]
     fn frame_mux_domain_over_255_returns_none() {
         // 域名 >255 不截断 (静默打错主机), 而是 None 让调用方 fail loud。
@@ -608,10 +704,14 @@ mod tests {
         let body_len = 4 + 1 + 1 + 6 + 2 + 5;
         assert_eq!(u16::from_be_bytes([f[0], f[1]]) as usize, body_len);
         assert_eq!(f.len(), 2 + body_len);
-        let (sid, payload, consumed) = parse_mux_frame(&f).unwrap();
-        assert_eq!(sid, 0xDEADBEEF);
-        assert_eq!(payload, b"hello");
-        assert_eq!(consumed, f.len());
+        assert_eq!(
+            parse_mux_frame(&f),
+            MuxFrameDecode::Frame {
+                sid: 0xDEADBEEF,
+                payload: b"hello".to_vec(),
+                consumed: f.len(),
+            }
+        );
     }
 
     #[test]
@@ -621,10 +721,14 @@ mod tests {
         let body_len = 4 + 1 + 4 + 2 + 3;
         assert_eq!(u16::from_be_bytes([f[0], f[1]]) as usize, body_len);
         assert_eq!(f[6], 0x01); // ATYP=1 after 2B len + 4B sid
-        let (sid, payload, consumed) = parse_mux_frame(&f).unwrap();
-        assert_eq!(sid, 7);
-        assert_eq!(payload, b"dns");
-        assert_eq!(consumed, f.len());
+        assert_eq!(
+            parse_mux_frame(&f),
+            MuxFrameDecode::Frame {
+                sid: 7,
+                payload: b"dns".to_vec(),
+                consumed: f.len(),
+            }
+        );
     }
 
     #[test]
@@ -632,10 +736,14 @@ mod tests {
         let addr = SocketAddr::V4(SocketAddrV4::new("1.2.3.4".parse().unwrap(), 9999));
         let f = frame_mux_addr(42, addr, b"reply").unwrap();
         assert_eq!(f[6], 0x01); // ATYP=1
-        let (sid, payload, consumed) = parse_mux_frame(&f).unwrap();
-        assert_eq!(sid, 42);
-        assert_eq!(payload, b"reply");
-        assert_eq!(consumed, f.len());
+        assert_eq!(
+            parse_mux_frame(&f),
+            MuxFrameDecode::Frame {
+                sid: 42,
+                payload: b"reply".to_vec(),
+                consumed: f.len(),
+            }
+        );
     }
 
     #[test]
@@ -644,10 +752,28 @@ mod tests {
         let addr = SocketAddr::V6(SocketAddrV6::new(v6, 443, 0, 0));
         let f = frame_mux_addr(99, addr, b"quic").unwrap();
         assert_eq!(f[6], 0x04); // ATYP=4
-        let (sid, payload, consumed) = parse_mux_frame(&f).unwrap();
-        assert_eq!(sid, 99);
-        assert_eq!(payload, b"quic");
-        assert_eq!(consumed, f.len());
+        assert_eq!(
+            parse_mux_frame(&f),
+            MuxFrameDecode::Frame {
+                sid: 99,
+                payload: b"quic".to_vec(),
+                consumed: f.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn zero_length_payload_is_valid_frame_not_malformed() {
+        let ip: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let f = frame_mux_ipv4(12, &ip, 53, b"").unwrap();
+        assert_eq!(
+            parse_mux_frame(&f),
+            MuxFrameDecode::Frame {
+                sid: 12,
+                payload: Vec::new(),
+                consumed: f.len(),
+            }
+        );
     }
 
     #[test]
@@ -658,7 +784,12 @@ mod tests {
         buf.extend_from_slice(&frame_mux_ipv4(3, &"2.2.2.2".parse().unwrap(), 443, b"ccc").unwrap());
         let mut acc = &buf[..];
         let mut got = Vec::new();
-        while let Some((sid, payload, consumed)) = parse_mux_frame(acc) {
+        while let MuxFrameDecode::Frame {
+            sid,
+            payload,
+            consumed,
+        } = parse_mux_frame(acc)
+        {
             got.push((sid, payload));
             acc = &acc[consumed..];
         }
@@ -670,49 +801,40 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_frame_returns_none() {
+    fn incomplete_frame_returns_incomplete() {
         let f = frame_mux_ipv4(1, &"1.1.1.1".parse().unwrap(), 53, b"payload").unwrap();
-        // 只喂前半截 → None, 不消费
-        assert!(parse_mux_frame(&f[..f.len() - 2]).is_none());
-        assert!(parse_mux_frame(&[0x00]).is_none()); // 不足 2B 长度
+        // 只喂前半截 → Incomplete, 不消费
+        assert_eq!(parse_mux_frame(&f[..f.len() - 2]), MuxFrameDecode::Incomplete);
+        assert_eq!(parse_mux_frame(&[0x00]), MuxFrameDecode::Incomplete); // 不足 2B 长度
     }
 
     #[test]
-    fn malformed_inner_consumes_frame_empty_payload() {
-        // frameLen=5, sid=0x01020304, 然后 ATYP=0x09 (非法) → 消费整帧, payload 空, sid 取出
+    fn malformed_inner_consumes_frame() {
+        // frameLen=5, sid=0x01020304, 然后 ATYP=0x09 (非法) → Malformed 消费整帧
         let buf = [0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x09];
-        let (sid, payload, consumed) = parse_mux_frame(&buf).unwrap();
-        assert_eq!(sid, 0x01020304);
-        assert!(payload.is_empty());
-        assert_eq!(consumed, 7);
+        assert_eq!(parse_mux_frame(&buf), MuxFrameDecode::Malformed { consumed: 7 });
     }
 
     #[test]
-    fn frame_too_short_for_sid_consumes_empty() {
-        // frameLen=2 (放不下 4B sid) → 消费整帧, sid=0, payload 空
+    fn frame_too_short_for_sid_consumes_malformed() {
+        // frameLen=2 (放不下 4B sid) → Malformed 消费整帧
         let buf = [0x00, 0x02, 0xAA, 0xBB];
-        let (sid, payload, consumed) = parse_mux_frame(&buf).unwrap();
-        assert_eq!(sid, 0);
-        assert!(payload.is_empty());
-        assert_eq!(consumed, 4);
+        assert_eq!(parse_mux_frame(&buf), MuxFrameDecode::Malformed { consumed: 4 });
     }
 
     #[test]
     fn frame_len_three_no_panic() {
         // frameLen=3 (仍放不下 4B sid) —— 边界: 守卫必须挡在读 frame[0..4] 之前, 否则越界 panic。
         let buf = [0x00, 0x03, 0xAA, 0xBB, 0xCC];
-        let (sid, payload, consumed) = parse_mux_frame(&buf).unwrap();
-        assert_eq!(sid, 0);
-        assert!(payload.is_empty());
-        assert_eq!(consumed, 5);
+        assert_eq!(parse_mux_frame(&buf), MuxFrameDecode::Malformed { consumed: 5 });
     }
 }
 
 #[cfg(test)]
 mod prop_tests {
-    //! 模糊/属性测试: 任意字节喂给 mux 帧解析器, **绝不 panic**, 且 Some 时 consumed 在
-    //! [2, len] 内 (进度保证 —— 防 demux while 循环因 consumed=0 死循环 / 越界)。
-    use super::{parse_mux_frame, parse_mux_uplink};
+    //! 模糊/属性测试: 任意字节喂给 mux 帧解析器, **绝不 panic**, 且非 Incomplete 时 consumed 在
+    //! [2, len] 内 (进度保证 —— 防 demux 循环因 consumed=0 死循环 / 越界)。
+    use super::{parse_mux_frame, parse_mux_uplink, MuxFrameDecode};
     use proptest::prelude::*;
 
     /// 构造一个**长度前缀合规**的帧: [2B len=body.len()][body]。这样解析器一定进入
@@ -727,8 +849,12 @@ mod prop_tests {
         // 纯随机 (浅层, 主要测长度前缀边界)。
         #[test]
         fn parse_mux_frame_raw_never_panics(data: Vec<u8>) {
-            if let Some((_s, _p, consumed)) = parse_mux_frame(&data) {
-                prop_assert!(consumed >= 2 && consumed <= data.len());
+            match parse_mux_frame(&data) {
+                MuxFrameDecode::Incomplete => {}
+                MuxFrameDecode::Malformed { consumed }
+                | MuxFrameDecode::Frame { consumed, .. } => {
+                    prop_assert!(consumed >= 2 && consumed <= data.len());
+                }
             }
         }
 
@@ -736,8 +862,12 @@ mod prop_tests {
         #[test]
         fn parse_mux_frame_framed_never_panics(body in prop::collection::vec(any::<u8>(), 0..300)) {
             let buf = framed(&body);
-            if let Some((_s, _p, consumed)) = parse_mux_frame(&buf) {
-                prop_assert!(consumed >= 2 && consumed <= buf.len());
+            match parse_mux_frame(&buf) {
+                MuxFrameDecode::Incomplete => {}
+                MuxFrameDecode::Malformed { consumed }
+                | MuxFrameDecode::Frame { consumed, .. } => {
+                    prop_assert!(consumed >= 2 && consumed <= buf.len());
+                }
             }
         }
 

@@ -792,7 +792,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
 #[cfg(test)]
 mod mux_tests {
     use super::*;
-    use crate::proxy::udp_mux::{frame_mux_ipv4, parse_mux_frame};
+    use crate::proxy::udp_mux::{frame_mux_ipv4, parse_mux_frame, MuxFrameDecode};
     use tokio::net::{TcpListener, TcpStream, UdpSocket as TokioUdp};
 
     /// 服务端 mux relay: 两条 sid 打**同一目标**, 回包不串 (per-sid 连接式 egress 的正确性)。
@@ -861,11 +861,21 @@ mod mux_tests {
             match tokio::time::timeout(std::time::Duration::from_secs(2), cr.recv_data()).await {
                 Ok(Ok(c)) => {
                     acc.extend_from_slice(&c);
-                    while let Some((sid, payload, consumed)) = parse_mux_frame(&acc) {
-                        if !payload.is_empty() {
-                            got.insert(sid, payload);
+                    loop {
+                        match parse_mux_frame(&acc) {
+                            MuxFrameDecode::Incomplete => break,
+                            MuxFrameDecode::Malformed { consumed } => {
+                                acc.drain(0..consumed);
+                            }
+                            MuxFrameDecode::Frame {
+                                sid,
+                                payload,
+                                consumed,
+                            } => {
+                                got.insert(sid, payload);
+                                acc.drain(0..consumed);
+                            }
                         }
-                        acc.drain(0..consumed);
                     }
                 }
                 _ => break,
