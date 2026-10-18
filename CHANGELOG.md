@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-### fix: 全库审计修复 (A1~A6) —— 抗探测预连对齐 / DNS 完整性 / fd 竞态 / 模板多样性 / 并发上限 / DNS 缓存维度 (2026-10-18)
+### fix: 全库审计修复 (A1~A7) —— 抗探测预连对齐 / DNS 完整性与放大 / fd 竞态 / 模板多样性 / 并发上限 / DNS 缓存维度 (2026-10-18)
+
+- **DNS 上游查询单飞** (A7, `dns/server.rs`): 新增通用 `singleflight()`（`OnceCell` 表，初始化完成即摘；leader 被 cancel 时下一个接替），接入 `direct_query`（key 含 **上游集合指纹**）与 `dns_over_tunnel`（key 含隧道 host/port）。同 key 并发 miss 的上游查询与**隧道消耗**从 N 降为 1。等待者用公共 `patch_for_query()` 换上自己的 tx_id/question（否则客户端丢包）；key 含上游集合避免把 CN/境外解析器的不同答案合并。
 
 - **DNS 缓存按 DO/CD 分维 + 大小适配** (A6, `dns/server.rs`): 缓存 key 从 `(domain, qtype)` 改为 `(domain, qtype, DO, CD)`，并新增 `edns_info()`（OPT 的 `CLASS`=客户端 UDP 上限/`TTL` bit15=DO/header byte3 `0x10`=CD，畸形安全回退）。命中时若条目超过当前客户端声明的大小 → 视为 miss 现查。修复三件事：`DO=1` 客户端拿到无 RRSIG 的条目（DNSSEC 降级）、`CD=1` 的上游未验证结果被发给 `CD=0` 客户端（绕过校验）、`4096` 字节条目下发给只声明 `512` 的客户端（越过协议上限）。因本服务只监听 UDP（无 TCP 重试），不用 `TC=1` 截断而是改走现查（代价：key 空间 ×4，命中率略降）。
 

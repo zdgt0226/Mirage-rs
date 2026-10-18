@@ -51,6 +51,18 @@
 - **为何不用 `TC=1` 截断**：本 DNS 服务**只监听 UDP**（无 TCP:53），置 `TC` 会让客户端改走 TCP 后直接失败。故采用“宁多一次上游查询，不越界下发”。若后续补上 TCP DNS 监听，可改成标准截断 + `TC=1`。
 - **代价**：key 空间 ×4（DO×CD），命中率下降；但只在同一域名被“不同 DNSSEC 意图”的客户端访问时发生，正确性优先。
 
+### A7（中，上游放大）DNS 查询无 single-flight
+
+- **位置**：`dns/server.rs::direct_query` / `DnsForwarder::dns_over_tunnel`
+- **问题**：N 个并发 miss 打 N 次上游；而 `udp_query` 每轮还向**所有**上游各发一份 ⇒ 放大 N×M。隧道路径更贵：**每次 miss 从 `WarmPool` 取一条隧道**，同名并发 miss 就是成倍的隧道消耗（冷启动 / 热点域名最明显）。
+- **修复**：新增通用 `singleflight()`（`OnceCell` + 表，初始化完成即摘除；leader 被 cancel 时下一个等待者接替，不会卡死），两处接入：
+  1. `direct_query`：key = `(域名, qtype, DO, CD, **上游集合指纹**)`；
+  2. `dns_over_tunnel`：key = `(域名, qtype, DO, CD, 隧道 host, port)`。
+- **两个易错点（已处理）**：
+  - 等待者拿到的是**别人 query 的**响应字节 ⇒ 必须用 `patch_for_query()` 把 tx_id + question 段换成自己的（与缓存命中同一套逻辑，顺手抽成公共函数），否则客户端因 tx_id 不匹配丢包。
+  - key **必须含上游集合**：同一域名经 CN 解析器与境外解析器会给出不同答案（分流/就近调度的前提），合并就是错答案。
+- **效果**：同 key 并发 miss 的上游查询数 / 隧道消耗从 N 降为 1（单测：5 并发 → 上游计数 = 1，且各自拿回自己的 tx_id；不同上游集合 → 各查 1 次、不合并）。
+
 ---
 
 ## 2. 待决策（已定位，未改）
@@ -61,7 +73,7 @@
 |---|---|---|---|---|
 | ~~**B1**~~ | ~~高（可用性）~~ | **已修复，见 §1 A5** | — | — |
 | ~~**B2**~~ | ~~中（正确性）~~ | **已修复，见 §1 A6** | — | — |
-| **B3** | 中（放大） | **同名查询无 single-flight**：N 个并发 miss 会打 N 次上游（`udp_query` 还向**所有**上游各发一份）。冷启动/热点域名下对上游放大明显。 | `udp_query` 每轮 `for up in upstreams { send_to }` | in-flight 合并：按 (domain,qtype,DO) 记 `Notify`/broadcast，后到者等首个结果。 |
+| ~~**B3**~~ | ~~中（放大）~~ | **已修复，见 §1 A7** | — | — |
 | **B4** | 中低（可观测性） | **`let _ =` 忽略关键路径错误 126 处**，其中含 DNS 回包 `send_to`、上游转发等；失败无计数、无日志 ⇒ 静默降级（例：回包 socket `ENETUNREACH`、上游 `EMSGSIZE`）。 | `grep -c 'let _ = ' src/proxy src/crypto src/api` = 126 | 对"发包/转发/写盘"三类加失败计数 + 采样 WARN；纯清理型（drop/close）保持忽略。 |
 | **B5** | 低 | 凭据热重载去重比较用 `==`（`mod.rs:150/158`，`o.password == new.password`）——非恒定时间、且长度不等早退。**不在鉴权判定路径**（鉴权用 `hello_auth` 的 `ct_eq`），影响很小。 | `mod.rs:150,158` | 若追求一致，改为对定长摘要（如 SHA-256）做 `ct_eq`。 |
 | **B6** | 低（性能） | 每连接 `spawn` + 每连接新建缓冲区（`Vec`/`Vec::with_capacity`），无池化。高并发下分配压力与 RSS 抖动。 | `handshake.rs`/`tcp_relay.rs`/`dns` | 与 B1 一并做：连接数上限 + `BytesMut` 复用（按 stream 分配，注意 `copy_bidirectional` 用不到）。 |
@@ -86,11 +98,12 @@
 ## 4. 门禁
 
 ```
-cargo test --lib                                  554 passed / 0 failed / 3 ignored
+cargo test --lib                                  556 passed / 0 failed / 3 ignored
 cargo clippy --all-targets -- -D warnings          0 warning（含 --features quic）
 bash scripts/check-no-real-endpoints.sh            0 命中
 ```
 
 新增单测：`dns::server::tests::response_matches_requires_question_equality`（8 条断言）、
 `edns_info_parses_do_and_bufsize`、`cache_separates_do_and_cd`、
-`cache_rejects_entry_larger_than_client_budget`、`mirage_server::conn_cap_tests::max_conns_normalization`。
+`cache_rejects_entry_larger_than_client_budget`、`direct_query_singleflight_coalesces_concurrent_misses`、
+`singleflight_does_not_merge_different_upstream_sets`、`mirage_server::conn_cap_tests::max_conns_normalization`。

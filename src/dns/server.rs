@@ -25,6 +25,15 @@ const DNS_UDP_BUF: usize = 4096;
 // DNS 入站并发查询封顶: 每查询 spawn 一个任务且向上游多发+重传, 无封顶时 LAN 洪水/伪源可
 // 无界 spawn + 放大上游流量。满了丢本查询 (客户端会重试)。
 const DNS_MAX_CONCURRENT: usize = 256;
+/// 直连上游单飞 key: `(域名, qtype, DO, CD, 上游集合指纹)`。
+type FlightKey = (String, u16, bool, bool, u64);
+
+/// 上游查询单飞表 (直连)。
+static INFLIGHT_UPSTREAM: FlightTable<FlightKey> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 隧道查询单飞表: 额外带隧道目标（不同目标可能给出不同答案）。
+static INFLIGHT_TUNNEL: FlightTable<String> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
 static DNS_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(DNS_MAX_CONCURRENT));
 
@@ -495,7 +504,87 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
 
 /// 直连上游解析: 按每个上游的传输协议分派。UDP 上游走 udp_query (并行 + 重传), TCP 上游
 /// 走 tcp_query (顺序 failover)。两者都配则并发跑、取先返回的正响应 (混配少见但支持)。
+///
+/// **单飞 (single-flight)**: 同一 `(域名, qtype, DO, CD)` 的并发 miss 只打**一次**上游
+/// (`udp_query` 还会向所有上游各发一份) —— 冷启动 / 热点域名下这是主要的放大源。
+/// 等到的结果按自己 query 的 tx_id + question 重新 patch（否则 tx_id 对不上会被客户端丢弃）。
+/// 单飞单元: 首个调用者执行初始化 (打上游), 其余等待同一结果。
+type FlightCell = std::sync::Arc<tokio::sync::OnceCell<Option<Vec<u8>>>>;
+type FlightTable<K> = std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashMap<K, FlightCell>>>;
+
+/// 通用单飞: 同 key 的并发调用只执行一次 `f`; 完成后从表里摘掉（只服务“同一瞬间的并发”）。
+/// 拿到的是**别的 query 的**响应字节, 调用方必须用 `patch_for_query` 换成自己的 tx_id/question。
+async fn singleflight<K, F, Fut>(table: &FlightTable<K>, key: K, f: F) -> Option<Vec<u8>>
+where
+    K: std::hash::Hash + Eq + Clone,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+{
+    let cell = {
+        let mut g = table.lock().await;
+        g.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())).clone()
+    };
+    // 若 leader 被取消 (任务 abort), OnceCell 会保持未初始化, 下一个等待者接替执行 —— 不会卡死。
+    let out = cell.get_or_init(f).await.clone();
+    {
+        let mut g = table.lock().await;
+        if g.get(&key).is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &cell)) {
+            g.remove(&key);
+        }
+    }
+    out
+}
+
 async fn direct_query(req: &[u8], upstreams: &[(SocketAddr, crate::config::DnsProtocol)]) -> Option<Vec<u8>> {
+    let Some((domain, qtype, do_bit, cd_bit)) = singleflight_key(req) else {
+        return direct_query_once(req, upstreams).await;
+    };
+    // key 必须包含**上游集合**的指纹: 同一域名经 CN 解析器与境外解析器会拿到不同答案
+    // (分流/就近调度的前提), 把它们合并就是错答案。
+    let key: FlightKey = (domain, qtype, do_bit, cd_bit, upstream_sig(upstreams));
+    let resp = singleflight(&INFLIGHT_UPSTREAM, key, || direct_query_once(req, upstreams)).await;
+    resp.map(|r| patch_for_query(r, req))
+}
+
+/// 上游集合指纹（地址 + 协议）—— 防止不同解析器集合的查询被单飞合并。
+fn upstream_sig(upstreams: &[(SocketAddr, crate::config::DnsProtocol)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (addr, proto) in upstreams {
+        addr.hash(&mut h);
+        matches!(proto, crate::config::DnsProtocol::Tcp).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// 单飞 key: `(小写域名, qtype, DO, CD)`。取不到域名/问题段 → None (不合并)。
+fn singleflight_key(req: &[u8]) -> Option<(String, u16, bool, bool)> {
+    let domain = extract_domain(req)?;
+    if domain.is_empty() {
+        return None;
+    }
+    let qtype = get_qtype(req)?;
+    let e = edns_info(req);
+    Some((domain.to_lowercase(), qtype, e.do_bit, e.cd_bit))
+}
+
+/// 把 `resp` 的 tx_id 与 question 段换成 `req` 的（0x20 大小写随机 + 客户端自己的 id）。
+/// 单飞/缓存共用：两者拿到的响应都属于“别的 query”，必须换头才能交给本客户端。
+fn patch_for_query(mut resp: Vec<u8>, req: &[u8]) -> Vec<u8> {
+    let q_end = question_end(req);
+    if q_end >= 12 && resp.len() >= q_end && req.len() >= q_end {
+        resp[0] = req[0];
+        resp[1] = req[1];
+        resp[12..q_end].copy_from_slice(&req[12..q_end]);
+    }
+    resp
+}
+
+/// 实际的上游查询（不合并）。
+async fn direct_query_once(
+    req: &[u8],
+    upstreams: &[(SocketAddr, crate::config::DnsProtocol)],
+) -> Option<Vec<u8>> {
     use crate::config::DnsProtocol::{Tcp, Udp};
     let udp: Vec<SocketAddr> = upstreams.iter().filter(|(_, p)| *p == Udp).map(|(a, _)| *a).collect();
     let tcp: Vec<SocketAddr> = upstreams.iter().filter(|(_, p)| *p == Tcp).map(|(a, _)| *a).collect();
@@ -684,14 +773,7 @@ impl DnsCache {
         if e.response.len() > edns.max_udp {
             return None; // 超客户端上限: 不截断 (无 TCP 可退)，现查
         }
-        let mut resp = e.response.clone();
-        let q_end = question_end(query);
-        if q_end >= 12 && resp.len() >= q_end && query.len() >= q_end {
-            resp[0] = query[0];
-            resp[1] = query[1];
-            resp[12..q_end].copy_from_slice(&query[12..q_end]);
-        }
-        Some(resp)
+        Some(patch_for_query(e.response.clone(), query))
     }
 
     /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
@@ -1287,7 +1369,26 @@ impl DnsForwarder {
         None
     }
 
-    pub(crate) async fn dns_over_tunnel(req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
+    /// 隧道查询入口（带单飞）。隧道查询比直连贵得多 —— 每次 miss 会从 `WarmPool` 取一条隧道，
+    /// 同名并发 miss 不合并就是成倍的隧道消耗。key 额外带隧道目标（不同目标答案可能不同）。
+    pub(crate) async fn dns_over_tunnel(
+        req: &[u8],
+        pool: &WarmPool,
+        remote_host: &str,
+        remote_port: u16,
+    ) -> Option<Vec<u8>> {
+        let Some((domain, qtype, do_bit, cd_bit)) = singleflight_key(req) else {
+            return Self::dns_over_tunnel_once(req, pool, remote_host, remote_port).await;
+        };
+        let key = format!("{domain}|{qtype}|{}|{}|{remote_host}|{remote_port}", do_bit as u8, cd_bit as u8);
+        let resp = singleflight(&INFLIGHT_TUNNEL, key, || {
+            Self::dns_over_tunnel_once(req, pool, remote_host, remote_port)
+        })
+        .await;
+        resp.map(|r| patch_for_query(r, req))
+    }
+
+    async fn dns_over_tunnel_once(req: &[u8], pool: &WarmPool, remote_host: &str, remote_port: u16) -> Option<Vec<u8>> {
         #[cfg(feature = "quic")]
         if pool.is_quic() {
             let target = format!("{remote_host}:{remote_port}");
@@ -2027,6 +2128,89 @@ mod tests {
         // 不同 qtype / 域名 → miss
         assert!(cache.get("x.com", 28, &q).is_none(), "不同 qtype miss");
         assert!(cache.get("y.com", 1, &q).is_none(), "不同域名 miss");
+    }
+
+    /// 单飞: 5 个并发同域名查询 → 上游只被查 1 次, 每个响应用自己的 tx_id。
+    #[tokio::test]
+    async fn direct_query_singleflight_coalesces_concurrent_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // 假上游: 计数 + 延迟 120ms 回包 (远小于 800ms 重传间隔 → 不会误重传)
+        let up = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = up.local_addr().unwrap();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 1500];
+            while let Ok((n, from)) = up.recv_from(&mut b).await {
+                h.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let mut resp = b[..n].to_vec();
+                resp[2] |= 0x80; // QR=1
+                let _ = up.send_to(&resp, from).await;
+            }
+        });
+
+        let ups = vec![(addr, crate::config::DnsProtocol::Udp)];
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..5u8 {
+            let q = cache_a_query([0x40 + i, 0x10 + i]); // 同域名/qtype, 不同 tx_id
+            let ups = ups.clone();
+            set.spawn(async move {
+                let tx = [q[0], q[1]];
+                (tx, direct_query(&q, &ups).await)
+            });
+        }
+        let mut n_ok = 0;
+        while let Some(r) = set.join_next().await {
+            let (tx, resp) = r.expect("任务不应 panic");
+            let resp = resp.expect("应得到响应");
+            assert_eq!(&resp[0..2], &tx, "每个等待者都要拿回自己的 tx_id");
+            n_ok += 1;
+        }
+        assert_eq!(n_ok, 5);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "并发同 key 的 miss 只应打一次上游 (实际 {})",
+            hits.load(Ordering::SeqCst)
+        );
+    }
+
+    /// 不同上游集合**不**应被合并（CN 与境外解析器对同一域名给出不同答案）。
+    #[tokio::test]
+    async fn singleflight_does_not_merge_different_upstream_sets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        async fn spawn_up(hits: std::sync::Arc<AtomicUsize>) -> SocketAddr {
+            let up = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = up.local_addr().unwrap();
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 1500];
+                while let Ok((n, from)) = up.recv_from(&mut b).await {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let mut resp = b[..n].to_vec();
+                    resp[2] |= 0x80;
+                    let _ = up.send_to(&resp, from).await;
+                }
+            });
+            addr
+        }
+        let h1 = std::sync::Arc::new(AtomicUsize::new(0));
+        let h2 = std::sync::Arc::new(AtomicUsize::new(0));
+        let a1 = spawn_up(h1.clone()).await;
+        let a2 = spawn_up(h2.clone()).await;
+
+        let q1 = cache_a_query([0x11, 0x22]);
+        let q2 = cache_a_query([0x33, 0x44]);
+        let ups1 = vec![(a1, crate::config::DnsProtocol::Udp)];
+        let ups2 = vec![(a2, crate::config::DnsProtocol::Udp)];
+        let (r1, r2) = tokio::join!(
+            direct_query(&q1, &ups1),
+            direct_query(&q2, &ups2)
+        );
+        assert!(r1.is_some() && r2.is_some());
+        assert_eq!(h1.load(Ordering::SeqCst), 1);
+        assert_eq!(h2.load(Ordering::SeqCst), 1, "不同上游集合各自查一次, 不得合并");
     }
 
     #[test]
