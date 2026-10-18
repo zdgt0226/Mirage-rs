@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-### fix: 全库审计修复 (A1~A7) —— 抗探测预连对齐 / DNS 完整性与放大 / fd 竞态 / 模板多样性 / 并发上限 / DNS 缓存维度 (2026-10-18)
+### fix: 全库审计修复 (A1~A8) —— 抗探测预连对齐 / DNS 完整性与放大 / fd 竞态 / 模板多样性 / 并发上限 / DNS 缓存维度 / 可观测性 (2026-10-18)
+
+- **DNS 回包/上游发包失败可观测** (A8, `dns/server.rs`): 两处原本的 `let _ = send_to(...)` 改为计数 + 采样告警（每 500 次一条，带对端地址与排查提示）—— 回程 UDP 被防火墙丢弃时不再“DNS 时好时坏但零日志”。其余 `let _ =` 按性质归类为有意忽略，不逐个改动。
 
 - **DNS 上游查询单飞** (A7, `dns/server.rs`): 新增通用 `singleflight()`（`OnceCell` 表，初始化完成即摘；leader 被 cancel 时下一个接替），接入 `direct_query`（key 含 **上游集合指纹**）与 `dns_over_tunnel`（key 含隧道 host/port）。同 key 并发 miss 的上游查询与**隧道消耗**从 N 降为 1。等待者用公共 `patch_for_query()` 换上自己的 tx_id/question（否则客户端丢包）；key 含上游集合避免把 CN/境外解析器的不同答案合并。
 

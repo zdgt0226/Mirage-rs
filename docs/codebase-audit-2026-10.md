@@ -63,6 +63,12 @@
   - key **必须含上游集合**：同一域名经 CN 解析器与境外解析器会给出不同答案（分流/就近调度的前提），合并就是错答案。
 - **效果**：同 key 并发 miss 的上游查询数 / 隧道消耗从 N 降为 1（单测：5 并发 → 上游计数 = 1，且各自拿回自己的 tx_id；不同上游集合 → 各查 1 次、不合并）。
 
+### A8（中低，可观测性）DNS 回包/上游发包失败无声
+
+- **位置**：`dns/server.rs`（`run_loop` 回包、`udp_query` 上游发包）
+- **问题**：两处原本是 `let _ = ...send_to(...)`。典型故障是**回程路由/防火墙丢弃 UDP**，现象是“DNS 时好时坏、页面偶发打不开”，但日志里**一行记录都没有**，只能靠抓包定位。
+- **修复**：两处改为 `if let Err(e)` → 计数 + **采样告警**（每 500 次打一条，带累计值与对端地址及排查提示）。全库其余 `let _ =` 按性质归类为“有意忽略”（drop/close/关闭已死连接、fire-and-forget 通知），**不再逐个改动** —— 盲目加日志反而淹没真正信号。
+
 ---
 
 ## 2. 待决策（已定位，未改）
@@ -74,9 +80,9 @@
 | ~~**B1**~~ | ~~高（可用性）~~ | **已修复，见 §1 A5** | — | — |
 | ~~**B2**~~ | ~~中（正确性）~~ | **已修复，见 §1 A6** | — | — |
 | ~~**B3**~~ | ~~中（放大）~~ | **已修复，见 §1 A7** | — | — |
-| **B4** | 中低（可观测性） | **`let _ =` 忽略关键路径错误 126 处**，其中含 DNS 回包 `send_to`、上游转发等；失败无计数、无日志 ⇒ 静默降级（例：回包 socket `ENETUNREACH`、上游 `EMSGSIZE`）。 | `grep -c 'let _ = ' src/proxy src/crypto src/api` = 126 | 对"发包/转发/写盘"三类加失败计数 + 采样 WARN；纯清理型（drop/close）保持忽略。 |
-| **B5** | 低 | 凭据热重载去重比较用 `==`（`mod.rs:150/158`，`o.password == new.password`）——非恒定时间、且长度不等早退。**不在鉴权判定路径**（鉴权用 `hello_auth` 的 `ct_eq`），影响很小。 | `mod.rs:150,158` | 若追求一致，改为对定长摘要（如 SHA-256）做 `ct_eq`。 |
-| **B6** | 低（性能） | 每连接 `spawn` + 每连接新建缓冲区（`Vec`/`Vec::with_capacity`），无池化。高并发下分配压力与 RSS 抖动。 | `handshake.rs`/`tcp_relay.rs`/`dns` | 与 B1 一并做：连接数上限 + `BytesMut` 复用（按 stream 分配，注意 `copy_bidirectional` 用不到）。 |
+| ~~**B4**~~ | ~~中低（可观测性）~~ | **已修复（最小面），见 §1 A8**：只给 DNS 回包/上游发包加计数与采样告警；其余 `let _ =` 归类为有意忽略 | — | — |
+| **B5** | 低 | 凭据重载去重比较用 `==`（`mod.rs` 的 `o.password == new.password`）——非恒定时间、长度不等早退。**不在鉴权判定路径**（鉴权用 `hello_auth` 的 `ct_eq`），影响很小。 | `mod.rs` 凭据去重 | **已知待办，不改**：改动收益近零（对手需已能改配置），会在热重载路径引入无意义的哈希开销。 |
+| **B6** | 低（性能） | 每连接 `spawn` + 每连接新建缓冲区，无池化。 | `handshake.rs` / `tcp_relay.rs` | **已知待办，不改**：A5 的连接上限已兜住内存上界；池化会与 `copy_bidirectional`/`split()` 的所有权模型冲突，回归风险 > 收益。 |
 
 ### 2.1 已验证**不是**缺陷（避免重复排查）
 
@@ -107,3 +113,27 @@ bash scripts/check-no-real-endpoints.sh            0 命中
 `edns_info_parses_do_and_bufsize`、`cache_separates_do_and_cd`、
 `cache_rejects_entry_larger_than_client_budget`、`direct_query_singleflight_coalesces_concurrent_misses`、
 `singleflight_does_not_merge_different_upstream_sets`、`mirage_server::conn_cap_tests::max_conns_normalization`。
+
+---
+
+## 5. 复跑核对清单（零成本，改完就跑）
+
+```bash
+cargo test --lib                                            # 556 passed / 0 failed / 3 ignored
+cargo clippy --all-targets -- -D warnings                   # 0
+cargo clippy --all-targets --features quic -- -D warnings   # 0
+bash scripts/check-no-real-endpoints.sh                     # 0 命中
+```
+
+改动对应到可观察行为的快速自检：
+
+| 改动 | 怎么看到它在工作 |
+|---|---|
+| A1 预连有界等待 | 压测 >128 并发空连接时出现 `预连预算耗尽` WARN；不再出现“关闭时间突然跳到 ~1s”的台阶 |
+| A2 question 校验 | 单测即可（伪造 txid 匹配但 qname 不同的响应必须被拒） |
+| A3 dup fd | `ss -tnp` 下频繁开关连接不再出现“误 shutdown 其他连接”的 ECONNRESET |
+| A4 模板多样性 | 伪装站不可达 6h 后出现“HandshakeCache 已 Ns 未更新” WARN；部分刷新时出现“已与旧集合并” |
+| A5 连接上限 | 启动日志 `服务端并发连接上限: 8192`；打满时 `连接数达上限 ... 累计拒绝` |
+| A6 缓存 DO/CD | `dig +dnssec` 与普通 `dig` 交替请求同域名，互不串味（不再出现 DO 客户端拿到无 RRSIG 的答案） |
+| A7 单飞 | 并发 `dig` 同一域名，上游抓包只看到**一次**查询（隧道场景只消耗一条隧道） |
+| A8 回包失败告警 | 人为封掉回程 UDP，出现 `DNS 回包失败 ... 累计 N` |

@@ -34,8 +34,20 @@ static INFLIGHT_UPSTREAM: FlightTable<FlightKey> = std::sync::LazyLock::new(|| t
 /// 隧道查询单飞表: 额外带隧道目标（不同目标可能给出不同答案）。
 static INFLIGHT_TUNNEL: FlightTable<String> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-static DNS_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(DNS_MAX_CONCURRENT));
+/// 回包/上游发包失败计数（B4）。之前这些是 `let _ =`，失败完全无声 ——
+/// 典型场景是回程路由/防火墙丢弃 UDP，观感上就是“DNS 时好时坏”，却没有一行日志。
+static DNS_REPLY_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DNS_UPSTREAM_SEND_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 采样告警：每 500 次失败打一条（避免被刷屏），并带累计值便于判断是否持续。
+fn warn_sampled(counter: &std::sync::atomic::AtomicU64, msg: impl FnOnce(u64) -> String) {
+    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n % 500 == 1 {
+        warn!("{}", msg(n));
+    }
+}
+
+static DNS_INFLIGHT: std::sync::LazyLock<tokio::sync::Semaphore> =    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(DNS_MAX_CONCURRENT));
 
 fn extract_domain(data: &[u8]) -> Option<String> {
     if data.len() < 12 {
@@ -484,8 +496,11 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
     for _round in 0..DNS_QUERY_ROUNDS {
         // 本轮向所有上游各发一份 (并行竞速 + 单上游丢包由其他上游兜底)
         for up in upstreams {
-            let _ = sock.send_to(req, up).await;
-        }
+            if let Err(e) = sock.send_to(req, up).await {
+                warn_sampled(&DNS_UPSTREAM_SEND_FAIL, |n| {
+                    format!("DNS 上游发包失败 {up}: {e} (累计 {n}) —— 持续出现请检查出向 UDP/防火墙")
+                });
+            }        }
         // 本轮内循环收包, 丢弃 tx_id 不匹配的串扰/迟到响应, 直到匹配或本轮超时
         let deadline = tokio::time::Instant::now() + DNS_RETRANSMIT_INTERVAL;
         loop {
@@ -1044,7 +1059,13 @@ impl DnsForwarder {
                     tokio::spawn(async move {
                         let _permit = permit; // 持到查询结束再释放名额
                         if let Some(resp) = f.process_query(&req).await {
-                            let _ = f.socket.send_to(&resp, addr).await;
+                            if let Err(e) = f.socket.send_to(&resp, addr).await {
+                                warn_sampled(&DNS_REPLY_FAIL, |n| {
+                                    format!(
+                                        "DNS 回包失败 {addr}: {e} (累计 {n}) —— 客户端会重试; 持续出现请查回程路由/防火墙"
+                                    )
+                                });
+                            }
                         }
                     });
                 }
