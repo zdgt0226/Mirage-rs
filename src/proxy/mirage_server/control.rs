@@ -119,8 +119,7 @@ pub(super) async fn dispatch_authenticated(
             // close_notify 是客户端主动优雅关闭 (warmup expire 时 pool sweeper 触发),
             // 不算错误. 对端提前断开 (UnexpectedEof/ConnectionReset 等) 亦作为常规关闭处理.
             // 只有其余错误 (crypto 解密失败 / 协议违反) 才视为会话密钥失配等真错误.
-            let msg = e.to_string();
-            if msg.contains("close_notify") {
+            if crate::crypto::aead::is_close_notify(&e) {
                 tracing::debug!("Mirage Server: warmup gracefully closed by client");
             } else if is_peer_disconnect(&e) {
                 tracing::debug!("Mirage Server: client closed before first frame: {:?}", e);

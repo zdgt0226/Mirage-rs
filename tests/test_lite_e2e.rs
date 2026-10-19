@@ -337,3 +337,113 @@ fn pfs_full_server_interops_with_lite_client() {
     std::fs::remove_file(&srv_cfg).ok();
     std::fs::remove_file(&cli_cfg).ok();
 }
+
+/// 起完整 mirage_server + lite-client 一对, 返回 (进程守卫, SOCKS 端口)。
+fn spawn_pair(name: &str, sport: u16, cport: u16) -> (Kid, Kid, u16) {
+    let srv_cfg = write_cfg(
+        &format!("{name}_srv.json"),
+        &format!(
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-close-semantics","camouflage_host":"www.apple.com","allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+        ),
+    );
+    let cli_cfg = write_cfg(
+        &format!("{name}_cli.json"),
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-close-semantics","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+        ),
+    );
+    let s = spawn("server", &srv_cfg);
+    assert!(wait_port(sport), "服务端未监听");
+    let c = spawn("lite-client", &cli_cfg);
+    assert!(wait_port(cport), "客户端未监听");
+    (s, c, cport)
+}
+
+/// 起一个目标: 读一次请求后按 `mode` 结束 —— "fin" 回 data 后正常关闭; "rst" 回 data 后 RST;
+/// "slow" 等 500ms 再回 data 后关闭。
+fn spawn_target(mode: &'static str) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut s = s;
+                let mut buf = [0u8; 64];
+                let _ = s.read(&mut buf);
+                if mode == "slow" {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                let _ = s.write_all(b"data");
+                if mode == "rst" {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let _ = socket2_free_linger_zero(&s);
+                }
+            });
+        }
+    });
+    port
+}
+
+/// SO_LINGER=0, 随后 drop 即发 RST (测试用, 避免引入 socket2 依赖)。
+fn socket2_free_linger_zero(s: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    // SAFETY: s 持有 fd; 参数为栈上 linger 结构体及其大小。
+    let rc = unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// 读到结束: Ok(数据) = 干净 EOF (FIN); Err = 连接被重置 (RST)。
+fn read_all_or_reset(s: &mut TcpStream) -> Result<Vec<u8>, std::io::ErrorKind> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => return Ok(out),
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(e.kind()),
+        }
+    }
+}
+
+/// 目标正常关闭 → 服务端发 close_notify → 本地应用收到完整数据 + FIN。
+#[test]
+fn target_clean_close_reaches_app_as_fin() {
+    let target = spawn_target("fin");
+    let (_s, _c, cport) = spawn_pair("close_fin", 18591, 11591);
+    let mut s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
+    s.write_all(b"req").unwrap();
+    assert_eq!(read_all_or_reset(&mut s), Ok(b"data".to_vec()), "干净结束应给本地 FIN");
+}
+
+/// 回归 (审计 D3): 目标 RST (下行不完整) → 服务端不发 close_notify → 本地应用必须看到 RST,
+/// 不能是 FIN (否则以 EOF 定界的协议会把残缺数据当完整)。旧版这里是 FIN。
+#[test]
+fn target_reset_reaches_app_as_reset() {
+    let target = spawn_target("rst");
+    let (_s, _c, cport) = spawn_pair("close_rst", 18592, 11592);
+    let mut s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
+    s.write_all(b"req").unwrap();
+    assert_eq!(read_all_or_reset(&mut s), Err(std::io::ErrorKind::ConnectionReset), "截断应给本地 RST");
+}
+
+/// 本地应用先结束写 (半关闭) 是正常收尾: 不支持半关闭 (服务端掐掉下行, 见 tcp_relay.rs 头注释),
+/// 但本地应看到 FIN 而不是 RST —— 本地先关不能被误判为截断 (审计第 3 轮)。
+#[test]
+fn app_half_close_first_gets_fin_not_reset() {
+    let target = spawn_target("slow");
+    let (_s, _c, cport) = spawn_pair("close_half", 18593, 11593);
+    let mut s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
+    s.write_all(b"req").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(read_all_or_reset(&mut s).is_ok(), "本地先关应收 FIN, 不应被 RST");
+}

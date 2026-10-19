@@ -252,6 +252,25 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
 // CryptoReader (接收端)
 // ============================================================================
 
+/// 对端发来经 AEAD 认证的 close_notify (inner type 0x15) —— 唯一能证明"对端是主动、完整地结束写"
+/// 的信号。EOF / RST / 解密失败都可能是路径注入的截断, 调用方须用 [`is_close_notify`] 区分。
+/// Display 文案沿用旧字符串 (含 "close_notify"), 兼容按文案匹配的旧调用方与日志。
+#[derive(Debug)]
+pub struct PeerCloseNotify;
+
+impl std::fmt::Display for PeerCloseNotify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("peer sent TLS alert (close_notify)")
+    }
+}
+
+impl std::error::Error for PeerCloseNotify {}
+
+/// `recv_data*` 的错误是否为认证过的 close_notify (见 [`PeerCloseNotify`])。
+pub fn is_close_notify(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<PeerCloseNotify>().is_some()
+}
+
 pub struct CryptoReader<R> {
     reader: R,
     cipher: LessSafeKey,
@@ -377,7 +396,7 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
         if inner_type == 0x17 {
             Ok(content_len)
         } else if inner_type == 0x15 {
-            Err(anyhow!("peer sent TLS alert (close_notify)"))
+            Err(anyhow::Error::new(PeerCloseNotify))
         } else {
             Err(anyhow!("unknown TLS inner content type {:#x}", inner_type))
         }

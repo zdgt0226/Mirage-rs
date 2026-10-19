@@ -52,8 +52,16 @@ pub fn parse_frame(frame: &[u8]) -> Option<String> {
 static CLIENT_VERSIONS: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// `CLIENT_VERSIONS` 条目上限: 已认证客户端每换一个源地址 (如 IPv6 /64 内轮换) 就多一条, 无上限会
+/// 慢速涨内存。满了遇到新 IP 时整表清空 (只是排障用的版本展示, 丢了下次连接即重新记录)。
+const MAX_CLIENT_VERSIONS: usize = 4096;
+
 pub fn record_version(client_ip: String, version: String) {
-    CLIENT_VERSIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(client_ip, version);
+    let mut map = CLIENT_VERSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= MAX_CLIENT_VERSIONS && !map.contains_key(&client_ip) {
+        map.clear();
+    }
+    map.insert(client_ip, version);
 }
 
 pub fn version_of(client_ip: &str) -> Option<String> {
@@ -72,5 +80,14 @@ mod tests {
         assert_eq!(parse_frame(&[0x00]), None);
         assert_eq!(parse_frame(&[0x16, 0x03]), None);
         assert_eq!(parse_frame(&[CLIENT_INFO_SENTINEL]), None); // 只有 sentinel 无版本
+    }
+
+    #[test]
+    fn client_versions_bounded() {
+        for i in 0..MAX_CLIENT_VERSIONS + 10 {
+            record_version(format!("198.51.100.{i}"), "0.15.5".into());
+        }
+        assert!(CLIENT_VERSIONS.lock().unwrap().len() <= MAX_CLIENT_VERSIONS);
+        assert_eq!(version_of(&format!("198.51.100.{}", MAX_CLIENT_VERSIONS + 9)).as_deref(), Some("0.15.5"));
     }
 }

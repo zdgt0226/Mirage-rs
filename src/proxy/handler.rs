@@ -80,6 +80,23 @@ pub(crate) fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// 让本地 socket 以 RST 收尾: 设 SO_LINGER=0 (fd 关闭时发 RST 而非 FIN), 再 SHUT_RD 叫醒
+/// 阻塞在读上的另一半 (Linux 上读立即返回 0, 不发报文)。调用方须保证两个半程仍持有该 fd。
+fn abort_local_socket(fd: std::os::fd::RawFd) {
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    // SAFETY: fd 由调用方持有的 TcpStream 半程保证有效; 参数为本栈上 linger 结构体及其大小。
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+        libc::shutdown(fd, libc::SHUT_RD);
+    }
+}
+
 /**
  * [TCP 流量核心路由与转发]
  * 核心流程：
@@ -382,7 +399,15 @@ pub async fn proxy_tcp_target(
             debug!("[TUNNEL] {} 建立 (隧道就绪, 目标头已发)", target);
             let t_start = std::time::Instant::now();
 
-            let (mut local_read, mut local_write) = local.into_split();
+            // 本地 socket fd: 下行被截断时据此对本地应用 RST (见 download 末尾)。两个半程活着期间有效。
+            let local_fd = std::os::fd::AsRawFd::as_raw_fd(&local);
+            // download 判定截断并 abort 本地 socket 后置位: upload 随后读到的 0 是 SHUT_RD 造成的,
+            // 不是本地应用写完, 不得向服务端发 close_notify (它表示"客户端完整结束写")。
+            let local_aborted = std::sync::atomic::AtomicBool::new(false);
+            // upload 读到本地 EOF/错误 (本地应用先结束写) 时置位。之后服务端下行往往不发 close_notify
+            // (它的 upload 已退出、SHUT_RDWR 掐断了上游), 这是本地先关的正常收尾, 不算截断, 走 FIN。
+            let local_eof = std::sync::atomic::AtomicBool::new(false);
+            let (mut local_read, local_write) = local.into_split();
             let tunnel_reader = tunnel.reader;
             let mut tunnel_writer = tunnel.writer;
 
@@ -402,7 +427,10 @@ pub async fn proxy_tcp_target(
                     // 空闲超时包在每次 read 内层 (非整个 loop 外层, 见 MIRAGE_RELAY_IDLE 注释)
                     match tokio::time::timeout(relay_idle(), local_read.read(&mut buf)).await {
                         Ok(Ok(0)) => {
-                            let _ = tunnel_writer.send_close_notify().await;
+                            if !local_aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                                local_eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let _ = tunnel_writer.send_close_notify().await;
+                            }
                             break;
                         }
                         Ok(Ok(n)) => {
@@ -427,7 +455,10 @@ pub async fn proxy_tcp_target(
                             up_bytes += total as u64;
                             up_conn.up(total as u64);
                         }
+                        // 本地读出错 (本地应用 RST 等): 仍发 close_notify —— 它是让服务端立即掐断上游、
+                        // 进而结束下行的唯一信号; 不发则上游空闲时下行要挂到 relay_idle。
                         Ok(Err(_)) => {
+                            local_eof.store(true, std::sync::atomic::Ordering::SeqCst);
                             let _ = tunnel_writer.send_close_notify().await;
                             break;
                         }
@@ -461,7 +492,11 @@ pub async fn proxy_tcp_target(
                 // 客户端接收侧因为 CryptoReader 的 read_exact 语义无法安全
                 // 加 try_recv (中途取消会丢帧半读). 保持一对一直连最稳.
                 let mut tunnel_reader = tunnel_reader;
+                let mut local_write = local_write; // 移入: 截断分支要 forget() 它
                 let mut down_bytes: u64 = 0;
+                // 下行是否被截断: 只有收到认证过的 close_notify 才算对端完整结束; 裸 EOF / RST /
+                // 解密失败 / 空闲超时都可能是路径注入或服务端异常收尾 (见 aead::PeerCloseNotify)。
+                let mut truncated = false;
 
                 loop {
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
@@ -476,8 +511,14 @@ pub async fn proxy_tcp_target(
                             down_bytes += data.len() as u64;
                             dn_conn.down(data.len() as u64);
                         }
-                        Ok(Err(_)) => break,
-                        Err(_) => break, // 空闲超时
+                        Ok(Err(e)) => {
+                            truncated = !crate::crypto::aead::is_close_notify(&e);
+                            break;
+                        }
+                        Err(_) => {
+                            truncated = true; // 空闲超时
+                            break;
+                        }
                     }
                 }
 
@@ -486,10 +527,20 @@ pub async fn proxy_tcp_target(
                     while tunnel_reader.recv_data().await.is_ok() {}
                 }).await;
 
-                // 半关闭传播: 远端已 EOF, 给本地客户端发 FIN (write 端半关), 让守规矩的
-                // 客户端随之关闭 → upload 的 local_read 读到 EOF 自然退出。否则客户端
-                // keep-alive/不发 FIN 时 upload 会干等到 1800s idle, join! 被拖成 30min 僵尸。
-                let _ = local_write.shutdown().await;
+                if truncated && !local_eof.load(std::sync::atomic::Ordering::SeqCst) {
+                    // 截断: 不能给本地 FIN (以 EOF 定界的明文协议会把残缺数据当完整结果), 改为 RST。
+                    // SO_LINGER=0 让 fd 关闭时发 RST; SHUT_RD 叫醒阻塞在 local_read 上的 upload (读到 0
+                    // 即退出), 不发任何报文, 避免 join! 挂到 relay_idle。forget(): OwnedWriteHalf 的 drop
+                    // 会先 shutdown(Write) 发 FIN, 必须跳过, 等读半程 drop 时 fd 关闭才发 RST。
+                    local_aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+                    abort_local_socket(local_fd);
+                    local_write.forget();
+                } else {
+                    // 半关闭传播: 远端已 EOF, 给本地客户端发 FIN (write 端半关), 让守规矩的
+                    // 客户端随之关闭 → upload 的 local_read 读到 EOF 自然退出。否则客户端
+                    // keep-alive/不发 FIN 时 upload 会干等到 1800s idle, join! 被拖成 30min 僵尸。
+                    let _ = local_write.shutdown().await;
+                }
 
                 (tunnel_reader, down_bytes)
             };
@@ -736,5 +787,36 @@ mod tests {
     fn real_v6_unchanged() {
         let v6 = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
         assert_eq!(normalize_peer_ip(v6), v6);
+    }
+
+    /// 回归 (审计 D3): 截断时本地应用必须看到 RST 而非 FIN, 且阻塞在本地读上的另一半要被叫醒。
+    #[tokio::test]
+    async fn abort_local_socket_wakes_reader_and_resets_peer() {
+        use tokio::io::AsyncReadExt;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut app = tokio::net::TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
+        let (local, _) = l.accept().await.unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&local);
+        let (mut rd, wr) = local.into_split();
+        let reader = tokio::spawn(async move {
+            let mut b = [0u8; 16];
+            let n = rd.read(&mut b).await.unwrap();
+            (rd, n)
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        super::abort_local_socket(fd);
+        let (rd, n) = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("SHUT_RD 必须叫醒阻塞的本地读")
+            .unwrap();
+        assert_eq!(n, 0);
+        wr.forget(); // 同 handler 截断分支: 跳过写半程 drop 时的 FIN
+        drop(rd);
+        let mut b = [0u8; 16];
+        let r = app.read(&mut b).await;
+        assert!(
+            matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "本地应用应收到 RST, 实得 {r:?}"
+        );
     }
 }

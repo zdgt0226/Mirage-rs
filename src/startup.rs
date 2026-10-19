@@ -145,6 +145,9 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
         }
 
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
+            for w in config.weak_password_warnings() {
+                warn!("安全提示: {w}");
+            }
             // ClientHello 计时/判定参数 (服务端; 见 docs/client-hello-timing-design.md)。
             // 环境变量 MIRAGE_CH_* 优先覆盖 (真机 A/B 调参)。放在 tuning 块外:
             // 配置未写 tuning 时 env 覆盖与启动日志同样生效。
