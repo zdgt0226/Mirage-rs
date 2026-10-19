@@ -25,14 +25,14 @@ const DNS_UDP_BUF: usize = 4096;
 // DNS 入站并发查询封顶: 每查询 spawn 一个任务且向上游多发+重传, 无封顶时 LAN 洪水/伪源可
 // 无界 spawn + 放大上游流量。满了丢本查询 (客户端会重试)。
 const DNS_MAX_CONCURRENT: usize = 256;
-/// 直连上游单飞 key: `(域名, qtype, DO, CD, bucket, 上游集合指纹)`。
-type FlightKey = (String, u16, bool, bool, u8, u64);
+/// 直连上游单飞 key: `(域名, qtype, DO, CD, size, 上游集合指纹)`。
+type FlightKey = (String, u16, bool, bool, u32, u64);
 
 /// 上游查询单飞表 (直连)。
-static INFLIGHT_UPSTREAM: FlightTable<FlightKey> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+static INFLIGHT_UPSTREAM: FlightTable<FlightKey> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 隧道查询单飞表: 额外带隧道目标（不同目标可能给出不同答案）。
-static INFLIGHT_TUNNEL: FlightTable<String> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+static INFLIGHT_TUNNEL: FlightTable<String> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// 回包/上游发包失败计数（B4）。之前这些是 `let _ =`，失败完全无声 ——
 /// 典型场景是回程路由/防火墙丢弃 UDP，观感上就是“DNS 时好时坏”，却没有一行日志。
@@ -527,7 +527,7 @@ async fn udp_query(req: &[u8], upstreams: &[SocketAddr]) -> Option<Vec<u8>> {
 /// 等到的结果按自己 query 的 tx_id + question 重新 patch（否则 tx_id 对不上会被客户端丢弃）。
 /// 单飞单元: 首个调用者执行初始化 (打上游), 其余等待同一结果。
 type FlightCell = std::sync::Arc<tokio::sync::OnceCell<Option<Vec<u8>>>>;
-type FlightTable<K> = std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashMap<K, FlightCell>>>;
+type FlightTable<K> = std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<K, FlightCell>>>;
 
 /// 通用单飞: 同 key 的并发调用只执行一次 `f`; 完成后从表里摘掉（只服务“同一瞬间的并发”）。
 /// 拿到的是**别的 query 的**响应字节, 调用方必须用 `patch_for_query` 换成自己的 tx_id/question。
@@ -538,27 +538,39 @@ where
     Fut: std::future::Future<Output = Option<Vec<u8>>>,
 {
     let cell = {
-        let mut g = table.lock().await;
+        let mut g = table.lock().unwrap_or_else(|e| e.into_inner());
         g.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())).clone()
     };
-    // 若 leader 被取消 (任务 abort), OnceCell 会保持未初始化, 下一个等待者接替执行 —— 不会卡死。
-    let out = cell.get_or_init(f).await.clone();
-    {
-        let mut g = table.lock().await;
-        if g.get(&key).is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &cell)) {
-            g.remove(&key);
+    // 摘除放在 drop 守卫里 (同步锁, 无 await): 结果已出但调用方恰在摘除前被取消时, 已完成的
+    // cell 不会永久留在表里被后来者当成"结果"拿走。cell 未初始化时不摘 (其余等待者仍在用它;
+    // leader 被取消后下一个等待者会接替执行 —— 不会卡死)。
+    struct Remove<'a, K: std::hash::Hash + Eq> {
+        table: &'a FlightTable<K>,
+        key: K,
+        cell: FlightCell,
+    }
+    impl<K: std::hash::Hash + Eq> Drop for Remove<'_, K> {
+        fn drop(&mut self) {
+            if !self.cell.initialized() {
+                return;
+            }
+            let mut g = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            if g.get(&self.key).is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &self.cell)) {
+                g.remove(&self.key);
+            }
         }
     }
-    out
+    let guard = Remove { table, key, cell };
+    guard.cell.get_or_init(f).await.clone()
 }
 
 async fn direct_query(req: &[u8], upstreams: &[(SocketAddr, crate::config::DnsProtocol)]) -> Option<Vec<u8>> {
-    let Some((domain, qtype, do_bit, cd_bit, bucket)) = singleflight_key(req) else {
+    let Some((domain, qtype, do_bit, cd_bit, size)) = singleflight_key(req) else {
         return direct_query_once(req, upstreams).await;
     };
     // key 必须包含**上游集合**的指纹: 同一域名经 CN 解析器与境外解析器会拿到不同答案
     // (分流/就近调度的前提), 把它们合并就是错答案。
-    let key: FlightKey = (domain, qtype, do_bit, cd_bit, bucket, upstream_sig(upstreams));
+    let key: FlightKey = (domain, qtype, do_bit, cd_bit, size, upstream_sig(upstreams));
     let resp = singleflight(&INFLIGHT_UPSTREAM, key, || direct_query_once(req, upstreams)).await;
     resp.map(|r| patch_for_query(r, req))
 }
@@ -585,24 +597,33 @@ fn udp_bucket(max_udp: usize) -> u8 {
     }
 }
 
-/// 单飞 key: `(小写域名, qtype, DO, CD, bucket)`。取不到域名/问题段 → None (不合并)。
-fn singleflight_key(req: &[u8]) -> Option<(String, u16, bool, bool, u8)> {
+/// 单飞 key: `(小写域名, qtype, DO, CD, size)`。取不到域名/问题段 → None (不合并)。
+///
+/// `size` 用**精确**的客户端 UDP 上限 (无 OPT 为 0), 不用缓存的分档: 单飞拿到的是 leader 的响应,
+/// 同档内声明更小的等待者 (如 4096 档里的 1500) 会收到超过自己上限的包; 缓存有 `get` 的长度守卫,
+/// 单飞没有。合并的是"同一瞬间的并发", 精确值几乎不损失合并率。
+fn singleflight_key(req: &[u8]) -> Option<(String, u16, bool, bool, u32)> {
     let domain = extract_domain(req)?;
     if domain.is_empty() {
         return None;
     }
     let qtype = get_qtype(req)?;
     let e = edns_info(req);
-    Some((domain.to_lowercase(), qtype, e.do_bit, e.cd_bit, udp_bucket(e.max_udp)))
+    let size = if e.has_opt { e.max_udp as u32 } else { 0 };
+    Some((domain.to_lowercase(), qtype, e.do_bit, e.cd_bit, size))
 }
 
 /// 把 `resp` 的 tx_id 与 question 段换成 `req` 的（0x20 大小写随机 + 客户端自己的 id）。
 /// 单飞/缓存共用：两者拿到的响应都属于“别的 query”，必须换头才能交给本客户端。
 fn patch_for_query(mut resp: Vec<u8>, req: &[u8]) -> Vec<u8> {
+    if resp.len() < 12 || req.len() < 12 {
+        return resp;
+    }
+    resp[0] = req[0];
+    resp[1] = req[1];
+    // 不回显 question 的错误响应 (QDCOUNT=0, 见 `response_matches`) 只换 tx_id。
     let q_end = question_end(req);
-    if q_end >= 12 && resp.len() >= q_end && req.len() >= q_end {
-        resp[0] = req[0];
-        resp[1] = req[1];
+    if resp[4..6] != [0, 0] && q_end > 12 && resp.len() >= q_end && req.len() >= q_end {
         resp[12..q_end].copy_from_slice(&req[12..q_end]);
     }
     resp
@@ -712,6 +733,20 @@ struct EdnsInfo {
     cd_bit: bool,
     /// 客户端声明的 UDP payload 上限（无 OPT 时为 512）。
     max_udp: usize,
+    /// 请求是否带 OPT。RFC 6891: 请求无 OPT 时响应不得带 OPT —— 带 OPT 的请求换来的响应
+    /// 不能给无 OPT 的客户端, 即使双方上限都是 512。
+    has_opt: bool,
+}
+
+impl EdnsInfo {
+    /// 缓存分档: 无 OPT → 3, 其余按 [`udp_bucket`]。
+    fn bucket(&self) -> u8 {
+        if self.has_opt {
+            udp_bucket(self.max_udp)
+        } else {
+            3
+        }
+    }
 }
 
 type CacheKey = (String, u16, bool, bool, u8); // (小写域名, qtype, DO, CD, bucket)
@@ -721,7 +756,7 @@ type CacheKey = (String, u16, bool, bool, u8); // (小写域名, qtype, DO, CD, 
 /// 全程边界安全（任何截断都返回默认值，不 panic）。
 fn edns_info(req: &[u8]) -> EdnsInfo {
     let cd_bit = req.get(3).is_some_and(|b| b & 0x10 != 0);
-    parse_opt(req).unwrap_or(EdnsInfo { do_bit: false, cd_bit, max_udp: 512 })
+    parse_opt(req).unwrap_or(EdnsInfo { do_bit: false, cd_bit, max_udp: 512, has_opt: false })
 }
 
 fn parse_opt(req: &[u8]) -> Option<EdnsInfo> {
@@ -755,7 +790,7 @@ fn parse_opt(req: &[u8]) -> Option<EdnsInfo> {
         ]);
         if rrtype == 41 {
             let max = (class as usize).clamp(512, DNS_UDP_BUF);
-            return Some(EdnsInfo { do_bit: ttl & 0x8000 != 0, cd_bit, max_udp: max });
+            return Some(EdnsInfo { do_bit: ttl & 0x8000 != 0, cd_bit, max_udp: max, has_opt: true });
         }
         pos = skip_rr(req, pos)?;
     }
@@ -791,7 +826,7 @@ impl DnsCache {
     /// 改走 TCP（它会重试 UDP 仍失败）——宁可多一次上游查询。
     fn get(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
         let edns = edns_info(query);
-        let bucket = udp_bucket(edns.max_udp);
+        let bucket = edns.bucket();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let e = m.get(&key)?;
@@ -815,7 +850,7 @@ impl DnsCache {
             None => return,
         };
         let edns = edns_info(query);
-        let bucket = udp_bucket(edns.max_udp);
+        let bucket = edns.bucket();
         let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= self.max_entries && !m.contains_key(&key) {
@@ -842,6 +877,10 @@ impl DnsCache {
 /// 只校验 tx_id 是 Kaminsky 式投毒的薄弱点 —— 16bit 猜中即可让攻击响应被接受, 并随后被
 /// `DnsCache` 缓存一整个 TTL。每个查询虽用独立临时端口(源端口随机)提高了时序难度, 但
 /// **question 比对是免费的**, 应当做。同时要求响应 QDCOUNT=1, 防止构造型响应。
+///
+/// 例外: RFC 1035 允许错误响应 (FORMERR/NOTIMP/REFUSED 等) 不回显 question —— QDCOUNT=0、
+/// RCODE≠0 且无答案的响应按 tx_id + QR 接受并透传。它不含任何记录, `DnsCache::put` 也不会缓存它,
+/// 投毒价值为零; 拒收它反而让客户端等满超时后拿到合成 NXDOMAIN (还会被负缓存)。
 fn response_matches(req: &[u8], resp: &[u8]) -> bool {
     if req.len() < 12 || resp.len() < 12 {
         return false;
@@ -849,7 +888,12 @@ fn response_matches(req: &[u8], resp: &[u8]) -> bool {
     if resp[0] != req[0] || resp[1] != req[1] || (resp[2] & 0x80) == 0 {
         return false;
     }
-    if u16::from_be_bytes([resp[4], resp[5]]) != 1 {
+    let qd = u16::from_be_bytes([resp[4], resp[5]]);
+    let an = u16::from_be_bytes([resp[6], resp[7]]);
+    if qd == 0 && an == 0 && (resp[3] & 0x0F) != 0 {
+        return true;
+    }
+    if qd != 1 {
         return false;
     }
     let q_end = question_end(req);
@@ -1416,10 +1460,10 @@ impl DnsForwarder {
         remote_host: &str,
         remote_port: u16,
     ) -> Option<Vec<u8>> {
-        let Some((domain, qtype, do_bit, cd_bit, bucket)) = singleflight_key(req) else {
+        let Some((domain, qtype, do_bit, cd_bit, size)) = singleflight_key(req) else {
             return Self::dns_over_tunnel_once(req, pool, remote_host, remote_port).await;
         };
-        let key = format!("{domain}|{qtype}|{}|{}|{bucket}|{remote_host}|{remote_port}|{:p}", do_bit as u8, cd_bit as u8, pool);
+        let key = format!("{domain}|{qtype}|{}|{}|{size}|{remote_host}|{remote_port}|{:p}", do_bit as u8, cd_bit as u8, pool);
         let resp = singleflight(&INFLIGHT_TUNNEL, key, || {
             Self::dns_over_tunnel_once(req, pool, remote_host, remote_port)
         })
@@ -2064,6 +2108,31 @@ mod tests {
         assert!(response_matches(&q, &r[..question_end(&q)]));
     }
 
+    /// 不回显 question 的错误响应 (QDCOUNT=0, RCODE≠0) 按 tx_id + QR 透传; RCODE=0 时仍拒。
+    #[test]
+    fn response_matches_accepts_questionless_error_response() {
+        let q = cache_a_query([0x12, 0x34]);
+        let formerr = vec![0x12, 0x34, 0x81, 0x81, 0, 0, 0, 0, 0, 0, 0, 0]; // QR=1, RCODE=1
+        assert!(response_matches(&q, &formerr), "QDCOUNT=0 的 FORMERR 应透传");
+
+        let mut noerr = formerr.clone();
+        noerr[3] &= 0xF0; // RCODE=0
+        assert!(!response_matches(&q, &noerr), "QDCOUNT=0 且 RCODE=0 仍应拒");
+
+        let mut with_answer = formerr.clone();
+        with_answer[7] = 1; // ANCOUNT=1
+        assert!(!response_matches(&q, &with_answer), "带答案的无问句响应应拒");
+
+        let mut bad_txid = formerr.clone();
+        bad_txid[0] = 0x99;
+        assert!(!response_matches(&q, &bad_txid), "tx_id 仍须一致");
+
+        // 单飞等待者拿到它: 只换 tx_id, 不往 12 字节头后写 question
+        let patched = patch_for_query(formerr.clone(), &cache_a_query([0x56, 0x78]));
+        assert_eq!(&patched[0..2], &[0x56, 0x78]);
+        assert_eq!(&patched[2..], &formerr[2..]);
+    }
+
     /// 带 OPT 的查询: `(bufsize, do_bit)`；`ar=1`。
     fn query_with_opt(tx: [u8; 2], bufsize: u16, do_bit: bool) -> Vec<u8> {
         let mut q = cache_a_query(tx);
@@ -2154,6 +2223,46 @@ mod tests {
         assert!(cache.get("x.com", 1, &query_with_opt([7, 7], 2048, false)).is_some());
     }
 
+    /// RFC 6891: 带 OPT 的请求换来的响应 (含 OPT RR) 不能给无 OPT 的客户端, 即使上限同为 512。
+    #[test]
+    fn cache_separates_no_opt_from_opt_512() {
+        let cache = DnsCache::new(10);
+        let opt512 = query_with_opt([3, 3], 512, false);
+        cache.put("x.com", 1, &opt512, &cache_a_response([3, 3], 300));
+        assert!(cache.get("x.com", 1, &opt512).is_some(), "同为 OPT 512 命中");
+        assert!(cache.get("x.com", 1, &cache_a_query([3, 3])).is_none(), "无 OPT 客户端不得命中");
+    }
+
+    /// 单飞 key 用精确上限: 同一缓存分档 (1233..) 里的 1500 与 4096 不合并, 带不带 OPT 也不合并。
+    #[test]
+    fn singleflight_key_uses_exact_udp_size() {
+        let k = |q: &[u8]| singleflight_key(q).unwrap().4;
+        assert_ne!(k(&query_with_opt([1, 1], 1500, false)), k(&query_with_opt([1, 1], 4096, false)));
+        assert_ne!(k(&cache_a_query([1, 1])), k(&query_with_opt([1, 1], 512, false)));
+        assert_eq!(k(&query_with_opt([1, 1], 4096, false)), k(&query_with_opt([2, 2], 4096, false)));
+    }
+
+    /// 单飞完成后条目被摘除; leader 中途被取消时留下的未完成 cell 由下一个调用者重新执行。
+    #[tokio::test]
+    async fn singleflight_entry_removed_and_cancel_safe() {
+        static T: FlightTable<u32> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let len = || T.lock().unwrap().len();
+
+        assert_eq!(singleflight(&T, 1, || async { Some(vec![1]) }).await, Some(vec![1]));
+        assert_eq!(len(), 0, "完成后应摘除");
+
+        // leader 卡住后被取消: cell 未初始化, 不能被当成结果
+        let leader = tokio::spawn(singleflight(&T, 2, || async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Some(vec![0])
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        leader.abort();
+        let _ = leader.await;
+        assert_eq!(singleflight(&T, 2, || async { Some(vec![2]) }).await, Some(vec![2]), "接替者应重新执行");
+        assert_eq!(len(), 0);
+    }
+
     #[test]
     fn cache_skips_truncated_tc_response() {
         let cache = DnsCache::new(10);
@@ -2167,7 +2276,7 @@ mod tests {
     #[test]
     fn cache_isolates_512_and_4096_clients() {
         let cache = DnsCache::new(10);
-        let q512 = cache_a_query([1, 2]); // 无 OPT, max_udp=512, bucket=0
+        let q512 = cache_a_query([1, 2]); // 无 OPT, max_udp=512, bucket=3
         let q4096 = query_with_opt([1, 2], 4096, false); // max_udp=4096, bucket=2
 
         let r512 = cache_a_response([1, 2], 300);
@@ -2301,8 +2410,8 @@ mod tests {
         });
 
         let ups = vec![(addr, crate::config::DnsProtocol::Udp)];
-        let q1 = cache_a_query([0x55, 0x66]); // bucket 0 (512)
-        let q2 = query_with_opt([0x77, 0x88], 4096, false); // bucket 2 (4096)
+        let q1 = cache_a_query([0x55, 0x66]); // 无 OPT (size 0)
+        let q2 = query_with_opt([0x77, 0x88], 4096, false); // size 4096
         let (r1, r2) = tokio::join!(
             direct_query(&q1, &ups),
             direct_query(&q2, &ups)

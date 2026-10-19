@@ -125,7 +125,8 @@ ask_port() {
 }
 
 # 询问 GUI 监听配置. 调用方:
-#   read gui_enabled gui_listen gui_token <<< "$(ask_gui 9090)"
+#   out=$(ask_gui 9090) || exit 1; read gui_enabled gui_listen gui_token <<< "$out"
+#   (不能直接 read <<< "$(ask_gui)": 子 shell 里 err 的 exit 1 会被吞掉, 安装带着空值继续)
 # 返回单行: "<enabled> <addr>:<port> <token>", enabled=true|false, token="-" 表示无鉴权。
 # 注意不能用全局变量传 enabled, 因为 $(ask_gui) 是子 shell, 出不来.
 # 用户拒绝时 listen 用 "127.0.0.1:9090" 占位 (enabled=false 时 mirage 忽略).
@@ -1880,7 +1881,9 @@ EOM
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
     local server_gui_enabled server_gui_listen server_gui_token server_gui_token_line=""
-    read server_gui_enabled server_gui_listen server_gui_token <<< "$(ask_gui 9090)"
+    local server_gui_out
+    server_gui_out=$(ask_gui 9090) || exit 1  # ask_gui 在子 shell 里, 其中 err 的 exit 只退出子 shell
+    read server_gui_enabled server_gui_listen server_gui_token <<< "$server_gui_out"
     [[ "$server_gui_token" != "-" && -n "$server_gui_token" ]] && server_gui_token_line=",
         \"token\": \"${server_gui_token}\""
 
@@ -2298,7 +2301,9 @@ EOM
     # mode 3 同机部署时, 服务端可能已占 9090, ask_gui 内的 ask_port 会自动
     # 检测占用并提示改成 9091 等. 单独 client (mode 2) 直接 9090 即可.
     local client_gui_enabled client_gui_listen client_gui_token client_gui_token_line=""
-    read client_gui_enabled client_gui_listen client_gui_token <<< "$(ask_gui 9090)"
+    local client_gui_out
+    client_gui_out=$(ask_gui 9090) || exit 1  # ask_gui 在子 shell 里, 其中 err 的 exit 只退出子 shell
+    read client_gui_enabled client_gui_listen client_gui_token <<< "$client_gui_out"
     [[ "$client_gui_token" != "-" && -n "$client_gui_token" ]] && client_gui_token_line=",
         \"token\": \"${client_gui_token}\""
 

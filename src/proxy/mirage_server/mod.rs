@@ -66,12 +66,13 @@ fn try_accept_slot() -> Option<tokio::sync::OwnedSemaphorePermit> {
     conn_sem().clone().try_acquire_owned().ok()
 }
 
-/// 单个来源 (IPv6 归一到 /64, IPv4-mapped 还原为 v4) 可同时占用的连接数上限: 全局上限的 1/4,
-/// 夹到 `[16, 1024]`。
+/// 单个来源 (IPv6 归一到 /64, IPv4-mapped 还原为 v4) 可同时持有的**未认证**连接数上限: 全局上限的
+/// 1/4, 夹到 `[16, 1024]`。认证成功即归还 (见 `handle_connection`), 已认证连接只受全局上限约束 ——
+/// 透明网关 / CGNAT 后面整个 LAN 共用一个出口 IP, 已认证并发超过 1024 是正常的。
 ///
 /// 没有它时, 单一来源就能独占全部全局名额: 认证前窗口 ≤ `hard_deadline`(5s), 约
 /// `上限/5` 条连接每秒即可占满, 所有合法新连接被拒 —— 全局上限把 "内存被打满" 换成了
-/// "可用性被打满"。1024 远高于正常用户并发 (浏览器 6~8 条/站点, 重度下载/BT 数百条)。
+/// "可用性被打满"。
 fn max_conns_per_ip() -> usize {
     per_ip_cap_for(max_connections())
 }
@@ -497,7 +498,9 @@ pub(crate) struct QuicRuntimeLimiter {
 impl QuicRuntimeLimiter {
     pub const DEFAULT_MAX_CONN_PER_IP: usize = 64;
     pub const DEFAULT_MAX_CONN_GLOBAL: usize = 4096;
-    pub const DEFAULT_MAX_STREAMS_PER_IP: usize = 512;
+    /// 与 `quic::transport_config` 通告的 `max_concurrent_bidi_streams(2048)` 对齐: 透明网关后整个 LAN
+    /// 共用一条 QUIC 连接 (一个来源), 低于通告值会让第 N+1 条流被 reset, 而客户端以为还有额度。
+    pub const DEFAULT_MAX_STREAMS_PER_IP: usize = 2048;
     pub const DEFAULT_MAX_STREAMS_GLOBAL: usize = 16384;
 
     pub fn new(
@@ -770,7 +773,7 @@ pub async fn start_server(
                 // A5: 全局并发上限。认证前的窗口只受 hard_deadline 约束, 无上限时 flood 可把
                 // 任务表与 socket 打满 (见 docs/codebase-audit-2026-10.md A5)。
                 // 超限 → 直接关闭 (与真站过载行为一致: 不握手、不给响应), 计数 + 采样告警。
-                // 先过来源 IP 子上限, 再取全局名额: 单一来源最多占全局的 1/4, 不会独占全部名额。
+                // 先过来源 IP 子上限, 再取全局名额: 单一来源的未认证连接最多占全局的 1/4, 不会独占全部名额。
                 let slots = try_acquire_ip_slot(peer_addr.ip()).and_then(|ip_guard| {
                     try_accept_slot().map(|permit| (ip_guard, permit))
                 });
@@ -778,7 +781,7 @@ pub async fn start_server(
                     let n = ACCEPT_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % 500 == 1 {
                         warn!(
-                            "连接数达上限 (全局 {} / 单来源 {}; 累计拒绝 {n}), 直接关闭 {} — 调大 tuning.max_connections 或排查 flood",
+                            "连接数达上限 (全局 {} / 单来源未认证 {}; 累计拒绝 {n}), 直接关闭 {} — 调大 tuning.max_connections 或排查 flood",
                             max_connections(),
                             max_conns_per_ip(),
                             peer_addr.ip()
@@ -789,8 +792,7 @@ pub async fn start_server(
                 };
                 tokio::spawn(async move {
                     let _permit = permit; // 名额持到连接结束 (含握手失败 / 转发全程)
-                    let _ip_guard = ip_guard;
-                    handshake::handle_connection(stream, peer_addr, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
+                    handshake::handle_connection(stream, peer_addr, ip_guard, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
                 });
             }
             Err(e) => {
@@ -967,7 +969,16 @@ pub async fn start_quic_server(
                 match conn.accept_bi().await {
                     Ok((mut send, mut recv)) => {
                         let Some(stream_guard) = rt_limiter.try_acquire_stream(peer_ip) else {
-                            debug!("Mirage QUIC Server: 活跃流预算超限, 拒绝来自 {} 的新流", peer_ip);
+                            static STREAM_REJECTED: AtomicUsize = AtomicUsize::new(0);
+                            let n = STREAM_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+                            if n % 500 == 1 {
+                                warn!(
+                                    "Mirage QUIC Server: 活跃流预算超限 (单来源 {} / 全局 {}; 累计拒绝 {n}), 重置来自 {} 的新流",
+                                    QuicRuntimeLimiter::DEFAULT_MAX_STREAMS_PER_IP,
+                                    QuicRuntimeLimiter::DEFAULT_MAX_STREAMS_GLOBAL,
+                                    peer_ip
+                                );
+                            }
                             let _ = send.reset(quinn::VarInt::from_u32(0));
                             let _ = recv.stop(quinn::VarInt::from_u32(0));
                             continue;

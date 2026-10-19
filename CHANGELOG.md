@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### fix: 多模型本地审计修复 (2026-10-19)
+
+Sonnet / Fable / Opus 独立审计未推送的 9 个提交 (无 P0/P1), 修复如下:
+
+- **单来源连接上限只管未认证连接** (`mirage_server/mod.rs`, `handshake.rs`): 原先单来源 1024 条的上限覆盖连接全程, 透明网关 / CGNAT 后整个 LAN 共用一个出口 IP, 已认证并发超过 1024 时新连接在 accept 处被静默关闭。改为认证成功即归还单来源名额 (认证失败转发伪装站的连接仍持到结束), 已认证连接只受全局上限约束。告警文字改为「单来源未认证」。
+- **QUIC 单来源流预算与通告值对齐** (`mirage_server/mod.rs`): `DEFAULT_MAX_STREAMS_PER_IP` 512 → 2048, 与 `max_concurrent_bidi_streams(2048)` 一致 —— 原先网关经 QUIC 的第 513 条并发流被 reset, 客户端却以为还有额度; 超限改为采样告警 (原为 debug)。
+- **DNS 单飞 key 用精确 UDP 上限** (`dns/server.rs`): 单飞按缓存分档合并时, 同档内声明更小的等待者 (如 4096 档里的 1500) 会收到 leader 的大响应, 越过自己的上限 (缓存 `get` 有长度守卫, 单飞没有)。改用精确值 (无 OPT 为 0)。
+- **DNS 缓存区分请求是否带 OPT** (`dns/server.rs`): 原先无 OPT 与 OPT bufsize ≤512 同档, 带 OPT RR 的响应会给到无 OPT 的客户端 (违反 RFC 6891)。无 OPT 单独一档。
+- **上游不回显 question 的错误响应透传** (`dns/server.rs`): `response_matches` 强制 QDCOUNT=1 后, QDCOUNT=0 的 FORMERR/REFUSED 会被当噪声丢弃, 客户端等满超时拿到合成 NXDOMAIN 并负缓存。现对 QDCOUNT=0、RCODE≠0、无答案的响应按 tx_id + QR 接受 (不含记录, 也不会入缓存); `patch_for_query` 对这类响应只换 tx_id。
+- **DNS 单飞条目摘除改为 drop 守卫** (`dns/server.rs`): 单飞表改用同步锁, 摘除放进 drop —— 结果已出但调用方恰在摘除前被取消时, 已完成的条目不再永久残留被后来者当结果拿走。
+- **install.sh: API token 生成失败真正终止安装**: `ask_gui` 在 `$(...)` 子 shell 中运行, 其中 `err` 的 `exit 1` 只退出子 shell, `read <<< "$(ask_gui)"` 拿到空值后安装继续。调用处改为先赋值 `|| exit 1` 再 `read`。
+- 未采纳: 「热重载后连接上限日志与实际不符」—— `scan_runtime_config` 只在启动时调用一次, 热重载路径不调 `set_max_connections`, 不成立; 单飞 key 缺 qclass/RD 位属理论问题, 不改。
+- 新增测试: 无问句错误响应透传 / 无 OPT 与 OPT 512 缓存隔离 / 单飞 key 精确大小 / 单飞摘除与取消安全。
+
 ### docs: README 精简与层级整理 (2026-10-19)
 
 - **`README.md` 480 → 约 367 行**: 修正标题跳级与多余的 `</details>`；新增「安装部署」总标题，把一键安装 / 容器 / 签名校验 / 源码构建并到下面；轻量模式加入完整版与轻量版对比表；路线图「已完成」与版本表压成要点，细节改为指向 `CHANGELOG.md` 与 `docs/`。代码块、配置示例、版本号、默认值、警告与路线图状态不变；补一句 QUIC 使用要点（两端同设 `transport: "quic"`、客户端必配 `quic_pin`、暂不支持 UDP 中继）。

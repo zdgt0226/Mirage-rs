@@ -1056,6 +1056,7 @@ where
 pub(super) async fn handle_connection(
     stream: TcpStream,
     peer_addr: SocketAddr,
+    ip_guard: super::ConnIpGuard,
     creds: super::CredsSnapshot,
     camouflage_host: String,
     cam_rtt: Arc<CamouflageRtt>,
@@ -1074,6 +1075,8 @@ pub(super) async fn handle_connection(
     )
     .await
     {
+        // 认证通过: 归还单来源未认证名额 (失败路径要转发伪装站, 名额持到连接结束)。
+        drop(ip_guard);
         // 命中的凭据: 用户名 + 派生会话密钥的 password + 该凭据的吊销令牌 (改口令/删用户时置位)
         let entry = &creds_snapshot[idx];
         let user = entry.name.clone();
