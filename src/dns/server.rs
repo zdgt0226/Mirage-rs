@@ -336,6 +336,16 @@ fn reassemble_tcp_dns(acc: &[u8]) -> Reassembled {
     Reassembled::Need
 }
 
+/// 问题段的 QCLASS (最后 2 字节)。缓存/单飞只服务 IN: key 不含 class, 其它 class (CH 等, 几乎只用于
+/// 诊断) 直接透传上游, 免得与同名同型的 IN 查询合并。
+fn get_qclass(data: &[u8]) -> Option<u16> {
+    let end = question_end(data);
+    if end > data.len() || end < 14 {
+        return None;
+    }
+    Some(u16::from_be_bytes([data[end - 2], data[end - 1]]))
+}
+
 fn get_qtype(data: &[u8]) -> Option<u16> {
     let end = question_end(data);
     if end > data.len() || end < 4 {
@@ -542,8 +552,9 @@ where
         g.entry(key.clone()).or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())).clone()
     };
     // 摘除放在 drop 守卫里 (同步锁, 无 await): 结果已出但调用方恰在摘除前被取消时, 已完成的
-    // cell 不会永久留在表里被后来者当成"结果"拿走。cell 未初始化时不摘 (其余等待者仍在用它;
-    // leader 被取消后下一个等待者会接替执行 —— 不会卡死)。
+    // cell 不会永久留在表里被后来者当成"结果"拿走。cell 未初始化且仍有其他等待者时不摘 (它们
+    // 会接替执行 —— 不会卡死); 没人等了 (只剩表与本守卫两份引用) 也摘, 免得取消的查询留空条目。
+    // 克隆 cell 也在这把锁内, 引用计数在持锁时是准的。
     struct Remove<'a, K: std::hash::Hash + Eq> {
         table: &'a FlightTable<K>,
         key: K,
@@ -551,11 +562,9 @@ where
     }
     impl<K: std::hash::Hash + Eq> Drop for Remove<'_, K> {
         fn drop(&mut self) {
-            if !self.cell.initialized() {
-                return;
-            }
             let mut g = self.table.lock().unwrap_or_else(|e| e.into_inner());
-            if g.get(&self.key).is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &self.cell)) {
+            let idle = self.cell.initialized() || std::sync::Arc::strong_count(&self.cell) == 2;
+            if idle && g.get(&self.key).is_some_and(|cur| std::sync::Arc::ptr_eq(cur, &self.cell)) {
                 g.remove(&self.key);
             }
         }
@@ -608,7 +617,13 @@ fn singleflight_key(req: &[u8]) -> Option<(String, u16, bool, bool, u32)> {
         return None;
     }
     let qtype = get_qtype(req)?;
+    if get_qclass(req) != Some(1) {
+        return None;
+    }
     let e = edns_info(req);
+    if e.has_options {
+        return None;
+    }
     let size = if e.has_opt { e.max_udp as u32 } else { 0 };
     Some((domain.to_lowercase(), qtype, e.do_bit, e.cd_bit, size))
 }
@@ -736,6 +751,9 @@ struct EdnsInfo {
     /// 请求是否带 OPT。RFC 6891: 请求无 OPT 时响应不得带 OPT —— 带 OPT 的请求换来的响应
     /// 不能给无 OPT 的客户端, 即使双方上限都是 512。
     has_opt: bool,
+    /// OPT 是否带选项 (DNS Cookie / ECS 等, RDLEN>0)。这些选项的回显是按客户端的 (client cookie、
+    /// ECS 子网), 单飞把 leader 的响应交给别的客户端会让严格校验 cookie 的解析器丢包 —— 这类请求不合并。
+    has_options: bool,
 }
 
 impl EdnsInfo {
@@ -756,7 +774,7 @@ type CacheKey = (String, u16, bool, bool, u8); // (小写域名, qtype, DO, CD, 
 /// 全程边界安全（任何截断都返回默认值，不 panic）。
 fn edns_info(req: &[u8]) -> EdnsInfo {
     let cd_bit = req.get(3).is_some_and(|b| b & 0x10 != 0);
-    parse_opt(req).unwrap_or(EdnsInfo { do_bit: false, cd_bit, max_udp: 512, has_opt: false })
+    parse_opt(req).unwrap_or(EdnsInfo { do_bit: false, cd_bit, max_udp: 512, has_opt: false, has_options: false })
 }
 
 fn parse_opt(req: &[u8]) -> Option<EdnsInfo> {
@@ -790,7 +808,14 @@ fn parse_opt(req: &[u8]) -> Option<EdnsInfo> {
         ]);
         if rrtype == 41 {
             let max = (class as usize).clamp(512, DNS_UDP_BUF);
-            return Some(EdnsInfo { do_bit: ttl & 0x8000 != 0, cd_bit, max_udp: max, has_opt: true });
+            let rdlen = u16::from_be_bytes([*req.get(rrtype_at + 8)?, *req.get(rrtype_at + 9)?]);
+            return Some(EdnsInfo {
+                do_bit: ttl & 0x8000 != 0,
+                cd_bit,
+                max_udp: max,
+                has_opt: true,
+                has_options: rdlen > 0,
+            });
         }
         pos = skip_rr(req, pos)?;
     }
@@ -825,6 +850,9 @@ impl DnsCache {
     /// 现查一次，拿适合该客户端大小的响应）。本服务只监听 UDP，所以不能靠置 `TC=1` 让客户端
     /// 改走 TCP（它会重试 UDP 仍失败）——宁可多一次上游查询。
     fn get(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
+        if get_qclass(query) != Some(1) {
+            return None;
+        }
         let edns = edns_info(query);
         let bucket = edns.bucket();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
@@ -842,6 +870,9 @@ impl DnsCache {
 
     /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
     fn put(&self, domain: &str, qtype: u16, query: &[u8], response: &[u8]) {
+        if get_qclass(query) != Some(1) {
+            return;
+        }
         if response.get(2).is_some_and(|b| b & 0x02 != 0) {
             return;
         }
@@ -2262,6 +2293,31 @@ mod tests {
         assert_ne!(k(&query_with_opt([1, 1], 1500, false)), k(&query_with_opt([1, 1], 4096, false)));
         assert_ne!(k(&cache_a_query([1, 1])), k(&query_with_opt([1, 1], 512, false)));
         assert_eq!(k(&query_with_opt([1, 1], 4096, false)), k(&query_with_opt([2, 2], 4096, false)));
+
+        // 非 IN class / 带 EDNS 选项 (cookie 等) → 不合并
+        let mut ch = cache_a_query([1, 1]);
+        let n = ch.len();
+        ch[n - 1] = 3; // QCLASS = CH
+        assert!(singleflight_key(&ch).is_none(), "CH 查询不进单飞");
+        let mut cookie = query_with_opt([1, 1], 4096, false);
+        let n = cookie.len();
+        cookie[n - 1] = 12; // RDLEN = 12
+        cookie.extend_from_slice(&[0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]); // COOKIE, client cookie 8B
+        assert!(edns_info(&cookie).has_options);
+        assert!(singleflight_key(&cookie).is_none(), "带 cookie 的查询不进单飞");
+        assert!(!edns_info(&query_with_opt([1, 1], 4096, false)).has_options);
+    }
+
+    #[test]
+    fn cache_ignores_non_in_class() {
+        let cache = DnsCache::new(10);
+        let mut ch = cache_a_query([5, 5]);
+        let n = ch.len();
+        ch[n - 1] = 3; // CH
+        cache.put("x.com", 1, &ch, &cache_a_response([5, 5], 300));
+        assert!(cache.get("x.com", 1, &cache_a_query([5, 5])).is_none(), "CH 响应不得给 IN 查询");
+        cache.put("x.com", 1, &cache_a_query([5, 5]), &cache_a_response([5, 5], 300));
+        assert!(cache.get("x.com", 1, &ch).is_none(), "CH 查询不读缓存");
     }
 
     /// 单飞完成后条目被摘除; leader 中途被取消时留下的未完成 cell 由下一个调用者重新执行。
@@ -2281,7 +2337,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         leader.abort();
         let _ = leader.await;
-        assert_eq!(singleflight(&T, 2, || async { Some(vec![2]) }).await, Some(vec![2]), "接替者应重新执行");
+        assert_eq!(len(), 0, "无人等待的未完成条目也应摘除");
+        assert_eq!(singleflight(&T, 2, || async { Some(vec![2]) }).await, Some(vec![2]), "后来者重新执行");
+        assert_eq!(len(), 0);
+
+        // leader 取消时仍有等待者: 条目保留, 等待者接替执行
+        let leader = tokio::spawn(singleflight(&T, 3, || async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Some(vec![0])
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waiter = tokio::spawn(singleflight(&T, 3, || async { Some(vec![3]) }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        leader.abort();
+        let _ = leader.await;
+        assert_eq!(waiter.await.unwrap(), Some(vec![3]), "等待者接替");
         assert_eq!(len(), 0);
     }
 
