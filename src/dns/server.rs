@@ -850,10 +850,11 @@ impl DnsCache {
     /// 现查一次，拿适合该客户端大小的响应）。本服务只监听 UDP，所以不能靠置 `TC=1` 让客户端
     /// 改走 TCP（它会重试 UDP 仍失败）——宁可多一次上游查询。
     fn get(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
-        if get_qclass(query) != Some(1) {
+        let edns = edns_info(query);
+        // 非 IN / 带 EDNS 选项 (Cookie/ECS 的回显按客户端) 的查询不读写缓存, 与单飞同规则。
+        if get_qclass(query) != Some(1) || edns.has_options {
             return None;
         }
-        let edns = edns_info(query);
         let bucket = edns.bucket();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
@@ -870,7 +871,8 @@ impl DnsCache {
 
     /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
     fn put(&self, domain: &str, qtype: u16, query: &[u8], response: &[u8]) {
-        if get_qclass(query) != Some(1) {
+        let edns = edns_info(query);
+        if get_qclass(query) != Some(1) || edns.has_options {
             return;
         }
         if response.get(2).is_some_and(|b| b & 0x02 != 0) {
@@ -880,7 +882,6 @@ impl DnsCache {
             Some(t) => t.clamp(1, 3600),
             None => return,
         };
-        let edns = edns_info(query);
         let bucket = edns.bucket();
         let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
@@ -2318,6 +2319,21 @@ mod tests {
         assert!(cache.get("x.com", 1, &cache_a_query([5, 5])).is_none(), "CH 响应不得给 IN 查询");
         cache.put("x.com", 1, &cache_a_query([5, 5]), &cache_a_response([5, 5], 300));
         assert!(cache.get("x.com", 1, &ch).is_none(), "CH 查询不读缓存");
+    }
+
+    #[test]
+    fn cache_ignores_queries_with_edns_options() {
+        let cache = DnsCache::new(10);
+        let mut cookie = query_with_opt([6, 6], 4096, false);
+        let n = cookie.len();
+        cookie[n - 1] = 12; // RDLEN = 12
+        cookie.extend_from_slice(&[0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]); // COOKIE
+        cache.put("x.com", 1, &cookie, &cache_a_response([6, 6], 300));
+        let plain = query_with_opt([6, 6], 4096, false);
+        assert!(cache.get("x.com", 1, &plain).is_none(), "带 cookie 的响应不得入缓存");
+        cache.put("x.com", 1, &plain, &cache_a_response([6, 6], 300));
+        assert!(cache.get("x.com", 1, &cookie).is_none(), "带 cookie 的查询不读缓存");
+        assert!(cache.get("x.com", 1, &plain).is_some());
     }
 
     /// 单飞完成后条目被摘除; leader 中途被取消时留下的未完成 cell 由下一个调用者重新执行。

@@ -15,9 +15,9 @@ Sonnet / Fable / Gemini (agy) / Opus 独立审计未推送的 9 个提交 (无�
 - **install.sh: API token 生成失败真正终止安装**: `ask_gui` 在 `$(...)` 子 shell 中运行, 其中 `err` 的 `exit 1` 只退出子 shell, `read <<< "$(ask_gui)"` 拿到空值后安装继续。调用处改为先赋值 `|| exit 1` 再 `read`。
 - **DNS 查询必须恰有一个问题段** (`dns/server.rs`, agy 审计): 入口原先只拒 QDCOUNT=0。QDCOUNT>1 时 `extract_domain` 取第一问的名字、`get_qtype` 却读最后一问的类型, 缓存/单飞命中时 `patch_for_query` 还会按两问长度把问题段拷进单问题响应、覆盖答案段。抽出 `is_wellformed_query` (QDCOUNT==1) 并加测试。
 - **预连降级只在真正超时后计数** (`handshake.rs`, agy 审计): 原先信号量一时拿不到就先记一次降级并告警, 即使随后在 800ms 预算内排到了名额 —— 突发时指标与告警虚高。
-- **第二轮复审补强** (`dns/server.rs`): 单飞守卫在「无人等待的未完成条目」时也摘除 (leader 取消且无等待者时原先会残留空条目, 随机子域名 + 取消可使表无界增长); 非 IN class (CH 等) 查询不进缓存与单飞 (key 不含 class); OPT 带选项 (DNS Cookie / ECS, RDLEN>0) 的查询不进单飞 (回显按客户端, 不能共享)。
+- **第二轮复审补强** (`dns/server.rs`): 单飞守卫在「无人等待的未完成条目」时也摘除 (leader 取消且无等待者时原先会残留空条目, 随机子域名 + 取消可使表无界增长); 非 IN class (CH 等) 查询不进缓存与单飞 (key 不含 class); OPT 带选项 (DNS Cookie / ECS, RDLEN>0) 的查询不进单飞也不读写缓存 (回显按客户端, 不能共享)。
 - 未采纳: 「热重载后连接上限日志与实际不符」—— `scan_runtime_config` 只在启动时调用一次, 热重载路径不调 `set_max_connections`, 不成立; 单飞 key 缺 qclass/RD 位属理论问题, 不改。
-- 范围外 (原有设计, 非本批引入, 另议): `DnsCache` 键不含解析来源 (cn 直连 / 隧道 remote / 设备策略), 同一域名在不同分流路径间共用缓存条目; 缓存也不区分 EDNS 选项 (Cookie/ECS)。「认证成功归还单来源名额」缺端到端测试 (TCP 侧无进程内握手测试框架)。
+- 范围外 (原有设计, 非本批引入, 另议): `DnsCache` 键不含解析来源 (cn 直连 / 隧道 remote / 设备策略), 同一域名在不同分流路径间共用缓存条目。「认证成功归还单来源名额」缺端到端测试 (TCP 侧无进程内握手测试框架)。
 - 新增测试: 无问句错误响应透传 / 无 OPT 与 OPT 512 缓存隔离 / 单飞 key 精确大小 / 单飞摘除与取消安全。
 
 ### docs: README 精简与层级整理 (2026-10-19)
