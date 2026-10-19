@@ -904,6 +904,18 @@ fn response_matches(req: &[u8], resp: &[u8]) -> bool {
         && req[12..q_end].eq_ignore_ascii_case(&resp[12..q_end])
 }
 
+/// 查询是否恰有一个真实问题段。
+///
+/// - QDCOUNT=0: question_end 停在 12, 而 extract_domain 只从 offset 12 起读 (不看 QDCOUNT) 仍可能
+///   返回域名 → get_qtype 把报头的 NSCOUNT 错当 qtype、make_fake_ip_response 生成指向自身的
+///   0xC00C 压缩指针 (自引用环, 畸形响应)。
+/// - QDCOUNT>1: extract_domain 取第一问的名字, get_qtype 却读到最后一问的类型; 缓存/单飞命中时
+///   `patch_for_query` 按两问的长度把请求的问题段拷进单问题响应, 覆盖掉答案段。实际解析器也都
+///   只接受 QDCOUNT=1。
+fn is_wellformed_query(req: &[u8]) -> bool {
+    req.len() >= 12 && u16::from_be_bytes([req[4], req[5]]) == 1 && question_end(req) > 12
+}
+
 /// 跳过一个 DNS 域名 (处理压缩指针), 返回其后偏移。
 fn skip_name(data: &[u8], mut pos: usize) -> Option<usize> {
     loop {
@@ -1140,14 +1152,7 @@ impl DnsForwarder {
     }
 
     async fn process_query(&self, req: &[u8]) -> Option<Vec<u8>> {
-        // 拒畸形查询: 必须有真实问题段。否则 question_end 停在 12, 而 extract_domain 只从
-        // offset 12 起读 (不看 QDCOUNT) 仍可能返回域名 → get_qtype 把报头的 NSCOUNT 错当 qtype、
-        // make_fake_ip_response 生成指向自身的 0xC00C 压缩指针 (自引用环, 畸形响应)。
-        // QDCOUNT>=1 且 question_end>12 才算有合法问题名。
-        if req.len() < 12
-            || u16::from_be_bytes([req[4], req[5]]) == 0
-            || question_end(req) <= 12
-        {
+        if !is_wellformed_query(req) {
             return None;
         }
         let domain = extract_domain(req)?;
@@ -1759,6 +1764,23 @@ mod tests {
         assert!(make_fake_ip_response(&crafted, ip).is_none(), "构造的空问询包应拒, 不生成自引用 0xC00C");
         // 正常查询仍应正常出响应。
         assert!(make_fake_ip_response(&aaaa_query(), ip).is_some(), "合法查询正常");
+    }
+
+    #[test]
+    fn query_must_have_exactly_one_question() {
+        let q = cache_a_query([1, 2]);
+        assert!(is_wellformed_query(&q), "单问题查询合法");
+        assert!(!is_wellformed_query(&q[..11]), "不足 12B 报头");
+        let mut zero = q.clone();
+        zero[5] = 0;
+        assert!(!is_wellformed_query(&zero), "QDCOUNT=0 拒");
+        // QDCOUNT=2: 两个问题 (x.com A + x.com AAAA)
+        let mut two = q.clone();
+        two[5] = 2;
+        two.extend_from_slice(&q[12..]);
+        let n = two.len();
+        two[n - 3] = 28;
+        assert!(!is_wellformed_query(&two), "QDCOUNT=2 拒");
     }
 
     #[test]

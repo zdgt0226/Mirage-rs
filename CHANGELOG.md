@@ -4,7 +4,7 @@
 
 ### fix: 多模型本地审计修复 (2026-10-19)
 
-Sonnet / Fable / Opus 独立审计未推送的 9 个提交 (无 P0/P1), 修复如下:
+Sonnet / Fable / Gemini (agy) / Opus 独立审计未推送的 9 个提交 (无确认的 P0/P1), 修复如下:
 
 - **单来源连接上限只管未认证连接** (`mirage_server/mod.rs`, `handshake.rs`): 原先单来源 1024 条的上限覆盖连接全程, 透明网关 / CGNAT 后整个 LAN 共用一个出口 IP, 已认证并发超过 1024 时新连接在 accept 处被静默关闭。改为认证成功即归还单来源名额 (认证失败转发伪装站的连接仍持到结束), 已认证连接只受全局上限约束。告警文字改为「单来源未认证」。
 - **QUIC 单来源流预算与通告值对齐** (`mirage_server/mod.rs`): `DEFAULT_MAX_STREAMS_PER_IP` 512 → 2048, 与 `max_concurrent_bidi_streams(2048)` 一致 —— 原先网关经 QUIC 的第 513 条并发流被 reset, 客户端却以为还有额度; 超限改为采样告警 (原为 debug)。
@@ -13,7 +13,10 @@ Sonnet / Fable / Opus 独立审计未推送的 9 个提交 (无 P0/P1), 修复�
 - **上游不回显 question 的错误响应透传** (`dns/server.rs`): `response_matches` 强制 QDCOUNT=1 后, QDCOUNT=0 的 FORMERR/REFUSED 会被当噪声丢弃, 客户端等满超时拿到合成 NXDOMAIN 并负缓存。现对 QDCOUNT=0、RCODE≠0、无答案的响应按 tx_id + QR 接受 (不含记录, 也不会入缓存); `patch_for_query` 对这类响应只换 tx_id。
 - **DNS 单飞条目摘除改为 drop 守卫** (`dns/server.rs`): 单飞表改用同步锁, 摘除放进 drop —— 结果已出但调用方恰在摘除前被取消时, 已完成的条目不再永久残留被后来者当结果拿走。
 - **install.sh: API token 生成失败真正终止安装**: `ask_gui` 在 `$(...)` 子 shell 中运行, 其中 `err` 的 `exit 1` 只退出子 shell, `read <<< "$(ask_gui)"` 拿到空值后安装继续。调用处改为先赋值 `|| exit 1` 再 `read`。
+- **DNS 查询必须恰有一个问题段** (`dns/server.rs`, agy 审计): 入口原先只拒 QDCOUNT=0。QDCOUNT>1 时 `extract_domain` 取第一问的名字、`get_qtype` 却读最后一问的类型, 缓存/单飞命中时 `patch_for_query` 还会按两问长度把问题段拷进单问题响应、覆盖答案段。抽出 `is_wellformed_query` (QDCOUNT==1) 并加测试。
+- **预连降级只在真正超时后计数** (`handshake.rs`, agy 审计): 原先信号量一时拿不到就先记一次降级并告警, 即使随后在 800ms 预算内排到了名额 —— 突发时指标与告警虚高。
 - 未采纳: 「热重载后连接上限日志与实际不符」—— `scan_runtime_config` 只在启动时调用一次, 热重载路径不调 `set_max_connections`, 不成立; 单飞 key 缺 qclass/RD 位属理论问题, 不改。
+- 范围外 (原有设计, 非本批引入, 另议): `DnsCache` 键不含解析来源 (cn 直连 / 隧道 remote / 设备策略), 同一域名在不同分流路径间共用缓存条目。
 - 新增测试: 无问句错误响应透传 / 无 OPT 与 OPT 512 缓存隔离 / 单飞 key 精确大小 / 单飞摘除与取消安全。
 
 ### docs: README 精简与层级整理 (2026-10-19)

@@ -566,18 +566,22 @@ async fn preconnect_permit(
     match PRECONNECT_INFLIGHT.clone().try_acquire_owned() {
         Ok(p) => Some(p),
         Err(_) => {
-            let n = PRECONNECT_DEGRADED.fetch_add(1, Ordering::Relaxed) + 1;
-            // 采样告警: 避免扫描时刷满日志
-            if n % 500 == 1 {
-                tracing::warn!(
-                    "预连预算耗尽, 第 {n} 次降级 (在途上限 {PRECONNECT_MAX_INFLIGHT}); \
-                     该连接将退回判定时按需建连 ⇒ 关闭时间对齐变差"
-                );
-            }
-            tokio::time::timeout(budget, PRECONNECT_INFLIGHT.clone().acquire_owned())
+            let permit = tokio::time::timeout(budget, PRECONNECT_INFLIGHT.clone().acquire_owned())
                 .await
                 .ok()
-                .and_then(|r| r.ok())
+                .and_then(|r| r.ok());
+            // 只有等满预算仍没拿到才算降级 (预算内排到名额的不计, 否则突发时指标与告警虚高)。
+            if permit.is_none() {
+                let n = PRECONNECT_DEGRADED.fetch_add(1, Ordering::Relaxed) + 1;
+                // 采样告警: 避免扫描时刷满日志
+                if n % 500 == 1 {
+                    tracing::warn!(
+                        "预连预算耗尽, 第 {n} 次降级 (在途上限 {PRECONNECT_MAX_INFLIGHT}); \
+                         该连接将退回判定时按需建连 ⇒ 关闭时间对齐变差"
+                    );
+                }
+            }
+            permit
         }
     }
 }
