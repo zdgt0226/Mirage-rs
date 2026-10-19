@@ -2,65 +2,47 @@
 
 ![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.15.4-10b981.svg)
 
-基于 **Rust** 与 **Tokio** 全新重写的高性能、抗审查代理引擎。继承 Python 版 POC (Shadow-TLS + Reality) 的隐藏特性, 底层彻底重构, 提供内核级 eBPF 加速与内置 Web 看板。
+基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
-> **定位**: 面向**自建跨境线路的个人/小团队** —— 有一台墙外 VPS + 一台能当网关的 Linux 机器。
-> 主打「零配置 eBPF 透明网关」+ 抗被动识别。
+> **定位**: 面向自建跨境线路的个人与小团队（墙外 VPS + Linux 网关），主打「零配置 eBPF 透明网关」与抗被动识别。
 
-> ⚠️ **安全声明 (务必先读)**:
-> - 🔴 **v0.15 协议断代 (BREAKING)**: 握手 token 与会话密钥派生已升级 (token 绑定 `ClientHello.random`、
->   会话密钥混入服务端新鲜随机数, 堵住会话重放; 修复 cipher agility 协商 ChaCha 时的 nonce 复用)。
->   **与 v0.14 及更早的服务端/客户端 (含 Android 客户端) 互不兼容, 必须两端同时升级**, 否则认证失败。
->   不提供兼容开关。详细版本兼容矩阵与平滑迁移步骤见 [`docs/version-compatibility.md`](docs/version-compatibility.md)；设计与论证见 [`docs/protocol-freshness-design.md`](docs/protocol-freshness-design.md)。
-> - **未经专业安全审计**。加密分帧 (ChaCha20-Poly1305) 与握手认证由项目自研, 仅经过多轮 LLM
->   复核与真机验证, **没有**独立安全公司审计。请据此评估信任度, 不要用于生命安全级场景。
-> - **前向保密 (PFS) 可选, 默认关**: 默认会话密钥由**共享口令 + 双方随机数**派生 (v0.15 起服务端贡献
->   新鲜性, 防重放), 但不做密钥协商 —— **口令泄露则历史与未来流量都可被解密**。两端 config 设 `"pfs": true` 可开启**一次性
->   X25519 ECDH** (临时私钥用完即弃), 开启后即便口令泄露也解不了已录流量。**两端必须同开**
->   (改了会话密钥派生, 一端开一端没开会连不上)。无论是否开 PFS, 都请用高强度随机口令、
->   限制传播、定期更换。见 brain external-audit-2026-08 / handshake-forward-secrecy。
-> - **认证支持多用户凭据与配额限速** (`mirage_server.users[]`): 每人独立口令 → per-user 密钥隔离 + 用量统计 +
->   **按用户独立限速与月度流量配额** (超额静默回落伪装站, 活跃连接即断, 周期用量持久化),
->   可按人吊销 (改口令、改主口令或删用户均会在下一块数据或最长空闲超时内 (QUIC 10s, UDP mux/直连 300s, TCP 1800s) 断开该凭据上已建立的会话, 删该 user 即失效, 不影响他人), Mirage-console 可增删/改密/查用量, 限速与配额经 `/api/users` 的 `set_limits` / `reset_quota` 设置 (console 界面待接)。
->   不配 `users` = 单一共享口令 (原行为)。**口令仍是唯一凭据 (无二次因子)**, 请用高强度随机口令。
-> - **服务端出站防 SSRF / 内部网络隔离**: 服务端替客户端直连出站时默认拒绝回环 (127.0.0.0/8, ::1)、链路本地 (169.254.0.0/16, fe80::/10)、常见云元数据地址 (AWS `fd00:ec2::254`、阿里云 `100.100.100.200`、Azure WireServer `168.63.129.16`) 以及**本机自身地址 (含公网 IP、docker 网桥等)**, 防止多用户场景下普通用户经隧道探测服务端本地管理 API (如 :9090) 或窃取云元数据凭据。RFC1918 私网默认放行 (便于自建中转连家庭 LAN); 若确需允许服务端访问本机/链路本地, 可在入站配置显式开启 `"allow_local_targets": true` (有安全风险)。(残余风险说明: 部分云主机采用 1:1 NAT, 其公网 IP (如 AWS EIP) 并不绑定在网卡上而无法被网卡枚举识别, 强烈建议管理 API 监听 127.0.0.1 或配置强 gui token)。
-> - **负责任使用**: 本工具用于**保护自己合法流量的隐私与可达性**。是否可在你所在司法辖区使用、
->   以及如何使用, 由你自行判断与负责; 请遵守当地法律。
-
-> **运行要求**: **Linux 内核 ≥ 5.10** —— eBPF 透明网关依赖 `sk_lookup`(5.9+) / `sk_assign`(5.7+) /
-> XDP DNS, 旧内核 (如 Ubuntu 20.04 的 5.4、老 NAS/OpenWrt) 上这些程序**加载会失败**。
-> 内核不够也不必放弃: **轻量 / SOCKS 模式不碰 eBPF**, 任意较新 Linux 都能跑 (只是没有透明网关)。
-> 服务端**不需要** eBPF (入站是加密流, 自动跳过), 内核门槛只针对**客户端/网关侧**。
+> ⚠️ **安全与运行声明 (务必先读)**:
+> - 🔴 **v0.15 协议断代 (BREAKING)**: 握手 token 绑定 `ClientHello.random`，会话密钥混入服务端新鲜随机数（防重放），修复 cipher agility 协商 ChaCha 时的 nonce 复用。**与 v0.14 及更早版本（含 Android 客户端）互不兼容，必须两端同时升级**，无兼容开关。版本兼容矩阵与迁移步骤参见 [`docs/version-compatibility.md`](docs/version-compatibility.md)，协议设计见 [`docs/protocol-freshness-design.md`](docs/protocol-freshness-design.md)。
+> - **未经专业安全审计**: 加密分帧 (ChaCha20-Poly1305) 与握手认证自研，仅经 LLM 复核与真机验证，**没有**独立安全公司审计，请勿用于生命安全级场景。
+> - **前向保密 (PFS) 可选 (默认关闭)**: 默认会话密钥由共享口令+双方随机数派生。两端配置 `"pfs": true` 可开启一次性 X25519 ECDH（公钥搭 fake-TLS random 传输，零指纹变化），口令泄露亦无法解密历史录包。**两端必须同开**。无论是否开启 PFS，均应使用高强度随机口令。
+> - **多用户凭据与配额限速 (`mirage_server.users[]`)**: 支持多用户独立口令、per-user 密钥隔离、用量统计、独立限速与按月配额（超额静默回落伪装站，存量连接即断）。改密/删用户在下一数据块或超时内断开会话（QUIC 10s、UDP mux/直连 300s、TCP 1800s）。Console 可通过 `/api/users` 动态管理（绝不回显密码）。不配 `users` 即单共享口令。口令为唯一凭据，无二次因子。
+> - **服务端出站防 SSRF / 内部网络隔离**: 服务端直连出站默认拦截回环 (`127.0.0.0/8`, `::1`)、链路本地 (`169.254.0.0/16`, `fe80::/10`)、常见云元数据地址 (AWS `fd00:ec2::254`、阿里云 `100.100.100.200`、Azure WireServer `168.63.129.16`) 及本机网卡自身地址；RFC1918 私网默认放行。如需访问本机/链路本地需显式开启 `"allow_local_targets": true`。
+> - **负责任使用**: 本工具用于保护合法流量的隐私与可达性，请自行评估并在遵守当地法律法规的前提下使用。
+> - **运行环境要求**: **Linux 内核 ≥ 5.10**（eBPF 透明网关依赖 `sk_lookup` 5.9+ / `sk_assign` 5.7+ / XDP DNS）。轻量/SOCKS 模式及服务端不需要 eBPF，常规较新 Linux 均可运行。
 
 ---
 
-## 🌟 核心特性概览
+## 核心特性
 
-* **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 加权轮换）、TCP Brutal 拥塞控制、无锁化异步架构底座。`mirage tls-capture` / API 可抓本机真浏览器 ClientHello 存成模板（不 phone-home），配 `client_hello_template` 即让出站握手复刻其 JA3/JA4（仅替换 SNI/session_id/random）。
-* **可选前向保密 (PFS)**: 两端 `pfs: true` 开启一次性 X25519 ECDH（公钥搭 fake-TLS random 字段交换，零指纹变化），口令泄露也解不了已录流量。默认关，认证仍靠口令、与加密解耦（对标 REALITY）。
-* **多用户凭据与配额限速**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户（**协议零改动**，客户端只配自己那份口令），per-user 密钥隔离 + 用量统计（连接数/上下行/活跃）+ **按用户独立限速 (`rate_limit_kbps`) + 按月流量配额 (`quota_gb`, `quota_reset_day`)**，跨额连接即断、新握手伪装回落，改口令/改主口令/删用户在下一块数据或最长空闲超时内断开存量会话，周期用量持久化跨重启保留。`/api/users` 供 Mirage-console 增删/改密/查用量, API 另支持调限速/重置配额 (console 界面待接)（**只出 name+用量，绝不回显 password**）。不配 = 单用户（原行为）。
-* **eBPF 透明网关**: 基于 Linux `sk_lookup` / `tc_divert` 的无感知内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；LAN 客户端 `ping` 被代理域名可通（fake-IP ICMP echo 本地反射）。（无 eBPF 的 VPS/容器服务端 Auto 自动跳过，TCP/UDP/PFS 全线可用。）
-* **全场景出站与中转**: 支持 WireGuard 与 Shadowsocks (SIP004/SIP022) 上游/出站。
+* **极致传输与伪装**: TLS 1.3 ClientHello 字节级仿真（Chrome/Firefox/Android-Conscrypt 多 Profile 轮换）、TCP Brutal 拥塞控制、无锁化异步架构。支持 `mirage tls-capture` / API 抓取真浏览器指纹模板（`client_hello_template`），精准复刻 JA3/JA4。
+* **可选前向保密 (PFS)**: 两端开启 `"pfs": true` 启用一次性 X25519 ECDH，公钥复用 fake-TLS random 字段交换，零指纹变化。
+* **多用户凭据与配额限速**: `mirage_server.users[]` 支持独立口令、流量/连接统计、独立限速 (`rate_limit_kbps`) 与按月配额 (`quota_gb`, `quota_reset_day`)。超额自动断连并回落伪装，API 动态管理。
+* **eBPF 透明网关**: 基于 `sk_lookup` / `tc_divert` 实现内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；支持 Fake-IP ICMP echo 本地反射（LAN 客户端 ping 被代理域名可通）。无 eBPF 环境自动回落。
+* **全场景出站与中转**: 支持直连、WireGuard 与 Shadowsocks (SIP004/SIP022) 出站及上游中转。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
-* **智能 DNS 解析**: fake-IP 透明代理引擎 (可 `fakeip.exclude` 按域名排除) + **DNS 规则层** (`advanced_dns.rules` 按域名选 cn 本地/remote 隧道解析、`host` 静态应答、`reject` 空答复) + **灰域名自适应分类** (`auto_classify`: 按解析 IP 归属自动直连/代理 + TTL 学习) + 可选 LAN 53 劫持 / 静态解析 / IP 版本策略。
-* **Geo 规则自动更新**: `geo_sources` 多镜像下载 (ETag/304 + 落地前校验 + 重启不重下) → **文件监视热重载** (新 `.dat` 落地即重建路由引擎, 无需重启) + 载入自检 (空壳/损坏即告警)。
-* **内置 Web 看板**: Mirage Console —— 简洁现代的监控台（侧栏切视图 + 暗/亮双主题 + **中/英双语**），实时流量图、域名连接表、per-出站分流量/规则命中统计、结构化规则编辑器（dry_run 预检 + 进程分流维度 + 拖排）。**按运行模式分视图**：客户端管 LAN 设备（列表 + 按设备一键路由），服务端管连接的客户端（域名排行、连接历史、客户端版本、一键屏蔽）。
-* **供应链完整性**: Release 产物 (SHA256SUMS) 与多架构容器镜像 (`ghcr.io`) 均经 **cosign keyless** 签名 (Sigstore OIDC + Rekor 透明日志，零密钥可公开审计)。
+* **智能 DNS 解析**: Fake-IP 引擎（支持 `fakeip.exclude` 排除）+ DNS 规则层 (`advanced_dns.rules` 分流/静态解析/拦截) + 灰域名自适应分类 (`auto_classify`) + 可选局域网 53 端口劫持与 IP 版本策略。
+* **Geo 规则自动更新**: `geo_sources` 多源下载校验 + 文件变动监视热重载（新 `.dat` 落地即刻重建路由，无需重启）+ 完整性自检。
+* **内置 Web 看板**: Mirage Console 现代控制台（暗/亮主题、中/英双语），提供流量监控、连接管理、规则可视化编辑（含 dry_run 预检与拖拽排序）。按服务端/客户端提供专用视图（LAN 设备管理/客户端管理）。
+* **供应链完整性**: Release 二进制 (SHA256SUMS) 与多架构容器镜像 (`ghcr.io`) 均通过 **cosign keyless** (Sigstore OIDC + Rekor) 签名与透明日志审计。
 
 ---
 
-## 一键安装 (推荐)
+## 安装部署
 
-**alpha.4+ 起提供交互式安装向导 `install.sh`**, 会自动 (需 root):
-- 下载最新预编译二进制到 `/usr/local/bin/mirage-rs` (含 SHA256 双通道校验)
-- 探测公网 IP + 端口占用检测 + Brutal 内核模块 (可选 v2 最新按客户端分组限速 / v1.0.3 兼容 <5.10 老内核)
-- 生成服务端 / 客户端 config, 写 systemd unit —— 完整版 `mirage-rs-{server,client}.service`,
-  轻量版 `mirage-rs-lite-{server,client}.service`(名字区分, 一眼看出装的是哪个模式)
-- **选择部署形态**: 完整版 (分流/DNS/透明网关/看板) 或**轻量版** (只要能翻墙, 配置极简)
-- 交互配置 GUI 端口 / SNI 伪装 / brutal 速率 / geo 分流策略
-- **可选配置 Shadowsocks 上游出口** (把本机当中转站)
-- 非回环监听时**强制设入站账号密码**, 避免装出一个开放代理
-- 服务端配完可直接输出 `mirage://` 节点 URI (含二维码), 客户端安装时一步导入
+### 一键安装 (推荐)
+
+alpha.4+ 起提供交互式安装向导 `install.sh`（需 root 权限），自动完成：
+- 下载最新预编译二进制至 `/usr/local/bin/mirage-rs`（双通道 SHA256 校验）。
+- 探测公网 IP、端口占用与 Brutal 内核模块（可选 v2 按客户端分组限速 / v1.0.3 兼容老内核）。
+- 生成配置文件并注册 systemd 服务（完整版 `mirage-rs-{server,client}`，轻量版 `mirage-rs-lite-{server,client}`）。
+- 交互配置 GUI 端口、SNI 伪装、Brutal 速率、Geo 分流策略与可选 Shadowsocks 上游。
+- 非回环监听时强制设置入站认证密码，防止开放代理。
+- 服务端配置完成后直接输出 `mirage://` 节点 URI 与二维码，客户端一步导入。
 
 ```bash
 # 一键运行 (1=服务端 / 2=客户端 / 3=同机 / 4=更新二进制 / 5=显示节点 / 6=卸载)
@@ -71,21 +53,20 @@ git clone https://github.com/zdgt0226/Mirage-rs.git && cd Mirage-rs
 sudo bash install.sh
 ```
 
-装完立刻可用: `sudo systemctl status mirage-rs-{server,client}`
-(轻量版是 `mirage-rs-lite-{server,client}`)。
+服务状态管理: `sudo systemctl status mirage-rs-{server,client}` (轻量版对应 `mirage-rs-lite-{server,client}`)。
 
-> **手动下载 Releases 二进制**: glibc 版 (`mirage-rs-<arch>`) 需 glibc ≥ 2.34 (Debian 11 / CentOS 8 等老发行版会报 `GLIBC_2.3x not found`), 老系统请用 `-musl` 版; `install.sh` 默认即下载 musl 版。
+> **手动下载 Releases 二进制**: glibc 版需 glibc ≥ 2.34，旧版系统（如 Debian 11 / CentOS 8）请选择 `-musl` 版；`install.sh` 默认下载 musl 版。
 
-### 容器镜像 (multi-arch amd64/arm64)
+### 容器镜像 (多架构 amd64/arm64)
 
 ```bash
 docker run --rm -v /etc/mirage-rs:/etc/mirage-rs \
   ghcr.io/zdgt0226/mirage-rs:latest server -c /etc/mirage-rs/config_server.json
 ```
 
-### 验证产物签名 (cosign keyless, 无需任何公钥)
+### 验证产物签名 (cosign keyless)
 
-Release 里的 `SHA256SUMS` 由 CI 用 **cosign keyless** (Sigstore, 身份 = 本仓库 Release workflow 的 GitHub OIDC) 签名, 容器镜像同样签名 —— 无长期私钥、可公开审计 (Rekor 透明日志):
+Release 发布的 `SHA256SUMS` 与容器镜像由 CI 通过 **cosign keyless**（Sigstore OIDC 身份验证，透明日志 Rekor）签名，无需长期公钥即可完成独立审计：
 
 ```bash
 # 校验和签名 (下载 SHA256SUMS + SHA256SUMS.cosign.bundle 后)
@@ -111,43 +92,34 @@ cargo build --release --no-default-features        # headless: 剔掉整个 Web 
 cargo build --release --features quic              # 含 QUIC 实验传输 (transport:"quic"; ⚠️ P0 不隐蔽)
 ```
 
-> **Web 看板走 `gui` 编译特性 (默认开)。** 纯服务端/无面板部署可 `--no-default-features` 把整个
-> WebUI 编译剔除 —— 无 HTTP 监听面、无 config 写/日志读接口, **更小二进制 + 更小攻击面**。
-> (剔掉后 config 若配了 `gui.enabled` 会启动 WARN 提示面板不可用。)
-
-> ⚠️ **`--features ebpf` 必须装 clang/llvm** (`apt install clang llvm libbpf-dev`) —— 要编译内核
-> BPF 程序。缺 clang 时构建会**明确报错提示装 clang**, 而非神秘失败 (eBPF 目标文件不入库, 不会
-> 静默加载陈旧版本; 见 `build.rs`)。**默认构建 (无 `--features ebpf`) 不碰 BPF, 不需要 clang。**
-> 大多数用户直接用上面的预编译二进制/容器即可, 无需自编译。
+- **Web 看板编译特性 (`gui`)**: 默认开启。纯服务端或无面板环境可用 `--no-default-features` 剔除，消除 HTTP 监听攻击面并减小二进制体积。
+- **eBPF 特性依赖**: `--features ebpf` 需系统安装 `clang`、`llvm` 与 `libbpf-dev`。默认用户态构建无需 clang。
 
 ---
 
-## 🛠️ 灵活的部署形态
+## 部署形态
 
-### 轻量模式 (只要"能翻墙"就够了)
+### 轻量模式 (SOCKS5 隧道)
 
-如果你不需要分流 / fake-IP / 透明网关 / 看板, 只想要「本机 SOCKS5 → 全部走隧道」,
-用轻量模式 —— **同一个二进制、同一套协议与伪装**, 与完整版可互通。
+若仅需「本机 SOCKS5 → 全量走隧道」而无需分流、DNS 劫持、透明代理与看板，可使用轻量模式。轻量模式与完整版使用同一二进制与协议伪装，彼此完全互通。
 
-**一键安装向导已支持**: 跑 `install.sh` 选完"部署服务端/客户端"后, 会再问一次
-**部署形态**, 选「轻量版」即可 —— 它会问端口/密码/SNI, 生成平铺配置并注册 systemd 服务
-(服务名为 `mirage-rs-lite-{server,client}`, 与完整版区分)。
+| 特性维度 | 完整版 (Full Gateway) | 轻量版 (Lite Mode) |
+| :--- | :--- | :--- |
+| **典型定位** | 局域网透明网关 / 规则分流代理 | 本机极简 SOCKS5 代理客户端 / VPS 服务端 |
+| **内核门槛** | 依赖 Linux ≥ 5.10 (eBPF 模块) | 无内核版本门槛 (纯用户态) |
+| **分流与 DNS** | GeoIP/GeoSite 分流、Fake-IP 引擎 | 全量转发，无规则分流与独立 DNS |
+| **传输协议** | TCP + UDP (含 UDP mux / QUIC) | 仅 TCP (SOCKS5 UDP 请求规范返回 0x07 拒绝) |
+| **加密与伪装** | TLS 仿真、握手认证、Brutal、PFS、回落 | 完全一致 (零阉割) |
+| **管理界面** | Mirage Console Web 看板 | 仅 CLI / 配置文件 |
 
-> 两种形态的 unit 可以并存, 但它们**默认监听同一端口**。安装向导会自动停用并禁用另一形态的
-> 同角色服务(配置文件保留), 避免两个服务抢一个端口导致"装完却时好时坏"。想切回去重新跑
-> 一次安装、选另一个形态即可。
-客户端还支持直接粘贴服务端导出的 `mirage://` 串, 免得手抄密码出错。
-
-手动运行:
+手动运行命令:
 
 ```bash
 mirage-rs lite-server -c lite_server.json    # 墙外 VPS
 mirage-rs lite-client -c lite_client.json    # 本机
 ```
 
-配置是平铺的极简格式。**带完整注释的模板见 [`templates/lite_server.jsonc`](templates/lite_server.jsonc)
-与 [`templates/lite_client.jsonc`](templates/lite_client.jsonc)**(列全了每个字段的含义与取值建议;
-JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
+配置为极简平铺格式。完整注释模板参见 [`templates/lite_server.jsonc`](templates/lite_server.jsonc) 与 [`templates/lite_client.jsonc`](templates/lite_client.jsonc):
 
 ```jsonc
 // lite_server.json —— 仅 password 必填, 其余都有默认值
@@ -169,30 +141,19 @@ JSON 不支持注释, 使用时请去掉 `//` 注释再存为 `.json`)。
 }
 ```
 
-> 服务端端口选 443 伪装效果最好(与真实 HTTPS 同端口), 但它是特权端口(<1024), 非 root
-> 启动会 bind 失败 —— 用 systemd/root, 或给二进制加 `CAP_NET_BIND_SERVICE`, 或直接换个
-> `>1024` 的端口(如 8443/9443, 同样可用)。**两端的端口必须对上**: 客户端 `server_port`
-> = 服务端 `port`。
-
-**与完整版的差别**: 无分流(**全部转发**)、无 DNS/fake-IP、无透明代理、无 Web 看板、
-无 geo 数据下载、无配置热重载、**SOCKS5 仅 TCP**(UDP ASSOCIATE 会按规范回 `0x07` 拒绝,
-所以 QUIC/HTTP3 走不了代理 —— 浏览器会自动回落 TCP)。
-加密、TLS 指纹伪装、握手认证、认证失败转发真站这些**一个都没少**。
-
-> 注: 轻量模式是**运行时**精简, 不是单独编译的小二进制 —— 体积与完整版相同。
+> **注意**: 服务端端口 443 伪装效果最佳，非 root 运行需授予 `CAP_NET_BIND_SERVICE` 或改用 >1024 端口。客户端 `server_port` 必须与服务端 `port` 一致。
 
 ---
 
 ### 中转站模式 (服务端接 Shadowsocks 上游)
 
-服务端可以**不直连目标**, 而是把流量再经 Shadowsocks 发往上游出口 —— 即把 Mirage 当中转站:
+服务端可将解密后的流量通过 Shadowsocks 转发至上游出口，实现中转落地分流：
 
 ```
 客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
 ```
 
-典型用途: Mirage 服务端放在离你近、线路好的位置(如香港)只做中转, 真正的出口落在另一台
-SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻量服务端配置)加:
+在入站或轻量服务端配置中添加 `upstream`:
 
 ```jsonc
 "upstream": {
@@ -207,61 +168,32 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
 }
 ```
 
-不配 `upstream` = 直连目标(原行为)。加密方式写错会**直接报错拒绝启动**, 而不是悄悄降级
-成直连 —— 配了中转却走直连意味着出口 IP 与预期完全不同, 必须让人立刻知道。
-
-> ⚠️ **仅作用于 TCP**。SS 的 UDP 是另一套包格式, 尚未实现, 因此 `udp` **默认 `block`**
-> (直接拒绝 UDP 中继)。这是刻意的: 若放行, UDP 会从**本机 IP** 直连出去而 TCP 从上游出去,
-> 出口 IP 不一致 —— 对落地解锁场景这不是"不一致"而是**功能性错误**(流媒体走 QUIC 时会被判
-> 成错误区域, 且不会像被封那样回落 TCP, 表现为解锁时灵时不灵)。**安全的失败方式是"不发",
-> 而非"发到别处去"**。代价: QUIC 回落 TCP(页面照常), 游戏/WebRTC 不可用。
-> 确需旧行为写 `"udp": "direct"`(启动会 WARN)。轻量客户端本就仅 TCP, 不受影响。
->
-> 📌 同时支持 **SIP004 AEAD** 与 **SIP022 (Shadowsocks 2022)**;
-> **不支持** legacy 流式加密(`aes-256-cfb` 等)—— 它们无完整性校验、已被社区废弃、易被主动探测识别。
->
-> 📌 **SIP022 的 `password` 与 SIP004 语义完全不同**: 它不是任意密码, 而是 **base64 编码的密钥本身**
-> (2022-blake3-aes-128-gcm 要 16 字节, aes-256 要 32 字节), 不做密码拉伸。用
-> `openssl rand -base64 32` 生成。长度不对会被 `mirage-rs check` 直接拦下并说明应有长度 ——
-> 这类错**不会**让服务端起不来, 而是每条连接都静默失败, 所以必须提前拦住。
+- **协议支持**: 支持 SIP004 AEAD 与 SIP022 (Shadowsocks 2022)，不支持已被废弃且易被探测的旧式流加密。SIP022 的 `password` 为 Base64 编码密钥（使用 `openssl rand -base64 32` 生成），长度错误将被 `mirage-rs check` 直接拦截。
+- ⚠️ **UDP 处理行为**: 仅代理 TCP 流量。因 Shadowsocks UDP 协议不同，`udp` 默认设为 `block`，避免 UDP 流量从本机直接泄露导致出口 IP 不一致（流媒体区域判定异常）。如确需直连出站可设为 `"udp": "direct"`（启动将告警）。
 
 ---
 
 ### 干净设备接入 (WireGuard 入站)
 
-让手机/平板用**系统原生 WireGuard** 接入家中网关, 经网关的 Mirage 抗审查出海 —— **设备上零翻墙
-痕迹** (只是一条通用 VPN), 翻墙逻辑全在网关侧。
+移动设备通过系统原生 WireGuard 连接家庭网关，网关利用 eBPF 透明拦截并将流量送入 Mirage 隧道出海。移动端仅保留标准 VPN 配置，无任何代理工具痕迹：
 
 ```
 [手机 原生 WireGuard] ──家域内 WG(不跨 GFW)──▶ [家中网关: wg0 + eBPF 透明 + Mirage] ──▶ 海外
 ```
 
-**为什么成立**: 设备↔家中网关是**局域网/家域内**的 WireGuard, 不跨 GFW 不会被封; 真正的抗审查
-出海发生在**网关**上。设备侧只有一个普通 WG 配置, 查不到任何代理/翻墙软件痕迹, 降低"查水表"风险。
-
-**一键配置**: 在已装好透明网关的机器上跑 `install.sh` 选 **`7) 家庭 WireGuard 服务端 (干净设备接入)`**:
-- 装 `wireguard-tools` + 内核 WG, 生成 `wg0` 服务端 (`10.7.0.1/24`) + NAT + 开机自启 (`wg-quick@wg0`)。
-- 为每台设备生成配置 (文本 + **二维码**), 存 `/etc/wireguard/peer-<名字>.conf`。设备装官方 WireGuard App
-  扫码即用。再加设备重跑一次, 会**追加 peer 不覆盖**旧的。
-
-**机制 (无需改代码)**: 透明拦截**按 fake-IP 目标, 不靠 SO_MARK** —— fake-IP 段是本机地址, `sk_lookup`
-挂在 netns 上**不绑网卡**, 所以 wg0 收到的、目的是 fake-IP 的包会本地投递并自动命中透明代理, 和 LAN
-流量一样, 零额外配置。国内/直连流量走标准 `ip_forward` + NAT。
-
-> **命门: 设备的 DNS 必须指向网关 wg0 IP** (`10.7.0.1`) —— 一键脚本已在设备配置里写好。**别在设备上
-> 改成公共 DNS** (8.8.8.8 等), 否则海外域名解不成 fake-IP 就走不了代理 (会直连或失败)。
-
-> **已知限制**: 不经 DNS 的**裸 IP** 直连 (少数 App 硬编码 IP) 从 wg0 进来不会被透明拦截 (tc_divert 绑
-> 物理网卡), 手机场景罕见且绝大多数流量走域名/fake-IP。真机已端到端验证 (WG peer → 网关 → Mirage →
-> google/cloudflare `HTTP 200`; 国内 baidu 走直连; 被代理域名只解到 fake-IP 不泄真实 IP)。
+- **一键配置**: 在已配置透明网关的机器上运行 `install.sh` 选 `7) 家庭 WireGuard 服务端 (干净设备接入)`，自动创建 `wg0` (`10.7.0.1/24`) 与 NAT，并生成 peer 配置文件与二维码 (`/etc/wireguard/peer-<名字>.conf`)，支持多次追加设备。
+- **实现原理**: 透明拦截按 Fake-IP 目标匹配而非 `SO_MARK`。`sk_lookup` 挂载于 netns 且不绑定特定网卡，`wg0` 接收的目的地为 Fake-IP 的报文自动触发透明代理，国内流量正常转发。
+- **关键前提**: 移动端 DNS 必须指向网关地址 (`10.7.0.1`)，不能改用公共 DNS，否则域名无法解析为 Fake-IP。
+- **已知限制**: 少数绕过 DNS 的裸 IP 直连流量从 `wg0` 接入时不会被拦截（`tc_divert` 绑定物理网卡）。
 
 ---
 
-## ⚙️ 服务端配置说明
+## 配置说明
 
 ### 服务端配置示例 (`/etc/mirage-rs/config_server.json`)
+
 <details>
-<summary>点击查看: 服务端配置示例 (config_server.json)</summary>
+<summary>点击展开查看: 服务端完整配置示例</summary>
 
 ```json
 {
@@ -295,42 +227,22 @@ SS 服务器上(如落地解锁用的机器)。给 `mirage_server` 入站(或轻
   }
 }
 ```
-</details>
 
 </details>
 
-密码 + `camouflage_host` 必须跟客户端完全一致。`brutal_rate_mbps` 是服务端到客户端方向 (下载) 的 brutal 目标速率, 见下方 Brutal 章节。
+### 关键配置要点
 
-> 💡 **camouflage_host 选域名**: 示例的 `www.cloudflare.com` 只是占位。隐蔽性最好是选**与你 VPS 同 ASN / 同 IP 段**的真实 HTTPS 站点 (SNI 与出口 IP 归属一致, 打掉 NGFW 的 SNI↔IP 一致性检查)。用 `tools/find_camouflage.py` 自动扫本机 ASN 段找候选 (零 API key)。
-
-> ⚠️ **看板安全**: `gui.listen` 默认 `127.0.0.1` (只本机, 安全)。若改 `0.0.0.0` 暴露到 LAN/公网,
-> **务必设 `gui.token`** —— 看板能读日志/配置**并可视化改路由规则**, 无鉴权暴露 = 任何可达者
-> 都能把你的流量重定向。设了之后 `/api/*` 需带 token (`Authorization: Bearer <token>` /
-> `mirage_token` cookie / `?token=`, 常量时间校验防时序侧信道)。install.sh 选「全网开放」会自动
-> 生成随机 token 并打印。不设仍可用 (向后兼容), 但非本机暴露时会 WARN, 且只能用 IP 地址或
-> `localhost` 访问 (用域名/主机名访问会被 403, 防 DNS rebinding)。生产建议叠 Nginx TLS。
-
-> **出向 UDP 被封的 VPS**: 系统 `getaddrinfo` (glibc) 默认用 **UDP:53** 查 DNS, 封了 UDP
-> 就解析不了代理目标域名 (代理域名全挂)。加 `"tuning": {"dns_tcp_resolver": "1.1.1.1"}` 让
-> **本进程所有域名解析改走 DNS-over-TCP** (地址无端口默认 53), 脱离系统解析器。不设 = 系统解析器。
-> (零改代码的替代: VPS 上 `echo "options use-vc" >> /etc/resolv.conf` 强制 glibc 走 TCP。)
-
-> **UDP 带机量 (透明网关)**: 透明 UDP 的 Mirage 流默认**一流一隧道**, 并发 UDP 流封顶在
-> `pool_size`。做局域网网关且大量并发 UDP (QUIC/游戏) 时, 加 `"tuning": {"udp_mux": true}`
-> 开 **UDP 多路复用** —— 多流按散列复用少量 (默认 `udp_mux_tunnels: 4`) 共享隧道, 并发脱钩
-> `pool_size`。install.sh 安装透明网关时会询问是否开启 (默认开)。⚠️ **需服务端也升级** (老服务端
-> 不认 mux, 那些 UDP 流回落 TCP)。代价: 同隧道内跨流队头阻塞 (靠加大 `udp_mux_tunnels` 分摊);
-> 实时 UDP 建议走 WG 上游 (原生无 TCP HoL)。真机实测 (旁路网关 + 单核 VPS): 并发 UDP 流拐点
-> **20 → 450 (22.5×)**, 且天花板受限于服务端 fd/CPU 而非 mux 本身 —— 高并发建议把服务端
-> `LimitNOFILE` 调高 (install.sh 的 systemd unit 已设 1048576)。
-
-> 注: 客户端与透明网关的详细配置示例见 `templates/` 目录下的注释版模板。
+- **伪装域名 (`camouflage_host`)**: 必须与客户端严格一致。建议选取与 VPS 同 ASN 或同 IP 段的真实 HTTPS 站点以抵御 SNI 与 IP 归属一致性检查，可运行 `tools/find_camouflage.py` 扫描本地 ASN 获取候选。
+- ⚠️ **Web 看板安全 (`gui`)**: `gui.listen` 默认为 `127.0.0.1`。若绑定 `0.0.0.0` 开放至局域网或公网，**必须配置 `gui.token`**（API 请求通过 Bearer token / Cookie / URL 参数校验，带常量时间比对防时序攻击；未设 token 时仅允许 IP/localhost 访问以防 DNS rebinding）。
+- **出口 UDP 被阻断的 VPS**: 若 VPS 无法向外发送 UDP 53 数据包，配置 `"tuning": {"dns_tcp_resolver": "1.1.1.1"}` 强制进程级域名解析走 TCP。
+- **UDP 多路复用 (`tuning.udp_mux`)**: 网关存在大量并发 UDP（如 QUIC/游戏）时，开启 `"tuning": {"udp_mux": true}` 可将并发流散列复用到少量共享隧道（默认 4 条），突破连接池带机量瓶颈（实测并发能力提升 22.5×，需服务端同步开启）。高并发下建议调大服务端 `LimitNOFILE`。老服务端不认 mux，相关 UDP 流回落 TCP；代价是同隧道内跨流队头阻塞（可调大 `udp_mux_tunnels` 分摊）。
+- 详细客户端与网关配置示例参见 `templates/` 目录中的注释版模板。
 
 ---
 
-## 🧰 CLI 用法
+## CLI 用法
 
-节点/配置管理子命令 (都写回配置文件, 原子写 + `.bak` 备份):
+### 常用子命令
 
 ```bash
 # 校验 / 格式化配置 (启动前闸门; check 挑未知字段+悬空引用, format 保留键序不吞字段)
@@ -355,125 +267,101 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 mirage-rs config -c config.json
 ```
 
-> 组类型 (rule / default_outbound 可指向): `urltest` (选延迟最低) · `fallback` (第一个健康) ·
-> `selector` (手动) · `load_balance` (round-robin 分摊)。`import`/`subscribe --group` 会自动建
-> urltest 组并把 `default_outbound` 指向它。`test` 与 `--group` 建组会读 `geoip.dat` 显示节点区域,
-> 混区域时告警 (负载均衡/自动选路出口国不一致会影响落地解锁)。
+> **出站组类型**: 支持 `urltest` (低延迟自动优选)、`fallback` (故障转移)、`selector` (手动指定)、`load_balance` (轮询负载均衡)。`test` 与 `--group` 建组会读取 `geoip.dat` 校验节点地域并在混杂时发出告警。
 
-#### 配置文件改动生效策略 (热重载 vs 需重启)
+### 配置文件生效策略
 
-| 配置维度 | 改动项目 | 生效策略 | 说明与代码依据 |
+| 配置维度 | 改动项目 | 生效策略 | 说明与机制依据 |
 | :--- | :--- | :--- | :--- |
-| **路由 (Routing)** | `rules` 规则增删改、`default_outbound` 选路切换、`profiles` / `device_profiles` 设备策略、`geo_alias` 短名 | **自动热重载** | `config_watcher` 监听文件写入，约 1 秒内自动重建 `RouterEngine` 生效，不中断连接 |
-| **用户与凭据** | `mirage_server` 的 `users` 增删改、密码变动、`rate_limit_kbps` 限速、流量配额及入站主 `password` | **自动热重载** | `apply_user_config` 动态热替换凭据注册表与限额器；删除/改密用户之存量会话立即吊销 |
-| **Geo 规则数据** | `tuning.geo_sources`、`tuning.geo_update_days` 以及本地 `.dat` 文件自动更新 | **自动热重载** | `extract_updater_state` 重建更新调度器，新 `.dat` 文件落地自动重编路由规则集 |
-| **出站 (Outbounds)** | 任何出站节点的增删、改端口/密钥/伪装/传输方式/连接池/组成员 | **需重启服务** | 防止在途连接断裂与连接池任务泄漏，热重载保持既有出站不变 (`config_watcher.rs:132`) |
-| **入站 (Inbounds)** | 监听端口 `port` / `listen`、传输 `transport`、PFS、伪装站、Brutal 限速、`allow_local_targets`、新增/删除入站 | **需重启服务** | 网络监听 socket 与传输栈在启动期绑定，修改后需重启服务才能生效或释放端口 |
-| **核心调优 (Tuning)** | `tls_padding`、`cipher_agility`、`ebpf_mode`、`dns_tcp_resolver`、`client_hello_guard` 等 | **需重启服务** | 加密策略与系统级解析器在进程启动初始化阶段生效 (`startup.rs:150`) |
+| **路由 (Routing)** | `rules` 增删改、`default_outbound` 切换、`profiles` / `device_profiles` 策略、`geo_alias` | **自动热重载** | `config_watcher` 监听文件写入，约 1 秒内重建 `RouterEngine`，已有连接不中断 |
+| **用户与凭据** | `mirage_server` 的 `users` 增删改、密码变动、`rate_limit_kbps` 限速、流量配额及主密码 | **自动热重载** | 动态热替换凭据注册表与限额器；删除或改密后立即吊销对应存量会话 |
+| **Geo 规则数据** | `tuning.geo_sources`、`tuning.geo_update_days` 及本地 `.dat` 文件更新 | **自动热重载** | 重建更新调度器，新 `.dat` 文件落地自动重编路由规则集 |
+| **出站 (Outbounds)** | 增删节点、修改端口/密钥/伪装/传输方式/连接池/组成员 | **需重启服务** | 防止在途连接断裂与连接池任务泄漏，热重载保持既有出站不变 |
+| **入站 (Inbounds)** | 监听端口 `port` / `listen`、`transport`、PFS、伪装站、Brutal、`allow_local_targets`、增删入站 | **需重启服务** | 监听 socket 与传输栈在启动阶段绑定，修改后需重启释放或接管端口 |
+| **核心调优 (Tuning)** | `tls_padding`、`cipher_agility`、`ebpf_mode`、`dns_tcp_resolver`、`client_hello_guard` | **需重启服务** | 加密策略与系统级解析器在进程启动初始化阶段生效 |
 
-> `mirage-rs config` 按「仅上表列为热重载的字段才热重载、其余一律提示重启」判定 (宁可多提示重启, 不漏报)。仅支持完整版配置, 轻量版 (`lite_*.json`) 请直接编辑。
-> `mirage://` 链接只含 口令 / 地址 / 端口 / SNI 四项: 服务端开了 `pfs`、`transport: "quic"`、`tls_padding` / `cipher_agility` 时, 客户端导入后须手动设置对应参数 (菜单 9 显示链接时会列出)。
+> `mirage-rs config` 严格按照上表规则判定：仅热重载项自动生效，其余项给出明确重启提示。`mirage://` 链接仅包含密码/地址/端口/SNI 四项，若服务端启用了 `pfs`、`transport: "quic"`、`tls_padding` 或 `cipher_agility`，客户端导入后需手动匹配相应参数。
 
 ---
 
-## 路线图 / TODO
+## 路线图 (Roadmap)
 
-> 图例: `[x]` 已完成并发布 · `[ ]` 未完成 · `[~]` 部分完成。完成一项即勾选一项。
-> 这是**候选池而非排期** —— 走一步看一步, 哪个撞到痛点先修哪个。
+> 图例: `[x]` 已完成并发布 · `[~]` 进行中 / 部分完成 · `[ ]` 计划中 / 候选池。
 
 ### ✅ 已完成
 
-- [x] 透明网关整链路真机跑通 (TCP + UDP + 隧道 + 回源)
-- [x] TLS ClientHello 字节级仿真 (三 profile 轮换 + JA4 对照 harness + 后量子 key_share)
-- [x] **指纹捕获 + 回放** (v0.11.0) —— `mirage tls-capture` / API 抓本机真浏览器 ClientHello 存模板 (不 phone-home), `client_hello_template` 让出站复刻其 JA3/JA4 (仅替换 SNI/session_id/random)
-- [x] **填充整形升级 (A/B')** —— `tls_padding` 从"前 4 条 ≤256B 零"升级为 **paddingScheme 定长整形** (切分+填充抹掉封装 TLS 握手 burst 长度序列, 抗 USENIX Sec 2024 Xue et al.); 方案可经 `tuning.tls_padding_scheme` config 换 + 热重载, 发端-only、零协议改动
-- [x] **brutal group_id (吸收 tcp-brutal 2.0)** —— **服务端按客户端 IP 分 group**, 该客户端所有连接 (暖池+mux) 共享一个 brutal 总速率 (谁发谁用), 修此前每连接各设 `brutal_rate` 并发聚合 N× 超发。`TCP_BRUTAL_PARAMS` struct 12B→20B (+group_id u64) + `getsockopt(TCP_BRUTAL_VERSION=23302)≥0x020000` 探测, **v1 模块自动回落 12B per-socket**。**单一部署不变**: 只服务端装 brutal(2.0), 客户端不装照拿下载加速; 客户端出站不分组 (group_id=0)。rules/brutalctl/`ip route proto 233` 不吸收 (透明路由用, Mirage 是 userspace per-socket 模型)
-- [x] **单隧道高 RTT 吞吐调查 (2026-09-07 实机结论: 不再投 TCP 侧优化)** —— 实机 China→US (167ms/10% 丢包) 实测单隧道 goodput 恒 ~22-30Mbps 且**与 brutal_rate 无关** (50/100/200 都一样, rate=50 retrans 仅 2% 仍 22)。服务端 ss 该连接恒 `app_limited` (cwnd 够/pacing 满但发送方饿), tcp_wmem 64KB→4MB 无改善, loopback 单隧道 137MB/s 证 relay 环非瓶颈 → **是单条 TCP 流在丢包高 RTT 链路的固有塌陷** (brutal 只 pacing 不做丢包恢复; app_limited 是等重传/ACK 的症状)。聚合靠 pool 多隧道各自穿透丢包 scale (70-96Mbps), 真实多连接不受影响。**丢包链路单流性能的杠杆 = 已有 QUIC + erasure-CC 腿** (`--features quic`, 27% 丢包实测 75-100×), 非 brutal-TCP。**结论: TCP 侧不新增单流优化** (多隧道 striping 单下载=大工程且 QUIC 已解)
-- [x] 轻量模式 (`lite-server` / `lite-client`)
-- [x] 中转站: Shadowsocks 上游 (SIP004 + SIP022) & WireGuard 上游
-- [x] WireGuard 出站 (客户端) + 上游 (服务端), TCP/UDP/隧道内 DNS, 真实 peer 五层验证
-- [x] 路由 `inbound` 维度 + 裸 IP 按域名分流 + SOCKS5 UDP 逐数据报路由
-- [x] geo 自动更新 (ETag/304 + 多镜像 + 落地前校验 + 重启不重下) **+ 文件监视热重载** (ConfigWatcher 监视 geodata 目录, 新 `.dat` 落地即重建 RouterEngine, 无需重启; 修过启动时序空隙) **+ 载入自检** (启动/热重载对每个 `.dat` 数分类, 空壳/损坏即 WARN)
-- [x] 配置工具链 (`check` / `format` / `import` + urltest 建组 / `test` 节点握手测活) + 启动时配置校验与热重载 (事件驱动覆盖一层软链接与 K8s ConfigMap, 更深链接链由 30s 轮询兜底)
-- [x] 入站认证 (SOCKS5 / HTTP), 修默认开放代理
-- [x] DNS: 可选劫持 (接管 LAN 53/UDP+TCP, 默认关) · 静态解析 (类 dnsmasq, 精确+子域) · IP 版本策略 (`ip_strategy` 控 v4/v6 返回) (v0.6.1)
-- [x] **DNS 规则层** (`advanced_dns.rules`, 有序首匹配, 与 fake-ip 无关) —— 按域名 (`domain`/`domain_suffix`/`domain_keyword`/`domain_regex`, 同 routing 字段) 选 **DNS 出口** (`resolve` + `server: cn`本地/`remote`隧道防污染) / 返静态 IP (`host` + `ip`) / 空答复 (`reject` NODATA)。fakeip 关时也生效, 在 static_hosts 之后、routing 之前
-- [x] **process_name 分流** —— 按应用分流 ("Telegram 走代理、微信直连"), 本机 loopback 入站经 `/proc` 反查进程名; 透明/LAN 转发无本机进程故不适用
-- [x] **MSS clamp** —— 内联 `tc_divert` (`clamp_tcp_mss`), MTU 自动探测网卡下发 (`max_mss = mtu-40`, PPPoE 1492), 覆盖直连转发路径, 防小 MTU 链路 PMTU 黑洞 ("小请求通、大下载卡"); `verify_mss_clamp.sh` CI 验证
-- [x] **cipher agility** (v0.7.0) —— 两端有 AES-NI 时协商 AES-256-GCM (比 ChaCha20 快 ~2.1x), 否则回落 ChaCha20; 协商全在加密信道内 (proto_ver 0x02 + CIPHER_NEGO/ACK), ClientHello 零触碰不改指纹; 服务端 `tuning.cipher_agility` 开关 (默认关=向后兼容)
-- [x] **IPv6 隧道传输** (v0.7.0, 瘦身自"IPv6 全栈") —— 隧道传输走 v6: 服务端 v6 监听 + 客户端 v6 字面量自动加方括号 (`net_util::join_host_port`) + `node_uri` v6。透明数据面 v6 大 epic **评估后否** (fake-IP + 服务端远程解析已让客户端 v6 数据面不必要; 已知限制见 brain `ipv6-full-stack-design`)
-- [x] **UDP 多路复用** (v0.9.0) —— 透明 UDP 的 Mirage 流按 flowkey 散列复用少量 (默认 K=4) 长命共享隧道, 拿掉"并发 UDP 流 ≤ `pool_size`"带机量硬伤 (真机拐点 20→450, 22.5×)。`tuning.udp_mux` 门控默认关 (两端同版)。容量不变量已有 CI 守卫 (v0.9.4)
-- [x] **协议新鲜性加固 (v0.15.0, 协议断代)** —— 2026-09-26 多模型审计的两条协议级 P1: token tag 绑定 `ClientHello.random` + `"mirage-token-v2"` 域分隔 (换 random 即认证失败), 会话 master salt = `client_random‖server_random` (服务端重启清空 replay cache 也无法重放录制会话), server_random 全 0 两端 fail-closed; cipher agility 协商结果不变时不 rekey (修 ChaCha 下 nonce 复用)。**不兼容旧协议**, 两端 (含 Android) 须同时升级。威胁模型新增 T6
-- [x] **可选前向保密 PFS** (v0.9.3, 外部审计 #2; v0.15.0 Elligator2 编码) —— 一次性 X25519 ECDH, 公钥经 Elligator2 编码搭 fake-TLS random 字段交换 (消除 Legendre 区分特征 + 高位随机化抗指纹), `password‖ecdh` 混进会话 master; opt-in 两端同开, 失配 fail-closed; install.sh 一键开关
-- [x] **供应链签名 + 多架构容器** (v0.9.3, 外部审计 #13) —— cosign **keyless** (Sigstore OIDC, 零密钥) 签 SHA256SUMS + ghcr 容器镜像 (amd64/arm64, 镜像亦签名); 验签命令见上方「验证产物签名」
-- [x] **外部审计整批清零** (v0.9.2–v0.9.4) —— API 失败限流 (#3) · cargo-deny 供应链门禁 (#11) · start_proxy 巨石拆分 (#4) · config 模板防漂移测试 (#7) · 版本歪斜诊断 (#8) · 解析器 proptest (#12) · 未审计声明 (#1)。纯代码/零密钥项全清, 残余仅 #14 bench (边际) / #10 orphan CI (需 ≥6.1 自托管 runner)
-- [x] **CI 回归哨兵** (v0.9.4) —— mux 容量不变量 · crypto AES/ChaCha 相对吞吐比值 (≥1.3×) · brutal 收敛轨迹; 相对/行为门抗共享 runner 计时噪声
-- [x] **限速与配额** —— 客户端**按设备** / 服务端**按客户端** / 服务端**按用户**限带宽与流量配额。**TCP 已做**: 用户态 token bucket 整形 relay 字节流 (无 eBPF 依赖), 复用 `routing.device_profiles` (按源 IP 聚合跨连接共享) 与 `mirage_server.users[].rate_limit_kbps` (同用户连接共享上/下行桶, 与源 IP 桶双重叠加生效)。实机验证: 本地两侧各限 1MB/s 误差<1%; CN2→US 服务端限 250KB/s 精准生效。**UDP 也做了**: policing (令牌不足丢包), 覆盖透明 UDP (网关 LAN) + 服务端 UDP + udp_mux + QUIC lean。**按月流量配额 (多用户 v2, v0.15.0)**: 服务端 `users[].quota_gb` + `quota_reset_day` (UTC 按月滚动), 实时原子累加, 超额存量连接即断、新握手伪装回落; 周期用量持久化跨重启保留; API 支持 `set_limits` 与 `reset_quota`。**WebUI Admin 限速旋钮已接后端**: Admin 用户管理与设备分配经 API 控制。GET/POST round-trip + 磁盘写入实测通过
-- [x] **WebUI 全新看板 Mirage Console** (v0.10.0) —— 界面重构 (侧栏切视图 + 暗/亮双主题 + Canvas 流量图, 对标 Linear/shadcn) + i18n 中/英双语 + **服务端/客户端多模式分视图 + Admin 区**。客户端: LAN 设备表 + 按设备一键路由; 服务端: 域名排行 · 连接历史 · 连接的客户端 (版本 `tuning.client_info` 两端 opt-in 零指纹 + 一键屏蔽)。规则编辑器 dry_run 预检/进程分流维度/拖排。前身 v0.9.6 五阶段 (连接登记/面板/统计/透明 UDP 登记)。（注: `gui.stats_persist_path` 开启后, 域名排行、设备统计、多用户统计、全局总量与屏蔽名单均落盘持久化跨重启保留; live 连接、closed 环与客户端版本为刻意瞬态, 重启清零）
-- [x] **规则集自动更新** —— 即上「geo 自动更新 + 热重载」: `geo_sources` 常用 v2ray `.dat` (geosite/geoip) 周期下载 → 落地触发热重载, 全程免手动放文件、免重启。更新失败保留旧文件 (freshness meta + `update_days` clamp≥1 防打爆源)。**任意远端 rule-set / sing-box `.json` 格式刻意不支持自动化** —— 聚焦零配置网关, 只认常用 `.dat`
-- [x] **统一出站流接口** (v0.8.1) —— `OutboundNode::connect(target)->OutStream`, geo 等进程内消费者直连隧道
-- [x] **隧道 relay 缓冲/合帧再调** —— 客户端**上行**已对称服务端 download 加 64KB heap buf + greedy `try_read` 收割 (修上下行不对称的上传碎片, v0.9.6)。**BufWriter/全局 read 灌大 (256KB) 评估后不做**: loopback bench 证明 relay 是 crypto CPU-bound 非 syscall-bound (见下 io_uring 条), 灌大不解瓶颈反增 warm 池空闲内存
+- [x] **透明网关与传输加速**: eBPF 透明网关全链路跑通 (TCP + UDP + 隧道 + 回源)；TCP Brutal 拥塞控制支持 group_id（按客户端 IP 分组共享带宽，v1 模块自动回落）；MSS clamp 内联 `tc_divert` 自动按 MTU 下发防 PMTU 黑洞。
+- [x] **TLS 仿真与抗识别**: TLS 1.3 ClientHello 字节级仿真（三 Profile 轮换 + 后量子 key_share）；指纹捕获与回放（`mirage tls-capture` 提取真浏览器指纹存入 `client_hello_template`）；定长填充整形 (`tls_padding_scheme` 抹除握手 burst 指纹）。
+- [x] **安全与认证体系**: 协议新鲜性加固（v0.15 断代：双随机 master salt 派生 + token tag 绑定 random，防重放与伪造）；可选前向保密 PFS（一次性 X25519 ECDH + Elligator2 编码消除特征）；入站认证（SOCKS5/HTTP 认证防开放代理）；外部审计清零（API 限流、供应链门禁、模板防漂移测试、版本歪斜诊断）。
+- [x] **多用户与配额限速**: `mirage_server.users[]` 多用户凭据与 per-user 密钥隔离；按用户独立限速 (`rate_limit_kbps`) 与按月流量配额 (`quota_gb`, `quota_reset_day`)，超额断连回落；`/api/users` 动态管理与凭据热重载吊销。
+- [x] **出站与中转接入**: 轻量模式 (`lite-server` / `lite-client`)；Shadowsocks 上游 (SIP004/SIP022)；WireGuard 出站与上游中转；统一出站流接口 (`OutboundNode::connect`)。
+- [x] **高维分流与 DNS**: 路由 inbound 维度、裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由；DNS 规则层 (`advanced_dns.rules` 分流/静态/拦截)；局域网 53 端口劫持与 IP 版本策略；进程名分流 (`process_name`)；灰域名自适应分类 (`auto_classify`)。
+- [x] **性能调优与架构**: Cipher agility 自动协商硬件加速 AES-256-GCM（`tuning.cipher_agility`）；UDP 多路复用 (`tuning.udp_mux` 突破并发带机量瓶颈)；IPv6 隧道传输支持；隧道 relay 缓冲调优 (上行 64KB buf + greedy `try_read`)。
+- [x] **运维工具与看板**: Web 看板 Mirage Console（双主题、中英双语、分角色视图、可视化规则编辑）；配置工具链 (`check` / `format` / `import` / `test` / `config`)；Geo 规则自动更新与热重载；CI 确定性回归哨兵；cosign keyless 供应链签名与多架构容器镜像。
+- [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
 
-### 🚧 部分完成
+### 🚧 进行中 / 部分完成
 
-- [~] **订阅链接** —— `mirage-rs subscribe <url>` 批量导入 (格式=每行 `mirage://` 或整段 base64, server:port 去重, 可选 --group)。**周期自动刷新**待做
-- [~] **LAN 每主机监控 + 设备专用规则** (随 WebUI 优化做) —— ① **设备规则已生效**: `source_ip_cidr` 现对透明 TCP + SOCKS-UDP + 透明 UDP 全路径匹配。**「不同用户匹配不同规则」已做** (v0.10.1): `routing.profiles` 命名策略 + `routing.device_profiles` 设备→策略分配, build 时展开成带 `source_ip_cidr` 的规则前插 (设备规则首命中优先); WebUI Routing「用户策略」卡可视化管理 + `GET/POST /api/profiles`。DNS 查询维度暂 None (每主机 DNS 策略未实现)。② **每主机用量**: 用户态版**已做** (v0.10.0 Admin/Devices 设备表 = per-源 IP 连接数/字节/活跃, `/api/devices`)。剩 **eBPF 精确计数** (tc 看得到含 splice 直连全部流量, 用户态计数会漏直连) + 可选设备别名
-- [~] **链式代理 / WG·SS 双向** —— SS 双向 (入站+出站) · Mirage 套娃 · SS-over-Mirage 已做 (v0.8.1); **WG 入站**改用"干净设备"落地 (内核 WG 服务端 + 现有 eBPF 透明网关, install.sh 选项 7, 非 boringtun responder) —— 见上方「干净设备接入」。剩自定义转发编排增强
-- [~] **UDP mux → QUIC Datagram** —— TCP-mux 已解带机量 (v0.9.0); QUIC 版解跨流队头阻塞 + 实时质量, 大工程 (吸收 queqiao, 见 `docs/quic-transport-design.md`)。**P0 骨架 + P3 erasure CC 首版已做** (v0.15.0 实验特性, `--features quic` 默认关): 运行时开关 `transport: "quic"` 两端同设, QUIC 承载 Mirage 流 (**Model X 精简**: 每流 token+target 裸转发, 去 per-stream fake-TLS 握手 + 内层 AEAD, QUIC 自加密; QUIC 传输暂不支持 UDP 中继), 与 TCP 主链路并存。**erasure-aware CC** (`ErasureController` 包 BBR, 测 floor + 忽略纯 erasure + 窗口补偿) —— **真机 china-us (27% 丢包) A/B: stock quinn 28KB/s → erasure 2.1MB/s (~75-100x), 追平 TCP 且更稳**。**mux 架构** (一连接多流, 治并发过冲 + 真共享瓶颈)。**抗审查 P1 重定向为 SNI 层** (据 USENIX Security 2025: GFW 解密 QUIC Initial 读 SNI 按黑名单封, 非 ClientHello 指纹): 良性 SNI (默认 = camouflage_host) + ALPN h3 + 源端口/pre-packet 规避 (opt-in)。**Salamander 混淆已做** (`quic_obfs` 密码两端一致, opt-in): socket 层每包 XOR (blake3 keystream) 把 QUIC 藏成随机 UDP, GFW 连 Initial 都解不出、根本无 QUIC 指纹可查 (不 fork rustls)。**服务端证书 SPKI 固定 (Pinning) 已实现**: 服务端持久化私钥 (`quic_key.pem`, 0600) + 客户端 `PinnedVerifier` 强校验 43 字符 base64url SPKI 指纹与 TLS 1.3 握手签名 (封死主动中间人截获 token 与数据风险)。客户端出站强制要求配 `quic_pin` (fail-closed); 服务端指纹可用 `mirage-rs quic-pin -c <服务端配置>` 预先获取或生成。⚠️ 真机深挖发现"QUIC 传输被切"非 GFW 而是 **quinn 0.11.17 gap 上限 × 重排序线路** → 默认窗口降 2MB (重排序线路稳; 干净长肥调 16-64)。**QUIC 定位 = 好链路/受控时的性能腿, 抗审查主力仍是 TCP fake-TLS**。FEC (P2)/pacing 层后续。release 二进制自 v0.15.2 起包含 (运行时 `transport: "quic"` 才启用)
-- [~] **ICMP 处理** —— ①fake-IP echo **本地反射已做** (v0.9.6): LAN 客户端 `ping` 被代理域名可通 —— `tc_divert` 就地把 fake-IP 段的 Echo Request 翻成 Echo Reply 弹回 (RTT 是本机假值, 对齐 Clash/sing-box fake-ip ping)。②真隧道 ICMP (端到端真 RTT) **评估后暂不做**: 捕获路径 (AF_PACKET / TUN / 无) 均需真机验证, TUN 违背 TUN-free eBPF 定位, 边际价值低 (应用走 TCP)。本机自身 ping fake-IP 不经 tc ingress, 暂不覆盖。
+- [~] **订阅链接管理**: `mirage-rs subscribe <url>` 批量导入已支持，周期自动定时刷新待完成。
+- [~] **LAN 设备监控与策略**: 设备分流规则 (`source_ip_cidr`)、多用户策略 (`routing.profiles` / `device_profiles`) 与用户态设备用量统计已完成；eBPF 精确统计与每主机独立 DNS 策略待完成。
+- [~] **链式代理增强**: SS 双向转发、Mirage 嵌套与 WireGuard 干净设备入站已完成；自定义转发编排增强中。
+- [~] **QUIC 传输链路 (实验特性)**: `--features quic` 骨架、erasure-aware CC、Salamander 混淆与证书 SPKI 固定 (`quic_pin`) 已实现，默认窗口优化为 8MB；FEC (P2) 与 pacing 层待完善。使用要点：两端同设 `transport: "quic"`，客户端必须配 `quic_pin`，暂不支持 UDP 中继，默认不隐蔽（可配 `quic_obfs`）；详见 [`docs/quic-transport-design.md`](docs/quic-transport-design.md)。
+- [~] **ICMP 支持**: Fake-IP Echo 本地反射已实现（LAN 客户端 ping 被代理域名可通）；真隧道端到端 ICMP 评估后暂不实现。
 
-### ⏳ 未完成 (计划池)
+### ⏳ 计划中 / 候选池
 
-- [~] **QUIC 定速模式 (实验, 已实现)** —— 复用 `brutal_rate_mbps`: 服务端入站配了即 QUIC 下行定速, 客户端出站配了即上行定速, 不配仍为 erasure CC。窗口 = rate × RTT / ack_rate² (按最近 5 秒送达率补偿, 下限 0.8; 无丢包不超发), 丢包只记账不退让。**根因与补丁** (见 `docs/quic-transport-design.md` §5.9): 高丢包吞吐上不去是 2MB 流控窗口队头阻塞 + quinn 乱序段上限 `MAX_CHUNKS=1024` (窗口放大即断连) —— `third_party/quinn-proto` 补丁为 8192, QUIC 默认窗口改 8MB。netns 实验 (RTT 180ms, 10%/20% 丢包): 定速 66–71 / 49–61 Mbps, hysteria2 63–73 / 50–60, 基本持平 (见 [`docs/benchmark-2026-09.md`](docs/benchmark-2026-09.md) §3.5)。公网复测 (丢包 5–20%) 定速 78–84 vs hysteria2 67–78 反超 (§3.6); QUIC 仍为实验特性, release 二进制自 v0.15.2 起包含 (运行时 `transport: "quic"` 才启用)。
-- [ ] **QUIC 腿 ECH GREASE (D, 暂缓, 仅 QUIC 腿)** —— ⚠️ **TCP 主协议 ClientHello 的 ECH GREASE 早已实现** (`crypto/tls_raw.rs` `ech_grease_ext`, Chrome 250B + Firefox 281B, config_id/enc/payload 每连接随机)。此项特指 **QUIC 腿** (rustls QUIC ClientHello) 的 ECH, 用来蹭 GFW 2025 初"不封带 ECH 的 QUIC"盲区。卡点: rustls ECH 的 HPKE 只在 aws-lc-rs provider (Mirage 用 ring, 换 provider 毁 Android/musl 交叉编译); 且 rustls QUIC ClientHello 本就非 Chrome 形状 (Rust 无 uTLS), 单加 ECH 收益有限; QUIC 腿尚未进 release。待手写最小 HPKE (ring 原语) 或 QUIC 腿转正后再评
-- [ ] orphan 验证器接回 CI —— **本地-only** (本机 ≥6.1 稳过, 但 GitHub runner 5.15 与 6.8 都红: 客户端连不上, 是 runner 对"跨进程 sk_assign"场景的兼容问题非产品; 覆盖已由 verify_tc_divert_tcp 兜)。接回需先把验证器改单进程 (仿 tcp.sh)
+- [~] **QUIC 定速模式 (实验特性, 已实现待完善)**: 复用 `brutal_rate_mbps` 实现 QUIC 上下行定速与窗口补偿，补丁 quinn-proto 乱序上限至 8192。
+- [ ] **QUIC 腿 ECH GREASE (暂缓)**: TCP 主协议已原生支持 ECH GREASE；QUIC 腿需等待底层 Rust 密码学库支持完善后再行评估。
+- [ ] **orphan 验证器接回 CI**: 本地测试稳定，需重构为单进程模式以适应 GitHub Actions 共享 runner。
 
 ### 评估后决定不做（避免重复提）
 
-- **v1/v2 协议版本开关 / 兼容旧协议** —— v0.15 断代彻底消除会话重放与新鲜度隐患；v0.15.2 之后的改动只涉及服务端行为优化，线上协议完全一致（已实测互通）；老版本走并行端口迁移（详见 [`docs/version-compatibility.md`](docs/version-compatibility.md)），不在新代码保留双重协议栈技术债
-- **Tailscale 原生支持** —— 官方 Rust 实现当前全走 DERP 中继, 对代理是吞吐硬伤; 让用户自己跑 `tailscaled` + Mirage 直连 `100.64.0.0/10` 今天就能用
-- **TLS session resumption 仿真** —— 抓包 + 统计实测证明: 真 Chrome 的 `legacy_session_id` 也每次全新随机, 我们与之不可区分, 立项前提不成立
-- **追平 sing-box 全部协议/规则** —— 定位是零配置 eBPF 网关, 不是通用代理框架
-- **io_uring 替代 relay read/write 循环** —— loopback bench (2026-08-19): 直连 splice 1418 MB/s vs 隧道单流 137 MB/s, 并发随核涨 4 核饱和 = relay 瓶颈是 **AEAD crypto CPU 非 syscall**。io_uring 优化 syscall 开销 → 优化错位零收益; 且 tokio-uring 独立 runtime 塞进全 tokio 库要整体迁移。唯一有效杠杆是更快 crypto (cipher agility AES-NI 已做)。单流 1.1 Gbps 已超真实跨境链路 —— 部署里网络才是瓶颈
-- **SS 上游 UDP** —— ①要 UDP 同出口**直接用 WireGuard 上游** (已通), 功能已覆盖; ②多数 SS 服务器默认不开 UDP, **实现≠能用**; ③SS UDP 无握手, 上游不支持时"包石沉大海"无法探测只能等报障; ④当前默认 `block` 已是安全失败方式 (不静默从本机 IP 直发致出口 IP 不一致)。仅"落地机只会 SS 不能上 WG 且必须走 UDP"这一窄场景才翻案
+- **v1/v2 协议版本开关 / 兼容旧协议**: v0.15 协议断代彻底解决了会话重放与新鲜度漏洞；老版本采用端口并行迁移，新代码不保留双协议栈技术债。
+- **Tailscale 原生集成**: 官方 Rust 实现走 DERP 中继影响吞吐，建议通过系统 tailscaled 配合 Mirage 直连路由。
+- **TLS session resumption 仿真**: 实测真实 Chrome 的 session_id 均为全新随机，与当前实现不可区分，立项前提不成立。
+- **追平 sing-box 全部协议与规则**: 定位为轻量零配置网关，不做庞大通用代理框架。
+- **io_uring 替代 relay 循环**: 实测瓶颈在 AEAD 加密 CPU 而非系统调用开销，切换无吞吐提升且增加维护负担。
+- **Shadowsocks 上游 UDP 中继**: 存在出口 IP 不一致与丢包黑洞隐患，默认 block 为安全失败设计；UDP 需求建议直接使用 WireGuard 上游。
+
 ---
 
-## 📜 版本迭代概览 (Changelog)
+## 版本迭代概览 (Changelog)
 
-Mirage-rs 遵循快速迭代模式，详细更新日志请查阅 [`CHANGELOG.md`](CHANGELOG.md)，跨版本兼容矩阵与迁移步骤请参阅 [`docs/version-compatibility.md`](docs/version-compatibility.md)。
+详细更新记录请查阅 [`CHANGELOG.md`](CHANGELOG.md)，跨版本兼容矩阵与平滑迁移指引请参阅 [`docs/version-compatibility.md`](docs/version-compatibility.md)。
 
-| 版本 | 发布日期 | 核心重大特性 |
+| 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
-| **v0.15.4** | 2026-10-17 | **无协议变更 (可单端升级)**: 全局审计修复 · API 非本机监听且无 token 时补 DNS rebinding 防护 · `/api/users` 覆盖全部 `mirage_server` 入站 (多入站下删用户 / 改口令真正生效), `set_limits` 局部更新, `upsert` 带限额报错 · 按 IP 限速桶跨热重载保留 (修复热重载后速率翻倍), 满表时溢出共享桶 · 日志 0600、统计文件软链接、`ip_cidr` 支持裸 IP、`geo_sources.name` 防路径穿越等 |
-| **v0.15.3** | 2026-10-16 | **无协议变更 (可单端升级, CI 验证 v0.15.2 客户端互通)**: 服务端主动探测加固 (伪装站改为按需建连, 移除预热连接池; 新增 `tuning.client_hello_guard`) · 版本兼容矩阵 `docs/version-compatibility.md` 与 `install.sh` 老版本并行迁移向导 · CI 跨版本互通测试 · `rustls` 安全更新 (RUSTSEC-2026-0346 ~ 0349) · 网关透明 UDP 接收缓冲 4MB |
-| **v0.15.2** | 2026-10-04 | **无协议变更 (可单端升级)**: release 二进制首次带上 **QUIC 传输** (实验, `transport: "quic"` 才启用) · **QUIC 定速模式** (复用 `brutal_rate_mbps`) · 定位并修复 QUIC 高丢包吞吐瓶颈 (quinn-proto 乱序段上限补丁 1024→8192 + 默认窗口 8MB; 公网定速 78–84 Mbps vs hysteria2 67–78, 服务端 CPU 少约 20%) · `install.sh` brutal 默认 100 Mbps、可选 v2 / v1.0.3 · 实测记录 `docs/benchmark-2026-09.md` |
-| **v0.15.1** | 2026-10-02 | **无协议变更 (可单端升级)**: 新增 `mirage-rs config` 交互式配置编辑 (节点增删改 / 协议参数 / 服务端多用户, 保存时校验 + 原子写回, 能热重载的自动生效、其余提示并协助重启) · 实测修复: 服务端每连接日志降 debug (隐私) · brutal 多入站速率隔离 · QUIC 出站 UDP 快速失败, 远程 DNS 与健康检查改走 QUIC 流 · QUIC pin / 口令错误明确提示 · 配置校验区分 TCP / UDP 同端口 |
-| **v0.15.0** | 2026-09-28 | **⚠️ 协议断代, 两端须同时升级**: 会话新鲜性加固 (双随机 master salt 派生 + token tag 绑定 ClientHello.random, 防重放与伪造) · **PFS Elligator2 编码** (消除 X25519 公钥 Legendre 特征) · cipher agility 避免 ChaCha20 重协商下的 nonce 复用。**多用户 v2 与安全加固**: **按用户独立限速与月度流量配额** (`rate_limit_kbps`/`quota_gb`/账单日滚动/用量持久化/超额伪装回落) + `/api/users` 管理 API · **QUIC 证书 SPKI 固定** (客户端强制 `quic_pin`, 封死 MITM) · **服务端出站防 SSRF** (默认拦截回环/链路本地/云元数据/本机所有网卡地址, 可选 `allow_local_targets`) · **凭据热重载生效与吊销** (改口令/删用户即刻断开存量会话) · **伪装防被动与主动探测** (ServerHello key_share 与加密 flight 逐连接随机化, 认证前异常增量读取并全量回落伪装站) · **服务端 UDP 直连 IPv6 目标** · **配置软链接与 K8s ConfigMap 原子切换热重载**。重复 tag 的 `mirage_server` 拒绝启动, UDP 非 mux 收紧为 restricted-cone。 |
-| **v0.14.1** | 2026-09-26 | **审计阶段 1 安全修复 (纯服务端)**: 配置文件与备份原子写恒以 **0600 权限**创建 (自愈历史 0644) · API **DNS rebinding** 防护 (loopback 监听且无 token 时校验 Host 白名单) · **XDP DNS 缓存淘汰与重载清除** (解决 fake-IP 淘汰后映射陈旧导致误路由) · 域名统计与限速 live 表设容量上限、连接池 watcher 任务泄漏修复。**细节优化与健壮性**: config `check` 增补入站监听 `listen:port` 冲突检测 · Salamander GRO 去混淆测试与 CI 覆盖 `--features quic` · 文件加载错误补上下文 · 连接池 queue 锁与统计惰性构造优化。向后完全兼容。 |
-| **v0.14.0** | 2026-09-21 | **多用户凭据**: `mirage_server.users[]` 每人独立口令 —— 握手按 token 认出是哪个用户 (`identify_session_token`, **协议零改动**, 客户端只配自己那份口令), per-user 密钥隔离 + 用量统计 (连接/上下行/活跃), 按人吊销。`/api/users` GET(列 name+用量, **不返 password**)/POST(**op-based** 增删/改密, 因藏 password 不能整表替换) 供 **Mirage-console 用户管理页** (server 模式) 操作。覆盖 TCP + QUIC(lean)。 |
-| **v0.13.3** | 2026-09-21 | **recv/send 热路径压榨**: recv 借用式解密去每帧 alloc+zero-fill (alloc/帧 1.00→0, +4.2%) · send 去 framed 双拷贝 (header/body 分写 BufWriter, wire 一致) · rustls RUSTSEC-2026-0285 安全修复 · install.sh UI 微调。附 P2 实测: ring AEAD 已在网关 CPU 峰值 (持平 openssl), crypto 后端非杠杆。 |
-| **v0.13.0** | 2026-09-10 | **DNS 解析增强线**: `fakeip.exclude` 按域名 (精确/后缀/关键字/正则) 排除代理解析 · **DNS 规则层** `advanced_dns.rules` (按域名选 cn 本地/remote 隧道解析 + `host` 静态 + `reject` 空答复, 与 fake-ip 无关、fakeip 关时也生效) · cn/remote 多上游 (cn 抢最快、remote 故障转移 + geoip 自动降级 cn) · 全局 fakeip 下国内非标端口连不上修复 (`auto_classify` 才是 fakeip 兼容的 geoip 分流)。含限速 WebUI 旋钮 + fakeip 反查 miss fail-fast。后续 v0.13.1 (ServerHello.random 每连接随机化 + geo 载入自检覆盖第三方) / v0.13.2 (移除废弃 `api` 段 + 全面刷新配置模板)。 |
-| **v0.12.0** | 2026-09-07 | **tcp-brutal 2.0 groups 适配**: 服务端按客户端 IP 分 group, 该客户端所有连接 (暖池+mux) 共享一个 brutal 总速率, 修此前每连接各设速率并发聚合 N× 超发。`TCP_BRUTAL_PARAMS` 12B→20B (+group_id) + `getsockopt(23302)≥0x020000` 探测, **v1 模块自动回落 per-socket**。**单一部署不变**: 只服务端装 brutal 2.0, 客户端不装照拿下载加速。附单隧道高 RTT 吞吐实机调查结论 (v0.12.1)。 |
-| **v0.11.0** | 2026-09-04 | **TLS 指纹捕获 + 回放**: `mirage tls-capture` CLI (一次性 SOCKS5 抓取代理) + `POST/GET /api/v1/tls/capture` 抓本机真浏览器 ClientHello 存成模板 (**不 phone-home**, 用实时真握手非联网拉取)。配 `client_hello_template` 让出站 fake-TLS **复刻该模板 JA3/JA4**, 仅替换 SNI(→camouflage_host)/session_id(token)/random(PFS 公钥) 三处动态字段, 变长 SNI 重编 server_name 扩展 + 修三层长度; 不配 = 内置 Chrome/FF/OkHttp 加权轮换 (保留)。移动端 (mirage-core) tokio 去 `full` 精简传递依赖。 |
-| **v0.10.0** | 2026-08-22 | **WebUI 全新看板 Mirage Console**: 界面重构 (侧栏切视图 + 暗/亮双主题 + Canvas 流量图, 对标 Linear/shadcn) + i18n 中/英 + 服务端/客户端分视图 + Admin 区。客户端 LAN 设备表按设备一键路由; 服务端域名排行·连接历史·已连客户端 (版本两端 opt-in 零指纹 + 一键屏蔽)。规则编辑器 dry_run 预检/进程分流/拖排。前端独立仓 Mirage-console (Vue3+TS+Vite)。后续 v0.10.1–0.10.8 补: 用户策略 device profiles · QUIC Salamander 混淆实验 · Android 内核 CI 交叉编译 · 前端对接契约 v1 全对齐 (P0–P3, 含 SSE 推流) · 架构原理图 (archify)。 |
-| **v0.9.4** | 2026-08-16 | **CI 回归哨兵**: 给"没人看的相对性能特征"补确定性/相对哨兵 —— UDP mux 容量不变量 (N 流散布到全 K 槽 + `MAX_FLOWS` 下限, 防 22.5× 带机量静默回归) · crypto AES/ChaCha 吞吐**比值** ≥1.3× (CI 实测 4.22×, 比值抗计时噪声) · brutal 收敛轨迹 (拥塞收敛 BDP±20% + 恢复回 ≥90% 满速)。均相对/行为门, 不上共享 runner 假报警。camouflage 模板拉取失败回落降 WARN (无外网服务端不再满屏 ERROR)。 |
-| **v0.9.3** | 2026-08-14 | **可选前向保密 (PFS)** + **供应链签名/容器**: 一次性 X25519 ECDH (公钥搭 fake-TLS random 字段交换, 零指纹变化 + 高位随机化抗指纹; `password‖ecdh` 混进 master; opt-in 两端同开, 失配 fail-closed) 补外部审计 #2 最大真安全缺口, install.sh 一键开关。cosign **keyless** 签 SHA256SUMS (bundle) + ghcr **多架构容器镜像** (buildx amd64/arm64, GITHUB_TOKEN, 镜像亦签名), 零密钥。审计尾单: start_proxy 巨石拆分 (753→400) · config 模板防漂移测试 (#7) · 版本歪斜诊断 (#8) · WG connect 同步失败 socket 泄漏修复。 |
-| **v0.9.2** | 2026-08-14 | **握手模板完整性修复**: 服务端只缓存含齐 `0x16+0x14+0x17` 三型的 camouflage 模板 (残模板回落恒完整 fallback), 修完整服务端↔客户端 (含轻量模式) 偶发 `read_exact tail timed out` 握手卡死。**外部审计便宜纯赚**: API 认证失败 per-IP 限流 (#3) · cargo-deny 供应链门禁 (#11, 抓出 anyhow RUSTSEC) · README 安全声明 (#1)。RTT/brutal 监控去阻塞 (spawn_blocking) + 调速抽纯函数 (#5) · 解析器 proptest (#12)。 |
-| **v0.9.1** | 2026-08-12 | **WireGuard 入站"干净设备"落地**: install.sh 菜单项 7 家庭 WireGuard 服务端 (内核 WG + eBPF 透明网关, 非 boringtun responder), 移动设备经家中网关代理零翻墙痕迹, 真机验证。§7 抗审查泄漏护甲测试 (T2/T4: fake-IP / 空 AAAA / block→NXDOMAIN) · clippy 安全子集清理。 |
-| **v0.9.0** | 2026-08-04 | **UDP 多路复用 (UDP mux)**: 透明 UDP 的 Mirage 流由"一流一隧道"改为多流按 flowkey 散列复用少量 (默认 K=4) 长命共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"带机量硬伤 (真机实测拐点 20→450, 22.5×)。协议加 `[0x01]` mux sentinel + 帧插 4B sid, 服务端 per-sid 连接式 egress socket (两流打同目标不串) + 单 AEAD writer cancel-safe; 客户端 K 条共享隧道持 Weak-pool 防热重载泄漏。`tuning.udp_mux` 门控默认关 (需两端同版), install.sh 装网关时询问。**外部审计 4 修**: WireGuard 隧道内 DNS 死代码接线 (config `dns` 此前被丢弃) · UDP mux 背压 (服务端 idle 对齐/饱和告警/客户端 sid 上限/首下行快拆) · DNS-over-TCP 响应校验 TXID+QR 防注入 · 常量时间比较统一 `subtle` (弃用 deprecated ring)。install.sh 修生成的服务端配置缺 direct 出站 (新版校验必需)。 |
-| **v0.8.1** | 2026-08-03 | **链式代理 (Chain Proxy)**: 统一出站流接口 `OutboundNode::connect(target)` (地基) · **Mirage-over-X** 套娃 (`underlying`: Mirage 隧道经另一出站拨号, Mirage-over-WG/双跳) · **Shadowsocks 入站** (网关接受 SS 客户端 SIP004, 惰性 salt 抗主动探测) · **Shadowsocks 出站 + SS-over-Mirage** (类 shadow-tls+ss: SS 骑 Mirage 隧道) · **geo 经隧道下载免配 SOCKS 入站** (进程内临时 SOCKS)。均经 Sonnet 多轮复核。 |
-| **v0.8.0** | 2026-08-02 | **TLS record padding** (协议层): 握手后前几条加密记录追加 TLS 1.3 原生零填充, 抹掉"包长序列"指纹 (抗 GFW ML 识别); 收端恒剥零 (兼容基座), 发端 `tuning.tls_padding` 门控 (默认关), 含抹除 server 首帧 TIME_SYNC 固定 10 字节。⚠️ 开启需两端同版。**外部审查加固**: DNS resolver `tcp://` 前缀解析修复 · outbound 循环组返 Result 不 panic · API token 常量时间比较改 `ring` + CSRF 重构进中间件 + `?token=` 限根路径 + `/api/rules` 写前结构化校验/dry-run · 抗审查威胁模型文档 + 泄漏守卫测试 · clippy 门禁。 |
-| **v0.7.0** | 2026-07-30 | **Cipher agility**: 两端有硬件 AES 加速时协商 **AES-256-GCM** (大流量 ~2x, 否则 ChaCha20); 全在加密信道内协商 + `rekey`, **ClientHello 一字不改 (TLS 指纹零触碰)**, 服务端 `tuning.cipher_agility` 门控。**IPv6 隧道传输**: 服务端 v6 监听 + 客户端连 v6 服务端 (`[v6]:port` 括号处理); 透明数据面 v6 epic 评估后否 (fake-IP+服务端远程解析已让客户端 v6 数据面不必要)。 |
-| **v0.6.9** | 2026-07-29 | **DNS 未分类域名自适应分流** (`auto_classify`): 灰域名按解析 IP 归属自动直连/代理 + TTL 学习, 可选 `verify_cn` 非阻塞交叉校验防污染。配置命名统一 snake_case (移除 `load-balance` 别名); 移除从未实现的 `advanced_dns.rules`; 4 路 Sonnet 全局审查加固。 |
-| **v0.6.8** | 2026-07-28 | **配置片段 Export/Import 闭环**: 支持交互式导出节点与规则 JSON 片段，支持 `subscribe` 导入本地文件合并；全局代码护栏加固。 |
-| **v0.6.7** | 2026-07-28 | **负载均衡组**: 新增 `load_balance` 出站组 (Round-Robin 分摊)；支持 URL 订阅批量导入；集成节点 GeoIP 区域判定与分组告警。 |
-| **v0.6.6** | 2026-07-27 | **进程名分流**: 支持按发起程序名路由 (`process_name`)；新增 `dump_tls` 会话指纹量化分析工具。 |
-| **v0.6.5** | 2026-07-27 | **DNS-over-TCP兜底**: 服务端可选 `dns_tcp_resolver`，彻底解决 VPS 屏蔽出口 UDP 导致的域名解析失败问题。 |
-| **v0.6.4** | 2026-07-26 | **智能网络质量探测**: 节点测活集成 HTTP 穿隧道端到端探测，联动 TCP RTT 揭露劣质出口节点。 |
-| **v0.6.1** | 2026-07-26 | **DNS 三件套重构**: 支持局域网 53 端口劫持；新增静态解析；新增 IPv4/IPv6 双栈返回控制。 |
-| **v0.6.0** | 2026-07-23 | **WireGuard 全面接入**: 客户端出站与服务端上游支持 WireGuard；修复 SOCKS5 UDP 绕过路由问题。 |
+| **v0.15.4** | 2026-10-17 | **无协议变更 (可单端升级)**: API 补齐 DNS rebinding 防护；`/api/users` 覆盖全部入站；按 IP 限速桶跨热重载保留；修复统计软链接与路径安全校验。 |
+| **v0.15.3** | 2026-10-16 | **无协议变更 (可单端升级)**: 伪装站主动探测防护（按需建连、新增 `tuning.client_hello_guard`）；补充版本兼容矩阵与迁移向导；rustls 安全修复；网关 UDP 接收缓冲调优至 4MB。 |
+| **v0.15.2** | 2026-10-04 | **无协议变更 (可单端升级)**: Release 首次包含实验性 **QUIC 传输** (`transport: "quic"`) 与定速模式；优化 quinn-proto 乱序上限至 8192 与 8MB 窗口；install.sh brutal 模块选项升级。 |
+| **v0.15.1** | 2026-10-02 | **无协议变更 (可单端升级)**: 新增 `mirage-rs config` 交互式配置管理；服务端日志降级保护隐私；QUIC UDP 快速失败与远程 DNS 走 QUIC 流；配置校验区分同端口 TCP/UDP。 |
+| **v0.15.0** | 2026-09-28 | **⚠️ 协议断代 (两端须同时升级)**: 双随机 master salt 派生与 token tag 绑定 random（消除重放与伪造）；PFS Elligator2 编码；ChaCha20 nonce 防复用；按用户限速与月度配额 (`rate_limit_kbps`/`quota_gb`)；QUIC 证书 SPKI 固定 (`quic_pin`)；出站防 SSRF (`allow_local_targets`)；凭据热重载实时吊销。 |
+| **v0.14.1** | 2026-09-26 | **纯服务端审计修复**: 配置文件与备份原子写以 0600 权限创建；API DNS rebinding 防护；XDP DNS 缓存淘汰清除；域名统计表与连接池内存泄漏修复。 |
+| **v0.14.0** | 2026-09-21 | **多用户凭据**: `mirage_server.users[]` 多用户独立口令与密钥隔离；用量统计与按人吊销；`/api/users` 管理接口对接 Mirage Console 用户管理页。 |
+| **v0.13.3** | 2026-09-21 | **热路径压榨**: recv 借用式解密消除每帧内存分配；send 双拷贝优化；rustls 安全漏洞修复。 |
+| **v0.13.0** | 2026-09-10 | **DNS 解析增强**: `fakeip.exclude` 域名排除；`advanced_dns.rules` 规则分流、静态解析与拦截；灰域名 `auto_classify` 自适应分类。 |
+| **v0.12.0** | 2026-09-07 | **tcp-brutal 2.0 groups 适配**: 服务端按客户端 IP 分组共享总速率，消除多连接超发；v1 内核模块自动回落兼容。 |
+| **v0.11.0** | 2026-09-04 | **TLS 指纹捕获与回放**: `mirage tls-capture` 与 API 捕获真实浏览器 ClientHello 存为模板，`client_hello_template` 精准复刻 JA3/JA4。 |
+| **v0.10.0** | 2026-08-22 | **WebUI Mirage Console**: 现代化双主题仪表盘、i18n 中英双语、分角色视图、可视化规则编辑器与 Admin 局域网设备管理。 |
+| **v0.9.4** | 2026-08-16 | **CI 回归哨兵**: 引入 UDP mux 容量不变量、AES/ChaCha 性能比值与 brutal 收敛轨迹等确定性守护测试。 |
+| **v0.9.3** | 2026-08-14 | **前向保密 (PFS) 与供应链签名**: 一次性 X25519 ECDH；cosign keyless 产物签名与 ghcr 多架构容器镜像；代码结构重构与防漂移测试。 |
+| **v0.9.2** | 2026-08-14 | **握手完整性修复**: 修复 camouflage 模板三型不齐导致的握手超时；补齐 API 认证限流与 cargo-deny 供应链门禁。 |
+| **v0.9.1** | 2026-08-12 | **WireGuard 干净设备接入**: install.sh 支持原生 WireGuard 接入透明网关，终端零翻墙痕迹；抗审查泄漏护甲测试。 |
+| **v0.9.0** | 2026-08-04 | **UDP 多路复用 (UDP mux)**: 透明 UDP 散列复用共享隧道突破并发瓶颈；补齐常量时间比对与 DNS-over-TCP 校验。 |
+| **v0.8.1** | 2026-08-03 | **链式代理**: 统一出站流接口 `OutboundNode::connect`；Mirage 嵌套与 Shadowsocks 双向中转支持。 |
+| **v0.8.0** | 2026-08-02 | **TLS 填充整形**: 握手后数据追加原生零填充抹除包长序列特征；外部审查防御加固与规则校验 API。 |
+| **v0.7.0** | 2026-07-30 | **Cipher Agility 与 IPv6 传输**: 硬件加速 AES-256-GCM 密闭协商；服务端 IPv6 监听与客户端 IPv6 拨号支持。 |
+| **v0.6.9** | 2026-07-29 | **灰域名自适应分流**: `auto_classify` 自动按解析 IP 归属分流与 TTL 学习；配置命名规范化。 |
+| **v0.6.8** | 2026-07-28 | **配置导入导出闭环**: 支持交互式导出节点与规则 JSON 片段，支持 `subscribe` 导入本地文件合并。 |
+| **v0.6.7** | 2026-07-28 | **负载均衡出站组**: 新增 `load_balance` 轮询组；订阅批量导入；集成 GeoIP 区域告警。 |
+| **v0.6.6** | 2026-07-27 | **进程名分流**: 支持按发起程序名分流 (`process_name`)；新增 `dump_tls` 指纹分析工具。 |
+| **v0.6.5** | 2026-07-27 | **DNS-over-TCP 兜底**: 服务端可选 `dns_tcp_resolver`，解决 VPS UDP 出口受阻导致的解析失败。 |
+| **v0.6.4** | 2026-07-26 | **网络质量探测**: 节点测活集成 HTTP 穿隧道端到端探测与 RTT 评估。 |
+| **v0.6.1** | 2026-07-26 | **DNS 增强**: 局域网 53 端口劫持；静态解析；IPv4/IPv6 双栈返回控制。 |
+| **v0.6.0** | 2026-07-23 | **WireGuard 全面接入**: 客户端出站与服务端上游支持 WireGuard；修复 SOCKS5 UDP 绕过。 |
 | **v0.5.0** | 早期 | 引入 Neon Pulse Dashboard 看板；重写 DNS 引擎支持 TTL 缓存。 |
-| **v0.4.5** | 早期 | 抗 DNS 风暴机制完善；TCP Brutal CC 优化定型；eBPF 透明网关正式成型。 |
+| **v0.4.5** | 早期 | 抗 DNS 风暴机制完善；TCP Brutal 拥塞控制定型；eBPF 透明网关正式成型。 |
 
 ---
+
 *"在数字迷雾中构筑坚不可摧的幻象。" —— Mirage-rs 团队*
