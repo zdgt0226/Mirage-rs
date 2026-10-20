@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### fix: 协议实现多模型审计 + Multi-Agent Debate 修复 (2026-10-19)
+
+Sonnet / Fable / Gemini (agy) / Opus 独立审计协议实现 (握手 token / 重放缓存 / 密钥派生 / AEAD 记录层 / 控制帧 / 中继收尾), 再经三轮辩论定方案。**无线上协议变更**, 新旧两端任意组合互通; Android 无需同步。密钥派生、nonce、rekey、方向分离、帧解析均核对无问题。
+
+- **重放缓存按凭据分区** (P2, `crypto/hello_auth.rs`): 原先全局一份、单桶满 10 万即对**所有用户** fail-closed; 持有任一口令的用户可自选时间戳与随机前缀铸造海量合法 token (QUIC 每流一个, 开流很便宜) 打满它, 让全体用户认证失败。现按口令派生的 scope 分区, 每凭据每 10s 桶上限 5 万 (5000 次认证/秒), 满了只拒该凭据; 元素改定长数组省去每条一次堆分配。
+- **`MirageStream` / `SsStream` 写后不 flush 会挂死** (P2, `proxy/mirage_stream.rs`, `proxy/ss_stream.rs`): `poll_write` 建好发送 future 就返回 Ready, 从不 poll 它。SS 入站 `write_all` 首包后直接进 `copy_bidirectional` 时首包永远发不出, 两端互等到空闲超时 (受影响: SS 入站经 Mirage / SS 出站、Mirage-over-X 链)。现建好即推进一次, 读路径顺带推进在途写, 写错误留到下次 write/flush 报出。
+- **下行截断不再伪装成正常结束** (P3, `crypto/aead.rs`, `proxy/handler.rs`, `mirage_server/tcp_relay.rs`): 原先任何隧道读错误 (含路径注入的 FIN/RST) 都给本地应用干净 FIN, 服务端在上游出错 / 超额 / 吊销 / 空闲超时时也照发 close_notify, 以 EOF 定界的明文协议会把残缺数据当完整。现在 close_notify 是带类型的错误 (`PeerCloseNotify`); 服务端只在上游**自己**干净 EOF 时发 (upload 先退出造成的 EOF 不算); 客户端只在收到 close_notify 时给本地 FIN, 否则对本地 RST。本地应用先结束写的正常收尾仍是 FIN。
+- **空内容记录被 `MirageStream` 当 EOF** (P3): 自定义 `tls_padding_scheme` 含 `lo=1` 时发端可能发出只有 inner type 的记录, 读端提前结束。现只有 close_notify 是 EOF。
+- **短口令启动提示** (P3, `config.rs`, `startup.rs`): ClientHello 的 token 可被抓包后离线逐个试口令 (改 KDF 要动协议, 不做), 服务端口令少于 16 个字符时启动打 WARN。不进 `semantic_issues` (否则 `mirage-rs config` 会拒绝写回现有配置)。README 安全声明补"PFS 不防口令被猜"。
+- `client_info` 版本表加 4096 条上限 (P3); 修正 `udp_relay.rs` 中"recv_data 是 cancel-safe"的错误注释。
+- 结论为不修: 不支持应用层 TCP 半关闭 (客户端分不清半关与全关, 按半关处理会复活僵尸连接, 已在 `tcp_relay.rs` 头注释写明); 记录头不进 AEAD AAD (篡改只会解密失败, 改要动协议); 服务端 `parse_tcp_target` 不限 target 长度 (仅已认证对端可达, 失败即断)。误报: 客户端 SOCKS-UDP 帧长 `as u16` 截断 (UDP 数据报上限使帧体 ≤65524)。
+- 留待下一轮: 上行方向截断时让上游看到 RST (需先让 `MirageStream::poll_shutdown`、DNS 转发等消费者正常结束时也发 close_notify, 否则误伤)。
+
 ## [v0.15.5] - 全库审计修复: 并发上限 / DNS 缓存与单飞 / QUIC 被拒退避 (2026-10-19)
 
 ### 升级须知

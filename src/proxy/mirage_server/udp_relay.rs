@@ -277,8 +277,10 @@ pub(super) async fn handle_udp_relay(
     // send_close_notify 又写一个 alert, 客户端 AEAD MAC 校验崩 → bad record mac.
     //
     // 修复: 用 watch 频道做协作式停止信号. 两 task 都 tokio::join! (而不是 select),
-    // select! 仅围绕 read 点 (recv_data / rx.recv 都是 cancel-safe), write 全部
-    // 在 select! 外面执行, 永远不会被中途打断. 任一方退出时 send(true), 另一方
+    // select! 仅围绕 read 点, write 全部在 select! 外面执行, 永远不会被中途打断.
+    // 注意 recv_data **不是** cancel-safe (头/体两段 read_exact, 中途取消会丢字节失步),
+    // 这里安全只因为它被取消后本会话立即退出、reader 不再复用 (rx.recv 才是真 cancel-safe).
+    // 任一方退出时 send(true), 另一方
     // 在下一次 read 边界 (changed() 返回) 检测到信号, 干净退出. 之后才 send_close_notify,
     // 此时绝无半截帧.
     let (stop_tx, _stop_rx_seed) = tokio::sync::watch::channel(false);

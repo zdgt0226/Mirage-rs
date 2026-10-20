@@ -1523,6 +1523,32 @@ impl Config {
         issues
     }
 
+    /// 短口令提示 (只打日志, 不进 [`Self::semantic_issues`] —— 后者会让 `mirage-rs config` 拒绝写回)。
+    ///
+    /// ClientHello 里的 token 可被被动观察者拿去离线逐个试口令 (单次快速哈希), 非 PFS 下猜中口令还能
+    /// 解开录下的会话; 改 KDF 要动线上协议, 所以只能靠口令本身足够长。内置生成器 (install.sh /
+    /// `mirage-rs config`) 都是 128 位随机口令, 这里只拦手填的短口令。按字符数计 (多字节字符口令按
+    /// 字节数会放过很短的口令)。
+    pub fn weak_password_warnings(&self) -> Vec<String> {
+        const MIN_PASSWORD_CHARS: usize = 16;
+        let mut out = Vec::new();
+        for ib in &self.inbounds {
+            if let InboundConfig::MirageServer { tag, password, users, .. } = ib {
+                let named = std::iter::once(("default", password.as_str()))
+                    .chain(users.iter().map(|u| (u.name.as_str(), u.password.as_str())));
+                for (name, pw) in named {
+                    if !pw.is_empty() && pw.chars().count() < MIN_PASSWORD_CHARS {
+                        out.push(format!(
+                            "mirage_server 入站 `{tag}` 的口令 ({name}) 少于 {MIN_PASSWORD_CHARS} 个字符, \
+                             可被抓包后离线猜解; 建议换成随机长口令 (如 `openssl rand -hex 16`)"
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// 语义校验: 语法没问题但逻辑不成立的配置。
     pub fn semantic_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
@@ -2607,6 +2633,22 @@ mod validation_tests {
               "port": 443, "password": "" }
         ]);
         assert!(has(&issues_of(&v), "任何人都能连"));
+    }
+
+    #[test]
+    fn weak_password_warnings_count_chars_and_skip_semantic_issues() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "0123456789abcdef",
+              "users": [ { "name": "alice", "password": "short" },
+                         { "name": "bob", "password": "口令口令口令口令口令口令" } ] }
+        ]);
+        let cfg: Config = serde_json::from_value(v.clone()).unwrap();
+        let w = cfg.weak_password_warnings();
+        assert_eq!(w.len(), 2, "16 字符主口令不报, alice 与 12 个汉字 (36 字节) 的 bob 都报: {w:?}");
+        assert!(w.iter().any(|m| m.contains("alice")) && w.iter().any(|m| m.contains("bob")));
+        assert!(!has(&issues_of(&v), "离线猜解"), "不得进 semantic_issues (会让 config 编辑器拒绝写回)");
     }
 
     #[test]

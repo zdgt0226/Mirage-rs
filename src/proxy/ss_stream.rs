@@ -34,6 +34,12 @@ pub struct SsStream {
     write: WriteState,
     read_buf: Vec<u8>,
     read_pos: usize,
+    /// poll_read 顺带驱动在途写时遇到的写错误, 留到下次 poll_write/poll_flush 报出。
+    write_err: Option<io::Error>,
+    /// 最近一次在 poll_write/poll_flush 处 Pending 的写方 waker。drive_write 用读方的 cx 推进写
+    /// future 会顶掉 socket 上登记的写方 waker; 读写分在两个 task 时, 写 future 在读路径完成后
+    /// 须由这里叫醒写方, 否则它会一直 Pending。
+    write_waker: Option<std::task::Waker>,
 }
 
 impl SsStream {
@@ -44,6 +50,24 @@ impl SsStream {
             write: WriteState::Idle(writer),
             read_buf: Vec::new(),
             read_pos: 0,
+            write_err: None,
+            write_waker: None,
+        }
+    }
+
+    /// 推进在途写 future 一步, 同 [`crate::proxy::mirage_stream`] 的 drive_write:
+    /// write_all 后不 flush 就转去读的调用方, 只有读路径会被 poll, 由它顺带把写推下去。
+    fn drive_write(&mut self, cx: &mut Context<'_>) {
+        if let WriteState::Busy(fut) = &mut self.write {
+            if let Poll::Ready((writer, res)) = fut.as_mut().poll(cx) {
+                self.write = WriteState::Idle(writer);
+                if let Err(e) = res {
+                    self.write_err = Some(e);
+                }
+                if let Some(w) = self.write_waker.take() {
+                    w.wake();
+                }
+            }
         }
     }
 }
@@ -55,6 +79,7 @@ impl AsyncRead for SsStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let me = &mut *self;
+        me.drive_write(cx);
         loop {
             if me.read_pos < me.read_buf.len() {
                 let remaining = &me.read_buf[me.read_pos..];
@@ -101,27 +126,39 @@ impl AsyncWrite for SsStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let me = &mut *self;
+        if let Some(e) = me.write_err.take() {
+            return Poll::Ready(Err(e));
+        }
         loop {
             match std::mem::replace(&mut me.write, WriteState::Poisoned) {
                 WriteState::Idle(mut writer) => {
                     let data = buf.to_vec();
                     let n = data.len();
-                    let fut: WriteFut = Box::pin(async move {
+                    let mut fut: WriteFut = Box::pin(async move {
                         let r = writer.write_all(&data).await;
                         (writer, r)
                     });
-                    me.write = WriteState::Busy(fut);
+                    // 立即推进一次; 未完成则留在 Busy, 由后续 poll_write / poll_flush / poll_read 驱动。
+                    match fut.as_mut().poll(cx) {
+                        Poll::Ready((writer, res)) => {
+                            me.write = WriteState::Idle(writer);
+                            res?;
+                        }
+                        Poll::Pending => me.write = WriteState::Busy(fut),
+                    }
                     return Poll::Ready(Ok(n));
                 }
                 WriteState::Busy(mut fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready((writer, res)) => {
                         me.write = WriteState::Idle(writer);
+                        me.write_waker = None;
                         if let Err(e) = res {
                             return Poll::Ready(Err(e));
                         }
                     }
                     Poll::Pending => {
                         me.write = WriteState::Busy(fut);
+                        me.write_waker = Some(cx.waker().clone());
                         return Poll::Pending;
                     }
                 },
@@ -132,6 +169,9 @@ impl AsyncWrite for SsStream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let me = &mut *self;
+        if let Some(e) = me.write_err.take() {
+            return Poll::Ready(Err(e));
+        }
         match std::mem::replace(&mut me.write, WriteState::Poisoned) {
             WriteState::Idle(writer) => {
                 me.write = WriteState::Idle(writer);
@@ -140,10 +180,12 @@ impl AsyncWrite for SsStream {
             WriteState::Busy(mut fut) => match fut.as_mut().poll(cx) {
                 Poll::Ready((writer, res)) => {
                     me.write = WriteState::Idle(writer);
+                    me.write_waker = None;
                     Poll::Ready(res)
                 }
                 Poll::Pending => {
                     me.write = WriteState::Busy(fut);
+                    me.write_waker = Some(cx.waker().clone());
                     Poll::Pending
                 }
             },

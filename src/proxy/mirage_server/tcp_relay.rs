@@ -13,6 +13,13 @@
 //! 强制关闭整个 upstream socket. 另一方的 read/write 立即返回 Err, 退出循环.
 //! 不用 tokio select! abort 是为了避免 cancel mid-write 导致协议层 AEAD 写入
 //! 半截后又写 close_notify, 客户端 bad record mac (见 udp_relay 同样的考量).
+//!
+//! 代价: **不支持应用层 TCP 半关闭**。客户端本地 `read()==0` 分不清"半关闭等响应"
+//! (`nc -N`、HTTP/1.0 式) 与"全关闭"(绝大多数), 收到 close_notify 后若只 SHUT_WR
+//! 继续下行, 全关闭 + 上游不主动关的连接会两端挂到 relay_idle —— 正是上面修掉的僵尸。
+//!
+//! close_notify 语义: 服务端只在上游干净 EOF 时发 (下行完整); 上游出错/超额/吊销/
+//! 空闲超时直接结束, 客户端读到裸 EOF 即判截断、对本地应用 RST 而非 FIN。
 
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -169,12 +176,18 @@ pub(super) async fn handle_tcp_relay(
         // 一次 send_data 送出大批 → CryptoWriter 里 BufWriter (alpha.23 加的)
         // 把多帧 syscall 合成一个大 write. 打破"读一片写一片"串行的碎片.
         let mut buf = vec![0u8; 65536];
+        let mut clean_eof = false;
         loop {
             if dn_auth.should_stop() {
                 break;
             }
             match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
-                Ok(Ok(0)) => break,
+                Ok(Ok(0)) => {
+                    // 上游自己 EOF 才算干净结束; fd 已被 upload 置 -1 说明这个 0 是 upload 退出
+                    // 时 SHUT_RDWR 造成的 (隧道上行被断/截断), 下行同样不完整。
+                    clean_eof = stop_fd_down.load(Ordering::SeqCst) >= 0;
+                    break;
+                }
                 Ok(Ok(n)) => {
                     let mut total = n;
                     // 贪婪收割: 非阻塞 try_read 继续填 buf 剩余空间, kernel 里有
@@ -204,10 +217,13 @@ pub(super) async fn handle_tcp_relay(
                 _ => break,
             }
         }
-        // 优雅通知客户端我们这边结束写 (走加密 close_notify alert).
-        // 此时 upload 协程还在 reader.recv_data 上, 客户端收到 close_notify
-        // 会优雅断开自己的 tunnel writer, upload 那边 recv_data 报错退出.
-        let _ = writer.send_close_notify().await;
+        // 只有上游干净 EOF 才发加密 close_notify —— 它是客户端判断"下行完整"的唯一依据
+        // (客户端据此给本地应用 FIN, 否则 RST)。上游出错 / 超额 / 吊销 / 空闲超时直接结束:
+        // writer 随本 future 结束而 drop, 隧道 TCP 写半关 (FIN), 客户端读到裸 EOF 即知被截断。
+        // 此时 upload 协程还在 reader.recv_data 上, 客户端断开后 upload 那边 recv_data 报错退出.
+        if clean_eof {
+            let _ = writer.send_close_notify().await;
+        }
         // 同时强制 shutdown upstream (上游已 EOF, 再 shutdown 是 idempotent),
         // 主要意义是: 若客户端忽视 close_notify 不断连接, upload 在 reader
         // 上仍阻塞, 此处再无能为力 (1800s 兜底). 但 upload 若是正在写 upstream,
@@ -304,12 +320,17 @@ async fn relay_via_shadowsocks(
     };
 
     let download = async move {
+        let mut clean_eof = false;
         loop {
             if limits.exhausted() {
                 break;
             }
             match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read_chunk()).await {
-                Ok(Ok(chunk)) if chunk.is_empty() => break, // 上游 EOF
+                Ok(Ok(chunk)) if chunk.is_empty() => {
+                    // 上游 EOF; fd 已被 upload 置 -1 则是 upload 退出时的 SHUT_RDWR 所致, 不算干净 (同直连路径)。
+                    clean_eof = stop_down.load(Ordering::SeqCst) >= 0;
+                    break;
+                }
                 Ok(Ok(chunk)) => {
                     if limits.charge(chunk.len(), false).await {
                         break; // 越过配额即断开
@@ -321,7 +342,9 @@ async fn relay_via_shadowsocks(
                 _ => break,
             }
         }
-        let _ = writer.send_close_notify().await;
+        if clean_eof {
+            let _ = writer.send_close_notify().await; // 只在干净 EOF 时发, 见直连路径
+        }
         shutdown_upstream(stop_down);
     };
 
@@ -387,6 +410,9 @@ async fn relay_via_wireguard(
     let closer = stream.closer();
     let (mut up_read, mut up_write) = tokio::io::split(stream);
     let (stop_up, stop_down) = (closer.clone(), closer);
+    // upload 已退出 (随后 abort 整条连接) → download 读到的 EOF 不是上游自己的结束, 不算干净。
+    let upload_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let upload_done_dn = upload_done.clone();
 
     if let Some(payload) = initial_payload {
         if !payload.is_empty() {
@@ -418,11 +444,13 @@ async fn relay_via_wireguard(
             }
         }
         // 中止整条连接, 叫醒可能正阻塞在读上的 download。
+        upload_done.store(true, Ordering::SeqCst);
         stop_up.abort();
     };
 
     let download = async move {
         let mut buf = vec![0u8; 32 * 1024];
+        let mut clean_eof = false;
         loop {
             if limits.exhausted() {
                 break;
@@ -433,7 +461,10 @@ async fn relay_via_wireguard(
             )
             .await
             {
-                Ok(Ok(0)) => break, // 上游 EOF
+                Ok(Ok(0)) => {
+                    clean_eof = !upload_done_dn.load(Ordering::SeqCst); // 上游 EOF
+                    break;
+                }
                 Ok(Ok(n)) => {
                     if limits.charge(n, false).await {
                         break; // 越过配额即断开
@@ -445,9 +476,112 @@ async fn relay_via_wireguard(
                 _ => break,
             }
         }
-        let _ = writer.send_close_notify().await;
+        if clean_eof {
+            let _ = writer.send_close_notify().await; // 只在干净 EOF 时发, 见直连路径
+        }
         stop_down.abort();
     };
 
     tokio::join!(upload, download);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::aead::{is_close_notify, CryptoReader, CryptoWriter};
+    use std::os::fd::AsRawFd;
+    use crate::proxy::tunnel::{TunnelRead, TunnelWrite};
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// 起直连中继: 返回客户端侧的加密读端 + 裸写半程 (服务端侧跑 handle_tcp_relay 到真上游 `target`)。
+    async fn spawn_relay(
+        target: String,
+    ) -> (CryptoReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf, tokio::task::JoinHandle<()>) {
+        let master = [0x42u8; 32];
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let reader = CryptoReader::new(TunnelRead::Tcp(r), &master, false);
+            let writer = CryptoWriter::new(TunnelWrite::Tcp(w), &master, false);
+            handle_tcp_relay(target, None, reader, writer, None, None, "default".into(), super::super::SessionAuth::unlimited(), true).await;
+        });
+        let c = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = c.into_split();
+        (CryptoReader::new(r, &master, true), w, relay)
+    }
+
+    /// 读到结束, 返回 (收到的数据, 结束是否为 close_notify)。
+    async fn read_until_end(r: &mut CryptoReader<tokio::net::tcp::OwnedReadHalf>) -> (Vec<u8>, bool) {
+        let mut got = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), r.recv_data()).await.expect("中继不应挂死") {
+                Ok(d) => got.extend_from_slice(&d),
+                Err(e) => return (got, is_close_notify(&e)),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_clean_eof_sends_close_notify() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            s.write_all(b"hello").await.unwrap();
+            // drop = FIN, 上游干净结束
+        });
+        let (mut cr, _cw, _relay) = spawn_relay(target).await;
+        let (got, clean) = read_until_end(&mut cr).await;
+        assert_eq!(got, b"hello");
+        assert!(clean, "上游干净 EOF 时服务端必须发 close_notify");
+    }
+
+    #[tokio::test]
+    async fn upstream_reset_does_not_send_close_notify() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            s.write_all(b"hello").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+            // SAFETY: s 持有该 fd; 参数为栈上 linger 结构体及其大小。
+            unsafe {
+                libc::setsockopt(
+                    s.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const libc::linger as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
+            drop(s); // SO_LINGER=0 → RST
+        });
+        let (mut cr, _cw, _relay) = spawn_relay(target).await;
+        let (got, clean) = read_until_end(&mut cr).await;
+        assert_eq!(got, b"hello");
+        assert!(!clean, "上游 RST 不是完整结束, 不得发 close_notify");
+    }
+
+    /// 隧道上行被截断 (客户端侧裸 FIN, 无 close_notify) → upload 退出 SHUT_RDWR 掐断下行;
+    /// 下行读到的 0 是自己造成的, 不能当上游干净 EOF 发 close_notify。
+    #[tokio::test]
+    async fn tunnel_upload_truncation_does_not_send_close_notify() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = up.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await; // 上游保持打开不说话
+            drop(s);
+        });
+        let (mut cr, mut cw, _relay) = spawn_relay(target).await;
+        tokio::time::sleep(Duration::from_millis(100)).await; // 等中继连上上游
+        cw.shutdown().await.unwrap(); // 裸 FIN, 无 close_notify
+        let (got, clean) = read_until_end(&mut cr).await;
+        assert!(got.is_empty());
+        assert!(!clean, "上行被截断时服务端不得发 close_notify");
+    }
 }

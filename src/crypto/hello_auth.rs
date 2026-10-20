@@ -80,7 +80,14 @@ pub const DEFAULT_AUTH_TS_TOLERANCE_SECS: u64 = 60;
 const REPLAY_BUCKET_SECS: u64 = 10;
 
 /// (high-water-mark bucket, bucket → 该桶已见 token 集)。见 `TokenReplayCache::seen`。
-type SeenBuckets = (u64, HashMap<u64, HashSet<Vec<u8>>>);
+type SeenBuckets = (u64, HashMap<u64, HashSet<[u8; 32]>>);
+
+/// 单个凭据单个桶 (10s) 最多记录的 token 数 —— 5000 次认证/秒/凭据, 远超正常用量 (含 CGNAT 后
+/// 多设备共用一个口令 + QUIC 每流一个 token 的突发)。满桶 fail-closed **只拒该凭据**: 缓存按凭据
+/// 分区 (见 [`replay_cache_for`]), 持有某个口令的用户自造海量合法 token 只能打满自己的分区,
+/// 不会让其他用户的认证被判重放。最坏内存 ≈ 每凭据 13 桶 × 50k × ~48B ≈ 30MB, 且只在该凭据
+/// 自己发起时出现。
+const REPLAY_BUCKET_CAP: usize = 50_000;
 
 pub struct TokenReplayCache {
     /// 淘汰参考用**单调递增的 hwm** 而非当前 token 桶 —— 否则重放一个旧 token 会把参考拉回、
@@ -103,7 +110,7 @@ impl TokenReplayCache {
 
     /// retain_buckets: 保留最近多少个桶 (由容差推导, 见 verify_session_token)。必须覆盖
     /// 整个 ±容差窗口, 否则窗口内的旧 token 被过早淘汰 → 重放漏检。
-    pub fn check_and_insert(&self, ts: u64, token: &[u8], retain_buckets: u64) -> bool {
+    pub fn check_and_insert(&self, ts: u64, token: &[u8; 32], retain_buckets: u64) -> bool {
         let current_bucket = ts / REPLAY_BUCKET_SECS;
         let mut guard = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         let (hwm, cache) = &mut *guard;
@@ -138,18 +145,16 @@ impl TokenReplayCache {
         cache.retain(|&k, _| hwm_val.saturating_sub(k) <= retain_buckets);
 
         let bucket = cache.entry(current_bucket).or_default();
-        if bucket.len() > 100_000 {
+        if bucket.len() >= REPLAY_BUCKET_CAP {
             // v0.4.5-alpha.7: fail-closed. 老版满桶时 return true (放行) 是"避免误
-            // 杀合法请求"取舍, 但攻击者可以 DDoS 拉满桶后无限重放合法 token, 让
-            // 重放防护完全失效. 现在满桶 → return false (拒绝) → 桶满期间合法 token
-            // 也会被误判重放, 但同时攻击者的重放也被拦, 保守安全大于可用性.
-            // 100k 桶 = 60 秒内 10 万个不同 token, 正常业务达不到这个量级,
-            // 只有 DDoS 才可能触发, 拒绝是对的.
-            tracing::warn!("ReplayCache bucket saturated at {} entries, denying (fail-closed)", bucket.len());
+            // 杀合法请求"取舍, 但攻击者可以拉满桶后无限重放合法 token, 让重放防护
+            // 完全失效. 现在满桶 → return false (拒绝). 能写入的只有 tag 校验通过的
+            // token (即持有该口令), 且缓存按凭据分区 —— 满桶只影响该凭据自己。
+            tracing::warn!("ReplayCache bucket saturated at {} entries, denying this credential (fail-closed)", bucket.len());
             return false;
         }
 
-        bucket.insert(token.to_vec())
+        bucket.insert(*token)
     }
 }
 
@@ -158,7 +163,18 @@ fn ts_within_tolerance(ts: u64, now: u64, tolerance_secs: u64) -> bool {
     now <= ts.saturating_add(tolerance_secs) && ts <= now.saturating_add(tolerance_secs)
 }
 
-static REPLAY_CACHE: OnceLock<TokenReplayCache> = OnceLock::new();
+/// 按凭据分区的重放缓存: 口令派生的 8B scope → 该凭据独立的 [`TokenReplayCache`]。
+/// 只在 tag 校验通过后才建分区, 未认证流量无法撑大此表; 分区数与配置过的口令数同量级
+/// (改口令后旧分区残留, 不清理)。
+static REPLAY_CACHES: OnceLock<Mutex<HashMap<[u8; 8], std::sync::Arc<TokenReplayCache>>>> = OnceLock::new();
+
+fn replay_cache_for(password: &str) -> std::sync::Arc<TokenReplayCache> {
+    let digest = Sha256::digest(password.as_bytes());
+    let mut scope = [0u8; 8];
+    scope.copy_from_slice(&digest[..8]);
+    let caches = REPLAY_CACHES.get_or_init(|| Mutex::new(HashMap::new()));
+    caches.lock().unwrap_or_else(|e| e.into_inner()).entry(scope).or_default().clone()
+}
 
 pub fn verify_session_token(
     password: &str,
@@ -198,8 +214,7 @@ pub fn verify_session_token(
     // 保留桶数覆盖整个 ±容差窗口: 最旧有效 token 桶 = (now-tol)/bucket, hwm 最高可被未来
     // 向 token 推到 (now+tol)/bucket → 需保留 2*tol/bucket 个桶, +2 余量抗桶边界量化。
     let retain_buckets = 2 * tolerance_secs / REPLAY_BUCKET_SECS + 2;
-    let cache = REPLAY_CACHE.get_or_init(TokenReplayCache::new);
-    if !cache.check_and_insert(ts, token, retain_buckets) {
+    if !replay_cache_for(password).check_and_insert(ts, token, retain_buckets) {
         return false; // Replay detected
     }
 
@@ -320,13 +335,20 @@ mod tolerance_tests {
 mod replay_tests {
     use super::*;
 
+    /// 测试用: 把短标签补零成 32B token。
+    fn tok(label: &[u8]) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        t[..label.len()].copy_from_slice(label);
+        t
+    }
+
     #[test]
     fn first_seen_ok_replay_denied() {
         let c = TokenReplayCache::new();
-        assert!(c.check_and_insert(1000, b"tok-a", 2), "首见应放行");
-        assert!(!c.check_and_insert(1000, b"tok-a", 2), "重放同 token 应拒绝");
+        assert!(c.check_and_insert(1000, &tok(b"tok-a"), 2), "首见应放行");
+        assert!(!c.check_and_insert(1000, &tok(b"tok-a"), 2), "重放同 token 应拒绝");
         // 不同 token 同桶各自独立
-        assert!(c.check_and_insert(1000, b"tok-b", 2));
+        assert!(c.check_and_insert(1000, &tok(b"tok-b"), 2));
     }
 
     #[test]
@@ -334,12 +356,12 @@ mod replay_tests {
         // 回归 F1: token1(桶100) 存入后, 一个更高桶的 token 推进 hwm, 旧 token 重放
         // 仍须被检出 (旧实现会因桶被淘汰而漏检)。
         let c = TokenReplayCache::new();
-        assert!(c.check_and_insert(1009, b"old", 2), "token1 首见");
+        assert!(c.check_and_insert(1009, &tok(b"old"), 2), "token1 首见");
         // ts=1020 → 桶 102, 把 hwm 推到 102 (旧代码此刻淘汰桶 100)
-        assert!(c.check_and_insert(1020, b"mid", 2));
+        assert!(c.check_and_insert(1020, &tok(b"mid"), 2));
         // token1 重放: 现在必须仍被检出为重放
         assert!(
-            !c.check_and_insert(1009, b"old", 2),
+            !c.check_and_insert(1009, &tok(b"old"), 2),
             "F1: 桶推进后旧 token 重放必须仍被检出"
         );
     }
@@ -349,27 +371,27 @@ mod replay_tests {
         // 超出 3 桶窗口的旧桶应被淘汰 (内存有界)。这类 token 早已被 ts 容忍窗口拒绝,
         // 淘汰后即便"重放"也无所谓 (ts 校验在 check_and_insert 之前已挡下)。
         let c = TokenReplayCache::new();
-        assert!(c.check_and_insert(1000, b"ancient", 2)); // 桶 100
+        assert!(c.check_and_insert(1000, &tok(b"ancient"), 2)); // 桶 100
         // hwm 推到 130 (桶 130), 桶 100 早已 < hwm-2 被淘汰
-        assert!(c.check_and_insert(1300, b"now", 2));
+        assert!(c.check_and_insert(1300, &tok(b"now"), 2));
         // 桶 100 已淘汰, 这里返回 true 只是证明桶确实被清 (内存有界); 真实场景 ts 校验已挡
-        assert!(c.check_and_insert(1000, b"ancient", 2));
+        assert!(c.check_and_insert(1000, &tok(b"ancient"), 2));
     }
 
     #[test]
     fn clock_rollback_resets_cache_and_detects_replay() {
         let c = TokenReplayCache::new();
         // 初始在桶 200 (ts = 2000), retain = 2 桶
-        assert!(c.check_and_insert(2000, b"future-tok", 2));
+        assert!(c.check_and_insert(2000, &tok(b"future-tok"), 2));
 
         // 时钟大幅回拨至桶 100 (ts = 1000): 100 + 2 < 200, 触发大幅回拨分支
         // 第一次插入新时代的 token: 应该放行 (清空旧缓存并重置 hwm 为 100)
-        assert!(c.check_and_insert(1000, b"tok-after-rollback", 2));
+        assert!(c.check_and_insert(1000, &tok(b"tok-after-rollback"), 2));
 
         // 同一 token 在回拨后第二次插入: 必须检出为重放 (返回 false)!
         // (旧实现中因为 hwm 仍为 200, 桶 100 在插入后立即被 retain(<=200-2) 淘汰, 导致重放检测失效)
         assert!(
-            !c.check_and_insert(1000, b"tok-after-rollback", 2),
+            !c.check_and_insert(1000, &tok(b"tok-after-rollback"), 2),
             "回拨后同一 token 第二次插入必须被拒 (重放检测正常生效)"
         );
     }
@@ -410,6 +432,51 @@ mod replay_tests {
         // verify_session_token (服务端鉴权) 使用 local_now_sec, 容差 60s,
         // 即使 TIME_OFFSET 达到 500s, 基于服务端真实时间的 token 依然通过校验!
         assert!(verify_session_token(pw, &token, &bind, 60), "服务端校验必须不受客户端 offset 污染");
+    }
+
+    /// 以指定 ts 手工铸 token (不依赖 TIME_OFFSET)。
+    fn token_at(pw: &str, ts: u64, bind: &[u8]) -> [u8; 32] {
+        let mut prefix = [0u8; 8];
+        rand::fill(&mut prefix);
+        let mask = ts_mask(pw, &prefix);
+        let ts_bytes = ts.to_be_bytes();
+        let mut token = [0u8; 32];
+        token[0..8].copy_from_slice(&prefix);
+        for i in 0..8 {
+            token[8 + i] = ts_bytes[i] ^ mask[i];
+        }
+        token[16..32].copy_from_slice(&poly1305_tag(pw.as_bytes(), &ts_bytes, &prefix, bind));
+        token
+    }
+
+    #[test]
+    fn bucket_cap_fails_closed() {
+        let c = TokenReplayCache::new();
+        for i in 0..REPLAY_BUCKET_CAP as u64 {
+            let mut t = [0u8; 32];
+            t[..8].copy_from_slice(&i.to_be_bytes());
+            assert!(c.check_and_insert(1000, &t, 2));
+        }
+        assert!(!c.check_and_insert(1000, &tok(b"one-more"), 2), "满桶必须 fail-closed");
+    }
+
+    /// 回归 (审计 D1): 一个凭据自造海量合法 token 打满自己的分区, 其他凭据的认证不受影响。
+    #[test]
+    fn saturating_one_credential_does_not_block_others() {
+        let bind = [0x31u8; 32];
+        let (pw_a, pw_b) = ("replay-scope-test-a", "replay-scope-test-b");
+        let ts = crate::time_sync::local_now_sec();
+        for _ in 0..REPLAY_BUCKET_CAP {
+            assert!(verify_session_token(pw_a, &token_at(pw_a, ts, &bind), &bind, 60));
+        }
+        assert!(
+            !verify_session_token(pw_a, &token_at(pw_a, ts, &bind), &bind, 60),
+            "A 的分区已满, A 的新 token 应被拒"
+        );
+        assert!(
+            verify_session_token(pw_b, &token_at(pw_b, ts, &bind), &bind, 60),
+            "A 打满自己的分区不得影响 B"
+        );
     }
 
     #[test]
