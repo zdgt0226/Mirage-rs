@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [v0.15.6] - 协议实现审计修复 + 依赖安全升级 (2026-10-26)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.0 ~ v0.15.5 两端互通, 可单端升级 (实机验证: 本版服务端 ↔ v0.15.5 客户端); Android 端无需同步。
+- 隧道下行被异常截断 (未收到 close_notify) 时, 新客户端对本地应用发 RST 而非 FIN, 以 EOF 定界的明文协议不再把残缺数据当完整; 正常结束不受影响。
+- 依赖升级修复 RUSTSEC-2026-0382 / 0383 / 0385 / 0386 (rustls-webpki、webpki-root-certs、ctutils、tokio)。
+
+### chore(deps): 依赖安全公告升级 (2026-10-26)
+
+cargo-deny 新增 4 条公告致 CI 供应链门禁失败, 仅 `cargo update -p`, 只动 `Cargo.lock`:
+- `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382, 证书校验可能接受被吊销信任的中间证书)
+- `webpki-root-certs` 1.0.7 → 1.0.11 (RUSTSEC-2026-0383, 内置根仍信任被吊销信任的 emSign 中间证书)
+- `ctutils` 0.4.2 → 0.4.6 (RUSTSEC-2026-0385, 掩码生成与 `u128` 比较非常数时间)
+- `tokio` 1.52.3 → 1.54.1 (RUSTSEC-2026-0386, `AsyncFd::new` 等违反 I/O 安全)
+
 ### fix: 协议实现多模型审计 + Multi-Agent Debate 修复 (2026-10-19)
 
 Sonnet / Fable / Gemini (agy) / Opus 独立审计协议实现 (握手 token / 重放缓存 / 密钥派生 / AEAD 记录层 / 控制帧 / 中继收尾), 再经三轮辩论定方案。**无线上协议变更**, 新旧两端任意组合互通; Android 无需同步。密钥派生、nonce、rekey、方向分离、帧解析均核对无问题。
