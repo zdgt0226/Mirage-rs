@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v0.15.6] - 协议实现审计修复 + 依赖安全升级 (2026-10-26)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.0 ~ v0.15.5 两端互通, 可单端升级 (实机验证: 本版服务端 ↔ v0.15.5 客户端); Android 端无需同步。
+- 隧道下行被异常截断 (未收到 close_notify) 时, 新客户端对本地应用发 RST 而非 FIN, 以 EOF 定界的明文协议不再把残缺数据当完整; 正常结束不受影响。
+- 依赖升级修复 RUSTSEC-2026-0382 / 0383 / 0385 / 0386 (rustls-webpki、webpki-root-certs、ctutils、tokio)。
+
 ### chore(deps): 依赖安全公告升级 (2026-10-26)
 
 cargo-deny 新增 4 条公告致 CI 供应链门禁失败, 仅 `cargo update -p`, 只动 `Cargo.lock`:
