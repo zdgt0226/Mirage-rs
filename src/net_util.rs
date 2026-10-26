@@ -1,5 +1,29 @@
 //! 网络地址小工具。
 
+/// 让 TCP socket 立即以 RST 收尾: `connect(AF_UNSPEC)` 断开连接 (Linux `tcp_disconnect`: 当场发
+/// RST, 阻塞在读/写上的另一半立即报错返回 —— 含卡在对端不读、发送缓冲已满的写)。失败时退回
+/// SO_LINGER=0 (fd 关闭时发 RST) + SHUT_RD (叫醒读, 读返回 0), 此时写半程不得正常 drop
+/// (tokio `OwnedWriteHalf` drop 会先 shutdown(Write) 发 FIN, 须 `forget()`)。调用方须保证 fd
+/// 仍被持有。用于转发被截断时: 以 EOF 定界的明文协议收到 FIN 会把残缺数据当完整结果。
+pub fn abort_socket(fd: std::os::fd::RawFd) {
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    // SAFETY: fd 由调用方持有的 TcpStream 半程保证有效; 参数为本栈上的结构体及其大小。
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+        let mut sa: libc::sockaddr = std::mem::zeroed();
+        sa.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+        if libc::connect(fd, &sa, std::mem::size_of::<libc::sockaddr>() as libc::socklen_t) != 0 {
+            libc::shutdown(fd, libc::SHUT_RD);
+        }
+    }
+}
+
 /// 拼 `host:port`, **IPv6 字面量自动加方括号** —— 裸 v6 直接 `format!("{}:{}")` 会产生
 /// 歧义串 (如 `2606::1:443` / `:::443`), 解析/bind/connect 都会失败。
 ///

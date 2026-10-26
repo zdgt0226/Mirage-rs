@@ -1617,6 +1617,9 @@ impl DnsForwarder {
             resp_buf[0] = req[0];
             resp_buf[1] = req[1];
         }
+
+        // 正常结束先发 close_notify: 服务端只在收到它时对上游 FIN, 否则按截断 RST 上游。
+        let _ = tunnel.writer.send_close_notify().await;
         
         Some(resp_buf)
     }

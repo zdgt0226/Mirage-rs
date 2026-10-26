@@ -8,6 +8,18 @@
 - 用 python3 原子改写 JSON (保留其余字段, 权限 600, 旧配置备份为 `.bak`); 完整版写到所有 TCP `mirage_server` 入站 (QUIC 入站不支持上游, 跳过), 写后过 `mirage-rs check`, 不通过自动还原。上游不热重载, 服务在运行时询问是否立即重启。
 - `tests/install_ui_test.sh` 新增 B5 (11 项) 覆盖改写 / 替换 / 移除 / 轻量版 / 无可配入站。
 
+### fix: 上行截断对称 + QUIC lean 异常收尾 + TCP 中继双向空闲超时 (2026-10-20)
+
+上一轮遗留的两条 P3 与一条 P2 (单向空闲超时), 改后经 Sonnet / Fable 独立复核再修。**无线上格式变更** (close_notify 早已存在, 只改"何时发 / 收到后怎么收尾"), 新老两端互通。
+
+- **上行截断不再伪装成正常结束** (`mirage_server/tcp_relay.rs`, `proxy/handler.rs`): 服务端原先 upload / download 任一方退出都 `SHUT_RDWR`, 上游看到 FIN —— 路径攻击者往隧道上行注入 FIN, 或下行先因超额 / 吊销 / 写隧道失败退出时, 目标会把残缺上传当完整。现只有 upload 收到 close_notify 或 download 读到上游自身干净 EOF 才对上游 FIN, 其余一律 RST (直连路径到目标; SS 上游路径只到 SS 服务端); upload 写半程一律 `forget()`, 免得 drop 时补发的 FIN 抢在 RST 之前; 写上游失败 (上游已断) 仍走 `SHUT_RDWR`, 不清接收队列, 上游已发出的早期响应 (如 413) 照常转给客户端。WG 上游一律 `abort()`, 既有行为未改。客户端本地应用 RST 时不再发 close_notify, 改为关隧道写方向 (`CryptoWriter::shutdown_transport`); 嵌套出站 (隧道骑在 `MirageStream` / `SsStream` 上) 的 `poll_shutdown` 只 flush 不关底层, 关写方向服务端看不到 EOF 会两端挂死, 故退回发 close_notify。
+- **RST 改为当场发出** (`net_util::abort_socket`, 由 `handler.rs` 的 `abort_local_socket` 移来供两端共用): 原先 SO_LINGER=0 + SHUT_RD 只叫醒读, 卡在满发送缓冲上的写叫不醒 (download 改为 abort 后 upload 可能挂在写上游); 改用 `connect(AF_UNSPEC)` (内核 `tcp_disconnect`) 立即发 RST, 读写两侧都报错返回, 失败才退回旧方案。
+- **QUIC lean 路径异常收尾** (`proxy/handler.rs`, `mirage_server/mod.rs`): quinn `SendStream` drop 会隐式 finish, 目标 RST / 超额 / 空闲等异常结束时客户端读到干净 EOF、给本地 FIN。现服务端泵交还半程与"是否经 EOF 正常结束", 异常时只对未正常结束的方向收尾 (RESET 流 / RST 目标), 已半关闭的完整方向不动; 客户端读到 RESET / 连接断 / 超时时 RST 本地, 本地应用 RST、下行截断或空闲超时后 RESET 上行流 (原先 finish)。半关闭语义不变。
+- DNS 隧道转发、健康检查、`mirage-rs test` 穿隧道探测正常结束时补发 close_notify, 免得新服务端把正常结束按截断 RST 上游。`MirageStream::poll_shutdown` 有意不发 (发了服务端会掐断下行, 破坏 SS 入站现有的半关闭); 进程内消费者不读到 EOF 就 drop 时上游会看到 RST, 无功能影响。新增 `SsWriter::into_inner`。
+- **TCP 中继改为双向共享空闲超时** (P2, `proxy/mod.rs`, `proxy/handler.rs`, `mirage_server/tcp_relay.rs`): 原先 Model-Y 两端中继循环 (直连 / SS / WG) 与 QUIC lean 客户端各自按单方向计 `relay_idle` (默认 1800s), 单向长传输 (HTTP/1.1 大文件下载、只收不发的 SSE/WebSocket) 超过 30 分钟静默方向超时退出即掐断整条连接。现通过 `IdleClock` 双向共享最后活跃时间, 两个方向都静默达 `relay_idle` 才断开; 等待中若另一方向有数据流动则按剩余时间继续等 (总空闲上界为 `relay_idle`, 不重新计满); 与 QUIC lean 服务端及 Android 端实现一致。
+- 兼容: 老客户端 / Android 正常结束都发 close_notify (本地 EOF、读错误、空闲), 新服务端对其仍是 FIN; 老客户端 DNS / 健康检查不发, 上游在响应已收完后看到 RST, 无功能影响。老服务端 + 新客户端: 关隧道写与 close_notify 在老服务端处理相同。Android 无需同步。
+- 测试: 新增工具单测 `test_idle_timeout_sustained_by_other_direction` / `test_idle_timeout_both_silent` / `test_idle_timeout_touch_once_remaining_wait` (双向共享活跃、两向全静默超时、按剩余时间等待; 换回单向 `timeout` 时第一、三项失败); 以下回归测试在旧代码上均失败: 单测 `tunnel_upload_truncation_reaches_upstream_as_reset` / `download_abnormal_exit_reaches_upstream_as_reset` / `tunnel_upload_clean_close_reaches_upstream_as_fin` / `abort_socket_wakes_reader_and_resets_peer` (加: 叫醒卡在满缓冲上的写、fd 未关时 RST 已发出); lite e2e `app_reset_reaches_target_as_reset`; QUIC e2e `quic_target_reset_reaches_app_as_reset` / `quic_app_reset_reaches_target_as_reset` / `quic_target_clean_close_reaches_app_as_fin` / `quic_app_half_close_still_gets_response`。
+
 ## [v0.15.6] - 协议实现审计修复 + 依赖安全升级 (2026-10-26)
 
 ### 升级须知

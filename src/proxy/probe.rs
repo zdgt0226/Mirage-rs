@@ -202,9 +202,12 @@ where
     let resp = timeout(dl, io)
         .await
         .map_err(|_| anyhow!("穿隧道 HTTP 探测超时"))??;
+    let ms = t.elapsed().as_millis() as u64;
+    // 正常结束发 close_notify, 否则服务端按截断 RST 上游。
+    let _ = writer.send_close_notify().await;
     // 收到像样的 HTTP 响应即算出口通 (非 HTTP 头 = 出口异常/被劫持)。
     if resp.starts_with(b"HTTP/") {
-        Ok(t.elapsed().as_millis() as u64)
+        Ok(ms)
     } else {
         Err(anyhow!("穿隧道响应非 HTTP (出口异常?)"))
     }
