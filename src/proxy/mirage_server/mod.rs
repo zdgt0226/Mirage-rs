@@ -14,6 +14,12 @@ mod camouflage_rtt;
 mod control;
 mod tcp_relay;
 pub(crate) mod udp_relay;
+pub mod server_router;
+
+pub use server_router::{
+    build_server_router_state, current_server_router_state, server_route, set_server_router_state,
+    ServerOutboundTarget, ServerRouteDecision, ServerRouterState,
+};
 
 // 供隧道 DNS 目标头回归测试直接调服务端真解析 (dns::server 测试用)。
 #[cfg(test)]
@@ -315,6 +321,33 @@ pub fn warn_egress_blocked(proto: &str, user: &str, target: &str) {
         proto,
         user,
         target
+    );
+}
+
+static WARNED_QUIC_UPSTREAM: LazyLock<Mutex<HashMap<(String, String), Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 记录 QUIC 命中非 direct 出站被拒的 warn 日志, 10s 内同一 (tag, target) 不重复刷屏。
+pub fn warn_quic_upstream_unsupported(tag: &str, target: &str) {
+    let now = Instant::now();
+    let mut map = match WARNED_QUIC_UPSTREAM.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(last) = map.get(&(tag.to_string(), target.to_string())) {
+        if now.duration_since(*last) < Duration::from_secs(10) {
+            return;
+        }
+    }
+    if map.len() >= WARNED_EGRESS_CAPACITY {
+        map.retain(|_, last| now.duration_since(*last) < Duration::from_secs(10));
+        if map.len() >= WARNED_EGRESS_CAPACITY {
+            map.clear();
+        }
+    }
+    map.insert((tag.to_string(), target.to_string()), now);
+    tracing::warn!(
+        "Mirage QUIC(lean): 目标 `{target}` 路由至上游出站 `{tag}`, 但 QUIC 传输暂不支持经上游出口转发, 拒绝该流 (建议改用 TCP 传输或调整路由)"
     );
 }
 
@@ -680,7 +713,9 @@ pub async fn start_server(
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
     allow_local_targets: bool,
+    inbound_tag: Option<String>,
 ) {
+    let ib_tag: Option<Arc<str>> = inbound_tag.map(|s| s.into());
     let listener = match TcpListener::bind(listen_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -790,9 +825,10 @@ pub async fn start_server(
                     drop(stream);
                     continue;
                 };
+                let ib_c = ib_tag.clone();
                 tokio::spawn(async move {
                     let _permit = permit; // 名额持到连接结束 (含握手失败 / 转发全程)
-                    handshake::handle_connection(stream, peer_addr, ip_guard, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets).await;
+                    handshake::handle_connection(stream, peer_addr, ip_guard, creds_c, cam, rtt, auth_ts_tolerance_secs, up, pfs, allow_local_targets, ib_c).await;
                 });
             }
             Err(e) => {
@@ -819,7 +855,9 @@ pub async fn start_quic_server(
     quic_obfs: Option<String>,
     quic_key_path: Option<&str>,
     allow_local_targets: bool,
+    inbound_tag: Option<String>,
 ) {
+    let ib_tag: Option<Arc<str>> = inbound_tag.map(|s| s.into());
     let addr: std::net::SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
@@ -885,6 +923,7 @@ pub async fn start_quic_server(
         let creds_c = creds.clone();
         let up = upstream.clone();
         let rt_limiter = runtime_limiter.clone();
+        let ib_tag_conn = ib_tag.clone();
         tokio::spawn(async move {
             let conn = match tokio::time::timeout(std::time::Duration::from_secs(10), incoming).await {
                 Ok(Ok(c)) => c,
@@ -950,6 +989,8 @@ pub async fn start_quic_server(
             };
             drop(guard);
 
+            let ib_tag_first = ib_tag_conn.clone();
+            let up_first = up.clone();
             tokio::spawn(async move {
                 relay_authenticated_quic_stream(
                     first_send,
@@ -959,6 +1000,8 @@ pub async fn start_quic_server(
                     first_session_auth,
                     allow_local_targets,
                     first_stream_guard,
+                    up_first,
+                    ib_tag_first,
                 )
                 .await;
             });
@@ -987,6 +1030,7 @@ pub async fn start_quic_server(
                         let up2 = up.clone();
                         let conn2 = conn.clone();
                         let fc = fail_count.clone();
+                        let ib_tag_sub = ib_tag_conn.clone();
                         tokio::spawn(async move {
                             handle_quic_stream_lean(
                                 send,
@@ -999,6 +1043,7 @@ pub async fn start_quic_server(
                                 conn2,
                                 fc,
                                 stream_guard,
+                                ib_tag_sub,
                             )
                             .await;
                         });
@@ -1121,11 +1166,8 @@ async fn handle_quic_stream_lean(
     conn: quinn::Connection,
     fail_count: Arc<std::sync::atomic::AtomicU32>,
     stream_guard: QuicStreamGuard,
+    inbound_tag: Option<Arc<str>>,
 ) {
-    if upstream.is_some() {
-        debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
-        return;
-    }
     let Some((user, session_auth)) = authenticate_quic_stream_token(
         &mut send,
         &mut recv,
@@ -1148,12 +1190,15 @@ async fn handle_quic_stream_lean(
         session_auth,
         allow_local_targets,
         stream_guard,
+        upstream,
+        inbound_tag,
     )
     .await;
 }
 
 /// 已完成 32B token 校验的 QUIC 流后续处理: 读取 `[2B len][target]` 并建立双向直连转发 (`_stream_guard` 随流生命周期释放)。
 #[cfg(feature = "quic")]
+#[allow(clippy::too_many_arguments)]
 async fn relay_authenticated_quic_stream(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -1162,6 +1207,8 @@ async fn relay_authenticated_quic_stream(
     session_auth: SessionAuth,
     allow_local_targets: bool,
     _stream_guard: QuicStreamGuard,
+    upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    inbound_tag: Option<Arc<str>>,
 ) {
     // 2. target: [2B len][host:port]
     let mut lenb = [0u8; 2];
@@ -1178,6 +1225,36 @@ async fn relay_authenticated_quic_stream(
         Ok(t) => t,
         Err(_) => return,
     };
+
+    // 选路判定: QUIC lean 路径直连照常, 命中非 direct 出站时拒绝并限频告警
+    let decision = server_route(
+        inbound_tag.as_deref(),
+        &target,
+        "tcp",
+        Some(peer_ip),
+        &user,
+        upstream.as_ref(),
+    )
+    .await;
+
+    // 显式 reset / stop: 直接 drop 会让 quinn 隐式 finish, 客户端应用看到的是"正常结束的空响应"。
+    match decision.target {
+        ServerOutboundTarget::Direct => {}
+        ServerOutboundTarget::Upstream(_) => {
+            warn_quic_upstream_unsupported(&decision.tag, &target);
+            let mut send = send;
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            return;
+        }
+        ServerOutboundTarget::Reject => {
+            let mut send = send;
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            return;
+        }
+    }
+
     // 3. 直连出口 (带 SSRF 过滤)
     let up = match crate::proxy::resolver::connect_smart_filtered(&target, |ip| {
         crate::net_util::egress_allowed(ip, allow_local_targets)
@@ -1193,7 +1270,7 @@ async fn relay_authenticated_quic_stream(
         }
     };
     let _conn = crate::monitor::register(
-        target.clone(), peer_ip.to_string(), "direct".to_string(), "quic", None, Some(peer_ip.to_string()), Some(user.clone()),
+        target.clone(), peer_ip.to_string(), decision.tag, "quic", None, Some(peer_ip.to_string()), Some(user.clone()),
     );
     // 4. 转发 (限速 + 配额计数)
     let (q_read, q_write) = tokio::io::split(crate::proxy::quic::QuicBiStream::new(send, recv));
@@ -1829,6 +1906,7 @@ mod quic_gate_tests {
                 None,
                 Some(&key_str),
                 true, // 允许回环目标: relay 测试的 echo 在 127.0.0.1
+                None,
             )
             .await;
         });

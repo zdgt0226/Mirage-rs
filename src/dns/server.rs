@@ -1325,6 +1325,7 @@ impl DnsForwarder {
             source_mac: None,
             inbound: Some(&self.inbound_tag),
             process_name: None, // DNS 查询: 无本机进程名维度
+            user: None,
         };
 
         let matched = st.router.route_matched(&routing_req);
@@ -1719,6 +1720,7 @@ mod tests {
                 None,
                 Some(&srv_key_path),
                 true, // 允许回环目标直连 (SSRF 白名单放开本地测试 DNS 桩)
+                None,
             ).await;
         });
 

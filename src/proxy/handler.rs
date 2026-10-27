@@ -227,6 +227,7 @@ pub async fn proxy_tcp_target(
         source_mac: None,
         inbound: inbound_tag.as_deref(),
         process_name: process_name.as_deref(),
+        user: None,
     };
     
     // 嗅到域名时**同时**带上域名与原始 IP: 域名让 domain_suffix/geosite 生效, IP 让

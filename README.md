@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.15.7-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.16.0-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -23,7 +23,7 @@
 * **可选前向保密 (PFS)**: 两端开启 `"pfs": true` 启用一次性 X25519 ECDH，公钥复用 fake-TLS random 字段交换，零指纹变化。
 * **多用户凭据与配额限速**: `mirage_server.users[]` 支持独立口令、流量/连接统计、独立限速 (`rate_limit_kbps`) 与按月配额 (`quota_gb`, `quota_reset_day`)。超额自动断连并回落伪装，API 动态管理。
 * **eBPF 透明网关**: 基于 `sk_lookup` / `tc_divert` 实现内核级透明代理，内置抗风暴 DNS 与 Fake-IP 加速；支持 Fake-IP ICMP echo 本地反射（LAN 客户端 ping 被代理域名可通）。无 eBPF 环境自动回落。
-* **全场景出站与中转**: 支持直连、WireGuard 与 Shadowsocks (SIP004/SIP022) 出站及上游中转。
+* **全场景出站与服务端路由**: 支持直连、WireGuard 与 Shadowsocks (SIP004/SIP022) 出站及多上游中转；服务端支持基于完整 RouterEngine 的出站选路（多上游分流与全局落地双模式、惰性域名解析、user 用户条件规则）与配置原子热重载。
 * **高维路由引擎**: 支持按域名、GeoIP/GeoSite、IP CIDR、进程名 (`process_name`)、源设备/网段 (`source_ip_cidr`) 分流。支持裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由。
 * **智能 DNS 解析**: Fake-IP 引擎（支持 `fakeip.exclude` 排除）+ DNS 规则层 (`advanced_dns.rules` 分流/静态解析/拦截) + 灰域名自适应分类 (`auto_classify`) + 可选局域网 53 端口劫持与 IP 版本策略。
 * **Geo 规则自动更新**: `geo_sources` 多源下载校验 + 文件变动监视热重载（新 `.dat` 落地即刻重建路由，无需重启）+ 完整性自检。
@@ -145,31 +145,90 @@ mirage-rs lite-client -c lite_client.json    # 本机
 
 ---
 
-### 中转站模式 (服务端接 Shadowsocks 上游)
+### 服务端出站与路由 (中转站与多落地)
 
-服务端可将解密后的流量通过 Shadowsocks 转发至上游出口，实现中转落地分流：
+Mirage 服务端顶层 `outbounds` 与 `routing` 完整生效，复用客户端的高性能 `RouterEngine`。无需额外全局开关，仅靠配置即可自然表达两种常见拓扑：
 
+```text
+客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(路由分流: Direct / SS / WG)──▶ 多上游出口 / 目标
 ```
-客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
-```
 
-部署服务端时 `install.sh` 会询问是否配置上游; 已部署的服务端可运行 `install.sh` 选 `9) 修改服务端上游出口 (中转 / 落地)`, 交互式配置、替换 (Shadowsocks / WireGuard) 或移除上游, 写入前经 `mirage-rs check` 校验 (不通过自动还原), 并提示重启生效 (上游不热重载)。也可手动在入站或轻量服务端配置中添加 `upstream`:
+- **模式一（直连为主，按规则分流到上游）**：`default_outbound: "direct"`，将特定流媒体、域名或指定用户路由至 Shadowsocks 或 WireGuard 落地机；
+- **模式二（全量走落地，特定流量拉回直连）**：`default_outbound: "<某上游 tag>"`，所有客户端流量默认经落地机出海，通过规则将特定流量拉回 direct 直连。
+
+#### 模式一配置示例 (直连为主 + 按规则分流)
 
 ```jsonc
-"upstream": {
-    "type": "shadowsocks",
-    "server": "1.2.3.4",
-    "server_port": 8388,
-    "password": "ss-password",
-    "method": "aes-256-gcm",    // SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305
-                                // SIP022: 2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm
-                                //         / 2022-blake3-chacha20-poly1305
-    "udp": "block"              // block(默认) | direct, 见下方说明
+{
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-hk",
+      "server": "192.0.2.10",
+      "server_port": 8388,
+      "password": "ss-password-16B",
+      "method": "aes-256-gcm",
+      "udp": "block"            // block(默认) | direct: SS UDP 未实现, 默认丢弃防从本机泄露
+    },
+    {
+      "type": "wireguard",
+      "tag": "wg-jp",
+      "endpoint": "192.0.2.20:51820",
+      "private_key": "<base64>",
+      "peer_public_key": "<base64>",
+      "address": "10.0.0.2/32"  // WG 出站 UDP 全量隧道转发
+    }
+  ],
+  "routing": {
+    "default_outbound": "direct",
+    "rules": [
+      { "outbound": "ss-hk", "geosite": ["netflix"] },
+      { "outbound": "wg-jp", "domain_suffix": ["jp.example"] },
+      { "outbound": "ss-hk", "user": ["vip-user"] }
+    ]
+  }
 }
 ```
 
-- **协议支持**: 支持 SIP004 AEAD 与 SIP022 (Shadowsocks 2022)，不支持已被废弃且易被探测的旧式流加密。SIP022 的 `password` 为 Base64 编码密钥（使用 `openssl rand -base64 32` 生成），长度错误将被 `mirage-rs check` 直接拦截。
-- ⚠️ **UDP 处理行为**: 仅代理 TCP 流量。因 Shadowsocks UDP 协议不同，`udp` 默认设为 `block`，避免 UDP 流量从本机直接泄露导致出口 IP 不一致（流媒体区域判定异常）。如确需直连出站可设为 `"udp": "direct"`（启动将告警）。
+#### 模式二配置示例 (全量走落地 + 特定流量拉回直连)
+
+```jsonc
+{
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    {
+      "type": "wireguard",
+      "tag": "wg-landing",
+      "endpoint": "192.0.2.30:51820",
+      "private_key": "<base64>",
+      "peer_public_key": "<base64>",
+      "address": "10.0.0.2/32"
+    }
+  ],
+  "routing": {
+    "default_outbound": "wg-landing",
+    "rules": [
+      { "outbound": "direct", "geoip": ["cn"] },
+      { "outbound": "direct", "domain_suffix": ["local.example"] },
+      { "outbound": "direct", "port": [22, 80, 443] }
+    ]
+  }
+}
+```
+
+#### 关键机制与运维要点
+
+- **选路优先级**: 单个入站上的旧 `upstream` 字段（按接入端口指定）享有最高优先级，**不经路由**（严格保持向后兼容）；否则走服务端路由；未配置 `routing` 段时等价于全部 direct。
+- **用户维度分流**: `Rule` 支持新增 `user: Vec<String>` 条件匹配命中的用户名（单用户固定为 "default"，多用户为各用户名，客户端无用户信息时不匹配）。
+- **域名惰性解析**: 仅当匹配到 IP 类规则（`ip_cidr` / `geoip`）且目标为域名时才会触发 DNS 解析，避免对常规域名做无意义前置解析。
+- **Fail-Closed 故障绝不回退**: 上游连接失败时直接报错断连，**绝不静默回退 direct**，避免悄悄换成中转机出口 IP 导致落地判定失败或泄露真实 IP。
+- **QUIC 传输行为**: QUIC 传输经路由若命中非 direct 出站将以限频告警直接拒绝该流（建议改用 TCP 传输或调整路由）。
+- **原子热重载**: 运行时修改 `outbounds` 与 `routing` 自动生效，通过 `ArcSwapOption` 原子替换，老连接维持，新连接即刻使用新配置，无需重启服务。
+- **管理与工具**:
+  - `install.sh` 主菜单 `9) 管理服务端出口与路由`：提供出站增删、设置默认出口、分流规则增删（支持多条件类型与目标出站选择）、旧入站 `upstream` 一键迁移至独立出站（原子改写、备份 `.bak`、`check -c` 闸门与热重载即时生效）。
+  - 主菜单 `5) 查看服务端节点信息`：若配置了 WG 出站，展示 endpoint、隧道内 IP 及通过 `mirage-rs wg-pubkey` 派生的本机公钥（隐藏私钥）。
+  - WireGuard 密钥工具：`mirage-rs wg-keygen [--psk]` 生成公私钥对与 PSK，`mirage-rs wg-pubkey` 从私钥推导公钥。
 
 ---
 
@@ -294,7 +353,7 @@ mirage-rs config -c config.json
 - [x] **TLS 仿真与抗识别**: TLS 1.3 ClientHello 字节级仿真（三 Profile 轮换 + 后量子 key_share）；指纹捕获与回放（`mirage tls-capture` 提取真浏览器指纹存入 `client_hello_template`）；定长填充整形 (`tls_padding_scheme` 抹除握手 burst 指纹）。
 - [x] **安全与认证体系**: 协议新鲜性加固（v0.15 断代：双随机 master salt 派生 + token tag 绑定 random，防重放与伪造）；可选前向保密 PFS（一次性 X25519 ECDH + Elligator2 编码消除特征）；入站认证（SOCKS5/HTTP 认证防开放代理）；外部审计清零（API 限流、供应链门禁、模板防漂移测试、版本歪斜诊断）。
 - [x] **多用户与配额限速**: `mirage_server.users[]` 多用户凭据与 per-user 密钥隔离；按用户独立限速 (`rate_limit_kbps`) 与按月流量配额 (`quota_gb`, `quota_reset_day`)，超额断连回落；`/api/users` 动态管理与凭据热重载吊销。
-- [x] **出站与中转接入**: 轻量模式 (`lite-server` / `lite-client`)；Shadowsocks 上游 (SIP004/SIP022)；WireGuard 出站与上游中转；统一出站流接口 (`OutboundNode::connect`)。
+- [x] **出站与中转接入**: 轻量模式 (`lite-server` / `lite-client`)；Shadowsocks 上游 (SIP004/SIP022)；WireGuard 出站与上游中转；统一出站流接口 (`OutboundNode::connect`)；**服务端出站与路由引擎**（顶层 `outbounds` 与 `routing` 生效、多上游分流/落地双模式、`user` 规则条件、配置原子热重载、WG 密钥生成工具）。
 - [x] **高维分流与 DNS**: 路由 inbound 维度、裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由；DNS 规则层 (`advanced_dns.rules` 分流/静态/拦截)；局域网 53 端口劫持与 IP 版本策略；进程名分流 (`process_name`)；灰域名自适应分类 (`auto_classify`)。
 - [x] **性能调优与架构**: Cipher agility 自动协商硬件加速 AES-256-GCM（`tuning.cipher_agility`）；UDP 多路复用 (`tuning.udp_mux` 突破并发带机量瓶颈)；IPv6 隧道传输支持；隧道 relay 缓冲调优 (上行 64KB buf + greedy `try_read`)。
 - [x] **运维工具与看板**: Web 看板 Mirage Console（双主题、中英双语、分角色视图、可视化规则编辑）；配置工具链 (`check` / `format` / `import` / `test` / `config`)；Geo 规则自动更新与热重载；CI 确定性回归哨兵；cosign keyless 供应链签名与多架构容器镜像。
@@ -331,6 +390,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.16.0** | 2026-10-27 | **无协议变更 (可单端升级)**: **服务端出站路由** —— 顶层 `outbounds` (direct / block / Shadowsocks / WireGuard, 可多个) 与 `routing` 在服务端生效，支持「默认直连 + 规则分流到上游」与「默认走落地 + 规则拉回直连」两种模式、按用户分流；出站与路由热重载；`wg-keygen` / `wg-pubkey`；`install.sh` 菜单 9 升级为「管理服务端出口与路由」。 |
 | **v0.15.7** | 2026-10-27 | **无协议变更 (可单端升级)**: 上行异常截断对上游发 RST；TCP 中继双向共享空闲超时 (单向长传输不再 30 分钟被掐)；QUIC lean 异常收尾；`install.sh` 新增「修改服务端上游出口」菜单。 |
 | **v0.15.6** | 2026-10-26 | **无协议变更 (可单端升级)**: 重放缓存按凭据分区 (单用户刷不满全体)；修复 SS 入站 / Mirage-over-X 首包挂死；下行异常截断对本地发 RST 不再伪装正常结束；依赖安全升级 (rustls-webpki / webpki-root-certs / ctutils / tokio)。 |
 | **v0.15.5** | 2026-10-19 | **无协议变更 (可单端升级)**: 服务端全局并发上限 + 单来源未认证上限（网关 / CGNAT 不受影响）；DNS 缓存按 DO/CD/EDNS 大小分维、上游单飞、响应 Question 校验；QUIC 客户端被拒退避；握手模板防多样性塌缩；修复 TCP 规则漏匹配 Shadowsocks 出站。 |

@@ -2,6 +2,69 @@
 
 ## [Unreleased]
 
+## [v0.16.0] - 服务端出站路由: 多上游分流 / 落地双模式 / 热重载 (2026-10-27)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.x 两端互通, 可单端升级 (实机验证: 本版服务端 ↔ v0.15.7 客户端); Android 端无需同步。
+- **服务端现在读取配置顶层的 `outbounds` 与 `routing`** (此前服务端忽略它们、一律直连)。由 `install.sh` 生成的服务端配置 (只有 `direct` 出站、默认直连) 行为不变。升级前建议先跑 `mirage-rs check -c <配置>`:
+  - 服务端配置里若残留从客户端抄来的 routing (引用 `mirage` 等服务端用不了的出站) 且没配任何 SS / WG 出站, 视为旧配置: 忽略 routing、全部直连, 启动时告警。
+  - 路由引用了**未定义**的出站 tag、或 `ip_cidr` 写法非法, 服务端会**启动失败**并报出具体问题 (此前会被静默忽略)。
+  - 同一进程既跑服务端又跑客户端的混合配置: 服务端只采用 `inbound` 限定到服务端入站的规则, 默认出站一律直连。
+- 入站上旧的 `upstream` 字段继续有效且优先于路由; 可用 `install.sh` 菜单 `9) 管理服务端出口与路由` 一键迁移成独立出站。
+- QUIC 传输的入站不支持经上游出口转发: 路由选到 SS / WG 出站的流会被拒绝并告警 (直连照常)。
+- 服务端的 `outbounds` / `routing` 改动**热重载生效, 无需重启**; 配置有误时热重载被拒绝并保留旧状态。入站监听端口等仍需重启。
+- 新增 `mirage-rs wg-keygen [--psk]` / `mirage-rs wg-pubkey`; `install.sh` 可自动生成 WG 私钥、PSK 与 SIP022 密码, 节点信息显示 WG 出站的本机公钥。
+
+### feat(server): 服务端出站路由、多上游分流与配置热重载 (2026-10-27)
+
+服务端现已完整支持出站路由与多上游分流，打破以往服务端只能在单个入站绑定单跳上游的限制，实现中转落地与多落地分流。
+
+- **服务端出站与路由引擎 (`src/proxy/mirage_server/server_router.rs`, `src/config.rs`)**:
+  - 服务端配置顶层 `outbounds` 生效，支持 `direct`、`block`（拒绝）、`shadowsocks`、`wireguard` 出站类型，允许多个出站并存；路由选到服务端不支持的出站（mirage / urltest 等）一律拒绝、绝不回落直连，纯服务端配置下 `check` 直接报错；Shadowsocks 出站新增 `udp: "block"` (默认) | `"direct"` 选项；WireGuard 出站 UDP 全量隧道转发。
+  - 服务端顶层 `routing` 生效，复用客户端 `RouterEngine`：
+    - 支持模式一（`default_outbound: "direct"`，按规则将部分流量分流到上游）；
+    - 支持模式二（`default_outbound: "<上游 tag>"`，全部流量走落地上游，通过规则将部分流量拉回 direct 直连）。
+  - 选路优先级：入站旧 `upstream` 字段优先（向后兼容，不经路由） > 服务端顶层 `routing` 规则 > 默认出站（无 `routing` 段时全部 direct）。
+  - 路由规则与请求扩展：`RoutingRequest` 与 `Rule` 新增 `user: Vec<String>` 条件匹配命中的用户名（单用户固定为 "default"，多用户为各用户名，客户端无用户信息时不匹配）。
+  - 域名惰性解析：路由匹配时仅当匹配到 IP 类规则（`ip_cidr` / `geoip`）且目标为域名时才触发 DNS 解析，不额外解析无关域名。
+  - 上游故障 fail-closed：上游连接失败直接阻断并不静默回落 direct，记录警告日志，避免泄露真实出口 IP。
+  - QUIC 传输限制（选项 A）：路由命中非 direct 出站时显式 reset 该流（不让客户端误以为是正常结束的空响应），并按 `(tag, target)` 限频记录 WARN 提示建议使用 TCP 传输或调整路由。
+  - UDP（非 mux）会话内按目标缓存选路结果，不再逐包跑一遍规则匹配。
+  - WebUI / Monitor 监控：出站流量按实际出站的 tag（如 `ss-up` / `wg-up` / `direct`）正确归属与上报。
+- **服务端热重载 (`src/config_watcher.rs`, `server_router.rs`)**:
+  - 运行时修改 `outbounds` 与 `routing` 自动生效，通过 `ArcSwapOption` 原子替换 `ServerRouterState` 与出站表（整份配置构建成功后才替换）；配置未变的上游出口复用旧实例（WG 出口若重建会以同一私钥另起会话，对端漫游后旧连接即断）；只有含 `mirage_server` 入站的配置才建服务端路由表（纯客户端不多占一份 geosite 内存）；已建连接沿用旧出口，新连接无缝使用新出口；重载失败保持旧配置并记录 error 日志。入站监听端口等监听级字段变动提示重启。
+- **配置校验增强 (`src/config.rs`)**:
+  - `mirage-rs check` 新增对规则引用未定义出站 tag、服务端 `default_outbound` 不存在、Shadowsocks `udp` 非法值的拦截报错；QUIC 入站 + 路由可能选到非 direct 出站告警提示（仅打 warn，不进入 `semantic_issues`）。
+- **WireGuard 密钥生成 CLI (`src/bin/mirage.rs`, `src/proxy/wg/mod.rs`)**:
+  - 新增 `mirage-rs wg-keygen [--psk]`：基于 `x25519-dalek` 生成 Base64 编码的私钥与公钥，可选生成 32 字节 PSK。
+  - 新增 `mirage-rs wg-pubkey`：从 stdin 读取 Base64 私钥推导并输出 Base64 公钥（格式与系统 `wg pubkey` 完全兼容）。
+  - 单测覆盖 RFC 7748 X25519 标准测试向量与 clamping 规范校验。
+- **一键脚本升级 (`install.sh`, `tests/install_ui_test.sh`)**:
+  - 主菜单第 9 项升级为「管理服务端出口与路由」：显示当前出站列表、默认出站、分流规则与旧入站 upstream；支持出站增删、设置默认出站、分流规则增删（支持 domain_suffix / geosite / geoip / ip_cidr / port / user 等）、旧入站 upstream 一键迁移为独立出站 + 按入站 tag 的前插规则（默认出站不变，其它入站行为不变）；部署服务端时上游写成独立出站并选择模式，生成配置不依赖 python3；原子改写、备份 `.bak`、`check -c` 闸门及热重载生效提示。
+  - 主菜单第 5 项「查看服务端节点信息」：当存在 WG 出站或 WG upstream 时，显示其 tag、endpoint、隧道内 IP 及通过 `wg-pubkey` 派生的本机公钥（隐藏私钥）。
+  - WG 上游引导（`ask_wg_upstream`）：支持自动生成密钥对（优先用 `mirage-rs wg-keygen`，退回 `wg genkey`）并醒目提示向服务端登记本机公钥；可选生成 PSK。
+  - SS 密码生成：支持 32/16 字节安全随机生成（openssl / python3 / /dev/urandom）。
+  - `tests/install_ui_test.sh`：更新 B5 并在 B5.12~B5.23 全面覆盖新菜单、增删出站/规则、迁移与热重载提示（49 项全 PASS）。
+- **多模型独立审计修复 (Sonnet / Fable / Gemini, 2026-10-27)**:
+  - 入站旧 WG `upstream` 只保留一份实例: 原先监听器与路由表各建一份, 同一私钥两个 WG 会话互踢; UDP (非 mux) 与 UDP 预检改读当前路由表, 热重载 / 迁移后立即生效。上游出口按配置指纹复用 (改 tag、迁移成独立出站也不另起会话), 新建的 WG 出口装表时即后台握手, 免得首批请求排队等握手超时。
+  - 热重载: 服务端路由引用未定义 / 服务端不可用的出站、非法 CIDR 一律构建失败, 整次热重载拒绝并保留旧状态 (原先坏路由照样装上, 或只跳过服务端表形成半新半旧状态却报成功); 冷启动同样报错退出。
+  - 升级兼容: 未配置任何上游出站的旧服务端配置, 路由有问题时按旧版行为全部直连 (不再因残留的客户端 routing 全部拒绝); 服务端 + 客户端混合配置只采用 `inbound` 限定到服务端入站的规则。
+  - UDP (非 mux) 重写出口选择: 主 socket 恒直连, WG 出口按 tag 懒建; 会话空闲以所有出口最后收包为准; 各出口独立的回包来源白名单; WG 目标走隧道内解析 (与 TCP / mux 一致); 修下行泵退出后会话不拆、WG 泵空闲退出后回包黑洞。
+  - 规则 `ip_cidr` 写裸 IP 时服务端也按 /32 处理 (原先被静默丢弃, 规则退化成匹配所有流量); `check` 新增非法 CIDR、服务端 SS 出站 `underlying` 不生效的提示; QUIC 告警不再把 `block` 说成上游。
+  - WG 出站新增 `udp` 字段 (`tunnel` 默认 / `block` / `direct`, 仅服务端语义), 旧入站 upstream 迁移后保留原 UDP 策略。
+  - `install.sh`: 菜单 9 的改动先写临时文件并 `check`, 通过才原子替换正式配置 (热重载不会先读到坏配置); 不允许覆盖或删除 `direct` 出站; 修正迁移 / 删除出站的提示文案; 部署时配置文件先建 600 再写入。
+- **复核修复 (Fable / Sonnet 复审, 2026-10-27)**:
+  - 「旧配置」降级收窄: 只有路由引用了服务端用不了的出站类型 (mirage / urltest 等, 即客户端抄来的 routing) 且没配任何 SS / WG 出站时才忽略 routing 全部直连; 未定义的出站 tag、非法 CIDR 一律报错 (只配 direct + block 的配置拼错 tag 不会让 block 规则悄悄失效)。
+  - 混合配置: 服务端默认出站一律直连; 只为服务端规则用到的出站建上游实例 (客户端的 WG 出站不会被服务端以同一私钥另起会话)。
+  - WG 出口只差 `udp` 策略时共用同一条隧道; 改 `udp` 策略热重载不重建会话。
+  - UDP (非 mux): WG 出口在锁外建立, 失败后 10s 冷却 (不再每包等握手超时拖住同会话的直连包); 回包任务订阅停止信号后先查一次 (收尾瞬间建出的任务不会泄露); 出口缓存键带实例 (热重载后同 tag 新配置不与旧隧道混用); 上行限速与配额放到选路之后, 被拒 / block 丢弃的包不计费。
+  - 服务端 SS 出站的 `underlying` 改为只告警 (原先作为 check 错误会挡住 install.sh 菜单的所有改动); `install.sh` 修 `set -e` 下迁移失败直接退出脚本、配置为软链接时被替换成普通文件。
+- **测试覆盖**:
+  - 路由单元测试：双模式、旧 upstream 优先、`user` 条件匹配、多上游分流、无 routing 段回退 direct、惰性解析断言、block / 不可用出站拒绝、热重载复用未变出口、纯客户端不建服务端路由表。
+  - 配置解析与 check 测试：非法 tag / 非法 SS udp / QUIC 路由警告等。
+  - 端到端集成测试 (`tests/test_server_routing_e2e.rs`)：本地 SS 上游服务器与 echo 服务器，验证模式一规则分流、模式二落地拉回直连、以及文件写入触发的动态热重载全流程。
+
 ## [v0.15.7] - 上行截断对称 + 中继双向空闲超时 + 服务端上游菜单 (2026-10-27)
 
 ### 升级须知

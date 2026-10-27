@@ -105,6 +105,7 @@ pub async fn handle_udp_associate_routed(
                 source_mac: None,
                 inbound: inbound_tag.as_deref(),
                 process_name: None, // UDP: 无本机进程名查询
+                user: None,
             });
 
             // ── 取或建该出站的 sink ──
@@ -436,6 +437,7 @@ mod tests {
                 protocol: vec![],
                 inbound: vec![],
                 process_name: vec![],
+                user: vec![],
             })
             .collect();
         let router = crate::router::RouterEngine::new(

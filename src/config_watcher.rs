@@ -128,6 +128,20 @@ impl ConfigWatcher {
         }
         
         let is_hot_reload = old_outbounds.is_some();
+
+        // 服务端出站表与路由 (只有服务端配置才建)。先建好, 整个 build_state 成功后再原子替换;
+        // 构建失败 (引用未定义出站等) 冷启动报错退出、热重载拒绝并保留旧状态。配置未变的上游
+        // 出口复用旧实例 (见 build_server_router_state)。
+        use crate::proxy::mirage_server::server_router as srv_router;
+        let srv_state = if srv_router::has_server_inbound(&config) {
+            let prev = srv_router::current_server_router_state();
+            // 失败一律整体失败 (热重载时外层保留整份旧状态): 只跳过服务端表、其余照换会形成
+            // 半新半旧的状态, 日志却报重载成功。
+            Some(Arc::new(srv_router::build_server_router_state(&config, geodata_dir, prev.as_deref())?))
+        } else {
+            None
+        };
+
         let outbounds = if let Some(old) = old_outbounds {
             info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
             // NOTE: Stateful components like pool/fake_ip_mapper are preserved during reload.
@@ -191,6 +205,7 @@ impl ConfigWatcher {
                 port: r.port,
                 inbound: r.inbound,
                 process_name: r.process_name,
+                user: r.user,
             });
         }
         
@@ -313,6 +328,10 @@ impl ConfigWatcher {
             apply_user_config_from_file(config_path);
         }
 
+        if let Some(st) = srv_state {
+            srv_router::set_server_router_state(st);
+            info!("服务端路由与出站表已就绪/已热重载更新");
+        }
         Ok(CoreState {
             router: Arc::new(router),
             outbounds,
@@ -1076,6 +1095,31 @@ mod leak_guard_tests {
 mod watcher_event_tests {
     use super::*;
 
+    /// 服务端配置的路由引用未定义出站: build_state 必须失败 (热重载据此保留整份旧状态,
+    /// 而不是把坏路由装上去让命中的流量全被拒)。
+    #[test]
+    fn server_build_state_rejects_dangling_outbound() {
+        let dir = std::env::temp_dir().join(format!("mirage_srvbad_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        let write = |rule_outbound: &str| {
+            std::fs::write(&cfg, format!(r#"{{
+                "inbounds": [ {{ "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" }} ],
+                "outbounds": [ {{ "type": "direct", "tag": "direct" }},
+                    {{ "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" }} ],
+                "routing": {{ "default_outbound": "direct", "rules": [ {{ "domain_suffix": ["a.example"], "outbound": "{rule_outbound}" }} ] }}
+            }}"#)).unwrap();
+        };
+        write("ss-up");
+        assert!(ConfigWatcher::build_state(cfg.to_str().unwrap(), dir.to_str().unwrap(), None).is_ok());
+        write("no-such-outbound");
+        assert!(
+            ConfigWatcher::build_state(cfg.to_str().unwrap(), dir.to_str().unwrap(), None).is_err(),
+            "引用未定义出站的服务端配置必须构建失败"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 规则 `ip_cidr` 写裸 IP 时按 /32 处理 (此前会被静默丢弃, 规则失效)。
     #[test]
     fn rule_ip_cidr_accepts_bare_ip() {
@@ -1097,6 +1141,7 @@ mod watcher_event_tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         };
         assert_eq!(st.router.route(req("192.0.2.5")), "block");
         assert_eq!(st.router.route(req("192.0.2.6")), "direct");

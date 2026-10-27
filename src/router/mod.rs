@@ -36,6 +36,9 @@ pub struct Rule {
     /// 进程名白名单 (comm, 精确匹配); 空 = 不限。仅对本机 (loopback) socks/mixed 入站
     /// 连接可判定 —— 透明/LAN 转发的连接进程在别的机器上, 无从取, 此维度不命中。
     pub process_name: Vec<String>,
+    /// 用户名白名单 (精确匹配); 空 = 不限。仅服务端多用户或已知用户连接可判定;
+    /// 客户端侧无用户信息时带 `user` 条件的规则一律不匹配 (同 inbound 语义)。
+    pub user: Vec<String>,
 }
 
 impl Rule {
@@ -93,6 +96,13 @@ impl Rule {
             // 同 inbound: 进程名未知 (非本机连接 / 查不到) 就不匹配, 不放宽。
             match req.process_name {
                 Some(name) if self.process_name.iter().any(|n| n == name) => {}
+                _ => return false,
+            }
+        }
+        if !self.user.is_empty() {
+            // 同 inbound: 用户信息未知 (客户端连接等) 就不匹配, 不放宽。
+            match req.user {
+                Some(u) if self.user.iter().any(|rule_user| rule_user == u) => {}
                 _ => return false,
             }
         }
@@ -235,6 +245,17 @@ struct RegexMatcher {
     pattern_to_rule_id: Vec<RuleId>,
 }
 
+/// 解析 ip_cidr / source_ip_cidr 列表: 接受 CIDR 与裸 IP (按 /32、/128)。返回第一个非法项。
+pub fn parse_ip_nets(list: &[String]) -> Result<Vec<IpNet>, String> {
+    list.iter()
+        .map(|s| {
+            s.parse::<IpNet>()
+                .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
+                .map_err(|_| s.clone())
+        })
+        .collect()
+}
+
 pub struct RouterEngine {
     domain_trie: DomainTrie,
     keyword_matcher: Option<KeywordMatcher>,
@@ -274,6 +295,20 @@ pub struct RoutingRequest<'a> {
     /// 发起连接的本机进程名 (comm)。仅本机 loopback 连接可查到; None = 未知,
     /// 带 `process_name` 条件的规则一律不匹配 (同 inbound 语义)。
     pub process_name: Option<&'a str>,
+    /// 命中的认证用户名 (服务端多用户, 单用户为 "default")。None = 未知/未提供,
+    /// 带 `user` 条件的规则一律不匹配 (同 inbound 语义)。
+    pub user: Option<&'a str>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum RouteDecision {
+    /// 目标为域名且尚未解析 IP, 在排除了不匹配的规则后, 遇到了包含 IP 过滤条件 (ip_cidr/geoip)
+    /// 且可能命中的规则。调用方应解析域名并将 IP 填入 `RoutingRequest.ip` 重新判定。
+    NeedIp,
+    /// 命中了明确的规则出站 tag。
+    Matched(OutboundTag),
+    /// 无规则命中, 选用默认出站 tag。
+    Default(OutboundTag),
 }
 
 impl RouterEngine {
@@ -552,6 +587,86 @@ impl RouterEngine {
         self.rule_table.iter().any(|r| !r.process_name.is_empty())
     }
 
+    /// 返回匹配指定域名的所有规则 ID（按升序去重）。
+    pub fn match_domain_rule_ids(&self, domain: &str) -> Vec<RuleId> {
+        let mut matched_domain_ids = Vec::new();
+        if let Some(ids) = self.exact_domain.get(domain) {
+            matched_domain_ids.extend(ids);
+        }
+        matched_domain_ids.extend(self.domain_trie.search(domain));
+        if let Some(matcher) = &self.keyword_matcher {
+            for mat in matcher.ac.find_iter(domain) {
+                let r_id = matcher.pattern_to_rule_id[mat.pattern().as_usize()];
+                matched_domain_ids.push(r_id);
+            }
+        }
+        if let Some(rmatcher) = &self.regex_matcher {
+            for mat_idx in rmatcher.set.matches(domain).into_iter() {
+                matched_domain_ids.push(rmatcher.pattern_to_rule_id[mat_idx]);
+            }
+        }
+        matched_domain_ids.sort_unstable();
+        matched_domain_ids.dedup();
+        matched_domain_ids
+    }
+
+    /// 延迟解析选路决策: 优先按域名规则匹配, 只有排在前面的规则包含 IP 条件且目标是域名时才要求解析 (`NeedIp`)。
+    pub fn route_decision(&self, req: &RoutingRequest) -> RouteDecision {
+        if req.ip.is_some() || req.domain.is_none() {
+            return match self.route_matched(req) {
+                Some(tag) => RouteDecision::Matched(tag),
+                None => {
+                    self.default_hits.fetch_add(1, Ordering::Relaxed);
+                    RouteDecision::Default(self.default_outbound.clone())
+                }
+            };
+        }
+
+        let domain = req.domain.unwrap();
+        let matched_domain_ids = self.match_domain_rule_ids(domain);
+
+        for (id, rule) in self.rule_table.iter().enumerate() {
+            if !rule.matches_port(req.port) || !rule.matches_extra(req) {
+                continue;
+            }
+
+            let domain_matched = matched_domain_ids.binary_search(&id).is_ok();
+
+            if rule.mode == "and" {
+                if rule.has_domain_filters() {
+                    if !domain_matched {
+                        continue;
+                    }
+                    if rule.has_ip_filters() {
+                        return RouteDecision::NeedIp;
+                    }
+                    self.hit_counts[id].fetch_add(1, Ordering::Relaxed);
+                    return RouteDecision::Matched(rule.outbound.clone());
+                } else if rule.has_ip_filters() {
+                    return RouteDecision::NeedIp;
+                } else {
+                    self.hit_counts[id].fetch_add(1, Ordering::Relaxed);
+                    return RouteDecision::Matched(rule.outbound.clone());
+                }
+            } else {
+                if domain_matched {
+                    self.hit_counts[id].fetch_add(1, Ordering::Relaxed);
+                    return RouteDecision::Matched(rule.outbound.clone());
+                }
+                if rule.has_ip_filters() {
+                    return RouteDecision::NeedIp;
+                }
+                if !rule.has_network_filters() {
+                    self.hit_counts[id].fetch_add(1, Ordering::Relaxed);
+                    return RouteDecision::Matched(rule.outbound.clone());
+                }
+            }
+        }
+
+        self.default_hits.fetch_add(1, Ordering::Relaxed);
+        RouteDecision::Default(self.default_outbound.clone())
+    }
+
     /// 命中即 default 的包装: route_matched 无命中时回落 default_outbound。
     pub fn route(&self, req: RoutingRequest) -> OutboundTag {
         self.route_matched(&req).unwrap_or_else(|| {
@@ -576,29 +691,7 @@ impl RouterEngine {
         let mut candidate_counts: std::collections::HashMap<RuleId, usize> = std::collections::HashMap::new();
 
         if let Some(domain) = req.domain {
-            let mut matched_domain_ids = Vec::new();
-            if let Some(ids) = self.exact_domain.get(domain) {
-                matched_domain_ids.extend(ids);
-            }
-            
-            matched_domain_ids.extend(self.domain_trie.search(domain));
-
-            if let Some(matcher) = &self.keyword_matcher {
-                for mat in matcher.ac.find_iter(domain) {
-                    let r_id = matcher.pattern_to_rule_id[mat.pattern().as_usize()];
-                    matched_domain_ids.push(r_id);
-                }
-            }
-            
-            if let Some(rmatcher) = &self.regex_matcher {
-                for mat_idx in rmatcher.set.matches(domain).into_iter() {
-                    matched_domain_ids.push(rmatcher.pattern_to_rule_id[mat_idx]);
-                }
-            }
-            
-            matched_domain_ids.sort_unstable();
-            matched_domain_ids.dedup();
-            for id in matched_domain_ids {
+            for id in self.match_domain_rule_ids(domain) {
                 *candidate_counts.entry(id).or_insert(0) += 1;
             }
         }
@@ -682,6 +775,7 @@ mod tests {
                 protocol: vec![],
                 inbound: vec![],
                 process_name: vec![],
+                user: vec![],
             },
             // Rule 1: direct cn
             Rule {
@@ -700,6 +794,7 @@ mod tests {
                 protocol: vec![],
                 inbound: vec![],
                 process_name: vec![],
+                user: vec![],
             },
             // Rule 2: proxy google
             Rule {
@@ -718,6 +813,7 @@ mod tests {
                 protocol: vec![],
                 inbound: vec![],
                 process_name: vec![],
+                user: vec![],
             },
             // Rule 3: proxy specific port
             Rule {
@@ -736,6 +832,7 @@ mod tests {
                 protocol: vec![],
                 inbound: vec![],
                 process_name: vec![],
+                user: vec![],
             },
         ];
 
@@ -756,6 +853,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "block");
 
@@ -769,6 +867,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "block");
 
@@ -782,6 +881,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "direct");
 
@@ -795,6 +895,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "direct");
 
@@ -808,6 +909,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "default");
 
@@ -821,6 +923,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "proxy_port");
 
@@ -834,6 +937,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "block");
 
@@ -847,6 +951,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         });
         assert_eq!(out, "block");
     }
@@ -868,6 +973,7 @@ mod tests {
             protocol: vec![],
             inbound: vec![],
             process_name: vec![],
+            user: vec![],
         }
     }
 
@@ -905,6 +1011,7 @@ mod tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         };
         // 命中规则 → Some
         assert_eq!(engine.route_matched(&req("1.2.3.5")).as_deref(), Some("proxy"));
@@ -936,6 +1043,7 @@ mod inbound_tests {
             protocol: vec![],
             inbound: inbound.into_iter().map(String::from).collect(),
             process_name: vec![],
+            user: vec![],
         }
     }
 
@@ -959,6 +1067,7 @@ mod inbound_tests {
             source_mac: None,
             inbound,
             process_name: None,
+            user: None,
         }
     }
 
@@ -1052,5 +1161,99 @@ mod inbound_tests {
     fn uses_process_name_flag() {
         assert!(engine(vec![rule_for_proc(0, "proxy", vec!["x"])]).uses_process_name());
         assert!(!engine(vec![rule_for_inbound(0, "proxy", vec![])]).uses_process_name());
+    }
+
+    fn rule_for_user(id: RuleId, outbound: &str, users: Vec<&str>) -> Rule {
+        let mut r = rule_for_inbound(id, outbound, vec![]);
+        r.user = users.into_iter().map(String::from).collect();
+        r
+    }
+
+    fn req_user<'a>(domain: &'a str, user: Option<&'a str>) -> RoutingRequest<'a> {
+        let mut q = req(domain, None);
+        q.user = user;
+        q
+    }
+
+    /// 用户名分流: alice 走 ss-a, bob 走 ss-b, default 走 direct。
+    #[test]
+    fn routes_by_user() {
+        let e = engine(vec![
+            rule_for_user(0, "ss-a", vec!["alice"]),
+            rule_for_user(1, "ss-b", vec!["bob"]),
+        ]);
+        assert_eq!(e.route(req_user("example.com", Some("alice"))), "ss-a");
+        assert_eq!(e.route(req_user("example.com", Some("bob"))), "ss-b");
+        assert_eq!(e.route(req_user("example.com", Some("charlie"))), "default", "其它用户走默认");
+    }
+
+    /// 信息缺失不猜: 客户端请求没有 user 维度 (None), 带 user 规则绝不命中。
+    #[test]
+    fn missing_user_never_matches_user_rule() {
+        let e = engine(vec![rule_for_user(0, "ss-a", vec!["alice"])]);
+        assert_eq!(e.route(req_user("example.com", None)), "default", "无用户信息绝不误命中");
+    }
+
+    /// route_decision 延迟解析测试:
+    /// 1. 域名规则命中在 IP 规则之前 -> 立即 Matched, 不返回 NeedIp;
+    /// 2. IP 规则排在前面且尚未排除 -> 返回 NeedIp; 填入 IP 后重新判定命中 IP 规则。
+    #[test]
+    fn route_decision_lazy_dns_resolution() {
+        let e = engine(vec![
+            // 规则 0: 域名规则 direct
+            Rule {
+                id: 0,
+                mode: "or".to_string(),
+                outbound: "direct".to_string(),
+                domain_suffix: vec!["example.com".to_string()],
+                domain_keyword: vec![],
+                domain_regex: vec![],
+                geosite: vec![],
+                ip_cidr: vec![],
+                source_ip_cidr: vec![],
+                source_mac: vec![],
+                geoip: vec![],
+                port: vec![],
+                protocol: vec![],
+                inbound: vec![],
+                process_name: vec![],
+                user: vec![],
+            },
+            // 规则 1: IP 规则 ss-up
+            Rule {
+                id: 1,
+                mode: "or".to_string(),
+                outbound: "ss-up".to_string(),
+                domain_suffix: vec![],
+                domain_keyword: vec![],
+                domain_regex: vec![],
+                geosite: vec![],
+                ip_cidr: vec!["198.51.100.0/24".parse().unwrap()],
+                source_ip_cidr: vec![],
+                source_mac: vec![],
+                geoip: vec![],
+                port: vec![],
+                protocol: vec![],
+                inbound: vec![],
+                process_name: vec![],
+                user: vec![],
+            },
+        ]);
+
+        // 测试 1: example.com 命中规则 0 (域名规则), 不需要解析 IP
+        let req_domain_only = req("sub.example.com", None);
+        assert_eq!(e.route_decision(&req_domain_only), RouteDecision::Matched("direct".to_string()));
+
+        // 测试 2: other.org 未命中规则 0, 遇到规则 1 (IP 规则), 返回 NeedIp
+        let mut req_ip_rule = req("other.org", None);
+        assert_eq!(e.route_decision(&req_ip_rule), RouteDecision::NeedIp);
+
+        // 解析后填入 IP 命中规则 1
+        req_ip_rule.ip = Some("198.51.100.22".parse().unwrap());
+        assert_eq!(e.route_decision(&req_ip_rule), RouteDecision::Matched("ss-up".to_string()));
+
+        // 解析后填入外部 IP 未命中规则 1 -> Default
+        req_ip_rule.ip = Some("203.0.113.88".parse().unwrap());
+        assert_eq!(e.route_decision(&req_ip_rule), RouteDecision::Default("default".to_string()));
     }
 }

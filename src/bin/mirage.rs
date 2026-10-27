@@ -54,6 +54,16 @@ enum Mode {
         #[arg(short, long, default_value = "config_server.json")]
         config: String,
     },
+    /// 生成 WireGuard 密钥对 (输出 private_key 和 public_key, 可选 --psk 附带 preshared_key)
+    #[command(name = "wg-keygen")]
+    WgKeygen {
+        /// 同时生成 32 字节预共享密钥 (preshared_key)
+        #[arg(long)]
+        psk: bool,
+    },
+    /// 从 stdin 读取一个 base64 编码的 WireGuard 私钥并输出对应公钥 (格式与 wg pubkey 一致)
+    #[command(name = "wg-pubkey")]
+    WgPubkey,
     /// 交互式修改配置文件并协助生效 (节点管理 / 协议参数 / 用户凭据 / 热重载与重启提示)
     Config {
         /// Path to configuration file
@@ -228,16 +238,23 @@ fn run_check(path: &str) -> i32 {
             eprintln!("  (JSON 语法错误, 或字段类型/结构与 schema 不符)");
             1
         }
-        Ok((_, issues)) if issues.is_empty() => {
-            println!("✓ {path} 校验通过 (无未知字段, 引用完整)");
-            0
-        }
-        Ok((_, issues)) => {
-            eprintln!("✗ {path} 发现 {} 个问题:", issues.len());
-            for i in &issues {
-                eprintln!("  · {i}");
+        Ok((cfg, issues)) => {
+            for w in cfg.weak_password_warnings() {
+                eprintln!("  ⚠️  {w}");
             }
-            1
+            for w in cfg.server_routing_warnings() {
+                eprintln!("  ⚠️  {w}");
+            }
+            if issues.is_empty() {
+                println!("✓ {path} 校验通过 (无未知字段, 引用完整)");
+                0
+            } else {
+                eprintln!("✗ {path} 发现 {} 个问题:", issues.len());
+                for i in &issues {
+                    eprintln!("  · {i}");
+                }
+                1
+            }
         }
     }
 }
@@ -318,6 +335,46 @@ fn run_quic_pin(config_path: &str) -> i32 {
 fn run_quic_pin(_config_path: &str) -> i32 {
     eprintln!("✗ quic-pin 子命令需要以 `--features quic` 编译");
     1
+}
+
+fn run_wg_keygen(psk: bool) -> i32 {
+    let (priv_k, pub_k) = mirage_rs::proxy::wg::generate_wg_keypair();
+    let priv_b64 = mirage_rs::proxy::wg::encode_wg_key(&priv_k);
+    let pub_b64 = mirage_rs::proxy::wg::encode_wg_key(&pub_k);
+    println!("private_key: {priv_b64}");
+    println!("public_key: {pub_b64}");
+    if psk {
+        let psk_bytes = mirage_rs::proxy::wg::generate_psk();
+        let psk_b64 = mirage_rs::proxy::wg::encode_wg_key(&psk_bytes);
+        println!("preshared_key: {psk_b64}");
+    }
+    0
+}
+
+fn run_wg_pubkey() -> i32 {
+    use std::io::Read;
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        eprintln!("✗ 读取 stdin 失败: {e}");
+        return 1;
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        eprintln!("✗ 未从 stdin 读入有效私钥");
+        return 1;
+    }
+    match mirage_rs::proxy::wg::decode_wg_key(trimmed, "private_key") {
+        Ok(priv_bytes) => {
+            let pub_bytes = mirage_rs::proxy::wg::public_key_from_private(&priv_bytes);
+            let pub_b64 = mirage_rs::proxy::wg::encode_wg_key(&pub_bytes);
+            println!("{pub_b64}");
+            0
+        }
+        Err(e) => {
+            eprintln!("✗ {e}");
+            1
+        }
+    }
 }
 
 /// 收集配置里已有的出站 tag。
@@ -1550,6 +1607,8 @@ async fn main() -> anyhow::Result<()> {
         Mode::Format { config } => std::process::exit(run_format(config)),
         Mode::Export { config, out } => std::process::exit(run_export(config, out.as_deref())),
         Mode::QuicPin { config } => std::process::exit(run_quic_pin(config)),
+        Mode::WgKeygen { psk } => std::process::exit(run_wg_keygen(*psk)),
+        Mode::WgPubkey => std::process::exit(run_wg_pubkey()),
         _ => {}
     }
 

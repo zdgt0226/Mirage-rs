@@ -72,8 +72,11 @@ pub struct Config {
     /// 保留的 gzip 历史归档数。不设 = 默认 10。0 = 不保留归档 (滚动即删旧)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_keep_archives: Option<usize>,
+    #[serde(default)]
     pub inbounds: Vec<InboundConfig>,
+    #[serde(default = "default_outbounds")]
     pub outbounds: Vec<OutboundConfig>,
+    #[serde(default)]
     pub routing: RoutingConfig,
     pub advanced_dns: Option<AdvancedDnsConfig>,
     pub tuning: Option<TuningConfig>,
@@ -602,6 +605,9 @@ pub enum OutboundConfig {
         /// SS-over-X: SS 到 server 的连接经该出站拨号 (而非物理网卡)。不设 = 直连。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         underlying: Option<String>,
+        /// 配了上游时 UDP 怎么办。默认 `block`。仅服务端语义 (含义同 UpstreamConfig 的 udp 策略)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp: Option<UdpPolicy>,
     },
     /// WireGuard 出站: 选中的流量经 WG 隧道发往 peer, 不走 Mirage 隧道。
     ///
@@ -630,6 +636,10 @@ pub enum OutboundConfig {
         /// 配了则走本隧道的域名**经隧道解析**; 不配 = 本机解析 (原行为)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dns: Option<String>,
+        /// 仅服务端语义: 选到本出站的 UDP 怎么走。默认 `tunnel` (与 TCP 同出口); `block` 丢弃;
+        /// `direct` 从本机直发。客户端忽略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp: Option<UdpPolicy>,
     },
     Direct {
         tag: String,
@@ -725,7 +735,7 @@ impl std::fmt::Debug for OutboundConfig {
                     .field("quic_pin", quic_pin)
                     .finish()
             }
-            Self::Shadowsocks { tag, server, server_port, method, password: _, underlying } => {
+            Self::Shadowsocks { tag, server, server_port, method, password: _, underlying, udp } => {
                 f.debug_struct("Shadowsocks")
                     .field("tag", tag)
                     .field("server", server)
@@ -733,6 +743,7 @@ impl std::fmt::Debug for OutboundConfig {
                     .field("method", method)
                     .field("password", &"[REDACTED]")
                     .field("underlying", underlying)
+                    .field("udp", udp)
                     .finish()
             }
             Self::Wireguard {
@@ -745,6 +756,7 @@ impl std::fmt::Debug for OutboundConfig {
                 mtu,
                 persistent_keepalive,
                 dns,
+                udp,
             } => {
                 let psk_redacted = preshared_key.as_ref().map(|_| "[REDACTED]");
                 f.debug_struct("Wireguard")
@@ -757,6 +769,7 @@ impl std::fmt::Debug for OutboundConfig {
                     .field("mtu", mtu)
                     .field("persistent_keepalive", persistent_keepalive)
                     .field("dns", dns)
+                    .field("udp", udp)
                     .finish()
             }
             Self::Direct { tag } => f.debug_struct("Direct").field("tag", tag).finish(),
@@ -806,11 +819,13 @@ fn default_lb_strategy() -> String {
     "round-robin".to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RoutingConfig {
+    #[serde(default = "default_direct_str")]
     pub default_outbound: String,
     #[serde(default)]
     pub geo_alias: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub rules: Vec<RuleConfig>,
     /// 命名策略 (「不同用户匹配不同规则」): profile 名 → 一组规则 (各规则不写 source_ip_cidr,
     /// 由分配到该 profile 的设备网段注入)。见 device_profiles。build 时展开成扁平 source_ip_cidr
@@ -820,6 +835,28 @@ pub struct RoutingConfig {
     /// 设备 (源网段) → profile 分配。命中的连接先走该 profile 的规则, 未命中再落全局 rules → default。
     #[serde(default)]
     pub device_profiles: Vec<DeviceProfile>,
+}
+
+fn default_direct_str() -> String {
+    "direct".to_string()
+}
+
+fn default_outbounds() -> Vec<OutboundConfig> {
+    vec![OutboundConfig::Direct {
+        tag: "direct".to_string(),
+    }]
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            default_outbound: default_direct_str(),
+            geo_alias: std::collections::HashMap::new(),
+            rules: Vec::new(),
+            profiles: std::collections::HashMap::new(),
+            device_profiles: Vec::new(),
+        }
+    }
 }
 
 /// 把一组设备/源网段绑定到某命名 profile。
@@ -892,6 +929,10 @@ pub struct RuleConfig {
     /// 无从取, 带此条件的规则对它们不命中。不写 = 不限进程。
     #[serde(default, deserialize_with = "one_or_many")]
     pub process_name: Vec<String>,
+    /// 按**用户名**精确匹配 —— 服务端多用户模式下认出认证的用户名 (单用户为 "default")。
+    /// 客户端侧没有用户信息时带 `user` 条件的规则一律不匹配 (同 `inbound` 语义)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub user: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1549,6 +1590,71 @@ impl Config {
         out
     }
 
+    /// 服务端配置的提示类问题 (QUIC 入站路由至上游、服务端不生效的字段): 只打告警, 不进
+    /// [`Self::semantic_issues`] —— 后者会让 `check` 失败、`mirage-rs config` 拒绝写回。
+    pub fn server_routing_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let quic_inbounds: Vec<&str> = self
+            .inbounds
+            .iter()
+            .filter_map(|ib| {
+                if let InboundConfig::MirageServer { tag, transport, .. } = ib {
+                    if *transport == Transport::Quic {
+                        return Some(tag.as_str());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        // 纯服务端配置里 SS 出站的 underlying 不生效 (服务端直接拨 SS 服务器)。只提示: 无害, 而进
+        // semantic_issues 会让 check 失败、install.sh 菜单的任何改动都被拒。
+        let server_only = !self.inbounds.is_empty()
+            && self.inbounds.iter().all(|ib| matches!(ib, InboundConfig::MirageServer { .. }));
+        if server_only {
+            for ob in &self.outbounds {
+                if let OutboundConfig::Shadowsocks { tag, underlying: Some(_), .. } = ob {
+                    warnings.push(format!(
+                        "shadowsocks 出站 `{tag}` 的 underlying 在服务端不生效 (服务端直接拨 SS 服务器), 可删除该字段"
+                    ));
+                }
+            }
+        }
+
+        if quic_inbounds.is_empty() {
+            return warnings;
+        }
+
+        // 只有真正的上游出口 (shadowsocks / wireguard) 才是"QUIC 不支持"; block 在 QUIC 上照常拒绝,
+        // mirage / urltest 等服务端本就不可用, 另有 issue 报。
+        let is_non_direct = |tag: &str| -> bool {
+            self.outbounds.iter().any(|ob| match ob {
+                OutboundConfig::Shadowsocks { tag: t, .. } | OutboundConfig::Wireguard { tag: t, .. } => t == tag,
+                _ => false,
+            })
+        };
+
+        for q_tag in &quic_inbounds {
+            if is_non_direct(&self.routing.default_outbound) {
+                warnings.push(format!(
+                    "入站 `{q_tag}` 采用 QUIC 传输, 但 default_outbound `{}` 为非 direct 出站: QUIC 传输暂不支持上游出口 (运行时将拒绝该流)",
+                    self.routing.default_outbound
+                ));
+            }
+            for (i, rule) in self.routing.rules.iter().enumerate() {
+                if is_non_direct(&rule.outbound)
+                    && (rule.inbound.is_empty() || rule.inbound.iter().any(|ib| ib == *q_tag))
+                {
+                    warnings.push(format!(
+                        "入站 `{q_tag}` 采用 QUIC 传输, 规则[{i}]将其导向非 direct 出站 `{}`: QUIC 传输暂不支持上游出口 (运行时将拒绝该流)",
+                        rule.outbound
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
     /// 语义校验: 语法没问题但逻辑不成立的配置。
     pub fn semantic_issues(&self) -> Vec<String> {
         let mut issues = Vec::new();
@@ -1638,6 +1744,43 @@ impl Config {
                 "routing.default_outbound = `{}` 不存在于 outbounds (未命中任何规则的流量将无法路由)",
                 self.routing.default_outbound
             ));
+        }
+
+        // 纯服务端配置 (只有 mirage_server 入站): 服务端只能走 direct / block / shadowsocks /
+        // wireguard 出站, 路由引用 mirage / urltest 等客户端出站时运行期只能拒绝, 这里提前报出。
+        let server_only = !self.inbounds.is_empty()
+            && self.inbounds.iter().all(|ib| matches!(ib, InboundConfig::MirageServer { .. }));
+        if server_only {
+            let server_usable = |t: &str| {
+                self.outbounds.iter().any(|ob| match ob {
+                    OutboundConfig::Direct { tag }
+                    | OutboundConfig::Block { tag }
+                    | OutboundConfig::Shadowsocks { tag, .. }
+                    | OutboundConfig::Wireguard { tag, .. } => tag == t,
+                    _ => false,
+                })
+            };
+            let mut refs: Vec<(String, &str)> = vec![("routing.default_outbound".into(), self.routing.default_outbound.as_str())];
+            for (i, rule) in self.routing.rules.iter().enumerate() {
+                refs.push((format!("routing.rules[{i}].outbound"), rule.outbound.as_str()));
+            }
+            for (field, t) in refs {
+                if known(t) && !server_usable(t) {
+                    issues.push(format!(
+                        "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站"
+                    ));
+                }
+            }
+        }
+
+        // 规则里的 ip_cidr / source_ip_cidr 必须是合法 CIDR 或 IP —— 否则该项被丢弃, 只剩这一个条件
+        // 的规则会退化成匹配所有流量。
+        for (i, rule) in self.routing.rules.iter().enumerate() {
+            for (field, list) in [("ip_cidr", &rule.ip_cidr), ("source_ip_cidr", &rule.source_ip_cidr)] {
+                if let Err(bad) = crate::router::parse_ip_nets(list) {
+                    issues.push(format!("routing.rules[{i}].{field} 含非法项 `{bad}` (应为 CIDR 或 IP)"));
+                }
+            }
         }
 
         // 每条规则引用的出站必须存在 —— 否则该规则形同虚设, 且是静默的
@@ -1769,16 +1912,42 @@ impl Config {
                     }
                 }
             }
-            // Shadowsocks 出站: method 合法性 + underlying 存在/非自引用。
-            if let OutboundConfig::Shadowsocks { tag, server, password, method, underlying, .. } = ob {
+            // Shadowsocks 出站: method 合法性 + underlying 存在/非自引用 + udp 策略。
+            if let OutboundConfig::Shadowsocks {
+                tag,
+                server,
+                server_port,
+                password,
+                method,
+                underlying,
+                udp,
+            } = ob
+            {
                 if server.trim().is_empty() {
                     issues.push(format!("shadowsocks 出站 `{tag}` 的 server 为空"));
+                }
+                if *server_port == 0 {
+                    issues.push(format!("shadowsocks 出站 `{tag}` 的 server_port 为 0"));
                 }
                 if password.is_empty() {
                     issues.push(format!("shadowsocks 出站 `{tag}` 的 password 为空"));
                 }
-                if let Err(e) = crate::proxy::shadowsocks::Method::parse(method) {
-                    issues.push(format!("shadowsocks 出站 `{tag}` 的 method 非法: {e}"));
+                match crate::proxy::shadowsocks::Method::parse(method) {
+                    Ok(m) => {
+                        if m.is_2022() {
+                            if let Err(e) = crate::proxy::shadowsocks::decode_ss2022_psk(password, m.key_len()) {
+                                issues.push(format!("shadowsocks 出站 `{tag}` 的 password 非法: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        issues.push(format!("shadowsocks 出站 `{tag}` 的 method 非法: {e}"));
+                    }
+                }
+                if let Some(policy) = udp {
+                    if matches!(policy, UdpPolicy::Tunnel) {
+                        issues.push(format!("shadowsocks 出站 `{tag}` 的 udp 策略仅支持 block 或 direct (不支持 tunnel)"));
+                    }
                 }
                 if let Some(u) = underlying {
                     if u == tag {
@@ -2649,6 +2818,85 @@ mod validation_tests {
         assert_eq!(w.len(), 2, "16 字符主口令不报, alice 与 12 个汉字 (36 字节) 的 bob 都报: {w:?}");
         assert!(w.iter().any(|m| m.contains("alice")) && w.iter().any(|m| m.contains("bob")));
         assert!(!has(&issues_of(&v), "离线猜解"), "不得进 semantic_issues (会让 config 编辑器拒绝写回)");
+    }
+
+    #[test]
+    fn server_routing_unknown_outbound_and_default_caught() {
+        let mut v = base();
+        v["routing"]["default_outbound"] = serde_json::json!("nonexistent-outbound");
+        v["routing"]["rules"] = serde_json::json!([
+            { "domain_suffix": ["example.com"], "outbound": "unknown-tag" }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "routing.default_outbound = `nonexistent-outbound` 不存在于 outbounds"));
+        assert!(has(&is, "routing.rules[0].outbound = `unknown-tag` 不存在于 outbounds"));
+    }
+
+    #[test]
+    fn server_routing_rejects_client_only_outbound_types() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "test_password_placeholder" }
+        ]);
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "block", "tag": "reject" },
+            { "type": "mirage", "tag": "m", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" }
+        ]);
+        v["routing"]["default_outbound"] = serde_json::json!("direct");
+        v["routing"]["rules"] = serde_json::json!([
+            { "domain_suffix": ["a.example"], "outbound": "m" },
+            { "domain_suffix": ["b.example"], "outbound": "reject" }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "routing.rules[0].outbound = `m`: 服务端只支持"), "实际: {is:?}");
+        assert!(!has(&is, "routing.rules[1].outbound = `reject`: 服务端只支持"), "block 是服务端可用出站: {is:?}");
+    }
+
+    #[test]
+    fn ss_outbound_udp_policy_validation() {
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "shadowsocks", "tag": "ss-tunnel", "server": "192.0.2.1", "server_port": 8388,
+              "password": "sspassword12345", "method": "aes-128-gcm", "udp": "tunnel" }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "udp 策略仅支持 block 或 direct"), "实际: {is:?}");
+
+        // block 或 direct 合法
+        v["outbounds"][1]["udp"] = serde_json::json!("block");
+        assert!(issues_of(&v).is_empty(), "block 应合法: {:?}", issues_of(&v));
+
+        v["outbounds"][1]["udp"] = serde_json::json!("direct");
+        assert!(issues_of(&v).is_empty(), "direct 应合法: {:?}", issues_of(&v));
+    }
+
+    #[test]
+    fn server_routing_warnings_skip_semantic_issues() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv_quic", "listen": "0.0.0.0", "port": 443,
+              "password": "test_password_placeholder", "transport": "quic" }
+        ]);
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388,
+              "password": "sspassword12345", "method": "aes-128-gcm" }
+        ]);
+        v["routing"]["default_outbound"] = serde_json::json!("ss-up");
+        let cfg: Config = serde_json::from_value(v.clone()).unwrap();
+        let w = cfg.server_routing_warnings();
+        assert!(!w.is_empty(), "QUIC 入站配非 direct default 应出告警");
+        assert!(w[0].contains("QUIC 传输暂不支持上游出口"));
+        assert!(!has(&issues_of(&v), "QUIC 传输暂不支持上游出口"), "不得进 semantic_issues (告警类不阻断 config 写回)");
+        // block 出站不是"上游", 不应报 QUIC 不支持 (对照: 指向 ss-up 时会报)
+        v["outbounds"].as_array_mut().unwrap().push(serde_json::json!({ "type": "block", "tag": "block" }));
+        v["routing"]["default_outbound"] = serde_json::json!("direct");
+        v["routing"]["rules"] = serde_json::json!([{ "domain_suffix": ["x.example"], "outbound": "block" }]);
+        let cfg: Config = serde_json::from_value(v).unwrap();
+        assert!(cfg.server_routing_warnings().is_empty(), "block 不应被报成 QUIC 不支持上游");
     }
 
     #[test]

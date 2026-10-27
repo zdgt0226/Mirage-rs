@@ -14,6 +14,8 @@ use tracing::{debug, error};
 /// 导致 task/UdpSocket/64KB buf 僵尸泄露 (对齐 tcp_relay 的 1800s 兜底思路; UDP
 /// 流更短, 且客户端透明 UDP 自身 60s idle 即拆, 300s 只作服务端兜底不误杀活跃流)。
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// 非 mux UDP: WG 上游出口建立失败后的重试冷却。
+const WG_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// 白名单最大目标数 (防无限膨胀)
 pub(crate) const MAX_SENT_TARGETS: usize = 1024;
@@ -112,36 +114,61 @@ fn normalize_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
 ///
 /// `Direct` = 从本机 IP 发出去 (不配上游、或上游 udp=direct);
 /// `Wireguard` = 经 WG 隧道发出去, **与 TCP 同一个出口 IP** —— 这正是配中转的本意。
-enum UdpEgress {
-    Direct(Arc<UdpSocket>),
-    Wireguard(Arc<crate::proxy::wg::socket::WgUdpSocket>),
+/// 非 mux UDP 会话的一个上游 WG 出口 (按出站 tag 懒建): 隧道内 socket + 隧道 (隧道内解析用)
+/// + 本出口独立的回包来源白名单 (各出口分开记, 发往 WG 的目标不能从直连 socket 冒名注入回包)。
+#[derive(Clone)]
+struct WgEgress {
+    socket: Arc<crate::proxy::wg::socket::WgUdpSocket>,
+    tunnel: Arc<crate::proxy::wg::tunnel::WgTunnel>,
+    sent: SentTargets,
 }
 
-impl UdpEgress {
-    async fn send_to(&self, payload: &[u8], addr: std::net::SocketAddr) -> std::io::Result<()> {
-        match self {
-            Self::Direct(s) => s.send_to(payload, addr).await.map(|_| ()),
-            // 隧道侧是同步入队 (数据进 smoltcp 缓冲后由 pump 加密发出), 不阻塞。
-            Self::Wireguard(s) => s
-                .send_to(payload, addr)
-                .map_err(|e| std::io::Error::other(e.to_string())),
-        }
-    }
+type SentTargets = Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>>;
 
-    async fn recv_from(
-        &self,
-        buf: &mut [u8],
-    ) -> std::io::Result<(usize, std::net::SocketAddr)> {
-        match self {
-            Self::Direct(s) => s.recv_from(buf).await,
-            Self::Wireguard(s) => s
-                .recv_from(buf)
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string())),
-        }
+/// 回包准入: 来源须在本出口白名单内, 并过限速与配额。None = 丢本包; Some(true) = 越额/吊销, 停会话。
+fn admit_reply(
+    sent: &SentTargets,
+    from: SocketAddr,
+    size: usize,
+    buckets: &Option<Arc<crate::proxy::rate_limit::DeviceBuckets>>,
+    auth: &super::SessionAuth,
+) -> Option<bool> {
+    // 校验回包来源: 丢弃未知来源的包 (不计费、不回送)。
+    // 注意: 这会收紧 full-cone UDP (如某些 STUN/P2P 游戏) 语义为 restricted-cone。
+    if !sent.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&from) {
+        return None;
     }
+    // 下行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
+    if !crate::proxy::rate_limit::try_consume_two(
+        buckets.as_ref().map(|b| &b.down),
+        auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
+        size,
+    ) {
+        return None;
+    }
+    Some(auth.record_bytes(size))
 }
 
+/// 回包封帧送入下行通道。false = 通道已关 (会话在收尾)。
+async fn forward_reply(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, from: SocketAddr, data: &[u8]) -> bool {
+    // Frame format: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
+    // 用归一化后的来源地址封帧: 双栈 socket 上 IPv4 目标的回包来源是 ::ffff:a.b.c.d,
+    // 原样编码会成 ATYP=4 + 16B, 客户端按 IPv6 回给应用 → IPv4 UDP 回包全丢。
+    let frame = encode_reply_frame(from, data);
+    if frame.len() > u16::MAX as usize {
+        debug!(
+            "Mirage Server UDP: 下行帧长度 ({}B) 超过 u16::MAX, 丢弃该报文以防解帧失步",
+            frame.len()
+        );
+        return true;
+    }
+    let mut packet = Vec::with_capacity(2 + frame.len());
+    packet.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+    packet.extend_from_slice(&frame);
+    tx.send(packet).await.is_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_udp_relay(
     mut reader: crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
     writer: crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
@@ -150,6 +177,7 @@ pub(super) async fn handle_udp_relay(
     user: String,
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
+    inbound_tag: Option<Arc<str>>,
 ) {
     debug!("Mirage Server: Started UDP relay session");
 
@@ -157,119 +185,28 @@ pub(super) async fn handle_udp_relay(
     // (令牌不足丢包), 与 SOCKS/transparent UDP 一致; 全局 limiter 同 tcp_relay::server_buckets_for。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
 
-    // 上游是 WG 且策略为 tunnel → UDP 也走隧道, 出口与 TCP 一致。否则从本机直发。
-    // 非 mux 路径直发: 优先绑定 [::]:0 双栈; 失败则回退 0.0.0.0:0。
-    let (egress, is_dual_stack) = match upstream.as_deref() {
-        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(wg))
-            if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) =>
-        {
-            let tunnel = match wg.tunnel().await {
-                Ok(t) => t,
+    // 出口按每个目标的选路结果决定 (与 TCP / UDP mux 一致): 主 socket 恒为直连, 选到 WG 出站的
+    // 目标走按 tag 懒建的隧道内 socket。直连优先绑定 [::]:0 双栈; 失败则回退 0.0.0.0:0。
+    // 双栈: 发往 IPv4 目标时转 IPv4-mapped (见 prepare_target_addr)。依赖 IPV6_V6ONLY=0
+    // (Linux 默认); 若主机设了 net.ipv6.bindv6only=1 则该 socket 只通 IPv6 → 退回 0.0.0.0:0 保 IPv4
+    // (Linux 上 bind 后不能再改 v6only, 故绑后探测而非强设)。
+    let (direct_socket, is_dual_stack) = match UdpSocket::bind("[::]:0").await.ok().filter(|s| {
+        !nix::sys::socket::getsockopt(s, nix::sys::socket::sockopt::Ipv6V6Only).unwrap_or(true)
+    }) {
+        Some(s) => (Arc::new(s), true),
+        None => {
+            debug!("[::]:0 dual-stack UDP socket unavailable (bind failed or v6only), falling back to 0.0.0.0:0");
+            match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => (Arc::new(s), false),
                 Err(e) => {
-                    error!("UDP 中继: 建立 WG 上游隧道失败: {}", e);
-                    return;
-                }
-            };
-            match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
-                Ok(s) => (UdpEgress::Wireguard(Arc::new(s)), false),
-                Err(e) => {
-                    error!("UDP 中继: 隧道内绑 UDP 失败: {}", e);
+                    error!("Failed to bind server UDP socket: {}", e);
                     return;
                 }
             }
         }
-        // 双栈: 绑 [::]:0, 发往 IPv4 目标时转 IPv4-mapped (见 prepare_target_addr)。依赖 IPV6_V6ONLY=0
-        // (Linux 默认); 若主机设了 net.ipv6.bindv6only=1 则该 socket 只通 IPv6 → 退回 0.0.0.0:0 保 IPv4
-        // (Linux 上 bind 后不能再改 v6only, 故绑后探测而非强设)。
-        _ => match UdpSocket::bind("[::]:0").await.ok().filter(|s| {
-            !nix::sys::socket::getsockopt(s, nix::sys::socket::sockopt::Ipv6V6Only).unwrap_or(true)
-        }) {
-            Some(s) => (UdpEgress::Direct(Arc::new(s)), true),
-            None => {
-                debug!("[::]:0 dual-stack UDP socket unavailable (bind failed or v6only), falling back to 0.0.0.0:0");
-                match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => (UdpEgress::Direct(Arc::new(s)), false),
-                    Err(e) => {
-                        error!("Failed to bind server UDP socket: {}", e);
-                        return;
-                    }
-                }
-            }
-        },
     };
-    let udp_socket = Arc::new(egress);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-    let udp_clone = udp_socket.clone();
-
-    // 维护该会话已发送过的目标地址集合 (限制 1024 条防膨胀)。
-    // 记最近一次向该目标发送的时间, 供下行校验回包来源 (阻止未授权来源注入数据及恶意消耗用户配额)。
-    let sent_targets: Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let sent_targets_down = sent_targets.clone();
-    let sent_targets_up = sent_targets.clone();
-
-    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
-    let writer_clone = writer.clone();
-
-    let dn_buckets = dev_buckets.clone();
-    let dn_auth = session_auth.clone();
-    let downlink = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
-        loop {
-            if dn_auth.should_stop() {
-                break;
-            }
-            match tokio::time::timeout(UDP_IDLE_TIMEOUT, udp_clone.recv_from(&mut buf)).await {
-                Ok(Ok((size, addr))) => {
-                    // 校验回包来源: 丢弃未知来源的包 (不计费、不回送)。
-                    // 自动处理 IPv4-mapped IPv6 (::ffff:a.b.c.d)。
-                    // 注意: 这会收紧 full-cone UDP (如某些 STUN/P2P 游戏) 语义为 restricted-cone。
-                    let norm = normalize_addr(addr);
-                    if !sent_targets_down
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains_key(&norm)
-                    {
-                        continue;
-                    }
-                    // 下行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
-                    if !crate::proxy::rate_limit::try_consume_two(
-                        dn_buckets.as_ref().map(|b| &b.down),
-                        dn_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
-                        size,
-                    ) {
-                        continue;
-                    }
-                    if dn_auth.record_bytes(size) {
-                        break; // 越额或吊销退出
-                    }
-                    // Frame format: [2B Len N][1B ATYP][ADDR][2B PORT][PAYLOAD]
-                    // 用归一化后的来源地址封帧: 双栈 socket 上 IPv4 目标的回包来源是 ::ffff:a.b.c.d,
-                    // 原样编码会成 ATYP=4 + 16B, 客户端按 IPv6 回给应用 → IPv4 UDP 回包全丢。
-                    let frame = encode_reply_frame(norm, &buf[..size]);
-
-                    if frame.len() > u16::MAX as usize {
-                        debug!(
-                            "Mirage Server UDP: 下行帧长度 ({}B) 超过 u16::MAX, 丢弃该报文以防解帧失步",
-                            frame.len()
-                        );
-                        continue;
-                    }
-
-                    let frame_len = frame.len() as u16;
-                    let mut packet = Vec::with_capacity(2 + frame.len());
-                    packet.extend_from_slice(&frame_len.to_be_bytes());
-                    packet.extend_from_slice(&frame);
-
-                    if tx.send(packet).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break, // 上游静默超 UDP_IDLE_TIMEOUT 或 socket 错误 → 拆流
-            }
-        }
-    });
 
     // 修 bug: cancel-safety. 旧版用 tokio::select!(uplink, downlink), 一方完成
     // 时 select! 暴力 drop 另一方, 若 downlink 正在 writer.send_data 半截
@@ -283,11 +220,73 @@ pub(super) async fn handle_udp_relay(
     // 任一方退出时 send(true), 另一方
     // 在下一次 read 边界 (changed() 返回) 检测到信号, 干净退出. 之后才 send_close_notify,
     // 此时绝无半截帧.
+    // 下行泵有多个 (直连 + 每个 WG 出口), 各泵与上行都持有 tx, 会话结束一律靠这个信号,
+    // 不靠 mpsc 通道关闭。
     let (stop_tx, _stop_rx_seed) = tokio::sync::watch::channel(false);
     let mut stop_rx_down = stop_tx.subscribe();
     let mut stop_rx_up = stop_tx.subscribe();
     let stop_tx_down = stop_tx.clone();
     let stop_tx_up = stop_tx.clone();
+
+    // 会话空闲以「任一出口最后一次收到回包」为准 (相对 session_start 的毫秒)。只有直连泵判空闲:
+    // 所有出口都静默超 UDP_IDLE_TIMEOUT 才拆会话 —— 流量全走 WG 时直连 socket 本身收不到包。
+    let session_start = std::time::Instant::now();
+    let last_rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // 直连出口的回包来源白名单 (限制 1024 条防膨胀); 每个 WG 出口各有一份 (见 WgEgress)。
+    // 记最近一次向该目标发送的时间, 供下行校验回包来源 (阻止未授权来源注入数据及恶意消耗用户配额)。
+    let sent_direct: SentTargets = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    let writer_clone = writer.clone();
+
+    let dn_socket = direct_socket.clone();
+    let dn_sent = sent_direct.clone();
+    let dn_buckets = dev_buckets.clone();
+    let dn_auth = session_auth.clone();
+    let dn_tx = tx.clone();
+    let dn_last_rx = last_rx.clone();
+    let mut dn_stop = stop_tx.subscribe();
+    let dn_stop_tx = stop_tx.clone();
+    let downlink = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            if dn_auth.should_stop() {
+                break;
+            }
+            let res = tokio::select! {
+                biased;
+                _ = dn_stop.changed() => break,
+                r = tokio::time::timeout(UDP_IDLE_TIMEOUT, dn_socket.recv_from(&mut buf)) => r,
+            };
+            match res {
+                Ok(Ok((size, addr))) => {
+                    // 自动处理 IPv4-mapped IPv6 (::ffff:a.b.c.d)。
+                    let norm = normalize_addr(addr);
+                    match admit_reply(&dn_sent, norm, size, &dn_buckets, &dn_auth) {
+                        None => continue,
+                        Some(true) => break, // 越额或吊销退出
+                        Some(false) => {}
+                    }
+                    dn_last_rx.store(session_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if !forward_reply(&dn_tx, norm, &buf[..size]).await {
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break, // socket 错误 → 拆流
+                Err(_) => {
+                    // 直连静默超时: 其它出口 (WG) 期间收过回包则会话仍活跃, 继续等
+                    let idle_ms = (session_start.elapsed().as_millis() as u64)
+                        .saturating_sub(dn_last_rx.load(std::sync::atomic::Ordering::Relaxed));
+                    if idle_ms < UDP_IDLE_TIMEOUT.as_millis() as u64 {
+                        continue;
+                    }
+                    break; // 全部出口静默超 UDP_IDLE_TIMEOUT → 拆流
+                }
+            }
+        }
+        let _ = dn_stop_tx.send(true);
+    });
 
     let dn_auth_tunnel = session_auth.clone();
     let tunnel_downlink = async move {
@@ -312,8 +311,21 @@ pub(super) async fn handle_udp_relay(
     };
 
     let up_auth = session_auth.clone();
+    let inbound_tag_up = inbound_tag.clone();
+    let user_up = user.clone();
+    let upstream_up = upstream.clone();
+    let tx_wg = tx;
+    let wg_stop_tx = stop_tx.clone();
     let tunnel_uplink = async move {
         let mut buffer = Vec::new();
+        // 选路结果按目标缓存 (本会话内): UDP 逐包走一遍规则匹配 (含 geosite、可能的解析) 太贵。
+        // 热重载对已建会话不生效, 与 TCP 已建连接沿用旧出口一致。
+        let mut route_cache: std::collections::HashMap<String, super::server_router::ServerRouteDecision> =
+            std::collections::HashMap::new();
+        // 选到 WG 出站的目标按 tag 懒建隧道内 socket; 泵出错退出时把自己移出表, 下个包重建。
+        let wg_egresses: Arc<tokio::sync::Mutex<std::collections::HashMap<String, WgEgress>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut wg_failed: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
         'outer: loop {
             if up_auth.should_stop() {
                 break;
@@ -377,7 +389,53 @@ pub(super) async fn handle_udp_relay(
 
                 let payload = &frame[offset..];
 
-                // 上行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
+                // 服务端选路 (IPv6 目标用 [addr]:port, split_host_port 才能拆开)
+                let target_str = crate::net_util::join_host_port(&target_addr_str, port);
+                let decision = match route_cache.get(&target_str) {
+                    Some(d) => d.clone(),
+                    None => {
+                        let d = super::server_router::server_route(
+                            inbound_tag_up.as_deref(),
+                            &target_str,
+                            "udp",
+                            client_ip,
+                            &user_up,
+                            upstream_up.as_ref(),
+                        )
+                        .await;
+                        if route_cache.len() >= MAX_SENT_TARGETS {
+                            route_cache.clear();
+                        }
+                        route_cache.insert(target_str.clone(), d.clone());
+                        d
+                    }
+                };
+
+                // 选出口: None = 直连 socket; Some = 某个 WG 出口。拒绝 / block 策略直接丢包。
+                let wg_outlet = match &decision.target {
+                    super::server_router::ServerOutboundTarget::Reject => continue,
+                    super::server_router::ServerOutboundTarget::Direct => None,
+                    super::server_router::ServerOutboundTarget::Upstream(outlet) => match &**outlet {
+                        crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
+                            if ss.block_udp {
+                                debug!("UDP: 丢弃发往 {} 的报文, 出站 `{}` 的 udp 策略为 block", target_str, decision.tag);
+                                continue;
+                            }
+                            None // SS 的 udp=direct: 本机直发 (既有语义, 出口与 TCP 不同)
+                        }
+                        crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => match wg.udp {
+                            crate::config::UdpPolicy::Block => {
+                                debug!("UDP: 丢弃发往 {} 的报文, 出站 `{}` 的 udp 策略为 block", target_str, decision.tag);
+                                continue;
+                            }
+                            crate::config::UdpPolicy::Direct => None,
+                            crate::config::UdpPolicy::Tunnel => Some((wg, Arc::as_ptr(outlet) as usize)),
+                        },
+                    },
+                };
+
+                // 上行限速 (policing) 与计费: 放在选路之后, 被拒 / block 丢弃的包不扣令牌、不计配额。
+                // 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
                 if !crate::proxy::rate_limit::try_consume_two(
                     dev_buckets.as_ref().map(|b| &b.up),
                     up_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
@@ -389,63 +447,149 @@ pub(super) async fn handle_udp_relay(
                     break 'outer; // 越额或吊销退出整个会话
                 }
 
-                // v0.4.5-alpha.16: 走 resolver::resolve_first_filtered (60s 缓存 + IPv4 优先 +
-                // 并发限流 + 出站 SSRF 白名单过滤), 不再每 UDP 包裸调 lookup_host 打满阻塞池.
-                // send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为).
-                match crate::proxy::resolver::resolve_first_filtered(&target_addr_str, port, |ip| {
-                    crate::net_util::egress_allowed(ip, allow_local_targets)
-                }).await {
-                    Ok(socket_addr) => {
-                        let send_addr = if matches!(*udp_socket, UdpEgress::Direct(_)) {
-                            match prepare_target_addr(socket_addr, is_dual_stack) {
-                                Some(a) => a,
-                                None => {
-                                    debug!("UDP direct socket (IPv4 only): dropping IPv6 target {}", socket_addr);
-                                    continue;
-                                }
+                let Some((wg, outlet_id)) = wg_outlet else {
+                    // 直连: v0.4.5-alpha.16 起走 resolver::resolve_first_filtered (60s 缓存 + IPv4 优先 +
+                    // 并发限流 + 出站 SSRF 白名单过滤), 不再每 UDP 包裸调 lookup_host 打满阻塞池.
+                    // send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为).
+                    let socket_addr = match crate::proxy::resolver::resolve_first_filtered(&target_addr_str, port, |ip| {
+                        crate::net_util::egress_allowed(ip, allow_local_targets)
+                    }).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                super::warn_egress_blocked("Mirage Server UDP", &user, &target_str);
                             }
-                        } else {
-                            socket_addr
-                        };
-
-                        // P2-3 + P3-1: 发送前插入白名单并刷新时间 (先发后记可能导致极快回包被丢)
-                        let norm = normalize_addr(socket_addr);
-                        record_sent_target(
-                            &mut sent_targets_up.lock().unwrap_or_else(|e| e.into_inner()),
-                            norm,
-                            std::time::Instant::now(),
-                            UDP_IDLE_TIMEOUT,
-                            MAX_SENT_TARGETS,
-                        );
-
-                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
-                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
-                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                        match udp_socket.send_to(payload, send_addr).await {
-                            Ok(()) => {}
-                            Err(e) => {
-                                static WARNED: std::sync::atomic::AtomicBool =
-                                    std::sync::atomic::AtomicBool::new(false);
-                                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                    tracing::warn!(
-                                        "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
-                                        socket_addr, e
-                                    );
-                                }
-                            }
+                            continue;
                         }
-                    }
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            super::warn_egress_blocked(
-                                "Mirage Server UDP",
-                                &user,
-                                &crate::net_util::join_host_port(&target_addr_str, port),
+                    };
+                    let Some(send_addr) = prepare_target_addr(socket_addr, is_dual_stack) else {
+                        debug!("UDP direct socket (IPv4 only): dropping IPv6 target {}", socket_addr);
+                        continue;
+                    };
+                    // P2-3 + P3-1: 发送前插入白名单并刷新时间 (先发后记可能导致极快回包被丢)
+                    record_sent_target(
+                        &mut sent_direct.lock().unwrap_or_else(|e| e.into_inner()),
+                        normalize_addr(socket_addr),
+                        std::time::Instant::now(),
+                        UDP_IDLE_TIMEOUT,
+                        MAX_SENT_TARGETS,
+                    );
+                    // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
+                    // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
+                    if let Err(e) = direct_socket.send_to(payload, send_addr).await {
+                        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            tracing::warn!(
+                                "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
+                                socket_addr, e
                             );
                         }
+                    }
+                    continue;
+                };
+
+                // WG 出口: 取 (或懒建) 隧道内 socket 与其下行泵。键带出口实例地址: 热重载后同 tag
+                // 但配置已变时用新实例, 不和旧隧道混用。上行是单任务串行, 握手不在锁内进行。
+                let key = format!("{}#{:x}", decision.tag, outlet_id);
+                let cached = wg_egresses.lock().await.get(&key).cloned();
+                let egress = match cached {
+                    Some(e) => e,
+                    None => {
+                        // 建隧道失败后冷却一段时间: 失败要等握手 / 解析超时, 上行串行, 每包都等会拖住
+                        // 同会话里发往其它目标 (含直连) 的包。
+                        if wg_failed.get(&key).is_some_and(|t: &std::time::Instant| t.elapsed() < WG_RETRY_COOLDOWN) {
+                            continue;
+                        }
+                        let built = match wg.tunnel().await {
+                            Ok(tunnel) => crate::proxy::wg::socket::WgUdpSocket::bind(tunnel.clone())
+                                .map(|s| (Arc::new(s), tunnel))
+                                .map_err(|e| anyhow::anyhow!("隧道内绑 UDP 失败: {e}")),
+                            Err(e) => Err(e),
+                        };
+                        let (socket, tunnel) = match built {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("UDP: WG 上游 `{}` 不可用 ({}s 内不再重试): {e}", decision.tag, WG_RETRY_COOLDOWN.as_secs());
+                                if wg_failed.len() >= 256 {
+                                    wg_failed.clear();
+                                }
+                                wg_failed.insert(key.clone(), std::time::Instant::now());
+                                continue;
+                            }
+                        };
+                        let eg = WgEgress {
+                            socket,
+                            tunnel,
+                            sent: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                        };
+                        wg_egresses.lock().await.insert(key.clone(), eg.clone());
+                        // 本出口的下行泵: 无独立空闲超时 (会话空闲由直连泵统一判), 会话结束
+                        // (stop 信号) 时退出; socket 出错退出时移出表, 下个包重建。
+                        let pump_eg = eg.clone();
+                        let pump_key = key.clone();
+                        let pump_map = wg_egresses.clone();
+                        let pump_tx = tx_wg.clone();
+                        let pump_auth = up_auth.clone();
+                        let pump_buckets = dev_buckets.clone();
+                        let pump_last_rx = last_rx.clone();
+                        let pump_stop_tx = wg_stop_tx.clone();
+                        let mut pump_stop = wg_stop_tx.subscribe();
+                        tokio::spawn(async move {
+                            // subscribe() 把当前值标为已读: 会话恰在此前已发出停止信号时, changed()
+                            // 不会再返回, 泵会永远挂在 recv 上 —— 先查一次当前值。
+                            if *pump_stop.borrow() {
+                                return;
+                            }
+                            let mut buf = vec![0u8; 65536];
+                            loop {
+                                if pump_auth.should_stop() {
+                                    break;
+                                }
+                                let res = tokio::select! {
+                                    biased;
+                                    _ = pump_stop.changed() => return,
+                                    r = pump_eg.socket.recv_from(&mut buf) => r,
+                                };
+                                let Ok((size, addr)) = res else {
+                                    pump_map.lock().await.remove(&pump_key);
+                                    return;
+                                };
+                                let norm = normalize_addr(addr);
+                                match admit_reply(&pump_eg.sent, norm, size, &pump_buckets, &pump_auth) {
+                                    None => continue,
+                                    Some(true) => break, // 越额或吊销 → 停整个会话
+                                    Some(false) => {}
+                                }
+                                pump_last_rx.store(session_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                                if !forward_reply(&pump_tx, norm, &buf[..size]).await {
+                                    return;
+                                }
+                            }
+                            let _ = pump_stop_tx.send(true);
+                        });
+                        eg
+                    }
+                };
+
+                // 隧道内解析 (WG 出站配了 dns 时用对端 DNS, 拿对端地区的结果), 不过 SSRF 白名单
+                // (只作用于直连; 目标可能本就是对端内网地址) —— 与 TCP / UDP mux 的 WG 路径一致。
+                let socket_addr = match crate::proxy::wg::resolve_target(&egress.tunnel, &target_addr_str, port).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        debug!("UDP: WG 上游 `{}` 解析 {} 失败: {e}", decision.tag, target_str);
                         continue;
                     }
+                };
+                record_sent_target(
+                    &mut egress.sent.lock().unwrap_or_else(|e| e.into_inner()),
+                    normalize_addr(socket_addr),
+                    std::time::Instant::now(),
+                    UDP_IDLE_TIMEOUT,
+                    MAX_SENT_TARGETS,
+                );
+                // 隧道侧是同步入队 (数据进 smoltcp 缓冲后由 pump 加密发出), 不阻塞。
+                if let Err(e) = egress.socket.send_to(payload, socket_addr) {
+                    debug!("UDP: 经 WG 上游 `{}` 发往 {} 失败: {e}", decision.tag, socket_addr);
                 }
             }
         }
@@ -535,6 +679,7 @@ pub(crate) async fn handle_udp_mux_relay(
     user: String,
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
+    inbound_tag: Option<Arc<str>>,
 ) {
     handle_udp_mux_relay_inner(
         reader,
@@ -545,6 +690,7 @@ pub(crate) async fn handle_udp_mux_relay(
         session_auth,
         allow_local_targets,
         super::REVOKE_CHECK_INTERVAL,
+        inbound_tag,
     )
     .await
 }
@@ -558,28 +704,13 @@ pub(crate) async fn handle_udp_mux_relay_inner(
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
     revoke_check_interval: Duration,
+    inbound_tag: Option<Arc<str>>,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
 
     // 服务端按客户端 IP 限速 (device_profiles): mux 复用一条隧道多 sid, 但都同一客户端 IP →
     // 共享同一对桶, policing (令牌不足丢包)。同 handle_udp_relay。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
-
-    // 上游是否 WG-tunnel 出口 (与 TCP 同出口 IP)。是则各 sid 在同一 WG 隧道内绑独立端口。
-    let wg_tunnel = match upstream.as_deref() {
-        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(wg))
-            if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) =>
-        {
-            match wg.tunnel().await {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    error!("UDP mux: 建立 WG 上游隧道失败: {}", e);
-                    return;
-                }
-            }
-        }
-        _ => None,
-    };
 
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     // 所有 sid 下行泵的回包经此汇入唯一 AEAD writer 泵。
@@ -598,6 +729,9 @@ pub(crate) async fn handle_udp_mux_relay_inner(
     let up_auth = session_auth.clone();
     let up_sessions = sessions.clone();
     let up_tx = tx.clone();
+    let inbound_tag_mux = inbound_tag.clone();
+    let user_mux = user.clone();
+    let upstream_mux = upstream.clone();
     let uplink = async move {
         let mut buffer: Vec<u8> = Vec::new();
         'outer: loop {
@@ -650,44 +784,139 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                     }
                     continue;
                 }
-                // 解析目标 (带 SSRF 校验: IP 字面量不解析, 域名走 60s 缓存 resolver)。
-                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
-                    crate::net_util::egress_allowed(ip, allow_local_targets)
-                }).await {
-                    Ok(sa) => sa,
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            super::warn_egress_blocked(
-                                "Mirage Server UDP mux",
-                                &user,
-                                &crate::net_util::join_host_port(&uf.target, uf.port),
-                            );
-                        }
-                        continue;
-                    }
-                };
-                // 建 egress。
-                let egress = match &wg_tunnel {
-                    Some(t) => match crate::proxy::wg::socket::WgUdpSocket::bind(t.clone()) {
-                        Ok(s) => SidEgress::Wireguard(Arc::new(s), target_sa),
-                        Err(e) => {
-                            debug!("UDP mux: WG 内绑 UDP 失败: {}", e);
-                            continue;
-                        }
-                    },
-                    None => {
+                let target_str = crate::net_util::join_host_port(&uf.target, uf.port);
+                let decision = super::server_router::server_route(
+                    inbound_tag_mux.as_deref(),
+                    &target_str,
+                    "udp",
+                    client_ip,
+                    &user_mux,
+                    upstream_mux.as_ref(),
+                )
+                .await;
+
+                let (egress, target_sa) = match &decision.target {
+                    super::server_router::ServerOutboundTarget::Reject => continue,
+                    super::server_router::ServerOutboundTarget::Direct => {
+                        let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                            crate::net_util::egress_allowed(ip, allow_local_targets)
+                        }).await {
+                            Ok(sa) => sa,
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                    super::warn_egress_blocked(
+                                        "Mirage Server UDP mux",
+                                        &user_mux,
+                                        &target_str,
+                                    );
+                                }
+                                continue;
+                            }
+                        };
                         let bind_addr = match target_sa {
                             SocketAddr::V4(_) => "0.0.0.0:0",
                             SocketAddr::V6(_) => "[::]:0",
                         };
                         match UdpSocket::bind(bind_addr).await {
                             Ok(s) => match s.connect(target_sa).await {
-                                Ok(()) => SidEgress::Direct(s),
+                                Ok(()) => (SidEgress::Direct(s), target_sa),
                                 Err(_) => continue,
                             },
                             Err(_) => continue,
                         }
                     }
+                    super::server_router::ServerOutboundTarget::Upstream(outlet) => match &**outlet {
+                        crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
+                            if ss.block_udp {
+                                debug!("UDP mux: sid {} 命中 SS 上游 {} 但 SS udp 策略为 block, 丢弃", uf.sid, decision.tag);
+                                continue;
+                            } else {
+                                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                                    crate::net_util::egress_allowed(ip, allow_local_targets)
+                                }).await {
+                                    Ok(sa) => sa,
+                                    Err(e) => {
+                                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                            super::warn_egress_blocked(
+                                                "Mirage Server UDP mux",
+                                                &user_mux,
+                                                &target_str,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let bind_addr = match target_sa {
+                                    SocketAddr::V4(_) => "0.0.0.0:0",
+                                    SocketAddr::V6(_) => "[::]:0",
+                                };
+                                match UdpSocket::bind(bind_addr).await {
+                                    Ok(s) => match s.connect(target_sa).await {
+                                        Ok(()) => (SidEgress::Direct(s), target_sa),
+                                        Err(_) => continue,
+                                    },
+                                    Err(_) => continue,
+                                }
+                            }
+                        }
+                        crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => match wg.udp {
+                            crate::config::UdpPolicy::Block => {
+                                debug!("UDP mux: sid {} 命中 WG 上游 {} 但 udp 策略为 block, 丢弃", uf.sid, decision.tag);
+                                continue;
+                            }
+                            crate::config::UdpPolicy::Direct => {
+                                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                                    crate::net_util::egress_allowed(ip, allow_local_targets)
+                                }).await {
+                                    Ok(sa) => sa,
+                                    Err(e) => {
+                                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                            super::warn_egress_blocked(
+                                                "Mirage Server UDP mux",
+                                                &user_mux,
+                                                &target_str,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let bind_addr = match target_sa {
+                                    SocketAddr::V4(_) => "0.0.0.0:0",
+                                    SocketAddr::V6(_) => "[::]:0",
+                                };
+                                match UdpSocket::bind(bind_addr).await {
+                                    Ok(s) => match s.connect(target_sa).await {
+                                        Ok(()) => (SidEgress::Direct(s), target_sa),
+                                        Err(_) => continue,
+                                    },
+                                    Err(_) => continue,
+                                }
+                            }
+                            crate::config::UdpPolicy::Tunnel => {
+                                let tunnel = match wg.tunnel().await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        error!("UDP mux: 建立 WG 上游隧道失败: {}", e);
+                                        continue;
+                                    }
+                                };
+                                let target_sa = match crate::proxy::wg::resolve_target(&tunnel, &uf.target, uf.port).await {
+                                    Ok(sa) => sa,
+                                    Err(e) => {
+                                        debug!("UDP mux: WG 内解析目标 {} 失败: {}", target_str, e);
+                                        continue;
+                                    }
+                                };
+                                match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
+                                    Ok(s) => (SidEgress::Wireguard(Arc::new(s), target_sa), target_sa),
+                                    Err(e) => {
+                                        debug!("UDP mux: WG 内绑 UDP 失败: {}", e);
+                                        continue;
+                                    }
+                                }
+                            }
+                        },
+                    },
                 };
                 let egress = Arc::new(egress);
                 // spawn 下行泵: egress.recv → frame_mux_addr(sid) → tx。
@@ -697,6 +926,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                 let pump_buckets = dev_buckets.clone();
                 let pump_auth = up_auth.clone();
                 let sid = uf.sid;
+                let pump_target_sa = target_sa;
                 let pump = tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     loop {
@@ -720,7 +950,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                                 }
                                 if let Some(f) = crate::proxy::udp_mux::frame_mux_addr(
                                     sid,
-                                    target_sa,
+                                    pump_target_sa,
                                     &buf[..n],
                                 ) {
                                     if pump_tx.send(f).await.is_err() {
@@ -837,7 +1067,7 @@ mod mux_tests {
 
         // 4. 起服务端 mux relay (upstream=None → Direct egress, 测试环境连本地 echo 需 allow_local_targets=true)
         let server = tokio::spawn(async move {
-            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), crate::proxy::mirage_server::SessionAuth::unlimited(), true).await;
+            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), crate::proxy::mirage_server::SessionAuth::unlimited(), true, None).await;
         });
 
         // 5. 客户端发两帧: 同目标, 不同 sid + payload
@@ -933,6 +1163,7 @@ mod mux_tests {
                 auth,
                 true,
                 revoke_interval,
+                None,
             )
             .await;
         });

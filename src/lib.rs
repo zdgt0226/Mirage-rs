@@ -510,9 +510,14 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 let brutal_bps = brutal_rate_mbps
                     .filter(|m| *m > 0)
                     .map(|m| m * 125_000);
-                let ss_upstream = match build_upstream(upstream.as_ref()) {
-                    Ok(v) => v,
-                    Err(e) => { error!("上游出口配置无效, 服务端未启动: {e}"); continue; }
+                // 入站旧 upstream: 用服务端路由表里那份实例 (同一个 Arc), 不另建 —— 另建会以同一
+                // WG 私钥起第二个会话, 对端在两个会话间漫游, 两边连接互相打断。
+                let ss_upstream = match crate::proxy::mirage_server::server_router::current_server_router_state() {
+                    Some(st) => st.inbound_upstreams.get(&tag).cloned(),
+                    None => match build_upstream(upstream.as_ref()) {
+                        Ok(v) => v,
+                        Err(e) => { error!("上游出口配置无效, 服务端未启动: {e}"); continue; }
+                    },
                 };
                 match transport {
                     crate::config::Transport::Quic => {
@@ -531,6 +536,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 quic_obfs.clone(),
                                 quic_key_path.as_deref(),
                                 allow_local_targets,
+                                Some(tag.clone()),
                             ).await;
                         });
                         #[cfg(not(feature = "quic"))]
@@ -548,6 +554,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 ss_upstream,
                                 pfs,
                                 allow_local_targets,
+                                Some(tag.clone()),
                             ).await;
                         });
                     }

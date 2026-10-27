@@ -42,19 +42,38 @@ pub(super) async fn handle_tcp_relay(
     user: String, // 命中的用户名 (多用户统计); 单用户恒 "default"
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
+    inbound_tag: Option<Arc<str>>,
 ) {
-    // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径;
-    // 字节在下方 direct 路径 relay 循环累加 (ss/wg 子路径仅登记可见, 字节暂不计, 同客户端 splice 限制)。
-    let outbound_label = match upstream_cfg.as_deref() {
-        Some(crate::proxy::upstream::UpstreamOutlet::Shadowsocks(_)) => "ss-upstream",
-        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(_)) => "wg-upstream",
-        None => "direct",
-    };
-    let inbound_label = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "client".into());
-    let _conn = crate::monitor::register(target.clone(), inbound_label, outbound_label.to_string(), "tcp", None, client_ip.map(|ip| ip.to_string()), Some(user.clone()));
+    let decision = super::server_router::server_route(
+        inbound_tag.as_deref(),
+        &target,
+        "tcp",
+        client_ip,
+        &user,
+        upstream_cfg.as_ref(),
+    )
+    .await;
 
-    // 配了上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
-    if let Some(outlet) = upstream_cfg {
+    // WebUI 服务端连接登记 (T1: 域名排行 / 服务端 Connections 视图)。覆盖 direct + ss/wg 全路径
+    let outbound_label = &decision.tag;
+    let inbound_label = client_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "client".into());
+    let _conn = crate::monitor::register(
+        target.clone(),
+        inbound_label,
+        outbound_label.clone(),
+        "tcp",
+        None,
+        client_ip.map(|ip| ip.to_string()),
+        Some(user.clone()),
+    );
+
+    // block 出站 / 路由选到服务端不可用的出站: 拒绝 (不回落直连)。
+    if matches!(decision.target, super::server_router::ServerOutboundTarget::Reject) {
+        debug!("Mirage Server: 目标 {} 路由至出站 `{}` (拒绝)", target, decision.tag);
+        return;
+    }
+    // 配了上游或路由选到上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
+    if let super::server_router::ServerOutboundTarget::Upstream(outlet) = decision.target {
         // 中转路径同样受限速/配额/吊销约束 (客户端 IP 桶 + 用户桶 + 凭据令牌), 否则配了上游即可绕过。
         let limits = UpstreamLimits {
             ip: client_ip.and_then(crate::proxy::rate_limit::server_buckets_for),
@@ -589,7 +608,7 @@ mod tests {
             let (r, w) = s.into_split();
             let reader = CryptoReader::new(TunnelRead::Tcp(r), &master, false);
             let writer = CryptoWriter::new(TunnelWrite::Tcp(w), &master, false);
-            handle_tcp_relay(target, None, reader, writer, None, None, "default".into(), auth, true).await;
+            handle_tcp_relay(target, None, reader, writer, None, None, "default".into(), auth, true, None).await;
         });
         let c = TcpStream::connect(addr).await.unwrap();
         let (r, w) = c.into_split();

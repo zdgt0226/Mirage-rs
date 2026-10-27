@@ -56,6 +56,7 @@ pub(super) async fn dispatch_authenticated(
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     ecdh: Option<[u8; 32]>,
     allow_local_targets: bool,
+    inbound_tag: Option<std::sync::Arc<str>>,
 ) {
     // 3. Setup Crypto Stream。PFS 开时 (ecdh=Some) 走混入 ecdh 的 master 派生。
     // read_half/write_half 已是传输无关的 TunnelRead/Write (TCP=Tcp 变体, QUIC=Boxed);
@@ -223,8 +224,8 @@ pub(super) async fn dispatch_authenticated(
         // SS 上游默认如此: SS 的 UDP 未实现, 放行会让 UDP 从本机 IP 出去而 TCP 从上游出去 ——
         // 出口 IP 不一致, 对落地解锁是功能性错误 (QUIC 会"成功"但用错 IP, 不像被封那样回落 TCP)。
         // WG 上游**默认不走这里**: 隧道能承载 UDP, 出口与 TCP 一致, 默认策略是 tunnel。
-        if upstream.as_ref().is_some_and(|u| u.block_udp()) {
-            let up = upstream.as_ref().unwrap();
+        let legacy_up = super::server_router::current_inbound_upstream(inbound_tag.as_deref(), upstream.as_ref());
+        if let Some(up) = legacy_up.as_ref().filter(|u| u.block_udp()) {
             tracing::warn!(
                 "拒绝 UDP 中继: 上游 {} 的 udp 策略为 block。{}",
                 up.describe(),
@@ -240,21 +241,22 @@ pub(super) async fn dispatch_authenticated(
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
+        udp_relay::handle_udp_relay(reader, writer, upstream, client_ip, user, session_auth, allow_local_targets, inbound_tag).await;
     } else if first_chunk.len() == 1 && first_chunk[0] == crate::proxy::udp_mux::MUX_SENTINEL {
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
-        if upstream.as_ref().is_some_and(|u| u.block_udp()) {
+        let legacy_up = super::server_router::current_inbound_upstream(inbound_tag.as_deref(), upstream.as_ref());
+        if legacy_up.as_ref().is_some_and(|u| u.block_udp()) {
             tracing::warn!("拒绝 UDP mux 中继: 上游 udp 策略为 block");
             let _ = writer.send_close_notify().await;
             return;
         }
-        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
+        udp_relay::handle_udp_mux_relay(reader, writer, upstream, client_ip, user, session_auth, allow_local_targets, inbound_tag).await;
     } else if first_chunk.len() >= 2 {
         // TCP Mode
         match parse_tcp_target(&first_chunk) {
             Ok((target, payload)) => {
                 debug!("Mirage Server: Target resolved to {}", target);
-                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, session_auth, allow_local_targets).await;
+                tcp_relay::handle_tcp_relay(target, payload, reader, writer, upstream, client_ip, user, session_auth, allow_local_targets, inbound_tag).await;
             }
             Err(e) => tracing::error!("Mirage Server: {}", e),
         }

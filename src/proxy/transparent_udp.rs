@@ -514,6 +514,7 @@ async fn setup_flow(
         source_mac: None,
         inbound: Some(&inbound_tag),
         process_name: None, // 透明 UDP: LAN 转发, 无本机进程
+        user: None,
     };
     match &domain {
         Some(d) => req.domain = Some(d.as_str()),
