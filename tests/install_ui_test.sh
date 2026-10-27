@@ -181,6 +181,25 @@ JSON
     ss_pw_16=$(generate_ss_password 16)
     eq_  "B5.23 generate_ss_password 16 生成 24 字符" "${#ss_pw_16}" "24"
 
+    # ── stage_and_commit: 校验不过时正式配置一字不动; 通过才替换并留 .bak ──
+    local sc="$d/stage.json" fake="$d/fake-check"
+    printf '{ "inbounds": [ { "type": "mirage_server", "tag": "t" } ] }\n' > "$sc"
+    local before; before=$(cat "$sc")
+    printf '#!/bin/sh\nexit 1\n' > "$fake"; chmod +x "$fake"
+    BIN_PATH="$fake" stage_and_commit "$sc" server_set_default_outbound "x" >/dev/null 2>&1
+    eq_  "B5.24 check 失败 → 返回 2" "$?" "2"
+    eq_  "B5.25 check 失败 → 正式配置不变" "$(cat "$sc")" "$before"
+    printf '#!/bin/sh\nexit 0\n' > "$fake"
+    BIN_PATH="$fake" stage_and_commit "$sc" server_set_default_outbound "x" >/dev/null 2>&1
+    eq_  "B5.26 check 通过 → 返回 0" "$?" "0"
+    has_ "B5.27 通过后已写入" "$(cat "$sc")" '"default_outbound": "x"'
+    eq_  "B5.28 通过后留 .bak 为原内容" "$(cat "$sc.bak")" "$before"
+    eq_  "B5.29 无残留临时文件" "$(ls "$d" | grep -c 'stage.json.new')" "0"
+    server_add_outbound "$sc" '{ "type": "block", "tag": "direct" }' >/dev/null 2>&1
+    eq_  "B5.30 不允许覆盖 direct 出站" "$?" "1"
+    server_remove_outbound "$sc" "direct" >/dev/null 2>&1
+    eq_  "B5.31 不允许删除 direct 出站" "$?" "1"
+
     rm -rf "$d"
 }
 

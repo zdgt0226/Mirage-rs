@@ -512,7 +512,7 @@ impl OutboundManager {
                 }
                 OutboundConfig::Wireguard {
                     tag, private_key, peer_public_key, preshared_key, endpoint, address,
-                    mtu, persistent_keepalive, dns,
+                    mtu, persistent_keepalive, dns, ..
                 } => {
                     // 配置有问题时**降级为 Block, 而不是 Direct**。
                     //

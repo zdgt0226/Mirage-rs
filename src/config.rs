@@ -636,6 +636,10 @@ pub enum OutboundConfig {
         /// 配了则走本隧道的域名**经隧道解析**; 不配 = 本机解析 (原行为)。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dns: Option<String>,
+        /// 仅服务端语义: 选到本出站的 UDP 怎么走。默认 `tunnel` (与 TCP 同出口); `block` 丢弃;
+        /// `direct` 从本机直发。客户端忽略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp: Option<UdpPolicy>,
     },
     Direct {
         tag: String,
@@ -752,6 +756,7 @@ impl std::fmt::Debug for OutboundConfig {
                 mtu,
                 persistent_keepalive,
                 dns,
+                udp,
             } => {
                 let psk_redacted = preshared_key.as_ref().map(|_| "[REDACTED]");
                 f.debug_struct("Wireguard")
@@ -764,6 +769,7 @@ impl std::fmt::Debug for OutboundConfig {
                     .field("mtu", mtu)
                     .field("persistent_keepalive", persistent_keepalive)
                     .field("dns", dns)
+                    .field("udp", udp)
                     .finish()
             }
             Self::Direct { tag } => f.debug_struct("Direct").field("tag", tag).finish(),
@@ -1604,24 +1610,13 @@ impl Config {
             return warnings;
         }
 
+        // 只有真正的上游出口 (shadowsocks / wireguard) 才是"QUIC 不支持"; block 在 QUIC 上照常拒绝,
+        // mirage / urltest 等服务端本就不可用, 另有 issue 报。
         let is_non_direct = |tag: &str| -> bool {
-            for ob in &self.outbounds {
-                let (ob_tag, is_dir) = match ob {
-                    OutboundConfig::Direct { tag } => (tag.as_str(), true),
-                    OutboundConfig::Shadowsocks { tag, .. }
-                    | OutboundConfig::Wireguard { tag, .. }
-                    | OutboundConfig::Mirage { tag, .. }
-                    | OutboundConfig::Block { tag }
-                    | OutboundConfig::Urltest { tag, .. }
-                    | OutboundConfig::Fallback { tag, .. }
-                    | OutboundConfig::Selector { tag, .. }
-                    | OutboundConfig::LoadBalance { tag, .. } => (tag.as_str(), false),
-                };
-                if ob_tag == tag {
-                    return !is_dir;
-                }
-            }
-            false
+            self.outbounds.iter().any(|ob| match ob {
+                OutboundConfig::Shadowsocks { tag: t, .. } | OutboundConfig::Wireguard { tag: t, .. } => t == tag,
+                _ => false,
+            })
         };
 
         for q_tag in &quic_inbounds {
@@ -1757,8 +1752,25 @@ impl Config {
             for (field, t) in refs {
                 if known(t) && !server_usable(t) {
                     issues.push(format!(
-                        "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站 (运行时会拒绝该流量)"
+                        "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站"
                     ));
+                }
+            }
+            for ob in &self.outbounds {
+                if let OutboundConfig::Shadowsocks { tag, underlying: Some(_), .. } = ob {
+                    issues.push(format!(
+                        "shadowsocks 出站 `{tag}` 的 underlying 在服务端不生效 (服务端直接拨 SS 服务器), 请删除该字段"
+                    ));
+                }
+            }
+        }
+
+        // 规则里的 ip_cidr / source_ip_cidr 必须是合法 CIDR 或 IP —— 否则该项被丢弃, 只剩这一个条件
+        // 的规则会退化成匹配所有流量。
+        for (i, rule) in self.routing.rules.iter().enumerate() {
+            for (field, list) in [("ip_cidr", &rule.ip_cidr), ("source_ip_cidr", &rule.source_ip_cidr)] {
+                if let Err(bad) = crate::router::parse_ip_nets(list) {
+                    issues.push(format!("routing.rules[{i}].{field} 含非法项 `{bad}` (应为 CIDR 或 IP)"));
                 }
             }
         }
@@ -2871,6 +2883,12 @@ mod validation_tests {
         assert!(!w.is_empty(), "QUIC 入站配非 direct default 应出告警");
         assert!(w[0].contains("QUIC 传输暂不支持上游出口"));
         assert!(!has(&issues_of(&v), "QUIC 传输暂不支持上游出口"), "不得进 semantic_issues (告警类不阻断 config 写回)");
+        // block 出站不是"上游", 不应报 QUIC 不支持 (对照: 指向 ss-up 时会报)
+        v["outbounds"].as_array_mut().unwrap().push(serde_json::json!({ "type": "block", "tag": "block" }));
+        v["routing"]["default_outbound"] = serde_json::json!("direct");
+        v["routing"]["rules"] = serde_json::json!([{ "domain_suffix": ["x.example"], "outbound": "block" }]);
+        let cfg: Config = serde_json::from_value(v).unwrap();
+        assert!(cfg.quic_routing_warnings().is_empty(), "block 不应被报成 QUIC 不支持上游");
     }
 
     #[test]

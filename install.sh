@@ -1921,6 +1921,25 @@ print(migrated)
 '
 }
 
+# 改服务端配置的统一入口: 在同目录临时副本上执行改写函数 → `check` 通过 → 备份原文件为 .bak
+# 再原子替换。改写失败或校验不过时正式配置一字不动 —— 若直接改正式文件再校验, 服务端的
+# 热重载会先读到这份坏配置。改写函数的 stdout 原样透传 (供调用方取返回值)。
+stage_and_commit() { # file func [args...]
+    local cfg=$1 fn=$2; shift 2
+    local tmp
+    tmp=$(mktemp "${cfg}.new.XXXXXX") || return 1
+    chmod 600 "$tmp"
+    cp -f "$cfg" "$tmp"
+    if ! "$fn" "$tmp" "$@"; then
+        rm -f "$tmp"; return 1
+    fi
+    if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$tmp" >&2; then
+        rm -f "$tmp"; return 2
+    fi
+    cp -p "$cfg" "${cfg}.bak"
+    mv -f "$tmp" "$cfg"
+}
+
 # 新增顶层出站
 server_add_outbound() { # file outbound_json
     CFG="$1" OB="$2" python3 -c '
@@ -1931,7 +1950,7 @@ d = json.load(open(path))
 obs = d.setdefault("outbounds", [{"type": "direct", "tag": "direct"}])
 d.setdefault("routing", {"default_outbound": "direct", "rules": []})
 tag = ob.get("tag")
-if not tag:
+if not tag or tag == "direct":  # 不允许覆盖内置直连出站
     sys.exit(1)
 replaced = False
 for i, o in enumerate(obs):
@@ -1958,6 +1977,8 @@ server_remove_outbound() { # file tag
 import json, os, sys, tempfile
 path = os.environ["CFG"]
 tag = os.environ["TAG"]
+if tag == "direct":  # 直连出站是默认出站的兜底, 不允许删
+    sys.exit(1)
 d = json.load(open(path))
 obs = d.get("outbounds", [])
 new_obs = [o for o in obs if o.get("tag") != tag]
@@ -2184,11 +2205,8 @@ u = json.loads(os.environ["UP"])
 u["tag"] = os.environ["TAG"]
 print(json.dumps(u))
 ')
-               cp -p "$cfg" "${cfg}.bak"
-               server_add_outbound "$cfg" "$full_ob"
-               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "新配置校验未通过, 已还原原配置。"
+               if ! stage_and_commit "$cfg" server_add_outbound "$full_ob" >/dev/null; then
+                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
                    continue
                fi
                ok "已新增出站 \`$tag\` (原配置备份: ${cfg}.bak)"
@@ -2227,16 +2245,13 @@ print("yes" if ref else "no")
 ')
                if [[ "$is_ref" == "yes" ]]; then
                    warn "出站 \`$del_tag\` 正被 default_outbound 或规则引用！"
-                   if ! ask_yn "确认删除并将相关引用自动调整为 direct 吗?" y; then
+                   if ! ask_yn "确认删除? 引用它的规则会一并删除 (流量改走默认出站); 若它是默认出站, 默认出站改为 direct" y; then
                        info "已取消删除。"
                        continue
                    fi
                fi
-               cp -p "$cfg" "${cfg}.bak"
-               server_remove_outbound "$cfg" "$del_tag"
-               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "新配置校验未通过, 已还原原配置。"
+               if ! stage_and_commit "$cfg" server_remove_outbound "$del_tag" >/dev/null; then
+                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
                    continue
                fi
                ok "已删除出站 \`$del_tag\` (原配置备份: ${cfg}.bak)"
@@ -2261,11 +2276,8 @@ print("\n".join(tags))
                    continue
                fi
                local def_tag="${tag_array[$((sel_idx - 1))]}"
-               cp -p "$cfg" "${cfg}.bak"
-               server_set_default_outbound "$cfg" "$def_tag"
-               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "新配置校验未通过, 已还原原配置。"
+               if ! stage_and_commit "$cfg" server_set_default_outbound "$def_tag" >/dev/null; then
+                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
                    continue
                fi
                ok "默认出站已设为 \`$def_tag\` (原配置备份: ${cfg}.bak)"
@@ -2321,11 +2333,8 @@ tag = os.environ["TAG"]
 rule = {field: vals, "outbound": tag}
 print(json.dumps(rule))
 ')
-               cp -p "$cfg" "${cfg}.bak"
-               server_add_rule "$cfg" "$rule_json"
-               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "新配置校验未通过, 已还原原配置。"
+               if ! stage_and_commit "$cfg" server_add_rule "$rule_json" >/dev/null; then
+                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
                    continue
                fi
                ok "已新增规则 (原配置备份: ${cfg}.bak)"
@@ -2365,11 +2374,8 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                    continue
                fi
                local del_idx=$((sel_idx - 1))
-               cp -p "$cfg" "${cfg}.bak"
-               server_remove_rule "$cfg" "$del_idx"
-               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "新配置校验未通过, 已还原原配置。"
+               if ! stage_and_commit "$cfg" server_remove_rule "$del_idx" >/dev/null; then
+                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
                    continue
                fi
                ok "已删除规则 (原配置备份: ${cfg}.bak)"
@@ -2378,19 +2384,16 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                fi
                ;;
             6)
-               cp -p "$cfg" "${cfg}.bak"
-               local mig_n
-               if ! mig_n=$(server_migrate_legacy_upstream "$cfg"); then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "入站上未发现旧 upstream 字段或迁移失败。"
+               local mig_n rc
+               mig_n=$(stage_and_commit "$cfg" server_migrate_legacy_upstream); rc=$?
+               if (( rc == 1 )); then
+                   warn "入站上未发现旧 upstream 字段或迁移失败 (正式配置未改动)。"
+                   continue
+               elif (( rc != 0 )); then
+                   warn "迁移后配置校验未通过 (正式配置未改动)。"
                    continue
                fi
-               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-                   mv -f "${cfg}.bak" "$cfg"
-                   warn "迁移后配置校验未通过, 已还原原配置。"
-                   continue
-               fi
-               ok "已将 ${mig_n} 个入站的旧 upstream 迁移至独立出站并设为默认出站 (原配置备份: ${cfg}.bak)"
+               ok "已将 ${mig_n} 个入站的旧 upstream 迁移为独立出站 + 按入站的分流规则, 默认出站不变 (原配置备份: ${cfg}.bak)"
                if service_active server; then
                    warn "由于修改了入站级字段 (移除了入站 upstream)，需要重启服务才能生效。"
                    if ask_yn "立即重启 $(svc_name server) 使其生效?" y; then
@@ -2724,6 +2727,8 @@ EOM
     [[ "$server_gui_token" != "-" && -n "$server_gui_token" ]] && server_gui_token_line=",
         \"token\": \"${server_gui_token}\""
 
+    # 先建空文件并设 600 再写: 配置里有口令 / WG 私钥, 不留"已写入但仍是默认权限"的窗口
+    install -m 600 /dev/null "${ETC_DIR}/config_server.json"
     cat > "${ETC_DIR}/config_server.json" <<EOF
 {
     "schema_version": 1,

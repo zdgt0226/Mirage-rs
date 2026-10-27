@@ -245,6 +245,17 @@ struct RegexMatcher {
     pattern_to_rule_id: Vec<RuleId>,
 }
 
+/// 解析 ip_cidr / source_ip_cidr 列表: 接受 CIDR 与裸 IP (按 /32、/128)。返回第一个非法项。
+pub fn parse_ip_nets(list: &[String]) -> Result<Vec<IpNet>, String> {
+    list.iter()
+        .map(|s| {
+            s.parse::<IpNet>()
+                .or_else(|_| s.parse::<IpAddr>().map(IpNet::from))
+                .map_err(|_| s.clone())
+        })
+        .collect()
+}
+
 pub struct RouterEngine {
     domain_trie: DomainTrie,
     keyword_matcher: Option<KeywordMatcher>,

@@ -26,6 +26,8 @@ pub struct ServerRouterState {
     /// 每个上游出口的配置指纹 (键: 出站 tag / `inbound:<tag>`)。热重载时配置没变的出口复用旧
     /// `UpstreamOutlet`: WG 出口重建会以同一私钥另起会话, 对端漫游到新会话, 旧连接随之断。
     fingerprints: HashMap<String, String>,
+    /// 本次构建新建 (非复用) 的 WG 出口, 装表时预热 (见 set_server_router_state)。
+    fresh_wg: Vec<Arc<crate::proxy::upstream::UpstreamOutlet>>,
 }
 
 static SERVER_ROUTER: OnceLock<ArcSwapOption<ServerRouterState>> = OnceLock::new();
@@ -34,7 +36,27 @@ fn slot() -> &'static ArcSwapOption<ServerRouterState> {
     SERVER_ROUTER.get_or_init(|| ArcSwapOption::from(None))
 }
 
+/// 首次在 tokio 运行时内装表时记下运行时句柄: 热重载在 std 线程里调本函数, 预热要靠它 spawn。
+static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
 pub fn set_server_router_state(state: Arc<ServerRouterState>) {
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        let _ = RUNTIME.set(h);
+    }
+    // 本次新建的 WG 出口立即后台握手: 否则要等第一个请求来才建隧道, 那批请求要排队等握手,
+    // 线路抖动时会顶到隧道内建连超时 (15s)。失败不缓存, 请求时还会再试。
+    if let Some(h) = RUNTIME.get() {
+        for outlet in &state.fresh_wg {
+            let outlet = outlet.clone();
+            h.spawn(async move {
+                if let crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) = &*outlet {
+                    if let Err(e) = wg.tunnel().await {
+                        tracing::warn!("WG 上游出口预热握手失败 (请求时会重试): {e}");
+                    }
+                }
+            });
+        }
+    }
     slot().store(Some(state));
 }
 
@@ -118,6 +140,18 @@ impl ServerRouterState {
     }
 }
 
+/// 入站上旧 `upstream` 字段对应的出口 (当前路由表里那份; 路由表未建时用监听器启动时的)。
+/// 监听器侧的预检要读这里, 才能跟上热重载 (入站 upstream 被改 / 迁移成独立出站后立即生效)。
+pub fn current_inbound_upstream(
+    inbound_tag: Option<&str>,
+    fallback: Option<&Arc<crate::proxy::upstream::UpstreamOutlet>>,
+) -> Option<Arc<crate::proxy::upstream::UpstreamOutlet>> {
+    match current_server_router_state() {
+        Some(st) => inbound_tag.and_then(|t| st.inbound_upstreams.get(t).cloned()),
+        None => fallback.cloned(),
+    }
+}
+
 pub async fn server_route(
     inbound_tag: Option<&str>,
     target: &str,
@@ -177,24 +211,39 @@ fn outlet_for(
     up_cfg: &crate::config::UpstreamConfig,
     prev: Option<&ServerRouterState>,
     fingerprints: &mut HashMap<String, String>,
+    built: &mut HashMap<String, Arc<crate::proxy::upstream::UpstreamOutlet>>,
+    fresh_wg: &mut Vec<Arc<crate::proxy::upstream::UpstreamOutlet>>,
 ) -> anyhow::Result<Option<Arc<crate::proxy::upstream::UpstreamOutlet>>> {
+    // 按配置指纹 (而非 tag) 在整张旧表里找: 改 tag、旧入站 upstream 迁移成独立出站时也复用,
+    // 不会以同一 WG 私钥另起会话。同一份配置在新表里出现多次时也共用一个实例。
+    let lookup = |p: &ServerRouterState, k: &str| match k.strip_prefix("inbound:") {
+        Some(ib) => p.inbound_upstreams.get(ib).cloned(),
+        None => match p.outbounds.get(k) {
+            Some(ServerOutboundTarget::Upstream(o)) => Some(o.clone()),
+            _ => None,
+        },
+    };
     let reused = prev.and_then(|p| {
-        if p.fingerprints.get(key) != Some(&fp) {
-            return None;
-        }
-        match key.strip_prefix("inbound:") {
-            Some(ib) => p.inbound_upstreams.get(ib).cloned(),
-            None => match p.outbounds.get(key) {
-                Some(ServerOutboundTarget::Upstream(o)) => Some(o.clone()),
-                _ => None,
-            },
-        }
+        p.fingerprints.iter().find(|(_, f)| **f == fp).and_then(|(k, _)| lookup(p, k))
     });
-    fingerprints.insert(key.to_string(), fp);
-    match reused {
-        Some(o) => Ok(Some(o)),
-        None => crate::build_upstream(Some(up_cfg)),
+    fingerprints.insert(key.to_string(), fp.clone());
+    if let Some(o) = built.get(&fp) {
+        return Ok(Some(o.clone()));
     }
+    let outlet = match reused {
+        Some(o) => Some(o),
+        None => {
+            let o = crate::build_upstream(Some(up_cfg))?;
+            if let Some(o) = o.as_ref().filter(|o| matches!(***o, crate::proxy::upstream::UpstreamOutlet::Wireguard(_))) {
+                fresh_wg.push(o.clone());
+            }
+            o
+        }
+    };
+    if let Some(o) = &outlet {
+        built.insert(fp, o.clone());
+    }
+    Ok(outlet)
 }
 
 /// 上游配置指纹 (含口令 / 私钥, 只在内存里比较, 不落日志)。
@@ -218,12 +267,14 @@ pub fn build_server_router_state(
     prev: Option<&ServerRouterState>,
 ) -> anyhow::Result<ServerRouterState> {
     let mut fingerprints = HashMap::new();
+    let mut built = HashMap::new();
+    let mut fresh_wg = Vec::new();
     // 1. 构建入站级旧 upstream 映射表 (按 inbound tag)
     let mut inbound_upstreams = HashMap::new();
     for ib in &config.inbounds {
         if let crate::config::InboundConfig::MirageServer { tag, upstream: Some(up_cfg), .. } = ib {
             let key = format!("inbound:{tag}");
-            if let Some(outlet) = outlet_for(&key, upstream_fingerprint(up_cfg), up_cfg, prev, &mut fingerprints)? {
+            if let Some(outlet) = outlet_for(&key, upstream_fingerprint(up_cfg), up_cfg, prev, &mut fingerprints, &mut built, &mut fresh_wg)? {
                 inbound_upstreams.insert(tag.clone(), outlet);
             }
         }
@@ -255,7 +306,7 @@ pub fn build_server_router_state(
                     method: method.clone(),
                     udp: udp.unwrap_or(crate::config::UdpPolicy::Block),
                 };
-                if let Some(outlet) = outlet_for(tag, upstream_fingerprint(&up_cfg), &up_cfg, prev, &mut fingerprints)? {
+                if let Some(outlet) = outlet_for(tag, upstream_fingerprint(&up_cfg), &up_cfg, prev, &mut fingerprints, &mut built, &mut fresh_wg)? {
                     outbounds.insert(tag.clone(), ServerOutboundTarget::Upstream(outlet));
                 }
             }
@@ -269,6 +320,7 @@ pub fn build_server_router_state(
                 mtu,
                 persistent_keepalive,
                 dns,
+                udp,
             } => {
                 let up_cfg = crate::config::UpstreamConfig::Wireguard {
                     private_key: private_key.clone(),
@@ -278,10 +330,10 @@ pub fn build_server_router_state(
                     address: address.clone(),
                     mtu: *mtu,
                     persistent_keepalive: *persistent_keepalive,
-                    udp: crate::config::UdpPolicy::Tunnel,
+                    udp: udp.unwrap_or(crate::config::UdpPolicy::Tunnel),
                     dns: dns.clone(),
                 };
-                if let Some(outlet) = outlet_for(tag, upstream_fingerprint(&up_cfg), &up_cfg, prev, &mut fingerprints)? {
+                if let Some(outlet) = outlet_for(tag, upstream_fingerprint(&up_cfg), &up_cfg, prev, &mut fingerprints, &mut built, &mut fresh_wg)? {
                     outbounds.insert(tag.clone(), ServerOutboundTarget::Upstream(outlet));
                 }
             }
@@ -289,68 +341,125 @@ pub fn build_server_router_state(
         }
     }
 
-    // 3. 构建路由引擎 (若有 outbounds 且配置了 routing)
-    let router = if !outbounds.is_empty() || !config.routing.rules.is_empty() || config.routing.default_outbound != "direct" {
-        let mut rules = Vec::new();
-        for (i, r) in config.routing.rules.iter().enumerate() {
-            let mut ip_cidr = Vec::new();
-            for c in &r.ip_cidr {
-                if let Ok(net) = c.parse() {
-                    ip_cidr.push(net);
-                }
-            }
-            let mut src_cidrs = Vec::new();
-            for c in &r.source_ip_cidr {
-                if let Ok(net) = c.parse() {
-                    src_cidrs.push(net);
-                }
-            }
-            rules.push(crate::router::Rule {
-                id: i,
-                mode: match r.mode {
-                    Some(crate::config::RuleMode::And) => "and",
-                    _ => "or",
-                }.to_string(),
-                outbound: r.outbound.clone(),
-                domain_suffix: r.domain_suffix.clone(),
-                domain_keyword: r.domain_keyword.clone(),
-                domain_regex: r.domain_regex.clone(),
-                geosite: r.geosite.clone(),
-                ip_cidr,
-                geoip: r.geoip.clone(),
-                source_ip_cidr: src_cidrs,
-                source_mac: r.source_mac.clone(),
-                protocol: r.protocol.clone(),
-                port: r.port.clone(),
-                inbound: r.inbound.clone(),
-                process_name: r.process_name.clone(),
-                user: r.user.clone(),
-            });
+    // 3. 构建路由引擎。服务端只能用 direct / block / shadowsocks / wireguard 出站 (见 outbounds 表)。
+    //    - 混合配置 (同时有客户端入站, 共用一份 routing): 只采用 `inbound` 明确限定到服务端入站的
+    //      规则; 默认出站服务端用不了 (如客户端的 proxy) 时按直连 —— 这份 routing 主要是给客户端写的。
+    //    - 旧配置 (顶层没有 SS / WG 出站, 从没用过服务端出站): 路由有问题时整体忽略、全部直连,
+    //      即 v0.16 之前服务端的行为 (那时服务端不读 routing), 升级不至于突然全拒。
+    //    - 其余 (用了服务端出站的配置): 引用未定义 / 服务端用不了的出站、非法 CIDR 都是配置错误,
+    //      返回 Err —— 冷启动报错退出, 热重载拒绝并保留旧表 (见 ConfigWatcher::build_state)。
+    let server_tags: Vec<&str> = config
+        .inbounds
+        .iter()
+        .filter_map(|ib| match ib {
+            crate::config::InboundConfig::MirageServer { tag, .. } => Some(tag.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mixed = server_tags.len() < config.inbounds.len();
+    let legacy = !outbounds.values().any(|t| matches!(t, ServerOutboundTarget::Upstream(_)));
+    let usable = |t: &str| outbounds.contains_key(t);
+
+    let rule_cfgs: Vec<&crate::config::RuleConfig> = config
+        .routing
+        .rules
+        .iter()
+        .filter(|r| !mixed || r.inbound.iter().any(|ib| server_tags.contains(&ib.as_str())))
+        .collect();
+    let mut problems: Vec<String> = Vec::new();
+    let default_outbound = if usable(&config.routing.default_outbound) {
+        config.routing.default_outbound.clone()
+    } else if mixed {
+        "direct".to_string()
+    } else {
+        problems.push(format!(
+            "routing.default_outbound = `{}` 不是服务端可用的出站 (未定义, 或不是 direct / block / shadowsocks / wireguard)",
+            config.routing.default_outbound
+        ));
+        "direct".to_string()
+    };
+    for r in &rule_cfgs {
+        if !usable(&r.outbound) {
+            problems.push(format!(
+                "规则引用的出站 `{}` 不是服务端可用的出站 (未定义, 或不是 direct / block / shadowsocks / wireguard)",
+                r.outbound
+            ));
         }
-        let engine = crate::router::RouterEngine::new(
+    }
+    let mut rules = Vec::new();
+    for (i, r) in rule_cfgs.iter().enumerate() {
+        let ip_cidr = match crate::router::parse_ip_nets(&r.ip_cidr) {
+            Ok(v) => v,
+            Err(bad) => {
+                problems.push(format!("规则 ip_cidr 含非法项 `{bad}`"));
+                continue;
+            }
+        };
+        let src_cidrs = match crate::router::parse_ip_nets(&r.source_ip_cidr) {
+            Ok(v) => v,
+            Err(bad) => {
+                problems.push(format!("规则 source_ip_cidr 含非法项 `{bad}`"));
+                continue;
+            }
+        };
+        rules.push(crate::router::Rule {
+            id: i,
+            mode: match r.mode {
+                Some(crate::config::RuleMode::And) => "and",
+                _ => "or",
+            }.to_string(),
+            outbound: r.outbound.clone(),
+            domain_suffix: r.domain_suffix.clone(),
+            domain_keyword: r.domain_keyword.clone(),
+            domain_regex: r.domain_regex.clone(),
+            geosite: r.geosite.clone(),
+            ip_cidr,
+            geoip: r.geoip.clone(),
+            source_ip_cidr: src_cidrs,
+            source_mac: r.source_mac.clone(),
+            protocol: r.protocol.clone(),
+            port: r.port.clone(),
+            inbound: r.inbound.clone(),
+            process_name: r.process_name.clone(),
+            user: r.user.clone(),
+        });
+    }
+
+    let router = if !problems.is_empty() {
+        if legacy {
+            tracing::warn!(
+                "服务端路由配置有问题, 且未配置任何上游出站: 按旧版行为忽略 routing、全部直连。问题: {}",
+                problems.join("; ")
+            );
+            None
+        } else {
+            anyhow::bail!("服务端路由配置无效: {}", problems.join("; "));
+        }
+    } else if rules.is_empty() && default_outbound == "direct" {
+        None // 无规则且默认直连: 不建路由引擎 (省一份 geosite), 全部直连
+    } else {
+        Some(Arc::new(crate::router::RouterEngine::new(
             rules,
-            config.routing.default_outbound.clone(),
+            default_outbound.clone(),
             geodata_dir,
             &config.routing.geo_alias,
-        )?;
-        Some(Arc::new(engine))
-    } else {
-        None
+        )?))
     };
 
     info!(
         "服务端出站表构建完成: {} 个出站 (旧 upstream 入站 {} 个), 默认出站 `{}`",
         outbounds.len(),
         inbound_upstreams.len(),
-        config.routing.default_outbound
+        default_outbound
     );
 
     Ok(ServerRouterState {
         router,
         outbounds,
         inbound_upstreams,
-        default_outbound: config.routing.default_outbound.clone(),
+        default_outbound,
         fingerprints,
+        fresh_wg,
     })
 }
 
@@ -675,45 +784,134 @@ mod tests {
             "outbounds": [
                 {{ "type": "direct", "tag": "direct" }},
                 {{ "type": "block", "tag": "reject" }},
-                {{ "type": "mirage", "tag": "m", "server": "192.0.2.9", "server_port": 443, "password": "p", "camouflage_host": "example.com" }},
                 {{ "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "{pw}" }}
             ],
             "routing": {{
                 "default_outbound": "direct",
                 "rules": [
                     {{ "domain_suffix": ["blocked.example"], "outbound": "reject" }},
-                    {{ "domain_suffix": ["client-only.example"], "outbound": "m" }},
-                    {{ "domain_suffix": ["up.example"], "outbound": "ss-up" }}
+                    {{ "ip_cidr": ["198.51.100.7"], "outbound": "ss-up" }}
                 ]
             }}
         }}"#)
     }
 
+    fn up_tag(st: &ServerRouterState, tag: &str) -> Arc<crate::proxy::upstream::UpstreamOutlet> {
+        match st.outbounds.get(tag) {
+            Some(ServerOutboundTarget::Upstream(o)) => o.clone(),
+            _ => panic!("{tag} 应是上游出口"),
+        }
+    }
+
     #[tokio::test]
-    async fn test_block_and_unusable_outbound_reject_never_direct() {
+    async fn test_block_rejects_and_bare_ip_rule_is_not_match_all() {
         let (cfg, _) = Config::parse_with_diagnostics(&ss_cfg("testpassword12345")).unwrap();
         let state = build_server_router_state(&cfg, "", None).unwrap();
         let d = state.route(Some("srv"), "a.blocked.example:443", "tcp", None, "default").await;
         assert!(matches!(d.target, ServerOutboundTarget::Reject), "block 出站必须拒绝");
-        // 选到服务端不可用的出站 (mirage): 拒绝, 不能回落直连
-        let d = state.route(Some("srv"), "a.client-only.example:443", "tcp", None, "default").await;
-        assert!(matches!(d.target, ServerOutboundTarget::Reject), "不可用出站必须拒绝而非直连");
+        // 裸 IP 规则按 /32: 只命中该 IP, 不能因解析失败退化成"匹配所有"
+        let d = state.route(Some("srv"), "198.51.100.7:443", "tcp", None, "default").await;
+        assert_eq!(d.tag, "ss-up");
+        let d = state.route(Some("srv"), "198.51.100.8:443", "tcp", None, "default").await;
+        assert_eq!(d.tag, "direct");
+    }
+
+    #[test]
+    fn test_invalid_routing_rejected_when_upstreams_configured() {
+        let base: serde_json::Value = serde_json::from_str(&ss_cfg("testpassword12345")).unwrap();
+        let build = |v: &serde_json::Value| {
+            let (cfg, _) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+            build_server_router_state(&cfg, "", None)
+        };
+        // 引用未定义的出站
+        let mut v = base.clone();
+        v["routing"]["rules"][1]["outbound"] = serde_json::json!("no-such");
+        assert!(build(&v).is_err(), "引用未定义出站应报错 (热重载据此拒绝)");
+        // 默认出站服务端用不了 (mirage)
+        let mut v = base.clone();
+        v["outbounds"].as_array_mut().unwrap().push(serde_json::json!(
+            { "type": "mirage", "tag": "m", "server": "192.0.2.9", "server_port": 443, "password": "p", "camouflage_host": "example.com" }));
+        v["routing"]["default_outbound"] = serde_json::json!("m");
+        assert!(build(&v).is_err(), "默认出站不可用应报错");
+        // 非法 CIDR
+        let mut v = base.clone();
+        v["routing"]["rules"][1]["ip_cidr"] = serde_json::json!(["10.0.0.0/33"]);
+        assert!(build(&v).is_err(), "非法 CIDR 应报错, 不能静默丢弃");
+    }
+
+    #[tokio::test]
+    async fn test_legacy_config_with_bad_routing_stays_direct() {
+        // 旧服务端配置 (未配任何上游出站) 里残留从客户端抄来的 routing: 按 v0.16 前行为全部直连
+        let json = r#"{
+            "inbounds": [ { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" } ],
+            "outbounds": [ { "type": "direct", "tag": "direct" } ],
+            "routing": { "default_outbound": "proxy", "rules": [ { "geosite": ["cn"], "outbound": "direct" } ] }
+        }"#;
+        let (cfg, _) = Config::parse_with_diagnostics(json).unwrap();
+        let state = build_server_router_state(&cfg, "", None).unwrap();
+        let d = state.route(Some("srv"), "example.com:443", "tcp", None, "default").await;
+        assert!(matches!(d.target, ServerOutboundTarget::Direct));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_config_only_server_scoped_rules() {
+        // 同一进程既是客户端 (socks + mirage 出站) 又是服务端: 共用的 routing 主要给客户端
+        let json = r#"{
+            "inbounds": [
+                { "type": "socks", "tag": "s", "listen": "127.0.0.1", "port": 1080 },
+                { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" }
+            ],
+            "outbounds": [
+                { "type": "direct", "tag": "direct" },
+                { "type": "block", "tag": "reject" },
+                { "type": "mirage", "tag": "proxy", "server": "192.0.2.9", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" }
+            ],
+            "routing": { "default_outbound": "proxy", "rules": [
+                { "domain_suffix": ["ads.example"], "outbound": "reject" },
+                { "inbound": ["srv"], "domain_suffix": ["up.example"], "outbound": "ss-up" }
+            ] }
+        }"#;
+        let (cfg, _) = Config::parse_with_diagnostics(json).unwrap();
+        let state = build_server_router_state(&cfg, "", None).unwrap();
+        // 限定到服务端入站的规则生效
+        assert_eq!(state.route(Some("srv"), "a.up.example:443", "tcp", None, "default").await.tag, "ss-up");
+        // 客户端规则 (未限定入站) 不作用于服务端; 客户端默认出站 proxy 服务端用不了 → 直连
+        let d = state.route(Some("srv"), "x.ads.example:443", "tcp", None, "default").await;
+        assert!(matches!(d.target, ServerOutboundTarget::Direct), "客户端规则不应作用于服务端");
     }
 
     #[tokio::test]
     async fn test_reload_reuses_unchanged_upstream_outlet() {
         let (c1, _) = Config::parse_with_diagnostics(&ss_cfg("testpassword12345")).unwrap();
         let s1 = build_server_router_state(&c1, "", None).unwrap();
-        let o1 = match s1.outbounds.get("ss-up") { Some(ServerOutboundTarget::Upstream(o)) => o.clone(), _ => panic!() };
         // 配置未变 → 复用同一 outlet (WG 不会以同一私钥另起会话)
         let s2 = build_server_router_state(&c1, "", Some(&s1)).unwrap();
-        let o2 = match s2.outbounds.get("ss-up") { Some(ServerOutboundTarget::Upstream(o)) => o.clone(), _ => panic!() };
-        assert!(Arc::ptr_eq(&o1, &o2), "配置未变的上游出口应复用");
-        // 口令变了 → 新建
-        let (c3, _) = Config::parse_with_diagnostics(&ss_cfg("otherpassword6789")).unwrap();
+        assert!(Arc::ptr_eq(&up_tag(&s1, "ss-up"), &up_tag(&s2, "ss-up")), "配置未变的上游出口应复用");
+        // 只改 tag (如旧入站 upstream 迁移成独立出站) → 按指纹仍复用
+        let renamed = ss_cfg("testpassword12345").replace("ss-up", "ss-renamed");
+        let (c3, _) = Config::parse_with_diagnostics(&renamed).unwrap();
         let s3 = build_server_router_state(&c3, "", Some(&s2)).unwrap();
-        let o3 = match s3.outbounds.get("ss-up") { Some(ServerOutboundTarget::Upstream(o)) => o.clone(), _ => panic!() };
-        assert!(!Arc::ptr_eq(&o2, &o3), "配置变化的上游出口应重建");
+        assert!(Arc::ptr_eq(&up_tag(&s2, "ss-up"), &up_tag(&s3, "ss-renamed")), "改 tag 应按指纹复用");
+        // 口令变了 → 新建
+        let (c4, _) = Config::parse_with_diagnostics(&ss_cfg("otherpassword6789")).unwrap();
+        let s4 = build_server_router_state(&c4, "", Some(&s2)).unwrap();
+        assert!(!Arc::ptr_eq(&up_tag(&s2, "ss-up"), &up_tag(&s4, "ss-up")), "配置变化的上游出口应重建");
+    }
+
+    #[test]
+    fn test_same_upstream_config_built_once() {
+        // 入站旧 upstream 与顶层出站是同一份配置: 只建一个实例 (WG 同私钥两会话会互踢)
+        let json = r#"{
+            "inbounds": [ { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012",
+                "upstream": { "type": "shadowsocks", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" } } ],
+            "outbounds": [ { "type": "direct", "tag": "direct" },
+                { "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" } ],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        }"#;
+        let (cfg, _) = Config::parse_with_diagnostics(json).unwrap();
+        let st = build_server_router_state(&cfg, "", None).unwrap();
+        assert!(Arc::ptr_eq(st.inbound_upstreams.get("srv").unwrap(), &up_tag(&st, "ss-up")));
     }
 
     #[test]
