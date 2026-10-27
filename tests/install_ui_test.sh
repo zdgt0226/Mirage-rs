@@ -104,12 +104,49 @@ section_b4() {
     has_ "B4.3b title 含标题文字" "$t" "T"
 }
 
+# ── B5: 服务端上游出口改写 (apply_server_upstream / server_upstream_summary) ──
+section_b5() {
+    echo "[B5] 服务端上游出口改写"
+    command -v python3 >/dev/null 2>&1 || { echo "  SKIP (无 python3)"; return; }
+    local d full lite out
+    d=$(mktemp -d); full="$d/config_server.json"; lite="$d/lite_server.json"
+    cat > "$full" <<'JSON'
+{ "inbounds": [
+    { "type": "mirage_server", "tag": "t", "port": 443, "password": "p" },
+    { "type": "mirage_server", "tag": "q", "port": 443, "password": "p", "transport": "quic" },
+    { "type": "socks", "tag": "s", "port": 1080 } ] }
+JSON
+    printf '{ "port": 443, "password": "p" }\n' > "$lite"
+    local ss='{ "type": "shadowsocks", "server": "192.0.2.1", "server_port": 8388, "password": "x", "method": "aes-256-gcm", "udp": "block" }'
+    local wg='{ "type": "wireguard", "private_key": "a", "peer_public_key": "b", "endpoint": "198.51.100.1:51820", "address": "10.0.0.2", "mtu": 1420, "udp": "tunnel" }'
+
+    has_ "B5.1  初始无上游 → 直连" "$(server_upstream_summary "$full")" "直连"
+    eq_  "B5.2  完整版只改 TCP mirage_server 入站 (1 个)" "$(apply_server_upstream "$full" "$ss")" "1"
+    out=$(python3 -c 'import json,sys; ib=json.load(open(sys.argv[1]))["inbounds"]; print([("upstream" in i) for i in ib])' "$full")
+    eq_  "B5.3  QUIC / socks 入站不被写入上游" "$out" "[True, False, False]"
+    has_ "B5.4  摘要显示 SS 上游" "$(server_upstream_summary "$full")" "Shadowsocks 192.0.2.1:8388"
+    eq_  "B5.5  改写后文件权限 600" "$(stat -c %a "$full")" "600"
+    apply_server_upstream "$full" "$wg" >/dev/null
+    has_ "B5.6  替换为 WG 上游" "$(server_upstream_summary "$full")" "WireGuard 198.51.100.1:51820"
+    apply_server_upstream "$full" "" >/dev/null
+    has_ "B5.7  空串 → 移除上游恢复直连" "$(server_upstream_summary "$full")" "直连"
+    eq_  "B5.8  轻量版写顶层" "$(apply_server_upstream "$lite" "$ss")" "1"
+    out=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream"]["server"])' "$lite")
+    eq_  "B5.9  轻量版顶层 upstream 落盘" "$out" "192.0.2.1"
+    printf '{ "inbounds": [ { "type": "mirage_server", "transport": "quic" } ] }\n' > "$d/q.json"
+    apply_server_upstream "$d/q.json" "$ss" >/dev/null 2>&1
+    eq_  "B5.10 无可配入站 → 非零退出" "$?" "1"
+    no_  "B5.11 无可配入站 → 文件不动" "$(cat "$d/q.json")" "upstream"
+    rm -rf "$d"
+}
+
 echo "== install.sh UI 护甲 =="
 section_b3
 load_install
 section_b1
 section_b2
 section_b4
+section_b5
 echo "----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

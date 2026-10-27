@@ -1527,7 +1527,8 @@ ask_upstream() {
   典型用途: 本机放在离你近、线路好的位置 (如香港) 只做中转, 真正的出口
   落在另一台机器上 (如落地解锁机)。需要你已有一台可用的上游服务器。
 EOM
-    ask_yn "是否配置上游出口?" n || { echo ""; return; }
+    # $1=force: 调用方已确认要配 (菜单「修改服务端上游出口」), 跳过是否询问
+    [[ "${1:-}" == force ]] || ask_yn "是否配置上游出口?" n || { echo ""; return; }
 
     local kind
     kind=$(ask_choice "上游类型" \
@@ -1637,6 +1638,118 @@ EOM
     printf '{ "type": "wireguard", "private_key": "%s", "peer_public_key": "%s", "endpoint": "%s", "address": "%s", "mtu": %s, "udp": "%s"%s }' \
         "$(json_escape "$wg_priv")" "$(json_escape "$wg_pub")" "$(json_escape "$wg_ep")" \
         "$(json_escape "$wg_addr")" "$mtu" "$wg_udp" "$extra"
+}
+
+# 一行描述配置里当前的上游出口 (完整版取 mirage_server 入站, 轻量版取顶层)。需 python3。
+server_upstream_summary() { # file
+    CFG="$1" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+if "inbounds" in d:
+    ups = [ib.get("upstream") for ib in d["inbounds"] if ib.get("type") == "mirage_server"]
+else:
+    ups = [d.get("upstream")]
+def desc(u):
+    if not u: return "直连 (未配上游)"
+    if u.get("type") == "shadowsocks":
+        return "Shadowsocks %s:%s (%s, udp=%s)" % (u.get("server"), u.get("server_port"), u.get("method"), u.get("udp", "block"))
+    if u.get("type") == "wireguard":
+        return "WireGuard %s (隧道内 %s)" % (u.get("endpoint"), u.get("address"))
+    return str(u.get("type"))
+print("; ".join(sorted(set(desc(u) for u in ups))) or "无 mirage_server 入站")
+'
+}
+
+# 把上游写进服务端配置 (json 为空串 = 移除, 恢复直连)。原子替换, 保留 600 权限。
+# 完整版写到每个 TCP 的 mirage_server 入站 (QUIC 入站不支持上游, 跳过); 轻量版写顶层。
+# 输出改动的入站数, 0 个可改时返回非零。
+apply_server_upstream() { # file json
+    CFG="$1" UP="$2" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+up = json.loads(os.environ["UP"]) if os.environ["UP"] else None
+d = json.load(open(path))
+if "inbounds" in d:
+    targets = [ib for ib in d["inbounds"]
+               if ib.get("type") == "mirage_server" and ib.get("transport", "tcp") != "quic"]
+else:
+    targets = [d]
+for t in targets:
+    if up is None: t.pop("upstream", None)
+    else: t["upstream"] = up
+if not targets: sys.exit(1)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(len(targets))
+'
+}
+
+# 菜单项: 交互式修改已部署服务端的上游出口 (中转 / 落地), 不必重走部署流程。
+edit_server_upstream() {
+    title "修改服务端上游出口 (中转 / 落地)"
+    command -v python3 >/dev/null 2>&1 || { warn "需要 python3 来安全改写 JSON 配置, 请先安装 python3"; return; }
+
+    local cfgs=() cfg
+    for cfg in "${ETC_DIR}/config_server.json" "${ETC_DIR}/lite_server.json"; do
+        [[ -f "$cfg" ]] && cfgs+=("$cfg")
+    done
+    if [[ ${#cfgs[@]} -eq 0 ]]; then
+        warn "在 ${ETC_DIR} 下未找到服务端配置, 请先部署服务端。"
+        return
+    elif [[ ${#cfgs[@]} -eq 1 ]]; then
+        cfg="${cfgs[0]}"
+    else
+        local choice
+        choice=$(ask_choice "检测到多个服务端配置，请选择要修改的配置" "${cfgs[@]}")
+        cfg="${cfgs[$((choice - 1))]}"
+    fi
+    [[ "$cfg" == */lite_server.json ]] && LITE_MODE=true
+
+    local cur
+    cur=$(server_upstream_summary "$cfg" 2>/dev/null) || { warn "读取 ${cfg} 失败 (JSON 格式有误?)"; return; }
+    info "配置文件: ${cfg}"
+    info "当前上游: ${cur}"
+
+    local action up=""
+    action=$(ask_choice "要做什么" "配置 / 替换上游出口" "移除上游 (恢复直连)" "取消")
+    case "$action" in
+        1) up=$(ask_upstream force)
+           [[ -z "$up" ]] && { info "未改动配置。"; return; } ;;
+        2) ;;
+        *) return ;;
+    esac
+
+    cp -p "$cfg" "${cfg}.bak"
+    local n
+    if ! n=$(apply_server_upstream "$cfg" "$up"); then
+        mv -f "${cfg}.bak" "$cfg"
+        warn "写入失败: 配置里没有可配上游的 TCP mirage_server 入站 (QUIC 入站不支持上游), 或 JSON 有误。未改动。"
+        return
+    fi
+    # 完整版重启前先过 check 闸门 (轻量版是平铺格式, check 不认)
+    if [[ "$LITE_MODE" != true && -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+        mv -f "${cfg}.bak" "$cfg"
+        warn "新配置校验未通过, 已还原原配置。"
+        return
+    fi
+    ok "已更新 ${n} 个入站的上游出口 (原配置备份: ${cfg}.bak)"
+    info "现在: $(server_upstream_summary "$cfg")"
+
+    # 上游出口不热重载, 须重启服务端才生效 (会断开现有连接)
+    if service_active server; then
+        if ask_yn "立即重启 $(svc_name server) 使其生效? (会断开现有连接)" y; then
+            svc_ctl restart server
+            ok "已重启 $(svc_name server)"
+        else
+            info "稍后手动重启生效: $(svc_restart_hint server)"
+        fi
+    else
+        info "服务端未在运行, 下次启动生效: $(svc_start_hint server)"
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2873,7 +2986,8 @@ main() {
         "查看服务端节点信息 (导入串 / 二维码)" \
         "卸载 Mirage-rs" \
         "家庭 WireGuard 服务端 (干净设备接入)" \
-        "修改现有配置 (交互式)")
+        "修改现有配置 (交互式)" \
+        "修改服务端上游出口 (中转 / 落地)")
 
     case "$mode" in
         4) update_binary; return ;;
@@ -2881,6 +2995,7 @@ main() {
         6) uninstall; return ;;
         7) config_wg_server; return ;;
         8) edit_config_interactive; return ;;
+        9) edit_server_upstream; return ;;
     esac
 
     # 部署路径 (1/2/3): 先选形态 —— 完整版还是轻量版
