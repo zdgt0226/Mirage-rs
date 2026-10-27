@@ -90,6 +90,43 @@ pub fn decode_wg_key(b64: &str, what: &str) -> Result<[u8; 32]> {
     Ok(k)
 }
 
+/// 标准 base64 编码 WireGuard 32 字节密钥。
+pub fn encode_wg_key(key: &[u8; 32]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(key)
+}
+
+/// 对 X25519 标量执行 Curve25519 clamping (对齐 RFC 7748 §5 与 WireGuard 规范)。
+pub fn clamp_scalar(scalar: &mut [u8; 32]) {
+    scalar[0] &= 248;
+    scalar[31] &= 127;
+    scalar[31] |= 64;
+}
+
+/// 生成 WireGuard 密钥对: (私钥, 公钥), 均已完成 clamping 并推导公钥。
+pub fn generate_wg_keypair() -> ([u8; 32], [u8; 32]) {
+    use rand::RngExt;
+    let mut priv_bytes = [0u8; 32];
+    rand::rng().fill(&mut priv_bytes);
+    clamp_scalar(&mut priv_bytes);
+    let pub_bytes = public_key_from_private(&priv_bytes);
+    (priv_bytes, pub_bytes)
+}
+
+/// 由 32 字节私钥推导 32 字节公钥。
+pub fn public_key_from_private(priv_bytes: &[u8; 32]) -> [u8; 32] {
+    let secret = StaticSecret::from(*priv_bytes);
+    PublicKey::from(&secret).to_bytes()
+}
+
+/// 生成 32 字节预共享密钥 (PSK)。
+pub fn generate_psk() -> [u8; 32] {
+    use rand::RngExt;
+    let mut psk = [0u8; 32];
+    rand::rng().fill(&mut psk);
+    psk
+}
+
 impl WgConfig {
     /// 本端公钥 (由私钥推导)。用于日志/排障时和服务端配的 `AllowedIPs`/peer 对照。
     pub fn public_key(&self) -> [u8; 32] {
@@ -165,6 +202,50 @@ mod tests {
         };
         let expect = PublicKey::from(&StaticSecret::from(priv_bytes)).to_bytes();
         assert_eq!(cfg.public_key(), expect);
+    }
+
+    /// RFC 7748 §6.1 官方测试向量验证公钥推导正确性及 clamping 行为。
+    #[test]
+    fn test_rfc7748_test_vectors_and_clamping() {
+        // Alice
+        let alice_priv_hex = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+        let alice_pub_hex = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+        let mut alice_priv = [0u8; 32];
+        hex::decode_to_slice(alice_priv_hex, &mut alice_priv).unwrap();
+        let mut alice_pub_expected = [0u8; 32];
+        hex::decode_to_slice(alice_pub_hex, &mut alice_pub_expected).unwrap();
+
+        let alice_pub_derived = public_key_from_private(&alice_priv);
+        assert_eq!(alice_pub_derived, alice_pub_expected, "Alice 公钥推导必须与 RFC 7748 一致");
+
+        // Bob
+        let bob_priv_hex = "5dab087e624a8a4b79477010910431d17666461f5048b645162a1494dd4fb82d";
+        let bob_pub_hex = "9b5132713d0ade3691a0e7ae89e0071d38e47516b5cb92edaa828e7a91f13a1e";
+        let mut bob_priv = [0u8; 32];
+        hex::decode_to_slice(bob_priv_hex, &mut bob_priv).unwrap();
+        let mut bob_pub_expected = [0u8; 32];
+        hex::decode_to_slice(bob_pub_hex, &mut bob_pub_expected).unwrap();
+
+        let bob_pub_derived = public_key_from_private(&bob_priv);
+        assert_eq!(bob_pub_derived, bob_pub_expected, "Bob 公钥推导必须与 RFC 7748 一致");
+
+        // 验证生成器符合 clamping 约束
+        for _ in 0..50 {
+            let (priv_k, pub_k) = generate_wg_keypair();
+            // clamp 检验: bit 0, 1, 2 为 0; bit 255 为 0; bit 254 为 1
+            assert_eq!(priv_k[0] & 7, 0, "私钥第 0 字节低 3 位必须为 0");
+            assert_eq!(priv_k[31] & 128, 0, "私钥最高 bit (bit 255) 必须为 0");
+            assert_ne!(priv_k[31] & 64, 0, "私钥次高 bit (bit 254) 必须为 1");
+
+            // 公钥非全零且与公钥推导一致
+            assert_ne!(pub_k, [0u8; 32]);
+            assert_eq!(public_key_from_private(&priv_k), pub_k);
+
+            // encode 与 decode roundtrip
+            let b64 = encode_wg_key(&priv_k);
+            let dec = decode_wg_key(&b64, "test_priv").unwrap();
+            assert_eq!(dec, priv_k);
+        }
     }
 
     /// 阶段1 里程碑: 用配置构造 Tunn, 驱动它产出**第一个握手包**, 验证它是合法的

@@ -77,6 +77,7 @@ pub async fn handle_ss_client(
         source_mac: None,
         inbound: Some(&inbound_tag),
         process_name: None,
+        user: None,
     };
     let outbound_tag = st.router.route(req);
     let outbound = match st.outbounds.get(&outbound_tag) {

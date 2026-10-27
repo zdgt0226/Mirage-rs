@@ -602,6 +602,9 @@ pub enum OutboundConfig {
         /// SS-over-X: SS 到 server 的连接经该出站拨号 (而非物理网卡)。不设 = 直连。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         underlying: Option<String>,
+        /// 配了上游时 UDP 怎么办。默认 `block`。仅服务端语义 (含义同 UpstreamConfig 的 udp 策略)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp: Option<UdpPolicy>,
     },
     /// WireGuard 出站: 选中的流量经 WG 隧道发往 peer, 不走 Mirage 隧道。
     ///
@@ -725,7 +728,7 @@ impl std::fmt::Debug for OutboundConfig {
                     .field("quic_pin", quic_pin)
                     .finish()
             }
-            Self::Shadowsocks { tag, server, server_port, method, password: _, underlying } => {
+            Self::Shadowsocks { tag, server, server_port, method, password: _, underlying, udp } => {
                 f.debug_struct("Shadowsocks")
                     .field("tag", tag)
                     .field("server", server)
@@ -733,6 +736,7 @@ impl std::fmt::Debug for OutboundConfig {
                     .field("method", method)
                     .field("password", &"[REDACTED]")
                     .field("underlying", underlying)
+                    .field("udp", udp)
                     .finish()
             }
             Self::Wireguard {
@@ -892,6 +896,10 @@ pub struct RuleConfig {
     /// 无从取, 带此条件的规则对它们不命中。不写 = 不限进程。
     #[serde(default, deserialize_with = "one_or_many")]
     pub process_name: Vec<String>,
+    /// 按**用户名**精确匹配 —— 服务端多用户模式下认出认证的用户名 (单用户为 "default")。
+    /// 客户端侧没有用户信息时带 `user` 条件的规则一律不匹配 (同 `inbound` 语义)。
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub user: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

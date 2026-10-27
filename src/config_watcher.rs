@@ -191,6 +191,7 @@ impl ConfigWatcher {
                 port: r.port,
                 inbound: r.inbound,
                 process_name: r.process_name,
+                user: r.user,
             });
         }
         
@@ -1097,6 +1098,7 @@ mod watcher_event_tests {
             source_mac: None,
             inbound: None,
             process_name: None,
+            user: None,
         };
         assert_eq!(st.router.route(req("192.0.2.5")), "block");
         assert_eq!(st.router.route(req("192.0.2.6")), "direct");

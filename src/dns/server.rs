@@ -1325,6 +1325,7 @@ impl DnsForwarder {
             source_mac: None,
             inbound: Some(&self.inbound_tag),
             process_name: None, // DNS 查询: 无本机进程名维度
+            user: None,
         };
 
         let matched = st.router.route_matched(&routing_req);
