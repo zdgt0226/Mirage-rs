@@ -1068,6 +1068,7 @@ pub(super) async fn handle_connection(
     upstream: Option<std::sync::Arc<crate::proxy::upstream::UpstreamOutlet>>,
     pfs: bool,
     allow_local_targets: bool,
+    inbound_tag: Option<Arc<str>>,
 ) {
     stream.set_nodelay(true).unwrap_or_default();
     let client_ip = peer_addr.ip();
@@ -1099,6 +1100,7 @@ pub(super) async fn handle_connection(
             upstream,
             ecdh,
             allow_local_targets,
+            inbound_tag,
         )
         .await;
     }

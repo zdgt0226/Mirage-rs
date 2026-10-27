@@ -531,6 +531,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 quic_obfs.clone(),
                                 quic_key_path.as_deref(),
                                 allow_local_targets,
+                                Some(tag.clone()),
                             ).await;
                         });
                         #[cfg(not(feature = "quic"))]
@@ -548,6 +549,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 ss_upstream,
                                 pfs,
                                 allow_local_targets,
+                                Some(tag.clone()),
                             ).await;
                         });
                     }

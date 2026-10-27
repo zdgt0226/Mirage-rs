@@ -150,6 +150,7 @@ pub(super) async fn handle_udp_relay(
     user: String,
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
+    inbound_tag: Option<Arc<str>>,
 ) {
     debug!("Mirage Server: Started UDP relay session");
 
@@ -202,6 +203,10 @@ pub(super) async fn handle_udp_relay(
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let udp_clone = udp_socket.clone();
 
+    // 路由选出的 WG 出口 socket 缓存表
+    let wg_sockets: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<crate::proxy::wg::socket::WgUdpSocket>>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // 维护该会话已发送过的目标地址集合 (限制 1024 条防膨胀)。
     // 记最近一次向该目标发送的时间, 供下行校验回包来源 (阻止未授权来源注入数据及恶意消耗用户配额)。
     let sent_targets: Arc<std::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>> =
@@ -214,6 +219,7 @@ pub(super) async fn handle_udp_relay(
 
     let dn_buckets = dev_buckets.clone();
     let dn_auth = session_auth.clone();
+    let tx_down = tx.clone();
     let downlink = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
@@ -262,7 +268,7 @@ pub(super) async fn handle_udp_relay(
                     packet.extend_from_slice(&frame_len.to_be_bytes());
                     packet.extend_from_slice(&frame);
 
-                    if tx.send(packet).await.is_err() {
+                    if tx_down.send(packet).await.is_err() {
                         break;
                     }
                 }
@@ -312,6 +318,13 @@ pub(super) async fn handle_udp_relay(
     };
 
     let up_auth = session_auth.clone();
+    let tx_up = tx.clone();
+    let dev_buckets_up = dev_buckets.clone();
+    let inbound_tag_up = inbound_tag.clone();
+    let user_up = user.clone();
+    let upstream_up = upstream.clone();
+    let wg_sockets_up = wg_sockets.clone();
+    let stop_tx_wg = stop_tx.clone();
     let tunnel_uplink = async move {
         let mut buffer = Vec::new();
         'outer: loop {
@@ -389,6 +402,104 @@ pub(super) async fn handle_udp_relay(
                     break 'outer; // 越额或吊销退出整个会话
                 }
 
+                // 服务端选路
+                let target_str = format!("{}:{}", target_addr_str, port);
+                let decision = super::server_router::server_route(
+                    inbound_tag_up.as_deref(),
+                    &target_str,
+                    "udp",
+                    client_ip,
+                    &user_up,
+                    upstream_up.as_ref(),
+                )
+                .await;
+
+                // SS block 或 WG block 策略丢包
+                if let super::server_router::ServerOutboundTarget::Upstream(outlet) = &decision.target {
+                    match &**outlet {
+                        crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) if ss.block_udp => {
+                            debug!("UDP: 丢弃发往 {} 的报文, 出站 `{}` 的 udp 策略为 block", target_str, decision.tag);
+                            continue;
+                        }
+                        crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) if matches!(wg.udp, crate::config::UdpPolicy::Block) => {
+                            debug!("UDP: 丢弃发往 {} 的报文, 出站 `{}` 的 udp 策略为 block", target_str, decision.tag);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 路由选到 WG tunnel 且主 socket 是 direct 时, 懒创建 WG 隧道 socket
+                let mut routed_wg = None;
+                if let super::server_router::ServerOutboundTarget::Upstream(outlet) = &decision.target {
+                    if let crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) = &**outlet {
+                        if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) && matches!(*udp_socket, UdpEgress::Direct(_)) {
+                            let mut map = wg_sockets_up.lock().await;
+                            if let Some(s) = map.get(&decision.tag) {
+                                routed_wg = Some(s.clone());
+                            } else {
+                                match wg.tunnel().await {
+                                    Ok(t) => match crate::proxy::wg::socket::WgUdpSocket::bind(t) {
+                                        Ok(s) => {
+                                            let s = Arc::new(s);
+                                            map.insert(decision.tag.clone(), s.clone());
+                                            routed_wg = Some(s.clone());
+                                            let s_down = s.clone();
+                                            let tx_c = tx_up.clone();
+                                            let dn_auth_c = up_auth.clone();
+                                            let dn_buckets_c = dev_buckets_up.clone();
+                                            let sent_targets_c = sent_targets_up.clone();
+                                            let mut stop_rx_c = stop_tx_wg.subscribe();
+                                            tokio::spawn(async move {
+                                                let mut buf = vec![0u8; 65536];
+                                                loop {
+                                                    if dn_auth_c.should_stop() { break; }
+                                                    tokio::select! {
+                                                        biased;
+                                                        _ = stop_rx_c.changed() => break,
+                                                        res = tokio::time::timeout(UDP_IDLE_TIMEOUT, s_down.recv_from(&mut buf)) => match res {
+                                                            Ok(Ok((size, addr))) => {
+                                                                let norm = normalize_addr(addr);
+                                                                if !sent_targets_c.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&norm) {
+                                                                    continue;
+                                                                }
+                                                                if !crate::proxy::rate_limit::try_consume_two(
+                                                                    dn_buckets_c.as_ref().map(|b| &b.down),
+                                                                    dn_auth_c.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.down),
+                                                                    size,
+                                                                ) {
+                                                                    continue;
+                                                                }
+                                                                if dn_auth_c.record_bytes(size) { break; }
+                                                                let frame = encode_reply_frame(norm, &buf[..size]);
+                                                                if frame.len() <= u16::MAX as usize {
+                                                                    let mut packet = Vec::with_capacity(2 + frame.len());
+                                                                    packet.extend_from_slice(&(frame.len() as u16).to_be_bytes());
+                                                                    packet.extend_from_slice(&frame);
+                                                                    if tx_c.send(packet).await.is_err() { break; }
+                                                                }
+                                                            }
+                                                            _ => break,
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            debug!("UDP: 绑定 WG 上游 `{}` 失败: {e}", decision.tag);
+                                            continue;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        debug!("UDP: 建立 WG 上游 `{}` 失败: {e}", decision.tag);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // v0.4.5-alpha.16: 走 resolver::resolve_first_filtered (60s 缓存 + IPv4 优先 +
                 // 并发限流 + 出站 SSRF 白名单过滤), 不再每 UDP 包裸调 lookup_host 打满阻塞池.
                 // send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为).
@@ -396,7 +507,7 @@ pub(super) async fn handle_udp_relay(
                     crate::net_util::egress_allowed(ip, allow_local_targets)
                 }).await {
                     Ok(socket_addr) => {
-                        let send_addr = if matches!(*udp_socket, UdpEgress::Direct(_)) {
+                        let send_addr = if matches!(*udp_socket, UdpEgress::Direct(_)) && routed_wg.is_none() {
                             match prepare_target_addr(socket_addr, is_dual_stack) {
                                 Some(a) => a,
                                 None => {
@@ -418,20 +529,20 @@ pub(super) async fn handle_udp_relay(
                             MAX_SENT_TARGETS,
                         );
 
-                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
-                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                        // send_to 失败以前被静默吞掉 —— VPS 封出向 UDP 时这里就是第一现场,
-                        // 却完全无痕 (真机排障卡过)。一次性记下, 不刷屏 (高频 QUIC)。
-                        match udp_socket.send_to(payload, send_addr).await {
-                            Ok(()) => {}
-                            Err(e) => {
-                                static WARNED: std::sync::atomic::AtomicBool =
-                                    std::sync::atomic::AtomicBool::new(false);
-                                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                    tracing::warn!(
-                                        "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
-                                        socket_addr, e
-                                    );
+                        if let Some(wg_s) = routed_wg {
+                            let _ = wg_s.send_to(payload, socket_addr);
+                        } else {
+                            match udp_socket.send_to(payload, send_addr).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    static WARNED: std::sync::atomic::AtomicBool =
+                                        std::sync::atomic::AtomicBool::new(false);
+                                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                        tracing::warn!(
+                                            "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
+                                            socket_addr, e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -535,6 +646,7 @@ pub(crate) async fn handle_udp_mux_relay(
     user: String,
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
+    inbound_tag: Option<Arc<str>>,
 ) {
     handle_udp_mux_relay_inner(
         reader,
@@ -545,6 +657,7 @@ pub(crate) async fn handle_udp_mux_relay(
         session_auth,
         allow_local_targets,
         super::REVOKE_CHECK_INTERVAL,
+        inbound_tag,
     )
     .await
 }
@@ -558,28 +671,13 @@ pub(crate) async fn handle_udp_mux_relay_inner(
     session_auth: super::SessionAuth,
     allow_local_targets: bool,
     revoke_check_interval: Duration,
+    inbound_tag: Option<Arc<str>>,
 ) {
     debug!("Mirage Server: Started UDP MUX relay session");
 
     // 服务端按客户端 IP 限速 (device_profiles): mux 复用一条隧道多 sid, 但都同一客户端 IP →
     // 共享同一对桶, policing (令牌不足丢包)。同 handle_udp_relay。
     let dev_buckets = client_ip.and_then(crate::proxy::rate_limit::server_buckets_for);
-
-    // 上游是否 WG-tunnel 出口 (与 TCP 同出口 IP)。是则各 sid 在同一 WG 隧道内绑独立端口。
-    let wg_tunnel = match upstream.as_deref() {
-        Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(wg))
-            if matches!(wg.udp, crate::config::UdpPolicy::Tunnel) =>
-        {
-            match wg.tunnel().await {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    error!("UDP mux: 建立 WG 上游隧道失败: {}", e);
-                    return;
-                }
-            }
-        }
-        _ => None,
-    };
 
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     // 所有 sid 下行泵的回包经此汇入唯一 AEAD writer 泵。
@@ -598,6 +696,9 @@ pub(crate) async fn handle_udp_mux_relay_inner(
     let up_auth = session_auth.clone();
     let up_sessions = sessions.clone();
     let up_tx = tx.clone();
+    let inbound_tag_mux = inbound_tag.clone();
+    let user_mux = user.clone();
+    let upstream_mux = upstream.clone();
     let uplink = async move {
         let mut buffer: Vec<u8> = Vec::new();
         'outer: loop {
@@ -650,44 +751,138 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                     }
                     continue;
                 }
-                // 解析目标 (带 SSRF 校验: IP 字面量不解析, 域名走 60s 缓存 resolver)。
-                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
-                    crate::net_util::egress_allowed(ip, allow_local_targets)
-                }).await {
-                    Ok(sa) => sa,
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::PermissionDenied {
-                            super::warn_egress_blocked(
-                                "Mirage Server UDP mux",
-                                &user,
-                                &crate::net_util::join_host_port(&uf.target, uf.port),
-                            );
-                        }
-                        continue;
-                    }
-                };
-                // 建 egress。
-                let egress = match &wg_tunnel {
-                    Some(t) => match crate::proxy::wg::socket::WgUdpSocket::bind(t.clone()) {
-                        Ok(s) => SidEgress::Wireguard(Arc::new(s), target_sa),
-                        Err(e) => {
-                            debug!("UDP mux: WG 内绑 UDP 失败: {}", e);
-                            continue;
-                        }
-                    },
-                    None => {
+                let target_str = crate::net_util::join_host_port(&uf.target, uf.port);
+                let decision = super::server_router::server_route(
+                    inbound_tag_mux.as_deref(),
+                    &target_str,
+                    "udp",
+                    client_ip,
+                    &user_mux,
+                    upstream_mux.as_ref(),
+                )
+                .await;
+
+                let (egress, target_sa) = match &decision.target {
+                    super::server_router::ServerOutboundTarget::Direct => {
+                        let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                            crate::net_util::egress_allowed(ip, allow_local_targets)
+                        }).await {
+                            Ok(sa) => sa,
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                    super::warn_egress_blocked(
+                                        "Mirage Server UDP mux",
+                                        &user_mux,
+                                        &target_str,
+                                    );
+                                }
+                                continue;
+                            }
+                        };
                         let bind_addr = match target_sa {
                             SocketAddr::V4(_) => "0.0.0.0:0",
                             SocketAddr::V6(_) => "[::]:0",
                         };
                         match UdpSocket::bind(bind_addr).await {
                             Ok(s) => match s.connect(target_sa).await {
-                                Ok(()) => SidEgress::Direct(s),
+                                Ok(()) => (SidEgress::Direct(s), target_sa),
                                 Err(_) => continue,
                             },
                             Err(_) => continue,
                         }
                     }
+                    super::server_router::ServerOutboundTarget::Upstream(outlet) => match &**outlet {
+                        crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
+                            if ss.block_udp {
+                                debug!("UDP mux: sid {} 命中 SS 上游 {} 但 SS udp 策略为 block, 丢弃", uf.sid, decision.tag);
+                                continue;
+                            } else {
+                                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                                    crate::net_util::egress_allowed(ip, allow_local_targets)
+                                }).await {
+                                    Ok(sa) => sa,
+                                    Err(e) => {
+                                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                            super::warn_egress_blocked(
+                                                "Mirage Server UDP mux",
+                                                &user_mux,
+                                                &target_str,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let bind_addr = match target_sa {
+                                    SocketAddr::V4(_) => "0.0.0.0:0",
+                                    SocketAddr::V6(_) => "[::]:0",
+                                };
+                                match UdpSocket::bind(bind_addr).await {
+                                    Ok(s) => match s.connect(target_sa).await {
+                                        Ok(()) => (SidEgress::Direct(s), target_sa),
+                                        Err(_) => continue,
+                                    },
+                                    Err(_) => continue,
+                                }
+                            }
+                        }
+                        crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => match wg.udp {
+                            crate::config::UdpPolicy::Block => {
+                                debug!("UDP mux: sid {} 命中 WG 上游 {} 但 udp 策略为 block, 丢弃", uf.sid, decision.tag);
+                                continue;
+                            }
+                            crate::config::UdpPolicy::Direct => {
+                                let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
+                                    crate::net_util::egress_allowed(ip, allow_local_targets)
+                                }).await {
+                                    Ok(sa) => sa,
+                                    Err(e) => {
+                                        if e.kind() == std::io::ErrorKind::PermissionDenied {
+                                            super::warn_egress_blocked(
+                                                "Mirage Server UDP mux",
+                                                &user_mux,
+                                                &target_str,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let bind_addr = match target_sa {
+                                    SocketAddr::V4(_) => "0.0.0.0:0",
+                                    SocketAddr::V6(_) => "[::]:0",
+                                };
+                                match UdpSocket::bind(bind_addr).await {
+                                    Ok(s) => match s.connect(target_sa).await {
+                                        Ok(()) => (SidEgress::Direct(s), target_sa),
+                                        Err(_) => continue,
+                                    },
+                                    Err(_) => continue,
+                                }
+                            }
+                            crate::config::UdpPolicy::Tunnel => {
+                                let tunnel = match wg.tunnel().await {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        error!("UDP mux: 建立 WG 上游隧道失败: {}", e);
+                                        continue;
+                                    }
+                                };
+                                let target_sa = match crate::proxy::wg::resolve_target(&tunnel, &uf.target, uf.port).await {
+                                    Ok(sa) => sa,
+                                    Err(e) => {
+                                        debug!("UDP mux: WG 内解析目标 {} 失败: {}", target_str, e);
+                                        continue;
+                                    }
+                                };
+                                match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
+                                    Ok(s) => (SidEgress::Wireguard(Arc::new(s), target_sa), target_sa),
+                                    Err(e) => {
+                                        debug!("UDP mux: WG 内绑 UDP 失败: {}", e);
+                                        continue;
+                                    }
+                                }
+                            }
+                        },
+                    },
                 };
                 let egress = Arc::new(egress);
                 // spawn 下行泵: egress.recv → frame_mux_addr(sid) → tx。
@@ -697,6 +892,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                 let pump_buckets = dev_buckets.clone();
                 let pump_auth = up_auth.clone();
                 let sid = uf.sid;
+                let pump_target_sa = target_sa;
                 let pump = tokio::spawn(async move {
                     let mut buf = vec![0u8; 65536];
                     loop {
@@ -720,7 +916,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                                 }
                                 if let Some(f) = crate::proxy::udp_mux::frame_mux_addr(
                                     sid,
-                                    target_sa,
+                                    pump_target_sa,
                                     &buf[..n],
                                 ) {
                                     if pump_tx.send(f).await.is_err() {
@@ -837,7 +1033,7 @@ mod mux_tests {
 
         // 4. 起服务端 mux relay (upstream=None → Direct egress, 测试环境连本地 echo 需 allow_local_targets=true)
         let server = tokio::spawn(async move {
-            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), crate::proxy::mirage_server::SessionAuth::unlimited(), true).await;
+            handle_udp_mux_relay(sr, sw, None, None, "default".to_string(), crate::proxy::mirage_server::SessionAuth::unlimited(), true, None).await;
         });
 
         // 5. 客户端发两帧: 同目标, 不同 sid + payload
@@ -933,6 +1129,7 @@ mod mux_tests {
                 auth,
                 true,
                 revoke_interval,
+                None,
             )
             .await;
         });

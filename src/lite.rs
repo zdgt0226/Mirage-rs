@@ -248,6 +248,7 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
         ss_upstream,
         cfg.pfs,
         cfg.allow_local_targets,
+        Some("lite_server".to_string()),
     )
     .await;
     Ok(())

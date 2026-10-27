@@ -128,6 +128,21 @@ impl ConfigWatcher {
         }
         
         let is_hot_reload = old_outbounds.is_some();
+
+        // 服务端路由与出站表热重载更新 (原子替换; 失败保持上一有效配置)
+        match crate::proxy::mirage_server::server_router::build_server_router_state(&config, geodata_dir) {
+            Ok(srv_state) => {
+                crate::proxy::mirage_server::server_router::set_server_router_state(Arc::new(srv_state));
+                info!("服务端路由与出站表已就绪/已热重载更新");
+            }
+            Err(e) => {
+                error!("服务端路由与出站表更新失败 (保持上一有效配置): {e}");
+                if !is_hot_reload {
+                    return Err(e);
+                }
+            }
+        }
+
         let outbounds = if let Some(old) = old_outbounds {
             info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
             // NOTE: Stateful components like pool/fake_ip_mapper are preserved during reload.

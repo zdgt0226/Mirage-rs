@@ -238,16 +238,23 @@ fn run_check(path: &str) -> i32 {
             eprintln!("  (JSON 语法错误, 或字段类型/结构与 schema 不符)");
             1
         }
-        Ok((_, issues)) if issues.is_empty() => {
-            println!("✓ {path} 校验通过 (无未知字段, 引用完整)");
-            0
-        }
-        Ok((_, issues)) => {
-            eprintln!("✗ {path} 发现 {} 个问题:", issues.len());
-            for i in &issues {
-                eprintln!("  · {i}");
+        Ok((cfg, issues)) => {
+            for w in cfg.weak_password_warnings() {
+                eprintln!("  ⚠️  {w}");
             }
-            1
+            for w in cfg.quic_routing_warnings() {
+                eprintln!("  ⚠️  {w}");
+            }
+            if issues.is_empty() {
+                println!("✓ {path} 校验通过 (无未知字段, 引用完整)");
+                0
+            } else {
+                eprintln!("✗ {path} 发现 {} 个问题:", issues.len());
+                for i in &issues {
+                    eprintln!("  · {i}");
+                }
+                1
+            }
         }
     }
 }
