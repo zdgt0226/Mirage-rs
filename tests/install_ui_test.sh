@@ -137,6 +137,48 @@ JSON
     apply_server_upstream "$d/q.json" "$ss" >/dev/null 2>&1
     eq_  "B5.10 无可配入站 → 非零退出" "$?" "1"
     no_  "B5.11 无可配入站 → 文件不动" "$(cat "$d/q.json")" "upstream"
+
+    # ── 新增: 迁移旧入站 upstream ──
+    apply_server_upstream "$full" "$ss" >/dev/null
+    eq_  "B5.12 迁移旧入站 upstream 成功" "$(server_migrate_legacy_upstream "$full")" "1"
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([("upstream" in i) for i in d["inbounds"]])' "$full")
+    eq_  "B5.13 迁移后入站不再包含 upstream" "$out" "[False, False, False]"
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["routing"]["default_outbound"])' "$full")
+    eq_  "B5.14 迁移后默认出站设为该上游" "$out" "ss-up"
+
+    # ── 新增: 顶层出站增删与规则管理 ──
+    local wg_ob='{ "type": "wireguard", "tag": "wg-up", "private_key": "a", "peer_public_key": "b", "endpoint": "198.51.100.1:51820", "address": "10.0.0.2", "mtu": 1420, "udp": "tunnel" }'
+    server_add_outbound "$full" "$wg_ob" >/dev/null
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([o["tag"] for o in d["outbounds"]])' "$full")
+    has_ "B5.15 新增 WG 顶层出站成功" "$out" "wg-up"
+
+    server_set_default_outbound "$full" "wg-up" >/dev/null
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["routing"]["default_outbound"])' "$full")
+    eq_  "B5.16 设置默认出站成功" "$out" "wg-up"
+
+    local rule='{ "domain_suffix": ["example.com"], "outbound": "wg-up" }'
+    server_add_rule "$full" "$rule" >/dev/null
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["routing"]["rules"]))' "$full")
+    eq_  "B5.17 新增分流规则成功" "$out" "1"
+
+    server_remove_outbound "$full" "wg-up" >/dev/null
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([o["tag"] for o in d["outbounds"]])' "$full")
+    no_  "B5.18 删除出站成功" "$out" "wg-up"
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["routing"]["default_outbound"])' "$full")
+    eq_  "B5.19 引用被删出站的 default 自动回退为 direct" "$out" "direct"
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["routing"]["rules"]))' "$full")
+    eq_  "B5.20 引用被删出站的规则自动被清理" "$out" "0"
+
+    # ── 新增: 密码与密钥自动生成 ──
+    local psk_32
+    psk_32=$(generate_wg_psk)
+    eq_  "B5.21 generate_wg_psk 生成 32 字节 base64" "${#psk_32}" "44"
+    local ss_pw_32 ss_pw_16
+    ss_pw_32=$(generate_ss_password 32)
+    eq_  "B5.22 generate_ss_password 32 生成 44 字符" "${#ss_pw_32}" "44"
+    ss_pw_16=$(generate_ss_password 16)
+    eq_  "B5.23 generate_ss_password 16 生成 24 字符" "${#ss_pw_16}" "24"
+
     rm -rf "$d"
 }
 

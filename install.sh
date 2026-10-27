@@ -1210,6 +1210,47 @@ show_server_node() {
             echo "  Brutal:     $(_c 36 "${brutal} Mbps")" >&2
         echo >&2
 
+        # 若配置里有 WireGuard 出站或旧 WG upstream, 额外显示出口信息与推导的公钥
+        if command -v python3 >/dev/null 2>&1; then
+            local wg_out_lines
+            wg_out_lines=$(CFG="$cfg" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["CFG"]))
+    res = []
+    for ob in d.get("outbounds", []):
+        if ob.get("type") == "wireguard":
+            res.append("%s\t%s\t%s\t%s" % (ob.get("tag", "wg-up"), ob.get("endpoint", ""), ob.get("address", ""), ob.get("private_key", "")))
+    for ib in d.get("inbounds", []):
+        u = ib.get("upstream")
+        if isinstance(u, dict) and u.get("type") == "wireguard":
+            res.append("inbound:%s\t%s\t%s\t%s" % (ib.get("tag", "mirage-in"), u.get("endpoint", ""), u.get("address", ""), u.get("private_key", "")))
+    up = d.get("upstream")
+    if isinstance(up, dict) and up.get("type") == "wireguard":
+        res.append("lite-upstream\t%s\t%s\t%s" % (up.get("endpoint", ""), up.get("address", ""), up.get("private_key", "")))
+    for line in res:
+        print(line)
+except Exception:
+    pass
+')
+            if [[ -n "$wg_out_lines" ]]; then
+                echo "  $(_c "1;35" "WireGuard 出口节点:")" >&2
+                while IFS=$'\t' read -r w_tag w_ep w_addr w_priv; do
+                    local w_pub="<无法推导公钥>"
+                    if [[ -n "$w_priv" ]]; then
+                        w_pub=$(derive_wg_pubkey "$w_priv")
+                        [[ -z "$w_pub" ]] && w_pub="<未找到推导工具>"
+                    fi
+                    echo "    • 出站标签 (tag): $(_c 36 "$w_tag")" >&2
+                    echo "      Endpoint:       $(_c 36 "$w_ep")" >&2
+                    echo "      隧道内地址:     $(_c 36 "$w_addr")" >&2
+                    echo "      本机公钥:       $(_c 32 "$w_pub")" >&2
+                    echo "      (提示: 私钥已保密隐藏，请将上述本机公钥登记至对端 WG peer 列表)" >&2
+                done <<< "$wg_out_lines"
+                echo >&2
+            fi
+        fi
+
         # 无现成导出串 → 现场探测公网 IP 重建
         if [[ -z "$node_uri" && -n "$pwd" && -n "$port" && -n "$sni" ]]; then
             local ip host
@@ -1546,28 +1587,45 @@ EOM
         echo ""; return
     fi
     ss_port=$(ask "上游 SS 端口" "8388")
-    ss_pwd=$(ask "上游 SS 密码" "")
     local m
     m=$(ask_choice "上游 SS 加密方式" \
         "aes-256-gcm (SIP004, 兼容性最好)" \
         "chacha20-ietf-poly1305 (SIP004, 无 AES 硬件加速时更快)" \
         "aes-128-gcm (SIP004)" \
         "2022-blake3-aes-256-gcm (SIP022, 安全性最好)" \
-        "2022-blake3-chacha20-poly1305 (SIP022, 无 AES 硬件加速时更快)")
+        "2022-blake3-chacha20-poly1305 (SIP022, 无 AES 硬件加速时更快)" \
+        "2022-blake3-aes-128-gcm (SIP022)")
     case "$m" in
         1) ss_method="aes-256-gcm" ;;
         2) ss_method="chacha20-ietf-poly1305" ;;
         3) ss_method="aes-128-gcm" ;;
         4) ss_method="2022-blake3-aes-256-gcm" ;;
         5) ss_method="2022-blake3-chacha20-poly1305" ;;
+        6) ss_method="2022-blake3-aes-128-gcm" ;;
     esac
-    if [[ "$ss_method" == 2022-* ]]; then
-        cat >&2 <<'EOM'
 
-  ⚠️ SIP022 的密码不是任意字符串, 而是 **base64 编码的 32 字节密钥**
+    if [[ "$ss_method" == 2022-* ]]; then
+        local psk_bytes=32
+        [[ "$ss_method" == *aes-128* ]] && psk_bytes=16
+        cat >&2 <<EOM
+
+  ⚠️ SIP022 的密码必须是 **base64 编码的 ${psk_bytes} 字节密钥**
      (与 SIP004 的"任意密码"完全不同, 填错会连不上)。
-     没有的话可以用: openssl rand -base64 32
 EOM
+        local pwd_choice
+        pwd_choice=$(ask_choice "上游 SS 密码选择" "自动生成 ${psk_bytes} 字节密钥 (推荐)" "手动粘贴已有密钥")
+        if [[ "$pwd_choice" == "1" ]]; then
+            ss_pwd=$(generate_ss_password "$psk_bytes")
+            ok "已自动生成密码: $(_c 36 "$ss_pwd")"
+        else
+            ss_pwd=$(ask "上游 SS 密码 (${psk_bytes} 字节 base64)" "")
+        fi
+    else
+        ss_pwd=$(ask "上游 SS 密码" "")
+    fi
+    if [[ -z "$ss_pwd" ]]; then
+        warn "未填密码, 跳过上游配置 (仍走直连)"
+        echo ""; return
     fi
     # legacy 流式加密 (aes-256-cfb 等) 不提供选项: 无完整性校验、已废弃、易被主动探测识别。
 
@@ -1592,6 +1650,62 @@ EOM
         "$(json_escape "$ss_server")" "$ss_port" "$(json_escape "$ss_pwd")" "$ss_method" "$ss_udp"
 }
 
+generate_ss_password() {
+    local bytes="${1:-32}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 "$bytes"
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes($bytes)).decode())"
+    else
+        head -c "$bytes" /dev/urandom | base64
+    fi
+}
+
+generate_wg_keypair() {
+    local priv="" pub=""
+    if [[ -x "$BIN_PATH" ]]; then
+        local out
+        if out=$("$BIN_PATH" wg-keygen 2>/dev/null); then
+            priv=$(echo "$out" | awk -F': ' '/private_key/{print $2}')
+            pub=$(echo "$out" | awk -F': ' '/public_key/{print $2}')
+        fi
+    fi
+    if [[ -z "$priv" ]] && command -v wg >/dev/null 2>&1; then
+        priv=$(wg genkey 2>/dev/null)
+        [[ -n "$priv" ]] && pub=$(printf "%s" "$priv" | wg pubkey 2>/dev/null)
+    fi
+    if [[ -n "$priv" && -n "$pub" ]]; then
+        printf "%s\t%s" "$priv" "$pub"
+        return 0
+    fi
+    return 1
+}
+
+derive_wg_pubkey() {
+    local priv="$1"
+    local pub=""
+    if [[ -x "$BIN_PATH" ]]; then
+        pub=$(printf "%s" "$priv" | "$BIN_PATH" wg-pubkey 2>/dev/null || true)
+    elif command -v wg >/dev/null 2>&1; then
+        pub=$(printf "%s" "$priv" | wg pubkey 2>/dev/null || true)
+    fi
+    echo "$pub"
+}
+
+generate_wg_psk() {
+    if [[ -x "$BIN_PATH" ]]; then
+        local out
+        out=$("$BIN_PATH" wg-keygen --psk 2>/dev/null)
+        echo "$out" | awk -F': ' '/preshared_key/{print $2}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl rand -base64 32
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+    else
+        head -c 32 /dev/urandom | base64
+    fi
+}
+
 # WireGuard 上游引导。
 ask_wg_upstream() {
     cat >&2 <<'EOM'
@@ -1602,12 +1716,44 @@ ask_wg_upstream() {
   密钥都是标准 WireGuard 的 base64 密钥 (wg genkey / wg pubkey 的输出),
   **不是任意密码** —— 填错长度会在启动前被 check 直接拦下。
 EOM
-    local wg_priv wg_pub wg_ep wg_addr wg_dns wg_psk wg_udp mtu
-    wg_priv=$(ask "本机私钥 (wg genkey 生成的 base64)" "")
+    local wg_priv="" wg_local_pub=""
+    local priv_choice
+    priv_choice=$(ask_choice "本机 WireGuard 私钥" "自动生成 (推荐)" "粘贴已有私钥")
+    if [[ "$priv_choice" == "1" ]]; then
+        local kp
+        if kp=$(generate_wg_keypair); then
+            wg_priv=$(echo "$kp" | cut -f1)
+            wg_local_pub=$(echo "$kp" | cut -f2)
+            ok "已自动生成 WireGuard 密钥对"
+        else
+            warn "未找到 mirage wg-keygen 或 wg 工具，请手动输入私钥"
+            wg_priv=$(ask "本机私钥 (base64)" "")
+            [[ -n "$wg_priv" ]] && wg_local_pub=$(derive_wg_pubkey "$wg_priv")
+        fi
+    else
+        wg_priv=$(ask "本机私钥 (base64)" "")
+        [[ -n "$wg_priv" ]] && wg_local_pub=$(derive_wg_pubkey "$wg_priv")
+    fi
+
     if [[ -z "$wg_priv" ]]; then
         warn "未填私钥, 跳过上游配置 (仍走直连)"
         echo ""; return
     fi
+
+    if [[ -n "$wg_local_pub" ]]; then
+        cat >&2 <<EOM
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ 🔑 本机 WireGuard 公钥:                                  │
+  │    $(_c 32 "$wg_local_pub")
+  │                                                          │
+  │ ⚠️  请将此公钥登记到上游 WireGuard 服务端的 peer 列表中！ │
+  └──────────────────────────────────────────────────────────┘
+
+EOM
+    fi
+
+    local wg_pub wg_ep wg_addr wg_dns wg_psk="" wg_udp mtu
     wg_pub=$(ask "对端公钥 (base64)" "")
     wg_ep=$(ask "对端 endpoint (host:port)" "")
     wg_addr=$(ask "本机在隧道内的地址 (不带掩码, 如 10.0.0.2)" "")
@@ -1615,7 +1761,22 @@ EOM
         warn "WireGuard 上游信息不完整, 跳过 (仍走直连)"
         echo ""; return
     fi
-    wg_psk=$(ask "预共享密钥 PSK (可选, 没有直接回车)" "")
+
+    local psk_choice
+    psk_choice=$(ask_choice "预共享密钥 (PSK, 可选)" "不使用 PSK" "自动生成 32 字节 PSK" "粘贴已有 PSK")
+    case "$psk_choice" in
+        2)
+            wg_psk=$(generate_wg_psk)
+            ok "已生成预共享密钥 PSK: $(_c 36 "$wg_psk") (请同步配到上游 WG 服务端)"
+            ;;
+        3)
+            wg_psk=$(ask "粘贴对端 PSK (base64)" "")
+            ;;
+        *)
+            wg_psk=""
+            ;;
+    esac
+
     mtu=$(ask "隧道 MTU" "1420")
 
     cat >&2 <<'EOM'
@@ -1640,23 +1801,51 @@ EOM
         "$(json_escape "$wg_addr")" "$mtu" "$wg_udp" "$extra"
 }
 
-# 一行描述配置里当前的上游出口 (完整版取 mirage_server 入站, 轻量版取顶层)。需 python3。
+# 一行描述配置里当前的上游出口 (完整版与轻量版通用)。需 python3。
 server_upstream_summary() { # file
     CFG="$1" python3 -c '
 import json, os
 d = json.load(open(os.environ["CFG"]))
-if "inbounds" in d:
-    ups = [ib.get("upstream") for ib in d["inbounds"] if ib.get("type") == "mirage_server"]
-else:
-    ups = [d.get("upstream")]
-def desc(u):
-    if not u: return "直连 (未配上游)"
+
+def desc_u(u):
+    if not u: return ""
+    tag_str = (" [tag=%s]" % u["tag"]) if "tag" in u else ""
     if u.get("type") == "shadowsocks":
-        return "Shadowsocks %s:%s (%s, udp=%s)" % (u.get("server"), u.get("server_port"), u.get("method"), u.get("udp", "block"))
+        return "Shadowsocks %s:%s (%s, udp=%s)%s" % (u.get("server"), u.get("server_port"), u.get("method"), u.get("udp", "block"), tag_str)
     if u.get("type") == "wireguard":
-        return "WireGuard %s (隧道内 %s)" % (u.get("endpoint"), u.get("address"))
+        return "WireGuard %s (隧道内 %s)%s" % (u.get("endpoint"), u.get("address"), tag_str)
     return str(u.get("type"))
-print("; ".join(sorted(set(desc(u) for u in ups))) or "无 mirage_server 入站")
+
+if "inbounds" in d:
+    obs = d.get("outbounds", [])
+    routing = d.get("routing", {})
+    def_ob = routing.get("default_outbound", "direct")
+    rules = routing.get("rules", [])
+    
+    up_obs = [desc_u(ob) for ob in obs if ob.get("type") in ("shadowsocks", "wireguard")]
+    legacy_ups = [desc_u(ib.get("upstream")) for ib in d.get("inbounds", []) if ib.get("type") == "mirage_server" and ib.get("upstream")]
+    
+    parts = []
+    if up_obs:
+        parts.append("; ".join(up_obs))
+    if legacy_ups:
+        parts.append("旧入站: " + "; ".join(legacy_ups))
+    
+    if parts:
+        summary = "; ".join(parts)
+        if rules and len(rules) > 0:
+            summary += f" (默认: {def_ob}, {len(rules)}条规则)"
+        elif def_ob != "direct":
+            summary += f" (默认: {def_ob})"
+        print(summary)
+    else:
+        print("直连 (未配上游)")
+else:
+    u = d.get("upstream")
+    if u:
+        print(desc_u(u))
+    else:
+        print("直连 (未配上游)")
 '
 }
 
@@ -1688,9 +1877,175 @@ print(len(targets))
 '
 }
 
-# 菜单项: 交互式修改已部署服务端的上游出口 (中转 / 落地), 不必重走部署流程。
+# 迁移入站上的旧 upstream 为顶层独立出站
+server_migrate_legacy_upstream() { # file
+    CFG="$1" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+d = json.load(open(path))
+if "inbounds" not in d:
+    sys.exit(1)
+obs = d.setdefault("outbounds", [{"type": "direct", "tag": "direct"}])
+routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+
+migrated = 0
+first_tag = None
+for ib in d.get("inbounds", []):
+    up = ib.pop("upstream", None)
+    if up:
+        migrated += 1
+        tag = "ss-up" if up.get("type") == "shadowsocks" else "wg-up"
+        base_tag = tag
+        suffix = 1
+        while any(o.get("tag") == tag for o in obs):
+            tag = f"{base_tag}-{suffix}"
+            suffix += 1
+        up["tag"] = tag
+        obs.append(up)
+        if first_tag is None:
+            first_tag = tag
+
+if first_tag:
+    routing["default_outbound"] = first_tag
+
+if migrated == 0:
+    sys.exit(1)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(migrated)
+'
+}
+
+# 新增顶层出站
+server_add_outbound() { # file outbound_json
+    CFG="$1" OB="$2" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+ob = json.loads(os.environ["OB"])
+d = json.load(open(path))
+obs = d.setdefault("outbounds", [{"type": "direct", "tag": "direct"}])
+d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+tag = ob.get("tag")
+if not tag:
+    sys.exit(1)
+replaced = False
+for i, o in enumerate(obs):
+    if o.get("tag") == tag:
+        obs[i] = ob
+        replaced = True
+        break
+if not replaced:
+    obs.append(ob)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(1)
+'
+}
+
+# 删除顶层出站
+server_remove_outbound() { # file tag
+    CFG="$1" TAG="$2" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+tag = os.environ["TAG"]
+d = json.load(open(path))
+obs = d.get("outbounds", [])
+new_obs = [o for o in obs if o.get("tag") != tag]
+if len(new_obs) == len(obs):
+    sys.exit(1)
+d["outbounds"] = new_obs
+routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+if routing.get("default_outbound") == tag:
+    routing["default_outbound"] = "direct"
+routing["rules"] = [r for r in routing.get("rules", []) if r.get("outbound") != tag]
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(1)
+'
+}
+
+# 设置默认出站
+server_set_default_outbound() { # file tag
+    CFG="$1" TAG="$2" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+tag = os.environ["TAG"]
+d = json.load(open(path))
+routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+routing["default_outbound"] = tag
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(1)
+'
+}
+
+# 新增分流规则
+server_add_rule() { # file rule_json
+    CFG="$1" RULE="$2" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+rule = json.loads(os.environ["RULE"])
+d = json.load(open(path))
+routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+rules = routing.setdefault("rules", [])
+rules.append(rule)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(len(rules))
+'
+}
+
+# 删除分流规则
+server_remove_rule() { # file rule_idx (0-based)
+    CFG="$1" IDX="$2" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+idx = int(os.environ["IDX"])
+d = json.load(open(path))
+routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+rules = routing.setdefault("rules", [])
+if idx < 0 or idx >= len(rules):
+    sys.exit(1)
+rules.pop(idx)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(len(rules))
+'
+}
+
+# 菜单项: 管理服务端出口与路由
 edit_server_upstream() {
-    title "修改服务端上游出口 (中转 / 落地)"
+    title "管理服务端出口与路由"
     command -v python3 >/dev/null 2>&1 || { warn "需要 python3 来安全改写 JSON 配置, 请先安装 python3"; return; }
 
     local cfgs=() cfg
@@ -1707,49 +2062,350 @@ edit_server_upstream() {
         choice=$(ask_choice "检测到多个服务端配置，请选择要修改的配置" "${cfgs[@]}")
         cfg="${cfgs[$((choice - 1))]}"
     fi
-    [[ "$cfg" == */lite_server.json ]] && LITE_MODE=true
+    local is_lite=false
+    [[ "$cfg" == */lite_server.json ]] && is_lite=true
 
-    local cur
-    cur=$(server_upstream_summary "$cfg" 2>/dev/null) || { warn "读取 ${cfg} 失败 (JSON 格式有误?)"; return; }
     info "配置文件: ${cfg}"
-    info "当前上游: ${cur}"
 
-    local action up=""
-    action=$(ask_choice "要做什么" "配置 / 替换上游出口" "移除上游 (恢复直连)" "取消")
-    case "$action" in
-        1) up=$(ask_upstream force)
-           [[ -z "$up" ]] && { info "未改动配置。"; return; } ;;
-        2) ;;
-        *) return ;;
-    esac
+    if [[ "$is_lite" == true ]]; then
+        local cur
+        cur=$(server_upstream_summary "$cfg" 2>/dev/null) || { warn "读取 ${cfg} 失败 (JSON 格式有误?)"; return; }
+        info "当前上游: ${cur}"
 
-    cp -p "$cfg" "${cfg}.bak"
-    local n
-    if ! n=$(apply_server_upstream "$cfg" "$up"); then
-        mv -f "${cfg}.bak" "$cfg"
-        warn "写入失败: 配置里没有可配上游的 TCP mirage_server 入站 (QUIC 入站不支持上游), 或 JSON 有误。未改动。"
-        return
-    fi
-    # 完整版重启前先过 check 闸门 (轻量版是平铺格式, check 不认)
-    if [[ "$LITE_MODE" != true && -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
-        mv -f "${cfg}.bak" "$cfg"
-        warn "新配置校验未通过, 已还原原配置。"
-        return
-    fi
-    ok "已更新 ${n} 个入站的上游出口 (原配置备份: ${cfg}.bak)"
-    info "现在: $(server_upstream_summary "$cfg")"
+        local action up=""
+        action=$(ask_choice "要做什么" "配置 / 替换上游出口" "移除上游 (恢复直连)" "取消")
+        case "$action" in
+            1) up=$(ask_upstream force)
+               [[ -z "$up" ]] && { info "未改动配置。"; return; } ;;
+            2) ;;
+            *) return ;;
+        esac
 
-    # 上游出口不热重载, 须重启服务端才生效 (会断开现有连接)
-    if service_active server; then
-        if ask_yn "立即重启 $(svc_name server) 使其生效? (会断开现有连接)" y; then
-            svc_ctl restart server
-            ok "已重启 $(svc_name server)"
-        else
-            info "稍后手动重启生效: $(svc_restart_hint server)"
+        cp -p "$cfg" "${cfg}.bak"
+        local n
+        if ! n=$(apply_server_upstream "$cfg" "$up"); then
+            mv -f "${cfg}.bak" "$cfg"
+            warn "写入失败: JSON 有误。未改动。"
+            return
         fi
-    else
-        info "服务端未在运行, 下次启动生效: $(svc_start_hint server)"
+        ok "已更新轻量服务端上游出口 (原配置备份: ${cfg}.bak)"
+        info "现在: $(server_upstream_summary "$cfg")"
+        if service_active server; then
+            if ask_yn "立即重启 $(svc_name server) 使其生效?" y; then
+                svc_ctl restart server
+                ok "已重启 $(svc_name server)"
+            else
+                info "稍后手动重启生效: $(svc_restart_hint server)"
+            fi
+        fi
+        return
     fi
+
+    # 完整版: 循环管理菜单
+    while true; do
+        CFG="$cfg" python3 -c '
+import json, os
+try:
+    d = json.load(open(os.environ["CFG"]))
+    obs = d.get("outbounds", [])
+    routing = d.get("routing", {})
+    def_ob = routing.get("default_outbound", "direct")
+    rules = routing.get("rules", [])
+    
+    print("\n  \033[1;36m[当前出站列表]\033[0m")
+    if not obs:
+        print("    (未配置顶层 outbounds，默认全部直连)")
+    for i, ob in enumerate(obs, 1):
+        t = ob.get("type", "unknown")
+        tag = ob.get("tag", "")
+        if t == "direct":
+            info = "直连"
+        elif t == "shadowsocks":
+            info = "Shadowsocks %s:%s (%s, udp=%s)" % (ob.get("server"), ob.get("server_port"), ob.get("method"), ob.get("udp", "block"))
+        elif t == "wireguard":
+            info = "WireGuard %s (隧道内 %s)" % (ob.get("endpoint"), ob.get("address"))
+        else:
+            info = t
+        star = " ★ (默认出站)" if tag == def_ob else ""
+        print(f"    [{i}] tag: \033[32m{tag}\033[0m ({info}){star}")
+    
+    print(f"\n  \033[1;36m[默认出站]\033[0m: \033[32m{def_ob}\033[0m")
+
+    print("\n  \033[1;36m[路由规则]\033[0m")
+    if not rules:
+        print("    (无显式规则，所有流量按默认出站选路)")
+    for i, r in enumerate(rules, 1):
+        conds = []
+        for k in ("domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
+            if k in r and r[k]:
+                v = r[k] if isinstance(r[k], list) else [r[k]]
+                conds.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+        cond_str = " && ".join(conds) if conds else "(全部匹配)"
+        out_tag = r.get("outbound", "direct")
+        print(f"    [{i}] {cond_str} ──▶ \033[32m{out_tag}\033[0m")
+
+    legacy = []
+    for ib in d.get("inbounds", []):
+        u = ib.get("upstream")
+        if u:
+            legacy.append((ib.get("tag", "mirage-in"), u.get("type", "")))
+    if legacy:
+        print("\n  \033[1;33m[⚠️ 兼容性提示: 入站存在旧 upstream 字段]\033[0m")
+        for tag, utype in legacy:
+            print(f"    入站 `{tag}` 配有旧 {utype} upstream (将优先于路由生效，建议迁移)")
+    print()
+except Exception as e:
+    print(f"解析配置出错: {e}")
+'
+        local action
+        action=$(ask_choice "操作选择" \
+            "新增上游出站 (Shadowsocks / WireGuard)" \
+            "删除出站" \
+            "设置默认出站" \
+            "新增分流规则" \
+            "删除分流规则" \
+            "迁移入站旧 upstream 为独立出站" \
+            "完成并退出")
+
+        case "$action" in
+            1)
+               local up_json
+               up_json=$(ask_upstream force)
+               [[ -z "$up_json" ]] && continue
+               local def_tag="ss-up"
+               [[ "$up_json" == *'"type": "wireguard"'* || "$up_json" == *'"type":"wireguard"'* ]] && def_tag="wg-up"
+               local tag
+               tag=$(ask "为该出站指定标签 (tag)" "$def_tag")
+               [[ -z "$tag" ]] && tag="$def_tag"
+               local full_ob
+               full_ob=$(UP="$up_json" TAG="$tag" python3 -c '
+import json, os
+u = json.loads(os.environ["UP"])
+u["tag"] = os.environ["TAG"]
+print(json.dumps(u))
+')
+               cp -p "$cfg" "${cfg}.bak"
+               server_add_outbound "$cfg" "$full_ob"
+               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "新配置校验未通过, 已还原原配置。"
+                   continue
+               fi
+               ok "已新增出站 \`$tag\` (原配置备份: ${cfg}.bak)"
+               if service_active server; then
+                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+               fi
+               ;;
+            2)
+               local non_direct_tags
+               non_direct_tags=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+tags = [o.get("tag") for o in d.get("outbounds", []) if o.get("tag") and o.get("tag") != "direct"]
+print("\n".join(tags))
+')
+               if [[ -z "$non_direct_tags" ]]; then
+                   warn "当前没有非 direct 的出站可删除。"
+                   continue
+               fi
+               local tag_array=()
+               while IFS= read -r t; do [[ -n "$t" ]] && tag_array+=("$t"); done <<< "$non_direct_tags"
+               local sel_idx
+               sel_idx=$(ask_choice "选择要删除的出站" "${tag_array[@]}" "取消")
+               if [[ "$sel_idx" -gt "${#tag_array[@]}" ]]; then
+                   continue
+               fi
+               local del_tag="${tag_array[$((sel_idx - 1))]}"
+               local is_ref
+               is_ref=$(CFG="$cfg" TAG="$del_tag" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+tag = os.environ["TAG"]
+routing = d.get("routing", {})
+ref = (routing.get("default_outbound") == tag) or any(r.get("outbound") == tag for r in routing.get("rules", []))
+print("yes" if ref else "no")
+')
+               if [[ "$is_ref" == "yes" ]]; then
+                   warn "出站 \`$del_tag\` 正被 default_outbound 或规则引用！"
+                   if ! ask_yn "确认删除并将相关引用自动调整为 direct 吗?" y; then
+                       info "已取消删除。"
+                       continue
+                   fi
+               fi
+               cp -p "$cfg" "${cfg}.bak"
+               server_remove_outbound "$cfg" "$del_tag"
+               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "新配置校验未通过, 已还原原配置。"
+                   continue
+               fi
+               ok "已删除出站 \`$del_tag\` (原配置备份: ${cfg}.bak)"
+               if service_active server; then
+                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+               fi
+               ;;
+            3)
+               local all_tags
+               all_tags=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+tags = [o.get("tag") for o in d.get("outbounds", []) if o.get("tag")]
+if not tags: tags = ["direct"]
+print("\n".join(tags))
+')
+               local tag_array=()
+               while IFS= read -r t; do [[ -n "$t" ]] && tag_array+=("$t"); done <<< "$all_tags"
+               local sel_idx
+               sel_idx=$(ask_choice "选择默认出站" "${tag_array[@]}" "取消")
+               if [[ "$sel_idx" -gt "${#tag_array[@]}" ]]; then
+                   continue
+               fi
+               local def_tag="${tag_array[$((sel_idx - 1))]}"
+               cp -p "$cfg" "${cfg}.bak"
+               server_set_default_outbound "$cfg" "$def_tag"
+               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "新配置校验未通过, 已还原原配置。"
+                   continue
+               fi
+               ok "默认出站已设为 \`$def_tag\` (原配置备份: ${cfg}.bak)"
+               if service_active server; then
+                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+               fi
+               ;;
+            4)
+               local cond_choice field_name
+               cond_choice=$(ask_choice "规则条件类型" \
+                   "domain_suffix (域名后缀, 如 example.com)" \
+                   "geosite (域名分类, 如 cn, geolocation-!cn)" \
+                   "geoip (IP地理位置, 如 cn, hk, us)" \
+                   "ip_cidr (目标 IP 网段, 如 192.0.2.0/24)" \
+                   "port (目标端口, 如 443, 80)" \
+                   "user (认证用户名)")
+               case "$cond_choice" in
+                   1) field_name="domain_suffix" ;;
+                   2) field_name="geosite" ;;
+                   3) field_name="geoip" ;;
+                   4) field_name="ip_cidr" ;;
+                   5) field_name="port" ;;
+                   6) field_name="user" ;;
+               esac
+               local val
+               val=$(ask "匹配值 (多个值逗号隔开)" "")
+               if [[ -z "$val" ]]; then
+                   warn "未填匹配值，取消添加规则。"
+                   continue
+               fi
+               local all_tags
+               all_tags=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+tags = [o.get("tag") for o in d.get("outbounds", []) if o.get("tag")]
+if not tags: tags = ["direct"]
+print("\n".join(tags))
+')
+               local tag_array=()
+               while IFS= read -r t; do [[ -n "$t" ]] && tag_array+=("$t"); done <<< "$all_tags"
+               local sel_idx
+               sel_idx=$(ask_choice "选择该规则的目标出站" "${tag_array[@]}")
+               local target_tag="${tag_array[$((sel_idx - 1))]}"
+               local rule_json
+               rule_json=$(FIELD="$field_name" VAL="$val" TAG="$target_tag" python3 -c '
+import json, os
+field = os.environ["FIELD"]
+vals = [v.strip() for v in os.environ["VAL"].split(",") if v.strip()]
+if field == "port":
+    try: vals = [int(v) for v in vals]
+    except Exception: pass
+tag = os.environ["TAG"]
+rule = {field: vals, "outbound": tag}
+print(json.dumps(rule))
+')
+               cp -p "$cfg" "${cfg}.bak"
+               server_add_rule "$cfg" "$rule_json"
+               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "新配置校验未通过, 已还原原配置。"
+                   continue
+               fi
+               ok "已新增规则 (原配置备份: ${cfg}.bak)"
+               if service_active server; then
+                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+               fi
+               ;;
+            5)
+               local rules_cnt
+               rules_cnt=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+print(len(d.get("routing", {}).get("rules", [])))
+')
+               if [[ "$rules_cnt" -eq 0 ]]; then
+                   warn "当前没有规则可删除。"
+                   continue
+               fi
+               local rule_descs
+               rule_descs=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
+    conds = []
+    for k in ("domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
+        if k in r and r[k]:
+            v = r[k] if isinstance(r[k], list) else [r[k]]
+            conds.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+    cond_str = " && ".join(conds) if conds else "any"
+    print("[%d] %s -> %s" % (i, cond_str, r.get("outbound", "direct")))
+')
+               local rule_array=()
+               while IFS= read -r rd; do [[ -n "$rd" ]] && rule_array+=("$rd"); done <<< "$rule_descs"
+               local sel_idx
+               sel_idx=$(ask_choice "选择要删除的规则" "${rule_array[@]}" "取消")
+               if [[ "$sel_idx" -gt "${#rule_array[@]}" ]]; then
+                   continue
+               fi
+               local del_idx=$((sel_idx - 1))
+               cp -p "$cfg" "${cfg}.bak"
+               server_remove_rule "$cfg" "$del_idx"
+               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "新配置校验未通过, 已还原原配置。"
+                   continue
+               fi
+               ok "已删除规则 (原配置备份: ${cfg}.bak)"
+               if service_active server; then
+                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+               fi
+               ;;
+            6)
+               cp -p "$cfg" "${cfg}.bak"
+               local mig_n
+               if ! mig_n=$(server_migrate_legacy_upstream "$cfg"); then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "入站上未发现旧 upstream 字段或迁移失败。"
+                   continue
+               fi
+               if [[ -x "$BIN_PATH" ]] && ! "$BIN_PATH" check -c "$cfg"; then
+                   mv -f "${cfg}.bak" "$cfg"
+                   warn "迁移后配置校验未通过, 已还原原配置。"
+                   continue
+               fi
+               ok "已将 ${mig_n} 个入站的旧 upstream 迁移至独立出站并设为默认出站 (原配置备份: ${cfg}.bak)"
+               if service_active server; then
+                   warn "由于修改了入站级字段 (移除了入站 upstream)，需要重启服务才能生效。"
+                   if ask_yn "立即重启 $(svc_name server) 使其生效?" y; then
+                       svc_ctl restart server
+                       ok "已重启 $(svc_name server)"
+                   else
+                       info "稍后手动重启生效: $(svc_restart_hint server)"
+                   fi
+               fi
+               ;;
+            *)
+               break
+               ;;
+        esac
+    done
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1973,12 +2629,83 @@ EOM
         brutal_line=",\"brutal_rate_mbps\": ${brutal_rate_mbps}"
     fi
 
-    # 上游出口 (中转站模式), 不配则为空串
+    # 上游出口引导 (完整版写顶层 outbounds 与 routing, 不写入 inbound)
     local ss_up_full
     ss_up_full=$(ask_upstream)
-    local upstream_line=""
-    [[ -n "$ss_up_full" ]] && upstream_line=",
-            \"upstream\": ${ss_up_full}"
+    local outbound_list='[
+        {
+            "type": "direct",
+            "tag": "direct"
+        }
+    ]'
+    local routing_default="direct"
+    local routing_rules='[]'
+
+    if [[ -n "$ss_up_full" ]]; then
+        local def_tag="ss-up"
+        [[ "$ss_up_full" == *'"type": "wireguard"'* || "$ss_up_full" == *'"type":"wireguard"'* ]] && def_tag="wg-up"
+        local up_tag
+        up_tag=$(ask "上游出口标签 (tag)" "$def_tag")
+        [[ -z "$up_tag" ]] && up_tag="$def_tag"
+
+        cat >&2 <<'EOM'
+
+  请选择出站模式:
+    1. 全部走上游 (模式二, 默认所有流量走落地上游, 可通过规则把部分流量拉回 direct 直连)
+    2. 默认直连 (模式一, 默认从本机直连, 仅命中规则的流量走该上游)
+EOM
+        local mode_choice
+        mode_choice=$(ask_choice "选路模式" "全部走上游出口 (推荐落地解锁场景)" "默认直连，按规则分流上游")
+        if [[ "$mode_choice" == "1" ]]; then
+            routing_default="$up_tag"
+        else
+            routing_default="direct"
+            if ask_yn "是否现在为该上游添加一条分流规则?" y; then
+                local cond_choice field_name
+                cond_choice=$(ask_choice "规则条件类型" \
+                    "domain_suffix (域名后缀, 如 example.com)" \
+                    "geosite (域名分类, 如 cn, geolocation-!cn)" \
+                    "geoip (IP地理位置, 如 cn, hk, us)" \
+                    "ip_cidr (目标 IP 网段, 如 192.0.2.0/24)" \
+                    "port (目标端口, 如 443, 80)" \
+                    "user (认证用户名)")
+                case "$cond_choice" in
+                    1) field_name="domain_suffix" ;;
+                    2) field_name="geosite" ;;
+                    3) field_name="geoip" ;;
+                    4) field_name="ip_cidr" ;;
+                    5) field_name="port" ;;
+                    6) field_name="user" ;;
+                esac
+                local val
+                val=$(ask "匹配值 (多个值逗号隔开)" "")
+                if [[ -n "$val" ]]; then
+                    routing_rules=$(FIELD="$field_name" VAL="$val" TAG="$up_tag" python3 -c '
+import json, os
+field = os.environ["FIELD"]
+vals = [v.strip() for v in os.environ["VAL"].split(",") if v.strip()]
+if field == "port":
+    try: vals = [int(v) for v in vals]
+    except Exception: pass
+tag = os.environ["TAG"]
+rule = {field: vals, "outbound": tag}
+print(json.dumps([rule], indent=8, ensure_ascii=False))
+')
+                fi
+            fi
+        fi
+
+        outbound_list=$(UP="$ss_up_full" TAG="$up_tag" python3 -c '
+import json, os
+up = json.loads(os.environ["UP"])
+up["tag"] = os.environ["TAG"]
+obs = [
+    {"type": "direct", "tag": "direct"},
+    up
+]
+print(json.dumps(obs, indent=8, ensure_ascii=False))
+')
+    fi
 
     # 前向保密 (PFS): opt-in, 两端必须一致。开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
     local pfs_line=""
@@ -2012,23 +2739,18 @@ EOM
             "listen": "0.0.0.0",
             "port": ${port},
             "password": "$(json_escape "$pwd")",
-            "camouflage_host": "$(json_escape "$sni")"${brutal_line}${upstream_line}${pfs_line}
+            "camouflage_host": "$(json_escape "$sni")"${brutal_line}${pfs_line}
         }
     ],
-    "outbounds": [
-        {
-            "type": "direct",
-            "tag": "direct"
-        }
-    ],
+    "outbounds": ${outbound_list},
     "gui": {
         "enabled": ${server_gui_enabled},
         "listen": "${server_gui_listen}"${server_gui_token_line},
         "stats_persist_path": "/var/lib/mirage-rs/stats_server.json"
     },
     "routing": {
-        "default_outbound": "direct",
-        "rules": []
+        "default_outbound": "${routing_default}",
+        "rules": ${routing_rules}
     },
     "tuning": {
         "geodata_dir": "${ETC_DIR}/geosite"
@@ -2987,7 +3709,7 @@ main() {
         "卸载 Mirage-rs" \
         "家庭 WireGuard 服务端 (干净设备接入)" \
         "修改现有配置 (交互式)" \
-        "修改服务端上游出口 (中转 / 落地)")
+        "管理服务端出口与路由")
 
     case "$mode" in
         4) update_binary; return ;;
