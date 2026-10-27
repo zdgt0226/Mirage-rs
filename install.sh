@@ -1888,8 +1888,10 @@ if "inbounds" not in d:
 obs = d.setdefault("outbounds", [{"type": "direct", "tag": "direct"}])
 routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
 
+# 每个带 upstream 的入站迁成「独立出站 + 按入站 tag 的规则」(前插, 优先于其它规则),
+# 默认出站不动 —— 其它入站 (如不支持上游的 QUIC 入站) 行为保持不变。
 migrated = 0
-first_tag = None
+new_rules = []
 for ib in d.get("inbounds", []):
     up = ib.pop("upstream", None)
     if up:
@@ -1902,11 +1904,9 @@ for ib in d.get("inbounds", []):
             suffix += 1
         up["tag"] = tag
         obs.append(up)
-        if first_tag is None:
-            first_tag = tag
+        new_rules.append({"inbound": [ib.get("tag", "mirage-in")], "outbound": tag})
 
-if first_tag:
-    routing["default_outbound"] = first_tag
+routing["rules"] = new_rules + routing.get("rules", [])
 
 if migrated == 0:
     sys.exit(1)
@@ -2680,31 +2680,28 @@ EOM
                 local val
                 val=$(ask "匹配值 (多个值逗号隔开)" "")
                 if [[ -n "$val" ]]; then
-                    routing_rules=$(FIELD="$field_name" VAL="$val" TAG="$up_tag" python3 -c '
-import json, os
-field = os.environ["FIELD"]
-vals = [v.strip() for v in os.environ["VAL"].split(",") if v.strip()]
-if field == "port":
-    try: vals = [int(v) for v in vals]
-    except Exception: pass
-tag = os.environ["TAG"]
-rule = {field: vals, "outbound": tag}
-print(json.dumps([rule], indent=8, ensure_ascii=False))
-')
+                    # 纯 bash 拼 JSON (部署流程不依赖 python3): port 为数字, 其余为字符串
+                    local items="" v
+                    IFS=',' read -ra _vals <<< "$val"
+                    for v in "${_vals[@]}"; do
+                        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+                        [[ -z "$v" ]] && continue
+                        if [[ "$field_name" == "port" && "$v" =~ ^[0-9]+$ ]]; then
+                            items+="${items:+, }${v}"
+                        else
+                            items+="${items:+, }\"$(json_escape "$v")\""
+                        fi
+                    done
+                    [[ -n "$items" ]] && routing_rules="[ { \"${field_name}\": [ ${items} ], \"outbound\": \"$(json_escape "$up_tag")\" } ]"
                 fi
             fi
         fi
 
-        outbound_list=$(UP="$ss_up_full" TAG="$up_tag" python3 -c '
-import json, os
-up = json.loads(os.environ["UP"])
-up["tag"] = os.environ["TAG"]
-obs = [
-    {"type": "direct", "tag": "direct"},
-    up
-]
-print(json.dumps(obs, indent=8, ensure_ascii=False))
-')
+        # ask_upstream 输出形如 `{ "type": ...}`, 在开头插入 tag (纯 bash, 不依赖 python3)
+        outbound_list="[
+        { \"type\": \"direct\", \"tag\": \"direct\" },
+        { \"tag\": \"$(json_escape "$up_tag")\", ${ss_up_full#\{ }
+    ]"
     fi
 
     # 前向保密 (PFS): opt-in, 两端必须一致。开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
@@ -2749,7 +2746,7 @@ print(json.dumps(obs, indent=8, ensure_ascii=False))
         "stats_persist_path": "/var/lib/mirage-rs/stats_server.json"
     },
     "routing": {
-        "default_outbound": "${routing_default}",
+        "default_outbound": "$(json_escape "$routing_default")",
         "rules": ${routing_rules}
     },
     "tuning": {

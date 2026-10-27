@@ -7,7 +7,7 @@
 服务端现已完整支持出站路由与多上游分流，打破以往服务端只能在单个入站绑定单跳上游的限制，实现中转落地与多落地分流。
 
 - **服务端出站与路由引擎 (`src/proxy/mirage_server/server_router.rs`, `src/config.rs`)**:
-  - 服务端配置顶层 `outbounds` 生效，支持 `direct`、`shadowsocks`、`wireguard` 出站类型，允许多个出站并存；Shadowsocks 出站新增 `udp: "block"` (默认) | `"direct"` 选项；WireGuard 出站 UDP 全量隧道转发。
+  - 服务端配置顶层 `outbounds` 生效，支持 `direct`、`block`（拒绝）、`shadowsocks`、`wireguard` 出站类型，允许多个出站并存；路由选到服务端不支持的出站（mirage / urltest 等）一律拒绝、绝不回落直连，纯服务端配置下 `check` 直接报错；Shadowsocks 出站新增 `udp: "block"` (默认) | `"direct"` 选项；WireGuard 出站 UDP 全量隧道转发。
   - 服务端顶层 `routing` 生效，复用客户端 `RouterEngine`：
     - 支持模式一（`default_outbound: "direct"`，按规则将部分流量分流到上游）；
     - 支持模式二（`default_outbound: "<上游 tag>"`，全部流量走落地上游，通过规则将部分流量拉回 direct 直连）。
@@ -15,24 +15,25 @@
   - 路由规则与请求扩展：`RoutingRequest` 与 `Rule` 新增 `user: Vec<String>` 条件匹配命中的用户名（单用户固定为 "default"，多用户为各用户名，客户端无用户信息时不匹配）。
   - 域名惰性解析：路由匹配时仅当匹配到 IP 类规则（`ip_cidr` / `geoip`）且目标为域名时才触发 DNS 解析，不额外解析无关域名。
   - 上游故障 fail-closed：上游连接失败直接阻断并不静默回落 direct，记录警告日志，避免泄露真实出口 IP。
-  - QUIC 传输限制（选项 A）：路由命中非 direct 出站时直接拒绝该流，并按 `(tag, target)` 限频记录 WARN 提示建议使用 TCP 传输或调整路由。
+  - QUIC 传输限制（选项 A）：路由命中非 direct 出站时显式 reset 该流（不让客户端误以为是正常结束的空响应），并按 `(tag, target)` 限频记录 WARN 提示建议使用 TCP 传输或调整路由。
+  - UDP（非 mux）会话内按目标缓存选路结果，不再逐包跑一遍规则匹配。
   - WebUI / Monitor 监控：出站流量按实际出站的 tag（如 `ss-up` / `wg-up` / `direct`）正确归属与上报。
 - **服务端热重载 (`src/config_watcher.rs`, `server_router.rs`)**:
-  - 运行时修改 `outbounds` 与 `routing` 自动生效，通过 `ArcSwapOption` 原子替换 `ServerRouterState` 与出站表；已建连接沿用旧出口，新连接无缝使用新出口；重载失败保持旧配置并记录 error 日志。入站监听端口等监听级字段变动提示重启。
+  - 运行时修改 `outbounds` 与 `routing` 自动生效，通过 `ArcSwapOption` 原子替换 `ServerRouterState` 与出站表（整份配置构建成功后才替换）；配置未变的上游出口复用旧实例（WG 出口若重建会以同一私钥另起会话，对端漫游后旧连接即断）；只有含 `mirage_server` 入站的配置才建服务端路由表（纯客户端不多占一份 geosite 内存）；已建连接沿用旧出口，新连接无缝使用新出口；重载失败保持旧配置并记录 error 日志。入站监听端口等监听级字段变动提示重启。
 - **配置校验增强 (`src/config.rs`)**:
-  - `mirage check` 新增对规则引用未定义出站 tag、服务端 `default_outbound` 不存在、Shadowsocks `udp` 非法值的拦截报错；QUIC 入站 + 路由可能选到非 direct 出站告警提示（仅打 warn，不进入 `semantic_issues`）。
-- **WireGuard 密钥生成 CLI (`src/bin/mirage/main.rs`, `x25519-dalek`)**:
-  - 新增 `mirage wg-keygen [--psk]`：基于 `x25519-dalek` 生成 Base64 编码的私钥与公钥，可选生成 32 字节 PSK。
-  - 新增 `mirage wg-pubkey`：从 stdin 读取 Base64 私钥推导并输出 Base64 公钥（格式与系统 `wg pubkey` 完全兼容）。
+  - `mirage-rs check` 新增对规则引用未定义出站 tag、服务端 `default_outbound` 不存在、Shadowsocks `udp` 非法值的拦截报错；QUIC 入站 + 路由可能选到非 direct 出站告警提示（仅打 warn，不进入 `semantic_issues`）。
+- **WireGuard 密钥生成 CLI (`src/bin/mirage.rs`, `src/proxy/wg/mod.rs`)**:
+  - 新增 `mirage-rs wg-keygen [--psk]`：基于 `x25519-dalek` 生成 Base64 编码的私钥与公钥，可选生成 32 字节 PSK。
+  - 新增 `mirage-rs wg-pubkey`：从 stdin 读取 Base64 私钥推导并输出 Base64 公钥（格式与系统 `wg pubkey` 完全兼容）。
   - 单测覆盖 RFC 7748 X25519 标准测试向量与 clamping 规范校验。
 - **一键脚本升级 (`install.sh`, `tests/install_ui_test.sh`)**:
-  - 主菜单第 9 项升级为「管理服务端出口与路由」：显示当前出站列表、默认出站、分流规则与旧入站 upstream；支持出站增删、设置默认出站、分流规则增删（支持 domain_suffix / geosite / geoip / ip_cidr / port / user 等）、旧入站 upstream 一键迁移至独立出站；原子改写、备份 `.bak`、`check -c` 闸门及热重载生效提示。
+  - 主菜单第 9 项升级为「管理服务端出口与路由」：显示当前出站列表、默认出站、分流规则与旧入站 upstream；支持出站增删、设置默认出站、分流规则增删（支持 domain_suffix / geosite / geoip / ip_cidr / port / user 等）、旧入站 upstream 一键迁移为独立出站 + 按入站 tag 的前插规则（默认出站不变，其它入站行为不变）；部署服务端时上游写成独立出站并选择模式，生成配置不依赖 python3；原子改写、备份 `.bak`、`check -c` 闸门及热重载生效提示。
   - 主菜单第 5 项「查看服务端节点信息」：当存在 WG 出站或 WG upstream 时，显示其 tag、endpoint、隧道内 IP 及通过 `wg-pubkey` 派生的本机公钥（隐藏私钥）。
-  - WG 上游引导（`ask_wg_upstream`）：支持自动生成密钥对（优先用 `mirage wg-keygen`，退回 `wg genkey`）并醒目提示向服务端登记本机公钥；可选生成 PSK。
+  - WG 上游引导（`ask_wg_upstream`）：支持自动生成密钥对（优先用 `mirage-rs wg-keygen`，退回 `wg genkey`）并醒目提示向服务端登记本机公钥；可选生成 PSK。
   - SS 密码生成：支持 32/16 字节安全随机生成（openssl / python3 / /dev/urandom）。
-  - `tests/install_ui_test.sh`：更新 B5 并在 B5.12~B5.23 全面覆盖新菜单、增删出站/规则、迁移与热重载提示（48 项测试全 PASS）。
+  - `tests/install_ui_test.sh`：更新 B5 并在 B5.12~B5.23 全面覆盖新菜单、增删出站/规则、迁移与热重载提示（49 项全 PASS）。
 - **测试覆盖**:
-  - 路由单元测试：双模式、旧 upstream 优先、`user` 条件匹配、多上游分流、无 routing 段回退 direct、惰性解析断言。
+  - 路由单元测试：双模式、旧 upstream 优先、`user` 条件匹配、多上游分流、无 routing 段回退 direct、惰性解析断言、block / 不可用出站拒绝、热重载复用未变出口、纯客户端不建服务端路由表。
   - 配置解析与 check 测试：非法 tag / 非法 SS udp / QUIC 路由警告等。
   - 端到端集成测试 (`tests/test_server_routing_e2e.rs`)：本地 SS 上游服务器与 echo 服务器，验证模式一规则分流、模式二落地拉回直连、以及文件写入触发的动态热重载全流程。
 

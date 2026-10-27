@@ -227,8 +227,8 @@ Mirage 服务端顶层 `outbounds` 与 `routing` 完整生效，复用客户端�
 - **原子热重载**: 运行时修改 `outbounds` 与 `routing` 自动生效，通过 `ArcSwapOption` 原子替换，老连接维持，新连接即刻使用新配置，无需重启服务。
 - **管理与工具**:
   - `install.sh` 主菜单 `9) 管理服务端出口与路由`：提供出站增删、设置默认出口、分流规则增删（支持多条件类型与目标出站选择）、旧入站 `upstream` 一键迁移至独立出站（原子改写、备份 `.bak`、`check -c` 闸门与热重载即时生效）。
-  - 主菜单 `5) 查看服务端节点信息`：若配置了 WG 出站，展示 endpoint、隧道内 IP 及通过 `mirage wg-pubkey` 派生的本机公钥（隐藏私钥）。
-  - WireGuard 密钥工具：`mirage wg-keygen [--psk]` 生成公私钥对与 PSK，`mirage wg-pubkey` 从私钥推导公钥。
+  - 主菜单 `5) 查看服务端节点信息`：若配置了 WG 出站，展示 endpoint、隧道内 IP 及通过 `mirage-rs wg-pubkey` 派生的本机公钥（隐藏私钥）。
+  - WireGuard 密钥工具：`mirage-rs wg-keygen [--psk]` 生成公私钥对与 PSK，`mirage-rs wg-pubkey` 从私钥推导公钥。
 
 ---
 

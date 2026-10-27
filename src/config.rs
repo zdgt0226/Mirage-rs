@@ -1736,6 +1736,33 @@ impl Config {
             ));
         }
 
+        // 纯服务端配置 (只有 mirage_server 入站): 服务端只能走 direct / block / shadowsocks /
+        // wireguard 出站, 路由引用 mirage / urltest 等客户端出站时运行期只能拒绝, 这里提前报出。
+        let server_only = !self.inbounds.is_empty()
+            && self.inbounds.iter().all(|ib| matches!(ib, InboundConfig::MirageServer { .. }));
+        if server_only {
+            let server_usable = |t: &str| {
+                self.outbounds.iter().any(|ob| match ob {
+                    OutboundConfig::Direct { tag }
+                    | OutboundConfig::Block { tag }
+                    | OutboundConfig::Shadowsocks { tag, .. }
+                    | OutboundConfig::Wireguard { tag, .. } => tag == t,
+                    _ => false,
+                })
+            };
+            let mut refs: Vec<(String, &str)> = vec![("routing.default_outbound".into(), self.routing.default_outbound.as_str())];
+            for (i, rule) in self.routing.rules.iter().enumerate() {
+                refs.push((format!("routing.rules[{i}].outbound"), rule.outbound.as_str()));
+            }
+            for (field, t) in refs {
+                if known(t) && !server_usable(t) {
+                    issues.push(format!(
+                        "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站 (运行时会拒绝该流量)"
+                    ));
+                }
+            }
+        }
+
         // 每条规则引用的出站必须存在 —— 否则该规则形同虚设, 且是静默的
         let mut inbound_tags: Vec<&str> = self
             .inbounds
@@ -2783,6 +2810,28 @@ mod validation_tests {
         let is = issues_of(&v);
         assert!(has(&is, "routing.default_outbound = `nonexistent-outbound` 不存在于 outbounds"));
         assert!(has(&is, "routing.rules[0].outbound = `unknown-tag` 不存在于 outbounds"));
+    }
+
+    #[test]
+    fn server_routing_rejects_client_only_outbound_types() {
+        let mut v = base();
+        v["inbounds"] = serde_json::json!([
+            { "type": "mirage_server", "tag": "srv", "listen": "0.0.0.0", "port": 443,
+              "password": "test_password_placeholder" }
+        ]);
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "direct" },
+            { "type": "block", "tag": "reject" },
+            { "type": "mirage", "tag": "m", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" }
+        ]);
+        v["routing"]["default_outbound"] = serde_json::json!("direct");
+        v["routing"]["rules"] = serde_json::json!([
+            { "domain_suffix": ["a.example"], "outbound": "m" },
+            { "domain_suffix": ["b.example"], "outbound": "reject" }
+        ]);
+        let is = issues_of(&v);
+        assert!(has(&is, "routing.rules[0].outbound = `m`: 服务端只支持"), "实际: {is:?}");
+        assert!(!has(&is, "routing.rules[1].outbound = `reject`: 服务端只支持"), "block 是服务端可用出站: {is:?}");
     }
 
     #[test]

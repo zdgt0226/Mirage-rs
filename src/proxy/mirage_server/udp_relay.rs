@@ -327,6 +327,10 @@ pub(super) async fn handle_udp_relay(
     let stop_tx_wg = stop_tx.clone();
     let tunnel_uplink = async move {
         let mut buffer = Vec::new();
+        // 选路结果按目标缓存 (本会话内): UDP 逐包走一遍规则匹配 (含 geosite、可能的解析) 太贵。
+        // 热重载对已建会话不生效, 与 TCP 已建连接沿用旧出口一致。
+        let mut route_cache: std::collections::HashMap<String, super::server_router::ServerRouteDecision> =
+            std::collections::HashMap::new();
         'outer: loop {
             if up_auth.should_stop() {
                 break;
@@ -404,16 +408,29 @@ pub(super) async fn handle_udp_relay(
 
                 // 服务端选路
                 let target_str = format!("{}:{}", target_addr_str, port);
-                let decision = super::server_router::server_route(
-                    inbound_tag_up.as_deref(),
-                    &target_str,
-                    "udp",
-                    client_ip,
-                    &user_up,
-                    upstream_up.as_ref(),
-                )
-                .await;
+                let decision = match route_cache.get(&target_str) {
+                    Some(d) => d.clone(),
+                    None => {
+                        let d = super::server_router::server_route(
+                            inbound_tag_up.as_deref(),
+                            &target_str,
+                            "udp",
+                            client_ip,
+                            &user_up,
+                            upstream_up.as_ref(),
+                        )
+                        .await;
+                        if route_cache.len() >= MAX_SENT_TARGETS {
+                            route_cache.clear();
+                        }
+                        route_cache.insert(target_str.clone(), d.clone());
+                        d
+                    }
+                };
 
+                if matches!(decision.target, super::server_router::ServerOutboundTarget::Reject) {
+                    continue;
+                }
                 // SS block 或 WG block 策略丢包
                 if let super::server_router::ServerOutboundTarget::Upstream(outlet) = &decision.target {
                     match &**outlet {
@@ -763,6 +780,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                 .await;
 
                 let (egress, target_sa) = match &decision.target {
+                    super::server_router::ServerOutboundTarget::Reject => continue,
                     super::server_router::ServerOutboundTarget::Direct => {
                         let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
                             crate::net_util::egress_allowed(ip, allow_local_targets)

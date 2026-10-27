@@ -1237,9 +1237,22 @@ async fn relay_authenticated_quic_stream(
     )
     .await;
 
-    if matches!(decision.target, ServerOutboundTarget::Upstream(_)) {
-        warn_quic_upstream_unsupported(&decision.tag, &target);
-        return;
+    // 显式 reset / stop: 直接 drop 会让 quinn 隐式 finish, 客户端应用看到的是"正常结束的空响应"。
+    match decision.target {
+        ServerOutboundTarget::Direct => {}
+        ServerOutboundTarget::Upstream(_) => {
+            warn_quic_upstream_unsupported(&decision.tag, &target);
+            let mut send = send;
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            return;
+        }
+        ServerOutboundTarget::Reject => {
+            let mut send = send;
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            return;
+        }
     }
 
     // 3. 直连出口 (带 SSRF 过滤)

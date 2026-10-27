@@ -129,19 +129,24 @@ impl ConfigWatcher {
         
         let is_hot_reload = old_outbounds.is_some();
 
-        // 服务端路由与出站表热重载更新 (原子替换; 失败保持上一有效配置)
-        match crate::proxy::mirage_server::server_router::build_server_router_state(&config, geodata_dir) {
-            Ok(srv_state) => {
-                crate::proxy::mirage_server::server_router::set_server_router_state(Arc::new(srv_state));
-                info!("服务端路由与出站表已就绪/已热重载更新");
-            }
-            Err(e) => {
-                error!("服务端路由与出站表更新失败 (保持上一有效配置): {e}");
-                if !is_hot_reload {
-                    return Err(e);
+        // 服务端出站表与路由 (只有服务端配置才建)。先建好, 整个 build_state 成功后再原子替换,
+        // 失败则保持上一有效配置; 配置未变的上游出口复用旧实例 (见 build_server_router_state)。
+        use crate::proxy::mirage_server::server_router as srv_router;
+        let srv_state = if srv_router::has_server_inbound(&config) {
+            let prev = srv_router::current_server_router_state();
+            match srv_router::build_server_router_state(&config, geodata_dir, prev.as_deref()) {
+                Ok(st) => Some(Arc::new(st)),
+                Err(e) => {
+                    error!("服务端路由与出站表构建失败 (保持上一有效配置): {e}");
+                    if !is_hot_reload {
+                        return Err(e);
+                    }
+                    None
                 }
             }
-        }
+        } else {
+            None
+        };
 
         let outbounds = if let Some(old) = old_outbounds {
             info!("Preserving existing outbounds (hot-reload for outbounds is disabled to prevent connection disruption/task leaks).");
@@ -329,6 +334,10 @@ impl ConfigWatcher {
             apply_user_config_from_file(config_path);
         }
 
+        if let Some(st) = srv_state {
+            srv_router::set_server_router_state(st);
+            info!("服务端路由与出站表已就绪/已热重载更新");
+        }
         Ok(CoreState {
             router: Arc::new(router),
             outbounds,

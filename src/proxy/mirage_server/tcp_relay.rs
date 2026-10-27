@@ -67,6 +67,11 @@ pub(super) async fn handle_tcp_relay(
         Some(user.clone()),
     );
 
+    // block 出站 / 路由选到服务端不可用的出站: 拒绝 (不回落直连)。
+    if matches!(decision.target, super::server_router::ServerOutboundTarget::Reject) {
+        debug!("Mirage Server: 目标 {} 路由至出站 `{}` (拒绝)", target, decision.tag);
+        return;
+    }
     // 配了上游或路由选到上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
     if let super::server_router::ServerOutboundTarget::Upstream(outlet) = decision.target {
         // 中转路径同样受限速/配额/吊销约束 (客户端 IP 桶 + 用户桶 + 凭据令牌), 否则配了上游即可绕过。

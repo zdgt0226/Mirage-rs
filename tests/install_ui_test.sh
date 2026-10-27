@@ -144,7 +144,9 @@ JSON
     out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([("upstream" in i) for i in d["inbounds"]])' "$full")
     eq_  "B5.13 迁移后入站不再包含 upstream" "$out" "[False, False, False]"
     out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["routing"]["default_outbound"])' "$full")
-    eq_  "B5.14 迁移后默认出站设为该上游" "$out" "ss-up"
+    eq_  "B5.14 迁移后默认出站不变 (其它入站行为保持)" "$out" "direct"
+    out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["routing"]["rules"][0])' "$full")
+    eq_  "B5.14b 迁移为按入站 tag 的前插规则" "$out" "{'inbound': ['t'], 'outbound': 'ss-up'}"
 
     # ── 新增: 顶层出站增删与规则管理 ──
     local wg_ob='{ "type": "wireguard", "tag": "wg-up", "private_key": "a", "peer_public_key": "b", "endpoint": "198.51.100.1:51820", "address": "10.0.0.2", "mtu": 1420, "udp": "tunnel" }'
@@ -159,7 +161,7 @@ JSON
     local rule='{ "domain_suffix": ["example.com"], "outbound": "wg-up" }'
     server_add_rule "$full" "$rule" >/dev/null
     out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["routing"]["rules"]))' "$full")
-    eq_  "B5.17 新增分流规则成功" "$out" "1"
+    eq_  "B5.17 新增分流规则成功 (迁移规则 + 新规则)" "$out" "2"
 
     server_remove_outbound "$full" "wg-up" >/dev/null
     out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([o["tag"] for o in d["outbounds"]])' "$full")
@@ -167,7 +169,7 @@ JSON
     out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["routing"]["default_outbound"])' "$full")
     eq_  "B5.19 引用被删出站的 default 自动回退为 direct" "$out" "direct"
     out=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["routing"]["rules"]))' "$full")
-    eq_  "B5.20 引用被删出站的规则自动被清理" "$out" "0"
+    eq_  "B5.20 引用被删出站的规则自动被清理 (只剩迁移规则)" "$out" "1"
 
     # ── 新增: 密码与密钥自动生成 ──
     local psk_32
