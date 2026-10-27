@@ -1205,12 +1205,27 @@ async fn relay_authenticated_quic_stream(
     // 半关闭语义同原 copy_bidirectional: 一侧 EOF 只关对端写方向 (传 FIN), 另一方向继续传完;
     // 只有出错、用户超额或凭据吊销才发 stop 让两个方向都立刻退出。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let stopped = stop_rx.clone(); // 自留一个接收端: 泵都退出后仍能读到是否异常结束
     let t0 = tokio::time::Instant::now();
     let last_active = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    tokio::join!(
+    let ((q_read, up_write, up_eof), (up_read, q_write, down_eof)) = tokio::join!(
         quic_pump(q_read, up_write, dev_buckets.clone(), session_auth.clone(), true, stop_tx.clone(), stop_rx.clone(), t0, last_active.clone()),
         quic_pump(up_read, q_write, dev_buckets, session_auth, false, stop_tx, stop_rx, t0, last_active),
     );
+    // 异常结束 (流 RESET / 目标 RST / 超额 / 吊销 / 空闲): 未正常结束的方向以 RST 收尾, 别让 drop
+    // 的隐式 finish / FIN 把截断伪装成完整结束 (quinn SendStream drop 会 finish)。已经 EOF 半关闭
+    // 的方向不动 —— 它是完整的, reset/RST 反而会丢掉其未被确认的尾部。
+    if *stopped.borrow() {
+        let (mut send, _recv) = q_read.unsplit(q_write).into_halves();
+        if !down_eof {
+            let _ = send.reset(quinn::VarInt::from_u32(0));
+        }
+        if !up_eof {
+            if let Ok(up) = up_read.reunite(up_write) {
+                crate::net_util::abort_socket(std::os::fd::AsRawFd::as_raw_fd(&up));
+            }
+        }
+    }
 }
 
 pub(crate) const REVOKE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1218,6 +1233,7 @@ pub(crate) const REVOKE_CHECK_INTERVAL: std::time::Duration = std::time::Duratio
 /// QUIC lean 单向泵: 带客户端 IP 桶 + 用户桶限速与配额计数 (`up` = 客户端→目标)。
 /// - EOF: `shutdown` 对端写方向后返回, **不打断另一方向** (半关闭, 否则客户端先关写时目标的响应会被丢)。
 /// - 读写出错 / 用户超额 / 凭据吊销 / 双向总空闲达 `relay_idle`: 发 stop, 另一方向随之退出。
+/// - 交还读写半程与"是否经 EOF 正常结束", 由调用方按是否异常 (stop) 决定以 RST 收尾。
 #[cfg(feature = "quic")]
 #[allow(clippy::too_many_arguments)]
 async fn quic_pump<R, W>(
@@ -1230,7 +1246,8 @@ async fn quic_pump<R, W>(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     t0: tokio::time::Instant,
     last_active: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) where
+) -> (R, W, bool)
+where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -1239,16 +1256,16 @@ async fn quic_pump<R, W>(
     loop {
         if auth.should_stop() {
             let _ = stop_tx.send(true);
-            return;
+            return (r, w, false);
         }
         let n = tokio::select! {
             biased;
-            _ = stop_rx.changed() => return,
+            _ = stop_rx.changed() => return (r, w, false),
             res = r.read(&mut buf) => match res {
                 Ok(n) => n,
                 Err(_) => {
                     let _ = stop_tx.send(true);
-                    return;
+                    return (r, w, false);
                 }
             },
             // 周期唤醒检查 auth.should_stop() 与双向总空闲超时:
@@ -1259,14 +1276,14 @@ async fn quic_pump<R, W>(
                 let idle_secs = now_secs.saturating_sub(last_active.load(Ordering::Relaxed));
                 if idle_secs >= crate::proxy::relay_idle().as_secs() {
                     let _ = stop_tx.send(true);
-                    return;
+                    return (r, w, false);
                 }
                 continue;
             }
         };
         if n == 0 {
             let _ = w.shutdown().await; // EOF → 半关闭
-            return;
+            return (r, w, true);
         }
         last_active.store(t0.elapsed().as_secs(), Ordering::Relaxed);
         if let Some(b) = &ip {
@@ -1276,7 +1293,7 @@ async fn quic_pump<R, W>(
             || w.write_all(&buf[..n]).await.is_err()
         {
             let _ = stop_tx.send(true); // 超额、凭据吊销或写失败 → 两个方向都断
-            return;
+            return (r, w, false);
         }
     }
 }

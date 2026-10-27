@@ -410,6 +410,11 @@ pub struct SsWriter<W> {
 }
 
 impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
+    /// 取回底层写半程 (如对其 `forget()` 以 RST 收尾, 见 `net_util::abort_socket`)。
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
     /// 写入明文, 内部按 MAX_CHUNK 切块并逐块加密。首次写入时若有惰性 salt, 拼在首块前一次送出。
     pub async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
         let mut pending = self.pending_salt.take();

@@ -1,8 +1,9 @@
 //! 服务端 TCP 上游转发. 收到 target 后建立 TCP 连接, 双向 copy.
 //!
-//! 空闲超时默认 1800s = 30min 双向 - 给长连接 (WebSocket / 大文件下载) 留余量; 由
+//! 空闲超时默认 1800s = 30min 双向共享 - 给长连接 (WebSocket / 大文件下载) 留余量; 由
 //! `crate::proxy::relay_idle()` 提供 (env `MIRAGE_RELAY_IDLE` 秒可调, 与客户端 handler 共用,
-//! 两端须同设). 资源受限/高频短连接可调小防僵尸连接泄露.
+//! 两端须同设). 两个方向通过 `IdleClock` 共享活跃时间, 仅两向共同静默达 `relay_idle` 才断开.
+//! 资源受限/高频短连接可调小防僵尸连接泄露.
 //!
 //! 半关闭联动 (修 bug: 30 分钟僵尸泄露):
 //! 单纯 `join!(upload, download)` 在一方先 Err 后会让另一方挂在阻塞读上
@@ -20,6 +21,10 @@
 //!
 //! close_notify 语义: 服务端只在上游干净 EOF 时发 (下行完整); 上游出错/超额/吊销/
 //! 空闲超时直接结束, 客户端读到裸 EOF 即判截断、对本地应用 RST 而非 FIN。
+//! 上行对称: 只有 upload 收到客户端 close_notify、或 download 读到上游自身干净 EOF 时才对上游
+//! FIN; 任一方向异常结束 (裸 EOF / 解密失败 / 超时 / 超额 / 吊销 / 读写失败) 都让上游看到 RST
+//! (直连路径到目标; SS 路径只到 SS 服务端, 它对最终目标如何收尾不由我们决定)。WG 路径无论
+//! 哪种都 `abort()` (smoltcp 发 RST), 干净结束也是 RST —— 既有行为, 未改。
 
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -129,6 +134,13 @@ pub(super) async fn handle_tcp_relay(
             }
         }
     };
+    // 同 shutdown_upstream 的抢占约定, 但以 RST 收尾 (异常结束时用)。
+    let abort_upstream = |stop: Arc<AtomicI32>| {
+        let fd = stop.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            crate::net_util::abort_socket(fd);
+        }
+    };
 
     let up_bkt = dev_buckets.clone();
     let dn_bkt = dev_buckets;
@@ -136,14 +148,21 @@ pub(super) async fn handle_tcp_relay(
     let up_auth = session_auth.clone();
     let dn_auth = session_auth;
 
+    let clock = Arc::new(crate::proxy::IdleClock::new());
+    let up_clock = clock.clone();
+    let dn_clock = clock;
+
     let up_conn = _conn.counter();
     let upload = async move {
+        let mut clean_end = false;
+        let mut write_failed = false;
         loop {
             if up_auth.should_stop() {
                 break;
             }
-            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
+            match crate::proxy::idle_timeout(&up_clock, crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
+                    up_clock.touch();
                     // 限速叠加: 客户端 IP 桶与用户桶同时扣 (取更严)
                     if let Some(b) = &up_bkt {
                         b.up.consume(data.len()).await; // 客户端上行限速整形
@@ -153,16 +172,33 @@ pub(super) async fn handle_tcp_relay(
                         break;
                     }
                     if up_write.write_all(data).await.is_err() {
+                        write_failed = true;
                         break;
                     }
                     up_conn.up(data.len() as u64);
                 }
-                _ => break,
+                Ok(Err(e)) => {
+                    clean_end = crate::crypto::aead::is_close_notify(&e);
+                    break;
+                }
+                Err(_) => break,
             }
         }
         // upload 退出 (客户端 reader 报错或超时) → 强制 shutdown upstream,
-        // 让 download 卡在 up_read.read() 上的阻塞立刻返回, 不再 hang 1800s
-        shutdown_upstream(stop_fd_up);
+        // 让 download 卡在 up_read.read() 上的阻塞立刻返回, 不再 hang 1800s。
+        // 只有收到 close_notify (客户端完整结束写) 才让上游看到 FIN; 裸 EOF / 解密失败 / 超时 /
+        // 超额 / 吊销都可能是路径注入的截断或异常收尾, 让上游看到 RST, 别把残缺上传当完整。
+        // 写上游失败 = 上游已断, RST 无新信息, 且 abort 会清空接收队列, 丢掉上游已发出的早期
+        // 响应 (如 413 后关闭); 走 SHUT_RDWR 保留队列, 让 download 把它转完 (随后仍按截断收尾)。
+        if clean_end || write_failed {
+            shutdown_upstream(stop_fd_up);
+        } else {
+            abort_upstream(stop_fd_up);
+        }
+        // 无条件 forget: 抢到 fd 的一方已安排好 FIN (SHUT_RDWR) 或 RST, 写半程 drop 补的
+        // shutdown(Write) 永远多余 —— 且 download 刚抢到 fd、尚未 abort 时它会抢先发出 FIN。
+        // fd 由读半程 drop 时关闭。
+        up_write.forget();
     };
 
     let dn_conn = _conn.counter();
@@ -181,7 +217,7 @@ pub(super) async fn handle_tcp_relay(
             if dn_auth.should_stop() {
                 break;
             }
-            match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
+            match crate::proxy::idle_timeout(&dn_clock, crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
                 Ok(Ok(0)) => {
                     // 上游自己 EOF 才算干净结束; fd 已被 upload 置 -1 说明这个 0 是 upload 退出
                     // 时 SHUT_RDWR 造成的 (隧道上行被断/截断), 下行同样不完整。
@@ -189,6 +225,7 @@ pub(super) async fn handle_tcp_relay(
                     break;
                 }
                 Ok(Ok(n)) => {
+                    dn_clock.touch();
                     let mut total = n;
                     // 贪婪收割: 非阻塞 try_read 继续填 buf 剩余空间, kernel 里有
                     // 多少数据就装多少, WouldBlock (E_AGAIN) 时立即退出. 不会
@@ -223,12 +260,16 @@ pub(super) async fn handle_tcp_relay(
         // 此时 upload 协程还在 reader.recv_data 上, 客户端断开后 upload 那边 recv_data 报错退出.
         if clean_eof {
             let _ = writer.send_close_notify().await;
+            // 同时强制 shutdown upstream (上游已 EOF, 再 shutdown 是 idempotent),
+            // 主要意义是: 若客户端忽视 close_notify 不断连接, upload 在 reader
+            // 上仍阻塞, 此处再无能为力 (1800s 兜底). 但 upload 若是正在写 upstream,
+            // 我们这一刀让它立刻报错退出.
+            shutdown_upstream(stop_fd_down);
+        } else {
+            // 下行异常先退出 (超额 / 吊销 / 写隧道失败 / 超时 / 上游出错): upload 可能还没收完,
+            // 对上游 RST 而非 FIN, 别把残缺上传当完整。
+            abort_upstream(stop_fd_down);
         }
-        // 同时强制 shutdown upstream (上游已 EOF, 再 shutdown 是 idempotent),
-        // 主要意义是: 若客户端忽视 close_notify 不断连接, upload 在 reader
-        // 上仍阻塞, 此处再无能为力 (1800s 兜底). 但 upload 若是正在写 upstream,
-        // 我们这一刀让它立刻报错退出.
-        shutdown_upstream(stop_fd_down);
     };
 
     tokio::join!(upload, download);
@@ -298,25 +339,50 @@ async fn relay_via_shadowsocks(
         }
     };
 
+    let abort_upstream = |stop: Arc<AtomicI32>| {
+        let fd = stop.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            crate::net_util::abort_socket(fd);
+        }
+    };
+
+    let clock = Arc::new(crate::proxy::IdleClock::new());
+    let up_clock = clock.clone();
+    let dn_clock = clock;
+
     let up_lim = limits.clone();
     let upload = async move {
+        let mut clean_end = false;
+        let mut write_failed = false;
         loop {
             if up_lim.exhausted() {
                 break;
             }
-            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
+            match crate::proxy::idle_timeout(&up_clock, crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
+                    up_clock.touch();
                     if up_lim.charge(data.len(), true).await {
                         break; // 越过配额即断开
                     }
                     if up_write.write_all(data).await.is_err() {
+                        write_failed = true;
                         break;
                     }
                 }
-                _ => break,
+                Ok(Err(e)) => {
+                    clean_end = crate::crypto::aead::is_close_notify(&e);
+                    break;
+                }
+                Err(_) => break,
             }
         }
-        shutdown_upstream(stop_up);
+        // 只有 close_notify 才对 SS 上游 FIN, 否则 RST; 写上游失败保留接收队列 (见直连路径)。
+        if clean_end || write_failed {
+            shutdown_upstream(stop_up);
+        } else {
+            abort_upstream(stop_up);
+        }
+        up_write.into_inner().forget(); // 无条件, 见直连路径
     };
 
     let download = async move {
@@ -325,13 +391,14 @@ async fn relay_via_shadowsocks(
             if limits.exhausted() {
                 break;
             }
-            match tokio::time::timeout(crate::proxy::relay_idle(), up_read.read_chunk()).await {
+            match crate::proxy::idle_timeout(&dn_clock, crate::proxy::relay_idle(), up_read.read_chunk()).await {
                 Ok(Ok(chunk)) if chunk.is_empty() => {
                     // 上游 EOF; fd 已被 upload 置 -1 则是 upload 退出时的 SHUT_RDWR 所致, 不算干净 (同直连路径)。
                     clean_eof = stop_down.load(Ordering::SeqCst) >= 0;
                     break;
                 }
                 Ok(Ok(chunk)) => {
+                    dn_clock.touch();
                     if limits.charge(chunk.len(), false).await {
                         break; // 越过配额即断开
                     }
@@ -344,8 +411,10 @@ async fn relay_via_shadowsocks(
         }
         if clean_eof {
             let _ = writer.send_close_notify().await; // 只在干净 EOF 时发, 见直连路径
+            shutdown_upstream(stop_down);
+        } else {
+            abort_upstream(stop_down); // 下行异常先退出, 见直连路径
         }
-        shutdown_upstream(stop_down);
     };
 
     tokio::join!(upload, download);
@@ -425,14 +494,19 @@ async fn relay_via_wireguard(
         }
     }
 
+    let clock = Arc::new(crate::proxy::IdleClock::new());
+    let up_clock = clock.clone();
+    let dn_clock = clock;
+
     let up_lim = limits.clone();
     let upload = async move {
         loop {
             if up_lim.exhausted() {
                 break;
             }
-            match tokio::time::timeout(crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
+            match crate::proxy::idle_timeout(&up_clock, crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
+                    up_clock.touch();
                     if up_lim.charge(data.len(), true).await {
                         break; // 越过配额即断开
                     }
@@ -455,7 +529,8 @@ async fn relay_via_wireguard(
             if limits.exhausted() {
                 break;
             }
-            match tokio::time::timeout(
+            match crate::proxy::idle_timeout(
+                &dn_clock,
                 crate::proxy::relay_idle(),
                 up_read.read(&mut buf),
             )
@@ -466,6 +541,7 @@ async fn relay_via_wireguard(
                     break;
                 }
                 Ok(Ok(n)) => {
+                    dn_clock.touch();
                     if limits.charge(n, false).await {
                         break; // 越过配额即断开
                     }
@@ -498,6 +574,13 @@ mod tests {
     async fn spawn_relay(
         target: String,
     ) -> (CryptoReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf, tokio::task::JoinHandle<()>) {
+        spawn_relay_with_auth(target, super::super::SessionAuth::unlimited()).await
+    }
+
+    async fn spawn_relay_with_auth(
+        target: String,
+        auth: super::super::SessionAuth,
+    ) -> (CryptoReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf, tokio::task::JoinHandle<()>) {
         let master = [0x42u8; 32];
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -506,7 +589,7 @@ mod tests {
             let (r, w) = s.into_split();
             let reader = CryptoReader::new(TunnelRead::Tcp(r), &master, false);
             let writer = CryptoWriter::new(TunnelWrite::Tcp(w), &master, false);
-            handle_tcp_relay(target, None, reader, writer, None, None, "default".into(), super::super::SessionAuth::unlimited(), true).await;
+            handle_tcp_relay(target, None, reader, writer, None, None, "default".into(), auth, true).await;
         });
         let c = TcpStream::connect(addr).await.unwrap();
         let (r, w) = c.into_split();
@@ -583,5 +666,93 @@ mod tests {
         let (got, clean) = read_until_end(&mut cr).await;
         assert!(got.is_empty());
         assert!(!clean, "上行被截断时服务端不得发 close_notify");
+    }
+
+    /// 隧道上行干净结束 (客户端发 close_notify) → upload 让上游看到 FIN (Ok(0))。
+    #[tokio::test]
+    async fn tunnel_upload_clean_close_reaches_upstream_as_fin() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        let up_task = tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"complete data");
+            let mut end_buf = [0u8; 16];
+            let n_end = s.read(&mut end_buf).await.unwrap();
+            assert_eq!(n_end, 0, "客户端发送 close_notify 后上游应收到 FIN (Ok(0))");
+        });
+        let (_cr, w, _relay) = spawn_relay(target).await;
+        let mut cw = CryptoWriter::new(w, &[0x42u8; 32], true);
+        cw.send_data(b"complete data").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cw.send_close_notify().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), up_task)
+            .await
+            .expect("上游不应挂死")
+            .unwrap();
+    }
+
+    /// 隧道上行被截断 (客户端侧裸 FIN, 无 close_notify) → upload 必须让上游看到 RST 而非 FIN。
+    #[tokio::test]
+    async fn tunnel_upload_truncation_reaches_upstream_as_reset() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        let up_task = tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"partial data");
+            // 接下来读到结束: 截断时必须是 RST, 不能是 Ok(0)
+            let mut end_buf = [0u8; 16];
+            s.read(&mut end_buf).await
+        });
+        let (_cr, w, _relay) = spawn_relay(target).await;
+        let mut cw = CryptoWriter::new(w, &[0x42u8; 32], true);
+        cw.send_data(b"partial data").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(cw); // 裸 FIN, 无 close_notify
+        let res = tokio::time::timeout(Duration::from_secs(5), up_task)
+            .await
+            .expect("上游不应挂死")
+            .unwrap();
+        assert!(
+            matches!(&res, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "上行被截断时上游必须收到 RST, 实得: {res:?}"
+        );
+    }
+
+    /// 下行异常先退出 (此处: 凭据吊销后上游再来数据) 时 upload 可能还没收完 → 上游必须看到 RST,
+    /// 不能是 FIN。旧版 download 退出一律 SHUT_RDWR, 上游看到 FIN。
+    #[tokio::test]
+    async fn download_abnormal_exit_reaches_upstream_as_reset() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+        let up_task = tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            let n = s.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"partial");
+            go_rx.await.unwrap();
+            s.write_all(b"x").await.unwrap(); // 叫醒 download, 它发现已吊销即退出
+            s.read(&mut buf).await
+        });
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth = super::super::SessionAuth::new(None, revoked.clone());
+        let (_cr, w, _relay) = spawn_relay_with_auth(target, auth).await;
+        let mut cw = CryptoWriter::new(w, &[0x42u8; 32], true);
+        cw.send_data(b"partial").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        revoked.store(true, Ordering::SeqCst);
+        go_tx.send(()).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), up_task)
+            .await
+            .expect("上游不应挂死")
+            .unwrap();
+        assert!(
+            matches!(&res, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
+            "下行异常退出时上游必须收到 RST, 实得: {res:?}"
+        );
     }
 }

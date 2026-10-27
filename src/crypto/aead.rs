@@ -246,6 +246,13 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         self.writer.flush().await?;
         Ok(())
     }
+
+    /// 不发 close_notify, 直接关闭底层传输的写方向 (TCP 为 FIN): 告诉对端"本端异常结束写",
+    /// 对端读到裸 EOF 即判截断 (服务端据此对上游 RST, 而非把残缺上行当完整结束)。
+    pub async fn shutdown_transport(&mut self) -> Result<()> {
+        self.writer.shutdown().await?; // BufWriter::shutdown 先刷残留再关内层
+        Ok(())
+    }
 }
 
 // ============================================================================

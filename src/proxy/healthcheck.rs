@@ -98,6 +98,8 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                                     pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                                     debug!("HealthCheck [{}] failed (bad status)", tag);
                                 }
+                                // 正常结束发 close_notify (rtt 已记), 否则服务端按截断 RST 上游。
+                                let _ = tunnel.writer.send_close_notify().await;
                             } else {
                                 pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
                                 debug!("HealthCheck [{}] failed (recv timeout/err)", tag);

@@ -447,3 +447,32 @@ fn app_half_close_first_gets_fin_not_reset() {
     s.shutdown(std::net::Shutdown::Write).unwrap();
     assert!(read_all_or_reset(&mut s).is_ok(), "本地先关应收 FIN, 不应被 RST");
 }
+
+/// 起一个目标: 读到结束后把结果 (Ok(数据)=FIN / Err=RST) 发回测试线程。
+fn spawn_target_report() -> (u16, std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::ErrorKind>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Some(mut s) = l.incoming().flatten().next() {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let _ = tx.send(read_all_or_reset(&mut s));
+        }
+    });
+    (port, rx)
+}
+
+/// 回归 (上行截断对称): 本地应用 RST (上行不完整) → 客户端不发 close_notify、关隧道写 →
+/// 服务端让目标看到 RST, 不能是 FIN (否则目标把残缺上传当完整)。旧版这里是 FIN。
+#[test]
+fn app_reset_reaches_target_as_reset() {
+    let (target, rx) = spawn_target_report();
+    let (_s, _c, cport) = spawn_pair("close_app_rst", 18594, 11594);
+    let s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
+    (&s).write_all(b"req").unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    socket2_free_linger_zero(&s).unwrap();
+    drop(s); // RST
+    let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("目标应结束");
+    assert_eq!(got, Err(std::io::ErrorKind::ConnectionReset), "本地 RST 应传到目标为 RST");
+}
