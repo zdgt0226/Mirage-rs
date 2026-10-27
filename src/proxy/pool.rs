@@ -5,6 +5,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use std::sync::RwLock;
@@ -75,6 +76,7 @@ pub struct PoolStats {
     pub latency_samples: VecDeque<u64>,
     pub consecutive_failures: u32,
     pub last_sample_time: Option<Instant>,
+    pub last_failure_time: Option<Instant>,
 }
 
 impl Default for PoolStats {
@@ -89,6 +91,7 @@ impl PoolStats {
             latency_samples: VecDeque::with_capacity(10),
             consecutive_failures: 0,
             last_sample_time: None,
+            last_failure_time: None,
         }
     }
 
@@ -99,10 +102,12 @@ impl PoolStats {
         self.latency_samples.push_back(ms);
         self.last_sample_time = Some(Instant::now());
         self.consecutive_failures = 0;
+        self.last_failure_time = None;
     }
 
     pub fn record_failure(&mut self) {
         self.consecutive_failures += 1;
+        self.last_failure_time = Some(Instant::now());
     }
 
     pub fn latency_ms(&self) -> Option<u64> {
@@ -117,6 +122,53 @@ impl PoolStats {
     pub fn is_healthy(&self) -> bool {
         self.consecutive_failures < 3
     }
+}
+
+/// 计算连续失败 `consecutive_failures` 次后的基础指数退避时长 (未加抖动).
+///
+/// 规则: 连续失败 n 次后额外等待 min(1s * 2^(n-1), 30s); n=0 时为 0.
+/// 大 n 不溢出 (上限 30s).
+pub(crate) fn backoff_delay(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let exp = (consecutive_failures - 1).min(31);
+    let secs = 1u64.checked_shl(exp).unwrap_or(u64::MAX).min(30);
+    Duration::from_secs(secs)
+}
+
+/// 连续失败第 n 次时的日志级别: 第 1 次 ERROR (带错误原文), 之后只在 n 为 2 的幂时 WARN,
+/// 其余 DEBUG —— 认证失败等持续性错误不刷屏。
+pub(crate) fn failure_log_level(consecutive_failures: u32) -> tracing::Level {
+    if consecutive_failures <= 1 {
+        tracing::Level::ERROR
+    } else if consecutive_failures.is_power_of_two() {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::DEBUG
+    }
+}
+
+/// 为指定基础时长叠加 ±20% 抖动 (因子范围 [-0.20, 0.20]).
+pub(crate) fn apply_jitter_with_factor(delay: Duration, factor: f64) -> Duration {
+    if delay.is_zero() {
+        return Duration::ZERO;
+    }
+    let factor = factor.clamp(-0.20, 0.20);
+    let ms = delay.as_millis() as f64;
+    let jittered_ms = (ms * (1.0 + factor)).round().max(0.0) as u64;
+    Duration::from_millis(jittered_ms)
+}
+
+/// 生产环境计算连续失败后的退避时长 (基础指数退避叠加 ±20% 随机抖动).
+pub(crate) fn jittered_backoff_delay(consecutive_failures: u32) -> Duration {
+    let base = backoff_delay(consecutive_failures);
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let permille = fastrand::i32(-200..=200);
+    let factor = permille as f64 / 1000.0;
+    apply_jitter_with_factor(base, factor)
 }
 
 /// WarmPool 反馈式弹性算法的运行时指标 (v0.4.2+).
@@ -271,7 +323,6 @@ mod feedback_tests {
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
-use std::time::Duration;
 
 /// 客户端伪装握手产物: client_random + server_random + 可选 PFS ECDH 共享秘密。
 struct ClientHandshake {
@@ -389,6 +440,8 @@ pub async fn read_server_handshake<R: tokio::io::AsyncRead + Unpin>(stream: &mut
 pub struct WarmPool {
     queue: Arc<Mutex<VecDeque<Tunnel>>>,      // 空闲可用的隧道队列
     notify: Arc<Notify>,                      // 阻塞唤醒器（当没有连接时挂起请求）
+    demand_notify: Arc<Notify>,               // 需求唤醒器 (get() 在队列空挂起时叫醒退避中的 builder)
+    builder_shutdown_notify: Arc<Notify>,     // 停机唤醒器 (Drop 时快速叫醒退避/SYN抖动中的 builder)
     pub stats: Arc<RwLock<PoolStats>>,        // 连接池的延迟统计和健康检查
     pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
     metrics: Arc<PoolMetrics>,                // 反馈式弹性算法的运行时指标
@@ -399,6 +452,13 @@ pub struct WarmPool {
     #[cfg(feature = "quic")]
     quic_mux: Option<Arc<crate::proxy::quic::QuicMux>>,
 }
+
+#[cfg(test)]
+pub(crate) type TestConnectFn = Arc<
+    dyn Fn(&PoolConfig, &BrutalState) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Tunnel>> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl WarmPool {
     /// transport=quic 走 Model X (connect() 直接开精简流, 不经 fake-TLS 暖池)。
@@ -448,8 +508,34 @@ impl WarmPool {
     }
 
     pub fn new(cfg: Arc<PoolConfig>, brutal_state: Arc<BrutalState>) -> Self {
+        #[cfg(test)]
+        {
+            Self::new_internal(cfg, brutal_state, None)
+        }
+        #[cfg(not(test))]
+        {
+            Self::new_internal(cfg, brutal_state)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_connect_fn(
+        cfg: Arc<PoolConfig>,
+        brutal_state: Arc<BrutalState>,
+        connect_fn: TestConnectFn,
+    ) -> Self {
+        Self::new_internal(cfg, brutal_state, Some(connect_fn))
+    }
+
+    fn new_internal(
+        cfg: Arc<PoolConfig>,
+        brutal_state: Arc<BrutalState>,
+        #[cfg(test)] test_connect_fn: Option<TestConnectFn>,
+    ) -> Self {
         let queue = Arc::new(Mutex::new(VecDeque::with_capacity(cfg.pool_size)));
         let notify = Arc::new(Notify::new());
+        let demand_notify = Arc::new(Notify::new());
+        let builder_shutdown_notify = Arc::new(Notify::new());
         let stats = Arc::new(RwLock::new(PoolStats::new()));
         let metrics = Arc::new(PoolMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -476,6 +562,8 @@ impl WarmPool {
         let pool = Self {
             queue: queue.clone(),
             notify: notify.clone(),
+            demand_notify: demand_notify.clone(),
+            builder_shutdown_notify: builder_shutdown_notify.clone(),
             stats: stats.clone(),
             brutal_state: brutal_state.clone(),
             metrics: metrics.clone(),
@@ -628,6 +716,12 @@ impl WarmPool {
         let stats_builder = stats.clone();
         let brutal_state_builder = brutal_state.clone();
         let shutdown_builder = shutdown.clone();
+        let demand_builder = demand_notify.clone();
+        let builder_shutdown_builder = builder_shutdown_notify.clone();
+        let task_done_notify = Arc::new(Notify::new());
+        let task_done_builder = task_done_notify.clone();
+        #[cfg(test)]
+        let test_connect_fn_builder = test_connect_fn.clone();
 
         tokio::spawn(async move {
             info!("WarmPool (Elastic) initialized. Max capacity: {}", cfg_clone.pool_size);
@@ -649,8 +743,68 @@ impl WarmPool {
                 // 判断是否需要补充连接：闲置 + 正在建连的 < 目标，且没有触碰总上限
                 if current_idle + current_in_flight >= current_target || current_idle + current_in_flight >= cfg_clone.pool_size {
                     // 等待消费者拿走连接，或者Manager提升目标值
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::select! {
+                        _ = builder_shutdown_builder.notified() => { break; }
+                        _ = demand_builder.notified() => {}
+                        _ = task_done_builder.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    }
                     continue;
+                }
+
+                let (failures, last_failure_time) = {
+                    let guard = stats_builder.read().unwrap_or_else(|e| e.into_inner());
+                    (guard.consecutive_failures, guard.last_failure_time)
+                };
+
+                // 退避期间只允许单连接试探，若已有连接在途则等待它完成
+                if failures > 0 && current_in_flight > 0 {
+                    tokio::select! {
+                        _ = builder_shutdown_builder.notified() => { break; }
+                        _ = task_done_builder.notified() => {}
+                    }
+                    continue;
+                }
+
+                // 连续失败退避 (指数退避 min(1s * 2^(n-1), 30s) ± 20% 抖动)
+                if failures > 0 {
+                    let jittered_delay = jittered_backoff_delay(failures);
+                    let mut woken_by_demand = false;
+
+                    tokio::select! {
+                        _ = builder_shutdown_builder.notified() => {
+                            break;
+                        }
+                        _ = tokio::time::sleep(jittered_delay) => {}
+                        _ = demand_builder.notified() => {
+                            woken_by_demand = true;
+                        }
+                    }
+
+                    if shutdown_builder.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    // 需求唤醒: 允许提前尝试建连, 但距上次失败至少间隔 2s
+                    if woken_by_demand {
+                        if let Some(fail_time) = last_failure_time {
+                            let min_interval = Duration::from_secs(2);
+                            let elapsed = fail_time.elapsed();
+                            if elapsed < min_interval {
+                                let remain = min_interval - elapsed;
+                                let capped = remain.min(jittered_delay);
+                                if !capped.is_zero() {
+                                    tokio::select! {
+                                        _ = builder_shutdown_builder.notified() => { break; }
+                                        _ = tokio::time::sleep(capped) => {}
+                                    }
+                                    if shutdown_builder.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 in_flight_clone.fetch_add(1, Ordering::Relaxed);
@@ -660,7 +814,17 @@ impl WarmPool {
                 // 时序图谱分析能识别为定时器调度; 抖动把尖峰打散成宽带分布。
                 let now = Instant::now();
                 if next_build_at > now {
-                    tokio::time::sleep_until(next_build_at).await;
+                    tokio::select! {
+                        _ = builder_shutdown_builder.notified() => {
+                            in_flight_clone.fetch_sub(1, Ordering::Relaxed);
+                            break;
+                        }
+                        _ = tokio::time::sleep_until(next_build_at) => {}
+                    }
+                    if shutdown_builder.load(Ordering::Relaxed) {
+                        in_flight_clone.fetch_sub(1, Ordering::Relaxed);
+                        break;
+                    }
                 }
                 next_build_at = Instant::now() + Duration::from_millis(200 + fastrand::u64(0..=300));
 
@@ -670,25 +834,59 @@ impl WarmPool {
                 let in_flight_task = in_flight_clone.clone();
                 let stats_task = stats_builder.clone();
                 let bs_task = brutal_state_builder.clone();
+                let task_done_task = task_done_builder.clone();
+                #[cfg(test)]
+                let test_connect_fn_task = test_connect_fn_builder.clone();
 
                 tokio::spawn(async move {
                     let start = Instant::now();
+                    #[cfg(test)]
+                    let conn_res = if let Some(ref f) = test_connect_fn_task {
+                        f(&cfg_task, &bs_task).await
+                    } else {
+                        Self::connect_upstream(&cfg_task, &bs_task).await
+                    };
+                    #[cfg(not(test))]
                     let conn_res = Self::connect_upstream(&cfg_task, &bs_task).await;
+
                     match conn_res {
                         Ok(tunnel) => {
                             let elapsed = start.elapsed().as_millis() as u64;
-                            stats_task.write().unwrap_or_else(|e| e.into_inner()).record_latency(elapsed);
+                            let prev_failures = {
+                                let mut stats = stats_task.write().unwrap_or_else(|e| e.into_inner());
+                                let prev = stats.consecutive_failures;
+                                stats.record_latency(elapsed);
+                                prev
+                            };
+                            if prev_failures > 0 {
+                                info!("WarmPool: 上游恢复, 此前连续失败 {} 次", prev_failures);
+                            }
                             
                             q_task.lock().await.push_back(tunnel);
                             n_task.notify_one();
                             in_flight_task.fetch_sub(1, Ordering::Relaxed);
+                            task_done_task.notify_one();
                             debug!("WarmPool: 预热连接就绪 ({}ms)", elapsed);
                         }
                         Err(e) => {
-                            stats_task.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                            let failures = {
+                                let mut stats = stats_task.write().unwrap_or_else(|e| e.into_inner());
+                                stats.record_failure();
+                                stats.consecutive_failures
+                            };
                             in_flight_task.fetch_sub(1, Ordering::Relaxed);
-                            error!("WarmPool: 上游连接失败: {:?}", e);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            task_done_task.notify_one();
+
+                            match failure_log_level(failures) {
+                                tracing::Level::ERROR => error!("WarmPool: 上游连接失败: {:?}", e),
+                                tracing::Level::WARN => warn!(
+                                    "WarmPool: 上游连接失败: 已连续失败 {} 次, 下次重试间隔 {} s: {:?}",
+                                    failures,
+                                    backoff_delay(failures).as_secs(),
+                                    e
+                                ),
+                                _ => debug!("WarmPool: 上游连接失败 (已连续失败 {} 次): {:?}", failures, e),
+                            }
                         }
                     }
                 });
@@ -974,7 +1172,8 @@ impl WarmPool {
                     return Some(tunnel);
                 }
 
-                // 队列真的空了，挂起当前协程等待补货
+                // 队列真的空了，唤醒处于退避中的 builder 提前尝试建连，并挂起当前协程等待补货
+                self.demand_notify.notify_one();
                 notified.await;
             }
         }).await;
@@ -1044,6 +1243,10 @@ impl Drop for WarmPool {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
+        self.demand_notify.notify_waiters();
+        // notify_one: builder 此刻若不在 await (两次检查 shutdown 之间), notify_waiters 会丢,
+        // 它随后进入最长 30s 的退避才发现停机; notify_one 留 permit, 下一次等待立即返回。
+        self.builder_shutdown_notify.notify_one();
         // notify_one 而非 notify_waiters: 无等待者时存一个 permit —— watcher 若尚未首次 poll 或正处在
         // 网络变更分支体内, 下一次 notified() 仍会立即完成, 不会漏唤醒而泄漏任务。
         self.net_shutdown_notify.notify_one();
@@ -1174,5 +1377,251 @@ mod pool_handshake_tests {
         let hs = res.unwrap();
         assert_eq!(hs.server_random, expected_random);
         assert_eq!(hs.cipher_suite, 0x1302);
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn test_backoff_delay_pure_function() {
+        // 0 次 = 0
+        assert_eq!(backoff_delay(0), Duration::ZERO);
+        // 1 次 = 1s
+        assert_eq!(backoff_delay(1), Duration::from_secs(1));
+        // 2 次 = 2s
+        assert_eq!(backoff_delay(2), Duration::from_secs(2));
+        // 3 次 = 4s
+        assert_eq!(backoff_delay(3), Duration::from_secs(4));
+        // 4 次 = 8s
+        assert_eq!(backoff_delay(4), Duration::from_secs(8));
+        // 5 次 = 16s
+        assert_eq!(backoff_delay(5), Duration::from_secs(16));
+        // 6 次 = 30s (min(32s, 30s))
+        assert_eq!(backoff_delay(6), Duration::from_secs(30));
+        // 上限 30s
+        assert_eq!(backoff_delay(7), Duration::from_secs(30));
+        assert_eq!(backoff_delay(10), Duration::from_secs(30));
+        assert_eq!(backoff_delay(100), Duration::from_secs(30));
+        // 大 n 不溢出
+        assert_eq!(backoff_delay(u32::MAX), Duration::from_secs(30));
+
+        // 递增性: 1..=6 严格单调递增
+        for n in 2..=6 {
+            assert!(
+                backoff_delay(n) > backoff_delay(n - 1),
+                "backoff_delay({}) 必须大于 backoff_delay({})",
+                n,
+                n - 1
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_jitter_with_factor() {
+        let base = Duration::from_secs(10);
+        // -20% 抖动
+        assert_eq!(apply_jitter_with_factor(base, -0.20), Duration::from_secs(8));
+        // +20% 抖动
+        assert_eq!(apply_jitter_with_factor(base, 0.20), Duration::from_secs(12));
+        // 0% 抖动
+        assert_eq!(apply_jitter_with_factor(base, 0.0), Duration::from_secs(10));
+        // 超出范围被 clamp
+        assert_eq!(apply_jitter_with_factor(base, -0.50), Duration::from_secs(8));
+        assert_eq!(apply_jitter_with_factor(base, 0.50), Duration::from_secs(12));
+        // 0 延迟始终为 0
+        assert_eq!(apply_jitter_with_factor(Duration::ZERO, 0.20), Duration::ZERO);
+
+        // 验证生产随机抖动函数落在 [0.8*base, 1.2*base] 区间内
+        for _ in 0..100 {
+            let j = jittered_backoff_delay(1);
+            assert!(j >= Duration::from_millis(800) && j <= Duration::from_millis(1200));
+            let j6 = jittered_backoff_delay(6);
+            assert!(j6 >= Duration::from_secs(24) && j6 <= Duration::from_secs(36));
+        }
+    }
+
+    #[test]
+    fn test_log_rate_limiting_rules() {
+        use tracing::Level;
+        let at = |lv: Level| (1u32..=35).filter(|n| failure_log_level(*n) == lv).collect::<Vec<_>>();
+        // 第 1 次打 error
+        assert_eq!(at(Level::ERROR), vec![1]);
+        // 之后只在 2 的幂次打 warn
+        assert_eq!(at(Level::WARN), vec![2, 4, 8, 16, 32]);
+        // 其余走 debug, 不刷屏
+        assert_eq!(at(Level::DEBUG).len(), 35 - 6);
+
+        // 成功恢复测试: record_latency 清零 consecutive_failures 并重置 last_failure_time
+        let mut stats = PoolStats::new();
+        stats.record_failure();
+        stats.record_failure();
+        assert_eq!(stats.consecutive_failures, 2);
+        assert!(stats.last_failure_time.is_some());
+
+        stats.record_latency(42);
+        assert_eq!(stats.consecutive_failures, 0);
+        assert!(stats.last_failure_time.is_none());
+    }
+
+    fn test_pool_config() -> Arc<PoolConfig> {
+        Arc::new(PoolConfig {
+            server_host: "127.0.0.1".into(),
+            server_port: 8080,
+            password: "test_password".into(),
+            camouflage_host: "example.com".into(),
+            pool_size: 10,
+            underlying: None,
+            pfs: false,
+            transport: crate::config::Transport::Tcp,
+            quic_window_mb: 4,
+            quic_erasure_cc: true,
+            quic_sni: "example.com".into(),
+            quic_low_src_port: false,
+            quic_pre_packet: false,
+            quic_obfs: None,
+            quic_pin: None,
+        })
+    }
+
+    fn test_brutal_state() -> Arc<BrutalState> {
+        Arc::new(BrutalState {
+            configured_rate: None,
+            current_rate: Arc::new(AtomicU64::new(0)),
+            base_rtt: None,
+            active_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_builder_exponential_backoff_and_demand_wakeup() {
+        tokio::time::pause();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let connect_fn: TestConnectFn = Arc::new(move |_cfg, _bs| {
+            attempts_clone.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(anyhow::anyhow!("simulated connection failure for test"))
+            })
+        });
+
+        let pool = Arc::new(WarmPool::new_with_connect_fn(
+            test_pool_config(),
+            test_brutal_state(),
+            connect_fn,
+        ));
+
+        // 初始让 builder 启动并完成第 1 次建连尝试
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "启动后应发起第 1 次建连");
+        assert_eq!(pool.stats.read().unwrap().consecutive_failures, 1);
+
+        // 推进 10 秒 (按秒推进以驱动连续建连与退避链):
+        // 无退避时, 每 200~500ms 重试一次, 10s 内会发生 20~50 次握手;
+        // 有指数退避时:
+        // 失败 1: 额外退避 ~1s
+        // 失败 2: 额外退避 ~2s
+        // 失败 3: 额外退避 ~4s
+        // 失败 4: 额外退避 ~8s
+        // 10s 内总尝试次数应被严格约束在 3~5 次 (远少于 20~50 次)
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        let attempt_count = attempts.load(Ordering::Relaxed);
+        assert!(
+            attempt_count <= 5,
+            "10秒内建连尝试次数受退避约束, 实际尝试 {} 次 (远少于无退避时的 20~50 次)",
+            attempt_count
+        );
+        assert!(
+            attempt_count >= 3,
+            "10秒内应有至少 3 次建连尝试, 实际 {} 次",
+            attempt_count
+        );
+
+        // 推进虚拟时间让其进入更长阶梯的退避 (例如失败 5 次后退避 16s)
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+
+        let current_failures = pool.stats.read().unwrap().consecutive_failures;
+        assert!(current_failures >= 5, "应已累积至少 5 次连续失败");
+        let last_attempts = attempts.load(Ordering::Relaxed);
+
+        // 推进 500ms, 此时距离上次失败仅 0.5s (< 2s)
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+
+        // 此时发起 pool.get(), 触发需求唤醒
+        let pool_for_get = pool.clone();
+        let get_task = tokio::spawn(async move {
+            let _ = pool_for_get.get().await;
+        });
+
+        // 让 get() 运行并执行 self.demand_notify.notify_one()
+        tokio::task::yield_now().await;
+
+        // 推进 1000ms: 距离上次失败共 1.5s (< 2s 最小安全间隔)
+        // 断言: 需求唤醒不得早于 2s 发起重试
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            last_attempts,
+            "需求唤醒在距离上次失败不足 2s 时不得提前发起重试"
+        );
+
+        // 再推进 1000ms (距离上次失败已满 2.5s > 2s)
+        // 此时应成功提前触发重试, 而不用等满 16s / 30s 退避
+        tokio::time::advance(Duration::from_millis(1000)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            last_attempts + 1,
+            "需求唤醒在满足 2s 间隔后应立即提前触发建连重试"
+        );
+
+        get_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_builder_shutdown_responsiveness() {
+        tokio::time::pause();
+
+        let connect_fn: TestConnectFn = Arc::new(|_cfg, _bs| {
+            Box::pin(async {
+                Err(anyhow::anyhow!("always fail"))
+            })
+        });
+
+        let pool = Arc::new(WarmPool::new_with_connect_fn(
+            test_pool_config(),
+            test_brutal_state(),
+            connect_fn,
+        ));
+
+        // 让失败累积到至少 6 次, 此时退避长达 30s
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(35)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(pool.stats.read().unwrap().consecutive_failures >= 6);
+
+        // 现在处于 30s 退避休眠中, 执行停机 (Drop)
+        let shutdown_start = Instant::now();
+        drop(pool);
+
+        // 验证无需等待 30s, shutdown 能够立即使后台协程退出
+        tokio::task::yield_now().await;
+        assert!(shutdown_start.elapsed() < Duration::from_secs(1), "Drop 应立刻唤醒退避中的 builder 退出");
     }
 }
