@@ -148,7 +148,7 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
             for w in config.weak_password_warnings() {
                 warn!("安全提示: {w}");
             }
-            for w in config.quic_routing_warnings() {
+            for w in config.server_routing_warnings() {
                 warn!("配置提示: {w}");
             }
             // ClientHello 计时/判定参数 (服务端; 见 docs/client-hello-timing-design.md)。

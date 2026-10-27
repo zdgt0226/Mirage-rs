@@ -1925,9 +1925,12 @@ print(migrated)
 # 再原子替换。改写失败或校验不过时正式配置一字不动 —— 若直接改正式文件再校验, 服务端的
 # 热重载会先读到这份坏配置。改写函数的 stdout 原样透传 (供调用方取返回值)。
 stage_and_commit() { # file func [args...]
-    local cfg=$1 fn=$2; shift 2
+    local cfg fn=$2
+    # 配置是软链接时改写其真实目标 (mv 到链接路径会把链接替换成普通文件)
+    cfg=$(readlink -f "$1" 2>/dev/null) || cfg=$1
+    shift 2
     local tmp
-    tmp=$(mktemp "${cfg}.new.XXXXXX") || return 1
+    tmp=$(mktemp "${cfg}.new.XXXXXX") || return 3
     chmod 600 "$tmp"
     cp -f "$cfg" "$tmp"
     if ! "$fn" "$tmp" "$@"; then
@@ -2384,8 +2387,9 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                fi
                ;;
             6)
-               local mig_n rc
-               mig_n=$(stage_and_commit "$cfg" server_migrate_legacy_upstream); rc=$?
+               local mig_n rc=0
+               # set -e 下裸赋值的命令替换失败会直接退出脚本, 必须放进条件里取返回码
+               if mig_n=$(stage_and_commit "$cfg" server_migrate_legacy_upstream); then :; else rc=$?; fi
                if (( rc == 1 )); then
                    warn "入站上未发现旧 upstream 字段或迁移失败 (正式配置未改动)。"
                    continue

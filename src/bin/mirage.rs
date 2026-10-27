@@ -242,7 +242,7 @@ fn run_check(path: &str) -> i32 {
             for w in cfg.weak_password_warnings() {
                 eprintln!("  ⚠️  {w}");
             }
-            for w in cfg.quic_routing_warnings() {
+            for w in cfg.server_routing_warnings() {
                 eprintln!("  ⚠️  {w}");
             }
             if issues.is_empty() {

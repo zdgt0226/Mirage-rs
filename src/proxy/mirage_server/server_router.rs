@@ -179,6 +179,21 @@ pub async fn server_route(
     }
 }
 
+fn outbound_tag(ob: &crate::config::OutboundConfig) -> &str {
+    use crate::config::OutboundConfig as O;
+    match ob {
+        O::Direct { tag }
+        | O::Block { tag }
+        | O::Shadowsocks { tag, .. }
+        | O::Wireguard { tag, .. }
+        | O::Mirage { tag, .. }
+        | O::Urltest { tag, .. }
+        | O::Fallback { tag, .. }
+        | O::Selector { tag, .. }
+        | O::LoadBalance { tag, .. } => tag,
+    }
+}
+
 /// 路由选到服务端没有的出站 (只可能是 check 未拦住的配置) —— 限频告警, 每个 tag 60s 一次。
 fn warn_unroutable(tag: &str) {
     static LAST: std::sync::Mutex<Option<HashMap<String, std::time::Instant>>> = std::sync::Mutex::new(None);
@@ -230,9 +245,31 @@ fn outlet_for(
     if let Some(o) = built.get(&fp) {
         return Ok(Some(o.clone()));
     }
-    let outlet = match reused {
-        Some(o) => Some(o),
-        None => {
+    // 没有完全相同的, 再按隧道指纹找只差 udp 策略的 WG 出口 (新表里已建的或旧表里的), 共用隧道
+    let shared_tunnel = || -> Option<Arc<crate::proxy::upstream::UpstreamOutlet>> {
+        let want = wg_tunnel_fingerprint(up_cfg)?;
+        let same_tunnel = |f: &String| f.rsplit_once("|udp=").map(|(t, _)| t) == Some(want.as_str());
+        built.iter().find(|(f, _)| same_tunnel(f)).map(|(_, o)| o.clone()).or_else(|| {
+            let p = prev?;
+            let (k, _) = p.fingerprints.iter().find(|(_, f)| same_tunnel(f))?;
+            match k.strip_prefix("inbound:") {
+                Some(ib) => p.inbound_upstreams.get(ib).cloned(),
+                None => match p.outbounds.get(k.as_str()) {
+                    Some(ServerOutboundTarget::Upstream(o)) => Some(o.clone()),
+                    _ => None,
+                },
+            }
+        })
+    };
+    let shared = if reused.is_none() { shared_tunnel() } else { None };
+    let outlet = match (reused, shared.as_deref(), up_cfg) {
+        (Some(o), _, _) => Some(o),
+        (
+            None,
+            Some(crate::proxy::upstream::UpstreamOutlet::Wireguard(base)),
+            crate::config::UpstreamConfig::Wireguard { udp, .. },
+        ) => Some(Arc::new(crate::proxy::upstream::UpstreamOutlet::Wireguard(base.with_udp(*udp)))),
+        _ => {
             let o = crate::build_upstream(Some(up_cfg))?;
             if let Some(o) = o.as_ref().filter(|o| matches!(***o, crate::proxy::upstream::UpstreamOutlet::Wireguard(_))) {
                 fresh_wg.push(o.clone());
@@ -246,17 +283,27 @@ fn outlet_for(
     Ok(outlet)
 }
 
+/// WG 隧道本身的指纹 (不含 udp 策略): 只差 udp 策略的出口共用一条隧道。
+fn wg_tunnel_fingerprint(up: &crate::config::UpstreamConfig) -> Option<String> {
+    match up {
+        crate::config::UpstreamConfig::Wireguard {
+            private_key, peer_public_key, preshared_key, endpoint, address, mtu, persistent_keepalive, udp: _, dns,
+        } => Some(format!(
+            "wg|{private_key}|{peer_public_key}|{preshared_key:?}|{endpoint}|{address}|{mtu:?}|{persistent_keepalive:?}|{dns:?}"
+        )),
+        _ => None,
+    }
+}
+
 /// 上游配置指纹 (含口令 / 私钥, 只在内存里比较, 不落日志)。
 fn upstream_fingerprint(up: &crate::config::UpstreamConfig) -> String {
     match up {
         crate::config::UpstreamConfig::Shadowsocks { server, server_port, password, method, udp } => {
             format!("ss|{server}|{server_port}|{password}|{method}|{udp:?}")
         }
-        crate::config::UpstreamConfig::Wireguard {
-            private_key, peer_public_key, preshared_key, endpoint, address, mtu, persistent_keepalive, udp, dns,
-        } => format!(
-            "wg|{private_key}|{peer_public_key}|{preshared_key:?}|{endpoint}|{address}|{mtu:?}|{persistent_keepalive:?}|{udp:?}|{dns:?}"
-        ),
+        crate::config::UpstreamConfig::Wireguard { udp, .. } => {
+            format!("{}|udp={udp:?}", wg_tunnel_fingerprint(up).unwrap_or_default())
+        }
     }
 }
 
@@ -279,6 +326,26 @@ pub fn build_server_router_state(
             }
         }
     }
+
+    // 服务端作用域: 混合配置 (同时有客户端入站, 共用一份 routing) 只采用 `inbound` 明确限定到
+    // 服务端入站的规则, 默认出站一律直连 (那份 routing 是给客户端写的); 上游出口也只为这些规则
+    // 用到的出站建 —— 客户端的 WG 出站若被服务端另建一份, 同一私钥两个会话会互踢。
+    let server_tags: Vec<&str> = config
+        .inbounds
+        .iter()
+        .filter_map(|ib| match ib {
+            crate::config::InboundConfig::MirageServer { tag, .. } => Some(tag.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mixed = server_tags.len() < config.inbounds.len();
+    let rule_cfgs: Vec<&crate::config::RuleConfig> = config
+        .routing
+        .rules
+        .iter()
+        .filter(|r| !mixed || r.inbound.iter().any(|ib| server_tags.contains(&ib.as_str())))
+        .collect();
+    let wanted = |tag: &str| !mixed || rule_cfgs.iter().any(|r| r.outbound == tag);
 
     // 2. 构建顶层 outbounds 表
     let mut outbounds = HashMap::new();
@@ -306,6 +373,9 @@ pub fn build_server_router_state(
                     method: method.clone(),
                     udp: udp.unwrap_or(crate::config::UdpPolicy::Block),
                 };
+                if !wanted(tag) {
+                    continue;
+                }
                 if let Some(outlet) = outlet_for(tag, upstream_fingerprint(&up_cfg), &up_cfg, prev, &mut fingerprints, &mut built, &mut fresh_wg)? {
                     outbounds.insert(tag.clone(), ServerOutboundTarget::Upstream(outlet));
                 }
@@ -333,6 +403,9 @@ pub fn build_server_router_state(
                     udp: udp.unwrap_or(crate::config::UdpPolicy::Tunnel),
                     dns: dns.clone(),
                 };
+                if !wanted(tag) {
+                    continue;
+                }
                 if let Some(outlet) = outlet_for(tag, upstream_fingerprint(&up_cfg), &up_cfg, prev, &mut fingerprints, &mut built, &mut fresh_wg)? {
                     outbounds.insert(tag.clone(), ServerOutboundTarget::Upstream(outlet));
                 }
@@ -342,63 +415,51 @@ pub fn build_server_router_state(
     }
 
     // 3. 构建路由引擎。服务端只能用 direct / block / shadowsocks / wireguard 出站 (见 outbounds 表)。
-    //    - 混合配置 (同时有客户端入站, 共用一份 routing): 只采用 `inbound` 明确限定到服务端入站的
-    //      规则; 默认出站服务端用不了 (如客户端的 proxy) 时按直连 —— 这份 routing 主要是给客户端写的。
-    //    - 旧配置 (顶层没有 SS / WG 出站, 从没用过服务端出站): 路由有问题时整体忽略、全部直连,
-    //      即 v0.16 之前服务端的行为 (那时服务端不读 routing), 升级不至于突然全拒。
-    //    - 其余 (用了服务端出站的配置): 引用未定义 / 服务端用不了的出站、非法 CIDR 都是配置错误,
-    //      返回 Err —— 冷启动报错退出, 热重载拒绝并保留旧表 (见 ConfigWatcher::build_state)。
-    let server_tags: Vec<&str> = config
-        .inbounds
-        .iter()
-        .filter_map(|ib| match ib {
-            crate::config::InboundConfig::MirageServer { tag, .. } => Some(tag.as_str()),
-            _ => None,
-        })
-        .collect();
-    let mixed = server_tags.len() < config.inbounds.len();
-    let legacy = !outbounds.values().any(|t| matches!(t, ServerOutboundTarget::Upstream(_)));
+    //    路由引用的出站分两类问题:
+    //    - 未定义的 tag、非法 CIDR: 配置错误, 返回 Err —— 冷启动报错退出, 热重载拒绝并保留旧表
+    //      (见 ConfigWatcher::build_state)。
+    //    - 已定义但服务端用不了的类型 (mirage / urltest 等, 即从客户端配置抄来的 routing): 若配置里
+    //      没有任何 SS / WG 出站 (从没用过服务端出站, 旧配置), 整体忽略 routing、全部直连 ——
+    //      即 v0.16 之前服务端的行为 (那时服务端不读 routing), 升级不至于突然全拒; 否则同样 Err。
+    let defined = |t: &str| config.outbounds.iter().any(|ob| outbound_tag(ob) == t);
     let usable = |t: &str| outbounds.contains_key(t);
-
-    let rule_cfgs: Vec<&crate::config::RuleConfig> = config
-        .routing
-        .rules
-        .iter()
-        .filter(|r| !mixed || r.inbound.iter().any(|ib| server_tags.contains(&ib.as_str())))
-        .collect();
-    let mut problems: Vec<String> = Vec::new();
-    let default_outbound = if usable(&config.routing.default_outbound) {
-        config.routing.default_outbound.clone()
-    } else if mixed {
+    let legacy = !config.outbounds.iter().any(|ob| {
+        matches!(
+            ob,
+            crate::config::OutboundConfig::Shadowsocks { .. } | crate::config::OutboundConfig::Wireguard { .. }
+        )
+    });
+    let mut invalid: Vec<String> = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
+    let mut check_ref = |field: String, t: &str| {
+        if !defined(t) {
+            invalid.push(format!("{field} = `{t}` 未定义"));
+        } else if !usable(t) {
+            unsupported.push(format!("{field} = `{t}` 不是服务端可用的出站 (仅 direct / block / shadowsocks / wireguard)"));
+        }
+    };
+    let default_outbound = if mixed {
         "direct".to_string()
     } else {
-        problems.push(format!(
-            "routing.default_outbound = `{}` 不是服务端可用的出站 (未定义, 或不是 direct / block / shadowsocks / wireguard)",
-            config.routing.default_outbound
-        ));
-        "direct".to_string()
+        check_ref("routing.default_outbound".into(), &config.routing.default_outbound);
+        config.routing.default_outbound.clone()
     };
-    for r in &rule_cfgs {
-        if !usable(&r.outbound) {
-            problems.push(format!(
-                "规则引用的出站 `{}` 不是服务端可用的出站 (未定义, 或不是 direct / block / shadowsocks / wireguard)",
-                r.outbound
-            ));
-        }
+    for (i, r) in rule_cfgs.iter().enumerate() {
+        check_ref(format!("服务端规则[{i}].outbound"), &r.outbound);
     }
     let mut rules = Vec::new();
     for (i, r) in rule_cfgs.iter().enumerate() {
         let ip_cidr = match crate::router::parse_ip_nets(&r.ip_cidr) {
             Ok(v) => v,
             Err(bad) => {
-                problems.push(format!("规则 ip_cidr 含非法项 `{bad}`"));
+                invalid.push(format!("规则 ip_cidr 含非法项 `{bad}`"));
                 continue;
             }
         };
         let src_cidrs = match crate::router::parse_ip_nets(&r.source_ip_cidr) {
             Ok(v) => v,
             Err(bad) => {
-                problems.push(format!("规则 source_ip_cidr 含非法项 `{bad}`"));
+                invalid.push(format!("规则 source_ip_cidr 含非法项 `{bad}`"));
                 continue;
             }
         };
@@ -425,16 +486,15 @@ pub fn build_server_router_state(
         });
     }
 
-    let router = if !problems.is_empty() {
-        if legacy {
-            tracing::warn!(
-                "服务端路由配置有问题, 且未配置任何上游出站: 按旧版行为忽略 routing、全部直连。问题: {}",
-                problems.join("; ")
-            );
-            None
-        } else {
-            anyhow::bail!("服务端路由配置无效: {}", problems.join("; "));
-        }
+    let router = if !invalid.is_empty() || (!unsupported.is_empty() && !legacy) {
+        invalid.extend(unsupported);
+        anyhow::bail!("服务端路由配置无效: {}", invalid.join("; "));
+    } else if !unsupported.is_empty() {
+        tracing::warn!(
+            "服务端路由引用了服务端用不了的出站, 且未配置任何上游出站 (视为旧配置): 忽略 routing、全部直连。{}",
+            unsupported.join("; ")
+        );
+        None
     } else if rules.is_empty() && default_outbound == "direct" {
         None // 无规则且默认直连: 不建路由引擎 (省一份 geosite), 全部直连
     } else {
@@ -844,13 +904,28 @@ mod tests {
         // 旧服务端配置 (未配任何上游出站) 里残留从客户端抄来的 routing: 按 v0.16 前行为全部直连
         let json = r#"{
             "inbounds": [ { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" } ],
-            "outbounds": [ { "type": "direct", "tag": "direct" } ],
-            "routing": { "default_outbound": "proxy", "rules": [ { "geosite": ["cn"], "outbound": "direct" } ] }
+            "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" },
+                { "type": "mirage", "tag": "proxy", "server": "192.0.2.9", "server_port": 443, "password": "p", "camouflage_host": "example.com" } ],
+            "routing": { "default_outbound": "proxy", "rules": [ { "domain_suffix": ["ads.example"], "outbound": "block" } ] }
         }"#;
         let (cfg, _) = Config::parse_with_diagnostics(json).unwrap();
         let state = build_server_router_state(&cfg, "", None).unwrap();
         let d = state.route(Some("srv"), "example.com:443", "tcp", None, "default").await;
         assert!(matches!(d.target, ServerOutboundTarget::Direct));
+    }
+
+    #[test]
+    fn test_block_only_config_typo_is_error_not_silent_direct() {
+        // 只配了 direct + block 的新配置: 规则 tag 拼错不能被当成"旧配置"整体忽略 (block 规则会悄悄失效)
+        let json = r#"{
+            "inbounds": [ { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" } ],
+            "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "reject" } ],
+            "routing": { "default_outbound": "direct", "rules": [
+                { "domain_suffix": ["a.example"], "outbound": "reject" },
+                { "domain_suffix": ["b.example"], "outbound": "rejct" } ] }
+        }"#;
+        let (cfg, _) = Config::parse_with_diagnostics(json).unwrap();
+        assert!(build_server_router_state(&cfg, "", None).is_err());
     }
 
     #[tokio::test]
@@ -865,7 +940,8 @@ mod tests {
                 { "type": "direct", "tag": "direct" },
                 { "type": "block", "tag": "reject" },
                 { "type": "mirage", "tag": "proxy", "server": "192.0.2.9", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
-                { "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" }
+                { "type": "shadowsocks", "tag": "ss-up", "server": "192.0.2.1", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" },
+                { "type": "shadowsocks", "tag": "ss-client", "server": "192.0.2.2", "server_port": 8388, "method": "aes-128-gcm", "password": "testpassword12345" }
             ],
             "routing": { "default_outbound": "proxy", "rules": [
                 { "domain_suffix": ["ads.example"], "outbound": "reject" },
@@ -879,6 +955,8 @@ mod tests {
         // 客户端规则 (未限定入站) 不作用于服务端; 客户端默认出站 proxy 服务端用不了 → 直连
         let d = state.route(Some("srv"), "x.ads.example:443", "tcp", None, "default").await;
         assert!(matches!(d.target, ServerOutboundTarget::Direct), "客户端规则不应作用于服务端");
+        // 服务端规则没用到的客户端出站不建服务端实例 (客户端的 WG 若被另建一份会以同一私钥互踢)
+        assert!(!state.outbounds.contains_key("ss-client"));
     }
 
     #[tokio::test]
@@ -897,6 +975,28 @@ mod tests {
         let (c4, _) = Config::parse_with_diagnostics(&ss_cfg("otherpassword6789")).unwrap();
         let s4 = build_server_router_state(&c4, "", Some(&s2)).unwrap();
         assert!(!Arc::ptr_eq(&up_tag(&s2, "ss-up"), &up_tag(&s4, "ss-up")), "配置变化的上游出口应重建");
+    }
+
+    #[test]
+    fn test_wg_outlets_differing_only_in_udp_share_tunnel() {
+        let (k1, _) = crate::proxy::wg::generate_wg_keypair();
+        let (_, peer) = crate::proxy::wg::generate_wg_keypair();
+        let (k1, peer) = (crate::proxy::wg::encode_wg_key(&k1), crate::proxy::wg::encode_wg_key(&peer));
+        let wg = |udp: &str| format!(r#""type": "wireguard", "private_key": "{k1}", "peer_public_key": "{peer}", "endpoint": "192.0.2.5:51820", "address": "10.0.0.2", "udp": "{udp}""#);
+        let json = format!(r#"{{
+            "inbounds": [ {{ "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012",
+                "upstream": {{ {} }} }} ],
+            "outbounds": [ {{ "type": "direct", "tag": "direct" }}, {{ "tag": "wg-up", {} }} ],
+            "routing": {{ "default_outbound": "direct", "rules": [] }}
+        }}"#, wg("block"), wg("tunnel"));
+        let (cfg, _) = Config::parse_with_diagnostics(&json).unwrap();
+        let st = build_server_router_state(&cfg, "", None).unwrap();
+        let (a, b) = (st.inbound_upstreams.get("srv").unwrap(), up_tag(&st, "wg-up"));
+        let (crate::proxy::upstream::UpstreamOutlet::Wireguard(a), crate::proxy::upstream::UpstreamOutlet::Wireguard(b)) = (&**a, &*b) else {
+            panic!("应为 WG 出口")
+        };
+        assert!(matches!(a.udp, crate::config::UdpPolicy::Block) && matches!(b.udp, crate::config::UdpPolicy::Tunnel));
+        assert!(Arc::ptr_eq(&a.cfg, &b.cfg), "只差 udp 策略应共用同一隧道 (同一私钥两会话会互踢)");
     }
 
     #[test]

@@ -1590,8 +1590,9 @@ impl Config {
         out
     }
 
-    /// QUIC 入站路由至非 direct 出站提示 (只打告警, 不进 [`Self::semantic_issues`] —— 后者会让 `mirage-rs config` 拒绝写回)。
-    pub fn quic_routing_warnings(&self) -> Vec<String> {
+    /// 服务端配置的提示类问题 (QUIC 入站路由至上游、服务端不生效的字段): 只打告警, 不进
+    /// [`Self::semantic_issues`] —— 后者会让 `check` 失败、`mirage-rs config` 拒绝写回。
+    pub fn server_routing_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
         let quic_inbounds: Vec<&str> = self
             .inbounds
@@ -1605,6 +1606,20 @@ impl Config {
                 None
             })
             .collect();
+
+        // 纯服务端配置里 SS 出站的 underlying 不生效 (服务端直接拨 SS 服务器)。只提示: 无害, 而进
+        // semantic_issues 会让 check 失败、install.sh 菜单的任何改动都被拒。
+        let server_only = !self.inbounds.is_empty()
+            && self.inbounds.iter().all(|ib| matches!(ib, InboundConfig::MirageServer { .. }));
+        if server_only {
+            for ob in &self.outbounds {
+                if let OutboundConfig::Shadowsocks { tag, underlying: Some(_), .. } = ob {
+                    warnings.push(format!(
+                        "shadowsocks 出站 `{tag}` 的 underlying 在服务端不生效 (服务端直接拨 SS 服务器), 可删除该字段"
+                    ));
+                }
+            }
+        }
 
         if quic_inbounds.is_empty() {
             return warnings;
@@ -1753,13 +1768,6 @@ impl Config {
                 if known(t) && !server_usable(t) {
                     issues.push(format!(
                         "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站"
-                    ));
-                }
-            }
-            for ob in &self.outbounds {
-                if let OutboundConfig::Shadowsocks { tag, underlying: Some(_), .. } = ob {
-                    issues.push(format!(
-                        "shadowsocks 出站 `{tag}` 的 underlying 在服务端不生效 (服务端直接拨 SS 服务器), 请删除该字段"
                     ));
                 }
             }
@@ -2866,7 +2874,7 @@ mod validation_tests {
     }
 
     #[test]
-    fn quic_routing_warnings_skip_semantic_issues() {
+    fn server_routing_warnings_skip_semantic_issues() {
         let mut v = base();
         v["inbounds"] = serde_json::json!([
             { "type": "mirage_server", "tag": "srv_quic", "listen": "0.0.0.0", "port": 443,
@@ -2879,7 +2887,7 @@ mod validation_tests {
         ]);
         v["routing"]["default_outbound"] = serde_json::json!("ss-up");
         let cfg: Config = serde_json::from_value(v.clone()).unwrap();
-        let w = cfg.quic_routing_warnings();
+        let w = cfg.server_routing_warnings();
         assert!(!w.is_empty(), "QUIC 入站配非 direct default 应出告警");
         assert!(w[0].contains("QUIC 传输暂不支持上游出口"));
         assert!(!has(&issues_of(&v), "QUIC 传输暂不支持上游出口"), "不得进 semantic_issues (告警类不阻断 config 写回)");
@@ -2888,7 +2896,7 @@ mod validation_tests {
         v["routing"]["default_outbound"] = serde_json::json!("direct");
         v["routing"]["rules"] = serde_json::json!([{ "domain_suffix": ["x.example"], "outbound": "block" }]);
         let cfg: Config = serde_json::from_value(v).unwrap();
-        assert!(cfg.quic_routing_warnings().is_empty(), "block 不应被报成 QUIC 不支持上游");
+        assert!(cfg.server_routing_warnings().is_empty(), "block 不应被报成 QUIC 不支持上游");
     }
 
     #[test]

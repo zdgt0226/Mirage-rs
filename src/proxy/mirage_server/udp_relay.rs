@@ -14,6 +14,8 @@ use tracing::{debug, error};
 /// 导致 task/UdpSocket/64KB buf 僵尸泄露 (对齐 tcp_relay 的 1800s 兜底思路; UDP
 /// 流更短, 且客户端透明 UDP 自身 60s idle 即拆, 300s 只作服务端兜底不误杀活跃流)。
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// 非 mux UDP: WG 上游出口建立失败后的重试冷却。
+const WG_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// 白名单最大目标数 (防无限膨胀)
 pub(crate) const MAX_SENT_TARGETS: usize = 1024;
@@ -323,6 +325,7 @@ pub(super) async fn handle_udp_relay(
         // 选到 WG 出站的目标按 tag 懒建隧道内 socket; 泵出错退出时把自己移出表, 下个包重建。
         let wg_egresses: Arc<tokio::sync::Mutex<std::collections::HashMap<String, WgEgress>>> =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut wg_failed: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
         'outer: loop {
             if up_auth.should_stop() {
                 break;
@@ -386,18 +389,6 @@ pub(super) async fn handle_udp_relay(
 
                 let payload = &frame[offset..];
 
-                // 上行限速 (policing): 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
-                if !crate::proxy::rate_limit::try_consume_two(
-                    dev_buckets.as_ref().map(|b| &b.up),
-                    up_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
-                    payload.len(),
-                ) {
-                    continue;
-                }
-                if up_auth.record_bytes(payload.len()) {
-                    break 'outer; // 越额或吊销退出整个会话
-                }
-
                 // 服务端选路 (IPv6 目标用 [addr]:port, split_host_port 才能拆开)
                 let target_str = crate::net_util::join_host_port(&target_addr_str, port);
                 let decision = match route_cache.get(&target_str) {
@@ -438,12 +429,25 @@ pub(super) async fn handle_udp_relay(
                                 continue;
                             }
                             crate::config::UdpPolicy::Direct => None,
-                            crate::config::UdpPolicy::Tunnel => Some(wg),
+                            crate::config::UdpPolicy::Tunnel => Some((wg, Arc::as_ptr(outlet) as usize)),
                         },
                     },
                 };
 
-                let Some(wg) = wg_outlet else {
+                // 上行限速 (policing) 与计费: 放在选路之后, 被拒 / block 丢弃的包不扣令牌、不计配额。
+                // 令牌不足丢本报文 (按 payload 字节计), 两桶都扣 (取更严)
+                if !crate::proxy::rate_limit::try_consume_two(
+                    dev_buckets.as_ref().map(|b| &b.up),
+                    up_auth.user_limit.as_ref().and_then(|u| u.buckets()).as_ref().map(|b| &b.up),
+                    payload.len(),
+                ) {
+                    continue;
+                }
+                if up_auth.record_bytes(payload.len()) {
+                    break 'outer; // 越额或吊销退出整个会话
+                }
+
+                let Some((wg, outlet_id)) = wg_outlet else {
                     // 直连: v0.4.5-alpha.16 起走 resolver::resolve_first_filtered (60s 缓存 + IPv4 优先 +
                     // 并发限流 + 出站 SSRF 白名单过滤), 不再每 UDP 包裸调 lookup_host 打满阻塞池.
                     // send_to 不是 AEAD 写, cancel 也无害 (UDP 本来就尽力而为).
@@ -484,73 +488,86 @@ pub(super) async fn handle_udp_relay(
                     continue;
                 };
 
-                // WG 出口: 取 (或懒建) 本 tag 的隧道内 socket 与其下行泵
-                let egress = {
-                    let mut map = wg_egresses.lock().await;
-                    match map.get(&decision.tag) {
-                        Some(e) => e.clone(),
-                        None => {
-                            let tunnel = match wg.tunnel().await {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    debug!("UDP: 建立 WG 上游 `{}` 失败: {e}", decision.tag);
-                                    continue;
-                                }
-                            };
-                            let socket = match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel.clone()) {
-                                Ok(s) => Arc::new(s),
-                                Err(e) => {
-                                    debug!("UDP: 在 WG 上游 `{}` 内绑 UDP 失败: {e}", decision.tag);
-                                    continue;
-                                }
-                            };
-                            let eg = WgEgress {
-                                socket,
-                                tunnel,
-                                sent: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                            };
-                            map.insert(decision.tag.clone(), eg.clone());
-                            // 本出口的下行泵: 无独立空闲超时 (会话空闲由直连泵统一判), 会话结束
-                            // (stop 信号) 时退出; socket 出错退出时移出表, 下个包重建。
-                            let pump_eg = eg.clone();
-                            let pump_tag = decision.tag.clone();
-                            let pump_map = wg_egresses.clone();
-                            let pump_tx = tx_wg.clone();
-                            let pump_auth = up_auth.clone();
-                            let pump_buckets = dev_buckets.clone();
-                            let pump_last_rx = last_rx.clone();
-                            let pump_stop_tx = wg_stop_tx.clone();
-                            let mut pump_stop = wg_stop_tx.subscribe();
-                            tokio::spawn(async move {
-                                let mut buf = vec![0u8; 65536];
-                                loop {
-                                    if pump_auth.should_stop() {
-                                        break;
-                                    }
-                                    let res = tokio::select! {
-                                        biased;
-                                        _ = pump_stop.changed() => return,
-                                        r = pump_eg.socket.recv_from(&mut buf) => r,
-                                    };
-                                    let Ok((size, addr)) = res else {
-                                        pump_map.lock().await.remove(&pump_tag);
-                                        return;
-                                    };
-                                    let norm = normalize_addr(addr);
-                                    match admit_reply(&pump_eg.sent, norm, size, &pump_buckets, &pump_auth) {
-                                        None => continue,
-                                        Some(true) => break, // 越额或吊销 → 停整个会话
-                                        Some(false) => {}
-                                    }
-                                    pump_last_rx.store(session_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
-                                    if !forward_reply(&pump_tx, norm, &buf[..size]).await {
-                                        return;
-                                    }
-                                }
-                                let _ = pump_stop_tx.send(true);
-                            });
-                            eg
+                // WG 出口: 取 (或懒建) 隧道内 socket 与其下行泵。键带出口实例地址: 热重载后同 tag
+                // 但配置已变时用新实例, 不和旧隧道混用。上行是单任务串行, 握手不在锁内进行。
+                let key = format!("{}#{:x}", decision.tag, outlet_id);
+                let cached = wg_egresses.lock().await.get(&key).cloned();
+                let egress = match cached {
+                    Some(e) => e,
+                    None => {
+                        // 建隧道失败后冷却一段时间: 失败要等握手 / 解析超时, 上行串行, 每包都等会拖住
+                        // 同会话里发往其它目标 (含直连) 的包。
+                        if wg_failed.get(&key).is_some_and(|t: &std::time::Instant| t.elapsed() < WG_RETRY_COOLDOWN) {
+                            continue;
                         }
+                        let built = match wg.tunnel().await {
+                            Ok(tunnel) => crate::proxy::wg::socket::WgUdpSocket::bind(tunnel.clone())
+                                .map(|s| (Arc::new(s), tunnel))
+                                .map_err(|e| anyhow::anyhow!("隧道内绑 UDP 失败: {e}")),
+                            Err(e) => Err(e),
+                        };
+                        let (socket, tunnel) = match built {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("UDP: WG 上游 `{}` 不可用 ({}s 内不再重试): {e}", decision.tag, WG_RETRY_COOLDOWN.as_secs());
+                                if wg_failed.len() >= 256 {
+                                    wg_failed.clear();
+                                }
+                                wg_failed.insert(key.clone(), std::time::Instant::now());
+                                continue;
+                            }
+                        };
+                        let eg = WgEgress {
+                            socket,
+                            tunnel,
+                            sent: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                        };
+                        wg_egresses.lock().await.insert(key.clone(), eg.clone());
+                        // 本出口的下行泵: 无独立空闲超时 (会话空闲由直连泵统一判), 会话结束
+                        // (stop 信号) 时退出; socket 出错退出时移出表, 下个包重建。
+                        let pump_eg = eg.clone();
+                        let pump_key = key.clone();
+                        let pump_map = wg_egresses.clone();
+                        let pump_tx = tx_wg.clone();
+                        let pump_auth = up_auth.clone();
+                        let pump_buckets = dev_buckets.clone();
+                        let pump_last_rx = last_rx.clone();
+                        let pump_stop_tx = wg_stop_tx.clone();
+                        let mut pump_stop = wg_stop_tx.subscribe();
+                        tokio::spawn(async move {
+                            // subscribe() 把当前值标为已读: 会话恰在此前已发出停止信号时, changed()
+                            // 不会再返回, 泵会永远挂在 recv 上 —— 先查一次当前值。
+                            if *pump_stop.borrow() {
+                                return;
+                            }
+                            let mut buf = vec![0u8; 65536];
+                            loop {
+                                if pump_auth.should_stop() {
+                                    break;
+                                }
+                                let res = tokio::select! {
+                                    biased;
+                                    _ = pump_stop.changed() => return,
+                                    r = pump_eg.socket.recv_from(&mut buf) => r,
+                                };
+                                let Ok((size, addr)) = res else {
+                                    pump_map.lock().await.remove(&pump_key);
+                                    return;
+                                };
+                                let norm = normalize_addr(addr);
+                                match admit_reply(&pump_eg.sent, norm, size, &pump_buckets, &pump_auth) {
+                                    None => continue,
+                                    Some(true) => break, // 越额或吊销 → 停整个会话
+                                    Some(false) => {}
+                                }
+                                pump_last_rx.store(session_start.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                                if !forward_reply(&pump_tx, norm, &buf[..size]).await {
+                                    return;
+                                }
+                            }
+                            let _ = pump_stop_tx.send(true);
+                        });
+                        eg
                     }
                 };
 

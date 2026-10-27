@@ -20,7 +20,9 @@ pub enum UpstreamOutlet {
 /// WireGuard 上游。隧道**懒初始化** —— 服务端启动时不建, 第一条要中转的连接才建。
 pub struct WgUpstream {
     pub cfg: Arc<crate::proxy::wg::WgConfig>,
-    tunnel: tokio::sync::OnceCell<Arc<crate::proxy::wg::tunnel::WgTunnel>>,
+    /// 共享的懒建隧道: 同一份隧道参数只配了不同 `udp` 策略的出口共用它 (见 [`Self::with_udp`]) ——
+    /// 同一私钥两个会话会互踢。
+    tunnel: Arc<tokio::sync::OnceCell<Arc<crate::proxy::wg::tunnel::WgTunnel>>>,
     /// UDP 策略。见 [`crate::config::UdpPolicy`]。
     pub udp: crate::config::UdpPolicy,
 }
@@ -29,9 +31,14 @@ impl WgUpstream {
     pub fn new(cfg: crate::proxy::wg::WgConfig, udp: crate::config::UdpPolicy) -> Self {
         Self {
             cfg: Arc::new(cfg),
-            tunnel: tokio::sync::OnceCell::new(),
+            tunnel: Arc::new(tokio::sync::OnceCell::new()),
             udp,
         }
+    }
+
+    /// 同一条隧道、另一种 UDP 策略的出口。
+    pub fn with_udp(&self, udp: crate::config::UdpPolicy) -> Self {
+        Self { cfg: self.cfg.clone(), tunnel: self.tunnel.clone(), udp }
     }
 
     /// 取(或首次建立)隧道。失败不缓存, 下条连接可重试。
