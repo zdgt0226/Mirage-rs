@@ -137,6 +137,18 @@ pub(crate) fn backoff_delay(consecutive_failures: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// 连续失败第 n 次时的日志级别: 第 1 次 ERROR (带错误原文), 之后只在 n 为 2 的幂时 WARN,
+/// 其余 DEBUG —— 认证失败等持续性错误不刷屏。
+pub(crate) fn failure_log_level(consecutive_failures: u32) -> tracing::Level {
+    if consecutive_failures <= 1 {
+        tracing::Level::ERROR
+    } else if consecutive_failures.is_power_of_two() {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::DEBUG
+    }
+}
+
 /// 为指定基础时长叠加 ±20% 抖动 (因子范围 [-0.20, 0.20]).
 pub(crate) fn apply_jitter_with_factor(delay: Duration, factor: f64) -> Duration {
     if delay.is_zero() {
@@ -865,16 +877,15 @@ impl WarmPool {
                             in_flight_task.fetch_sub(1, Ordering::Relaxed);
                             task_done_task.notify_one();
 
-                            if failures == 1 {
-                                error!("WarmPool: 上游连接失败: {:?}", e);
-                            } else if failures.is_power_of_two() {
-                                let next_retry_secs = backoff_delay(failures).as_secs();
-                                warn!(
+                            match failure_log_level(failures) {
+                                tracing::Level::ERROR => error!("WarmPool: 上游连接失败: {:?}", e),
+                                tracing::Level::WARN => warn!(
                                     "WarmPool: 上游连接失败: 已连续失败 {} 次, 下次重试间隔 {} s: {:?}",
-                                    failures, next_retry_secs, e
-                                );
-                            } else {
-                                debug!("WarmPool: 上游连接失败 (已连续失败 {} 次): {:?}", failures, e);
+                                    failures,
+                                    backoff_delay(failures).as_secs(),
+                                    e
+                                ),
+                                _ => debug!("WarmPool: 上游连接失败 (已连续失败 {} 次): {:?}", failures, e),
                             }
                         }
                     }
@@ -1233,7 +1244,9 @@ impl Drop for WarmPool {
         self.shutdown.store(true, Ordering::Relaxed);
         self.notify.notify_waiters();
         self.demand_notify.notify_waiters();
-        self.builder_shutdown_notify.notify_waiters();
+        // notify_one: builder 此刻若不在 await (两次检查 shutdown 之间), notify_waiters 会丢,
+        // 它随后进入最长 30s 的退避才发现停机; notify_one 留 permit, 下一次等待立即返回。
+        self.builder_shutdown_notify.notify_one();
         // notify_one 而非 notify_waiters: 无等待者时存一个 permit —— watcher 若尚未首次 poll 或正处在
         // 网络变更分支体内, 下一次 notified() 仍会立即完成, 不会漏唤醒而泄漏任务。
         self.net_shutdown_notify.notify_one();
@@ -1431,29 +1444,14 @@ mod backoff_tests {
 
     #[test]
     fn test_log_rate_limiting_rules() {
-        let mut error_attempts = Vec::new();
-        let mut warn_attempts = Vec::new();
-        let mut debug_attempts = Vec::new();
-
-        for failures in 1u32..=35 {
-            if failures == 1 {
-                error_attempts.push(failures);
-            } else if failures.is_power_of_two() {
-                warn_attempts.push(failures);
-            } else {
-                debug_attempts.push(failures);
-            }
-        }
-
+        use tracing::Level;
+        let at = |lv: Level| (1u32..=35).filter(|n| failure_log_level(*n) == lv).collect::<Vec<_>>();
         // 第 1 次打 error
-        assert_eq!(error_attempts, vec![1]);
+        assert_eq!(at(Level::ERROR), vec![1]);
         // 之后只在 2 的幂次打 warn
-        assert_eq!(warn_attempts, vec![2, 4, 8, 16, 32]);
-        // 其余次数走 debug / 静默, 不刷屏
-        assert!(debug_attempts.contains(&3));
-        assert!(debug_attempts.contains(&5));
-        assert!(debug_attempts.contains(&7));
-        assert!(debug_attempts.contains(&15));
+        assert_eq!(at(Level::WARN), vec![2, 4, 8, 16, 32]);
+        // 其余走 debug, 不刷屏
+        assert_eq!(at(Level::DEBUG).len(), 35 - 6);
 
         // 成功恢复测试: record_latency 清零 consecutive_failures 并重置 last_failure_time
         let mut stats = PoolStats::new();
