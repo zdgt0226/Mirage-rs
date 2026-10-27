@@ -153,7 +153,7 @@ mirage-rs lite-client -c lite_client.json    # 本机
 客户端 ──(Mirage 隧道)──▶ Mirage 服务端 ──(Shadowsocks)──▶ SS 服务器 ──▶ 目标
 ```
 
-在入站或轻量服务端配置中添加 `upstream`:
+部署服务端时 `install.sh` 会询问是否配置上游; 已部署的服务端可运行 `install.sh` 选 `9) 修改服务端上游出口 (中转 / 落地)`, 交互式配置、替换 (Shadowsocks / WireGuard) 或移除上游, 写入前经 `mirage-rs check` 校验 (不通过自动还原), 并提示重启生效 (上游不热重载)。也可手动在入站或轻量服务端配置中添加 `upstream`:
 
 ```jsonc
 "upstream": {

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### feat(install): 主菜单新增「修改服务端上游出口」 (2026-10-27)
+
+- `install.sh` 主菜单加 `9) 修改服务端上游出口 (中转 / 落地)`: 对已部署的服务端 (完整版 `config_server.json` / 轻量版 `lite_server.json`) 显示当前上游, 交互式配置 / 替换 (Shadowsocks / WireGuard, 复用部署时的 `ask_upstream` 引导) 或移除 (恢复直连), 不必重走部署流程。
+- 用 python3 原子改写 JSON (保留其余字段, 权限 600, 旧配置备份为 `.bak`); 完整版写到所有 TCP `mirage_server` 入站 (QUIC 入站不支持上游, 跳过), 写后过 `mirage-rs check`, 不通过自动还原。上游不热重载, 服务在运行时询问是否立即重启。
+- `tests/install_ui_test.sh` 新增 B5 (11 项) 覆盖改写 / 替换 / 移除 / 轻量版 / 无可配入站。
+
 ## [v0.15.6] - 协议实现审计修复 + 依赖安全升级 (2026-10-26)
 
 ### 升级须知
