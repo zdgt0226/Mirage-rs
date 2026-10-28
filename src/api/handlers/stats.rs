@@ -12,7 +12,20 @@ use super::super::state::AppState;
 pub async fn get_stats(State(app_state): State<AppState>) -> Json<Value> {
     let outbounds = crate::monitor::outbound_stats();
     let st = app_state.state.load();
-    let (rules, (default_outbound, default_hits)) = st.router.hit_stats();
+    // 纯服务端配置下客户端 RouterEngine 规则为空 (避免 geosite 内存翻倍), 命中统计读服务端路由表
+    let (rules, (default_outbound, default_hits)) = if st.router.rules_count() == 0 {
+        if let Some(srv_state) = crate::proxy::mirage_server::server_router::current_server_router_state() {
+            if let Some(srv_router) = &srv_state.router {
+                srv_router.hit_stats()
+            } else {
+                st.router.hit_stats()
+            }
+        } else {
+            st.router.hit_stats()
+        }
+    } else {
+        st.router.hit_stats()
+    };
     let rules_json: Vec<Value> = rules
         .into_iter()
         .map(|(index, outbound, hits)| json!({"index": index, "outbound": outbound, "hits": hits}))

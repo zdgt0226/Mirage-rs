@@ -302,9 +302,15 @@ pub async fn proxy_tcp_target(
                 hdr.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
                 hdr.extend_from_slice(target_bytes);
                 let (mut send, mut recv) = (send, recv);
-                if AsyncWriteExt::write_all(&mut send, &hdr).await.is_err() { return; }
+                if AsyncWriteExt::write_all(&mut send, &hdr).await.is_err() {
+                    mux.check_conn_closed();
+                    return;
+                }
                 if !initial_payload.is_empty() {
-                    if AsyncWriteExt::write_all(&mut send, &initial_payload).await.is_err() { return; }
+                    if AsyncWriteExt::write_all(&mut send, &initial_payload).await.is_err() {
+                        mux.check_conn_closed();
+                        return;
+                    }
                     _conn.counter().up(initial_payload.len() as u64);
                 }
                 // 双向裸转发 (QUIC 加密), 带空闲超时 + 字节计数 (WebUI 统计), 对齐 Model-Y 路径的健壮性。
@@ -372,6 +378,7 @@ pub async fn proxy_tcp_target(
                     }
                 };
                 tokio::join!(upload, download);
+                mux.check_conn_closed();
                 return;
             }
 

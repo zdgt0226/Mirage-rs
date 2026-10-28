@@ -155,7 +155,10 @@ impl ConfigWatcher {
         // 「不同用户匹配不同规则」: 展开 device_profiles —— 每个设备分配把其 profile 的规则注入
         // source_ip_cidr(设备网段), 前插到全局规则之前 (设备规则首命中优先; 未命中落全局 → default)。
         let mut all_rule_cfgs: Vec<crate::config::RuleConfig> = Vec::new();
-        for dp in &config.routing.device_profiles {
+        // 纯服务端配置 (所有入站都是 mirage_server): 选路全由服务端路由表负责, 客户端引擎不加载规则
+        // —— 否则同一份 geosite / geoip 被两份引擎各加载一次, 内存翻倍。
+        let pure_server = crate::proxy::mirage_server::server_router::is_pure_server(&config);
+        for dp in config.routing.device_profiles.iter().filter(|_| !pure_server) {
             if let Some(profile_rules) = config.routing.profiles.get(&dp.profile) {
                 for pr in profile_rules {
                     let mut rc = pr.clone();
@@ -164,7 +167,9 @@ impl ConfigWatcher {
                 }
             }
         }
-        all_rule_cfgs.extend(config.routing.rules); // 全局规则在设备规则之后
+        if !pure_server {
+            all_rule_cfgs.extend(config.routing.rules); // 全局规则在设备规则之后
+        }
         for (i, r) in all_rule_cfgs.into_iter().enumerate() {
             let mut ip_cidr = Vec::new();
             for cidr_str in r.ip_cidr {
@@ -1094,6 +1099,42 @@ mod leak_guard_tests {
 #[cfg(test)]
 mod watcher_event_tests {
     use super::*;
+
+    /// 纯服务端配置: 客户端引擎不加载规则, 服务端表照常; 混合配置不受影响。
+    #[test]
+    fn pure_server_config_client_router_has_zero_rules() {
+        let dir = std::env::temp_dir().join(format!("mirage_puresrv_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        // 1. 纯服务端配置 (含一条 geosite / ip_cidr 规则)
+        std::fs::write(&cfg, r#"{
+            "inbounds": [ { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" } ],
+            "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
+            "routing": { "default_outbound": "direct", "rules": [ { "geosite": ["cn"], "ip_cidr": ["192.0.2.0/24"], "outbound": "block" } ] }
+        }"#).unwrap();
+        let st = ConfigWatcher::build_state(cfg.to_str().unwrap(), dir.to_str().unwrap(), None).unwrap();
+        assert_eq!(st.router.rules_count(), 0, "纯服务端配置下客户端 RouterEngine 规则数必须为 0");
+        // 服务端表照常建规则 (直接调构建函数断言, 不读进程级全局表 —— 并行测试会互相覆盖它)
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        let (parsed, _) = crate::config::Config::parse_with_diagnostics(&content).unwrap();
+        let srv = crate::proxy::mirage_server::server_router::build_server_router_state(&parsed, dir.to_str().unwrap(), None).unwrap();
+        assert_eq!(srv.router.as_ref().expect("服务端路由引擎必须存在").rules_count(), 1, "服务端路由表规则数必须正常保留 (为 1)");
+
+        // 2. 混合配置 (同时有客户端入站和服务端入站): 客户端 router 规则不受影响
+        let cfg_mixed = dir.join("config_mixed.json");
+        std::fs::write(&cfg_mixed, r#"{
+            "inbounds": [
+                { "type": "socks", "tag": "socks", "listen": "127.0.0.1", "port": 1080 },
+                { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "pass123456789012" }
+            ],
+            "outbounds": [ { "type": "direct", "tag": "direct" }, { "type": "block", "tag": "block" } ],
+            "routing": { "default_outbound": "direct", "rules": [ { "geosite": ["cn"], "ip_cidr": ["192.0.2.0/24"], "outbound": "block" } ] }
+        }"#).unwrap();
+        let st_mixed = ConfigWatcher::build_state(cfg_mixed.to_str().unwrap(), dir.to_str().unwrap(), None).unwrap();
+        assert_eq!(st_mixed.router.rules_count(), 1, "混合配置下客户端 RouterEngine 规则数不受影响");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 服务端配置的路由引用未定义出站: build_state 必须失败 (热重载据此保留整份旧状态,
     /// 而不是把坏路由装上去让命中的流量全被拒)。

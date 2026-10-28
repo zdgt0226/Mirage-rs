@@ -558,6 +558,11 @@ impl RouterEngine {
         (rules, (self.default_outbound.clone(), self.default_hits.load(Ordering::Relaxed)))
     }
 
+    /// 规则表中规则数量。
+    pub fn rules_count(&self) -> usize {
+        self.rule_table.len()
+    }
+
     /// 收集会被"直连"的 v4 CIDR 集, 供 eBPF tc_divert 的 direct_cidr map 用作内核
     /// 直连快路径。来源是 new() 已统一解析的 all_v4_cidrs (用户手动 ip_cidr ∪
     /// geoip/geosite), 按规则出站是否直连筛选。

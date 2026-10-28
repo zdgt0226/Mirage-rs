@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [v0.16.2] - 三个 P3 修复: 服务端 geo 内存 / WG UDP 解析阻塞 / QUIC 错口令首次无日志 (2026-10-28)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.x / v0.16.x 两端互通, 可单端升级; Android 内核未同步 (由 Android 项目后续拉取)。
+- 纯服务端配置不再加载两份 geosite / geoip, 内存占用下降; WebUI 规则命中统计在纯服务端下显示服务端路由表。
+- 客户端 QUIC 出站口令错误时, 第一个失败的请求就会打出可能原因的 WARN (此前要到第二次请求才有日志)。
+
+### fix(router): 纯服务端配置下客户端 RouterEngine 规则置空避免 geosite/geoip 内存翻倍 (`src/config_watcher.rs`, `src/proxy/mirage_server/server_router.rs`)
+
+- **纯服务端内存优化**: 当所有入站均为 `mirage_server` 时，客户端路由表（`CoreState.router`）不再加载 `routing.rules`，规则数置为 0，避免重复解析与载入 geosite / geoip 数据（此前纯服务端会同时在 `ConfigWatcher::build_state` 与 `build_server_router_state` 各加载一份，导致 geo 内存翻倍）；混合配置与纯客户端配置行为完全不变。 改动只给"设备规则展开 / 并入全局规则"两处加判断; 测试直接调服务端表构建函数断言, 不读进程级全局表 (并行测试会互相覆盖)。
+- **统计接口对齐**: `/api/stats` 在客户端规则为空且服务端路由表存在时，自动读取服务端路由引擎的 `hit_stats`，使 WebUI 能正常展示服务端路由规则命中统计。
+
+### fix(server): 非 mux UDP 经 WireGuard 出口会话内按目标缓存域名解析结果 (`src/proxy/mirage_server/udp_relay.rs`)
+
+- **WG 隧道解析缓存与负缓存冷却**: 非 mux UDP 上行循环（`handle_udp_relay`）发往 WireGuard 出口时，新增会话内按目标缓存解析结果（`WgResolveCache`，成功缓存 60s，容量上限 1024 条）；隧道内 DNS 不通解析失败时自动进入 10s 负缓存冷却期，冷却期内对相同域名目标直接丢包并跳过网络调用，避免每次发包串行阻塞 5s 查询超时而拖死同会话中其它目标（包括直连）的上行转发。
+- **IP 字面量零开销**: IP 字面量目标直接构造目标地址，不进行域名解析、不查询也不占用缓存条目。
+
+### fix(quic): 客户端口令错误首个请求失败立即结算服务端拒绝与告警 (`src/proxy/quic.rs`, `src/proxy/handler.rs`)
+
+- **首请求失败立即结算与日志告警**: 修复客户端 QUIC 出站口令错误时首个请求失败没有任何日志（仅第二次请求才延迟打印 WARN/ERROR）的问题。当首条流建连并发送 token 遭服务端认证失败执行通用 `close(0)` 拒绝时，后台连接监听任务与 `handler` 退出流程立即调用 `check_conn_closed` 捕获连接关闭并触发 `note_conn_closed` 结算；第 1 次失败即输出明确的 `warn!` 日志（提示服务端刚建连即关闭与口令/时钟/吊销等常见原因），并同步激活退避冷却窗口；沿用现有防刷屏限频机制（同一连接的拒绝仅结算一次），协议与服务端行为零改变。
+
 ## [v0.16.1] - 客户端暖池建连失败退避 (2026-10-27)
 
 ### 升级须知

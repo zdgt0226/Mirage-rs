@@ -163,7 +163,7 @@ type DialWatchTx = tokio::sync::watch::Sender<Option<DialOutcome>>;
 /// endpoint + 当前连接存在内部, 跨 open_stream 复用; 连接死了 (close_reason) 下次 open_stream 重拨。
 /// 建连采用单飞 (Singleflight) 状态机: 锁仅保护内存状态切换, 不跨 DNS/握手网络等待。
 pub struct QuicMux {
-    inner: std::sync::Mutex<MuxInner>,
+    inner: Arc<std::sync::Mutex<MuxInner>>,
     host: String,
     port: u16,
     /// QUIC ClientHello 里发的 SNI —— **良性域名 (camouflage_host)**, 而非 server 的真 IP/域名。
@@ -285,7 +285,7 @@ impl QuicMux {
         pin: Option<String>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            inner: std::sync::Mutex::new(MuxInner::default()),
+            inner: Arc::new(std::sync::Mutex::new(MuxInner::default())),
             host: host.to_string(),
             port,
             sni: sni.to_string(),
@@ -405,6 +405,23 @@ impl QuicMux {
                             g.dialing = None;
                             drop(g);
                             let _ = tx.send(Some(DialOutcome::Connected(conn.clone())));
+
+                            // 后台监控连接关闭: 一旦服务端在首条流认证失败后 close(0), 立即结算拒绝并记录 WARN,
+                            // 不必等到客户端发起"下一次"请求调 open_stream 时才感知并报警。
+                            let conn_for_watcher = conn.clone();
+                            let inner_weak = Arc::downgrade(&self.inner);
+                            tokio::spawn(async move {
+                                let reason = conn_for_watcher.closed().await;
+                                if let Some(inner) = inner_weak.upgrade() {
+                                    let mut g = inner.lock().unwrap_or_else(|e| e.into_inner());
+                                    if g.conn.as_ref().is_some_and(|c| c.stable_id() == conn_for_watcher.stable_id()) {
+                                        g.note_conn_closed(&reason);
+                                        g.conn = None;
+                                        g.endpoint = None;
+                                    }
+                                }
+                            });
+
                             Ok((conn, false))
                         }
                         Err(e) => {
@@ -447,6 +464,32 @@ impl QuicMux {
             }
         }
         unreachable!()
+    }
+
+    /// 检查并结算当前连接的关闭状态 (防首个流在传输期间被服务端关闭连接后延迟结算)。
+    pub fn check_conn_closed(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = &g.conn {
+            if let Some(reason) = c.close_reason() {
+                g.note_conn_closed(&reason);
+                g.conn = None;
+                g.endpoint = None;
+            }
+        }
+    }
+
+    /// 连续被服务端拒绝的次数 (供测试与状态断言)。
+    pub fn reject_streak(&self) -> u32 {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).reject_streak
+    }
+
+    /// 是否正处于服务端拒绝后的退避冷却期内。
+    pub fn is_in_rejection_cooldown(&self) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match g.reject_until {
+            Some(until) => std::time::Instant::now() < until,
+            None => false,
+        }
     }
 }
 
@@ -1260,6 +1303,67 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        srv_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// 客户端 QUIC 出站口令错误时，第一次请求失败（如首个流读报错 / 连接被服务端 close(0)）
+    /// 必须立即结算拒绝并进入退避冷却期，而无需等到第二次调用 open_stream。
+    #[tokio::test]
+    async fn test_quic_mux_first_failure_settles_rejection() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_mux_first_rej_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("quic_key.pem");
+        let key_path_str = key_path.to_str().unwrap();
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let ep_server = server_endpoint(listen_addr, 2, QuicCc::Stock, None, Some(key_path_str)).unwrap();
+        let server_addr = ep_server.local_addr().unwrap();
+        let pin = spki_pin(&load_or_generate_key(&key_path).unwrap().public_key_der());
+
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_srv = accepted.clone();
+        let srv_handle = tokio::spawn(async move {
+            while let Some(incoming) = ep_server.accept().await {
+                let cnt = accepted_srv.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if conn.accept_bi().await.is_ok() {
+                            conn.close(quinn::VarInt::from_u32(0), b"");
+                        }
+                    }
+                });
+            }
+        });
+
+        let mux = QuicMux::new("127.0.0.1", server_addr.port(), "localhost", false, false, None, 2, QuicCc::Stock, Some(pin));
+
+        // 第一次发起请求: open_stream 建立连接并开出流
+        let (mut send, mut recv) = mux.open_stream().await.expect("首条流建连应成功");
+        assert_eq!(mux.reject_streak(), 0, "建连成功时 streak 仍为 0");
+
+        // 发送首包触发展示: 服务端认证失败 close(0)
+        tokio::io::AsyncWriteExt::write_all(&mut send, b"dummy_bad_token").await.unwrap();
+        let mut b = [0u8; 1];
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), tokio::io::AsyncReadExt::read(&mut recv, &mut b))
+            .await
+            .expect("服务端应在 2s 内关闭连接");
+        assert!(r.is_err(), "服务端关闭后读流报错");
+
+        // 模拟 handler 完成后调用 check_conn_closed (或后台 watcher 结算)
+        mux.check_conn_closed();
+
+        // 核心验证: 第一次失败即完成拒绝结算, streak 升为 1 且处于冷却中
+        assert_eq!(mux.reject_streak(), 1, "第一次失败必须已立即完成结算，streak = 1");
+        assert!(mux.is_in_rejection_cooldown(), "第一次失败后必须已处于冷却中");
+
+        // 后续请求在冷却期内直接返回服务端拒绝的明确错误提示
+        let err = mux.open_stream().await.unwrap_err();
+        assert!(err.to_string().contains("服务端拒绝了本客户端的连接"), "错误提示必须明确指示拒绝: {err}");
+        assert_eq!(mux.reject_streak(), 1, "同一连接不得重复累加拒绝计数");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "冷却期间不得重新发起拨号建连");
 
         srv_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
