@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v0.16.2] - 三个 P3 修复: 服务端 geo 内存 / WG UDP 解析阻塞 / QUIC 错口令首次无日志 (2026-10-28)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.x / v0.16.x 两端互通, 可单端升级; Android 内核未同步 (由 Android 项目后续拉取)。
+- 纯服务端配置不再加载两份 geosite / geoip, 内存占用下降; WebUI 规则命中统计在纯服务端下显示服务端路由表。
+- 客户端 QUIC 出站口令错误时, 第一个失败的请求就会打出可能原因的 WARN (此前要到第二次请求才有日志)。
+
 ### fix(router): 纯服务端配置下客户端 RouterEngine 规则置空避免 geosite/geoip 内存翻倍 (`src/config_watcher.rs`, `src/proxy/mirage_server/server_router.rs`)
 
 - **纯服务端内存优化**: 当所有入站均为 `mirage_server` 时，客户端路由表（`CoreState.router`）不再加载 `routing.rules`，规则数置为 0，避免重复解析与载入 geosite / geoip 数据（此前纯服务端会同时在 `ConfigWatcher::build_state` 与 `build_server_router_state` 各加载一份，导致 geo 内存翻倍）；混合配置与纯客户端配置行为完全不变。 改动只给"设备规则展开 / 并入全局规则"两处加判断; 测试直接调服务端表构建函数断言, 不读进程级全局表 (并行测试会互相覆盖)。

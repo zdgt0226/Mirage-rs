@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.16.1-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.16.2-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -390,6 +390,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.16.2** | 2026-10-28 | **无协议变更 (可单端升级)**: 纯服务端配置不再重复加载 geosite / geoip；非 mux UDP 经 WG 出口时解析结果会话内缓存 (隧道 DNS 不通不再拖住上行)；QUIC 口令错误首个请求即告警。 |
 | **v0.16.1** | 2026-10-27 | **无协议变更 (可单端升级)**: 客户端暖池建连失败指数退避 (1s→30s, 有请求等待时最快 2s 重试), 口令错误等持续失败时不再每秒数次握手打服务端, 失败日志限频。 |
 | **v0.16.0** | 2026-10-27 | **无协议变更 (可单端升级)**: **服务端出站路由** —— 顶层 `outbounds` (direct / block / Shadowsocks / WireGuard, 可多个) 与 `routing` 在服务端生效，支持「默认直连 + 规则分流到上游」与「默认走落地 + 规则拉回直连」两种模式、按用户分流；出站与路由热重载；`wg-keygen` / `wg-pubkey`；`install.sh` 菜单 9 升级为「管理服务端出口与路由」。 |
 | **v0.15.7** | 2026-10-27 | **无协议变更 (可单端升级)**: 上行异常截断对上游发 RST；TCP 中继双向共享空闲超时 (单向长传输不再 30 分钟被掐)；QUIC lean 异常收尾；`install.sh` 新增「修改服务端上游出口」菜单。 |
