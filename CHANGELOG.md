@@ -4,7 +4,7 @@
 
 ### fix(router): 纯服务端配置下客户端 RouterEngine 规则置空避免 geosite/geoip 内存翻倍 (`src/config_watcher.rs`, `src/proxy/mirage_server/server_router.rs`)
 
-- **纯服务端内存优化**: 当所有入站均为 `mirage_server` 时，客户端路由表（`CoreState.router`）不再加载 `routing.rules`，规则数置为 0，避免重复解析与载入 geosite / geoip 数据（此前纯服务端会同时在 `ConfigWatcher::build_state` 与 `build_server_router_state` 各加载一份，导致 geo 内存翻倍）；混合配置与纯客户端配置行为完全不变。
+- **纯服务端内存优化**: 当所有入站均为 `mirage_server` 时，客户端路由表（`CoreState.router`）不再加载 `routing.rules`，规则数置为 0，避免重复解析与载入 geosite / geoip 数据（此前纯服务端会同时在 `ConfigWatcher::build_state` 与 `build_server_router_state` 各加载一份，导致 geo 内存翻倍）；混合配置与纯客户端配置行为完全不变。 改动只给"设备规则展开 / 并入全局规则"两处加判断; 测试直接调服务端表构建函数断言, 不读进程级全局表 (并行测试会互相覆盖)。
 - **统计接口对齐**: `/api/stats` 在客户端规则为空且服务端路由表存在时，自动读取服务端路由引擎的 `hit_stats`，使 WebUI 能正常展示服务端路由规则命中统计。
 
 ### fix(server): 非 mux UDP 经 WireGuard 出口会话内按目标缓存域名解析结果 (`src/proxy/mirage_server/udp_relay.rs`)
