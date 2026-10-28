@@ -219,6 +219,16 @@ pub fn has_server_inbound(config: &crate::config::Config) -> bool {
         .any(|ib| matches!(ib, crate::config::InboundConfig::MirageServer { .. }))
 }
 
+/// 配置是否为纯服务端配置: 所有入站都是 mirage_server (且至少有一个入站)。
+/// 纯服务端配置时, 客户端 RouterEngine 不加载任何规则以避免 geosite 内存翻倍。
+pub fn is_pure_server(config: &crate::config::Config) -> bool {
+    !config.inbounds.is_empty()
+        && config
+            .inbounds
+            .iter()
+            .all(|ib| matches!(ib, crate::config::InboundConfig::MirageServer { .. }))
+}
+
 /// 上游出口: 指纹与旧表相同则复用旧 outlet, 否则新建。
 fn outlet_for(
     key: &str,
@@ -1025,5 +1035,19 @@ mod tests {
         }"#;
         let (cli, _) = Config::parse_with_diagnostics(client).unwrap();
         assert!(!has_server_inbound(&cli), "纯客户端配置不应建服务端路由表");
+        assert!(!is_pure_server(&cli), "纯客户端不是纯服务端配置");
+        assert!(is_pure_server(&srv), "单 mirage_server 入站属于纯服务端配置");
+
+        let mixed = r#"{
+            "inbounds": [
+                { "type": "socks", "tag": "s", "listen": "127.0.0.1", "port": 1080 },
+                { "type": "mirage_server", "tag": "srv", "listen": "127.0.0.1", "port": 1443, "password": "testpassword12345" }
+            ],
+            "outbounds": [ { "type": "direct", "tag": "direct" } ],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        }"#;
+        let (mix, _) = Config::parse_with_diagnostics(mixed).unwrap();
+        assert!(has_server_inbound(&mix), "混合配置有服务端入站");
+        assert!(!is_pure_server(&mix), "混合配置不是纯服务端配置");
     }
 }
