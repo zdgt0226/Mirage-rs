@@ -19,6 +19,127 @@ const WG_RETRY_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// 白名单最大目标数 (防无限膨胀)
 pub(crate) const MAX_SENT_TARGETS: usize = 1024;
+/// 非 mux UDP: WG 出口目标解析缓存 TTL (成功 60s, 失败负缓存 10s 冷却防阻塞上行单任务)。
+pub(crate) const WG_RESOLVE_CACHE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const WG_RESOLVE_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WgResolveEntry {
+    Positive {
+        addr: SocketAddr,
+        valid_until: std::time::Instant,
+    },
+    Negative {
+        valid_until: std::time::Instant,
+    },
+}
+
+impl WgResolveEntry {
+    pub(crate) fn valid_until(&self) -> std::time::Instant {
+        match *self {
+            WgResolveEntry::Positive { valid_until, .. } => valid_until,
+            WgResolveEntry::Negative { valid_until } => valid_until,
+        }
+    }
+
+    pub(crate) fn is_expired(&self, now: std::time::Instant) -> bool {
+        now >= self.valid_until()
+    }
+}
+
+pub(crate) struct WgResolveCache {
+    entries: std::collections::HashMap<String, WgResolveEntry>,
+    positive_ttl: Duration,
+    negative_ttl: Duration,
+    capacity: usize,
+}
+
+impl Default for WgResolveCache {
+    fn default() -> Self {
+        Self::new(WG_RESOLVE_CACHE_TTL, WG_RESOLVE_NEGATIVE_TTL, MAX_SENT_TARGETS)
+    }
+}
+
+impl WgResolveCache {
+    pub(crate) fn new(positive_ttl: Duration, negative_ttl: Duration, capacity: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            positive_ttl,
+            negative_ttl,
+            capacity,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn insert_entry(&mut self, key: &str, entry: WgResolveEntry, now: std::time::Instant) {
+        if !self.entries.contains_key(key) && self.entries.len() >= self.capacity {
+            self.entries.retain(|_, e| !e.is_expired(now));
+            if self.entries.len() >= self.capacity {
+                if let Some((oldest_key, _)) = self.entries.iter().min_by_key(|(_, e)| e.valid_until()) {
+                    let oldest = oldest_key.clone();
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.entries.insert(key.to_string(), entry);
+    }
+
+    /// 解析目标地址并使用会话内缓存。
+    /// - IP 字面量目标照常不解析, 直接返回 `Some(SocketAddr)`, 且不查也不占用缓存。
+    /// - 若命中未过期的正缓存, 直接返回缓存的 `SocketAddr`。
+    /// - 若命中未过期的负缓存, 直接返回 `None` (冷却期内丢包, 不调用外部解析)。
+    /// - 缓存未命中或已过期时, 调用注入的异步解析函数 `resolve_fn()`:
+    ///   - 解析成功: 写入正缓存 (positive_ttl), 返回 `Some(addr)`。
+    ///   - 解析失败: 写入负缓存 (negative_ttl), 返回 `None`。
+    pub(crate) async fn resolve_with<F, Fut, E>(
+        &mut self,
+        cache_key: &str,
+        host: &str,
+        port: u16,
+        now: std::time::Instant,
+        resolve_fn: F,
+    ) -> Option<SocketAddr>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<SocketAddr, E>>,
+    {
+        let clean_host = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = clean_host.parse::<std::net::IpAddr>() {
+            return Some(SocketAddr::new(ip, port));
+        }
+
+        if let Some(entry) = self.entries.get(cache_key) {
+            if !entry.is_expired(now) {
+                return match entry {
+                    WgResolveEntry::Positive { addr, .. } => Some(*addr),
+                    WgResolveEntry::Negative { .. } => None,
+                };
+            }
+        }
+
+        match resolve_fn().await {
+            Ok(addr) => {
+                let entry = WgResolveEntry::Positive {
+                    addr,
+                    valid_until: now + self.positive_ttl,
+                };
+                self.insert_entry(cache_key, entry, now);
+                Some(addr)
+            }
+            Err(_) => {
+                let entry = WgResolveEntry::Negative {
+                    valid_until: now + self.negative_ttl,
+                };
+                self.insert_entry(cache_key, entry, now);
+                None
+            }
+        }
+    }
+}
 
 /// 记录上行发送目标地址及时间戳。
 /// 满额 (>= capacity) 时先淘汰超过 idle_timeout 未刷新的目标;
@@ -326,6 +447,7 @@ pub(super) async fn handle_udp_relay(
         let wg_egresses: Arc<tokio::sync::Mutex<std::collections::HashMap<String, WgEgress>>> =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let mut wg_failed: std::collections::HashMap<String, std::time::Instant> = std::collections::HashMap::new();
+        let mut wg_resolve_cache = WgResolveCache::default();
         'outer: loop {
             if up_auth.should_stop() {
                 break;
@@ -573,10 +695,21 @@ pub(super) async fn handle_udp_relay(
 
                 // 隧道内解析 (WG 出站配了 dns 时用对端 DNS, 拿对端地区的结果), 不过 SSRF 白名单
                 // (只作用于直连; 目标可能本就是对端内网地址) —— 与 TCP / UDP mux 的 WG 路径一致。
-                let socket_addr = match crate::proxy::wg::resolve_target(&egress.tunnel, &target_addr_str, port).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        debug!("UDP: WG 上游 `{}` 解析 {} 失败: {e}", decision.tag, target_str);
+                // 会话内按目标缓存解析结果 (成功 60s, 失败 10s 负缓存冷却), 防 DNS 不通卡死上行单任务。
+                let cache_key = format!("{}@{}", key, target_str);
+                let socket_addr = match wg_resolve_cache
+                    .resolve_with(
+                        &cache_key,
+                        &target_addr_str,
+                        port,
+                        std::time::Instant::now(),
+                        || async { crate::proxy::wg::resolve_target(&egress.tunnel, &target_addr_str, port).await },
+                    )
+                    .await
+                {
+                    Some(a) => a,
+                    None => {
+                        debug!("UDP: WG 上游 `{}` 解析 {} 失败 (或处于负缓存冷却中)", decision.tag, target_str);
                         continue;
                     }
                 };
@@ -1298,5 +1431,131 @@ mod mux_tests {
         let small_payload = vec![0x42; 100];
         let frame_ok = encode_reply_frame(normalize_addr(v6), &small_payload);
         assert!(frame_ok.len() <= u16::MAX as usize);
+    }
+
+    #[tokio::test]
+    async fn test_wg_resolve_cache_second_call_no_resolve() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut cache = WgResolveCache::new(Duration::from_secs(60), Duration::from_secs(10), 10);
+        let now = std::time::Instant::now();
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let cc = call_count.clone();
+        let r1 = cache
+            .resolve_with("k1", "example.com", 80, now, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok::<SocketAddr, anyhow::Error>("192.0.2.10:80".parse().unwrap())
+                }
+            })
+            .await;
+        assert_eq!(r1, Some("192.0.2.10:80".parse().unwrap()));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // 同目标第二次调用 (未过期): 命中正缓存, 不再调用外部解析
+        let cc = call_count.clone();
+        let r2 = cache
+            .resolve_with("k1", "example.com", 80, now + Duration::from_secs(5), || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok::<SocketAddr, anyhow::Error>("192.0.2.20:80".parse().unwrap())
+                }
+            })
+            .await;
+        assert_eq!(r2, Some("192.0.2.10:80".parse().unwrap()), "应返回缓存的初次解析结果");
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "同目标第二次不应调用解析函数");
+    }
+
+    #[tokio::test]
+    async fn test_wg_resolve_cache_negative_cooldown_and_expire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut cache = WgResolveCache::new(Duration::from_secs(60), Duration::from_secs(10), 10);
+        let now = std::time::Instant::now();
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        // 1. 初次解析失败: 写入负缓存
+        let cc = call_count.clone();
+        let r1 = cache
+            .resolve_with("k1", "bad.example", 80, now, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<SocketAddr, anyhow::Error>(anyhow::anyhow!("timeout"))
+                }
+            })
+            .await;
+        assert_eq!(r1, None);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // 2. 失败后冷却期内 (如 5s < 10s): 不调用解析, 直接返回 None
+        let cc = call_count.clone();
+        let r2 = cache
+            .resolve_with("k1", "bad.example", 80, now + Duration::from_secs(5), || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Err::<SocketAddr, anyhow::Error>(anyhow::anyhow!("timeout"))
+                }
+            })
+            .await;
+        assert_eq!(r2, None);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "冷却期内不得调用解析函数");
+
+        // 3. 冷却期过期后 (11s > 10s): 重新触发外部解析
+        let cc = call_count.clone();
+        let r3 = cache
+            .resolve_with("k1", "bad.example", 80, now + Duration::from_secs(11), || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok::<SocketAddr, anyhow::Error>("192.0.2.30:80".parse().unwrap())
+                }
+            })
+            .await;
+        assert_eq!(r3, Some("192.0.2.30:80".parse().unwrap()));
+        assert_eq!(call_count.load(Ordering::SeqCst), 2, "冷却期过期后必须重新调用解析函数");
+    }
+
+    #[tokio::test]
+    async fn test_wg_resolve_cache_capacity_limit() {
+        let mut cache = WgResolveCache::new(Duration::from_secs(60), Duration::from_secs(10), 3);
+        let now = std::time::Instant::now();
+
+        // 连续插入 10 个不同域名目标
+        for i in 0..10 {
+            let key = format!("wg@h{i}.example:80");
+            let host = format!("h{i}.example");
+            let _ = cache
+                .resolve_with(&key, &host, 80, now, || async move {
+                    Ok::<SocketAddr, anyhow::Error>("192.0.2.1:80".parse().unwrap())
+                })
+                .await;
+            assert!(cache.len() <= 3, "缓存条目数必须严格受限于 capacity");
+        }
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_wg_resolve_cache_ip_literal_not_resolved() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut cache = WgResolveCache::new(Duration::from_secs(60), Duration::from_secs(10), 10);
+        let now = std::time::Instant::now();
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let cc = call_count.clone();
+        let r = cache
+            .resolve_with("k1", "192.0.2.99", 53, now, || {
+                let cc = cc.clone();
+                async move {
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    Ok::<SocketAddr, anyhow::Error>("192.0.2.1:53".parse().unwrap())
+                }
+            })
+            .await;
+        assert_eq!(r, Some("192.0.2.99:53".parse().unwrap()));
+        assert_eq!(call_count.load(Ordering::SeqCst), 0, "IP 字面量不得调用解析函数");
+        assert_eq!(cache.len(), 0, "IP 字面量不进入缓存");
     }
 }

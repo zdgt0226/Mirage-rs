@@ -7,6 +7,11 @@
 - **纯服务端内存优化**: 当所有入站均为 `mirage_server` 时，客户端路由表（`CoreState.router`）不再加载 `routing.rules`，规则数置为 0，避免重复解析与载入 geosite / geoip 数据（此前纯服务端会同时在 `ConfigWatcher::build_state` 与 `build_server_router_state` 各加载一份，导致 geo 内存翻倍）；混合配置与纯客户端配置行为完全不变。
 - **统计接口对齐**: `/api/stats` 在客户端规则为空且服务端路由表存在时，自动读取服务端路由引擎的 `hit_stats`，使 WebUI 能正常展示服务端路由规则命中统计。
 
+### fix(server): 非 mux UDP 经 WireGuard 出口会话内按目标缓存域名解析结果 (`src/proxy/mirage_server/udp_relay.rs`)
+
+- **WG 隧道解析缓存与负缓存冷却**: 非 mux UDP 上行循环（`handle_udp_relay`）发往 WireGuard 出口时，新增会话内按目标缓存解析结果（`WgResolveCache`，成功缓存 60s，容量上限 1024 条）；隧道内 DNS 不通解析失败时自动进入 10s 负缓存冷却期，冷却期内对相同域名目标直接丢包并跳过网络调用，避免每次发包串行阻塞 5s 查询超时而拖死同会话中其它目标（包括直连）的上行转发。
+- **IP 字面量零开销**: IP 字面量目标直接构造目标地址，不进行域名解析、不查询也不占用缓存条目。
+
 ## [v0.16.1] - 客户端暖池建连失败退避 (2026-10-27)
 
 ### 升级须知
