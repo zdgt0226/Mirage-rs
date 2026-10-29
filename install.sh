@@ -342,12 +342,33 @@ brutal_loaded() {
         grep -qw brutal /proc/sys/net/ipv4/tcp_available_congestion_control
 }
 
+# 从 `dkms status` 输出里取已安装的 tcp-brutal 版本 (多个时取最高)。兼容两种格式:
+#   新: tcp-brutal/1.0.3, 6.1.0-21-amd64, x86_64: installed
+#   旧: tcp-brutal, 1.0.3, 5.10.0-45-amd64, x86_64: installed
+parse_dkms_brutal_version() { # stdin
+    grep -i 'installed' | sed -nE 's#^tcp-brutal[/,] *([0-9][0-9.]*)[,:].*#\1#p' | sort -V | tail -1
+}
+
+# 已安装的 Brutal 版本。优先取 dkms 记录的包版本 (= 安装时的 release tag): 上游 v1.0.3 源码里的
+# MODULE_VERSION 仍写 "1.0.2", 只读已加载模块的 /sys/module/brutal/version 分不出这两版。
+# 没有 dkms 记录 (手动 insmod 等) 时才退回模块自报版本。
 brutal_version() {
     local ver=""
-    if [[ -r /sys/module/brutal/version ]]; then
-        ver=$(cat /sys/module/brutal/version 2>/dev/null | tr -d '[:space:]')
+    if command -v dkms >/dev/null 2>&1; then
+        ver=$(dkms status tcp-brutal 2>/dev/null | parse_dkms_brutal_version)
+    fi
+    if [[ -z "$ver" && -r /sys/module/brutal/version ]]; then
+        ver=$(tr -d '[:space:]' < /sys/module/brutal/version 2>/dev/null)
     fi
     echo "${ver:-未知}"
+}
+
+# 已加载的 brutal 模块是否就是磁盘上已安装的那个 (srcversion 比对)。装了新版但没重新加载时返回 1。
+brutal_loaded_is_installed() {
+    local loaded disk
+    loaded=$(tr -d '[:space:]' < /sys/module/brutal/srcversion 2>/dev/null) || return 0
+    disk=$(modinfo -F srcversion brutal 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$loaded" || -z "$disk" || "$loaded" == "$disk" ]]
 }
 
 # 探测本机公网 IP. 顺序尝试多个公共 echo 服务, 取第一个返回合法 IPv4 的.
@@ -378,6 +399,9 @@ handle_brutal_optional() {
         was_loaded=1
         cur_ver=$(brutal_version)
         ok "已检测到 Brutal 内核模块 (版本: ${cur_ver})"
+        if ! brutal_loaded_is_installed; then
+            warn "当前加载的 brutal 模块不是磁盘上已安装的版本 (装了新版但未重新加载), 重启或执行 rmmod brutal && modprobe brutal 后生效"
+        fi
         if [[ "$cur_ver" =~ ^1\. ]]; then
             warn "当前为 v1.x 版本，无客户端分组限速 (多连接并发会叠加超发)"
         fi
@@ -1707,15 +1731,95 @@ generate_wg_psk() {
 }
 
 # WireGuard 上游引导。
+# 把 wg-quick 格式的配置文件 (含 wgcf 生成的 wgcf-profile.conf) 转成 WireGuard 出站 JSON (无 tag)。
+# 取第一个 IPv4 Address 作隧道内地址 (隧道内只支持单个地址), 第一个 IPv4 DNS 作隧道内 DNS。
+# 缺私钥 / 对端公钥 / Endpoint / IPv4 地址时返回 1。纯 awk, 不依赖 python3。
+wg_conf_to_outbound() { # file
+    awk -F'=' '
+        function trim(x) { gsub(/^[ \t]+|[ \t\r]+$/, "", x); return x }
+        function esc(x) { gsub(/\\/, "\\\\", x); gsub(/"/, "\\\"", x); return x }
+        /^[ \t]*#/ { next }
+        /^[ \t]*\[/ { sec = tolower(trim($0)); next }
+        NF < 2 { next }
+        {
+            key = tolower(trim($1)); val = trim(substr($0, index($0, "=") + 1))
+            if (sec == "[interface]") {
+                if (key == "privatekey") priv = val
+                else if (key == "mtu") mtu = val
+                else if (key == "address" || key == "dns") {
+                    n = split(val, parts, ",")
+                    for (i = 1; i <= n; i++) {
+                        p = trim(parts[i]); sub(/\/.*/, "", p)
+                        if (p ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                            if (key == "address" && addr == "") addr = p
+                            if (key == "dns" && dns == "") dns = p
+                        }
+                    }
+                }
+            } else if (sec == "[peer]") {
+                if (key == "publickey") pub = val
+                else if (key == "presharedkey") psk = val
+                else if (key == "endpoint") ep = val
+                else if (key == "persistentkeepalive") ka = val
+            }
+        }
+        END {
+            if (priv == "" || pub == "" || ep == "" || addr == "") exit 1
+            if (mtu !~ /^[0-9]+$/) mtu = 1420
+            out = sprintf("{ \"type\": \"wireguard\", \"private_key\": \"%s\", \"peer_public_key\": \"%s\", \"endpoint\": \"%s\", \"address\": \"%s\", \"mtu\": %s, \"udp\": \"tunnel\"", esc(priv), esc(pub), esc(ep), addr, mtu)
+            if (psk != "") out = out sprintf(", \"preshared_key\": \"%s\"", esc(psk))
+            if (dns != "") out = out sprintf(", \"dns\": \"%s\"", dns)
+            if (ka ~ /^[0-9]+$/ && ka > 0) out = out sprintf(", \"persistent_keepalive\": %s", ka)
+            print out " }"
+        }
+    ' "$1"
+}
+
+# 从 wg-quick 配置文件 (或现场用 wgcf 注册 Cloudflare WARP) 导入 WireGuard 上游。输出出站 JSON 或空串。
+import_wg_conf_upstream() {
+    local conf=""
+    if command -v wgcf >/dev/null 2>&1 && ask_yn "检测到 wgcf, 是否现场注册 Cloudflare WARP 并生成配置?" n; then
+        local wdir="${ETC_DIR}/wgcf"
+        mkdir -p "$wdir"
+        # wgcf 在当前目录读写 wgcf-account.toml / wgcf-profile.conf; 已注册过则只重新生成
+        if ( cd "$wdir" && { [[ -f wgcf-account.toml ]] || wgcf register --accept-tos >&2; } && wgcf generate >&2 ); then
+            conf="${wdir}/wgcf-profile.conf"
+            chmod 600 "$wdir"/* 2>/dev/null || true
+        else
+            warn "wgcf 注册 / 生成失败"
+        fi
+    fi
+    [[ -z "$conf" ]] && conf=$(ask "WireGuard 配置文件路径 (如 wgcf 生成的 wgcf-profile.conf)" "./wgcf-profile.conf")
+    if [[ ! -r "$conf" ]]; then
+        warn "读不到 ${conf}"
+        echo ""; return
+    fi
+    local ob
+    if ! ob=$(wg_conf_to_outbound "$conf"); then
+        warn "${conf} 缺少 PrivateKey / PublicKey / Endpoint / IPv4 Address, 无法导入"
+        echo ""; return
+    fi
+    ok "已从 ${conf} 导入 WireGuard 上游 (隧道内 IPv4 地址; 配置里的 IPv6 地址不使用)"
+    info "该配置的密钥已在对端登记 (wgcf 注册时已完成), 无需再登记本机公钥"
+    echo "$ob"
+}
+
 ask_wg_upstream() {
     cat >&2 <<'EOM'
 
   WireGuard 上游: TCP 与 UDP **同一个出口 IP** (SS 上游做不到这点)。
-  需要你已有一台 WG 服务端, 并在它的 peer 列表里登记本机的公钥。
+  需要你已有一台 WG 服务端, 并在它的 peer 列表里登记本机的公钥;
+  或者直接导入现成的 wg-quick 配置文件 (如 wgcf 生成的 Cloudflare WARP 配置)。
 
   密钥都是标准 WireGuard 的 base64 密钥 (wg genkey / wg pubkey 的输出),
   **不是任意密码** —— 填错长度会在启动前被 check 直接拦下。
 EOM
+    local src
+    src=$(ask_choice "WireGuard 上游来源" "手动填写 (自建 WG 服务端)" "导入配置文件 (wgcf-profile.conf 等 wg-quick 格式, 可现场用 wgcf 注册 WARP)")
+    if [[ "$src" == "2" ]]; then
+        import_wg_conf_upstream
+        return
+    fi
     local wg_priv="" wg_local_pub=""
     local priv_choice
     priv_choice=$(ask_choice "本机 WireGuard 私钥" "自动生成 (推荐)" "粘贴已有私钥")
@@ -2067,6 +2171,30 @@ print(len(rules))
 '
 }
 
+# 入口 → 出口绑定 (链式代理指针): 前插一条只按入站匹配的规则 {inbound:[tag], outbound}。
+# 同一入站已有的纯绑定规则 (只有 inbound 条件) 先删掉, 保证一个入站只有一个绑定。outbound 为空串 = 解除绑定。
+server_bind_inbound() { # file inbound_tag outbound_tag
+    CFG="$1" IB="$2" OB="$3" python3 -c '
+import json, os, sys, tempfile
+path = os.environ["CFG"]
+ib, ob = os.environ["IB"], os.environ["OB"]
+d = json.load(open(path))
+routing = d.setdefault("routing", {"default_outbound": "direct", "rules": []})
+rules = routing.setdefault("rules", [])
+is_bind = lambda r: set(r) <= {"inbound", "outbound"} and r.get("inbound") == [ib]
+rules[:] = [r for r in rules if not is_bind(r)]
+if ob:
+    rules.insert(0, {"inbound": [ib], "outbound": ob})
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w") as f:
+    json.dump(d, f, indent=4, ensure_ascii=False)
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print(len(rules))
+'
+}
+
 # 菜单项: 管理服务端出口与路由
 edit_server_upstream() {
     title "管理服务端出口与路由"
@@ -2160,10 +2288,11 @@ try:
         print("    (无显式规则，所有流量按默认出站选路)")
     for i, r in enumerate(rules, 1):
         conds = []
-        for k in ("domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
+        for k in ("inbound", "domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
             if k in r and r[k]:
                 v = r[k] if isinstance(r[k], list) else [r[k]]
-                conds.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+                # 本段 python 包在 bash 单引号里: 代码中不能出现单引号, 否则 bash 提前截断字符串
+                conds.append("%s: [%s]" % (k, ", ".join(str(x) for x in v)))
         cond_str = " && ".join(conds) if conds else "(全部匹配)"
         out_tag = r.get("outbound", "direct")
         print(f"    [{i}] {cond_str} ──▶ \033[32m{out_tag}\033[0m")
@@ -2189,6 +2318,7 @@ except Exception as e:
             "新增分流规则" \
             "删除分流规则" \
             "迁移入站旧 upstream 为独立出站" \
+            "入口 → 出口绑定 (链式代理: 某个接入端口的流量全部走指定出口)" \
             "完成并退出")
 
         case "$action" in
@@ -2362,10 +2492,10 @@ import json, os
 d = json.load(open(os.environ["CFG"]))
 for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
     conds = []
-    for k in ("domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
+    for k in ("inbound", "domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
         if k in r and r[k]:
             v = r[k] if isinstance(r[k], list) else [r[k]]
-            conds.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+            conds.append("%s: [%s]" % (k, ", ".join(str(x) for x in v)))
     cond_str = " && ".join(conds) if conds else "any"
     print("[%d] %s -> %s" % (i, cond_str, r.get("outbound", "direct")))
 ')
@@ -2406,6 +2536,44 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                    else
                        info "稍后手动重启生效: $(svc_restart_hint server)"
                    fi
+               fi
+               ;;
+            7)
+               local ib_tags ob_tags
+               ib_tags=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+print("\n".join(ib.get("tag", "") for ib in d.get("inbounds", []) if ib.get("type") == "mirage_server" and ib.get("tag")))
+')
+               ob_tags=$(CFG="$cfg" python3 -c '
+import json, os
+d = json.load(open(os.environ["CFG"]))
+print("\n".join(o.get("tag") for o in d.get("outbounds", []) if o.get("tag")))
+')
+               local ib_arr=() ob_arr=()
+               mapfile -t ib_arr <<< "$ib_tags"
+               mapfile -t ob_arr <<< "$ob_tags"
+               if [[ -z "$ib_tags" ]]; then
+                   warn "配置里没有带 tag 的 mirage_server 入站。"
+                   continue
+               fi
+               local ic oc ib_tag ob_tag
+               ic=$(ask_choice "选择入口 (服务端入站)" "${ib_arr[@]}")
+               ib_tag="${ib_arr[$((ic - 1))]}"
+               oc=$(ask_choice "该入口的流量全部走哪个出口" "${ob_arr[@]}" "解除该入口的绑定")
+               ob_tag=""
+               (( oc <= ${#ob_arr[@]} )) && ob_tag="${ob_arr[$((oc - 1))]}"
+               if ! stage_and_commit "$cfg" server_bind_inbound "$ib_tag" "$ob_tag" >/dev/null; then
+                   warn "新配置校验未通过 (正式配置未改动)。"
+                   continue
+               fi
+               if [[ -n "$ob_tag" ]]; then
+                   ok "已绑定: 入口 \`${ib_tag}\` ──▶ 出口 \`${ob_tag}\` (规则已前插到最前, 原配置备份: ${cfg}.bak)"
+               else
+                   ok "已解除入口 \`${ib_tag}\` 的绑定"
+               fi
+               if service_active server; then
+                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
                fi
                ;;
             *)
@@ -2573,6 +2741,58 @@ EOF
     info "使用方式: 把浏览器/系统代理指向 SOCKS5 ${listen}:${lport}"
 }
 
+# 在已占用的 tag 之外取一个不重复的 tag: base, base-2, base-3 ...
+unique_tag() { # base used...
+    local base=$1 t=$1 k=2; shift
+    while [[ "$t" == "direct" || " $* " == *" ${t} "* ]]; do
+        t="${base}-${k}"; k=$((k + 1))
+    done
+    echo "$t"
+}
+
+# 交互式新建一条分流规则, 输出规则 JSON (纯 bash); 放弃时输出空串。参数: 可选的目标出站 tag。
+ask_rule_json() { # targets...
+    local targets=("$@") target="$1"
+    if (( ${#targets[@]} > 1 )); then
+        local tc
+        tc=$(ask_choice "命中后走哪个出站" "${targets[@]}")
+        target="${targets[$((tc - 1))]}"
+    fi
+    local cond_choice field_name
+    cond_choice=$(ask_choice "规则条件类型" \
+        "domain_suffix (域名后缀, 如 example.com)" \
+        "geosite (域名分类, 如 cn, geolocation-!cn)" \
+        "geoip (IP地理位置, 如 cn, hk, us)" \
+        "ip_cidr (目标 IP 网段, 如 192.0.2.0/24)" \
+        "port (目标端口, 如 443, 80)" \
+        "user (认证用户名)")
+    case "$cond_choice" in
+        1) field_name="domain_suffix" ;;
+        2) field_name="geosite" ;;
+        3) field_name="geoip" ;;
+        4) field_name="ip_cidr" ;;
+        5) field_name="port" ;;
+        *) field_name="user" ;;
+    esac
+    local val items="" v
+    val=$(ask "匹配值 (多个值逗号隔开)" "")
+    local _vals=()
+    IFS=',' read -ra _vals <<< "$val"
+    for v in "${_vals[@]}"; do
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        [[ -z "$v" ]] && continue
+        if [[ "$field_name" == "port" && "$v" =~ ^[0-9]+$ ]]; then
+            items+="${items:+, }${v}"
+        else
+            items+="${items:+, }\"$(json_escape "$v")\""
+        fi
+    done
+    if [[ -z "$items" ]]; then
+        echo ""; return
+    fi
+    printf '{ "%s": [ %s ], "outbound": "%s" }' "$field_name" "$items" "$(json_escape "$target")"
+}
+
 config_server() {
     title "配置 Mirage-rs 服务端"
     
@@ -2636,79 +2856,61 @@ EOM
         brutal_line=",\"brutal_rate_mbps\": ${brutal_rate_mbps}"
     fi
 
-    # 上游出口引导 (完整版写顶层 outbounds 与 routing, 不写入 inbound)
-    local ss_up_full
-    ss_up_full=$(ask_upstream)
-    local outbound_list='[
-        {
-            "type": "direct",
-            "tag": "direct"
-        }
-    ]'
-    local routing_default="direct"
-    local routing_rules='[]'
-
-    if [[ -n "$ss_up_full" ]]; then
+    # 上游出口引导 (完整版写顶层 outbounds 与 routing, 不写入 inbound)。可连续添加多个上游,
+    # 再用规则分流 (如流媒体走一个落地、其余走另一个)。纯 bash 拼 JSON, 部署流程不依赖 python3。
+    local up_json up_objs="" up_tags=()
+    up_json=$(ask_upstream)
+    while [[ -n "$up_json" ]]; do
         local def_tag="ss-up"
-        [[ "$ss_up_full" == *'"type": "wireguard"'* || "$ss_up_full" == *'"type":"wireguard"'* ]] && def_tag="wg-up"
+        [[ "$up_json" == *'"type": "wireguard"'* ]] && def_tag="wg-up"
+        def_tag=$(unique_tag "$def_tag" "${up_tags[@]}")
         local up_tag
         up_tag=$(ask "上游出口标签 (tag)" "$def_tag")
         [[ -z "$up_tag" ]] && up_tag="$def_tag"
+        if [[ "$up_tag" == "direct" || " ${up_tags[*]} " == *" ${up_tag} "* ]]; then
+            warn "标签 \`${up_tag}\` 已被占用, 改用 ${def_tag}"
+            up_tag="$def_tag"
+        fi
+        up_tags+=("$up_tag")
+        # ask_upstream 输出形如 `{ "type": ...}`, 在开头插入 tag
+        up_objs+=",
+        { \"tag\": \"$(json_escape "$up_tag")\", ${up_json#\{ }"
+        ask_yn "再添加一个上游出口? (多个上游可按规则分流)" n || break
+        up_json=$(ask_upstream force)
+    done
+    local outbound_list="[
+        { \"type\": \"direct\", \"tag\": \"direct\" }${up_objs}
+    ]"
+    local routing_default="direct"
+    local routing_rules='[]'
 
+    if (( ${#up_tags[@]} > 0 )); then
         cat >&2 <<'EOM'
 
   请选择出站模式:
-    1. 全部走上游 (模式二, 默认所有流量走落地上游, 可通过规则把部分流量拉回 direct 直连)
-    2. 默认直连 (模式一, 默认从本机直连, 仅命中规则的流量走该上游)
+    1. 全部走上游 (默认所有流量走落地上游, 可通过规则把部分流量拉回 direct 直连)
+    2. 默认直连 (默认从本机直连, 仅命中规则的流量走上游)
 EOM
         local mode_choice
         mode_choice=$(ask_choice "选路模式" "全部走上游出口 (推荐落地解锁场景)" "默认直连，按规则分流上游")
+        local rule_targets
         if [[ "$mode_choice" == "1" ]]; then
-            routing_default="$up_tag"
-        else
-            routing_default="direct"
-            if ask_yn "是否现在为该上游添加一条分流规则?" y; then
-                local cond_choice field_name
-                cond_choice=$(ask_choice "规则条件类型" \
-                    "domain_suffix (域名后缀, 如 example.com)" \
-                    "geosite (域名分类, 如 cn, geolocation-!cn)" \
-                    "geoip (IP地理位置, 如 cn, hk, us)" \
-                    "ip_cidr (目标 IP 网段, 如 192.0.2.0/24)" \
-                    "port (目标端口, 如 443, 80)" \
-                    "user (认证用户名)")
-                case "$cond_choice" in
-                    1) field_name="domain_suffix" ;;
-                    2) field_name="geosite" ;;
-                    3) field_name="geoip" ;;
-                    4) field_name="ip_cidr" ;;
-                    5) field_name="port" ;;
-                    6) field_name="user" ;;
-                esac
-                local val
-                val=$(ask "匹配值 (多个值逗号隔开)" "")
-                if [[ -n "$val" ]]; then
-                    # 纯 bash 拼 JSON (部署流程不依赖 python3): port 为数字, 其余为字符串
-                    local items="" v
-                    IFS=',' read -ra _vals <<< "$val"
-                    for v in "${_vals[@]}"; do
-                        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
-                        [[ -z "$v" ]] && continue
-                        if [[ "$field_name" == "port" && "$v" =~ ^[0-9]+$ ]]; then
-                            items+="${items:+, }${v}"
-                        else
-                            items+="${items:+, }\"$(json_escape "$v")\""
-                        fi
-                    done
-                    [[ -n "$items" ]] && routing_rules="[ { \"${field_name}\": [ ${items} ], \"outbound\": \"$(json_escape "$up_tag")\" } ]"
-                fi
+            routing_default="${up_tags[0]}"
+            if (( ${#up_tags[@]} > 1 )); then
+                local dc
+                dc=$(ask_choice "默认走哪个上游" "${up_tags[@]}")
+                routing_default="${up_tags[$((dc - 1))]}"
             fi
+            rule_targets=(direct "${up_tags[@]}")
+        else
+            rule_targets=("${up_tags[@]}")
         fi
-
-        # ask_upstream 输出形如 `{ "type": ...}`, 在开头插入 tag (纯 bash, 不依赖 python3)
-        outbound_list="[
-        { \"type\": \"direct\", \"tag\": \"direct\" },
-        { \"tag\": \"$(json_escape "$up_tag")\", ${ss_up_full#\{ }
-    ]"
+        local rules="" rule
+        while ask_yn "是否添加一条分流规则? (可多次添加, 按顺序匹配)" "$([[ -z "$rules" && "$mode_choice" == "2" ]] && echo y || echo n)"; do
+            rule=$(ask_rule_json "${rule_targets[@]}")
+            [[ -n "$rule" ]] && rules+="${rules:+, }${rule}"
+        done
+        [[ -n "$rules" ]] && routing_rules="[ ${rules} ]"
     fi
 
     # 前向保密 (PFS): opt-in, 两端必须一致。开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。

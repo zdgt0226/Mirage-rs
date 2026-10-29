@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [v0.16.3] - 安装脚本修复与增强: 菜单 9 报错 / brutal 版本 / 多上游 / wgcf 导入 / 入口绑定 (2026-10-29)
+
+### 升级须知
+
+- **无协议变更, 二进制行为不变** (只改 `install.sh` 与 CI), 与 v0.15.x / v0.16.x 两端互通; Android 无需同步。
+- 用 v0.16.x 的 `install.sh` 进「管理服务端出口与路由」遇到 `SyntaxError: unterminated string literal` 的, 换本版脚本即可。
+- CI 新增「安装脚本」门禁: `bash -n install.sh` + `tests/install_ui_test.sh` (含所有内嵌 python 段可编译检查)。
+
+### fix/feat(install): 菜单 9 报错 / brutal 版本识别 / 部署多上游 / 导入 wgcf 配置 / 入口绑定出口 (2026-10-29)
+
+- **修菜单 9 `SyntaxError: unterminated string literal`**: 「管理服务端出口与路由」显示规则时, 内嵌在 bash 单引号里的 python 用了含单引号的 f-string, bash 提前截断字符串, 只要配置里有路由规则就报错 (删除规则的列表同样)。`tests/install_ui_test.sh` 新增检查: 按 bash 实际传入的内容截取所有 `python3 -c '...'` 段逐段编译 (对旧脚本能抓到这两处)。
+- **修 tcp-brutal 版本识别**: 上游 v1.0.3 源码里的 `MODULE_VERSION` 仍写 "1.0.2", 只读 `/sys/module/brutal/version` 会把 v1.0.3 认成 v1.0.2。改为优先取 `dkms status` 记录的已安装包版本 (兼容新旧两种输出格式, 多版本取最高), 无 dkms 记录时才退回模块自报版本; 另比对已加载模块与磁盘模块的 `srcversion`, 装了新版未重新加载时提示重启或 `rmmod brutal && modprobe brutal`。
+- **部署服务端可添加多个上游**: 部署时可连续添加多个 SS / WG 上游出口 (tag 自动去重), 「全部走上游」模式下选择默认走哪个上游; 分流规则可逐条添加, 每条选择命中后走的出站 (含 direct)。仍为纯 bash 生成 JSON, 不依赖 python3。
+- **导入 WireGuard 配置文件 (含 wgcf / Cloudflare WARP)**: WG 上游新增「导入配置文件」来源, 解析 wg-quick 格式 (`[Interface]` PrivateKey / Address / DNS / MTU, `[Peer]` PublicKey / PresharedKey / Endpoint / PersistentKeepalive), 取第一个 IPv4 地址与 IPv4 DNS (隧道内只支持单个地址), 生成独立的 WG 出站供路由规则引用; 本机装有 `wgcf` 时可现场注册 WARP 并生成配置 (账号保存在 `${ETC_DIR}/wgcf`)。纯 awk 解析, 不依赖 python3。部署流程与菜单 9 新增出站都可用。
+- **入口 → 出口绑定 (链式代理指针)**: 菜单 9 新增操作, 选一个服务端入站与一个出站, 前插一条只按入站匹配的规则 (`{"inbound": [...], "outbound": ...}`), 该接入端口的流量全部走指定出口; 同一入站重复绑定会替换, 可解除绑定。规则列表显示补上 `inbound` 条件。
+- `install_ui_test.sh` 新增 B6 (13 项): 内嵌 python 可编译、dkms 版本解析、wg 配置导入 (IPv4 选取 / 域名端点 / 缺字段失败)、tag 去重、入口绑定 (前插 / 替换 / 解除)。
+
 ## [v0.16.2] - 三个 P3 修复: 服务端 geo 内存 / WG UDP 解析阻塞 / QUIC 错口令首次无日志 (2026-10-28)
 
 ### 升级须知

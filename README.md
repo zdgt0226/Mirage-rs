@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.16.2-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.16.3-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -227,6 +227,9 @@ Mirage 服务端顶层 `outbounds` 与 `routing` 完整生效，复用客户端�
 - **原子热重载**: 运行时修改 `outbounds` 与 `routing` 自动生效，通过 `ArcSwapOption` 原子替换，老连接维持，新连接即刻使用新配置，无需重启服务。
 - **管理与工具**:
   - `install.sh` 主菜单 `9) 管理服务端出口与路由`：提供出站增删、设置默认出口、分流规则增删（支持多条件类型与目标出站选择）、旧入站 `upstream` 一键迁移至独立出站（原子改写、备份 `.bak`、`check -c` 闸门与热重载即时生效）。
+  - **入口 → 出口绑定（链式代理指针）**：菜单 9 中选一个服务端入站和一个出站，该接入端口的流量全部走指定出口（生成一条前插的 `inbound` 规则，可随时解除）。
+  - **部署时可添加多个上游**：部署服务端时可连续添加多个 SS / WG 上游，选择默认走哪个上游并逐条添加分流规则。
+  - **导入 WireGuard 配置文件**：WG 上游可直接导入 wg-quick 格式配置（如 [wgcf](https://github.com/ViRb3/wgcf) 生成的 Cloudflare WARP `wgcf-profile.conf`）；本机装有 `wgcf` 时可现场注册生成。取第一个 IPv4 地址作隧道地址（IPv6 地址不使用）。
   - 主菜单 `5) 查看服务端节点信息`：若配置了 WG 出站，展示 endpoint、隧道内 IP 及通过 `mirage-rs wg-pubkey` 派生的本机公钥（隐藏私钥）。
   - WireGuard 密钥工具：`mirage-rs wg-keygen [--psk]` 生成公私钥对与 PSK，`mirage-rs wg-pubkey` 从私钥推导公钥。
 
@@ -390,6 +393,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.16.3** | 2026-10-29 | **无协议变更**: `install.sh` 修菜单 9 报错与 tcp-brutal 版本识别；部署可添加多个上游并逐条分流；WG 上游可导入 wgcf / wg-quick 配置文件；菜单 9 新增入口 → 出口绑定；安装脚本测试进 CI。 |
 | **v0.16.2** | 2026-10-28 | **无协议变更 (可单端升级)**: 纯服务端配置不再重复加载 geosite / geoip；非 mux UDP 经 WG 出口时解析结果会话内缓存 (隧道 DNS 不通不再拖住上行)；QUIC 口令错误首个请求即告警。 |
 | **v0.16.1** | 2026-10-27 | **无协议变更 (可单端升级)**: 客户端暖池建连失败指数退避 (1s→30s, 有请求等待时最快 2s 重试), 口令错误等持续失败时不再每秒数次握手打服务端, 失败日志限频。 |
 | **v0.16.0** | 2026-10-27 | **无协议变更 (可单端升级)**: **服务端出站路由** —— 顶层 `outbounds` (direct / block / Shadowsocks / WireGuard, 可多个) 与 `routing` 在服务端生效，支持「默认直连 + 规则分流到上游」与「默认走落地 + 规则拉回直连」两种模式、按用户分流；出站与路由热重载；`wg-keygen` / `wg-pubkey`；`install.sh` 菜单 9 升级为「管理服务端出口与路由」。 |

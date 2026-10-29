@@ -99,6 +99,18 @@ jobs:
     - name: XDP 极速 DNS — 收发改包 + BPF/用户态哈希一致 (端到端)
       run: sudo bash examples/verify_dns_xdp.sh
 
+  # install.sh 门禁: 语法 + UI / 配置改写辅助函数单测 (含"所有内嵌 python -c 段可编译"检查 ——
+  # v0.16.0 曾因 bash 单引号截断内嵌 python 让菜单 9 在用户机器上 SyntaxError, 而这套测试当时没进 CI)。
+  install-script:
+    name: 安装脚本 (install.sh)
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Syntax check
+      run: bash -n install.sh
+    - name: install.sh UI / helper tests
+      run: bash tests/install_ui_test.sh
+
   # 供应链门禁: 安全公告 (RUSTSEC) + 许可证 + 依赖来源。见 deny.toml。
   supply-chain:
     name: 供应链 (cargo-deny)
