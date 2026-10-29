@@ -203,6 +203,70 @@ JSON
     rm -rf "$d"
 }
 
+# ── B6: 内嵌 python 可编译 / brutal 版本 / wg 配置导入 / tag 去重 / 入口绑定 ──
+section_b6() {
+    echo "[B6] 安装脚本辅助函数"
+    # 内嵌在 bash 单引号里的 python 段: 按 bash 实际传入的内容截取, 必须能编译
+    # (代码里出现单引号会让 bash 提前截断字符串, 曾导致菜单 9 SyntaxError)
+    local bad
+    bad=$(python3 - "$INSTALL_SH" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+bad = []
+for m in re.finditer(r"python3 -c '", s):
+    st = m.end(); en = s.index("'", st)
+    try:
+        compile(s[st:en], "blk", "exec")
+    except SyntaxError as e:
+        bad.append("install.sh:%d %s" % (s[:st].count("\n") + 1, e.msg))
+print(";".join(bad))
+PY
+)
+    eq_ "B6.1  内嵌 python 段全部可编译" "$bad" ""
+
+    eq_ "B6.2  dkms 新格式取最高版本" \
+        "$(printf 'tcp-brutal/1.0.2, 5.10.0-45-amd64, x86_64: installed\ntcp-brutal/1.0.3, 5.10.0-45-amd64, x86_64: installed\n' | parse_dkms_brutal_version)" "1.0.3"
+    eq_ "B6.3  dkms 旧格式" "$(printf 'tcp-brutal, 1.0.3, 5.10.0, x86_64: installed\n' | parse_dkms_brutal_version)" "1.0.3"
+    eq_ "B6.4  未完成安装 (added) 不算" "$(printf 'tcp-brutal/1.0.3: added\n' | parse_dkms_brutal_version)" ""
+
+    local d; d=$(mktemp -d)
+    cat > "$d/wgcf.conf" <<'CONF'
+[Interface]
+PrivateKey = cDFhUkZpZ2pQbE1UZ0x0YktTQUpqV3hXWnRiQWdSOWE=
+Address = 2001:db8::2/128, 172.16.0.2/32
+DNS = 2001:db8::53, 192.0.2.53
+MTU = 1280
+[Peer]
+PublicKey = YlZ4cUxyTXZ4YXdYVXZsRWpZZ0NaT0lMZFJ1bW5jSmw=
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = engage.example.com:2408
+PersistentKeepalive = 25
+CONF
+    local ob
+    ob=$(wg_conf_to_outbound "$d/wgcf.conf")
+    eq_ "B6.5  wg 配置导入: 退出码 0" "$?" "0"
+    local got
+    got=$(python3 -c 'import json,sys; o=json.loads(sys.argv[1]); print(o["address"], o["dns"], o["mtu"], o["endpoint"], o["persistent_keepalive"], o["private_key"][-1])' "$ob")
+    eq_ "B6.6  取 IPv4 地址 / IPv4 DNS / MTU / 域名端点 / keepalive / 私钥保留 =" "$got" "172.16.0.2 192.0.2.53 1280 engage.example.com:2408 25 ="
+    grep -v '^Endpoint' "$d/wgcf.conf" > "$d/noep.conf"
+    wg_conf_to_outbound "$d/noep.conf" >/dev/null 2>&1
+    eq_ "B6.7  缺 Endpoint → 失败" "$?" "1"
+
+    eq_ "B6.8  unique_tag 不冲突原样" "$(unique_tag wg-up ss-up)" "wg-up"
+    eq_ "B6.9  unique_tag 冲突递增" "$(unique_tag wg-up wg-up wg-up-2)" "wg-up-3"
+    eq_ "B6.10 unique_tag 不取 direct" "$(unique_tag direct)" "direct-2"
+
+    local cfg="$d/srv.json"
+    printf '{ "inbounds": [ { "type": "mirage_server", "tag": "in-a" } ], "routing": { "default_outbound": "direct", "rules": [ { "domain_suffix": ["x.example"], "outbound": "direct" } ] } }\n' > "$cfg"
+    server_bind_inbound "$cfg" in-a wg-up >/dev/null
+    eq_ "B6.11 绑定前插到最前" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["routing"]["rules"][0])' "$cfg")" "{'inbound': ['in-a'], 'outbound': 'wg-up'}"
+    server_bind_inbound "$cfg" in-a ss-up >/dev/null
+    eq_ "B6.12 重复绑定替换而非叠加" "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["routing"]["rules"]; print(len(r), r[0]["outbound"])' "$cfg")" "2 ss-up"
+    server_bind_inbound "$cfg" in-a "" >/dev/null
+    eq_ "B6.13 解除绑定只删绑定规则" "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1]))["routing"]["rules"]; print(len(r), r[0]["outbound"])' "$cfg")" "1 direct"
+    rm -rf "$d"
+}
+
 echo "== install.sh UI 护甲 =="
 section_b3
 load_install
@@ -210,6 +274,7 @@ section_b1
 section_b2
 section_b4
 section_b5
+section_b6
 echo "----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
