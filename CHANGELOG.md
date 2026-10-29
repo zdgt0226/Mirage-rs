@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [v0.16.3] - 安装脚本修复与增强: 菜单 9 报错 / brutal 版本 / 多上游 / wgcf 导入 / 入口绑定 (2026-10-29)
+
+### 升级须知
+
+- **无协议变更, 二进制行为不变** (只改 `install.sh` 与 CI), 与 v0.15.x / v0.16.x 两端互通; Android 无需同步。
+- 用 v0.16.x 的 `install.sh` 进「管理服务端出口与路由」遇到 `SyntaxError: unterminated string literal` 的, 换本版脚本即可。
+- CI 新增「安装脚本」门禁: `bash -n install.sh` + `tests/install_ui_test.sh` (含所有内嵌 python 段可编译检查)。
+
 ### fix/feat(install): 菜单 9 报错 / brutal 版本识别 / 部署多上游 / 导入 wgcf 配置 / 入口绑定出口 (2026-10-29)
 
 - **修菜单 9 `SyntaxError: unterminated string literal`**: 「管理服务端出口与路由」显示规则时, 内嵌在 bash 单引号里的 python 用了含单引号的 f-string, bash 提前截断字符串, 只要配置里有路由规则就报错 (删除规则的列表同样)。`tests/install_ui_test.sh` 新增检查: 按 bash 实际传入的内容截取所有 `python3 -c '...'` 段逐段编译 (对旧脚本能抓到这两处)。
