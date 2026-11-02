@@ -87,7 +87,7 @@ ask_choice() {
     local n=${#options[@]} val
     _render_choice "$prompt" "${options[@]}"
     while :; do
-        read -rp "  选择 [1-$n] (默认 1): " val </dev/tty
+        read -rp "  选择 [1-$n]: " val </dev/tty
         val="${val:-1}"
         if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= n )); then
             echo "$val"
@@ -133,7 +133,7 @@ ask_port() {
         fi
         if (( HAVE_SS )) && port_in_use "$p" "$proto"; then
             warn "端口 $p/$proto 已被占用:"
-            echo "      $(port_holder "$p" "$proto" || echo '(无法查询占用进程)')" >&2
+            echo "    $(port_holder "$p" "$proto" || echo '(无法查询占用进程)')" >&2
             if ask_yn "仍然使用该端口? (冲突时服务无法启动)" n; then
                 echo "$p"; return
             fi
@@ -245,10 +245,10 @@ probe_camouflage() {
     out=$(timeout 10 openssl s_client -connect "${host}:${port}" -servername "$host" \
           -tls1_3 -no_ign_eof < /dev/null 2>&1 || true)
     if echo "$out" | grep -q "Protocol  : TLSv1.3"; then
-        ok "$host 支持 TLS 1.3，完美兼容。"
+        ok "$host 支持 TLS 1.3, 完美兼容。"
         return 0
     fi
-    warn "$host 不支持 TLS 1.3 或被墙阻断，强行使用可能导致被精准识别！"
+    warn "$host 不支持 TLS 1.3 或被墙阻断, 强行使用可能导致被精准识别！"
     return 1
 }
 
@@ -411,7 +411,7 @@ detect_public_ip() {
 }
 
 handle_brutal_optional() {
-    info "Brutal 是给单条连接定速的内核模块（Hysteria2 思路），极大地优化高丢包线路"
+    info "Brutal 是给单条连接定速的内核模块 (Hysteria2 思路), 极大地优化高丢包线路"
     local was_loaded=0 cur_ver=""
     if brutal_loaded; then
         was_loaded=1
@@ -421,7 +421,7 @@ handle_brutal_optional() {
             warn "当前加载的 brutal 模块不是磁盘上已安装的版本 (装了新版但未重新加载), 重启或执行 rmmod brutal && modprobe brutal 后生效"
         fi
         if [[ "$cur_ver" =~ ^1\. ]]; then
-            warn "当前为 v1.x 版本，无客户端分组限速 (多连接并发会叠加超发)"
+            warn "当前为 v1.x 版本, 无客户端分组限速 (多连接并发会叠加超发)"
         fi
         if ! ask_yn "是否更换 Brutal 版本?" n; then
             return 0
@@ -444,7 +444,7 @@ handle_brutal_optional() {
     case "$choice" in
         1)
             if ! version_ge "$kernel_ver" "5.10"; then
-                warn "本机内核 ${kernel_ver} 低于 5.10 不支持 v2，自动改用 ${BRUTAL_V1_VERSION}"
+                warn "本机内核 ${kernel_ver} 低于 5.10 不支持 v2, 自动改用 ${BRUTAL_V1_VERSION}"
                 choice=2
             fi
             ;;
@@ -455,7 +455,7 @@ handle_brutal_optional() {
                 info "保持当前已加载的 Brutal (版本: ${cur_ver})"
                 return 0
             fi
-            info "已跳过 Brutal 安装，将使用系统默认拥塞控制 (BBR)"
+            info "已跳过 Brutal 安装, 将使用系统默认拥塞控制 (BBR)"
             return 1
             ;;
     esac
@@ -477,7 +477,7 @@ handle_brutal_optional() {
     info "下载官方一键脚本到临时文件..."
     if ! curl -fsSL https://tcp.hy2.sh/ -o "$script_file"; then
         rm -f "$script_file"
-        warn "安装脚本下载失败，请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
+        warn "安装脚本下载失败, 请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
         return 1
     fi
 
@@ -487,13 +487,13 @@ handle_brutal_optional() {
 
     if [[ ! -t 0 && ! -t 1 ]] || [[ ! -r /dev/tty ]] || [[ -n "${NONINTERACTIVE:-}" ]] || [[ "${DEBIAN_FRONTEND:-}" == "noninteractive" ]]; then
         rm -f "$script_file"
-        warn "非交互模式下拒绝执行外部脚本，跳过 Brutal 安装。"
+        warn "非交互模式下拒绝执行外部脚本, 跳过 Brutal 安装。"
         return 1
     fi
 
     if ! ask_yn "是否确认执行上述 Brutal 安装脚本?" n; then
         rm -f "$script_file"
-        info "已取消执行安装脚本，跳过 Brutal 安装。"
+        info "已取消执行安装脚本, 跳过 Brutal 安装。"
         return 1
     fi
 
@@ -516,10 +516,10 @@ handle_brutal_optional() {
             fi
             return 0
         else
-            warn "安装完成但未检测到 brutal，可能是内核不兼容或需要重启。"
+            warn "安装完成但未检测到 brutal, 可能是内核不兼容或需要重启。"
         fi
     else
-        warn "安装脚本执行失败，请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
+        warn "安装脚本执行失败, 请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
     fi
     return 1
 }
@@ -787,7 +787,7 @@ fetch_release_binary() {
         info "下载最新版本: $download_url"
     fi
     if ! curl -# -fLo "$dest" "$download_url"; then
-        warn "从 GitHub Releases 下载失败，请检查网络或手动下载编译。"
+        warn "从 GitHub Releases 下载失败, 请检查网络或手动下载编译。"
         return 1
     fi
     verify_binary_integrity "$dest" "$download_url"
@@ -908,7 +908,7 @@ migrate_parallel_v15() {
     info "下载新版本二进制 (${rv:-最新版})..."
     if ! fetch_release_binary "$tmp_bin"; then
         rm -f "$tmp_bin"
-        err "下载失败，老版本服务未受任何影响。"
+        err "下载失败, 老版本服务未受任何影响。"
     fi
     chmod 755 "$tmp_bin"
     mv -f "$tmp_bin" "$new_bin"
@@ -959,7 +959,7 @@ except Exception:
         chmod 600 "$new_cfg"
         ok "新版本配置已创建: ${new_cfg}"
     else
-        warn "未找到老版本配置，请使用新端口手动配置 ${new_cfg}"
+        warn "未找到老版本配置, 请使用新端口手动配置 ${new_cfg}"
     fi
 
     local subcmd="server"
@@ -1078,7 +1078,7 @@ EOF
             service mirage-rs-server-v15 start 2>/dev/null || "$init_path" start 2>/dev/null || true
             ;;
         *)
-            info "未识别 init 系统，可前台运行: ${new_bin} ${subcmd} -c ${new_cfg}"
+            info "未识别 init 系统, 可前台运行: ${new_bin} ${subcmd} -c ${new_cfg}"
             ;;
     esac
 
@@ -1100,16 +1100,16 @@ EOF
 EOM
     case "$INIT_SYS" in
         systemd)
-            echo "         systemctl stop ${old_svc_name} && systemctl disable ${old_svc_name}" >&2
+            echo "       systemctl stop ${old_svc_name} && systemctl disable ${old_svc_name}" >&2
             ;;
         openrc)
-            echo "         rc-service ${old_svc_name} stop && rc-update del ${old_svc_name} default" >&2
+            echo "       rc-service ${old_svc_name} stop && rc-update del ${old_svc_name} default" >&2
             ;;
         sysvinit)
-            echo "         service ${old_svc_name} stop && chkconfig ${old_svc_name} off" >&2
+            echo "       service ${old_svc_name} stop && chkconfig ${old_svc_name} off" >&2
             ;;
         *)
-            echo "         killall mirage-rs" >&2
+            echo "       killall mirage-rs" >&2
             ;;
     esac
     cat >&2 <<'EOM'
@@ -1162,17 +1162,17 @@ update_binary() {
 
     # 检测从 < v0.15.0 升级到 ≥ v0.15.0 的协议断代升级 (本机 < v0.15.0 且目标未知或目标 ≥ v0.15.0)
     if [[ -n "$lv" ]] && ! version_ge "${lv#v}" "0.15.0" && { [[ -z "$rv" ]] || version_ge "${rv#v}" "0.15.0"; }; then
-        warn "⚠️ 检测到本机已安装的 mirage 版本 ($lv) < v0.15.0"
-        warn "协议不兼容，所有客户端（含 Android）必须同步升级到 ≥ v0.15"
+        warn "本机已安装的 mirage 版本 ($lv) < v0.15.0"
+        warn "协议不兼容, 所有客户端 (含 Android) 必须同步升级到 ≥ v0.15"
         if [[ -t 0 || -t 1 ]] && [[ -r /dev/tty ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ "${DEBIAN_FRONTEND:-}" != "noninteractive" ]]; then
             local mig_choice
-            mig_choice=$(ask_choice "检测到老版本升级，请选择升级方案" \
-                "原地升级 (继续现有流程，停用老服务并替换)" \
-                "并行迁移 (新版装到另一端口，老服务保持运行)" \
+            mig_choice=$(ask_choice "检测到老版本升级, 请选择升级方案" \
+                "原地升级 (继续现有流程, 停用老服务并替换)" \
+                "并行迁移 (新版装到另一端口, 老服务保持运行)" \
                 "取消更新")
             case "$mig_choice" in
                 1)
-                    info "选择原地升级，继续现有流程..."
+                    info "选择原地升级, 继续现有流程..."
                     ;;
                 2)
                     migrate_parallel_v15 "$lv" "$rv"
@@ -1274,7 +1274,7 @@ except Exception:
                     echo "      Endpoint:       $(_c 36 "$w_ep")" >&2
                     echo "      隧道内地址:     $(_c 36 "$w_addr")" >&2
                     echo "      本机公钥:       $(_c 32 "$w_pub")" >&2
-                    echo "      (提示: 私钥已保密隐藏，请将上述本机公钥登记至对端 WG peer 列表)" >&2
+                    echo "      (提示: 私钥已保密隐藏, 请将上述本机公钥登记至对端 WG peer 列表)" >&2
                 done <<< "$wg_out_lines"
                 echo >&2
             fi
@@ -1290,7 +1290,7 @@ except Exception:
     fi
 
     if [[ -n "$node_uri" ]]; then
-        title "客户端节点导入串 (复制到客户端)"
+        section "客户端节点导入串 (复制到客户端)"
         echo "  $(_c 32 "$node_uri")" >&2
         echo >&2
         if command -v qrencode >/dev/null 2>&1; then
@@ -1314,13 +1314,13 @@ setup_fhs() {
     # 服务端完全不需要安装 clang/llvm 或 cargo。
     
     if [ -f "mirage" ]; then
-        info "检测到本地当前目录存在 mirage 可执行文件，直接拷贝。"
+        info "检测到本地当前目录存在 mirage 可执行文件, 直接拷贝。"
         cp mirage "$BIN_PATH"
     elif [ -f "target/release/mirage" ]; then
-        info "检测到本地存在编译产物，直接拷贝。"
+        info "检测到本地存在编译产物, 直接拷贝。"
         cp target/release/mirage "$BIN_PATH"
     else
-        info "本地未找到可执行文件，准备从 GitHub 拉取预编译产物..."
+        info "本地未找到可执行文件, 准备从 GitHub 拉取预编译产物..."
         if ! fetch_release_binary "$BIN_PATH"; then
             touch "$BIN_PATH" # Placeholder for sandbox/development fallback
         fi
@@ -1817,7 +1817,7 @@ EOM
             wg_local_pub=$(echo "$kp" | cut -f2)
             ok "已自动生成 WireGuard 密钥对"
         else
-            warn "未找到 mirage wg-keygen 或 wg 工具，请手动输入私钥"
+            warn "未找到 mirage wg-keygen 或 wg 工具, 请手动输入私钥"
             wg_priv=$(ask "本机私钥 (base64)" "")
             [[ -n "$wg_priv" ]] && wg_local_pub=$(derive_wg_pubkey "$wg_priv")
         fi
@@ -2188,7 +2188,7 @@ edit_server_upstream() {
         cfg="${cfgs[0]}"
     else
         local choice
-        choice=$(ask_choice "检测到多个服务端配置，请选择要修改的配置" "${cfgs[@]}")
+        choice=$(ask_choice "检测到多个服务端配置, 请选择要修改的配置" "${cfgs[@]}")
         cfg="${cfgs[$((choice - 1))]}"
     fi
     local is_lite=false
@@ -2419,7 +2419,7 @@ print("\n".join(tags))
                local val
                val=$(ask "匹配值 (多个值逗号隔开)" "")
                if [[ -z "$val" ]]; then
-                   warn "未填匹配值，取消添加规则。"
+                   warn "未填匹配值, 取消添加规则。"
                    continue
                fi
                local all_tags
@@ -2510,7 +2510,7 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                fi
                ok "已将 ${mig_n} 个入站的旧 upstream 迁移为独立出站 + 按入站的分流规则, 默认出站不变 (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   warn "由于修改了入站级字段 (移除了入站 upstream)，需要重启服务才能生效。"
+                   warn "由于修改了入站级字段 (移除了入站 upstream), 需要重启服务才能生效。"
                    if ask_yn "立即重启 $(svc_name server) 使其生效?" y; then
                        svc_ctl restart server
                        ok "已重启 $(svc_name server)"
@@ -2595,7 +2595,7 @@ EOM
 
     # 前向保密 (PFS): opt-in, 客户端必须同样开启。
     local pfs_line=""
-    if ask_yn "开启前向保密 PFS? (口令泄露也解不了已录流量; 客户端须同样开启)" n; then
+    if ask_yn "开启前向保密 PFS? (客户端须同样开启)" n; then
         pfs_line=",
     \"pfs\": true"
         info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
@@ -2627,13 +2627,19 @@ EOF
         node_uri=$(build_node_uri "$pwd" "$pub_host" "$port" "$sni")
         echo "$node_uri" > "${ETC_DIR}/node-export.txt"
         chmod 600 "${ETC_DIR}/node-export.txt"
-        title "客户端节点导入串"
+        section "客户端节点导入串"
         echo "  $(_c 32 "$node_uri")" >&2
         echo "  已保存到: ${ETC_DIR}/node-export.txt (chmod 600), 内含密码请妥善保管。" >&2
         command -v qrencode >/dev/null 2>&1 && { echo >&2; qrencode -t UTF8 "$node_uri" >&2; }
         echo >&2
     fi
-    info "启动命令: $(svc_start_hint server)"
+}
+
+# 同机部署: 服务端刚导出的节点串 (node-export.txt) 作为客户端导入的默认值, 回车即复用
+local_node_uri() {
+    [[ -f "${ETC_DIR}/node-export.txt" ]] || return 0
+    info "检测到本机刚生成的节点串, 输入时直接回车即可复用。"
+    cat "${ETC_DIR}/node-export.txt"
 }
 
 config_lite_client() {
@@ -2643,11 +2649,12 @@ config_lite_client() {
   仅 TCP: QUIC 会自动回落 TCP, 依赖 UDP 的应用不可用 (需要请用完整版)。
 EOM
     # 支持粘贴服务端导出的 mirage:// 串, 免得手抄密码/SNI 出错
-    local server server_port pwd sni
+    local server server_port pwd sni local_node_default
+    local_node_default=$(local_node_uri)
     if ask_yn "是否粘贴服务端的 mirage:// 节点串导入?" y; then
         local uri
         while :; do
-            uri=$(ask "粘贴 mirage:// 节点串" "")
+            uri=$(ask "粘贴 mirage:// 节点串" "$local_node_default")
             if parse_node_uri "$uri"; then
                 server="$NODE_HOST"; server_port="$NODE_PORT"
                 pwd="$NODE_PWD";     sni="$NODE_SNI"
@@ -2707,7 +2714,6 @@ EOF
     ok "轻量客户端配置已保存至: ${ETC_DIR}/lite_client.json"
 
     setup_service "client"
-    info "启动命令: $(svc_start_hint client)"
     info "使用方式: 把浏览器/系统代理指向 SOCKS5 ${listen}:${lport}"
 }
 
@@ -2865,7 +2871,7 @@ EOM
 
     # 前向保密 (PFS): opt-in, 两端必须一致。开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
     local pfs_line=""
-    if ask_yn "开启前向保密 PFS? (口令泄露也解不了已录流量; 客户端须同样开启)" n; then
+    if ask_yn "开启前向保密 PFS? (客户端须同样开启)" n; then
         pfs_line=",
             \"pfs\": true"
         info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
@@ -2940,7 +2946,7 @@ EOF
         echo "$node_uri" > "${ETC_DIR}/node-export.txt"
         chmod 600 "${ETC_DIR}/node-export.txt"
 
-        title "客户端节点导入串"
+        section "客户端节点导入串"
         echo "  $(_c 32 "$node_uri")" >&2
         echo >&2
         echo "  已保存到: ${ETC_DIR}/node-export.txt (chmod 600)" >&2
@@ -2952,7 +2958,6 @@ EOF
         echo >&2
     fi
 
-    info "启动服务端: $(svc_start_hint server)"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2970,7 +2975,7 @@ _ask_rule() {
         1) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"direct\"}") ;;
         2) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"proxy\"}") ;;
         3) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"block\"}") ;;
-        *) warn "无效输入 '$v'，跳过 $label"; ;;
+        *) warn "无效输入 '$v', 跳过 $label"; ;;
     esac
 }
 
@@ -2980,7 +2985,7 @@ ask_route_advanced() {
     ROUTE_ADV_RULES=()
     # 内网总是 direct（必须）
     ROUTE_ADV_RULES+=('                {"ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outbound": "direct"}')
-    info "（内网 / 保留地址已固定 direct，不可关）"
+    info "(内网 / 保留地址已固定 direct, 不可关)"
 
     _ask_rule "广告 (category-ads-all)"          "geosite" "category-ads-all"   "3"
     _ask_rule "国内域名 (geosite:cn)"            "geosite" "cn"                  "1"
@@ -3000,7 +3005,7 @@ ask_route_advanced() {
         1) ROUTE_ADV_DEFAULT="direct" ;;
         *) ROUTE_ADV_DEFAULT="proxy" ;;
     esac
-    info "已配 $(( ${#ROUTE_ADV_RULES[@]} )) 条规则，默认出口：$ROUTE_ADV_DEFAULT"
+    info "已配 $(( ${#ROUTE_ADV_RULES[@]} )) 条规则, 默认出口: $ROUTE_ADV_DEFAULT"
 }
 
 config_client() {
@@ -3009,11 +3014,8 @@ config_client() {
     local srv_host srv_port pwd sni
 
     # ── 节点导入: 优先粘贴 URI ──
-    local local_node_default=""
-    if [[ -f "${ETC_DIR}/node-export.txt" ]]; then
-        local_node_default=$(cat "${ETC_DIR}/node-export.txt")
-        info "检测到本机刚生成的节点串, 输入时直接回车即可复用."
-    fi
+    local local_node_default
+    local_node_default=$(local_node_uri)
 
     local source
     source=$(ask_choice "节点参数获取方式" \
@@ -3041,7 +3043,11 @@ config_client() {
     fi
 
     if [[ "$source" == "2" ]]; then
-        srv_host=$(ask "服务端 IP 或域名" "1.2.3.4")
+        srv_host=""
+        while [[ -z "$srv_host" ]]; do
+            srv_host=$(ask "服务端 IP 或域名" "")
+            [[ -z "$srv_host" ]] && warn "服务端地址不能为空"
+        done
         srv_port=$(ask "服务端端口" "443")
         pwd=$(ask "认证密码" "")
         sni=$(ask_camouflage_host "www.apple.com")
@@ -3171,7 +3177,7 @@ config_client() {
     fi
 
     local pool_size
-    pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
+    pool_size=$(ask "并发连接池大小 (越大速度越快, 推荐 50)" "50")
 
     # UDP 多路复用: 多条透明 UDP 流复用少量共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"的带机量硬伤
     # (真机实测并发天花板 20→450+)。默认开 —— 需服务端同版本 (老服务端不认 mux, 那些 UDP 流回落 TCP)。
@@ -3185,7 +3191,7 @@ config_client() {
         "国内直连 / 局域网直连, 其余走代理 (经典中国分流, 推荐)" \
         "全部流量走代理 (全局代理)" \
         "自定义分流 (交互选配常用 Geo Tag 去向)" \
-        "留空规则, 全部走默认出口")
+        "不设规则 (含局域网, 全部走代理)")
         
     local routing_json=""
     case $routing_preset in
@@ -3351,7 +3357,6 @@ EOF
     chmod 600 "${ETC_DIR}/config_client.json"
 
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
-    [[ -z "$cht_line" ]] && info "提示: 可用 mirage tls-capture 抓本机浏览器指纹, 填入 client_hello_template"
     setup_service "client"
 
     # ── 部署汇总 ── 一屏看清关键信息, 免得用户回翻日志找端口/地址
@@ -3363,16 +3368,14 @@ EOF
         gui_url="http://${gui_host}:${gui_port}"
         [[ -n "$client_gui_token" && "$client_gui_token" != "-" ]] && gui_url="${gui_url}/?token=${client_gui_token}"
     fi
-    title "客户端部署完成"
+    section "客户端信息"
     echo -e "  代理入站:   $(_c 36 "${inbound_listen}:${inbound_port}") (mixed: SOCKS5/HTTP)" >&2
     echo -e "  Web 看板:   $(_c 36 "${gui_url}") (Mirage Console)" >&2
     echo -e "  配置文件:   $(_c 36 "${ETC_DIR}/config_client.json")" >&2
-    echo -e "  日志目录:   $(_c 36 "${LOG_DIR}")" >&2
-    echo -e "  日志命令:   $(_c 36 "$(svc_log_hint client)")" >&2
-    echo -e "  启动命令:   $(_c 36 "$(svc_start_hint client)")" >&2
     if [[ "$client_gui_enabled" == "true" ]]; then
-        echo -e "  $(_c 33 "提示"): 按设备限速 / 用户策略 (不同设备走不同规则) 在 Web 看板 Admin 区管理 —— 无需改配置文件。" >&2
+        echo "  $(_c 2 "按设备限速 / 用户策略可在 Web 看板 Admin 区管理, 无需改配置文件。")" >&2
     fi
+    [[ -z "$cht_line" ]] && echo "  $(_c 2 "可用 mirage tls-capture 抓本机浏览器指纹, 填入 client_hello_template。")" >&2
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3506,10 +3509,9 @@ EOF
 
     # ⑤ LAN 侧指引 (这步在你的路由器/设备上做)
     local lan_ip; lan_ip=$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1 | cut -d/ -f1)
-    echo >&2
-    title "还需在 LAN 侧配置 (路由器/设备上)"
+    section "还需在 LAN 侧配置 (路由器 / 设备上)"
     echo "  把 LAN 设备的【默认网关】和【DNS】都指向本机: ${lan_ip:-<本机_LAN_IP>}" >&2
-    echo "  ⚠️ DNS 必须指过来才能拿到 fake-IP; 不指则所有流量都当直连、不走代理。" >&2
+    warn "DNS 必须指向本机才能拿到 fake-IP, 否则所有流量都当直连、不走代理"
     echo >&2
 }
 
@@ -3555,6 +3557,10 @@ teardown_transparent_gateway() {
 
 uninstall() {
     title "Mirage-rs 卸载"
+    note <<'EOM'
+  将停止并删除所有 Mirage-rs 服务与二进制; 配置 / 日志目录稍后逐项询问是否保留。
+EOM
+    ask_yn "确认卸载?" n || { info "已取消。"; return 0; }
 
     # 兼容两种命名: 新 (mirage-rs-*) + 旧 (mirage-*, alpha.8 之前的旧机器)
     # 必须涵盖**所有历史与当前**的服务名: 完整版 / 轻量版 / 更早的 mirage-* 旧名。
@@ -3824,7 +3830,7 @@ edit_config_interactive() {
         target_cfg="${cfgs[0]}"
     else
         local choice
-        choice=$(ask_choice "检测到多个配置文件，请选择要修改的配置" "${cfgs[@]}")
+        choice=$(ask_choice "检测到多个配置文件, 请选择要修改的配置" "${cfgs[@]}")
         target_cfg="${cfgs[$((choice - 1))]}"
     fi
 
@@ -3844,7 +3850,7 @@ main() {
 
     # 探测 init 系统 (systemd / openrc / none), 供服务注册 + 提示分派.
     INIT_SYS=$(detect_init)
-    info "检测到 init 系统: ${INIT_SYS}"
+    [[ "$INIT_SYS" == systemd ]] || info "检测到 init 系统: ${INIT_SYS}"
     if [ "$INIT_SYS" = none ]; then
         warn "未检测到 systemd / OpenRC / SysV init, 服务将不会自动注册 (可手动前台运行)。"
     fi
@@ -3874,7 +3880,7 @@ main() {
     section_box "部署形态" <<'EOM'
   完整版: 分流 + fake-IP DNS + 透明网关 (可选) + Web 看板 + UDP, 配置项较多。
   轻量版: 本机 SOCKS5 全部走隧道, 仅 TCP, 填三五项即可用。
-  两者协议互通。拿不准选完整版。
+  两者协议互通。
 EOM
     local form
     form=$(ask_choice "选择部署形态" "完整版" "轻量版")
@@ -3913,11 +3919,23 @@ EOM
             ;;
     esac
 
-    title "安装完成！"
-    echo -e "  配置目录: $(_c 36 "${ETC_DIR}")"
-    echo -e "  数据目录: $(_c 36 "${STATE_DIR}")"
-    echo -e "  日志命令: $(_c 36 "$(svc_log_hint server)")"
-    echo -e "\n  感谢使用 Mirage-rs，极致性能尽在掌握。"
+    title "安装完成"
+    local roles=()
+    case $mode in
+        1) roles=(server) ;;
+        2) roles=(client) ;;
+        3) roles=(server client) ;;
+    esac
+    echo "  配置目录: $(_c 36 "${ETC_DIR}")" >&2
+    echo "  数据目录: $(_c 36 "${STATE_DIR}")" >&2
+    local r label
+    for r in "${roles[@]}"; do
+        label="服务端"; [[ "$r" == client ]] && label="客户端"
+        echo "  ${label}启动: $(_c 36 "$(svc_start_hint "$r")")" >&2
+        echo "  ${label}日志: $(_c 36 "$(svc_log_hint "$r")")" >&2
+    done
+    echo >&2
+    echo "  感谢使用 Mirage-rs, 极致性能尽在掌握。" >&2
 }
 
 # source-guard: 直接执行 (`bash install.sh`) 时跑 main; 被 `source` 时不自动跑,
