@@ -20,31 +20,50 @@ info()  { echo "$(_c 36 "[*]") $*" >&2; }
 ok()    { echo "$(_c 32 "[✓]") $*" >&2; }
 warn()  { echo "$(_c 33 "[!]") $*" >&2; }
 err()   { echo "$(_c 31 "[✗]") $*" >&2; exit 1; }
+UI_WIDTH=56
+_rule() { # char [count]
+    local n=${2:-$UI_WIDTH} out=""
+    while (( n-- > 0 )); do out+=$1; done
+    printf "%s" "$out"
+}
+# 主步骤标题: 上下两条 ═ 线, 加粗品红
 title() {
-    local line; line=$(printf '═%.0s' {1..56})
-    printf "\n\033[1;35m%s\n  %s\n%s\033[0m\n\n" "$line" "$*" "$line" >&2
+    local line; line=$(_rule '═')
+    printf "\n%s\n" "$(_c '1;35' "$line
+  $*
+$line")" >&2
+    echo >&2
 }
 
+# 子步骤标题: 一条 ── 线带标题, 不另起框
+section() {
+    printf "\n%s\n" "$(_c '1;36' "── $* $(_rule '─' 12)")" >&2
+}
+
+# 说明文字 (stdin): 暗色, 与提问区分开; 用于选项前的简短背景说明
+note() {
+    local l
+    while IFS= read -r l; do echo "$(_c 2 "$l")" >&2; done
+}
+
+# 子步骤 + 说明 (stdin) 一起输出
 section_box() {
-    local box_title=$1
-    local line; line=$(printf '═%.0s' {1..51})
-    printf "\n%s\n  %s\n%s\n" "$line" "$box_title" "$line" >&2
-    cat >&2
-    printf "%s\n" "$line" >&2
+    section "$1"
+    note
 }
 
 ask() {
     local prompt=$1 default=${2:-} val
     local hint=""
     [[ -n "$default" ]] && hint=" [$default]"
-    read -rp "    ${prompt}${hint}: " val </dev/tty
+    read -rp "  ${prompt}${hint}: " val </dev/tty
     echo "${val:-$default}"
 }
 
 ask_yn() {
     local prompt=$1 default=${2:-y} hint val
     hint=$( [[ "$default" == y ]] && echo "Y/n" || echo "y/N" )
-    read -rp "    ${prompt} (${hint}): " val </dev/tty
+    read -rp "  ${prompt} (${hint}): " val </dev/tty
     val="${val:-$default}"
     [[ "$val" =~ ^[Yy] ]]
 }
@@ -55,10 +74,10 @@ _render_choice() {
     local prompt=$1; shift
     local options=("$@")
     local n=${#options[@]} i mark
-    echo "    $prompt" >&2
+    echo "  $prompt" >&2
     for ((i = 0; i < n; i++)); do
         mark=""; (( i == 0 )) && mark=" (默认)"
-        printf "      %d) %s%s\n" $((i + 1)) "${options[$i]}" "$mark" >&2
+        printf "    %d) %s%s\n" $((i + 1)) "${options[$i]}" "$mark" >&2
     done
 }
 
@@ -68,13 +87,13 @@ ask_choice() {
     local n=${#options[@]} val
     _render_choice "$prompt" "${options[@]}"
     while :; do
-        read -rp "    选择 [1-$n] (默认 1): " val </dev/tty
+        read -rp "  选择 [1-$n]: " val </dev/tty
         val="${val:-1}"
         if [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= n )); then
             echo "$val"
             return
         fi
-        echo "    无效输入。" >&2
+        echo "  无效输入, 请输入 1-$n。" >&2
     done
 }
 
@@ -114,7 +133,7 @@ ask_port() {
         fi
         if (( HAVE_SS )) && port_in_use "$p" "$proto"; then
             warn "端口 $p/$proto 已被占用:"
-            echo "      $(port_holder "$p" "$proto" || echo '(无法查询占用进程)')" >&2
+            echo "    $(port_holder "$p" "$proto" || echo '(无法查询占用进程)')" >&2
             if ask_yn "仍然使用该端口? (冲突时服务无法启动)" n; then
                 echo "$p"; return
             fi
@@ -139,7 +158,7 @@ ask_gui() {
     fi
     local scope listen_addr token="-"
     scope=$(ask_choice "GUI 监听范围" \
-        "仅本机 127.0.0.1 (推荐)" \
+        "仅本机 127.0.0.1" \
         "全网开放 0.0.0.0 (LAN/远程访问)")
     case "$scope" in
         1) listen_addr="127.0.0.1" ;;
@@ -226,17 +245,17 @@ probe_camouflage() {
     out=$(timeout 10 openssl s_client -connect "${host}:${port}" -servername "$host" \
           -tls1_3 -no_ign_eof < /dev/null 2>&1 || true)
     if echo "$out" | grep -q "Protocol  : TLSv1.3"; then
-        ok "$host 支持 TLS 1.3，完美兼容。"
+        ok "$host 支持 TLS 1.3, 完美兼容。"
         return 0
     fi
-    warn "$host 不支持 TLS 1.3 或被墙阻断，强行使用可能导致被精准识别！"
+    warn "$host 不支持 TLS 1.3 或被墙阻断, 强行使用可能导致被精准识别！"
     return 1
 }
 
 ask_camouflage_host() {
     local default=${1:-www.apple.com} val
     while :; do
-        val=$(ask "请输入伪装 SNI 域名（用于防御 Active Probing）" "$default")
+        val=$(ask "伪装 SNI 域名" "$default")
         if probe_camouflage "$val"; then
             echo "$val"
             return
@@ -279,11 +298,10 @@ suggest_camouflage_host() {
 
     # 搜索范围。默认只扫 RIPEstat 给出的通告前缀 (通常 /24); 候选太少时可按掩码扩大 ——
     # 扩出去的段会逐个校验 ASN 归属, 同 ASN 的仍算合格 (跨 ASN 的会被降权标注)。
-    cat >&2 <<'EOM'
+    note <<'EOM'
 
-  搜索范围: 默认只扫本机所在的通告前缀 (通常 /24, 约 256 个地址)。
-  若候选太少, 可按子网掩码扩大 —— 同一家机房常在相邻网段还有别的前缀,
-  它们仍属同一 ASN, 照样满足 SNI/IP 一致性。代价是耗时成倍增加。
+  默认只扫本机所在前缀 (通常 /24)。候选太少可扩大掩码:
+  相邻网段仍属同一 ASN, 照样可用, 但耗时成倍增加。
 EOM
     local range
     range=$(ask_choice "搜索范围" \
@@ -393,7 +411,7 @@ detect_public_ip() {
 }
 
 handle_brutal_optional() {
-    info "Brutal 是给单条连接定速的内核模块（Hysteria2 思路），极大地优化高丢包线路"
+    info "Brutal 是给单条连接定速的内核模块 (Hysteria2 思路), 极大地优化高丢包线路"
     local was_loaded=0 cur_ver=""
     if brutal_loaded; then
         was_loaded=1
@@ -403,7 +421,7 @@ handle_brutal_optional() {
             warn "当前加载的 brutal 模块不是磁盘上已安装的版本 (装了新版但未重新加载), 重启或执行 rmmod brutal && modprobe brutal 后生效"
         fi
         if [[ "$cur_ver" =~ ^1\. ]]; then
-            warn "当前为 v1.x 版本，无客户端分组限速 (多连接并发会叠加超发)"
+            warn "当前为 v1.x 版本, 无客户端分组限速 (多连接并发会叠加超发)"
         fi
         if ! ask_yn "是否更换 Brutal 版本?" n; then
             return 0
@@ -426,7 +444,7 @@ handle_brutal_optional() {
     case "$choice" in
         1)
             if ! version_ge "$kernel_ver" "5.10"; then
-                warn "本机内核 ${kernel_ver} 低于 5.10 不支持 v2，自动改用 ${BRUTAL_V1_VERSION}"
+                warn "本机内核 ${kernel_ver} 低于 5.10 不支持 v2, 自动改用 ${BRUTAL_V1_VERSION}"
                 choice=2
             fi
             ;;
@@ -437,7 +455,7 @@ handle_brutal_optional() {
                 info "保持当前已加载的 Brutal (版本: ${cur_ver})"
                 return 0
             fi
-            info "已跳过 Brutal 安装，将使用系统默认拥塞控制 (BBR)"
+            info "已跳过 Brutal 安装, 将使用系统默认拥塞控制 (BBR)"
             return 1
             ;;
     esac
@@ -459,7 +477,7 @@ handle_brutal_optional() {
     info "下载官方一键脚本到临时文件..."
     if ! curl -fsSL https://tcp.hy2.sh/ -o "$script_file"; then
         rm -f "$script_file"
-        warn "安装脚本下载失败，请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
+        warn "安装脚本下载失败, 请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
         return 1
     fi
 
@@ -469,13 +487,13 @@ handle_brutal_optional() {
 
     if [[ ! -t 0 && ! -t 1 ]] || [[ ! -r /dev/tty ]] || [[ -n "${NONINTERACTIVE:-}" ]] || [[ "${DEBIAN_FRONTEND:-}" == "noninteractive" ]]; then
         rm -f "$script_file"
-        warn "非交互模式下拒绝执行外部脚本，跳过 Brutal 安装。"
+        warn "非交互模式下拒绝执行外部脚本, 跳过 Brutal 安装。"
         return 1
     fi
 
     if ! ask_yn "是否确认执行上述 Brutal 安装脚本?" n; then
         rm -f "$script_file"
-        info "已取消执行安装脚本，跳过 Brutal 安装。"
+        info "已取消执行安装脚本, 跳过 Brutal 安装。"
         return 1
     fi
 
@@ -498,10 +516,10 @@ handle_brutal_optional() {
             fi
             return 0
         else
-            warn "安装完成但未检测到 brutal，可能是内核不兼容或需要重启。"
+            warn "安装完成但未检测到 brutal, 可能是内核不兼容或需要重启。"
         fi
     else
-        warn "安装脚本执行失败，请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
+        warn "安装脚本执行失败, 请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
     fi
     return 1
 }
@@ -769,7 +787,7 @@ fetch_release_binary() {
         info "下载最新版本: $download_url"
     fi
     if ! curl -# -fLo "$dest" "$download_url"; then
-        warn "从 GitHub Releases 下载失败，请检查网络或手动下载编译。"
+        warn "从 GitHub Releases 下载失败, 请检查网络或手动下载编译。"
         return 1
     fi
     verify_binary_integrity "$dest" "$download_url"
@@ -890,7 +908,7 @@ migrate_parallel_v15() {
     info "下载新版本二进制 (${rv:-最新版})..."
     if ! fetch_release_binary "$tmp_bin"; then
         rm -f "$tmp_bin"
-        err "下载失败，老版本服务未受任何影响。"
+        err "下载失败, 老版本服务未受任何影响。"
     fi
     chmod 755 "$tmp_bin"
     mv -f "$tmp_bin" "$new_bin"
@@ -941,7 +959,7 @@ except Exception:
         chmod 600 "$new_cfg"
         ok "新版本配置已创建: ${new_cfg}"
     else
-        warn "未找到老版本配置，请使用新端口手动配置 ${new_cfg}"
+        warn "未找到老版本配置, 请使用新端口手动配置 ${new_cfg}"
     fi
 
     local subcmd="server"
@@ -1060,7 +1078,7 @@ EOF
             service mirage-rs-server-v15 start 2>/dev/null || "$init_path" start 2>/dev/null || true
             ;;
         *)
-            info "未识别 init 系统，可前台运行: ${new_bin} ${subcmd} -c ${new_cfg}"
+            info "未识别 init 系统, 可前台运行: ${new_bin} ${subcmd} -c ${new_cfg}"
             ;;
     esac
 
@@ -1069,25 +1087,16 @@ EOF
     warn "请在防火墙 / 云安全组放行新端口: ${new_port} (TCP；用 QUIC 传输时还需 UDP)"
 
     # 打印迁移步骤与停老服务命令
-    title "🎉 并行迁移部署完成"
+    title "并行迁移部署完成"
     cat >&2 <<EOM
-  ======================================================================
-  已完成新版本并行部署！当前服务状态：
-    - 老版本服务: 端口 ${old_port} (保持运行，现有客户端不受影响)
-    - 新版本服务: 端口 ${new_port} (已启动，供 ≥ v0.15 客户端接入)
+  老版本: 端口 ${old_port}  保持运行, 现有客户端不受影响
+  新版本: 端口 ${new_port}  已启动, 供 ≥ v0.15 客户端接入
 
-  【防火墙 / 云安全组配置】
-  请在防火墙 / 云安全组放行新端口 ${new_port}（TCP；用 QUIC 传输时还需 UDP）。
-
-  【平滑迁移步骤】
-  1. 升级客户端：
-     将所有客户端（PC、网关及 Android App）升级至最新版 (≥ v0.15)。
-  2. 切换连接端口：
-     将客户端节点配置中的连接端口修改为新端口: ${new_port}。
-  3. 逐台验证：
-     确认所有客户端在新端口上连接与转发正常。
-  4. 停用老版本服务：
-     全部客户端换新完毕后，执行以下命令停用并禁用老版本服务：
+  迁移步骤:
+    1. 防火墙 / 云安全组放行 ${new_port} (TCP; 用 QUIC 时还需 UDP)
+    2. 所有客户端 (PC / 网关 / Android) 升级到 ≥ v0.15
+    3. 客户端节点端口改为 ${new_port}, 逐台确认能用
+    4. 全部换完后停用老服务:
 EOM
     case "$INIT_SYS" in
         systemd)
@@ -1104,11 +1113,7 @@ EOM
             ;;
     esac
     cat >&2 <<'EOM'
-
-  5. （可选）换回原端口：
-     停用老服务后，若希望新服务换回原端口，可修改
-     新版配置文件中的端口为原端口并重启新服务。
-  ======================================================================
+    5. (可选) 想换回原端口: 改新版配置里的端口后重启新服务
 EOM
 }
 
@@ -1157,17 +1162,17 @@ update_binary() {
 
     # 检测从 < v0.15.0 升级到 ≥ v0.15.0 的协议断代升级 (本机 < v0.15.0 且目标未知或目标 ≥ v0.15.0)
     if [[ -n "$lv" ]] && ! version_ge "${lv#v}" "0.15.0" && { [[ -z "$rv" ]] || version_ge "${rv#v}" "0.15.0"; }; then
-        warn "⚠️ 检测到本机已安装的 mirage 版本 ($lv) < v0.15.0"
-        warn "协议不兼容，所有客户端（含 Android）必须同步升级到 ≥ v0.15"
+        warn "本机已安装的 mirage 版本 ($lv) < v0.15.0"
+        warn "协议不兼容, 所有客户端 (含 Android) 必须同步升级到 ≥ v0.15"
         if [[ -t 0 || -t 1 ]] && [[ -r /dev/tty ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ "${DEBIAN_FRONTEND:-}" != "noninteractive" ]]; then
             local mig_choice
-            mig_choice=$(ask_choice "检测到老版本升级，请选择升级方案" \
-                "原地升级 (继续现有流程，停用老服务并替换)" \
-                "并行迁移 (新版装到另一端口，老服务保持运行)" \
+            mig_choice=$(ask_choice "检测到老版本升级, 请选择升级方案" \
+                "原地升级 (继续现有流程, 停用老服务并替换)" \
+                "并行迁移 (新版装到另一端口, 老服务保持运行)" \
                 "取消更新")
             case "$mig_choice" in
                 1)
-                    info "选择原地升级，继续现有流程..."
+                    info "选择原地升级, 继续现有流程..."
                     ;;
                 2)
                     migrate_parallel_v15 "$lv" "$rv"
@@ -1269,7 +1274,7 @@ except Exception:
                     echo "      Endpoint:       $(_c 36 "$w_ep")" >&2
                     echo "      隧道内地址:     $(_c 36 "$w_addr")" >&2
                     echo "      本机公钥:       $(_c 32 "$w_pub")" >&2
-                    echo "      (提示: 私钥已保密隐藏，请将上述本机公钥登记至对端 WG peer 列表)" >&2
+                    echo "      (提示: 私钥已保密隐藏, 请将上述本机公钥登记至对端 WG peer 列表)" >&2
                 done <<< "$wg_out_lines"
                 echo >&2
             fi
@@ -1285,7 +1290,7 @@ except Exception:
     fi
 
     if [[ -n "$node_uri" ]]; then
-        title "客户端节点导入串 (复制到客户端)"
+        section "客户端节点导入串 (复制到客户端)"
         echo "  $(_c 32 "$node_uri")" >&2
         echo >&2
         if command -v qrencode >/dev/null 2>&1; then
@@ -1309,13 +1314,13 @@ setup_fhs() {
     # 服务端完全不需要安装 clang/llvm 或 cargo。
     
     if [ -f "mirage" ]; then
-        info "检测到本地当前目录存在 mirage 可执行文件，直接拷贝。"
+        info "检测到本地当前目录存在 mirage 可执行文件, 直接拷贝。"
         cp mirage "$BIN_PATH"
     elif [ -f "target/release/mirage" ]; then
-        info "检测到本地存在编译产物，直接拷贝。"
+        info "检测到本地存在编译产物, 直接拷贝。"
         cp target/release/mirage "$BIN_PATH"
     else
-        info "本地未找到可执行文件，准备从 GitHub 拉取预编译产物..."
+        info "本地未找到可执行文件, 准备从 GitHub 拉取预编译产物..."
         if ! fetch_release_binary "$BIN_PATH"; then
             touch "$BIN_PATH" # Placeholder for sandbox/development fallback
         fi
@@ -1581,24 +1586,18 @@ generate_password() {
 # 提示与告警走 stderr, 不污染返回值。
 # 上游出口引导。返回一段 JSON (不配则返回空串)。
 ask_upstream() {
-    title "上游出口 (可选) —— 把本机当作中转站"
-    cat >&2 <<'EOM'
-  默认: 服务端直接连目标 (绝大多数人要的就是这个)。
-
-  配了上游后, 服务端不再直连, 而是把流量再发往上游出口:
-
-    客户端 ──(Mirage 隧道)──▶ 本机 ──(SS / WireGuard)──▶ 出口 ──▶ 目标
-
-  典型用途: 本机放在离你近、线路好的位置 (如香港) 只做中转, 真正的出口
-  落在另一台机器上 (如落地解锁机)。需要你已有一台可用的上游服务器。
+    section_box "上游出口 (可选, 本机做中转)" <<'EOM'
+  默认服务端直接连目标。配了上游, 流量改为:
+    客户端 ─(Mirage)─▶ 本机 ─(SS / WireGuard)─▶ 上游出口 ─▶ 目标
+  用于本机只做中转、出口在另一台机器 (如落地解锁机)。
 EOM
     # $1=force: 调用方已确认要配 (菜单「修改服务端上游出口」), 跳过是否询问
     [[ "${1:-}" == force ]] || ask_yn "是否配置上游出口?" n || { echo ""; return; }
 
     local kind
     kind=$(ask_choice "上游类型" \
-        "Shadowsocks (仅 TCP; UDP 默认阻断)" \
-        "WireGuard (TCP + UDP 同出口; 还可让 DNS 也走隧道)")
+        "Shadowsocks (仅 TCP)" \
+        "WireGuard (TCP + UDP 同一出口)")
     if [[ "$kind" == "2" ]]; then
         ask_wg_upstream
         return
@@ -1613,12 +1612,12 @@ EOM
     ss_port=$(ask "上游 SS 端口" "8388")
     local m
     m=$(ask_choice "上游 SS 加密方式" \
-        "aes-256-gcm (SIP004, 兼容性最好)" \
-        "chacha20-ietf-poly1305 (SIP004, 无 AES 硬件加速时更快)" \
-        "aes-128-gcm (SIP004)" \
-        "2022-blake3-aes-256-gcm (SIP022, 安全性最好)" \
-        "2022-blake3-chacha20-poly1305 (SIP022, 无 AES 硬件加速时更快)" \
-        "2022-blake3-aes-128-gcm (SIP022)")
+        "aes-256-gcm                    兼容性最好" \
+        "chacha20-ietf-poly1305         无 AES 硬件加速时更快" \
+        "aes-128-gcm" \
+        "2022-blake3-aes-256-gcm        SIP022, 安全性最好" \
+        "2022-blake3-chacha20-poly1305  SIP022, 无 AES 加速时更快" \
+        "2022-blake3-aes-128-gcm        SIP022")
     case "$m" in
         1) ss_method="aes-256-gcm" ;;
         2) ss_method="chacha20-ietf-poly1305" ;;
@@ -1631,13 +1630,11 @@ EOM
     if [[ "$ss_method" == 2022-* ]]; then
         local psk_bytes=32
         [[ "$ss_method" == *aes-128* ]] && psk_bytes=16
-        cat >&2 <<EOM
-
-  ⚠️ SIP022 的密码必须是 **base64 编码的 ${psk_bytes} 字节密钥**
-     (与 SIP004 的"任意密码"完全不同, 填错会连不上)。
+        note <<EOM
+  SIP022 密码必须是 base64 编码的 ${psk_bytes} 字节密钥, 不是任意字符串。
 EOM
         local pwd_choice
-        pwd_choice=$(ask_choice "上游 SS 密码选择" "自动生成 ${psk_bytes} 字节密钥 (推荐)" "手动粘贴已有密钥")
+        pwd_choice=$(ask_choice "上游 SS 密码选择" "自动生成 ${psk_bytes} 字节密钥" "手动粘贴已有密钥")
         if [[ "$pwd_choice" == "1" ]]; then
             ss_pwd=$(generate_ss_password "$psk_bytes")
             ok "已自动生成密码: $(_c 36 "$ss_pwd")"
@@ -1653,16 +1650,11 @@ EOM
     fi
     # legacy 流式加密 (aes-256-cfb 等) 不提供选项: 无完整性校验、已废弃、易被主动探测识别。
 
-    cat >&2 <<'EOM'
-
-  UDP 怎么办? SS 的 UDP 尚未实现。
-    · block (默认, 推荐): 直接拒绝 UDP。QUIC 会回落 TCP (页面照常),
-      游戏/WebRTC 不可用。
-    · direct: UDP 从**本机 IP** 直连出去 —— 与 TCP 的上游出口**不同**。
-      落地解锁场景下流媒体走 QUIC 会被判成本机所在区域, 且不会回落 TCP,
-      表现为解锁时灵时不灵且极难排查。
+    note <<'EOM'
+  SS 上游不转发 UDP。阻断 (推荐): QUIC 自动回落 TCP, 游戏 / WebRTC 不可用。
+  直连: UDP 从本机 IP 出去, 与 TCP 出口不一致, 落地解锁会时灵时不灵。
 EOM
-    if ask_yn "保留旧行为让 UDP 直连出去? (不推荐, 选 n 则阻断)" n; then
+    if ask_yn "让 UDP 从本机直连? (不推荐, n = 阻断)" n; then
         ss_udp="direct"
         warn "UDP 将从本机 IP 出去, 与 TCP 出口不一致 —— 请确认你不介意"
     else
@@ -1805,24 +1797,19 @@ import_wg_conf_upstream() {
 }
 
 ask_wg_upstream() {
-    cat >&2 <<'EOM'
-
-  WireGuard 上游: TCP 与 UDP **同一个出口 IP** (SS 上游做不到这点)。
-  需要你已有一台 WG 服务端, 并在它的 peer 列表里登记本机的公钥;
-  或者直接导入现成的 wg-quick 配置文件 (如 wgcf 生成的 Cloudflare WARP 配置)。
-
-  密钥都是标准 WireGuard 的 base64 密钥 (wg genkey / wg pubkey 的输出),
-  **不是任意密码** —— 填错长度会在启动前被 check 直接拦下。
+    note <<'EOM'
+  WireGuard 上游: TCP 与 UDP 同一出口 IP。需在上游 WG 服务端登记本机公钥,
+  或直接导入 wg-quick 配置文件 (如 wgcf 生成的 Cloudflare WARP 配置)。
 EOM
     local src
-    src=$(ask_choice "WireGuard 上游来源" "手动填写 (自建 WG 服务端)" "导入配置文件 (wgcf-profile.conf 等 wg-quick 格式, 可现场用 wgcf 注册 WARP)")
+    src=$(ask_choice "WireGuard 上游来源" "手动填写 (自建 WG 服务端)" "导入配置文件 (wgcf-profile.conf 等 wg-quick 格式)")
     if [[ "$src" == "2" ]]; then
         import_wg_conf_upstream
         return
     fi
     local wg_priv="" wg_local_pub=""
     local priv_choice
-    priv_choice=$(ask_choice "本机 WireGuard 私钥" "自动生成 (推荐)" "粘贴已有私钥")
+    priv_choice=$(ask_choice "本机 WireGuard 私钥" "自动生成" "粘贴已有私钥")
     if [[ "$priv_choice" == "1" ]]; then
         local kp
         if kp=$(generate_wg_keypair); then
@@ -1830,7 +1817,7 @@ EOM
             wg_local_pub=$(echo "$kp" | cut -f2)
             ok "已自动生成 WireGuard 密钥对"
         else
-            warn "未找到 mirage wg-keygen 或 wg 工具，请手动输入私钥"
+            warn "未找到 mirage wg-keygen 或 wg 工具, 请手动输入私钥"
             wg_priv=$(ask "本机私钥 (base64)" "")
             [[ -n "$wg_priv" ]] && wg_local_pub=$(derive_wg_pubkey "$wg_priv")
         fi
@@ -1845,16 +1832,10 @@ EOM
     fi
 
     if [[ -n "$wg_local_pub" ]]; then
-        cat >&2 <<EOM
-
-  ┌──────────────────────────────────────────────────────────┐
-  │ 🔑 本机 WireGuard 公钥:                                  │
-  │    $(_c 32 "$wg_local_pub")
-  │                                                          │
-  │ ⚠️  请将此公钥登记到上游 WireGuard 服务端的 peer 列表中！ │
-  └──────────────────────────────────────────────────────────┘
-
-EOM
+        echo >&2
+        echo "  本机公钥: $(_c 32 "$wg_local_pub")" >&2
+        warn "请把上面的公钥登记到上游 WireGuard 服务端的 peer 列表"
+        echo >&2
     fi
 
     local wg_pub wg_ep wg_addr wg_dns wg_psk="" wg_udp mtu
@@ -1871,7 +1852,7 @@ EOM
     case "$psk_choice" in
         2)
             wg_psk=$(generate_wg_psk)
-            ok "已生成预共享密钥 PSK: $(_c 36 "$wg_psk") (请同步配到上游 WG 服务端)"
+            ok "已生成 PSK: $(_c 36 "$wg_psk") (上游 WG 服务端需配同一个)"
             ;;
         3)
             wg_psk=$(ask "粘贴对端 PSK (base64)" "")
@@ -1883,15 +1864,11 @@ EOM
 
     mtu=$(ask "隧道 MTU" "1420")
 
-    cat >&2 <<'EOM'
-
-  隧道内 DNS (可选但强烈建议填):
-    填了 → 域名**经隧道解析**, 拿到的是**对端地区**的解析结果。
-           走 CDN/流媒体时这是必须的。
-    留空 → 在本机解析。流量确实从对端出去, 但目标 IP 是按**你本地位置**
-           挑的 —— 对 CDN/流媒体等于把这个出口白配了。
+    note <<'EOM'
+  隧道内 DNS 建议填: 域名经隧道解析, CDN / 流媒体才会按对端地区选节点。
+  留空则在本机解析, 目标 IP 按本机位置挑选。
 EOM
-    wg_dns=$(ask "隧道内 DNS 服务器 IP (留空则本机解析)" "")
+    wg_dns=$(ask "隧道内 DNS 服务器 IP (留空 = 本机解析)" "")
 
     # WG 隧道能承载 UDP, 出口与 TCP 一致, 所以默认 tunnel —— 不像 SS 那样需要 block 兜底。
     wg_udp="tunnel"
@@ -2211,7 +2188,7 @@ edit_server_upstream() {
         cfg="${cfgs[0]}"
     else
         local choice
-        choice=$(ask_choice "检测到多个服务端配置，请选择要修改的配置" "${cfgs[@]}")
+        choice=$(ask_choice "检测到多个服务端配置, 请选择要修改的配置" "${cfgs[@]}")
         cfg="${cfgs[$((choice - 1))]}"
     fi
     local is_lite=false
@@ -2255,47 +2232,51 @@ edit_server_upstream() {
 
     # 完整版: 循环管理菜单
     while true; do
-        CFG="$cfg" python3 -c '
+        CFG="$cfg" COLOR="$USE_COLOR" python3 -c '
 import json, os
+def c(code, t):
+    return "\033[%sm%s\033[0m" % (code, t) if os.environ.get("COLOR") == "1" else t
+def head(t):
+    print("\n" + c("1;36", "── %s %s" % (t, "─" * 12)))
 try:
     d = json.load(open(os.environ["CFG"]))
     obs = d.get("outbounds", [])
     routing = d.get("routing", {})
     def_ob = routing.get("default_outbound", "direct")
     rules = routing.get("rules", [])
-    
-    print("\n  \033[1;36m[当前出站列表]\033[0m")
+
+    head("出站")
     if not obs:
-        print("    (未配置顶层 outbounds，默认全部直连)")
+        print("    (未配置 outbounds, 全部直连)")
+    w = max([len(ob.get("tag", "")) for ob in obs] + [6])
     for i, ob in enumerate(obs, 1):
         t = ob.get("type", "unknown")
         tag = ob.get("tag", "")
         if t == "direct":
             info = "直连"
         elif t == "shadowsocks":
-            info = "Shadowsocks %s:%s (%s, udp=%s)" % (ob.get("server"), ob.get("server_port"), ob.get("method"), ob.get("udp", "block"))
+            info = "Shadowsocks %s:%s  %s, udp=%s" % (ob.get("server"), ob.get("server_port"), ob.get("method"), ob.get("udp", "block"))
         elif t == "wireguard":
-            info = "WireGuard %s (隧道内 %s)" % (ob.get("endpoint"), ob.get("address"))
+            info = "WireGuard %s  隧道内 %s" % (ob.get("endpoint"), ob.get("address"))
         else:
             info = t
-        star = " ★ (默认出站)" if tag == def_ob else ""
-        print(f"    [{i}] tag: \033[32m{tag}\033[0m ({info}){star}")
-    
-    print(f"\n  \033[1;36m[默认出站]\033[0m: \033[32m{def_ob}\033[0m")
+        star = "  " + c("33", "★ 默认") if tag == def_ob else ""
+        print("    %d) %s  %s%s" % (i, c("32", tag.ljust(w)), info, star))
 
-    print("\n  \033[1;36m[路由规则]\033[0m")
+    head("路由规则")
     if not rules:
-        print("    (无显式规则，所有流量按默认出站选路)")
+        print("    (无规则, 全部走默认出站 %s)" % c("32", def_ob))
     for i, r in enumerate(rules, 1):
         conds = []
         for k in ("inbound", "domain_suffix", "geosite", "geoip", "ip_cidr", "port", "user"):
             if k in r and r[k]:
                 v = r[k] if isinstance(r[k], list) else [r[k]]
                 # 本段 python 包在 bash 单引号里: 代码中不能出现单引号, 否则 bash 提前截断字符串
-                conds.append("%s: [%s]" % (k, ", ".join(str(x) for x in v)))
-        cond_str = " && ".join(conds) if conds else "(全部匹配)"
-        out_tag = r.get("outbound", "direct")
-        print(f"    [{i}] {cond_str} ──▶ \033[32m{out_tag}\033[0m")
+                conds.append("%s: %s" % (k, ", ".join(str(x) for x in v)))
+        cond_str = " 且 ".join(conds) if conds else "(全部)"
+        print("    %d) %s  →  %s" % (i, cond_str, c("32", r.get("outbound", "direct"))))
+    if rules:
+        print("    其余  →  %s" % c("32", def_ob))
 
     legacy = []
     for ib in d.get("inbounds", []):
@@ -2303,12 +2284,12 @@ try:
         if u:
             legacy.append((ib.get("tag", "mirage-in"), u.get("type", "")))
     if legacy:
-        print("\n  \033[1;33m[⚠️ 兼容性提示: 入站存在旧 upstream 字段]\033[0m")
+        head("旧版 upstream 字段 (优先于路由生效, 建议用操作 6 迁移)")
         for tag, utype in legacy:
-            print(f"    入站 `{tag}` 配有旧 {utype} upstream (将优先于路由生效，建议迁移)")
+            print("    入站 %s: %s" % (tag, utype))
     print()
 except Exception as e:
-    print(f"解析配置出错: {e}")
+    print("解析配置出错: %s" % e)
 '
         local action
         action=$(ask_choice "操作选择" \
@@ -2318,7 +2299,7 @@ except Exception as e:
             "新增分流规则" \
             "删除分流规则" \
             "迁移入站旧 upstream 为独立出站" \
-            "入口 → 出口绑定 (链式代理: 某个接入端口的流量全部走指定出口)" \
+            "入口绑定出口 (某个入站的流量全部走指定出口)" \
             "完成并退出")
 
         case "$action" in
@@ -2339,12 +2320,12 @@ u["tag"] = os.environ["TAG"]
 print(json.dumps(u))
 ')
                if ! stage_and_commit "$cfg" server_add_outbound "$full_ob" >/dev/null; then
-                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
+                   warn "新配置校验未通过, 原配置未改动"
                    continue
                fi
                ok "已新增出站 \`$tag\` (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+                   ok "已热重载生效, 无需重启"
                fi
                ;;
             2)
@@ -2384,12 +2365,12 @@ print("yes" if ref else "no")
                    fi
                fi
                if ! stage_and_commit "$cfg" server_remove_outbound "$del_tag" >/dev/null; then
-                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
+                   warn "新配置校验未通过, 原配置未改动"
                    continue
                fi
                ok "已删除出站 \`$del_tag\` (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+                   ok "已热重载生效, 无需重启"
                fi
                ;;
             3)
@@ -2410,12 +2391,12 @@ print("\n".join(tags))
                fi
                local def_tag="${tag_array[$((sel_idx - 1))]}"
                if ! stage_and_commit "$cfg" server_set_default_outbound "$def_tag" >/dev/null; then
-                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
+                   warn "新配置校验未通过, 原配置未改动"
                    continue
                fi
                ok "默认出站已设为 \`$def_tag\` (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+                   ok "已热重载生效, 无需重启"
                fi
                ;;
             4)
@@ -2423,7 +2404,7 @@ print("\n".join(tags))
                cond_choice=$(ask_choice "规则条件类型" \
                    "domain_suffix (域名后缀, 如 example.com)" \
                    "geosite (域名分类, 如 cn, geolocation-!cn)" \
-                   "geoip (IP地理位置, 如 cn, hk, us)" \
+                   "geoip (IP 地理位置, 如 cn, hk, us)" \
                    "ip_cidr (目标 IP 网段, 如 192.0.2.0/24)" \
                    "port (目标端口, 如 443, 80)" \
                    "user (认证用户名)")
@@ -2438,7 +2419,7 @@ print("\n".join(tags))
                local val
                val=$(ask "匹配值 (多个值逗号隔开)" "")
                if [[ -z "$val" ]]; then
-                   warn "未填匹配值，取消添加规则。"
+                   warn "未填匹配值, 取消添加规则。"
                    continue
                fi
                local all_tags
@@ -2467,12 +2448,12 @@ rule = {field: vals, "outbound": tag}
 print(json.dumps(rule))
 ')
                if ! stage_and_commit "$cfg" server_add_rule "$rule_json" >/dev/null; then
-                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
+                   warn "新配置校验未通过, 原配置未改动"
                    continue
                fi
                ok "已新增规则 (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+                   ok "已热重载生效, 无需重启"
                fi
                ;;
             5)
@@ -2508,12 +2489,12 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                fi
                local del_idx=$((sel_idx - 1))
                if ! stage_and_commit "$cfg" server_remove_rule "$del_idx" >/dev/null; then
-                   warn "新配置校验未通过, 已还原原配置。 (正式配置未改动)"
+                   warn "新配置校验未通过, 原配置未改动"
                    continue
                fi
                ok "已删除规则 (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+                   ok "已热重载生效, 无需重启"
                fi
                ;;
             6)
@@ -2529,7 +2510,7 @@ for i, r in enumerate(d.get("routing", {}).get("rules", []), 1):
                fi
                ok "已将 ${mig_n} 个入站的旧 upstream 迁移为独立出站 + 按入站的分流规则, 默认出站不变 (原配置备份: ${cfg}.bak)"
                if service_active server; then
-                   warn "由于修改了入站级字段 (移除了入站 upstream)，需要重启服务才能生效。"
+                   warn "由于修改了入站级字段 (移除了入站 upstream), 需要重启服务才能生效。"
                    if ask_yn "立即重启 $(svc_name server) 使其生效?" y; then
                        svc_ctl restart server
                        ok "已重启 $(svc_name server)"
@@ -2573,7 +2554,7 @@ print("\n".join(o.get("tag") for o in d.get("outbounds", []) if o.get("tag")))
                    ok "已解除入口 \`${ib_tag}\` 的绑定"
                fi
                if service_active server; then
-                   ok "服务端支持路由热重载：已热重载生效，无需重启！"
+                   ok "已热重载生效, 无需重启"
                fi
                ;;
             *)
@@ -2588,19 +2569,17 @@ print("\n".join(o.get("tag") for o in d.get("outbounds", []) if o.get("tag")))
 # ──────────────────────────────────────────────────────────────────────────────
 config_lite_server() {
     title "配置 Mirage-rs 服务端 (轻量模式)"
-    cat >&2 <<'EOM'
-  轻量服务端: 只做「收隧道 → 全部转发」, 不带 Web 看板 / DNS / eBPF。
-  加密、TLS 伪装握手、认证失败转发真站与完整版完全一致, 协议互通 ——
-  轻量服务端可以直接给完整版客户端用。
+    note <<'EOM'
+  只做「收隧道 → 全部转发」, 无看板 / DNS / eBPF; 协议与完整版互通。
 EOM
     # 443 伪装效果最好, 但属特权端口; 这里跑在 root 下装 systemd 服务, 故无 bind 问题。
     local port rand_pwd pwd sni ss_up
-    port=$(ask_port "监听端口 [1-65535] (默认 443; 实测非 443 性能无差异, 被占用可改)" "443" tcp)
+    port=$(ask_port "监听端口" "443" tcp)
     rand_pwd=$(generate_password)
     pwd=$(ask "认证密码" "$rand_pwd")
 
     local sni_default="www.apple.com"
-    if ask_yn "是否自动搜索同 ASN 的伪装域名候选? (提升 SNI/IP 一致性)" n; then
+    if ask_yn "自动搜索同 ASN 的伪装域名候选? (提升 SNI/IP 一致性)" n; then
         local found
         if found=$(suggest_camouflage_host) && [[ -n "$found" ]]; then
             sni_default="$found"
@@ -2616,7 +2595,7 @@ EOM
 
     # 前向保密 (PFS): opt-in, 客户端必须同样开启。
     local pfs_line=""
-    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？口令泄露也解不了已录流量。⚠️ 客户端必须同样开启才能连上" n; then
+    if ask_yn "开启前向保密 PFS? (客户端须同样开启)" n; then
         pfs_line=",
     \"pfs\": true"
         info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
@@ -2648,32 +2627,34 @@ EOF
         node_uri=$(build_node_uri "$pwd" "$pub_host" "$port" "$sni")
         echo "$node_uri" > "${ETC_DIR}/node-export.txt"
         chmod 600 "${ETC_DIR}/node-export.txt"
-        echo >&2
-        title "客户端节点导入串"
+        section "客户端节点导入串"
         echo "  $(_c 32 "$node_uri")" >&2
         echo "  已保存到: ${ETC_DIR}/node-export.txt (chmod 600), 内含密码请妥善保管。" >&2
         command -v qrencode >/dev/null 2>&1 && { echo >&2; qrencode -t UTF8 "$node_uri" >&2; }
         echo >&2
     fi
-    info "启动命令: $(svc_start_hint server)"
+}
+
+# 同机部署: 服务端刚导出的节点串 (node-export.txt) 作为客户端导入的默认值, 回车即复用
+local_node_uri() {
+    [[ -f "${ETC_DIR}/node-export.txt" ]] || return 0
+    info "检测到本机刚生成的节点串, 输入时直接回车即可复用。"
+    cat "${ETC_DIR}/node-export.txt"
 }
 
 config_lite_client() {
     title "配置 Mirage-rs 客户端 (轻量模式)"
-    cat >&2 <<'EOM'
-  轻量客户端: 本机开一个 SOCKS5 入站, **全部流量走隧道** —— 不分流、不查 DNS、
-  不做 fake-IP、无透明网关、无看板。浏览器/系统把代理指到下面填的地址即可。
-
-  ⚠️ 仅支持 TCP: SOCKS5 UDP ASSOCIATE 会被拒绝, QUIC/HTTP3 走不了代理
-     (浏览器会自动回落 TCP, 页面照常; 但依赖 UDP 的应用/游戏不可用)。
-     需要 UDP 请改用完整版客户端。
+    note <<'EOM'
+  本机开一个 SOCKS5 入站, 全部流量走隧道; 不分流 / 无 DNS / 无透明网关 / 无看板。
+  仅 TCP: QUIC 会自动回落 TCP, 依赖 UDP 的应用不可用 (需要请用完整版)。
 EOM
     # 支持粘贴服务端导出的 mirage:// 串, 免得手抄密码/SNI 出错
-    local server server_port pwd sni
+    local server server_port pwd sni local_node_default
+    local_node_default=$(local_node_uri)
     if ask_yn "是否粘贴服务端的 mirage:// 节点串导入?" y; then
         local uri
         while :; do
-            uri=$(ask "粘贴 mirage:// 节点串" "")
+            uri=$(ask "粘贴 mirage:// 节点串" "$local_node_default")
             if parse_node_uri "$uri"; then
                 server="$NODE_HOST"; server_port="$NODE_PORT"
                 pwd="$NODE_PWD";     sni="$NODE_SNI"
@@ -2692,17 +2673,13 @@ EOM
     fi
 
     local listen lport
-    listen=$(ask "本地 SOCKS5 监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0)" "127.0.0.1")
+    listen=$(ask "SOCKS5 监听地址 (本机 127.0.0.1 / 局域网共享 0.0.0.0)" "127.0.0.1")
     lport=$(ask_port "本地 SOCKS5 监听端口" "1080" tcp)
 
     # 与完整版同一策略: 非回环监听必须设认证, 否则是开放代理。
     local auth_json=""
     if [[ "$listen" != "127.0.0.1" && "$listen" != "::1" && "$listen" != "localhost" ]]; then
-        cat >&2 <<'EOM'
-
-  ⚠️  非回环监听 —— 不设认证 = 开放代理: 任何能连到它的人都能用你的隧道,
-      流量从你的服务端出去, 出口 IP 会被滥用甚至拉黑。
-EOM
+        warn "非本机监听必须设认证, 否则任何人都能借你的隧道出网"
         local u p
         u=$(ask "代理用户名" "mirage")
         p=$(ask "代理密码 (留空=自动生成)" "")
@@ -2714,7 +2691,7 @@ EOM
 
     # 前向保密 (PFS): opt-in, 必须与服务端一致。
     local pfs_line=""
-    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？⚠️ 必须与服务端设置一致" n; then
+    if ask_yn "开启前向保密 PFS? (须与服务端一致)" n; then
         pfs_line=",
     \"pfs\": true"
         info "已开启 PFS —— 服务端配置也必须设 \"pfs\": true, 否则连不上。"
@@ -2737,7 +2714,6 @@ EOF
     ok "轻量客户端配置已保存至: ${ETC_DIR}/lite_client.json"
 
     setup_service "client"
-    info "启动命令: $(svc_start_hint client)"
     info "使用方式: 把浏览器/系统代理指向 SOCKS5 ${listen}:${lport}"
 }
 
@@ -2762,7 +2738,7 @@ ask_rule_json() { # targets...
     cond_choice=$(ask_choice "规则条件类型" \
         "domain_suffix (域名后缀, 如 example.com)" \
         "geosite (域名分类, 如 cn, geolocation-!cn)" \
-        "geoip (IP地理位置, 如 cn, hk, us)" \
+        "geoip (IP 地理位置, 如 cn, hk, us)" \
         "ip_cidr (目标 IP 网段, 如 192.0.2.0/24)" \
         "port (目标端口, 如 443, 80)" \
         "user (认证用户名)")
@@ -2797,27 +2773,19 @@ config_server() {
     title "配置 Mirage-rs 服务端"
     
     local port rand_pwd pwd
-    port=$(ask_port "监听端口 [1-65535]" "443" tcp)
+    port=$(ask_port "监听端口" "443" tcp)
     rand_pwd=$(generate_password)
     pwd=$(ask "认证密码" "$rand_pwd")
 
     # 伪装 SNI: 可先自动搜索"与本机同 ASN"的候选, 搜到的作为默认值,
     # 再走原有的 TLS1.3 探测 + 人工确认流程 (ask_camouflage_host).
     local sni_default="www.apple.com"
-    section_box "伪装 SNI 域名 —— SNI/IP 一致性 (可选自动搜索)" <<'EOM'
-  伪装域名若与本机 IP 不在同一网络 (例如 SNI 填 speedtest.net
-  却打到某小机房 VPS), 企业防火墙的"SNI 归属 ASN vs 目的 IP
-  ASN 一致性"检查会盯上它 —— 这是被动关联暴露面。
-
-  自动搜索会扫描**本机所在 /24** 的 :443, 从证书 SAN 里找出
-  真实托管在同一 ASN 的域名, 让 SNI 与 IP 名实相符。
-  需要 python3 + openssl; 耗时约 1~3 分钟。
-
-  注意: 扫描的是你自己 VPS 的同段邻居; 廉价机房邻居很可能
-  本身也是代理/空壳站, 结果需人工过目后再选 (不会自动采用)。
-  不搜索也完全可用 —— 直接填一个支持 TLS1.3 的大站即可。
+    section_box "伪装 SNI 域名" <<'EOM'
+  SNI 与本机 IP 同属一个 ASN 更不易被关联。自动搜索会扫本机所在 /24 的 :443,
+  从证书里找同 ASN 的域名 (需 python3 + openssl, 约 1~3 分钟, 结果需人工确认)。
+  不搜索也可以, 直接填一个支持 TLS 1.3 的大站。
 EOM
-    if ask_yn "是否自动搜索同 ASN 的伪装域名候选?" n; then
+    if ask_yn "自动搜索同 ASN 的伪装域名候选?" n; then
         local found
         if found=$(suggest_camouflage_host) && [[ -n "$found" ]]; then
             sni_default="$found"
@@ -2831,24 +2799,15 @@ EOM
     
     local brutal_rate_mbps=0
     if handle_brutal_optional; then
-        section_box "Brutal CC 单连接目标速率" <<'EOM'
-  Brutal 给单条 TCP 死磕设定速率, 遇丢包不退让. 适合跨境
-  "高 RTT + 丢包"线路: 实测晚高峰 BBR 在 5~59 Mbps 间大幅摆动,
-  brutal 稳定得多 (见 docs/benchmark-2026-09.md §4).
-
-  没有自动回落: 设定后始终按此速率发送. 不适合的链路 (低 RTT
-  高丢包 / CDN 前置) 请设 0 关掉, 让系统默认 BBR 自适应.
-
-  取值 = 客户端实际能跑到的跨境带宽 (不是 VPS 端口速率):
-    跨境丢包线路一般 50~150 Mbps, 默认 100.
-    设太高 → 自己灌满线路, 重传放大 (实测 200 时重传 ~30%,
-             吞吐反不如 100); 设太低 → 被硬限在该值.
-  设错就改 config 里 brutal_rate_mbps 重启服务即可.
+        section_box "Brutal 单连接目标速率" <<'EOM'
+  Brutal 按固定速率发送、遇丢包不退让, 适合高 RTT + 丢包的跨境线路。
+  取客户端实际跨境带宽 (一般 50~150, 默认 100); 设太高反而重传放大。
+  0 = 关闭, 用系统默认 BBR。之后可改配置里的 brutal_rate_mbps。
 EOM
         # 默认 100: 跨境丢包线路实测甜点 (50 被硬限在 ~48, 200 重传 ~30%), 见 docs/benchmark-2026-09.md §4
         local default_rate=100
-        brutal_rate_mbps=$(ask "Brutal 目标速率 (Mbps, 取客户端实际跨境带宽, 0=关闭)" "$default_rate")
-        info "Brutal 速率: ${brutal_rate_mbps} Mbps (无自动回落; 不合适请改为 0 用 BBR)"
+        brutal_rate_mbps=$(ask "Brutal 目标速率 (Mbps, 0 = 关闭)" "$default_rate")
+        info "Brutal 速率: ${brutal_rate_mbps} Mbps"
     fi
 
     local brutal_line=""
@@ -2875,7 +2834,7 @@ EOM
         # ask_upstream 输出形如 `{ "type": ...}`, 在开头插入 tag
         up_objs+=",
         { \"tag\": \"$(json_escape "$up_tag")\", ${up_json#\{ }"
-        ask_yn "再添加一个上游出口? (多个上游可按规则分流)" n || break
+        ask_yn "再添加一个上游出口?" n || break
         up_json=$(ask_upstream force)
     done
     local outbound_list="[
@@ -2885,14 +2844,11 @@ EOM
     local routing_rules='[]'
 
     if (( ${#up_tags[@]} > 0 )); then
-        cat >&2 <<'EOM'
-
-  请选择出站模式:
-    1. 全部走上游 (默认所有流量走落地上游, 可通过规则把部分流量拉回 direct 直连)
-    2. 默认直连 (默认从本机直连, 仅命中规则的流量走上游)
-EOM
+        section "出站选路"
         local mode_choice
-        mode_choice=$(ask_choice "选路模式" "全部走上游出口 (推荐落地解锁场景)" "默认直连，按规则分流上游")
+        mode_choice=$(ask_choice "默认出口" \
+            "全部走上游 (规则可把部分流量拉回直连, 适合落地解锁)" \
+            "默认直连 (只有命中规则的流量走上游)")
         local rule_targets
         if [[ "$mode_choice" == "1" ]]; then
             routing_default="${up_tags[0]}"
@@ -2906,7 +2862,7 @@ EOM
             rule_targets=("${up_tags[@]}")
         fi
         local rules="" rule
-        while ask_yn "是否添加一条分流规则? (可多次添加, 按顺序匹配)" "$([[ -z "$rules" && "$mode_choice" == "2" ]] && echo y || echo n)"; do
+        while ask_yn "添加一条分流规则? (按添加顺序匹配)" "$([[ -z "$rules" && "$mode_choice" == "2" ]] && echo y || echo n)"; do
             rule=$(ask_rule_json "${rule_targets[@]}")
             [[ -n "$rule" ]] && rules+="${rules:+, }${rule}"
         done
@@ -2915,14 +2871,14 @@ EOM
 
     # 前向保密 (PFS): opt-in, 两端必须一致。开则握手做一次性 X25519 ECDH, 口令泄露也解不了已录流量。
     local pfs_line=""
-    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？口令泄露也解不了已录流量。⚠️ 客户端必须同样开启才能连上" n; then
+    if ask_yn "开启前向保密 PFS? (客户端须同样开启)" n; then
         pfs_line=",
             \"pfs\": true"
         info "已开启 PFS —— 客户端配置也必须设 \"pfs\": true, 否则连不上。"
     fi
 
     local log_level
-    log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
+    log_level=$(ask_choice "日志等级" "info" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
@@ -2978,9 +2934,9 @@ EOF
     if [[ -n "$detected_ip" ]]; then
         ok "探测到公网 IP: $detected_ip"
     else
-        warn "公网 IP 探测失败 (网络断 / 全部回源服务超时), 需手动输入"
+        warn "公网 IP 探测失败, 请手动输入"
     fi
-    pub_host=$(ask "公网地址 (域名/IP, 用于生成客户端节点导入串; 留空则跳过)" "$detected_ip")
+    pub_host=$(ask "公网地址 (域名或 IP, 生成节点导入串用; 留空跳过)" "$detected_ip")
     if [[ -z "$pub_host" ]]; then
         warn "未输入公网地址, 跳过节点导出. 如需手动构造:"
         echo "      mirage://<密码>@<host>:${port}?sni=${sni}" >&2
@@ -2990,12 +2946,11 @@ EOF
         echo "$node_uri" > "${ETC_DIR}/node-export.txt"
         chmod 600 "${ETC_DIR}/node-export.txt"
 
-        echo >&2
-        title "客户端节点导入串"
+        section "客户端节点导入串"
         echo "  $(_c 32 "$node_uri")" >&2
         echo >&2
         echo "  已保存到: ${ETC_DIR}/node-export.txt (chmod 600)" >&2
-        echo "  客户端安装时选择 '粘贴节点导入' 直接复用. 内含密码, 妥善保管." >&2
+        echo "  部署客户端时选「粘贴节点串」即可导入。内含密码, 注意保管。" >&2
         if command -v qrencode >/dev/null 2>&1; then
             echo >&2
             qrencode -t UTF8 "$node_uri" >&2
@@ -3003,7 +2958,6 @@ EOF
         echo >&2
     fi
 
-    info "你可以使用以下命令启动服务端: $(svc_start_hint server)"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3021,7 +2975,7 @@ _ask_rule() {
         1) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"direct\"}") ;;
         2) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"proxy\"}") ;;
         3) ROUTE_ADV_RULES+=("                {\"${type}\": [\"${tag}\"], \"outbound\": \"block\"}") ;;
-        *) warn "无效输入 '$v'，跳过 $label"; ;;
+        *) warn "无效输入 '$v', 跳过 $label"; ;;
     esac
 }
 
@@ -3031,7 +2985,7 @@ ask_route_advanced() {
     ROUTE_ADV_RULES=()
     # 内网总是 direct（必须）
     ROUTE_ADV_RULES+=('                {"ip_cidr": ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"], "outbound": "direct"}')
-    info "（内网 / 保留地址已固定 direct，不可关）"
+    info "(内网 / 保留地址已固定 direct, 不可关)"
 
     _ask_rule "广告 (category-ads-all)"          "geosite" "category-ads-all"   "3"
     _ask_rule "国内域名 (geosite:cn)"            "geosite" "cn"                  "1"
@@ -3051,7 +3005,7 @@ ask_route_advanced() {
         1) ROUTE_ADV_DEFAULT="direct" ;;
         *) ROUTE_ADV_DEFAULT="proxy" ;;
     esac
-    info "已配 $(( ${#ROUTE_ADV_RULES[@]} )) 条规则，默认出口：$ROUTE_ADV_DEFAULT"
+    info "已配 $(( ${#ROUTE_ADV_RULES[@]} )) 条规则, 默认出口: $ROUTE_ADV_DEFAULT"
 }
 
 config_client() {
@@ -3060,15 +3014,12 @@ config_client() {
     local srv_host srv_port pwd sni
 
     # ── 节点导入: 优先粘贴 URI ──
-    local local_node_default=""
-    if [[ -f "${ETC_DIR}/node-export.txt" ]]; then
-        local_node_default=$(cat "${ETC_DIR}/node-export.txt")
-        info "检测到本机刚生成的节点串, 输入时直接回车即可复用."
-    fi
+    local local_node_default
+    local_node_default=$(local_node_uri)
 
     local source
     source=$(ask_choice "节点参数获取方式" \
-        "粘贴服务端导出的 mirage:// 节点串 (推荐)" \
+        "粘贴服务端导出的 mirage:// 节点串" \
         "手动逐项输入")
 
     if [[ "$source" == "1" ]]; then
@@ -3092,7 +3043,11 @@ config_client() {
     fi
 
     if [[ "$source" == "2" ]]; then
-        srv_host=$(ask "服务端 IP 或域名" "1.2.3.4")
+        srv_host=""
+        while [[ -z "$srv_host" ]]; do
+            srv_host=$(ask "服务端 IP 或域名" "")
+            [[ -z "$srv_host" ]] && warn "服务端地址不能为空"
+        done
         srv_port=$(ask "服务端端口" "443")
         pwd=$(ask "认证密码" "")
         sni=$(ask_camouflage_host "www.apple.com")
@@ -3102,15 +3057,10 @@ config_client() {
     inbound_port=$(ask_port "本地代理入站监听端口 (mixed 模式同时支持 SOCKS5/HTTP)" "1080" tcp)
     # 默认回环: 监听 0.0.0.0 而不鉴权 = 开放代理, 任何能连到的人都能白嫖隧道,
     # 出口 IP 会被滥用/拉黑 (对抗审查部署尤其致命)。要 LAN 共享就必须设凭据。
-    inbound_listen=$(ask "本地代理监听地址 (仅本机用 127.0.0.1; LAN 共享用 0.0.0.0, 会要求设账号密码)" "127.0.0.1")
+    inbound_listen=$(ask "本地代理监听地址 (本机 127.0.0.1 / 局域网共享 0.0.0.0)" "127.0.0.1")
     local inbound_auth_json=""
     if [[ "$inbound_listen" != "127.0.0.1" && "$inbound_listen" != "::1" && "$inbound_listen" != "localhost" ]]; then
-        cat >&2 <<'EOM'
-
-  ⚠️  你选择了非回环监听地址 —— 该端口对本机之外可达。
-      不设认证 = 开放代理: 任何能连到它的人都能使用你的隧道, 流量从你的服务端出去,
-      出口 IP 会被滥用甚至拉黑。对抗审查部署来说, 招来注意力是最不能承受的。
-EOM
+        warn "非本机监听: 不设认证就是开放代理, 出口 IP 可能被滥用甚至拉黑"
         if ask_yn "设置账号密码保护这个入站? (强烈建议 y)" y; then
             local ib_user ib_pass
             ib_user=$(ask "代理用户名" "mirage")
@@ -3121,9 +3071,8 @@ EOM
             ok "入站认证已启用 (SOCKS5 走 RFC 1929, HTTP 走 Proxy-Authorization: Basic)"
         else
             # 逃生阀: 明确知情后允许开放代理 (例如纯可信 LAN)。二次确认防手滑。
-            warn "你选择了**不设认证的非回环监听** = 开放代理。"
-            warn "同一网络内任何设备 (含被入侵的 IoT / 访客) 都能白嫖你的隧道, 出口 IP"
-            warn "可能被滥用甚至拉黑 —— 抗审查部署里这可能让整条链路失效。"
+            warn "你选择了不设认证的非本机监听 = 开放代理。"
+            warn "同网络任何设备 (含访客 / IoT) 都能用你的隧道, 出口 IP 可能被滥用拉黑"
             if ask_yn "我明白风险, 确认不设认证?" n; then
                 ok "已按你的选择: 非回环开放代理 (无认证)"
             else
@@ -3153,10 +3102,10 @@ EOM
         CLIENT_IS_GATEWAY=true
         local transparent_port lan_iface dns_listen dns_port fakeip_range direct_dns remote_dns proxy_local dns_hijack
         transparent_port=$(ask_port "透明代理监听端口 (sk_lookup 内部用, 随意)" "12345" tcp)
-        lan_iface=$(ask "LAN 网卡名 (tc_divert 挂这张卡抓裸-IP 转发流量, 面向内网设备的那张)" "$(detect_wan_iface)")
+        lan_iface=$(ask "LAN 网卡名 (面向内网设备的那张)" "$(detect_wan_iface)")
         # 本机出向: 让网关这台机器自己的流量也走代理 (cgroup/connect4)。开启则需把
         # 本机 DNS 指向 mirage 才能拿到 fake-IP —— 下面会自动改 /etc/resolv.conf 并备份。
-        if ask_yn "让网关本机自身的流量也走代理? (否则仅转发的 LAN 流量走代理)" n; then
+        if ask_yn "网关本机的流量也走代理? (否则只代理 LAN 设备)" n; then
             proxy_local=true
         else
             proxy_local=false
@@ -3165,7 +3114,7 @@ EOM
         # DNS 劫持 (默认关): tc_divert 已抓 LAN 转发流量, 顺带把流经的 53/UDP+TCP 查询
         # 交本机 DNS 服务应答 —— LAN 设备无需把 DNS 指向网关也能拿 fake-IP。纯用户态
         # (sk_assign + 透明回包), 不改包无 conntrack。不劫持本机自身 DNS, 不碰 DoT/DoH。
-        if ask_yn "劫持流经 LAN 的 DNS 请求? (LAN 设备无需改 DNS 设置即被接管 53/UDP+TCP)" n; then
+        if ask_yn "接管 LAN 的 DNS 请求? (设备无需改 DNS)" n; then
             dns_hijack=true
         else
             dns_hijack=false
@@ -3178,7 +3127,7 @@ EOM
         # 丢一个 UDP 包不再放大成客户端 ~11s 卡顿。备用留空则只用主用 (仍有重传)。
         # 地址不带端口默认 53 (无需写 :53); 要走 TCP 解析在生成后手动给该 resolver 加 "protocol": "tcp"。
         direct_dns=$(ask "直连(国内)DNS 主用 (不带端口默认 53)" "223.5.5.5")
-        direct_dns2=$(ask "直连(国内)DNS 备用 (多上游并行兜底, 留空=只用主用)" "114.114.114.114")
+        direct_dns2=$(ask "国内 DNS 备用 (留空 = 只用主用)" "114.114.114.114")
         remote_dns=$(ask "代理(境外)DNS, 经隧道查" "8.8.8.8")
         inbounds_json='{
             "type": "mixed",
@@ -3217,7 +3166,7 @@ EOM
     },'
         local dns_upstreams="$direct_dns"; [[ -n "$direct_dns2" ]] && dns_upstreams="$direct_dns + $direct_dns2"
         info "透明网关模式: transparent(:$transparent_port, tc_divert@$lan_iface) + dns(:$dns_port, 国内上游=$dns_upstreams 并行+重传) 入站 + fake-IP($fakeip_range)"
-        [[ "$dns_hijack" == true ]] && info "DNS 劫持: 已开启 —— 流经 LAN 的 53/UDP+TCP 查询由本机应答, LAN 设备无需改 DNS 设置"
+        [[ "$dns_hijack" == true ]] && info "DNS 接管已开启: LAN 的 53 端口查询由本机应答"
     else
         inbounds_json='{
             "type": "mixed",
@@ -3228,12 +3177,12 @@ EOM
     fi
 
     local pool_size
-    pool_size=$(ask "并发连接池大小 (越大速度越快，推荐 50)" "50")
+    pool_size=$(ask "并发连接池大小 (越大速度越快, 推荐 50)" "50")
 
     # UDP 多路复用: 多条透明 UDP 流复用少量共享隧道, 拿掉"并发 UDP 流 ≤ pool_size"的带机量硬伤
     # (真机实测并发天花板 20→450+)。默认开 —— 需服务端同版本 (老服务端不认 mux, 那些 UDP 流回落 TCP)。
     local udp_mux_bool=false
-    if ask_yn "启用 UDP 多路复用 (大幅提升 UDP 带机量, 需服务端同为本版本)" y; then
+    if ask_yn "启用 UDP 多路复用? (提升 UDP 带机量, 需服务端同版本)" y; then
         udp_mux_bool=true
     fi
 
@@ -3242,7 +3191,7 @@ EOM
         "国内直连 / 局域网直连, 其余走代理 (经典中国分流, 推荐)" \
         "全部流量走代理 (全局代理)" \
         "自定义分流 (交互选配常用 Geo Tag 去向)" \
-        "留空规则, 全部走默认出口")
+        "不设规则 (含局域网, 全部走代理)")
         
     local routing_json=""
     case $routing_preset in
@@ -3302,13 +3251,13 @@ EOM
     esac
     
     local log_level
-    log_level=$(ask_choice "日志等级" "info (推荐)" "warn" "debug" "error")
+    log_level=$(ask_choice "日志等级" "info" "warn" "debug" "error")
     local log_str="info"
     case $log_level in 1) log_str="info";; 2) log_str="warn";; 3) log_str="debug";; 4) log_str="error";; esac
 
     # 前向保密 (PFS): opt-in, 必须与服务端一致 (服务端开了这里也得开, 否则连不上)。
     local pfs_line=""
-    if ask_yn "开启前向保密 (PFS, 一次性 X25519 ECDH)？⚠️ 必须与服务端设置一致" n; then
+    if ask_yn "开启前向保密 PFS? (须与服务端一致)" n; then
         pfs_line=",
             \"pfs\": true"
         info "已开启 PFS —— 服务端配置也必须设 \"pfs\": true, 否则连不上。"
@@ -3318,14 +3267,14 @@ EOM
     # 留空 = 内置 Chrome/FF/OkHttp 加权轮换 (绝大多数场景够用)。
     local cht_line=""
     local cht_path
-    cht_path=$(ask "自定义 fake-TLS 指纹模板路径 (mirage tls-capture 抓的 .bin; 留空=内置轮换)" "")
+    cht_path=$(ask "自定义 TLS 指纹模板 (mirage tls-capture 抓的 .bin, 留空 = 内置)" "")
     if [[ -n "$cht_path" ]]; then
         if [[ -f "$cht_path" ]] && [[ "$(head -c1 "$cht_path" | od -An -tx1 | tr -d ' ')" == "16" ]]; then
             cht_line='
     "client_hello_template": "'"$(json_escape "$cht_path")"'",'
             ok "出站握手将复刻该模板指纹 JA3/JA4 (仅替换 SNI/session_id/random)"
         else
-            warn "模板 $cht_path 不存在或非 TLS ClientHello —— 忽略, 用内置轮换。先跑 mirage tls-capture 抓一个。"
+            warn "模板 $cht_path 无效, 改用内置指纹"
         fi
     fi
 
@@ -3408,7 +3357,6 @@ EOF
     chmod 600 "${ETC_DIR}/config_client.json"
 
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
-    [[ -z "$cht_line" ]] && info "想让指纹贴合本机真浏览器? 跑 mirage tls-capture 抓个模板, 填进 config 的 client_hello_template。"
     setup_service "client"
 
     # ── 部署汇总 ── 一屏看清关键信息, 免得用户回翻日志找端口/地址
@@ -3420,16 +3368,14 @@ EOF
         gui_url="http://${gui_host}:${gui_port}"
         [[ -n "$client_gui_token" && "$client_gui_token" != "-" ]] && gui_url="${gui_url}/?token=${client_gui_token}"
     fi
-    title "客户端部署完成"
+    section "客户端信息"
     echo -e "  代理入站:   $(_c 36 "${inbound_listen}:${inbound_port}") (mixed: SOCKS5/HTTP)" >&2
     echo -e "  Web 看板:   $(_c 36 "${gui_url}") (Mirage Console)" >&2
     echo -e "  配置文件:   $(_c 36 "${ETC_DIR}/config_client.json")" >&2
-    echo -e "  日志目录:   $(_c 36 "${LOG_DIR}")" >&2
-    echo -e "  日志命令:   $(_c 36 "$(svc_log_hint client)")" >&2
-    echo -e "  启动命令:   $(_c 36 "$(svc_start_hint client)")" >&2
     if [[ "$client_gui_enabled" == "true" ]]; then
-        echo -e "  $(_c 33 "提示"): 按设备限速 / 用户策略 (不同设备走不同规则) 在 Web 看板 Admin 区管理 —— 无需改配置文件。" >&2
+        echo "  $(_c 2 "按设备限速 / 用户策略可在 Web 看板 Admin 区管理, 无需改配置文件。")" >&2
     fi
+    [[ -z "$cht_line" ]] && echo "  $(_c 2 "可用 mirage tls-capture 抓本机浏览器指纹, 填入 client_hello_template。")" >&2
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3545,7 +3491,7 @@ EOF
             ok "开机持久化: systemd mirage-gw-nat.service"
             ;;
         *)
-            warn "非 systemd: NAT 已应用但**重启后失效**。请把 ${GW_NAT_SCRIPT} 加进开机启动。"
+            warn "非 systemd: NAT 已应用但重启后失效。请把 ${GW_NAT_SCRIPT} 加进开机启动。"
             ;;
     esac
 
@@ -3563,10 +3509,9 @@ EOF
 
     # ⑤ LAN 侧指引 (这步在你的路由器/设备上做)
     local lan_ip; lan_ip=$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1 | cut -d/ -f1)
-    echo >&2
-    title "还需在 LAN 侧配置 (路由器/设备上)"
+    section "还需在 LAN 侧配置 (路由器 / 设备上)"
     echo "  把 LAN 设备的【默认网关】和【DNS】都指向本机: ${lan_ip:-<本机_LAN_IP>}" >&2
-    echo "  ⚠️ DNS 必须指过来才能拿到 fake-IP; 不指则所有流量都当直连、不走代理。" >&2
+    warn "DNS 必须指向本机才能拿到 fake-IP, 否则所有流量都当直连、不走代理"
     echo >&2
 }
 
@@ -3612,6 +3557,10 @@ teardown_transparent_gateway() {
 
 uninstall() {
     title "Mirage-rs 卸载"
+    note <<'EOM'
+  将停止并删除所有 Mirage-rs 服务与二进制; 配置 / 日志目录稍后逐项询问是否保留。
+EOM
+    ask_yn "确认卸载?" n || { info "已取消。"; return 0; }
 
     # 兼容两种命名: 新 (mirage-rs-*) + 旧 (mirage-*, alpha.8 之前的旧机器)
     # 必须涵盖**所有历史与当前**的服务名: 完整版 / 轻量版 / 更早的 mirage-* 旧名。
@@ -3847,12 +3796,11 @@ CONF
     ok "配置已存至 ${out} —— 导入设备的 WireGuard 客户端即可。"
     cat >&2 <<EOM
 
-  用法要点:
-  - 设备装官方 WireGuard App, 导入上面配置 (扫码或粘贴), 连接即可。
-  - 设备↔网关是家域内 WG (不跨 GFW), 海外流量在**网关**上经 Mirage 出海, 设备零翻墙痕迹。
-  - 命门: DNS 已设为网关 ${wg_srv_ip} —— 别在设备上改成公共 DNS, 否则海外域名解不成 fake-IP 就走不了代理。
-  - 再加一台设备: 重跑本项 (7), 会追加新 peer 不覆盖旧的。
-  - 局域网/公网防火墙需放行 UDP ${wg_port} 到本机。
+  使用:
+    · 设备装官方 WireGuard App, 扫码或粘贴上面的配置后连接
+    · 设备 DNS 保持 ${wg_srv_ip} (网关), 改成公共 DNS 会导致海外域名不走代理
+    · 防火墙放行 UDP ${wg_port} 到本机
+    · 再加设备: 重跑菜单 7, 追加新 peer, 不覆盖旧的
 EOM
 }
 
@@ -3882,7 +3830,7 @@ edit_config_interactive() {
         target_cfg="${cfgs[0]}"
     else
         local choice
-        choice=$(ask_choice "检测到多个配置文件，请选择要修改的配置" "${cfgs[@]}")
+        choice=$(ask_choice "检测到多个配置文件, 请选择要修改的配置" "${cfgs[@]}")
         target_cfg="${cfgs[$((choice - 1))]}"
     fi
 
@@ -3902,7 +3850,7 @@ main() {
 
     # 探测 init 系统 (systemd / openrc / none), 供服务注册 + 提示分派.
     INIT_SYS=$(detect_init)
-    info "检测到 init 系统: ${INIT_SYS}"
+    [[ "$INIT_SYS" == systemd ]] || info "检测到 init 系统: ${INIT_SYS}"
     if [ "$INIT_SYS" = none ]; then
         warn "未检测到 systemd / OpenRC / SysV init, 服务将不会自动注册 (可手动前台运行)。"
     fi
@@ -3911,12 +3859,12 @@ main() {
     mode=$(ask_choice "请选择操作" \
         "部署服务端" \
         "部署客户端" \
-        "服务端 + 客户端 (同机部署)" \
-        "更新二进制到最新版" \
+        "部署服务端 + 客户端 (同机)" \
+        "更新到最新版" \
         "查看服务端节点信息 (导入串 / 二维码)" \
-        "卸载 Mirage-rs" \
+        "卸载" \
         "家庭 WireGuard 服务端 (干净设备接入)" \
-        "修改现有配置 (交互式)" \
+        "修改现有配置" \
         "管理服务端出口与路由")
 
     case "$mode" in
@@ -3929,19 +3877,13 @@ main() {
     esac
 
     # 部署路径 (1/2/3): 先选形态 —— 完整版还是轻量版
-    title "部署形态"
-    cat >&2 <<'EOM'
-  完整版: 分流 (国内直连/国外走代理) + fake-IP DNS + 可选透明网关 +
-          Web 看板 + UDP 支持。功能齐全, 配置项也多。
-
-  轻量版: 只有「本机 SOCKS5 → 全部走隧道」。无分流/DNS/透明网关/看板,
-          仅 TCP (QUIC 走不了代理, 浏览器会自动回落)。配置极简, 三五项填完就能用。
-          加密与 TLS 伪装与完整版**完全一致**, 两者协议互通。
-
-  拿不准就选完整版 —— 它能做轻量版的一切, 只是要多配几项。
+    section_box "部署形态" <<'EOM'
+  完整版: 分流 + fake-IP DNS + 透明网关 (可选) + Web 看板 + UDP, 配置项较多。
+  轻量版: 本机 SOCKS5 全部走隧道, 仅 TCP, 填三五项即可用。
+  两者协议互通。
 EOM
     local form
-    form=$(ask_choice "选择部署形态" "完整版 (功能齐全)" "轻量版 (只要能翻墙)")
+    form=$(ask_choice "选择部署形态" "完整版" "轻量版")
     [[ "$form" == "2" ]] && LITE_MODE=true
     if [[ "$LITE_MODE" == true ]]; then
         ok "已选择轻量版: SOCKS5 全部转发, 仅 TCP"
@@ -3977,11 +3919,23 @@ EOM
             ;;
     esac
 
-    title "安装完成！"
-    echo -e "  配置目录: $(_c 36 "${ETC_DIR}")"
-    echo -e "  数据目录: $(_c 36 "${STATE_DIR}")"
-    echo -e "  日志命令: $(_c 36 "$(svc_log_hint server)")"
-    echo -e "\n  感谢使用 Mirage-rs，极致性能尽在掌握。"
+    title "安装完成"
+    local roles=()
+    case $mode in
+        1) roles=(server) ;;
+        2) roles=(client) ;;
+        3) roles=(server client) ;;
+    esac
+    echo "  配置目录: $(_c 36 "${ETC_DIR}")" >&2
+    echo "  数据目录: $(_c 36 "${STATE_DIR}")" >&2
+    local r label
+    for r in "${roles[@]}"; do
+        label="服务端"; [[ "$r" == client ]] && label="客户端"
+        echo "  ${label}启动: $(_c 36 "$(svc_start_hint "$r")")" >&2
+        echo "  ${label}日志: $(_c 36 "$(svc_log_hint "$r")")" >&2
+    done
+    echo >&2
+    echo "  感谢使用 Mirage-rs, 极致性能尽在掌握。" >&2
 }
 
 # source-guard: 直接执行 (`bash install.sh`) 时跑 main; 被 `source` 时不自动跑,
