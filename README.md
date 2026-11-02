@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.1-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.2-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -364,6 +364,7 @@ mirage-rs config -c config.json
 - [x] **高维分流与 DNS**: 路由 inbound 维度、裸 IP SNI 嗅探与 SOCKS5 UDP 逐包路由；DNS 规则层 (`advanced_dns.rules` 分流/静态/拦截)；局域网 53 端口劫持与 IP 版本策略；进程名分流 (`process_name`)；灰域名自适应分类 (`auto_classify`)。
 - [x] **性能调优与架构**: Cipher agility 自动协商硬件加速 AES-256-GCM（`tuning.cipher_agility`）；UDP 多路复用 (`tuning.udp_mux` 突破并发带机量瓶颈)；IPv6 隧道传输支持；隧道 relay 缓冲调优 (上行 64KB buf + greedy `try_read`)。
 - [x] **运维工具与看板**: Web 看板 Mirage Console（双主题、中英双语、分角色视图、可视化规则编辑）；配置工具链 (`check` / `format` / `import` / `test` / `config`)；Geo 规则自动更新与热重载；CI 确定性回归哨兵；cosign keyless 供应链签名与多架构容器镜像。
+- [x] **节点健康判定迟滞 (v0.17.2, 参考 honk)**: 连续失败 3 次判死, 判死后连续成功 2 次才恢复; 网络变化时取消退避立即重建, 判死节点成功 1 次即恢复; urltest 不再黏在已判死的当前节点上。
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
 
 ### 🚧 进行中 / 部分完成
@@ -378,7 +379,6 @@ mirage-rs config -c config.json
 
 - [~] **QUIC 定速模式 (实验特性, 已实现待完善)**: 复用 `brutal_rate_mbps` 实现 QUIC 上下行定速与窗口补偿，补丁 quinn-proto 乱序上限至 8192。
 - [ ] **QUIC 腿 ECH GREASE (暂缓)**: TCP 主协议已原生支持 ECH GREASE；QUIC 腿需等待底层 Rust 密码学库支持完善后再行评估。
-- [ ] **节点健康判定迟滞 (参考 honk)**: 判死后需连续 2 次成功才恢复, 网络变更时取消退避立即重建 (判死节点成功 1 次即恢复); 避免节点抖动时活/死来回翻。新节点不设宽限期 (启动时宁可快速切走坏节点)。
 - [ ] **fallback 防回切抖动 (观察项)**: 先靠健康判定迟滞减少主节点抖动带来的反复切换, 上线后实机观察仍有抖动再加"恢复后稳定一段时间才切回"。
 - [ ] **urltest 真实连接失败降级 (参考 honk)**: 真实连接连续失败记罚分, 排到正常节点之后, 连续成功才清除; 连续明显变慢触发补测。
 - [ ] **selector 切换可断开旧连接**: 控制台 / API 切换时可选关闭走旧节点的连接, 让长连接也切过去。
@@ -409,6 +409,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.2** | 2026-11-03 | **无协议变更**: 修 urltest 组在当前节点挂掉后仍黏在它上面 (新连接要等 10s 超时); 节点健康判定加迟滞 (判死后连续成功 2 次才恢复), 网络变化后立即重建暖池并快速恢复判死节点。 |
 | **v0.17.1** | 2026-11-02 | **无协议变更**: `/api/proxies` 补全 fallback / load_balance 组, 新增默认出站 `default` 与成员健康状态 `healthy`, 组按名称排序; 配套 Mirage-console 出站组切换界面 (四类组、默认出站标记、切换反馈)。 |
 | **v0.17.0** | 2026-11-02 | **无协议变更**: 命令行加到 2 个以上节点时自动引导建出站组 (auto / select / fallback / load_balance, 终端里空格勾选成员); 未写 `default_outbound` 时默认出站取 outbounds 第一条 (原为 direct); selector 手动选择持久化, 重启后保留; 出站增减的改动热重载时若会让路由失效则拒绝并提示重启; `install.sh` 客户端部署可连续添加多个节点, 并整理全部提示文案与排版。 |
 | **v0.16.3** | 2026-10-29 | **无协议变更**: `install.sh` 修菜单 9 报错与 tcp-brutal 版本识别；部署可添加多个上游并逐条分流；WG 上游可导入 wgcf / wg-quick 配置文件；菜单 9 新增入口 → 出口绑定；安装脚本测试进 CI。 |
