@@ -102,6 +102,12 @@ section_b4() {
     local nlines; nlines=$(printf '%s\n' "$t" | grep -c '═') || true
     eq_ "B4.3  title 有 2 条 ═ 分隔线" "$nlines" "2"
     has_ "B4.3b title 含标题文字" "$t" "T"
+    no_  "B4.3c USE_COLOR=0 时 title 无转义码" "$t" "${ESC}["
+    local sec; sec=$(USE_COLOR=0 section S 2>&1)
+    has_ "B4.4  section 单行 ── 标题" "$sec" "── S ──"
+    no_  "B4.4b USE_COLOR=0 时 section 无转义码" "$sec" "${ESC}["
+    eq_  "B4.5  note 原样逐行输出" "$(printf '  a\n  b\n' | USE_COLOR=0 note 2>&1)" "$(printf '  a\n  b')"
+    has_ "B4.5b USE_COLOR=1 时 note 为暗色" "$(echo x | USE_COLOR=1 note 2>&1)" "${ESC}[2m"
 }
 
 # ── B5: 服务端上游出口改写 (apply_server_upstream / server_upstream_summary) ──
