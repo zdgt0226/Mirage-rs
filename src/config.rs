@@ -965,10 +965,8 @@ pub fn resolve_default_outbound_from_value(root: &serde_json::Value) -> &str {
         .and_then(|ob| ob.get("tag"))
         .and_then(|t| t.as_str())
     {
-        let trimmed = first_tag.trim();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
+        // 与类型化版 resolve_default_outbound 同口径: 原样取第一条的 tag
+        return first_tag;
     }
     "direct"
 }
@@ -1498,7 +1496,7 @@ pub fn resolve_selector_persist_path(config: &Config) -> String {
                 let p = std::path::Path::new(trimmed);
                 if let Some(parent) = p.parent() {
                     let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                    let suffix = stem.strip_prefix("stats_").unwrap_or(stem);
+                    let suffix = if stem == "stats" { "" } else { stem.strip_prefix("stats_").unwrap_or(stem) };
                     let name = if suffix.is_empty() {
                         "selector_state.json".to_string()
                     } else {

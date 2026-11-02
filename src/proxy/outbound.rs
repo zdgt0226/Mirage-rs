@@ -1150,6 +1150,8 @@ mod selector_tests {
             "/var/lib/mirage-rs/selector_state_client.json");
         assert_eq!(crate::config::resolve_selector_persist_path(&mk("/var/lib/mirage-rs/stats_server.json")),
             "/var/lib/mirage-rs/selector_state_server.json");
+        assert_eq!(crate::config::resolve_selector_persist_path(&mk("/var/lib/mirage-rs/stats.json")),
+            "/var/lib/mirage-rs/selector_state.json");
     }
 
     #[cfg(unix)]
@@ -1167,6 +1169,21 @@ mod selector_tests {
         let loaded = crate::proxy::selector_state::load_selector_choices(link.to_str().unwrap());
         assert_eq!(loaded.get("sel").map(String::as_str), Some("c2"));
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_selector_save_current_writes_latest_in_memory_value() {
+        // 连切 A→B 时落盘任务先后不保证: 每次都在锁内读内存最新值, 迟到的旧任务也写最新值
+        let tmp_dir = std::env::temp_dir().join(format!("sel_cur_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("selector_state.json");
+        let p = path.to_str().unwrap();
+        let latest = std::sync::Mutex::new("c2".to_string());
+        crate::proxy::selector_state::save_selector_current(p, "sel", || Some(latest.lock().unwrap().clone()));
+        // "迟到"的 A 任务: 闭包读到的仍是最新 c2
+        crate::proxy::selector_state::save_selector_current(p, "sel", || Some(latest.lock().unwrap().clone()));
+        assert_eq!(crate::proxy::selector_state::load_selector_choices(p).get("sel").map(String::as_str), Some("c2"));
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 

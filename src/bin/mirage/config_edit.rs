@@ -70,6 +70,7 @@ pub struct UserSummary {
 pub enum OutboundRef {
     DefaultOutbound,
     Rule { rule_index: usize },
+    ProfileRule { profile: String, rule_index: usize },
     Group { group_tag: String },
     Underlying { outbound_tag: String },
 }
@@ -79,6 +80,7 @@ impl std::fmt::Display for OutboundRef {
         match self {
             Self::DefaultOutbound => write!(f, "routing.default_outbound 默认出站"),
             Self::Rule { rule_index } => write!(f, "routing.rules[{rule_index}] 路由规则"),
+            Self::ProfileRule { profile, rule_index } => write!(f, "routing.profiles.{profile}[{rule_index}] 策略规则"),
             Self::Group { group_tag } => write!(f, "出站组 `{group_tag}`"),
             Self::Underlying { outbound_tag } => write!(f, "出站 `{outbound_tag}` 的 underlying 链式底座"),
         }
@@ -523,6 +525,17 @@ pub fn check_outbound_references(root: &Value, tag: &str) -> Vec<OutboundRef> {
         for (i, rule) in rules.iter().enumerate() {
             if rule.get("outbound").and_then(|o| o.as_str()) == Some(tag) {
                 refs.push(OutboundRef::Rule { rule_index: i });
+            }
+        }
+    }
+
+    // 2b. routing.profiles.<名>[].outbound (设备策略规则)
+    if let Some(profiles) = root.get("routing").and_then(|r| r.get("profiles")).and_then(|p| p.as_object()) {
+        for (name, rules) in profiles {
+            for (i, rule) in rules.as_array().into_iter().flatten().enumerate() {
+                if rule.get("outbound").and_then(|o| o.as_str()) == Some(tag) {
+                    refs.push(OutboundRef::ProfileRule { profile: name.clone(), rule_index: i });
+                }
             }
         }
     }
@@ -1509,7 +1522,11 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
 
                 if let Some((ref added_tag, ..)) = new_tag {
                     if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, executor.stdin_is_tty(), std::slice::from_ref(added_tag)) {
-                        writeln!(writer, "⚠ 调整出站组提示: {e}").map_err(|e| e.to_string())?;
+                        if e == super::group_adjust::CANCELLED {
+                            writeln!(writer, "已跳过建组 (节点已加入本次待保存的改动, 不想要可在退出时放弃保存)。").map_err(|e| e.to_string())?;
+                        } else {
+                            writeln!(writer, "⚠ 调整出站组提示: {e}").map_err(|e| e.to_string())?;
+                        }
                     }
                 }
 
@@ -1622,9 +1639,13 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                         writeln!(writer, "  · {r}").map_err(|e| e.to_string())?;
                     }
 
+                    // 删除中途取消 / 放弃时整体回滚 (含已改的默认出站)
+                    let snapshot = root.clone();
                     if refs.iter().any(|r| matches!(r, OutboundRef::DefaultOutbound)) {
                         writeln!(writer, "由于该节点是全局默认出站，必须先选定新的默认出站才能删除。").map_err(|e| e.to_string())?;
-                        let other_tags: Vec<_> = mirage_nodes.iter().filter(|n| n.tag != tag).map(|n| n.tag.clone()).collect();
+                        // 候选: 除它以外的全部出站 (节点 / 出站组 / direct 等)
+                        let mut other_tags: Vec<_> = get_existing_outbound_tags(&root).into_iter().filter(|t| t != &tag).collect();
+                        other_tags.sort();
                         if other_tags.is_empty() {
                             writeln!(writer, "✗ 没有其它可用出站，无法删除唯一出站。").map_err(|e| e.to_string())?;
                             continue;
@@ -1643,6 +1664,7 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                     let non_group = remaining_refs.iter().any(|r| !matches!(r, OutboundRef::Group { .. }));
                     if non_group {
                         writeln!(writer, "✗ 该节点仍被规则或链式底座引用，请先修改对应规则后重试。").map_err(|e| e.to_string())?;
+                        root = snapshot;
                         continue;
                     }
 
@@ -1653,7 +1675,8 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                             writeln!(writer, "✓ 节点 `{tag}` 已从配置中删除。").map_err(|e| e.to_string())?;
                         }
                     } else {
-                        writeln!(writer, "操作已取消。").map_err(|e| e.to_string())?;
+                        root = snapshot;
+                        writeln!(writer, "操作已取消 (默认出站等改动已一并撤回)。").map_err(|e| e.to_string())?;
                     }
                 } else if prompt_yes_no(reader, writer, &format!("确认删除节点 `{tag}`？"), false) {
                     if let Err(e) = delete_outbound(&mut root, &tag, false) {
@@ -2401,6 +2424,12 @@ mod tests {
             "routing": { "rules": [] }
         });
         assert!(check_outbound_references(&root, "proxy").contains(&OutboundRef::DefaultOutbound));
+        // 设备策略 (routing.profiles) 里的规则引用也算
+        let mut rp = root.clone();
+        rp["routing"]["default_outbound"] = json!("block");
+        rp["routing"]["profiles"] = json!({ "kids": [ { "outbound": "proxy", "domain_suffix": ["example.com"] } ] });
+        assert!(check_outbound_references(&rp, "proxy")
+            .contains(&OutboundRef::ProfileRule { profile: "kids".into(), rule_index: 0 }));
         let mut r = root.clone();
         assert!(delete_outbound(&mut r, "proxy", true).is_err());
     }

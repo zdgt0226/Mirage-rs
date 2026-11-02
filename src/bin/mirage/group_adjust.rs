@@ -180,6 +180,48 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// 终端显示宽度 (近似): 东亚宽字符 / 全角标点按 2 列, 其余 1 列。
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
+}
+
+fn is_wide(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6)
+}
+
+/// 按显示宽度截断到 `width` 列以内 (超出时末尾换成 …), 保证重绘时一行不折行。
+fn fit_width(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = if is_wide(c) { 2 } else { 1 };
+        if w + cw + 1 > width {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// 当前终端列数 (取不到时按 80)。
+#[cfg(unix)]
+fn terminal_width(fd: libc::c_int) -> usize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+        ws.ws_col as usize
+    } else {
+        80
+    }
+}
+
 #[cfg(unix)]
 struct RawModeGuard {
     orig: libc::termios,
@@ -211,6 +253,8 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe {
+            // 恢复光标显示 (写到 stdout; 含 panic 展开路径) 与原终端属性
+            let _ = libc::write(libc::STDOUT_FILENO, b"\x1b[?25h".as_ptr() as *const libc::c_void, 6);
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
         }
     }
@@ -238,7 +282,8 @@ fn parse_keys(chunk: &[u8]) -> Vec<Key> {
             b' ' => keys.push(Key::Toggle),
             b'k' | b'K' => keys.push(Key::Up),
             b'j' | b'J' => keys.push(Key::Down),
-            0x1b if chunk.get(i + 1) == Some(&b'[') && i + 2 < chunk.len() => {
+            // CSI (ESC [ A) 与 application cursor 模式的 SS3 (ESC O A) 两种方向键序列
+            0x1b if matches!(chunk.get(i + 1), Some(b'[') | Some(b'O')) && i + 2 < chunk.len() => {
                 keys.push(match chunk[i + 2] {
                     b'A' => Key::Up,
                     b'B' => Key::Down,
@@ -307,13 +352,15 @@ fn run_tty_checkbox(
     let stdin_fd = libc::STDIN_FILENO;
     let guard = RawModeGuard::enter(stdin_fd).map_err(|e| format!("启用终端 raw mode 失败: {e}"))?;
 
+    // 每行按终端宽度截断: 折行会让"上移 N 行"重绘错位
+    let width = terminal_width(libc::STDOUT_FILENO).saturating_sub(1).max(20);
     let draw = |state: &CheckboxState, writer: &mut dyn Write, prev_lines: usize| -> Result<usize, String> {
         if prev_lines > 0 {
             write!(writer, "\r\x1b[{prev_lines}A\x1b[J").map_err(|e| e.to_string())?;
         }
         let lines = state.render_tty_lines();
         for l in &lines {
-            writeln!(writer, "\r{l}").map_err(|e| e.to_string())?;
+            writeln!(writer, "\r{}", fit_width(l, width)).map_err(|e| e.to_string())?;
         }
         writer.flush().map_err(|e| e.to_string())?;
         Ok(lines.len())
@@ -326,6 +373,9 @@ fn run_tty_checkbox(
         let mut buf = [0u8; 64];
         loop {
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // 被信号打断 (如窗口大小变化 SIGWINCH), 重读
+            }
             if n <= 0 {
                 return Err("读取终端输入遇到 EOF 或错误".to_string());
             }
@@ -343,8 +393,8 @@ fn run_tty_checkbox(
         }
     })();
 
+    let _ = writer.flush();
     drop(guard);
-    let _ = write!(writer, "\x1b[?25h");
     writeln!(writer).map_err(|e| e.to_string())?;
     if let Ok(ref selected) = res {
         writeln!(writer, "  已选择: [{}]", selected.join(", ")).map_err(|e| e.to_string())?;
@@ -874,6 +924,17 @@ mod tests {
         // 一块里多个按键 (粘贴 / 快速连按) 逐个解析
         assert_eq!(parse_keys(b"j j\r"), vec![Key::Down, Key::Toggle, Key::Down, Key::Enter]);
         assert_eq!(parse_keys(&[3]), vec![Key::Cancel]);
+        // application cursor 模式 (SS3) 的方向键
+        assert_eq!(parse_keys(b"\x1bOA\x1bOB"), vec![Key::Up, Key::Down]);
+    }
+
+    #[test]
+    fn test_fit_width_counts_wide_chars() {
+        assert_eq!(fit_width("abc", 10), "abc");
+        // 中文按 2 列: 6 个汉字 = 12 列, 截到 10 列以内并加 …
+        let t = fit_width("请选择将新节点", 10);
+        assert!(display_width(&t) <= 10, "{t}");
+        assert!(t.ends_with('…'));
     }
 
     #[test]

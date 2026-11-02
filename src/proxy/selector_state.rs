@@ -39,6 +39,20 @@ pub fn save_selector_choice(path: &str, group: &str, target: &str) {
     write_selector_choices_locked(path, &map);
 }
 
+/// 保存某组"此刻"的选择: 拿到持久化锁后才调用 `current` 取值再写。
+/// API 切换把落盘丢到阻塞线程池, 连切 A→B 时两个任务的先后不保证; 由于每个任务都在锁内读最新值,
+/// 最后完成的那次写入的一定是内存里的最终选择。`current` 返回 None 时不写。
+pub fn save_selector_current(path: &str, group: &str, current: impl FnOnce() -> Option<String>) {
+    let _guard = SELECTOR_PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(target) = current() else { return };
+    let mut map = load_selector_choices(path);
+    if map.get(group) == Some(&target) {
+        return;
+    }
+    map.insert(group.to_string(), target);
+    write_selector_choices_locked(path, &map);
+}
+
 /// 从持久化文件中移除指定的组选择记录 (如组已被删除或成员已失效)。
 pub fn remove_selector_choices(path: &str, groups: &[String]) {
     let _guard = SELECTOR_PERSIST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -63,10 +77,6 @@ fn write_selector_choices_locked(path: &str, map: &HashMap<String, String>) {
         }
     };
 
-    if let Some(parent) = Path::new(path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
     // 软链接: 写到它指向的目标 (目标尚不存在时 canonicalize 会失败, 用 read_link 解析), 不把链接本身替换掉
     let resolved = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
@@ -79,6 +89,9 @@ fn write_selector_choices_locked(path: &str, map: &HashMap<String, String>) {
                 .into_owned(),
             Err(_) => path.to_string(),
         });
+    if let Some(parent) = Path::new(&resolved).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     // 临时文件名带 pid + 随机数: 跨进程并发写不会互相截断同一个 .tmp
     let tmp = format!("{resolved}.tmp.{}.{}", std::process::id(), fastrand::u32(..));
 
