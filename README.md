@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.16.3-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.0-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -333,7 +333,7 @@ mirage-rs config -c config.json
 > - **默认出站 (Default Outbound)**: 若未显式配置 `routing.default_outbound`，系统统一推导并采用 `outbounds` 列表的第一项作为默认出站；若 `outbounds` 亦未配置，则回退为 `"direct"`。亦可在 `routing` 中手动显式指定。
 > - **出站组类型**: 支持 `urltest` (低延迟自动优选)、`fallback` (故障转移)、`selector` (手动指定)、`load_balance` (轮询负载均衡)。`test` 与 `--group` 建组会读取 `geoip.dat` 校验节点地域并在混杂时发出告警。
 > - **出站组智能调整**: 当节点数 ≥ 2 时，CLI 导入（`import` / `subscribe` / `config`）会自动引导出站组配置（支持终端复选框交互：空格勾选、上下键切换、回车确认，非 TTY 环境退回行输入）。新建出站组自动置于 `outbounds` 首位作为默认出口。
-> - **Selector 选择持久化**: 通过 API (`POST /api/proxies/select`) 手动切换的 selector 节点自动持久化至状态文件（权限 0600 原子写入，可由 `tuning.selector_persist_path` 自定义），服务重启与配置热重载时自动恢复。
+> - **Selector 选择持久化**: 通过 API (`POST /api/proxies/select`) 手动切换的 selector 节点自动持久化至状态文件（权限 0600 原子写入，默认 `selector_state_client.json` 与统计文件同目录，可由 `tuning.selector_persist_path` 自定义），服务重启后自动恢复；配置热重载本就保留出站与当前选择。新增节点 / 出站组需重启生效，热重载会拒绝引用运行中不存在出站的路由并提示重启。
 
 ### 配置文件生效策略
 
@@ -397,6 +397,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.0** | 2026-11-02 | **无协议变更**: 命令行加到 2 个以上节点时自动引导建出站组 (auto / select / fallback / load_balance, 终端里空格勾选成员); 未写 `default_outbound` 时默认出站取 outbounds 第一条 (原为 direct); selector 手动选择持久化, 重启后保留; 出站增减的改动热重载时若会让路由失效则拒绝并提示重启; `install.sh` 客户端部署可连续添加多个节点, 并整理全部提示文案与排版。 |
 | **v0.16.3** | 2026-10-29 | **无协议变更**: `install.sh` 修菜单 9 报错与 tcp-brutal 版本识别；部署可添加多个上游并逐条分流；WG 上游可导入 wgcf / wg-quick 配置文件；菜单 9 新增入口 → 出口绑定；安装脚本测试进 CI。 |
 | **v0.16.2** | 2026-10-28 | **无协议变更 (可单端升级)**: 纯服务端配置不再重复加载 geosite / geoip；非 mux UDP 经 WG 出口时解析结果会话内缓存 (隧道 DNS 不通不再拖住上行)；QUIC 口令错误首个请求即告警。 |
 | **v0.16.1** | 2026-10-27 | **无协议变更 (可单端升级)**: 客户端暖池建连失败指数退避 (1s→30s, 有请求等待时最快 2s 重试), 口令错误等持续失败时不再每秒数次握手打服务端, 失败日志限频。 |

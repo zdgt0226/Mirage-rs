@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [v0.17.0] - 出站组随节点自动调整 / 默认出站取第一条出站 / selector 选择持久化 (2026-11-02)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.x / v0.16.x 两端互通 (实机: 新服务端 × 新客户端、v0.16.3 客户端 × 新服务端)。Android 内核本版不同步, 下次同步时一并带上默认出站规则变化。
+- **行为变化: 未写 `routing.default_outbound` 时, 默认出站改为 outbounds 第一条** (原为固定 `direct`)。`install.sh` 生成的配置与仓库模板都显式写了 default_outbound, 不受影响; 手写配置若没写且第一条是代理节点, 升级后未命中规则的流量会改走该节点 —— 要保持直连请显式写 `"default_outbound": "direct"`。显式写成空串仍报错。
+- 出站有增减 (新增节点 / 出站组) 的配置改动需要重启生效; 这类改动触发热重载时, 若新路由引用了运行中不存在的出站, 本次重载会被拒绝并在日志提示重启 (原来会导致未命中规则的流量失败)。
+- selector 手动选择保存在 state 目录 (默认 `selector_state_client.json`, 与 `gui.stats_persist_path` 同目录; 可用 `tuning.selector_persist_path` 指定)。
+
 ### feat(outbounds): 统一默认出站推导、出站组自动调整与 Selector 持久化 (2026-11-02)
 
 #### 升级须知 (行为变化)
