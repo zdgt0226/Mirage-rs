@@ -214,6 +214,23 @@ impl ConfigWatcher {
             });
         }
         
+        // 热重载整体沿用旧出站表 (见上); 若新路由引用了旧表里没有的出站 (如 CLI 刚建的出站组成了
+        // 默认出站), 照换路由会让这些流量全部 "outbound not found"。拒绝本次重载、保留旧状态, 提示重启。
+        if is_hot_reload && !pure_server {
+            let missing: Vec<&str> = std::iter::once(config.routing.default_outbound.as_str())
+                .chain(rules.iter().map(|r| r.outbound.as_str()))
+                .filter(|t| !outbounds.outbounds.contains_key(*t))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if !missing.is_empty() {
+                anyhow::bail!(
+                    "路由引用了运行中尚不存在的出站 {:?} (出站增减不支持热重载), 本次重载已拒绝, 请重启服务生效",
+                    missing
+                );
+            }
+        }
+
         let router = RouterEngine::new(
             rules,
             config.routing.default_outbound,
@@ -1099,6 +1116,35 @@ mod leak_guard_tests {
 #[cfg(test)]
 mod watcher_event_tests {
     use super::*;
+
+    /// 热重载沿用旧出站表: 新路由引用旧表里没有的出站 (如 CLI 刚建的组成了默认出站) 时必须拒绝重载,
+    /// 否则未命中规则的流量全部 "outbound not found"。
+    #[test]
+    fn hot_reload_rejects_routing_to_outbound_absent_from_running_table() {
+        let dir = std::env::temp_dir().join(format!("mirage_hr_newob_{}_{}", std::process::id(), fastrand::u64(..)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config.json");
+        let p = cfg.to_str().unwrap();
+        std::fs::write(&cfg, r#"{ "inbounds": [ { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 0 } ],
+            "outbounds": [ { "type": "direct", "tag": "d1" }, { "type": "direct", "tag": "direct" } ] }"#).unwrap();
+        let st = ConfigWatcher::build_state(p, dir.to_str().unwrap(), None).unwrap();
+
+        // 新配置: 前插了一个组, 推导默认出站变成它 (运行中的出站表里没有)
+        std::fs::write(&cfg, r#"{ "inbounds": [ { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 0 } ],
+            "outbounds": [ { "type": "selector", "tag": "select", "outbounds": ["d1"] },
+                           { "type": "direct", "tag": "d1" }, { "type": "direct", "tag": "direct" } ] }"#).unwrap();
+        let err = ConfigWatcher::build_state(p, dir.to_str().unwrap(), Some(st.outbounds.clone()))
+            .err()
+            .expect("应拒绝本次热重载");
+        assert!(err.to_string().contains("select"), "{err}");
+
+        // 只改路由、引用的出站都在: 照常热重载
+        std::fs::write(&cfg, r#"{ "inbounds": [ { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 0 } ],
+            "outbounds": [ { "type": "direct", "tag": "d1" }, { "type": "direct", "tag": "direct" } ],
+            "routing": { "default_outbound": "direct" } }"#).unwrap();
+        assert!(ConfigWatcher::build_state(p, dir.to_str().unwrap(), Some(st.outbounds.clone())).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 纯服务端配置: 客户端引擎不加载规则, 服务端表照常; 混合配置不受影响。
     #[test]

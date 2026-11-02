@@ -56,6 +56,7 @@ fn default_gui_listen() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(from = "RawConfig")]
 pub struct Config {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -87,6 +88,61 @@ pub struct Config {
     /// 不设 = 内置 Chrome/FF/OkHttp 加权轮换。装载失败 (文件缺失/非法) 只 WARN 并落回轮换, 不阻断启动。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_hello_template: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawConfig {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    #[serde(default)]
+    pub log_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_rotate_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_keep_archives: Option<usize>,
+    #[serde(default)]
+    pub inbounds: Vec<InboundConfig>,
+    #[serde(default = "default_outbounds")]
+    pub outbounds: Vec<OutboundConfig>,
+    #[serde(default)]
+    pub routing: RawRoutingConfig,
+    pub advanced_dns: Option<AdvancedDnsConfig>,
+    pub tuning: Option<TuningConfig>,
+    #[serde(default)]
+    pub gui: Option<GuiConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_hello_template: Option<String>,
+}
+
+impl From<RawConfig> for Config {
+    fn from(raw: RawConfig) -> Self {
+        let default_outbound = resolve_default_outbound(
+            raw.routing.default_outbound.as_deref(),
+            &raw.outbounds,
+        );
+        Config {
+            schema_version: raw.schema_version,
+            log_level: raw.log_level,
+            log_file: raw.log_file,
+            log_rotate_mb: raw.log_rotate_mb,
+            log_keep_archives: raw.log_keep_archives,
+            inbounds: raw.inbounds,
+            outbounds: raw.outbounds,
+            routing: RoutingConfig {
+                default_outbound,
+                geo_alias: raw.routing.geo_alias,
+                rules: raw.routing.rules,
+                profiles: raw.routing.profiles,
+                device_profiles: raw.routing.device_profiles,
+            },
+            advanced_dns: raw.advanced_dns,
+            tuning: raw.tuning,
+            gui: raw.gui,
+            client_hello_template: raw.client_hello_template,
+        }
+    }
 }
 
 /// 服务端的**上游出口**配置 —— 配了它, Mirage 服务端就不再直连目标, 而是把流量
@@ -690,6 +746,30 @@ pub enum OutboundConfig {
     },
 }
 
+impl OutboundConfig {
+    pub fn tag(&self) -> &str {
+        match self {
+            Self::Mirage { tag, .. }
+            | Self::Wireguard { tag, .. }
+            | Self::Direct { tag }
+            | Self::Block { tag }
+            | Self::Shadowsocks { tag, .. }
+            | Self::Urltest { tag, .. }
+            | Self::Fallback { tag, .. }
+            | Self::Selector { tag, .. }
+            | Self::LoadBalance { tag, .. } => tag.as_str(),
+        }
+    }
+}
+
+/// 判断出站类型是否为出站组 (urltest / fallback / selector / load_balance)
+pub fn is_group_type(t: &str) -> bool {
+    matches!(
+        t,
+        "urltest" | "fallback" | "selector" | "load_balance"
+    )
+}
+
 impl std::fmt::Debug for OutboundConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -819,6 +899,20 @@ fn default_lb_strategy() -> String {
     "round-robin".to_string()
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+struct RawRoutingConfig {
+    #[serde(default)]
+    pub default_outbound: Option<String>,
+    #[serde(default)]
+    pub geo_alias: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, Vec<RuleConfig>>,
+    #[serde(default)]
+    pub device_profiles: Vec<DeviceProfile>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoutingConfig {
     #[serde(default = "default_direct_str")]
@@ -835,6 +929,46 @@ pub struct RoutingConfig {
     /// 设备 (源网段) → profile 分配。命中的连接先走该 profile 的规则, 未命中再落全局 rules → default。
     #[serde(default)]
     pub device_profiles: Vec<DeviceProfile>,
+}
+
+/// 解析默认出站 tag (支持类型化的 OutboundConfig 列表):
+/// 1. 若 routing.default_outbound 显式写了，原样取其值 (写成空串也保留, 交给 check 报"不存在",
+///    不静默换成第一条出站 —— 防写错被掩盖)；
+/// 2. 否则取 outbounds 数组第一条的 tag；
+/// 3. 若 outbounds 缺省或为空，取 "direct"。
+pub fn resolve_default_outbound(explicit: Option<&str>, outbounds: &[OutboundConfig]) -> String {
+    if let Some(explicit) = explicit {
+        return explicit.to_string();
+    }
+    if let Some(first) = outbounds.first() {
+        return first.tag().to_string();
+    }
+    "direct".to_string()
+}
+
+/// 解析默认出站 tag (支持 serde_json::Value), 规则同 `resolve_default_outbound`:
+/// 1. 若 routing.default_outbound 显式写了，原样取其值；
+/// 2. 否则取 outbounds 数组第一条的 tag；
+/// 3. 若 outbounds 缺省或为空，取 "direct"。
+pub fn resolve_default_outbound_from_value(root: &serde_json::Value) -> &str {
+    if let Some(d) = root
+        .get("routing")
+        .and_then(|r| r.get("default_outbound"))
+        .and_then(|d| d.as_str())
+    {
+        return d;
+    }
+    if let Some(first_tag) = root
+        .get("outbounds")
+        .and_then(|o| o.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|ob| ob.get("tag"))
+        .and_then(|t| t.as_str())
+    {
+        // 与类型化版 resolve_default_outbound 同口径: 原样取第一条的 tag
+        return first_tag;
+    }
+    "direct"
 }
 
 fn default_direct_str() -> String {
@@ -1337,6 +1471,43 @@ pub struct TuningConfig {
     /// 是 slowloris 总兜底。不设 = `2×RTT` (clamp 100~500ms) / 1000ms / 5000ms。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_hello_guard: Option<ClientHelloGuardConfig>,
+    /// selector 手动选择持久化文件路径。
+    /// 未配时默认: 若配了 gui.stats_persist_path (如 stats_client.json) 则为其同目录下按同名区分的
+    /// selector_state_client.json (同机服务端 / 客户端不共用一个文件);
+    /// 否则默认为 "/var/lib/mirage-rs/selector_state.json"。
+    #[serde(default)]
+    pub selector_persist_path: Option<String>,
+}
+
+/// 解析 selector 选择状态的持久化文件路径
+pub fn resolve_selector_persist_path(config: &Config) -> String {
+    if let Some(tuning) = &config.tuning {
+        if let Some(ref p) = tuning.selector_persist_path {
+            let trimmed = p.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if let Some(gui) = &config.gui {
+        if let Some(ref sp) = gui.stats_persist_path {
+            let trimmed = sp.trim();
+            if !trimmed.is_empty() {
+                let p = std::path::Path::new(trimmed);
+                if let Some(parent) = p.parent() {
+                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let suffix = if stem == "stats" { "" } else { stem.strip_prefix("stats_").unwrap_or(stem) };
+                    let name = if suffix.is_empty() {
+                        "selector_state.json".to_string()
+                    } else {
+                        format!("selector_state_{suffix}.json")
+                    };
+                    return parent.join(name).to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    "/var/lib/mirage-rs/selector_state.json".to_string()
 }
 
 /// 见 `TuningConfig::client_hello_guard` 与 `docs/client-hello-timing-design.md`。
@@ -2503,6 +2674,108 @@ mod validation_tests {
         let mut v = base();
         v["routing"]["default_outbound"] = serde_json::json!("nope");
         assert!(has(&issues_of(&v), "default_outbound"));
+    }
+
+    #[test]
+    fn principle1_default_outbound_inferred_from_first_outbound() {
+        // 未显式写 routing.default_outbound 时，自动取 outbounds 数组第一项的 tag
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "my-first-outbound" },
+            { "type": "block", "tag": "block" }
+        ]);
+        v["routing"].as_object_mut().unwrap().remove("default_outbound");
+
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        assert_eq!(cfg.routing.default_outbound, "my-first-outbound");
+        assert!(issues.is_empty(), "推导出的默认出站存在，不应有语义告警: {issues:?}");
+
+        // routing 整段缺失时，同样取第一项
+        v.as_object_mut().unwrap().remove("routing");
+        let (cfg2, issues2) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        assert_eq!(cfg2.routing.default_outbound, "my-first-outbound");
+        assert!(issues2.is_empty(), "routing 缺失时推导出首项，不应有告警: {issues2:?}");
+    }
+
+    #[test]
+    fn principle1_default_outbound_explicit_precedence() {
+        // 显式指定 default_outbound 时以显式为准
+        let mut v = base();
+        v["outbounds"] = serde_json::json!([
+            { "type": "direct", "tag": "first" },
+            { "type": "block", "tag": "second" }
+        ]);
+        v["routing"]["default_outbound"] = serde_json::json!("second");
+
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        assert_eq!(cfg.routing.default_outbound, "second");
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn principle1_default_outbound_fallback_to_direct_when_outbounds_empty() {
+        // outbounds 缺省时默认 [direct]，推导结果为 direct
+        let v = serde_json::json!({
+            "inbounds": [{ "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 1080 }]
+        });
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        assert_eq!(cfg.routing.default_outbound, "direct");
+        assert!(issues.is_empty());
+
+        // outbounds 为显式空数组 [] 时，默认出站仍为 direct，且校验报错
+        let v_empty = serde_json::json!({
+            "inbounds": [{ "type": "mixed", "tag": "in", "listen": "127.0.0.1", "port": 1080 }],
+            "outbounds": []
+        });
+        let (cfg_empty, issues_empty) = Config::parse_with_diagnostics(&v_empty.to_string()).unwrap();
+        assert_eq!(cfg_empty.routing.default_outbound, "direct");
+        assert!(has(&issues_empty, "routing.default_outbound = `direct` 不存在于 outbounds"));
+    }
+
+    #[test]
+    fn principle1_resolve_default_outbound_from_value() {
+        use super::resolve_default_outbound_from_value;
+
+        // 1. 显式 routing.default_outbound
+        let v1 = serde_json::json!({
+            "outbounds": [{ "tag": "first" }],
+            "routing": { "default_outbound": "custom" }
+        });
+        assert_eq!(resolve_default_outbound_from_value(&v1), "custom");
+
+        // 2. 未写 default_outbound，取 outbounds[0]
+        let v2 = serde_json::json!({
+            "outbounds": [{ "tag": "first" }, { "tag": "second" }],
+            "routing": { "rules": [] }
+        });
+        assert_eq!(resolve_default_outbound_from_value(&v2), "first");
+
+        // 3. routing 整段缺失，取 outbounds[0]
+        let v3 = serde_json::json!({
+            "outbounds": [{ "tag": "first" }]
+        });
+        assert_eq!(resolve_default_outbound_from_value(&v3), "first");
+
+        // 4. 全部缺失，回落 direct
+        let v4 = serde_json::json!({});
+        assert_eq!(resolve_default_outbound_from_value(&v4), "direct");
+
+        // 5. 显式空串原样保留 (不静默换成第一条)
+        let v5 = serde_json::json!({
+            "outbounds": [{ "tag": "first" }],
+            "routing": { "default_outbound": "" }
+        });
+        assert_eq!(resolve_default_outbound_from_value(&v5), "");
+    }
+
+    #[test]
+    fn principle1_explicit_empty_default_outbound_still_reported() {
+        // 显式写成空串是写错, 照旧由 check 报"不存在", 不被第一条出站掩盖
+        let mut v = base();
+        v["routing"]["default_outbound"] = serde_json::json!("");
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        assert_eq!(cfg.routing.default_outbound, "");
+        assert!(has(&issues, "default_outbound"), "空串应报: {issues:?}");
     }
 
     #[test]

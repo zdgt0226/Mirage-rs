@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [v0.17.0] - 出站组随节点自动调整 / 默认出站取第一条出站 / selector 选择持久化 (2026-11-02)
+
+### 升级须知
+
+- **无协议变更**, 与 v0.15.x / v0.16.x 两端互通 (实机: 新服务端 × 新客户端、v0.16.3 客户端 × 新服务端)。Android 内核本版不同步, 下次同步时一并带上默认出站规则变化。
+- **行为变化: 未写 `routing.default_outbound` 时, 默认出站改为 outbounds 第一条** (原为固定 `direct`)。`install.sh` 生成的配置与仓库模板都显式写了 default_outbound, 不受影响; 手写配置若没写且第一条是代理节点, 升级后未命中规则的流量会改走该节点 —— 要保持直连请显式写 `"default_outbound": "direct"`。显式写成空串仍报错。
+- 出站有增减 (新增节点 / 出站组) 的配置改动需要重启生效; 这类改动触发热重载时, 若新路由引用了运行中不存在的出站, 本次重载会被拒绝并在日志提示重启 (原来会导致未命中规则的流量失败)。
+- selector 手动选择保存在 state 目录 (默认 `selector_state_client.json`, 与 `gui.stats_persist_path` 同目录; 可用 `tuning.selector_persist_path` 指定)。
+
+### feat(outbounds): 统一默认出站推导、出站组自动调整与 Selector 持久化 (2026-11-02)
+
+#### 升级须知 (行为变化)
+
+- **默认出站推导规则变更 (原则 1)**: 当 `routing.default_outbound` 缺省时，系统不再无条件固定为 `"direct"`，而是与主流代理工具对齐，**统一取 `outbounds` 列表第一项的 tag**；若 `outbounds` 列表亦为空时才回退至 `"direct"`。已在核心解析层 (`Config` 反序列化及 `resolve_default_outbound_from_value`) 统一收敛，运行时、`check` 校验、热重载、API、CLI 判定完全一致。
+- **存量配置影响评估**: 若历史配置未显式声明 `routing.default_outbound` 且第一项出站不是 `direct`，升级后默认出口将变为该第一项出站。官方样例 (`templates/`、`config.json`) 及安装脚本 (`install.sh`) 生成的配置均已显式指定 `default_outbound` 或首项为 `direct`/`proxy`，出口行为保持不变；如需强制走直连，请在 `routing` 中显式指定 `"default_outbound": "direct"`。
+
+#### 详细改动
+
+- **默认出站统一解析 (原则 1)**: `src/config.rs` 新增 `resolve_default_outbound` 与 `resolve_default_outbound_from_value`，在反序列化规范化阶段确定 `default_outbound`。`check` 严格校验推导出的默认出口是否存在。
+- **出站组自动调整与交互控件 (原则 2)**: 命令行新增节点（`import`、`subscribe`、`mirage-rs config`）后，当代理节点数 ≥ 2 时自动触发建组与加组引导：
+  - 尚未包含出站组时，提供 `auto` (urltest, 默认勾选)、`select` (selector, 默认勾选)、`fallback`、`load_balance` 四类候选组供选择，并针对所选组多选纳入的节点。若同时创建 auto 与 select，select 首项默认引用 auto。新组自动插入 `outbounds` 最前作为默认出站，并询问更新 `routing.default_outbound`。
+  - 已包含出站组时，列出现有组并默认勾选已全量包含其它节点的组，引导新节点加入。
+  - 基于 libc/termios 原生实现复选框交互（空格切换勾选、上下键移动、回车确认，RAII 确保异常恢复终端模式）；非 TTY 环境平滑退回空格分隔编号行输入（回车接受默认, 输错编号提示重输）；非交互/EOF 保持现状不建组。`--group` 现有参数兼容保留。
+- **Selector 选择状态持久化 (任务 B)**: 通过 API (`POST /api/proxies/select`) 手动切换出站组节点后，自动以 0600 权限原子落盘至 `selector_state.json`（路径可通过 `tuning.selector_persist_path` 自定义，默认置于 GUI 统计同级目录）。服务启动时自动恢复选择 (配置热重载本就整体保留出站, 选择不丢)；记录的节点已不在组里时回退首项并清理该记录；只有配了 selector 的配置才读写该文件, 本配置里没有的组的记录不动 (同机服务端 / 客户端共用 state 目录时互不干扰)；持久化异常仅 warn 不中断代理转发。
+- **交互式配置编辑器完整识别四类组 (任务 C)**: `mirage-rs config` 统一采用 `is_group_type` 识别 `urltest`、`fallback`、`selector`、`load_balance` 四种组 (原先只认 urltest / selector, 删除只在 fallback / load_balance 组里引用的节点时不提示、组里留下悬空引用)。在节点列表、引用检测、节点删除时全量覆盖四类出站组并自动同步剔除。
+- **多模型独立审计 (Gemini / Sonnet) 后修复**: selector 切换时写锁只罩切换本身, 落盘 (fsync) 移到阻塞线程池, 不再卡选路; subscribe 批量导入时本次新增的全部节点一起询问入组 (原来只问最后一个); 建组交互按 Ctrl-C 取消时整体中止、不写配置并以 130 退出; 删除推导出的默认出站 (未写 default_outbound 时的第一条) 会被拦下, `mirage-rs config` 的改动 diff 也按推导规则显示默认出站变化; 显式写成空串的 default_outbound 照旧由 check 报错, 不被第一条出站掩盖; 单按 ESC 不再吞掉下一个按键; stdin、stdout 都是终端才进勾选控件 (输出重定向时退回行输入); 光标控制序列写到输出端; 长说明截断避免折行重绘错位; 默认出站不是组时 (如显式 direct) 提示组尚未被使用; `mirage-rs config` 加节点不再先问一遍"加入已有出站组"; 状态文件默认按统计文件名区分 (selector_state_client.json / selector_state_server.json), 临时文件名带 pid 与随机数, 写入软链接时写到链接目标。
+- **第二轮复审后修复**: 热重载时若新路由 (默认出站 / 规则) 引用了运行中出站表里没有的出站 (例如 CLI 刚建的出站组成了默认出站), 拒绝本次重载并保留旧状态、提示重启 —— 原来会照换路由, 未命中规则的流量全部 "outbound not found" 直到重启; selector 落盘在锁内读取内存中的最新选择, 连续快速切换时文件不会停在旧选择; 勾选控件按终端宽度 (中文按 2 列) 截断每一行, 长标题不再折行错位; 支持 SS3 方向键 (`ESC O A/B`), 读按键被信号打断时重读, 光标恢复放进终端守卫 (含 panic 路径); `mirage-rs config` 删除默认出站节点时候选包含出站组与 direct, 中途放弃会撤回已改的默认出站, 引用检查覆盖 `routing.profiles` 里的策略规则; `stats.json` 对应的状态文件名为 `selector_state.json`; 写入软链接目标时为目标所在目录建目录。
+- **安装脚本客户端部署支持多节点与建组 (任务 A)**: `install.sh` 客户端完整版部署完成首个节点后，新增多节点追加循环（`ask_yn "再添加一个节点?"`），支持透传终端交互调用 `mirage-rs import` 接入后续节点并自动建组 (导入失败只告警, 不中断安装)；`tests/install_ui_test.sh` 补充离线模拟测试。
+
 ### style(install): 安装脚本文案与排版整理 (2026-11-02)
 
 - 统一显示层级: 主步骤用 `title` (═ 双线框), 子步骤改用单行 `── 标题 ──` (`section`), 背景说明改为暗色 `note` 与提问区分; 原 `section_box` 的整框改为子标题 + 暗色说明。提问统一缩进 2 格、选项 4 格。

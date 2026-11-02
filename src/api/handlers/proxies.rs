@@ -55,8 +55,16 @@ pub async fn select_proxy(State(app_state): State<AppState>, Json(req): Json<Sel
     if let Some(group_node) = st.outbounds.outbounds.get(&req.group) {
         if let OutboundNode::Selector { children, current, .. } = group_node.as_ref() {
             if let Some(target_node) = children.iter().find(|c| c.tag() == req.target) {
-                let mut curr = current.write().unwrap_or_else(|e| e.into_inner());
-                *curr = Some(target_node.clone());
+                // 写锁只罩住切换本身; 落盘 (含 fsync) 放到阻塞线程池, 不卡选路也不占 tokio worker
+                *current.write().unwrap_or_else(|e| e.into_inner()) = Some(target_node.clone());
+                let (path, group, current) =
+                    (st.outbounds.selector_persist_path.clone(), req.group.clone(), current.clone());
+                tokio::task::spawn_blocking(move || {
+                    // 锁内读内存最新值再写: 连切时落盘顺序乱了也不会把旧选择写成最终结果
+                    crate::proxy::selector_state::save_selector_current(&path, &group, || {
+                        current.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|n| n.tag().to_string())
+                    })
+                });
                 return Json(json!({"status": "success", "message": format!("Switched {} to {}", req.group, req.target)})).into_response();
             }
         }

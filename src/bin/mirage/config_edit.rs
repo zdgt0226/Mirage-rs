@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use serde_json::Value;
+pub use mirage_rs::config::is_group_type;
 
 // ============================================================================
 // 1. 类型定义与特征 (Types & Traits)
@@ -69,6 +70,7 @@ pub struct UserSummary {
 pub enum OutboundRef {
     DefaultOutbound,
     Rule { rule_index: usize },
+    ProfileRule { profile: String, rule_index: usize },
     Group { group_tag: String },
     Underlying { outbound_tag: String },
 }
@@ -78,6 +80,7 @@ impl std::fmt::Display for OutboundRef {
         match self {
             Self::DefaultOutbound => write!(f, "routing.default_outbound 默认出站"),
             Self::Rule { rule_index } => write!(f, "routing.rules[{rule_index}] 路由规则"),
+            Self::ProfileRule { profile, rule_index } => write!(f, "routing.profiles.{profile}[{rule_index}] 策略规则"),
             Self::Group { group_tag } => write!(f, "出站组 `{group_tag}`"),
             Self::Underlying { outbound_tag } => write!(f, "出站 `{outbound_tag}` 的 underlying 链式底座"),
         }
@@ -88,12 +91,19 @@ impl std::fmt::Display for OutboundRef {
 pub trait CommandExecutor {
     fn has_systemctl(&self) -> bool;
     fn execute(&self, cmd: &str, args: &[&str]) -> Result<String, String>;
+    /// 交互输入是否来自真实终端 (决定出站组复选框用空格勾选控件还是行输入)。测试桩默认 false。
+    fn stdin_is_tty(&self) -> bool {
+        false
+    }
 }
 
 /// 生产环境真实系统命令执行器
 pub struct RealCommandExecutor;
 
 impl CommandExecutor for RealCommandExecutor {
+    fn stdin_is_tty(&self) -> bool {
+        unsafe { libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0 }
+    }
     fn has_systemctl(&self) -> bool {
         std::process::Command::new("which")
             .arg("systemctl")
@@ -200,11 +210,7 @@ pub fn get_existing_outbound_tags(root: &Value) -> HashSet<String> {
 
 /// 列出所有 mirage 类型的出站节点
 pub fn list_mirage_outbounds(root: &Value) -> Vec<OutboundSummary> {
-    let default_outbound = root
-        .get("routing")
-        .and_then(|r| r.get("default_outbound"))
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
+    let default_outbound = mirage_rs::config::resolve_default_outbound_from_value(root);
 
     let arr = match root.get("outbounds").and_then(|v| v.as_array()) {
         Some(a) => a,
@@ -216,7 +222,7 @@ pub fn list_mirage_outbounds(root: &Value) -> Vec<OutboundSummary> {
     for o in arr {
         let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let g_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-        if (o_type == "urltest" || o_type == "selector") && !g_tag.is_empty() {
+        if is_group_type(o_type) && !g_tag.is_empty() {
             if let Some(members) = o.get("outbounds").and_then(|m| m.as_array()) {
                 for m in members {
                     if let Some(m_str) = m.as_str() {
@@ -509,11 +515,9 @@ pub fn modify_mirage_outbound(
 pub fn check_outbound_references(root: &Value, tag: &str) -> Vec<OutboundRef> {
     let mut refs = Vec::new();
 
-    // 1. routing.default_outbound
-    if let Some(def) = root.get("routing").and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()) {
-        if def == tag {
-            refs.push(OutboundRef::DefaultOutbound);
-        }
+    // 1. routing.default_outbound (含未显式写时推导出的第一条出站)
+    if mirage_rs::config::resolve_default_outbound_from_value(root) == tag {
+        refs.push(OutboundRef::DefaultOutbound);
     }
 
     // 2. routing.rules[].outbound
@@ -525,13 +529,24 @@ pub fn check_outbound_references(root: &Value, tag: &str) -> Vec<OutboundRef> {
         }
     }
 
-    // 3. urltest / selector 组中的 outbounds
+    // 2b. routing.profiles.<名>[].outbound (设备策略规则)
+    if let Some(profiles) = root.get("routing").and_then(|r| r.get("profiles")).and_then(|p| p.as_object()) {
+        for (name, rules) in profiles {
+            for (i, rule) in rules.as_array().into_iter().flatten().enumerate() {
+                if rule.get("outbound").and_then(|o| o.as_str()) == Some(tag) {
+                    refs.push(OutboundRef::ProfileRule { profile: name.clone(), rule_index: i });
+                }
+            }
+        }
+    }
+
+    // 3. 出站组 (urltest / fallback / selector / load_balance) 中的 outbounds
     if let Some(arr) = root.get("outbounds").and_then(|v| v.as_array()) {
         for o in arr {
             let o_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
             if o_tag == tag { continue; }
             let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if o_type == "urltest" || o_type == "selector" {
+            if is_group_type(o_type) {
                 if let Some(members) = o.get("outbounds").and_then(|m| m.as_array()) {
                     if members.iter().any(|m| m.as_str() == Some(tag)) {
                         refs.push(OutboundRef::Group { group_tag: o_tag.to_string() });
@@ -566,7 +581,7 @@ pub fn delete_outbound(
     if let Some(arr) = root.get_mut("outbounds").and_then(|v| v.as_array_mut()) {
         for o in arr.iter_mut() {
             let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if o_type == "urltest" || o_type == "selector" {
+            if is_group_type(o_type) {
                 if let Some(members) = o.get_mut("outbounds").and_then(|m| m.as_array_mut()) {
                     members.retain(|m| m.as_str() != Some(tag));
                 }
@@ -582,7 +597,7 @@ pub fn delete_outbound(
     Ok(())
 }
 
-/// 将 tag 追加进指定 urltest/selector 组
+/// 将 tag 追加进指定出站组 (urltest/fallback/selector/load_balance)
 pub fn add_tag_to_group(root: &mut Value, group_tag: &str, target_tag: &str) -> Result<(), String> {
     let arr = root
         .get_mut("outbounds")
@@ -595,8 +610,8 @@ pub fn add_tag_to_group(root: &mut Value, group_tag: &str, target_tag: &str) -> 
         .ok_or_else(|| format!("未找到出站组 `{group_tag}`"))?;
 
     let g_type = group.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if g_type != "urltest" && g_type != "selector" {
-        return Err(format!("出站 `{group_tag}` 类型为 `{g_type}`, 不是出站组 (urltest/selector)"));
+    if !is_group_type(g_type) {
+        return Err(format!("出站 `{group_tag}` 类型为 `{g_type}`, 不是出站组"));
     }
 
     if group.get("outbounds").is_none() {
@@ -1199,15 +1214,16 @@ pub fn generate_diff(old: &Value, new: &Value) -> Vec<String> {
     // 3. Routing
     let old_routing = old.get("routing");
     let new_routing = new.get("routing");
-    if old_routing != new_routing {
-        let old_def = old_routing.and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()).unwrap_or("");
-        let new_def = new_routing.and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()).unwrap_or("");
-        if old_def != new_def {
-            diffs.push(format!("~ routing.default_outbound: `{old_def}` -> `{new_def}`"));
-        }
-        if old_routing.and_then(|r| r.get("rules")) != new_routing.and_then(|r| r.get("rules")) {
-            diffs.push("~ routing.rules 规则列表发生变动".to_string());
-        }
+    // 默认出站按推导规则比 (未显式写时取第一条出站, 调整出站顺序也可能改变它)
+    let old_def = mirage_rs::config::resolve_default_outbound_from_value(old);
+    let new_def = mirage_rs::config::resolve_default_outbound_from_value(new);
+    if old_def != new_def {
+        diffs.push(format!("~ routing.default_outbound: `{old_def}` -> `{new_def}`"));
+    }
+    if old_routing != new_routing
+        && old_routing.and_then(|r| r.get("rules")) != new_routing.and_then(|r| r.get("rules"))
+    {
+        diffs.push("~ routing.rules 规则列表发生变动".to_string());
     }
 
     // 4. Tuning
@@ -1455,8 +1471,8 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                     let brutal_str = prompt_line(reader, writer, "下载限速速率 (brutal_rate_mbps, 留空默认):");
                     let brutal_rate_mbps = brutal_str.parse::<u64>().ok();
 
-                    let grp_prompt = prompt_line(reader, writer, "加入已有出站组 (如 auto / selector, 留空不加):");
-                    let group = if grp_prompt.is_empty() { None } else { Some(grp_prompt.as_str()) };
+                    // 加入哪些出站组由随后的建组交互 (group_adjust) 统一询问, 这里不再单独问
+                    let group: Option<&str> = None;
 
                     match add_mirage_outbound_manual(
                         &mut root,
@@ -1484,8 +1500,8 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                 } else {
                     let uri = prompt_line(reader, writer, "请输入 mirage:// 链接:");
                     let tag = prompt_line(reader, writer, "请输入该节点的出站 tag:");
-                    let grp_prompt = prompt_line(reader, writer, "加入已有出站组 (如 auto / selector, 留空不加):");
-                    let group = if grp_prompt.is_empty() { None } else { Some(grp_prompt.as_str()) };
+                    // 加入哪些出站组由随后的建组交互 (group_adjust) 统一询问, 这里不再单独问
+                    let group: Option<&str> = None;
 
                     match add_mirage_outbound_from_uri(&mut root, &uri, &tag, group) {
                         Ok(_) => {
@@ -1503,6 +1519,16 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                         }
                     }
                 };
+
+                if let Some((ref added_tag, ..)) = new_tag {
+                    if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, executor.stdin_is_tty(), std::slice::from_ref(added_tag)) {
+                        if e == super::group_adjust::CANCELLED {
+                            writeln!(writer, "已跳过建组 (节点已加入本次待保存的改动, 不想要可在退出时放弃保存)。").map_err(|e| e.to_string())?;
+                        } else {
+                            writeln!(writer, "⚠ 调整出站组提示: {e}").map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
 
                 if need_probe {
                     if let Some((tag, host, port, pwd, sni, trans)) = new_tag {
@@ -1613,9 +1639,13 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                         writeln!(writer, "  · {r}").map_err(|e| e.to_string())?;
                     }
 
+                    // 删除中途取消 / 放弃时整体回滚 (含已改的默认出站)
+                    let snapshot = root.clone();
                     if refs.iter().any(|r| matches!(r, OutboundRef::DefaultOutbound)) {
                         writeln!(writer, "由于该节点是全局默认出站，必须先选定新的默认出站才能删除。").map_err(|e| e.to_string())?;
-                        let other_tags: Vec<_> = mirage_nodes.iter().filter(|n| n.tag != tag).map(|n| n.tag.clone()).collect();
+                        // 候选: 除它以外的全部出站 (节点 / 出站组 / direct 等)
+                        let mut other_tags: Vec<_> = get_existing_outbound_tags(&root).into_iter().filter(|t| t != &tag).collect();
+                        other_tags.sort();
                         if other_tags.is_empty() {
                             writeln!(writer, "✗ 没有其它可用出站，无法删除唯一出站。").map_err(|e| e.to_string())?;
                             continue;
@@ -1634,6 +1664,7 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                     let non_group = remaining_refs.iter().any(|r| !matches!(r, OutboundRef::Group { .. }));
                     if non_group {
                         writeln!(writer, "✗ 该节点仍被规则或链式底座引用，请先修改对应规则后重试。").map_err(|e| e.to_string())?;
+                        root = snapshot;
                         continue;
                     }
 
@@ -1644,7 +1675,8 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                             writeln!(writer, "✓ 节点 `{tag}` 已从配置中删除。").map_err(|e| e.to_string())?;
                         }
                     } else {
-                        writeln!(writer, "操作已取消。").map_err(|e| e.to_string())?;
+                        root = snapshot;
+                        writeln!(writer, "操作已取消 (默认出站等改动已一并撤回)。").map_err(|e| e.to_string())?;
                     }
                 } else if prompt_yes_no(reader, writer, &format!("确认删除节点 `{tag}`？"), false) {
                     if let Err(e) = delete_outbound(&mut root, &tag, false) {
@@ -1656,7 +1688,7 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
             }
             "5" if has_mirage_nodes => {
                 let tags = get_existing_outbound_tags(&root);
-                let cur = root.get("routing").and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()).unwrap_or("");
+                let cur = mirage_rs::config::resolve_default_outbound_from_value(&root);
                 writeln!(writer, "现有所有出站/组 tag: {}", tags.into_iter().collect::<Vec<_>>().join(", ")).map_err(|e| e.to_string())?;
                 writeln!(writer, "当前默认出站: `{cur}`").map_err(|e| e.to_string())?;
                 let new_def = prompt_line(reader, writer, "请输入要设为默认出站的 tag:");
@@ -2379,6 +2411,72 @@ mod tests {
         let group_members = root["outbounds"][1]["outbounds"].as_array().unwrap();
         assert_eq!(group_members.len(), 1);
         assert_eq!(group_members[0].as_str(), Some("proxy-2"));
+    }
+
+    #[test]
+    fn test_inferred_default_outbound_counts_as_reference() {
+        // 未写 default_outbound 时第一条出站就是默认出站: 删它要被拦, 否则默认会静默换成下一条 (可能是 block)
+        let root = json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "proxy", "server": "203.0.113.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "block", "tag": "block" }
+            ],
+            "routing": { "rules": [] }
+        });
+        assert!(check_outbound_references(&root, "proxy").contains(&OutboundRef::DefaultOutbound));
+        // 设备策略 (routing.profiles) 里的规则引用也算
+        let mut rp = root.clone();
+        rp["routing"]["default_outbound"] = json!("block");
+        rp["routing"]["profiles"] = json!({ "kids": [ { "outbound": "proxy", "domain_suffix": ["example.com"] } ] });
+        assert!(check_outbound_references(&rp, "proxy")
+            .contains(&OutboundRef::ProfileRule { profile: "kids".into(), rule_index: 0 }));
+        let mut r = root.clone();
+        assert!(delete_outbound(&mut r, "proxy", true).is_err());
+    }
+
+    #[test]
+    fn test_all_four_group_types_recognized_and_cleaned() {
+        let mut root = json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "n1", "server": "203.0.113.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "n2", "server": "203.0.113.2", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "urltest", "tag": "grp-ut", "outbounds": ["n1", "n2"] },
+                { "type": "fallback", "tag": "grp-fb", "outbounds": ["n1", "n2"] },
+                { "type": "selector", "tag": "grp-sel", "outbounds": ["n1", "n2"] },
+                { "type": "load_balance", "tag": "grp-lb", "outbounds": ["n1", "n2"], "strategy": "round-robin" },
+                { "type": "direct", "tag": "direct" }
+            ],
+            "routing": {
+                "default_outbound": "direct",
+                "rules": []
+            }
+        });
+
+        // 1. check_outbound_references 必须识别全部四种组
+        let refs = check_outbound_references(&root, "n1");
+        assert_eq!(refs.len(), 4);
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-ut".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-fb".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-sel".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-lb".to_string() }));
+
+        // 2. add_tag_to_group 必须支持全部四种组 (含 fallback / load_balance)
+        let mut r2 = root.clone();
+        for g in ["grp-fb", "grp-lb"] {
+            r2["outbounds"].as_array_mut().unwrap().iter_mut().find(|o| o["tag"] == g).unwrap()["outbounds"] = json!(["n1"]);
+            add_tag_to_group(&mut r2, g, "n2").unwrap();
+            let grp = r2["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == g).unwrap();
+            assert_eq!(grp["outbounds"], json!(["n1", "n2"]), "{g}");
+        }
+
+        // 3. delete_outbound 成功将 n1 从全部四类组中清理
+        assert!(delete_outbound(&mut root, "n1", true).is_ok());
+        for g_tag in ["grp-ut", "grp-fb", "grp-sel", "grp-lb"] {
+            let g = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == g_tag).unwrap();
+            let members = g["outbounds"].as_array().unwrap();
+            assert!(!members.iter().any(|m| m.as_str() == Some("n1")), "{g_tag} 中不应再包含 n1");
+            assert!(members.iter().any(|m| m.as_str() == Some("n2")), "{g_tag} 中应保留 n2");
+        }
     }
 
     #[test]
