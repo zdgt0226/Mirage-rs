@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [v0.17.1] - `/api/proxies` 补全出站组信息 (2026-11-02)
+
+- **无协议变更**, 与 v0.17.0 及更早版本两端互通; 只新增 API 字段, 老控制台不受影响。配套 Mirage-console 出站组切换界面已上线。
+
 ### feat(api): `/api/proxies` 补全出站组信息 (2026-11-02)
 
 - 新增返回 `fallback` / `load_balance` 组 (`type` 为 `Fallback` / `LoadBalance`, 只读); 原来只返回 selector / urltest, 控制台看不到这两类组。
