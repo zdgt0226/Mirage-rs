@@ -3023,11 +3023,15 @@ client_import_additional_nodes() {
             continue
         fi
         info "正在导入节点: ${NODE_HOST}:${NODE_PORT} (sni=${NODE_SNI})..."
-        if [[ -r /dev/tty && -w /dev/tty ]]; then
-            "$BIN_PATH" import -c "$cfg" "$more_uri" </dev/tty
+        # import 失败 (tag 冲突取消 / 配置写回失败等) 不能让 set -e 中断整个安装
+        local rc=0
+        # 实际试开 /dev/tty: 无控制终端时 -r 测试为真但打开会失败
+        if { : </dev/tty; } 2>/dev/null; then
+            "$BIN_PATH" import -c "$cfg" "$more_uri" </dev/tty || rc=$?
         else
-            "$BIN_PATH" import -c "$cfg" "$more_uri"
+            "$BIN_PATH" import -c "$cfg" "$more_uri" || rc=$?
         fi
+        (( rc == 0 )) || warn "节点导入失败 (退出码 $rc), 配置未改动, 可重试或稍后用 mirage-rs import 添加"
     done
 }
 

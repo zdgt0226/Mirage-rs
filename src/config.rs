@@ -766,7 +766,7 @@ impl OutboundConfig {
 pub fn is_group_type(t: &str) -> bool {
     matches!(
         t,
-        "urltest" | "fallback" | "selector" | "load_balance" | "load-balance"
+        "urltest" | "fallback" | "selector" | "load_balance"
     )
 }
 

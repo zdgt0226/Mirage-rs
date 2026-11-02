@@ -15,10 +15,10 @@
 - **出站组自动调整与交互控件 (原则 2)**: 命令行新增节点（`import`、`subscribe`、`mirage-rs config`）后，当代理节点数 ≥ 2 时自动触发建组与加组引导：
   - 尚未包含出站组时，提供 `auto` (urltest, 默认勾选)、`select` (selector, 默认勾选)、`fallback`、`load_balance` 四类候选组供选择，并针对所选组多选纳入的节点。若同时创建 auto 与 select，select 首项默认引用 auto。新组自动插入 `outbounds` 最前作为默认出站，并询问更新 `routing.default_outbound`。
   - 已包含出站组时，列出现有组并默认勾选已全量包含其它节点的组，引导新节点加入。
-  - 基于 libc/termios 原生实现复选框交互（空格切换勾选、上下键移动、回车确认，RAII 确保异常恢复终端模式）；非 TTY 环境平滑退回空格分隔编号行输入（回车接受默认）；非交互/EOF 保持现状不建组。`--group` 现有参数兼容保留。
-- **Selector 选择状态持久化 (任务 B)**: 通过 API (`POST /api/proxies/select`) 手动切换出站组节点后，自动以 0600 权限原子落盘至 `selector_state.json`（路径可通过 `tuning.selector_persist_path` 自定义，默认置于 GUI 统计同级目录）。服务启动与热重载时自动恢复选择；热重载时内存选择优先于文件，目标节点不存在时自动回退首项并清理无效记录；持久化异常仅 warn 不中断代理转发。
-- **交互式配置编辑器完整识别四类组 (任务 C)**: `mirage-rs config` 统一采用 `is_group_type` 识别 `urltest`、`fallback`、`selector`、`load_balance`（及 `load-balance` 别名）。在节点列表、引用检测、节点删除时全量覆盖四类出站组并自动同步剔除。
-- **安装脚本客户端部署支持多节点与建组 (任务 A)**: `install.sh` 客户端完整版部署完成首个节点后，新增多节点追加循环（`ask_yn "再添加一个节点?"`），支持透传终端交互调用 `mirage-rs import` 接入后续节点并自动建组；`tests/install_ui_test.sh` 补充离线模拟测试。
+  - 基于 libc/termios 原生实现复选框交互（空格切换勾选、上下键移动、回车确认，RAII 确保异常恢复终端模式）；非 TTY 环境平滑退回空格分隔编号行输入（回车接受默认, 输错编号提示重输）；非交互/EOF 保持现状不建组。`--group` 现有参数兼容保留。
+- **Selector 选择状态持久化 (任务 B)**: 通过 API (`POST /api/proxies/select`) 手动切换出站组节点后，自动以 0600 权限原子落盘至 `selector_state.json`（路径可通过 `tuning.selector_persist_path` 自定义，默认置于 GUI 统计同级目录）。服务启动时自动恢复选择 (配置热重载本就整体保留出站, 选择不丢)；记录的节点已不在组里时回退首项并清理该记录；只有配了 selector 的配置才读写该文件, 本配置里没有的组的记录不动 (同机服务端 / 客户端共用 state 目录时互不干扰)；持久化异常仅 warn 不中断代理转发。
+- **交互式配置编辑器完整识别四类组 (任务 C)**: `mirage-rs config` 统一采用 `is_group_type` 识别 `urltest`、`fallback`、`selector`、`load_balance` 四种组 (原先只认 urltest / selector, 删除只在 fallback / load_balance 组里引用的节点时不提示、组里留下悬空引用)。在节点列表、引用检测、节点删除时全量覆盖四类出站组并自动同步剔除。
+- **安装脚本客户端部署支持多节点与建组 (任务 A)**: `install.sh` 客户端完整版部署完成首个节点后，新增多节点追加循环（`ask_yn "再添加一个节点?"`），支持透传终端交互调用 `mirage-rs import` 接入后续节点并自动建组 (导入失败只告警, 不中断安装)；`tests/install_ui_test.sh` 补充离线模拟测试。
 
 ### style(install): 安装脚本文案与排版整理 (2026-11-02)
 

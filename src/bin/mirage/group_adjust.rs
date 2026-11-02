@@ -231,16 +231,21 @@ fn run_line_checkbox(
     for line in state.render_line_prompt() {
         writeln!(writer, "{line}").map_err(|e| e.to_string())?;
     }
-    write!(writer, "> ").map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
+    loop {
+        write!(writer, "> ").map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())?;
 
-    let mut line = String::new();
-    if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-        // EOF 无输入: 保持现状不建组
-        return Ok(Vec::new());
+        let mut line = String::new();
+        if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            // EOF 无输入: 保持现状不建组
+            return Ok(Vec::new());
+        }
+        // 输错编号就重输, 不整段放弃
+        match state.apply_line_input(&line) {
+            Ok(()) => break,
+            Err(e) => writeln!(writer, "  {e}, 请重新输入。").map_err(|e| e.to_string())?,
+        }
     }
-
-    state.apply_line_input(&line)?;
     let selected = state.checked_keys();
     writeln!(writer, "  已选择: [{}]", selected.join(", ")).map_err(|e| e.to_string())?;
     Ok(selected)

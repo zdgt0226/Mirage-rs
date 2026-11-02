@@ -89,12 +89,19 @@ impl std::fmt::Display for OutboundRef {
 pub trait CommandExecutor {
     fn has_systemctl(&self) -> bool;
     fn execute(&self, cmd: &str, args: &[&str]) -> Result<String, String>;
+    /// 交互输入是否来自真实终端 (决定出站组复选框用空格勾选控件还是行输入)。测试桩默认 false。
+    fn stdin_is_tty(&self) -> bool {
+        false
+    }
 }
 
 /// 生产环境真实系统命令执行器
 pub struct RealCommandExecutor;
 
 impl CommandExecutor for RealCommandExecutor {
+    fn stdin_is_tty(&self) -> bool {
+        unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
+    }
     fn has_systemctl(&self) -> bool {
         std::process::Command::new("which")
             .arg("systemctl")
@@ -1502,7 +1509,7 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                 };
 
                 if let Some((ref added_tag, ..)) = new_tag {
-                    if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, false, Some(added_tag)) {
+                    if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, executor.stdin_is_tty(), Some(added_tag)) {
                         writeln!(writer, "⚠ 调整出站组提示: {e}").map_err(|e| e.to_string())?;
                     }
                 }
@@ -2394,7 +2401,6 @@ mod tests {
                 { "type": "fallback", "tag": "grp-fb", "outbounds": ["n1", "n2"] },
                 { "type": "selector", "tag": "grp-sel", "outbounds": ["n1", "n2"] },
                 { "type": "load_balance", "tag": "grp-lb", "outbounds": ["n1", "n2"], "strategy": "round-robin" },
-                { "type": "load-balance", "tag": "grp-lb-alias", "outbounds": ["n1"], "strategy": "round-robin" },
                 { "type": "direct", "tag": "direct" }
             ],
             "routing": {
@@ -2403,23 +2409,26 @@ mod tests {
             }
         });
 
-        // 1. check_outbound_references 必须识别全部四种组 (及 alias)
+        // 1. check_outbound_references 必须识别全部四种组
         let refs = check_outbound_references(&root, "n1");
-        assert_eq!(refs.len(), 5);
+        assert_eq!(refs.len(), 4);
         assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-ut".to_string() }));
         assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-fb".to_string() }));
         assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-sel".to_string() }));
         assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-lb".to_string() }));
-        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-lb-alias".to_string() }));
 
-        // 2. add_tag_to_group 必须支持全部四种组
-        add_tag_to_group(&mut root, "grp-lb-alias", "n2").unwrap();
-        let lb_alias = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grp-lb-alias").unwrap();
-        assert_eq!(lb_alias["outbounds"], json!(["n1", "n2"]));
+        // 2. add_tag_to_group 必须支持全部四种组 (含 fallback / load_balance)
+        let mut r2 = root.clone();
+        for g in ["grp-fb", "grp-lb"] {
+            r2["outbounds"].as_array_mut().unwrap().iter_mut().find(|o| o["tag"] == g).unwrap()["outbounds"] = json!(["n1"]);
+            add_tag_to_group(&mut r2, g, "n2").unwrap();
+            let grp = r2["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == g).unwrap();
+            assert_eq!(grp["outbounds"], json!(["n1", "n2"]), "{g}");
+        }
 
         // 3. delete_outbound 成功将 n1 从全部四类组中清理
         assert!(delete_outbound(&mut root, "n1", true).is_ok());
-        for g_tag in ["grp-ut", "grp-fb", "grp-sel", "grp-lb", "grp-lb-alias"] {
+        for g_tag in ["grp-ut", "grp-fb", "grp-sel", "grp-lb"] {
             let g = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == g_tag).unwrap();
             let members = g["outbounds"].as_array().unwrap();
             assert!(!members.iter().any(|m| m.as_str() == Some("n1")), "{g_tag} 中不应再包含 n1");

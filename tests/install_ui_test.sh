@@ -342,6 +342,18 @@ EOF
     has_auto=$(python3 -c 'import json; obs=[o["tag"] for o in json.load(open("'$cfg'"))["outbounds"]]; print("yes" if "auto" in obs and "select" in obs else "no")')
     eq_ "B7.2  配置中包含 auto 和 select 出站组" "$has_auto" "yes"
 
+    # B7.3 import 失败 (桩返回 1) 不能让 set -e 中断安装, 循环照常结束
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$mock_bin"
+    BIN_PATH="$mock_bin"
+    local rc=0
+    ( set -e
+      ask_yn() { if [[ -z "${_once:-}" ]]; then _once=1; return 0; fi; return 1; }
+      ask() { echo "mirage://secret@192.0.2.3:443?sni=example.com"; }
+      client_import_additional_nodes "$cfg" 2>/dev/null
+      echo reached ) > "$d/out" || rc=$?
+    BIN_PATH="$old_bin"
+    eq_ "B7.3  import 失败不中断安装 (set -e 下继续)" "$rc:$(cat "$d/out")" "0:reached"
+
     rm -rf "$d"
 }
 
