@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.0-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.1-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -397,6 +397,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.1** | 2026-11-02 | **无协议变更**: `/api/proxies` 补全 fallback / load_balance 组, 新增默认出站 `default` 与成员健康状态 `healthy`, 组按名称排序; 配套 Mirage-console 出站组切换界面 (四类组、默认出站标记、切换反馈)。 |
 | **v0.17.0** | 2026-11-02 | **无协议变更**: 命令行加到 2 个以上节点时自动引导建出站组 (auto / select / fallback / load_balance, 终端里空格勾选成员); 未写 `default_outbound` 时默认出站取 outbounds 第一条 (原为 direct); selector 手动选择持久化, 重启后保留; 出站增减的改动热重载时若会让路由失效则拒绝并提示重启; `install.sh` 客户端部署可连续添加多个节点, 并整理全部提示文案与排版。 |
 | **v0.16.3** | 2026-10-29 | **无协议变更**: `install.sh` 修菜单 9 报错与 tcp-brutal 版本识别；部署可添加多个上游并逐条分流；WG 上游可导入 wgcf / wg-quick 配置文件；菜单 9 新增入口 → 出口绑定；安装脚本测试进 CI。 |
 | **v0.16.2** | 2026-10-28 | **无协议变更 (可单端升级)**: 纯服务端配置不再重复加载 geosite / geoip；非 mux UDP 经 WG 出口时解析结果会话内缓存 (隧道 DNS 不通不再拖住上行)；QUIC 口令错误首个请求即告警。 |
