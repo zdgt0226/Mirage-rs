@@ -67,7 +67,7 @@
 - **POST `/api/clients/block`** `{ ip: "1.2.3.4", blocked: true }` → `{ status:"success", ip, blocked }` | `{ status:"error", message:"invalid IP" }` — 屏蔽/解屏蔽。**鉴权+CSRF**。
 
 ### 4.2 出站组切换 (Selector/Urltest)
-- **GET `/api/proxies`** → `{ proxies: [{ tag, type: "Selector"|"UrlTest", children: [{ tag, latency_rtt_ms, latency_http_ms }], selected: "tag" }] }`
+- **GET `/api/proxies`** → `{ default: "tag", proxies: [{ tag, type: "Selector"|"UrlTest"|"Fallback"|"LoadBalance", children: [{ tag, latency_rtt_ms, latency_http_ms, healthy }], selected: "tag" }] }`。`default` = 当前生效默认出站; 组按 tag 排序; `selected` 为当前生效的直接子成员 (`LoadBalance` 轮询无固定选择, 以及 `UrlTest` 尚未首次选出时, 为空串)。
 - **POST `/api/proxies/select`** `{ group: "auto", target: "node-hk" }` → `{ status:"success", message }` | `{ status:"error", message:"Group or target not found" }`。**鉴权+CSRF**。仅 `Selector` 组可手切。
 
 ### 4.3 路由规则读写

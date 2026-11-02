@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### feat(api): `/api/proxies` 补全出站组信息 (2026-11-02)
+
+- 新增返回 `fallback` / `load_balance` 组 (`type` 为 `Fallback` / `LoadBalance`, 只读); 原来只返回 selector / urltest, 控制台看不到这两类组。
+- 顶层新增 `default` (当前生效默认出站), 子成员新增 `healthy`; 只新增字段, 老前端不受影响。
+- 组按 tag 排序返回 (原按 HashMap 顺序, 控制台每次轮询组卡片顺序会变)。
+
 ## [v0.17.0] - 出站组随节点自动调整 / 默认出站取第一条出站 / selector 选择持久化 (2026-11-02)
 
 ### 升级须知
