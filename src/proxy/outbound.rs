@@ -165,7 +165,8 @@ impl OutboundNode {
                     .unwrap();
 
                 let mut curr_guard = current.write().unwrap_or_else(|e| e.into_inner());
-                if let Some(curr) = curr_guard.as_ref() {
+                // 迟滞只保护健康的当前节点: 死节点的历史延迟样本不清空, 不判健康会一直黏在死节点上
+                if let Some(curr) = curr_guard.as_ref().filter(|c| c.is_healthy()) {
                     if let Some(curr_lat) = curr.latency_ms(test_type) {
                         if curr_lat <= best.1 + *tolerance_ms {
                             return curr.resolve_leaf();
@@ -1203,5 +1204,97 @@ mod selector_tests {
         assert_eq!(sel_node.resolve_leaf().tag(), "c1", "损坏文件应忽略并取首个节点");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}
+
+#[cfg(test)]
+mod urltest_tests {
+    use super::*;
+    use crate::proxy::pool::{BrutalState, PoolConfig, WarmPool};
+
+    /// 建连永远失败的 Mirage 节点: 健康/延迟完全由测试手动写 pool.stats 控制。
+    fn mirage(tag: &str) -> Arc<OutboundNode> {
+        let cfg = Arc::new(PoolConfig {
+            server_host: "192.0.2.1".into(),
+            server_port: 443,
+            password: "test-only".into(),
+            camouflage_host: "example.com".into(),
+            pool_size: 1,
+            underlying: None,
+            pfs: false,
+            transport: crate::config::Transport::Tcp,
+            quic_window_mb: 4,
+            quic_erasure_cc: true,
+            quic_sni: "example.com".into(),
+            quic_low_src_port: false,
+            quic_pre_packet: false,
+            quic_obfs: None,
+            quic_pin: None,
+        });
+        let brutal = Arc::new(BrutalState {
+            configured_rate: None,
+            current_rate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            base_rtt: None,
+            active_fds: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        });
+        let pool = Arc::new(WarmPool::new_with_connect_fn(
+            cfg,
+            brutal,
+            Arc::new(|_, _| Box::pin(async { anyhow::bail!("test: never connects") })),
+        ));
+        Arc::new(OutboundNode::Mirage {
+            tag: tag.into(),
+            pool,
+            server_host: "192.0.2.1".into(),
+            server_port: 443,
+            server_ip: Arc::new(RwLock::new(None)),
+            rtt_ms: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            snd_cwnd: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            total_retrans: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            total_segs_out: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        })
+    }
+
+    fn stats(node: &Arc<OutboundNode>) -> std::sync::RwLockWriteGuard<'_, crate::proxy::pool::PoolStats> {
+        let OutboundNode::Mirage { pool, .. } = node.as_ref() else { unreachable!() };
+        pool.stats.write().unwrap()
+    }
+
+    fn urltest(children: Vec<Arc<OutboundNode>>, current: Option<Arc<OutboundNode>>) -> Arc<OutboundNode> {
+        Arc::new(OutboundNode::Urltest {
+            tag: "auto".into(),
+            children,
+            tolerance_ms: 50,
+            test_type: "http".into(),
+            current: Arc::new(RwLock::new(current)),
+        })
+    }
+
+    /// 当前节点判死但历史延迟仍在容差内时必须切走, 不能黏在死节点上。
+    #[tokio::test]
+    async fn dead_incumbent_within_tolerance_is_replaced() {
+        let a = mirage("a");
+        let b = mirage("b");
+        stats(&a).record_latency(80);
+        stats(&b).record_latency(100);
+        for _ in 0..3 {
+            stats(&a).record_failure();
+        }
+        assert!(!a.is_healthy());
+        let g = urltest(vec![a.clone(), b.clone()], Some(a.clone()));
+        assert_eq!(g.resolve_leaf().tag(), "b");
+        let OutboundNode::Urltest { current, .. } = g.as_ref() else { unreachable!() };
+        assert_eq!(current.read().unwrap().as_ref().unwrap().tag(), "b");
+    }
+
+    /// 健康的当前节点在容差内仍保留 (迟滞不变)。
+    #[tokio::test]
+    async fn healthy_incumbent_within_tolerance_is_kept() {
+        let a = mirage("a");
+        let b = mirage("b");
+        stats(&a).record_latency(120);
+        stats(&b).record_latency(100);
+        let g = urltest(vec![a.clone(), b], Some(a));
+        assert_eq!(g.resolve_leaf().tag(), "a");
     }
 }
