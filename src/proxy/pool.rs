@@ -71,10 +71,15 @@ impl Drop for ActiveFdGuard {
     }
 }
 
+pub const DEAD_AFTER_FAILURES: u32 = 3;
+pub const RECOVER_AFTER_SUCCESSES: u32 = 2;
+
 #[derive(Debug)]
 pub struct PoolStats {
     pub latency_samples: VecDeque<u64>,
     pub consecutive_failures: u32,
+    pub consecutive_successes: u32,
+    pub dead: bool,
     pub last_sample_time: Option<Instant>,
     pub last_failure_time: Option<Instant>,
 }
@@ -90,6 +95,8 @@ impl PoolStats {
         Self {
             latency_samples: VecDeque::with_capacity(10),
             consecutive_failures: 0,
+            consecutive_successes: 0,
+            dead: false,
             last_sample_time: None,
             last_failure_time: None,
         }
@@ -103,11 +110,19 @@ impl PoolStats {
         self.last_sample_time = Some(Instant::now());
         self.consecutive_failures = 0;
         self.last_failure_time = None;
+        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+        if self.dead && self.consecutive_successes >= RECOVER_AFTER_SUCCESSES {
+            self.dead = false;
+        }
     }
 
     pub fn record_failure(&mut self) {
         self.consecutive_failures += 1;
         self.last_failure_time = Some(Instant::now());
+        self.consecutive_successes = 0;
+        if self.consecutive_failures >= DEAD_AFTER_FAILURES {
+            self.dead = true;
+        }
     }
 
     pub fn latency_ms(&self) -> Option<u64> {
@@ -120,7 +135,15 @@ impl PoolStats {
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.consecutive_failures < 3
+        !self.dead
+    }
+
+    pub fn on_network_change(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_failure_time = None;
+        if self.dead {
+            self.consecutive_successes = RECOVER_AFTER_SUCCESSES.saturating_sub(1);
+        }
     }
 }
 
@@ -581,6 +604,8 @@ impl WarmPool {
         // 已失效, 直接 clear 让 Drop 关 fd (不 close_notify, 网络已变多半发不出去)。
         {
             let flush_q = queue.clone();
+            let flush_stats = stats.clone();
+            let flush_demand = demand_notify.clone();
             let mut net_rx = crate::net_monitor::subscribe();
             let shutdown_net = shutdown.clone();
             let net_exit = net_shutdown_notify.clone();
@@ -606,6 +631,11 @@ impl WarmPool {
                             if n > 0 {
                                 info!("WarmPool: 检测到网络变更, 清空 {} 条旧隧道, builder 将用新路径重建", n);
                             }
+                            {
+                                let mut s = flush_stats.write().unwrap_or_else(|e| e.into_inner());
+                                s.on_network_change();
+                            }
+                            flush_demand.notify_one();
                         }
                     }
                 }
@@ -1463,6 +1493,99 @@ mod backoff_tests {
         stats.record_latency(42);
         assert_eq!(stats.consecutive_failures, 0);
         assert!(stats.last_failure_time.is_none());
+    }
+
+    #[test]
+    fn test_pool_stats_health_hysteresis() {
+        let mut stats = PoolStats::new();
+        // 初始健康
+        assert!(stats.is_healthy());
+        assert!(!stats.dead);
+        assert_eq!(stats.consecutive_successes, 0);
+
+        // 连续失败 2 次仍健康, 第 3 次判死
+        stats.record_failure();
+        assert!(stats.is_healthy());
+        assert!(!stats.dead);
+        stats.record_failure();
+        assert!(stats.is_healthy());
+        assert!(!stats.dead);
+        stats.record_failure();
+        assert!(!stats.is_healthy());
+        assert!(stats.dead);
+
+        // 判死后成功 1 次仍不健康, 连续成功 2 次恢复
+        stats.record_latency(10);
+        assert_eq!(stats.consecutive_successes, 1);
+        assert!(!stats.is_healthy());
+        assert!(stats.dead);
+        stats.record_latency(10);
+        assert_eq!(stats.consecutive_successes, 2);
+        assert!(stats.is_healthy());
+        assert!(!stats.dead);
+
+        // 判死后 成功-失败-成功 交替不恢复 (失败会把 consecutive_successes 清零)
+        stats.record_failure();
+        stats.record_failure();
+        stats.record_failure();
+        assert!(stats.dead);
+        assert!(!stats.is_healthy());
+
+        stats.record_latency(10);
+        assert_eq!(stats.consecutive_successes, 1);
+        assert!(!stats.is_healthy());
+        assert!(stats.dead);
+
+        stats.record_failure();
+        assert_eq!(stats.consecutive_successes, 0);
+        assert!(!stats.is_healthy());
+        assert!(stats.dead);
+
+        stats.record_latency(10);
+        assert_eq!(stats.consecutive_successes, 1);
+        assert!(!stats.is_healthy());
+        assert!(stats.dead);
+    }
+
+    #[test]
+    fn test_pool_stats_on_network_change() {
+        // 判死后调用 on_network_change: consecutive_failures == 0、last_failure_time.is_none()、仍 dead, 之后成功 1 次即恢复
+        let mut stats = PoolStats::new();
+        for _ in 0..DEAD_AFTER_FAILURES {
+            stats.record_failure();
+        }
+        assert!(stats.dead);
+        assert!(!stats.is_healthy());
+        assert_eq!(stats.consecutive_failures, 3);
+        assert!(stats.last_failure_time.is_some());
+
+        stats.on_network_change();
+        assert_eq!(stats.consecutive_failures, 0);
+        assert!(stats.last_failure_time.is_none());
+        assert!(stats.dead);
+        assert!(!stats.is_healthy());
+        assert_eq!(stats.consecutive_successes, RECOVER_AFTER_SUCCESSES - 1);
+
+        // 之后成功 1 次即恢复
+        stats.record_latency(15);
+        assert!(stats.is_healthy());
+        assert!(!stats.dead);
+
+        // 健康节点调用 on_network_change 不影响健康, consecutive_successes 不被改动
+        let mut healthy = PoolStats::new();
+        assert!(healthy.is_healthy());
+        assert_eq!(healthy.consecutive_successes, 0);
+
+        healthy.record_latency(20);
+        assert_eq!(healthy.consecutive_successes, 1);
+        assert!(healthy.is_healthy());
+
+        healthy.on_network_change();
+        assert!(healthy.is_healthy());
+        assert!(!healthy.dead);
+        assert_eq!(healthy.consecutive_successes, 1);
+        assert_eq!(healthy.consecutive_failures, 0);
+        assert!(healthy.last_failure_time.is_none());
     }
 
     fn test_pool_config() -> Arc<PoolConfig> {
