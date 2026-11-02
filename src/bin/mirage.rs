@@ -464,17 +464,33 @@ fn apply_urltest_group(root: &mut serde_json::Value, group_tag: &str, opts: &Gro
     if let Some(v) = &opts.url { group["url"] = serde_json::json!(v); }
     if let Some(v) = &opts.test_type { group["test_type"] = serde_json::json!(v); }
     // 把默认出站指向组 = 按 RTT 自动选路 (显式 --group 请求的核心动作)。
-    let old_default = root
-        .get("routing")
-        .and_then(|r| r.get("default_outbound"))
-        .and_then(|d| d.as_str())
-        .map(|s| s.to_string());
+    let old_default = Some(mirage_rs::config::resolve_default_outbound_from_value(root).to_string());
     match root.get_mut("routing").filter(|r| r.is_object()) {
         Some(routing) => routing["default_outbound"] = serde_json::json!(group_tag),
         // routing 缺失/非对象: 创建一个最小 routing 指向组, 否则会"报成功却没改路由"。
         None => root["routing"] = serde_json::json!({ "default_outbound": group_tag, "rules": [] }),
     }
     Ok((mirage_outbounds(root).len(), old_default))
+}
+
+/// import / subscribe 加节点后的建组交互 (原则 2)。取消或出错 → Err(退出码), 调用方不写盘。
+fn adjust_groups_interactive(root: &mut serde_json::Value, new_tags: &[String]) -> Result<bool, i32> {
+    // stdin 与 stdout 都是终端才用勾选控件; 输出被重定向时退回行输入, 免得转义码写进文件
+    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0 };
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let mut stdout = std::io::stdout();
+    match group_adjust::adjust_outbound_groups(root, &mut reader, &mut stdout, is_tty, new_tags) {
+        Ok(changed) => Ok(changed),
+        Err(e) if e == group_adjust::CANCELLED => {
+            eprintln!("✗ 已取消, 配置未改动");
+            Err(130)
+        }
+        Err(e) => {
+            eprintln!("✗ 出站组交互失败: {e} (配置未改动)");
+            Err(1)
+        }
+    }
 }
 
 /// 由 NodeUri 构造一个 mirage 出站 JSON。import / subscribe 共用。
@@ -669,17 +685,9 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         }
     } else {
         // 原则 2: 出站组随节点数自动调整
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
-        let mut stdout = std::io::stdout();
-        match group_adjust::adjust_outbound_groups(&mut root, &mut reader, &mut stdout, is_tty, Some(&tag)) {
-            Ok(changed) => {
-                groups_adjusted = changed;
-            }
-            Err(e) => {
-                eprintln!("⚠ 出站组交互中止: {e}");
-            }
+        match adjust_groups_interactive(&mut root, std::slice::from_ref(&tag)) {
+            Ok(changed) => groups_adjusted = changed,
+            Err(code) => return code,
         }
     }
 
@@ -702,7 +710,7 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
         println!("  {note}");
         println!("  `mirage-rs check -c {path}` 确认无误再重启。");
     } else if groups_adjusted {
-        println!("  出站组与默认出站已更新。");
+        println!("  {}", group_adjust::default_outbound_note(&root));
         println!("  `mirage-rs check -c {path}` 确认无误再重启。");
     } else {
         println!("  提示: 出站已添加, 但还没有任何路由规则使用它。");
@@ -825,6 +833,7 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
         .filter_map(|o| Some((o.get("server")?.as_str()?.to_string(), u16::try_from(o.get("server_port")?.as_u64()?).ok()?)))
         .collect();
     let (mut added, mut skipped) = (0u32, 0u32);
+    let mut new_tags: Vec<String> = Vec::new();
     for node in &nodes {
         if !seen.insert((node.host.clone(), node.port)) {
             skipped += 1;
@@ -832,6 +841,7 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
         }
         let tag = unique_auto_tag(&node.host, &mut taken);
         root["outbounds"].as_array_mut().unwrap().push(mirage_outbound_json(&tag, node));
+        new_tags.push(tag);
         added += 1;
     }
     println!("  新增 {added} 个, 跳过 {skipped} 个 (server:port 已存在)");
@@ -852,18 +862,10 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
             Err(e) => { eprintln!("✗ 建组失败: {e} (未改动配置)"); return 1; }
         }
     } else if added > 0 {
-        // 原则 2: 出站组随节点数自动调整
-        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
-        let mut stdout = std::io::stdout();
-        match group_adjust::adjust_outbound_groups(&mut root, &mut reader, &mut stdout, is_tty, None) {
-            Ok(changed) => {
-                groups_adjusted = changed;
-            }
-            Err(e) => {
-                eprintln!("⚠ 出站组交互中止: {e}");
-            }
+        // 原则 2: 出站组随节点数自动调整 (本次新增的全部节点一起问)
+        match adjust_groups_interactive(&mut root, &new_tags) {
+            Ok(changed) => groups_adjusted = changed,
+            Err(code) => return code,
         }
     }
 
@@ -879,7 +881,7 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
     if let Some(note) = group_note {
         println!("  {note}\n  `mirage-rs check -c {path}` 确认后重启。");
     } else if groups_adjusted {
-        println!("  出站组与默认出站已更新。\n  `mirage-rs check -c {path}` 确认后重启。");
+        println!("  {}\n  `mirage-rs check -c {path}` 确认后重启。", group_adjust::default_outbound_note(&root));
     } else {
         println!("  提示: 出站已加但未接路由。要按 RTT 自动选路, 重跑时加 --group。");
     }
@@ -1893,7 +1895,7 @@ mod tests {
         });
         let (n, old) = apply_urltest_group(&mut root, "auto", &GroupOpts::default()).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(old, None, "原本无 default");
+        assert_eq!(old.as_deref(), Some("m1"), "原本未写 default: 按推导规则为第一条出站");
         assert_eq!(root["routing"]["default_outbound"], "auto", "已创建 routing 并指向组");
     }
 

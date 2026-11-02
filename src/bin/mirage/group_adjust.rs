@@ -83,10 +83,11 @@ impl CheckboxState {
         for (i, item) in self.items.iter().enumerate() {
             let pointer = if i == self.cursor { ">" } else { " " };
             let mark = if item.checked { "[x]" } else { "[ ]" };
+            // 截断过长说明: 折行会让"上移 N 行重绘"错位
             let detail = if item.detail.is_empty() {
                 String::new()
             } else {
-                format!(" - {}", item.detail)
+                format!(" - {}", truncate_chars(&item.detail, 40))
             };
             lines.push(format!("{pointer} {mark} {}{detail}", item.title));
         }
@@ -166,6 +167,19 @@ impl CheckboxState {
     }
 }
 
+/// 用户在复选框里按 Ctrl-C / Ctrl-D 取消时的错误文本; 调用方据此整体中止 (不写盘)。
+pub const CANCELLED: &str = "用户取消操作";
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
+
 #[cfg(unix)]
 struct RawModeGuard {
     orig: libc::termios,
@@ -188,8 +202,6 @@ impl RawModeGuard {
             if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // 隐藏光标
-            let _ = libc::write(fd, b"\x1b[?25l".as_ptr() as *const libc::c_void, 6);
             Ok(Self { orig, fd })
         }
     }
@@ -199,11 +211,47 @@ impl RawModeGuard {
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe {
-            // 显示光标并恢复原始终端属性
-            let _ = libc::write(self.fd, b"\x1b[?25h".as_ptr() as *const libc::c_void, 6);
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
         }
     }
+}
+
+/// 复选框按键 (从一次 read 到的字节块里解析; 终端一次按键的转义序列通常在同一块里到达)。
+#[derive(Debug, PartialEq, Eq)]
+enum Key {
+    Up,
+    Down,
+    Toggle,
+    Enter,
+    Cancel,
+    Other,
+}
+
+/// 把一块输入字节解析成按键序列。单独的 ESC (后面没有 `[`) 当作无操作, 不吞后续按键。
+fn parse_keys(chunk: &[u8]) -> Vec<Key> {
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < chunk.len() {
+        match chunk[i] {
+            3 | 4 => keys.push(Key::Cancel),
+            b'\r' | b'\n' => keys.push(Key::Enter),
+            b' ' => keys.push(Key::Toggle),
+            b'k' | b'K' => keys.push(Key::Up),
+            b'j' | b'J' => keys.push(Key::Down),
+            0x1b if chunk.get(i + 1) == Some(&b'[') && i + 2 < chunk.len() => {
+                keys.push(match chunk[i + 2] {
+                    b'A' => Key::Up,
+                    b'B' => Key::Down,
+                    _ => Key::Other,
+                });
+                i += 3;
+                continue;
+            }
+            _ => keys.push(Key::Other),
+        }
+        i += 1;
+    }
+    keys
 }
 
 /// 交互式复选框选择。
@@ -259,60 +307,44 @@ fn run_tty_checkbox(
     let stdin_fd = libc::STDIN_FILENO;
     let guard = RawModeGuard::enter(stdin_fd).map_err(|e| format!("启用终端 raw mode 失败: {e}"))?;
 
-    let lines = state.render_tty_lines();
-    for l in &lines {
-        writeln!(writer, "\r{l}").map_err(|e| e.to_string())?;
-    }
-    writer.flush().map_err(|e| e.to_string())?;
-    let mut last_line_count = lines.len();
-
-    let mut buf = [0u8; 1];
-    let res: Result<Vec<String>, String> = (|| loop {
-        let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-        if n <= 0 {
-            return Err("读取终端输入遇到 EOF 或错误".to_string());
+    let draw = |state: &CheckboxState, writer: &mut dyn Write, prev_lines: usize| -> Result<usize, String> {
+        if prev_lines > 0 {
+            write!(writer, "\r\x1b[{prev_lines}A\x1b[J").map_err(|e| e.to_string())?;
         }
-        match buf[0] {
-            // Ctrl-C (0x03) 或 Ctrl-D (0x04)
-            3 | 4 => return Err("用户取消操作 (Ctrl-C)".to_string()),
-            // 回车
-            b'\r' | b'\n' => {
-                return Ok(state.checked_keys());
-            }
-            // 空格: 切换勾选
-            b' ' => {
-                state.toggle();
-            }
-            // 上下键 (支持 k/j 与 ESC [ A/B)
-            b'k' | b'K' => state.move_up(),
-            b'j' | b'J' => state.move_down(),
-            0x1b => {
-                // 读取 ANSI escape sequence
-                let mut seq = [0u8; 2];
-                let n2 = unsafe { libc::read(stdin_fd, seq.as_mut_ptr() as *mut libc::c_void, 2) };
-                if n2 == 2 && seq[0] == b'[' {
-                    match seq[1] {
-                        b'A' => state.move_up(),
-                        b'B' => state.move_down(),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // 重绘 UI: 先光标向上移动 last_line_count 行并清屏到末尾
-        let new_lines = state.render_tty_lines();
-        write!(writer, "\r\x1b[{}A\x1b[J", last_line_count).map_err(|e| e.to_string())?;
-        for l in &new_lines {
+        let lines = state.render_tty_lines();
+        for l in &lines {
             writeln!(writer, "\r{l}").map_err(|e| e.to_string())?;
         }
         writer.flush().map_err(|e| e.to_string())?;
-        last_line_count = new_lines.len();
+        Ok(lines.len())
+    };
+
+    // 隐藏光标 (写到输出端; stdin 可能是只读打开的 /dev/tty)
+    let _ = write!(writer, "\x1b[?25l");
+    let res: Result<Vec<String>, String> = (|| {
+        let mut drawn = draw(&state, writer, 0)?;
+        let mut buf = [0u8; 64];
+        loop {
+            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                return Err("读取终端输入遇到 EOF 或错误".to_string());
+            }
+            for key in parse_keys(&buf[..n as usize]) {
+                match key {
+                    Key::Cancel => return Err(CANCELLED.to_string()),
+                    Key::Enter => return Ok(state.checked_keys()),
+                    Key::Toggle => state.toggle(),
+                    Key::Up => state.move_up(),
+                    Key::Down => state.move_down(),
+                    Key::Other => {}
+                }
+            }
+            drawn = draw(&state, writer, drawn)?;
+        }
     })();
 
     drop(guard);
-    // 换行退出 raw mode
+    let _ = write!(writer, "\x1b[?25h");
     writeln!(writer).map_err(|e| e.to_string())?;
     if let Ok(ref selected) = res {
         writeln!(writer, "  已选择: [{}]", selected.join(", ")).map_err(|e| e.to_string())?;
@@ -345,6 +377,22 @@ pub fn prompt_yes_no_interactive(
         Ok(false)
     } else {
         Ok(default_yes)
+    }
+}
+
+/// 建组后给用户的默认出站说明: 默认出站是组 → 说明已走组; 否则提醒组还没被用上。
+pub fn default_outbound_note(root: &Value) -> String {
+    let def = mirage_rs::config::resolve_default_outbound_from_value(root);
+    let is_group = root
+        .get("outbounds")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.iter().find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(def)))
+        .and_then(|o| o.get("type").and_then(|t| t.as_str()))
+        .is_some_and(mirage_rs::config::is_group_type);
+    if is_group {
+        format!("出站组已更新, 默认出站为组 `{def}`。")
+    } else {
+        format!("出站组已更新, 但默认出站仍是 `{def}`; 要让流量走组, 把 routing.default_outbound 改为组的 tag。")
     }
 }
 
@@ -397,7 +445,7 @@ pub fn adjust_outbound_groups(
     reader: &mut dyn BufRead,
     writer: &mut dyn Write,
     is_tty: bool,
-    new_node_tag: Option<&str>,
+    new_node_tags: &[String],
 ) -> Result<bool, String> {
     let mirage_tags = collect_mirage_tags(root);
     if mirage_tags.len() < 2 {
@@ -592,16 +640,24 @@ pub fn adjust_outbound_groups(
         // ── 情况 2: 配置里已有组 ─────────────────────────────────────
         // 列出现有各组 (复选框)，默认勾选"当前已包含全部其它节点"的组，用户勾选新节点加入哪些组
         let mut group_items = Vec::new();
-        let other_mirage_tags: Vec<String> = if let Some(tag) = new_node_tag {
-            mirage_tags.iter().filter(|t| t.as_str() != tag).cloned().collect()
+        // 新节点: 调用方给出 (import 一个 / subscribe 一批); 未给出时退化为"不在任何组里的节点"
+        let new_tags: Vec<String> = if new_node_tags.is_empty() {
+            let in_groups: std::collections::HashSet<String> = arr
+                .iter()
+                .filter(|o| mirage_rs::config::is_group_type(o.get("type").and_then(|t| t.as_str()).unwrap_or("")))
+                .filter_map(|o| o.get("outbounds").and_then(|m| m.as_array()))
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            mirage_tags.iter().filter(|t| !in_groups.contains(*t)).cloned().collect()
         } else {
-            // 如果未能确定单个新节点，则取非最新节点
-            if mirage_tags.len() > 1 {
-                mirage_tags[..mirage_tags.len() - 1].to_vec()
-            } else {
-                Vec::new()
-            }
+            new_node_tags.to_vec()
         };
+        if new_tags.is_empty() {
+            return Ok(false);
+        }
+        let other_mirage_tags: Vec<String> =
+            mirage_tags.iter().filter(|t| !new_tags.contains(t)).cloned().collect();
 
         for o in arr.iter() {
             let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -631,8 +687,8 @@ pub fn adjust_outbound_groups(
             return Ok(false);
         }
 
-        let target_node = new_node_tag.unwrap_or(mirage_tags.last().unwrap().as_str());
-        let prompt_title = format!("请选择将新节点 `{target_node}` 加入哪些出站组");
+        let target_desc = new_tags.join(", ");
+        let prompt_title = format!("请选择将新节点 [{target_desc}] 加入哪些出站组");
         let state = CheckboxState::new(prompt_title, group_items);
         let chosen = prompt_checkbox_interactive(state, reader, writer, is_tty)?;
 
@@ -646,9 +702,11 @@ pub fn adjust_outbound_groups(
             let g_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
             if chosen.contains(&g_tag.to_string()) {
                 if let Some(members) = o.get_mut("outbounds").and_then(|m| m.as_array_mut()) {
-                    if !members.iter().any(|m| m.as_str() == Some(target_node)) {
-                        members.push(serde_json::json!(target_node));
-                        updated = true;
+                    for t in &new_tags {
+                        if !members.iter().any(|m| m.as_str() == Some(t.as_str())) {
+                            members.push(serde_json::json!(t));
+                            updated = true;
+                        }
                     }
                 }
             }
@@ -657,7 +715,7 @@ pub fn adjust_outbound_groups(
         if updated {
             writeln!(
                 writer,
-                "✓ 节点 `{target_node}` 已成功加入选中的出站组: [{}]",
+                "✓ 新节点 [{target_desc}] 已加入出站组: [{}]",
                 chosen.join(", ")
             )
             .map_err(|e| e.to_string())?;
@@ -714,7 +772,7 @@ mod tests {
         });
         let mut reader = Cursor::new(b"\n");
         let mut writer = Vec::new();
-        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, Some("m1")).unwrap();
+        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, &["m1".to_string()]).unwrap();
         assert!(!changed, "1个节点时不建组");
         assert_eq!(root["outbounds"].as_array().unwrap().len(), 2);
     }
@@ -733,7 +791,7 @@ mod tests {
         // 交互输入: 组选择回车 (默认选 auto 和 select), auto 节点选择回车 (默认全选), select 节点选择回车 (默认全选), routing 切换默认回车 (y)
         let mut reader = Cursor::new(b"\n\n\ny\n");
         let mut writer = Vec::new();
-        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, Some("m2")).unwrap();
+        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, &["m2".to_string()]).unwrap();
         assert!(changed, "2个节点触发建组");
 
         let obs = root["outbounds"].as_array().unwrap();
@@ -774,7 +832,7 @@ mod tests {
         // 回车接受默认勾选
         let mut reader = Cursor::new(b"\n");
         let mut writer = Vec::new();
-        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, Some("m3")).unwrap();
+        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, &["m3".to_string()]).unwrap();
         assert!(changed);
 
         let obs = root["outbounds"].as_array().unwrap();
@@ -795,7 +853,7 @@ mod tests {
 
         let mut reader = Cursor::new(b"\n\n\n");
         let mut writer = Vec::new();
-        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, Some("m2")).unwrap();
+        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, &["m2".to_string()]).unwrap();
         assert!(changed);
 
         let obs = root["outbounds"].as_array().unwrap();
@@ -803,5 +861,57 @@ mod tests {
         assert!(obs.iter().any(|o| o["tag"] == "auto" && o["type"] == "mirage"));
         // 新建的 urltest 组 tag 自动加后缀变 auto-2
         assert!(obs.iter().any(|o| o["tag"] == "auto-2" && o["type"] == "urltest"));
+    }
+
+    #[test]
+    fn test_parse_keys_lone_esc_does_not_swallow_next_key() {
+        // 单独 ESC 后紧跟回车 (同一块或下一块) 回车照样生效
+        assert_eq!(parse_keys(b"\x1b"), vec![Key::Other]);
+        assert_eq!(parse_keys(b"\x1b\r"), vec![Key::Other, Key::Enter]);
+        assert_eq!(parse_keys(b"\r"), vec![Key::Enter]);
+        // 方向键转义序列
+        assert_eq!(parse_keys(b"\x1b[A\x1b[B"), vec![Key::Up, Key::Down]);
+        // 一块里多个按键 (粘贴 / 快速连按) 逐个解析
+        assert_eq!(parse_keys(b"j j\r"), vec![Key::Down, Key::Toggle, Key::Down, Key::Enter]);
+        assert_eq!(parse_keys(&[3]), vec![Key::Cancel]);
+    }
+
+    #[test]
+    fn test_subscribe_batch_all_new_nodes_join_chosen_groups() {
+        let mut root = serde_json::json!({
+            "outbounds": [
+                { "type": "urltest", "tag": "auto", "outbounds": ["m1", "m2"] },
+                { "type": "mirage", "tag": "m1", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "m2", "server": "192.0.2.2", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "m3", "server": "192.0.2.3", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "m4", "server": "192.0.2.4", "server_port": 443, "password": "p", "camouflage_host": "example.com" }
+            ]
+        });
+        let mut reader = Cursor::new(b"\n");
+        let mut writer = Vec::new();
+        let new = vec!["m3".to_string(), "m4".to_string()];
+        assert!(adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, &new).unwrap());
+        assert_eq!(root["outbounds"][0]["outbounds"], serde_json::json!(["m1", "m2", "m3", "m4"]));
+
+        // 未给出新节点列表时退化为"不在任何组里的节点"
+        let mut root2 = root.clone();
+        root2["outbounds"][0]["outbounds"] = serde_json::json!(["m1", "m2"]);
+        let mut reader = Cursor::new(b"\n");
+        assert!(adjust_outbound_groups(&mut root2, &mut reader, &mut writer, false, &[]).unwrap());
+        assert_eq!(root2["outbounds"][0]["outbounds"], serde_json::json!(["m1", "m2", "m3", "m4"]));
+    }
+
+    #[test]
+    fn test_default_outbound_note_reflects_whether_group_is_default() {
+        let mut root = serde_json::json!({
+            "outbounds": [
+                { "type": "selector", "tag": "select", "outbounds": ["m1"] },
+                { "type": "mirage", "tag": "m1", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "direct", "tag": "direct" }
+            ]
+        });
+        assert!(default_outbound_note(&root).contains("默认出站为组 `select`"));
+        root["routing"] = serde_json::json!({ "default_outbound": "direct" });
+        assert!(default_outbound_note(&root).contains("仍是 `direct`"));
     }
 }

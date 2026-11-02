@@ -100,7 +100,7 @@ pub struct RealCommandExecutor;
 
 impl CommandExecutor for RealCommandExecutor {
     fn stdin_is_tty(&self) -> bool {
-        unsafe { libc::isatty(libc::STDIN_FILENO) != 0 }
+        unsafe { libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0 }
     }
     fn has_systemctl(&self) -> bool {
         std::process::Command::new("which")
@@ -513,11 +513,9 @@ pub fn modify_mirage_outbound(
 pub fn check_outbound_references(root: &Value, tag: &str) -> Vec<OutboundRef> {
     let mut refs = Vec::new();
 
-    // 1. routing.default_outbound
-    if let Some(def) = root.get("routing").and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()) {
-        if def == tag {
-            refs.push(OutboundRef::DefaultOutbound);
-        }
+    // 1. routing.default_outbound (含未显式写时推导出的第一条出站)
+    if mirage_rs::config::resolve_default_outbound_from_value(root) == tag {
+        refs.push(OutboundRef::DefaultOutbound);
     }
 
     // 2. routing.rules[].outbound
@@ -1203,15 +1201,16 @@ pub fn generate_diff(old: &Value, new: &Value) -> Vec<String> {
     // 3. Routing
     let old_routing = old.get("routing");
     let new_routing = new.get("routing");
-    if old_routing != new_routing {
-        let old_def = old_routing.and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()).unwrap_or("");
-        let new_def = new_routing.and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()).unwrap_or("");
-        if old_def != new_def {
-            diffs.push(format!("~ routing.default_outbound: `{old_def}` -> `{new_def}`"));
-        }
-        if old_routing.and_then(|r| r.get("rules")) != new_routing.and_then(|r| r.get("rules")) {
-            diffs.push("~ routing.rules 规则列表发生变动".to_string());
-        }
+    // 默认出站按推导规则比 (未显式写时取第一条出站, 调整出站顺序也可能改变它)
+    let old_def = mirage_rs::config::resolve_default_outbound_from_value(old);
+    let new_def = mirage_rs::config::resolve_default_outbound_from_value(new);
+    if old_def != new_def {
+        diffs.push(format!("~ routing.default_outbound: `{old_def}` -> `{new_def}`"));
+    }
+    if old_routing != new_routing
+        && old_routing.and_then(|r| r.get("rules")) != new_routing.and_then(|r| r.get("rules"))
+    {
+        diffs.push("~ routing.rules 规则列表发生变动".to_string());
     }
 
     // 4. Tuning
@@ -1459,8 +1458,8 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                     let brutal_str = prompt_line(reader, writer, "下载限速速率 (brutal_rate_mbps, 留空默认):");
                     let brutal_rate_mbps = brutal_str.parse::<u64>().ok();
 
-                    let grp_prompt = prompt_line(reader, writer, "加入已有出站组 (如 auto / selector, 留空不加):");
-                    let group = if grp_prompt.is_empty() { None } else { Some(grp_prompt.as_str()) };
+                    // 加入哪些出站组由随后的建组交互 (group_adjust) 统一询问, 这里不再单独问
+                    let group: Option<&str> = None;
 
                     match add_mirage_outbound_manual(
                         &mut root,
@@ -1488,8 +1487,8 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                 } else {
                     let uri = prompt_line(reader, writer, "请输入 mirage:// 链接:");
                     let tag = prompt_line(reader, writer, "请输入该节点的出站 tag:");
-                    let grp_prompt = prompt_line(reader, writer, "加入已有出站组 (如 auto / selector, 留空不加):");
-                    let group = if grp_prompt.is_empty() { None } else { Some(grp_prompt.as_str()) };
+                    // 加入哪些出站组由随后的建组交互 (group_adjust) 统一询问, 这里不再单独问
+                    let group: Option<&str> = None;
 
                     match add_mirage_outbound_from_uri(&mut root, &uri, &tag, group) {
                         Ok(_) => {
@@ -1509,7 +1508,7 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                 };
 
                 if let Some((ref added_tag, ..)) = new_tag {
-                    if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, executor.stdin_is_tty(), Some(added_tag)) {
+                    if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, executor.stdin_is_tty(), std::slice::from_ref(added_tag)) {
                         writeln!(writer, "⚠ 调整出站组提示: {e}").map_err(|e| e.to_string())?;
                     }
                 }
@@ -2389,6 +2388,21 @@ mod tests {
         let group_members = root["outbounds"][1]["outbounds"].as_array().unwrap();
         assert_eq!(group_members.len(), 1);
         assert_eq!(group_members[0].as_str(), Some("proxy-2"));
+    }
+
+    #[test]
+    fn test_inferred_default_outbound_counts_as_reference() {
+        // 未写 default_outbound 时第一条出站就是默认出站: 删它要被拦, 否则默认会静默换成下一条 (可能是 block)
+        let root = json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "proxy", "server": "203.0.113.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "block", "tag": "block" }
+            ],
+            "routing": { "rules": [] }
+        });
+        assert!(check_outbound_references(&root, "proxy").contains(&OutboundRef::DefaultOutbound));
+        let mut r = root.clone();
+        assert!(delete_outbound(&mut r, "proxy", true).is_err());
     }
 
     #[test]

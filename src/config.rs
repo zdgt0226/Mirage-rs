@@ -932,15 +932,13 @@ pub struct RoutingConfig {
 }
 
 /// 解析默认出站 tag (支持类型化的 OutboundConfig 列表):
-/// 1. 若 routing.default_outbound 显式存在且非空，取其值；
+/// 1. 若 routing.default_outbound 显式写了，原样取其值 (写成空串也保留, 交给 check 报"不存在",
+///    不静默换成第一条出站 —— 防写错被掩盖)；
 /// 2. 否则取 outbounds 数组第一条的 tag；
 /// 3. 若 outbounds 缺省或为空，取 "direct"。
 pub fn resolve_default_outbound(explicit: Option<&str>, outbounds: &[OutboundConfig]) -> String {
     if let Some(explicit) = explicit {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
+        return explicit.to_string();
     }
     if let Some(first) = outbounds.first() {
         return first.tag().to_string();
@@ -948,8 +946,8 @@ pub fn resolve_default_outbound(explicit: Option<&str>, outbounds: &[OutboundCon
     "direct".to_string()
 }
 
-/// 解析默认出站 tag (支持 serde_json::Value):
-/// 1. 若 routing.default_outbound 显式存在且非空，取其值；
+/// 解析默认出站 tag (支持 serde_json::Value), 规则同 `resolve_default_outbound`:
+/// 1. 若 routing.default_outbound 显式写了，原样取其值；
 /// 2. 否则取 outbounds 数组第一条的 tag；
 /// 3. 若 outbounds 缺省或为空，取 "direct"。
 pub fn resolve_default_outbound_from_value(root: &serde_json::Value) -> &str {
@@ -958,10 +956,7 @@ pub fn resolve_default_outbound_from_value(root: &serde_json::Value) -> &str {
         .and_then(|r| r.get("default_outbound"))
         .and_then(|d| d.as_str())
     {
-        let trimmed = d.trim();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
+        return d;
     }
     if let Some(first_tag) = root
         .get("outbounds")
@@ -1479,7 +1474,8 @@ pub struct TuningConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_hello_guard: Option<ClientHelloGuardConfig>,
     /// selector 手动选择持久化文件路径。
-    /// 未配时默认: 若配了 gui.stats_persist_path 则为其同目录下的 selector_state.json;
+    /// 未配时默认: 若配了 gui.stats_persist_path (如 stats_client.json) 则为其同目录下按同名区分的
+    /// selector_state_client.json (同机服务端 / 客户端不共用一个文件);
     /// 否则默认为 "/var/lib/mirage-rs/selector_state.json"。
     #[serde(default)]
     pub selector_persist_path: Option<String>,
@@ -1501,7 +1497,14 @@ pub fn resolve_selector_persist_path(config: &Config) -> String {
             if !trimmed.is_empty() {
                 let p = std::path::Path::new(trimmed);
                 if let Some(parent) = p.parent() {
-                    return parent.join("selector_state.json").to_string_lossy().into_owned();
+                    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let suffix = stem.strip_prefix("stats_").unwrap_or(stem);
+                    let name = if suffix.is_empty() {
+                        "selector_state.json".to_string()
+                    } else {
+                        format!("selector_state_{suffix}.json")
+                    };
+                    return parent.join(name).to_string_lossy().into_owned();
                 }
             }
         }
@@ -2758,6 +2761,23 @@ mod validation_tests {
         // 4. 全部缺失，回落 direct
         let v4 = serde_json::json!({});
         assert_eq!(resolve_default_outbound_from_value(&v4), "direct");
+
+        // 5. 显式空串原样保留 (不静默换成第一条)
+        let v5 = serde_json::json!({
+            "outbounds": [{ "tag": "first" }],
+            "routing": { "default_outbound": "" }
+        });
+        assert_eq!(resolve_default_outbound_from_value(&v5), "");
+    }
+
+    #[test]
+    fn principle1_explicit_empty_default_outbound_still_reported() {
+        // 显式写成空串是写错, 照旧由 check 报"不存在", 不被第一条出站掩盖
+        let mut v = base();
+        v["routing"]["default_outbound"] = serde_json::json!("");
+        let (cfg, issues) = Config::parse_with_diagnostics(&v.to_string()).unwrap();
+        assert_eq!(cfg.routing.default_outbound, "");
+        assert!(has(&issues, "default_outbound"), "空串应报: {issues:?}");
     }
 
     #[test]

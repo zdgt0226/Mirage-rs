@@ -67,10 +67,20 @@ fn write_selector_choices_locked(path: &str, map: &HashMap<String, String>) {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    // 软链接: 写到它指向的目标 (目标尚不存在时 canonicalize 会失败, 用 read_link 解析), 不把链接本身替换掉
     let resolved = std::fs::canonicalize(path)
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| path.to_string());
-    let tmp = format!("{resolved}.tmp");
+        .unwrap_or_else(|_| match std::fs::read_link(path) {
+            Ok(target) => Path::new(path)
+                .parent()
+                .map(|d| d.join(&target))
+                .unwrap_or(target)
+                .to_string_lossy()
+                .into_owned(),
+            Err(_) => path.to_string(),
+        });
+    // 临时文件名带 pid + 随机数: 跨进程并发写不会互相截断同一个 .tmp
+    let tmp = format!("{resolved}.tmp.{}.{}", std::process::id(), fastrand::u32(..));
 
     #[cfg(unix)]
     let mode: u32 = 0o600;

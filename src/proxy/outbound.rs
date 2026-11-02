@@ -1142,6 +1142,35 @@ mod selector_tests {
     }
 
     #[test]
+    fn test_selector_default_path_per_stats_file() {
+        let mk = |stats: &str| -> crate::config::Config {
+            serde_json::from_str(&format!(r#"{{ "gui": {{ "stats_persist_path": "{stats}" }} }}"#)).unwrap()
+        };
+        assert_eq!(crate::config::resolve_selector_persist_path(&mk("/var/lib/mirage-rs/stats_client.json")),
+            "/var/lib/mirage-rs/selector_state_client.json");
+        assert_eq!(crate::config::resolve_selector_persist_path(&mk("/var/lib/mirage-rs/stats_server.json")),
+            "/var/lib/mirage-rs/selector_state_server.json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_selector_save_through_dangling_symlink_keeps_link() {
+        let tmp_dir = std::env::temp_dir().join(format!("sel_link_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let target = tmp_dir.join("real_state.json");
+        let link = tmp_dir.join("selector_state.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        crate::proxy::selector_state::save_selector_choice(link.to_str().unwrap(), "sel", "c2");
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "链接本身不能被替换");
+        assert!(target.exists(), "应写到链接目标");
+        let loaded = crate::proxy::selector_state::load_selector_choices(link.to_str().unwrap());
+        assert_eq!(loaded.get("sel").map(String::as_str), Some("c2"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
     fn test_selector_corrupted_file_ignored_with_warn() {
         let tmp_dir = std::env::temp_dir().join(format!("sel_bad_test_{}", fastrand::u64(..)));
         let _ = std::fs::create_dir_all(&tmp_dir);
