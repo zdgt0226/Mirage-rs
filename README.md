@@ -329,7 +329,11 @@ mirage-rs test -c config.json                                 # --tag 只测某�
 mirage-rs config -c config.json
 ```
 
-> **出站组类型**: 支持 `urltest` (低延迟自动优选)、`fallback` (故障转移)、`selector` (手动指定)、`load_balance` (轮询负载均衡)。`test` 与 `--group` 建组会读取 `geoip.dat` 校验节点地域并在混杂时发出告警。
+> **默认出站与出站组**:
+> - **默认出站 (Default Outbound)**: 若未显式配置 `routing.default_outbound`，系统统一推导并采用 `outbounds` 列表的第一项作为默认出站；若 `outbounds` 亦未配置，则回退为 `"direct"`。亦可在 `routing` 中手动显式指定。
+> - **出站组类型**: 支持 `urltest` (低延迟自动优选)、`fallback` (故障转移)、`selector` (手动指定)、`load_balance` (轮询负载均衡)。`test` 与 `--group` 建组会读取 `geoip.dat` 校验节点地域并在混杂时发出告警。
+> - **出站组智能调整**: 当节点数 ≥ 2 时，CLI 导入（`import` / `subscribe` / `config`）会自动引导出站组配置（支持终端复选框交互：空格勾选、上下键切换、回车确认，非 TTY 环境退回行输入）。新建出站组自动置于 `outbounds` 首位作为默认出口。
+> - **Selector 选择持久化**: 通过 API (`POST /api/proxies/select`) 手动切换的 selector 节点自动持久化至状态文件（权限 0600 原子写入，可由 `tuning.selector_persist_path` 自定义），服务重启与配置热重载时自动恢复。
 
 ### 配置文件生效策略
 

@@ -273,6 +273,78 @@ CONF
     rm -rf "$d"
 }
 
+section_b7() {
+    echo "[B7] 客户端多节点导入与建组"
+    local d; d=$(mktemp -d)
+    local cfg="$d/config_client.json"
+    cat > "$cfg" <<'EOF'
+{
+    "outbounds": [
+        { "type": "mirage", "tag": "proxy", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+        { "type": "direct", "tag": "direct" }
+    ],
+    "routing": { "default_outbound": "proxy", "rules": [] }
+}
+EOF
+
+    # 桩二进制: 模拟 mirage-rs import -c <cfg> <uri>
+    local mock_bin="$d/mock_mirage"
+    cat > "$mock_bin" <<'EOF'
+#!/usr/bin/env bash
+cfg=""
+uri=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c) cfg="$2"; shift 2 ;;
+        *) uri="$1"; shift ;;
+    esac
+done
+python3 -c '
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["outbounds"].insert(0, {"type": "selector", "tag": "select", "outbounds": ["auto", "proxy", "node2"]})
+d["outbounds"].insert(1, {"type": "urltest", "tag": "auto", "outbounds": ["proxy", "node2"]})
+d["outbounds"].append({"type": "mirage", "tag": "node2", "server": "192.0.2.2", "server_port": 443, "password": "p", "camouflage_host": "example.com"})
+d["routing"]["default_outbound"] = "select"
+with open(p, "w") as f:
+    json.dump(d, f)
+' "$cfg"
+EOF
+    chmod +x "$mock_bin"
+
+    local old_bin="$BIN_PATH"
+    BIN_PATH="$mock_bin"
+
+    # 模拟输入: 第一次添加 (y), 粘贴 mirage:// 串, 第二次不再添加 (n)
+    local test_run
+    test_run=$(
+        ask_yn() {
+            if [[ "${ASK_YN_CALLS:-0}" -eq 0 ]]; then
+                ASK_YN_CALLS=1
+                return 0
+            else
+                return 1
+            fi
+        }
+        ask() {
+            echo "mirage://secret@192.0.2.2:443?sni=example.com"
+        }
+        client_import_additional_nodes "$cfg" 2>&1
+    )
+    BIN_PATH="$old_bin"
+
+    local def_ob
+    def_ob=$(python3 -c 'import json; print(json.load(open("'$cfg'"))["routing"]["default_outbound"])')
+    eq_ "B7.1  多节点导入完成并更新默认出站为 select" "$def_ob" "select"
+
+    local has_auto
+    has_auto=$(python3 -c 'import json; obs=[o["tag"] for o in json.load(open("'$cfg'"))["outbounds"]]; print("yes" if "auto" in obs and "select" in obs else "no")')
+    eq_ "B7.2  配置中包含 auto 和 select 出站组" "$has_auto" "yes"
+
+    rm -rf "$d"
+}
+
 echo "== install.sh UI 护甲 =="
 section_b3
 load_install
@@ -281,6 +353,7 @@ section_b2
 section_b4
 section_b5
 section_b6
+section_b7
 echo "----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

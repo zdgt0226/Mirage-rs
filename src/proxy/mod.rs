@@ -33,6 +33,7 @@ pub mod probe;
 pub mod proc_lookup;
 pub mod rate_limit;
 pub mod user_limits;
+pub mod selector_state;
 
 /// Mirage **TCP 隧道 relay 的空闲超时** (双向共同静默满此值才断, 非单向亦非绝对寿命)。
 /// 默认 1800s (30min, 给 SSH/视频/大下载/长连接留余量), 可用环境变量 `MIRAGE_RELAY_IDLE` (秒)

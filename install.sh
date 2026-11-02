@@ -3008,6 +3008,29 @@ ask_route_advanced() {
     info "已配 $(( ${#ROUTE_ADV_RULES[@]} )) 条规则, 默认出口: $ROUTE_ADV_DEFAULT"
 }
 
+# 客户端部署多节点循环导入 (调用二进制 import 完成交互建组)
+client_import_additional_nodes() {
+    local cfg="$1"
+    while ask_yn "再添加一个节点?" n; do
+        local more_uri
+        more_uri=$(ask "请粘贴 mirage:// 节点串" "")
+        if [[ -z "$more_uri" ]]; then
+            warn "未输入节点串"
+            continue
+        fi
+        if ! parse_node_uri "$more_uri"; then
+            warn "节点串格式无效. 期望: mirage://<密码>@<host>:<port>?sni=<域名>"
+            continue
+        fi
+        info "正在导入节点: ${NODE_HOST}:${NODE_PORT} (sni=${NODE_SNI})..."
+        if [[ -r /dev/tty && -w /dev/tty ]]; then
+            "$BIN_PATH" import -c "$cfg" "$more_uri" </dev/tty
+        else
+            "$BIN_PATH" import -c "$cfg" "$more_uri"
+        fi
+    done
+}
+
 config_client() {
     title "配置 Mirage-rs 客户端"
 
@@ -3357,6 +3380,10 @@ EOF
     chmod 600 "${ETC_DIR}/config_client.json"
 
     ok "客户端配置文件已保存至: ${ETC_DIR}/config_client.json"
+
+    # 多节点导入与出站组 (由 mirage-rs import 交互建组)
+    client_import_additional_nodes "${ETC_DIR}/config_client.json"
+
     setup_service "client"
 
     # ── 部署汇总 ── 一屏看清关键信息, 免得用户回翻日志找端口/地址

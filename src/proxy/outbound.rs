@@ -426,6 +426,7 @@ impl tokio::io::AsyncWrite for OutStream {
 
 pub struct OutboundManager {
     pub outbounds: HashMap<String, Arc<OutboundNode>>,
+    pub selector_persist_path: String,
 }
 
 impl OutboundManager {
@@ -495,6 +496,14 @@ impl OutboundManager {
     }
 
     pub fn new(cfg: &Config) -> anyhow::Result<Self> {
+        Self::new_with_prev(cfg, None)
+    }
+
+    pub fn new_with_prev(cfg: &Config, prev: Option<&OutboundManager>) -> anyhow::Result<Self> {
+        let selector_persist_path = crate::config::resolve_selector_persist_path(cfg);
+        let persisted_choices = crate::proxy::selector_state::load_selector_choices(&selector_persist_path);
+        let mut stale_selector_records = Vec::new();
+
         let mut outbounds = HashMap::new();
         let mut deferred = Vec::new();
 
@@ -685,10 +694,43 @@ impl OutboundManager {
                             current: Arc::new(RwLock::new(None)),
                         })
                     } else if otype == "selector" {
+                        // 1. 热重载时内存中的当前选择优先于文件 (避免竞态丢失)
+                        let mem_choice = prev.and_then(|p| {
+                            if let Some(prev_node) = p.outbounds.get(tag) {
+                                if let OutboundNode::Selector { current, .. } = &**prev_node {
+                                    let guard = current.read().unwrap_or_else(|e| e.into_inner());
+                                    return guard.as_ref().map(|n| n.tag().to_string());
+                                }
+                            }
+                            None
+                        });
+
+                        let mut selected_node = None;
+                        if let Some(ref mtag) = mem_choice {
+                            if let Some(c) = children.iter().find(|c| c.tag() == mtag) {
+                                selected_node = Some(c.clone());
+                            }
+                        }
+
+                        // 2. 若无内存选择，从持久化文件恢复
+                        if selected_node.is_none() {
+                            if let Some(ftag) = persisted_choices.get(tag) {
+                                if let Some(c) = children.iter().find(|c| c.tag() == ftag) {
+                                    selected_node = Some(c.clone());
+                                } else {
+                                    // 记录的成员已不在 children 中: 回到第一个成员并清理该记录
+                                    selected_node = children.first().cloned();
+                                    stale_selector_records.push(tag.clone());
+                                }
+                            } else {
+                                selected_node = children.first().cloned();
+                            }
+                        }
+
                         Arc::new(OutboundNode::Selector {
                             tag: tag.clone(),
                             children,
-                            current: Arc::new(RwLock::new(None)),
+                            current: Arc::new(RwLock::new(selected_node)),
                         })
                     } else if otype == "load_balance" {
                         Arc::new(OutboundNode::LoadBalance {
@@ -719,7 +761,17 @@ impl OutboundManager {
             pending = next_round;
         }
 
-        Ok(Self { outbounds })
+        // 组已不存在或成员失效时清理对应记录
+        for key in persisted_choices.keys() {
+            if !outbounds.contains_key(key) && !stale_selector_records.contains(key) {
+                stale_selector_records.push(key.clone());
+            }
+        }
+        if !stale_selector_records.is_empty() {
+            crate::proxy::selector_state::remove_selector_choices(&selector_persist_path, &stale_selector_records);
+        }
+
+        Ok(Self { outbounds, selector_persist_path })
     }
 
     pub fn get(&self, tag: &str) -> Option<Arc<OutboundNode>> {
@@ -1024,5 +1076,117 @@ mod lb_tests {
         let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
         assert!(cfg.semantic_issues().iter().any(|i| i.contains("strategy") && i.contains("consistent-hash")),
             "未支持的 strategy 应被拦: {:?}", cfg.semantic_issues());
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    fn cfg_with_selector(persist_path: &str, members: &[&str]) -> crate::config::Config {
+        let members_json = serde_json::to_string(members).unwrap();
+        let s = format!(r#"{{
+            "inbounds": [],
+            "outbounds": [
+                {{ "type": "direct", "tag": "c1" }},
+                {{ "type": "direct", "tag": "c2" }},
+                {{ "type": "selector", "tag": "sel", "outbounds": {members_json} }}
+            ],
+            "routing": {{ "default_outbound": "sel", "rules": [] }},
+            "tuning": {{
+                "selector_persist_path": "{persist_path}"
+            }}
+        }}"#);
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn test_selector_switch_persists_and_restores() {
+        let tmp_dir = std::env::temp_dir().join(format!("sel_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("selector_state.json");
+        let path_str = path.to_str().unwrap();
+
+        let cfg = cfg_with_selector(path_str, &["c1", "c2"]);
+        let m1 = OutboundManager::new(&cfg).unwrap();
+        let sel_node1 = m1.outbounds.get("sel").unwrap();
+        assert_eq!(sel_node1.resolve_leaf().tag(), "c1");
+
+        // 模拟 API 切换并持久化选择
+        crate::proxy::selector_state::save_selector_choice(path_str, "sel", "c2");
+
+        // 重建出站管理器 (模拟服务重启)
+        let m2 = OutboundManager::new(&cfg).unwrap();
+        let sel_node2 = m2.outbounds.get("sel").unwrap();
+        assert_eq!(sel_node2.resolve_leaf().tag(), "c2", "重启后应成功恢复至 c2");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_selector_member_deleted_falls_back_and_cleans() {
+        let tmp_dir = std::env::temp_dir().join(format!("sel_del_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("selector_state.json");
+        let path_str = path.to_str().unwrap();
+
+        // 初始持久化状态为 c2
+        crate::proxy::selector_state::save_selector_choice(path_str, "sel", "c2");
+
+        // 此时配置中成员删除了 c2, 仅剩 c1
+        let cfg = cfg_with_selector(path_str, &["c1"]);
+        let m = OutboundManager::new(&cfg).unwrap();
+        let sel_node = m.outbounds.get("sel").unwrap();
+        assert_eq!(sel_node.resolve_leaf().tag(), "c1", "成员被删后应回退到第一个成员 c1");
+
+        // 验证文件中的失效记录已被清理
+        let loaded = crate::proxy::selector_state::load_selector_choices(path_str);
+        assert!(!loaded.contains_key("sel"), "失效成员的选择记录应被清理");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_selector_corrupted_file_ignored_with_warn() {
+        let tmp_dir = std::env::temp_dir().join(format!("sel_bad_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("selector_state.json");
+        let path_str = path.to_str().unwrap();
+
+        // 写入损坏的内容
+        std::fs::write(&path, b"{{{invalid-json-content").unwrap();
+
+        let cfg = cfg_with_selector(path_str, &["c1", "c2"]);
+        let m = OutboundManager::new(&cfg).expect("损坏文件不应阻断初始化");
+        let sel_node = m.outbounds.get("sel").unwrap();
+        assert_eq!(sel_node.resolve_leaf().tag(), "c1", "损坏文件应忽略并取首个节点");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_selector_memory_choice_takes_precedence_over_file() {
+        let tmp_dir = std::env::temp_dir().join(format!("sel_mem_test_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("selector_state.json");
+        let path_str = path.to_str().unwrap();
+
+        // 文件中记录的是 c1
+        crate::proxy::selector_state::save_selector_choice(path_str, "sel", "c1");
+
+        let cfg = cfg_with_selector(path_str, &["c1", "c2"]);
+        let m_old = OutboundManager::new(&cfg).unwrap();
+        // 内存中切换到 c2
+        if let OutboundNode::Selector { current, children, .. } = &**m_old.outbounds.get("sel").unwrap() {
+            let mut curr = current.write().unwrap();
+            *curr = Some(children[1].clone()); // c2
+        }
+
+        // 热重载重建 (传入旧 outbounds): 内存中的 c2 应优先于文件中的 c1
+        let m_new = OutboundManager::new_with_prev(&cfg, Some(&m_old)).unwrap();
+        let sel_node = m_new.outbounds.get("sel").unwrap();
+        assert_eq!(sel_node.resolve_leaf().tag(), "c2", "热重载时内存选择应优先于文件");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

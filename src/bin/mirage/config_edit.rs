@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use serde_json::Value;
+pub use mirage_rs::config::is_group_type;
 
 // ============================================================================
 // 1. 类型定义与特征 (Types & Traits)
@@ -200,11 +201,7 @@ pub fn get_existing_outbound_tags(root: &Value) -> HashSet<String> {
 
 /// 列出所有 mirage 类型的出站节点
 pub fn list_mirage_outbounds(root: &Value) -> Vec<OutboundSummary> {
-    let default_outbound = root
-        .get("routing")
-        .and_then(|r| r.get("default_outbound"))
-        .and_then(|d| d.as_str())
-        .unwrap_or("");
+    let default_outbound = mirage_rs::config::resolve_default_outbound_from_value(root);
 
     let arr = match root.get("outbounds").and_then(|v| v.as_array()) {
         Some(a) => a,
@@ -216,7 +213,7 @@ pub fn list_mirage_outbounds(root: &Value) -> Vec<OutboundSummary> {
     for o in arr {
         let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let g_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-        if (o_type == "urltest" || o_type == "selector") && !g_tag.is_empty() {
+        if is_group_type(o_type) && !g_tag.is_empty() {
             if let Some(members) = o.get("outbounds").and_then(|m| m.as_array()) {
                 for m in members {
                     if let Some(m_str) = m.as_str() {
@@ -525,13 +522,13 @@ pub fn check_outbound_references(root: &Value, tag: &str) -> Vec<OutboundRef> {
         }
     }
 
-    // 3. urltest / selector 组中的 outbounds
+    // 3. 出站组 (urltest / fallback / selector / load_balance) 中的 outbounds
     if let Some(arr) = root.get("outbounds").and_then(|v| v.as_array()) {
         for o in arr {
             let o_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
             if o_tag == tag { continue; }
             let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if o_type == "urltest" || o_type == "selector" {
+            if is_group_type(o_type) {
                 if let Some(members) = o.get("outbounds").and_then(|m| m.as_array()) {
                     if members.iter().any(|m| m.as_str() == Some(tag)) {
                         refs.push(OutboundRef::Group { group_tag: o_tag.to_string() });
@@ -566,7 +563,7 @@ pub fn delete_outbound(
     if let Some(arr) = root.get_mut("outbounds").and_then(|v| v.as_array_mut()) {
         for o in arr.iter_mut() {
             let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if o_type == "urltest" || o_type == "selector" {
+            if is_group_type(o_type) {
                 if let Some(members) = o.get_mut("outbounds").and_then(|m| m.as_array_mut()) {
                     members.retain(|m| m.as_str() != Some(tag));
                 }
@@ -582,7 +579,7 @@ pub fn delete_outbound(
     Ok(())
 }
 
-/// 将 tag 追加进指定 urltest/selector 组
+/// 将 tag 追加进指定出站组 (urltest/fallback/selector/load_balance)
 pub fn add_tag_to_group(root: &mut Value, group_tag: &str, target_tag: &str) -> Result<(), String> {
     let arr = root
         .get_mut("outbounds")
@@ -595,8 +592,8 @@ pub fn add_tag_to_group(root: &mut Value, group_tag: &str, target_tag: &str) -> 
         .ok_or_else(|| format!("未找到出站组 `{group_tag}`"))?;
 
     let g_type = group.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if g_type != "urltest" && g_type != "selector" {
-        return Err(format!("出站 `{group_tag}` 类型为 `{g_type}`, 不是出站组 (urltest/selector)"));
+    if !is_group_type(g_type) {
+        return Err(format!("出站 `{group_tag}` 类型为 `{g_type}`, 不是出站组"));
     }
 
     if group.get("outbounds").is_none() {
@@ -1504,6 +1501,12 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                     }
                 };
 
+                if let Some((ref added_tag, ..)) = new_tag {
+                    if let Err(e) = super::group_adjust::adjust_outbound_groups(&mut root, reader, writer, false, Some(added_tag)) {
+                        writeln!(writer, "⚠ 调整出站组提示: {e}").map_err(|e| e.to_string())?;
+                    }
+                }
+
                 if need_probe {
                     if let Some((tag, host, port, pwd, sni, trans)) = new_tag {
                         if trans == "tcp" && prompt_yes_no(reader, writer, &format!("是否立即测活节点 `{tag}`？"), false) {
@@ -1656,7 +1659,7 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
             }
             "5" if has_mirage_nodes => {
                 let tags = get_existing_outbound_tags(&root);
-                let cur = root.get("routing").and_then(|r| r.get("default_outbound")).and_then(|d| d.as_str()).unwrap_or("");
+                let cur = mirage_rs::config::resolve_default_outbound_from_value(&root);
                 writeln!(writer, "现有所有出站/组 tag: {}", tags.into_iter().collect::<Vec<_>>().join(", ")).map_err(|e| e.to_string())?;
                 writeln!(writer, "当前默认出站: `{cur}`").map_err(|e| e.to_string())?;
                 let new_def = prompt_line(reader, writer, "请输入要设为默认出站的 tag:");
@@ -2379,6 +2382,49 @@ mod tests {
         let group_members = root["outbounds"][1]["outbounds"].as_array().unwrap();
         assert_eq!(group_members.len(), 1);
         assert_eq!(group_members[0].as_str(), Some("proxy-2"));
+    }
+
+    #[test]
+    fn test_all_four_group_types_recognized_and_cleaned() {
+        let mut root = json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "n1", "server": "203.0.113.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "n2", "server": "203.0.113.2", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "urltest", "tag": "grp-ut", "outbounds": ["n1", "n2"] },
+                { "type": "fallback", "tag": "grp-fb", "outbounds": ["n1", "n2"] },
+                { "type": "selector", "tag": "grp-sel", "outbounds": ["n1", "n2"] },
+                { "type": "load_balance", "tag": "grp-lb", "outbounds": ["n1", "n2"], "strategy": "round-robin" },
+                { "type": "load-balance", "tag": "grp-lb-alias", "outbounds": ["n1"], "strategy": "round-robin" },
+                { "type": "direct", "tag": "direct" }
+            ],
+            "routing": {
+                "default_outbound": "direct",
+                "rules": []
+            }
+        });
+
+        // 1. check_outbound_references 必须识别全部四种组 (及 alias)
+        let refs = check_outbound_references(&root, "n1");
+        assert_eq!(refs.len(), 5);
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-ut".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-fb".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-sel".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-lb".to_string() }));
+        assert!(refs.contains(&OutboundRef::Group { group_tag: "grp-lb-alias".to_string() }));
+
+        // 2. add_tag_to_group 必须支持全部四种组
+        add_tag_to_group(&mut root, "grp-lb-alias", "n2").unwrap();
+        let lb_alias = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == "grp-lb-alias").unwrap();
+        assert_eq!(lb_alias["outbounds"], json!(["n1", "n2"]));
+
+        // 3. delete_outbound 成功将 n1 从全部四类组中清理
+        assert!(delete_outbound(&mut root, "n1", true).is_ok());
+        for g_tag in ["grp-ut", "grp-fb", "grp-sel", "grp-lb", "grp-lb-alias"] {
+            let g = root["outbounds"].as_array().unwrap().iter().find(|o| o["tag"] == g_tag).unwrap();
+            let members = g["outbounds"].as_array().unwrap();
+            assert!(!members.iter().any(|m| m.as_str() == Some("n1")), "{g_tag} 中不应再包含 n1");
+            assert!(members.iter().any(|m| m.as_str() == Some("n2")), "{g_tag} 中应保留 n2");
+        }
     }
 
     #[test]

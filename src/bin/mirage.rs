@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+#[path = "mirage/group_adjust.rs"]
+pub mod group_adjust;
+
 #[path = "mirage/config_edit.rs"]
 mod config_edit;
 
@@ -641,8 +644,9 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
 
     root["outbounds"].as_array_mut().unwrap().push(mirage_outbound_json(&tag, &node));
 
-    // --group: 建/更新 urltest 组并指向它 (唯一改路由的路径); 否则仅在代理数>1 时给建议。
+    // --group: 建/更新 urltest 组并指向它 (唯一改路由的路径); 否则仅在代理数>1 时引导建组或给建议。
     let mut group_note: Option<String> = None;
+    let mut groups_adjusted = false;
     if let Some(gname) = group {
         match apply_urltest_group(&mut root, gname, group_opts) {
             Ok((n, old)) => {
@@ -661,6 +665,20 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
             Err(e) => {
                 eprintln!("✗ 建组失败: {e} (未改动配置)");
                 return 1;
+            }
+        }
+    } else {
+        // 原则 2: 出站组随节点数自动调整
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut stdout = std::io::stdout();
+        match group_adjust::adjust_outbound_groups(&mut root, &mut reader, &mut stdout, is_tty, Some(&tag)) {
+            Ok(changed) => {
+                groups_adjusted = changed;
+            }
+            Err(e) => {
+                eprintln!("⚠ 出站组交互中止: {e}");
             }
         }
     }
@@ -682,6 +700,9 @@ async fn run_import(path: &str, uri: &str, test: bool, require_live: bool, group
     if let Some(note) = group_note {
         // --group: 路由已自动指向组, 无需再手动接线。
         println!("  {note}");
+        println!("  `mirage-rs check -c {path}` 确认无误再重启。");
+    } else if groups_adjusted {
+        println!("  出站组与默认出站已更新。");
         println!("  `mirage-rs check -c {path}` 确认无误再重启。");
     } else {
         println!("  提示: 出站已添加, 但还没有任何路由规则使用它。");
@@ -821,6 +842,7 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
     }
 
     let mut group_note = None;
+    let mut groups_adjusted = false;
     if let Some(gname) = group {
         match apply_urltest_group(&mut root, gname, group_opts) {
             Ok((n, old)) => group_note = Some(format!(
@@ -828,6 +850,20 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
                 old.as_deref().unwrap_or("<未设>")
             )),
             Err(e) => { eprintln!("✗ 建组失败: {e} (未改动配置)"); return 1; }
+        }
+    } else if added > 0 {
+        // 原则 2: 出站组随节点数自动调整
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        let mut stdout = std::io::stdout();
+        match group_adjust::adjust_outbound_groups(&mut root, &mut reader, &mut stdout, is_tty, None) {
+            Ok(changed) => {
+                groups_adjusted = changed;
+            }
+            Err(e) => {
+                eprintln!("⚠ 出站组交互中止: {e}");
+            }
         }
     }
 
@@ -840,9 +876,12 @@ async fn run_subscribe(path: &str, source: &str, group: Option<&str>, group_opts
         return 1;
     }
     println!("✓ 已写回 {path} (原文件备份: {path}.bak)");
-    match group_note {
-        Some(note) => println!("  {note}\n  `mirage-rs check -c {path}` 确认后重启。"),
-        None => println!("  提示: 出站已加但未接路由。要按 RTT 自动选路, 重跑时加 --group。"),
+    if let Some(note) = group_note {
+        println!("  {note}\n  `mirage-rs check -c {path}` 确认后重启。");
+    } else if groups_adjusted {
+        println!("  出站组与默认出站已更新。\n  `mirage-rs check -c {path}` 确认后重启。");
+    } else {
+        println!("  提示: 出站已加但未接路由。要按 RTT 自动选路, 重跑时加 --group。");
     }
     // 建组时若节点跨区域给出告警 (与 import --group 一致)
     if group.is_some() {

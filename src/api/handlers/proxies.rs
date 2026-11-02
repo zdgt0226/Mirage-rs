@@ -57,6 +57,11 @@ pub async fn select_proxy(State(app_state): State<AppState>, Json(req): Json<Sel
             if let Some(target_node) = children.iter().find(|c| c.tag() == req.target) {
                 let mut curr = current.write().unwrap_or_else(|e| e.into_inner());
                 *curr = Some(target_node.clone());
+                crate::proxy::selector_state::save_selector_choice(
+                    &st.outbounds.selector_persist_path,
+                    &req.group,
+                    &req.target,
+                );
                 return Json(json!({"status": "success", "message": format!("Switched {} to {}", req.group, req.target)})).into_response();
             }
         }
