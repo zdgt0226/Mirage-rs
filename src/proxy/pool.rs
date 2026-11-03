@@ -73,6 +73,9 @@ impl Drop for ActiveFdGuard {
 
 pub const DEAD_AFTER_FAILURES: u32 = 3;
 pub const RECOVER_AFTER_SUCCESSES: u32 = 2;
+pub const PENALIZE_AFTER_FAILURES: u32 = 3;
+pub const PENALTY_CLEAR_SUCCESSES: u32 = 2;
+pub const PENALTY_DURATION: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct PoolStats {
@@ -82,6 +85,10 @@ pub struct PoolStats {
     pub dead: bool,
     pub last_sample_time: Option<Instant>,
     pub last_failure_time: Option<Instant>,
+    pub real_failures: u32,
+    pub real_successes: u32,
+    pub penalized_until: Option<Instant>,
+    pub recent_fail_targets: VecDeque<String>,
 }
 
 impl Default for PoolStats {
@@ -99,6 +106,10 @@ impl PoolStats {
             dead: false,
             last_sample_time: None,
             last_failure_time: None,
+            real_failures: 0,
+            real_successes: 0,
+            penalized_until: None,
+            recent_fail_targets: VecDeque::with_capacity(3),
         }
     }
 
@@ -125,6 +136,59 @@ impl PoolStats {
         }
     }
 
+    /// 记一次真实连接失败。返回 true 表示本次刚进入降级 (调用方据此打带节点名的日志)。
+    pub fn record_real_failure(&mut self, target: &str) -> bool {
+        self.record_real_failure_at(target, Instant::now())
+    }
+
+    pub fn record_real_failure_at(&mut self, target: &str, now: Instant) -> bool {
+        self.real_successes = 0;
+        if self.recent_fail_targets.iter().any(|t| t == target) {
+            return false;
+        }
+        if self.recent_fail_targets.len() >= 3 {
+            self.recent_fail_targets.pop_front();
+        }
+        self.recent_fail_targets.push_back(target.to_string());
+        self.real_failures += 1;
+        if self.real_failures >= PENALIZE_AFTER_FAILURES {
+            let was_penalized = self.is_penalized_at(now);
+            self.penalized_until = Some(now + PENALTY_DURATION);
+            return !was_penalized;
+        }
+        false
+    }
+
+    pub fn record_real_success(&mut self) {
+        self.record_real_success_at(Instant::now());
+    }
+
+    pub fn record_real_success_at(&mut self, now: Instant) {
+        self.real_failures = 0;
+        self.recent_fail_targets.clear();
+        if self.is_penalized_at(now) {
+            self.real_successes += 1;
+            if self.real_successes >= PENALTY_CLEAR_SUCCESSES {
+                self.penalized_until = None;
+                self.real_successes = 0;
+            }
+        } else {
+            self.penalized_until = None;
+            self.real_successes = 0;
+        }
+    }
+
+    pub fn is_penalized(&self) -> bool {
+        self.is_penalized_at(Instant::now())
+    }
+
+    pub fn is_penalized_at(&self, now: Instant) -> bool {
+        match self.penalized_until {
+            Some(until) => now < until,
+            None => false,
+        }
+    }
+
     pub fn latency_ms(&self) -> Option<u64> {
         if self.latency_samples.is_empty() {
             return None;
@@ -144,6 +208,10 @@ impl PoolStats {
         if self.dead {
             self.consecutive_successes = RECOVER_AFTER_SUCCESSES.saturating_sub(1);
         }
+        self.real_failures = 0;
+        self.real_successes = 0;
+        self.penalized_until = None;
+        self.recent_fail_targets.clear();
     }
 }
 
@@ -1746,5 +1814,102 @@ mod backoff_tests {
         // 验证无需等待 30s, shutdown 能够立即使后台协程退出
         tokio::task::yield_now().await;
         assert!(shutdown_start.elapsed() < Duration::from_secs(1), "Drop 应立刻唤醒退避中的 builder 退出");
+    }
+
+    #[test]
+    fn test_pool_stats_real_failure_penalty_three_distinct_targets() {
+        let mut stats = PoolStats::new();
+        assert!(!stats.is_penalized());
+
+        stats.record_real_failure("t1.example.com:443");
+        assert_eq!(stats.real_failures, 1);
+        assert!(!stats.is_penalized());
+
+        stats.record_real_failure("t2.example.com:443");
+        assert_eq!(stats.real_failures, 2);
+        assert!(!stats.is_penalized());
+
+        stats.record_real_failure("t3.example.com:443");
+        assert_eq!(stats.real_failures, 3);
+        assert!(stats.is_penalized());
+        // 罚分不影响健康状态
+        assert!(stats.is_healthy());
+    }
+
+    #[test]
+    fn test_pool_stats_real_failure_same_target_five_times_no_penalty() {
+        let mut stats = PoolStats::new();
+        for _ in 0..5 {
+            stats.record_real_failure("same.example.com:443");
+        }
+        assert_eq!(stats.real_failures, 1);
+        assert!(!stats.is_penalized());
+    }
+
+    #[test]
+    fn test_pool_stats_penalty_clear_after_two_successes() {
+        let mut stats = PoolStats::new();
+        stats.record_real_failure("t1.example.com:443");
+        stats.record_real_failure("t2.example.com:443");
+        stats.record_real_failure("t3.example.com:443");
+        assert!(stats.is_penalized());
+
+        // 成功 1 次: 仍处于罚分中
+        stats.record_real_success();
+        assert_eq!(stats.real_successes, 1);
+        assert!(stats.is_penalized());
+
+        // 成功 2 次: 清除罚分
+        stats.record_real_success();
+        assert_eq!(stats.real_successes, 0);
+        assert!(!stats.is_penalized());
+        assert!(stats.penalized_until.is_none());
+    }
+
+    #[test]
+    fn test_pool_stats_success_resets_failure_count_before_penalty() {
+        let mut stats = PoolStats::new();
+        stats.record_real_failure("t1.example.com:443");
+        stats.record_real_failure("t2.example.com:443");
+        assert_eq!(stats.real_failures, 2);
+
+        // 穿插成功: 计数清零
+        stats.record_real_success();
+        assert_eq!(stats.real_failures, 0);
+        assert!(stats.recent_fail_targets.is_empty());
+
+        // 再失败 1 次不会罚分
+        stats.record_real_failure("t3.example.com:443");
+        assert_eq!(stats.real_failures, 1);
+        assert!(!stats.is_penalized());
+    }
+
+    #[test]
+    fn test_pool_stats_penalty_expires() {
+        let mut stats = PoolStats::new();
+        let now = Instant::now();
+        stats.record_real_failure_at("t1.example.com:443", now);
+        stats.record_real_failure_at("t2.example.com:443", now);
+        stats.record_real_failure_at("t3.example.com:443", now);
+        assert!(stats.is_penalized_at(now));
+        assert!(stats.is_penalized_at(now + Duration::from_secs(299)));
+        assert!(!stats.is_penalized_at(now + Duration::from_secs(300)));
+        assert!(!stats.is_penalized_at(now + Duration::from_secs(301)));
+    }
+
+    #[test]
+    fn test_pool_stats_on_network_change_clears_penalty() {
+        let mut stats = PoolStats::new();
+        stats.record_real_failure("t1.example.com:443");
+        stats.record_real_failure("t2.example.com:443");
+        stats.record_real_failure("t3.example.com:443");
+        assert!(stats.is_penalized());
+
+        stats.on_network_change();
+        assert_eq!(stats.real_failures, 0);
+        assert_eq!(stats.real_successes, 0);
+        assert!(stats.penalized_until.is_none());
+        assert!(stats.recent_fail_targets.is_empty());
+        assert!(!stats.is_penalized());
     }
 }
