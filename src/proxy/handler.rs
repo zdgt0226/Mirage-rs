@@ -34,6 +34,35 @@ pub(crate) fn human_bytes(n: u64) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadEndReason {
+    CloseNotify,
+    PeerError,     // 对端错误结束 (裸 EOF、RST、解密失败)
+    IdleTimeout,   // 空闲超时
+    LocalWriteErr, // 本地写失败
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RealConnResult {
+    Success,
+    Failure,
+    Ignore,
+}
+
+pub(crate) fn classify_real_conn(
+    down_bytes: u64,
+    end_reason: DownloadEndReason,
+    local_eof: bool,
+) -> RealConnResult {
+    if down_bytes > 0 {
+        RealConnResult::Success
+    } else if end_reason == DownloadEndReason::PeerError && !local_eof {
+        RealConnResult::Failure
+    } else {
+        RealConnResult::Ignore
+    }
+}
+
 /**
  * [SOCKS5 客户端接入点]
  * 负责接收局域网设备或本机发来的代理请求，执行 SOCKS5 握手，
@@ -271,7 +300,7 @@ pub async fn proxy_tcp_target(
     let leaf = outbound.resolve_leaf();
     drop(current_state);
     match &*leaf {
-        OutboundNode::Mirage { pool, .. } => {
+        OutboundNode::Mirage { tag: node_tag, pool, .. } => {
             let target_bytes = target.as_bytes();
             if target_bytes.is_empty() || target_bytes.len() > 512 {
                 error!(
@@ -417,6 +446,9 @@ pub async fn proxy_tcp_target(
                 Some(t) => t,
                 None => {
                     error!("Mirage outbound: {} 尝试 {} 条隧道首写均失败, 放弃", target, MAX_TUNNEL_ATTEMPTS);
+                    if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target) {
+                        info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
+                    }
                     return;
                 }
             };
@@ -538,6 +570,7 @@ pub async fn proxy_tcp_target(
                 // 下行是否被截断: 只有收到认证过的 close_notify 才算对端完整结束; 裸 EOF / RST /
                 // 解密失败 / 空闲超时都可能是路径注入或服务端异常收尾 (见 aead::PeerCloseNotify)。
                 let mut truncated = false;
+                let end_reason: DownloadEndReason;
 
                 loop {
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
@@ -548,17 +581,24 @@ pub async fn proxy_tcp_target(
                                 b.down.consume(data.len()).await; // 限速整形 (下行)
                             }
                             if local_write.write_all(data).await.is_err() {
+                                end_reason = DownloadEndReason::LocalWriteErr;
                                 break;
                             }
                             down_bytes += data.len() as u64;
                             dn_conn.down(data.len() as u64);
                         }
                         Ok(Err(e)) => {
-                            truncated = !crate::crypto::aead::is_close_notify(&e);
+                            if crate::crypto::aead::is_close_notify(&e) {
+                                end_reason = DownloadEndReason::CloseNotify;
+                            } else {
+                                truncated = true;
+                                end_reason = DownloadEndReason::PeerError;
+                            }
                             break;
                         }
                         Err(_) => {
                             truncated = true; // 空闲超时
+                            end_reason = DownloadEndReason::IdleTimeout;
                             break;
                         }
                     }
@@ -584,7 +624,7 @@ pub async fn proxy_tcp_target(
                     let _ = local_write.shutdown().await;
                 }
 
-                (tunnel_reader, down_bytes)
+                (tunnel_reader, down_bytes, end_reason)
             };
 
             // ★ guard 必须在 upload/download **之后**声明。这两个 async 块把
@@ -602,7 +642,7 @@ pub async fn proxy_tcp_target(
             // 物理 TCP 隧道注册 fd 供 brutal 动态调速; 嵌套 (Boxed, 无 fd) 跳过 (无 brutal)。
             let _guard = active_fd.map(|fd| pool.active_fd_guard(fd));
 
-            let ((tw, up_bytes), (tr, down_bytes)) = tokio::join!(upload, download);
+            let ((tw, up_bytes), (tr, down_bytes, end_reason)) = tokio::join!(upload, download);
             drop(_guard);   // 正常路径: 先从 set 移除，防止微秒级死 FD 暴露 (cancel 路径靠声明顺序)
             drop(tw);
             drop(tr);
@@ -613,6 +653,19 @@ pub async fn proxy_tcp_target(
                 human_bytes(down_bytes),
                 t_start.elapsed().as_secs_f64()
             );
+
+            let local_eof_val = local_eof.load(std::sync::atomic::Ordering::SeqCst);
+            match classify_real_conn(down_bytes, end_reason, local_eof_val) {
+                RealConnResult::Success => {
+                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_success();
+                }
+                RealConnResult::Failure => {
+                    if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target) {
+                        info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
+                    }
+                }
+                RealConnResult::Ignore => {}
+            }
         }
         OutboundNode::Direct { .. } => {
             // v0.4.5-alpha.3: 直连数据面 = splice(2)+pipe 零拷贝 (学 dae/control/tcp_copy_linux.go).
@@ -878,5 +931,52 @@ mod tests {
             "本地应用应收到 RST, 实得 {r:?}"
         );
         drop((rd, wr));
+    }
+
+    #[test]
+    fn test_classify_real_conn() {
+        use super::{classify_real_conn, DownloadEndReason, RealConnResult};
+
+        // 成功: down_bytes > 0 (无论结束原因与 local_eof)
+        assert_eq!(
+            classify_real_conn(1, DownloadEndReason::PeerError, false),
+            RealConnResult::Success
+        );
+        assert_eq!(
+            classify_real_conn(1024, DownloadEndReason::CloseNotify, false),
+            RealConnResult::Success
+        );
+        assert_eq!(
+            classify_real_conn(50, DownloadEndReason::IdleTimeout, true),
+            RealConnResult::Success
+        );
+
+        // 失败: down_bytes == 0 且 对端错误结束 且 本地没有先结束
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::PeerError, false),
+            RealConnResult::Failure
+        );
+
+        // 其它情况均为 Ignore (不记)
+        // 0 字节但收到 close_notify
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::CloseNotify, false),
+            RealConnResult::Ignore
+        );
+        // 0 字节但空闲超时
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::IdleTimeout, false),
+            RealConnResult::Ignore
+        );
+        // 0 字节但本地写失败
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::LocalWriteErr, false),
+            RealConnResult::Ignore
+        );
+        // 0 字节且对端错误, 但本地先结束 (local_eof == true)
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::PeerError, true),
+            RealConnResult::Ignore
+        );
     }
 }

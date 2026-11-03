@@ -104,6 +104,13 @@ impl OutboundNode {
         }
     }
 
+    pub fn is_penalized(&self) -> bool {
+        match self {
+            Self::Mirage { pool, .. } => pool.stats.read().unwrap_or_else(|e| e.into_inner()).is_penalized(),
+            _ => false,
+        }
+    }
+
     pub fn latency_rtt_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
             Self::Mirage { rtt_ms, .. } => {
@@ -140,23 +147,30 @@ impl OutboundNode {
     pub fn resolve_leaf(self: &Arc<Self>) -> Arc<OutboundNode> {
         match &**self {
             Self::Urltest { tag, children, tolerance_ms, test_type, current } => {
-                let candidates: Vec<_> = children.iter().filter(|c| c.is_healthy()).collect();
-                if candidates.is_empty() {
+                let healthy: Vec<_> = children.iter().filter(|c| c.is_healthy()).collect();
+                if healthy.is_empty() {
                     return self.clone();
                 }
 
+                let unpenalized: Vec<_> = healthy.iter().copied().filter(|c| !c.is_penalized()).collect();
+                let (candidates, allow_penalized_current) = if unpenalized.is_empty() {
+                    (healthy, true)
+                } else {
+                    (unpenalized, false)
+                };
+
                 let with_lat: Vec<_> = candidates.iter()
-                    .filter_map(|c| c.latency_ms(test_type).map(|lat| (c, lat)))
+                    .filter_map(|c| c.latency_ms(test_type).map(|lat| (*c, lat)))
                     .collect();
 
                 if with_lat.is_empty() {
                     let mut curr_guard = current.write().unwrap_or_else(|e| e.into_inner());
                     if let Some(c) = curr_guard.as_ref() {
-                        if c.is_healthy() {
+                        if c.is_healthy() && (allow_penalized_current || !c.is_penalized()) {
                             return c.resolve_leaf();
                         }
                     }
-                    *curr_guard = Some(candidates[0].clone());
+                    *curr_guard = Some((*candidates[0]).clone());
                     return candidates[0].resolve_leaf();
                 }
 
@@ -165,8 +179,9 @@ impl OutboundNode {
                     .unwrap();
 
                 let mut curr_guard = current.write().unwrap_or_else(|e| e.into_inner());
-                // 迟滞只保护健康的当前节点: 死节点的历史延迟样本不清空, 不判健康会一直黏在死节点上
-                if let Some(curr) = curr_guard.as_ref().filter(|c| c.is_healthy()) {
+                // 迟滞只保护健康且未罚分的当前节点 (若全部罚分则回退保护健康节点):
+                // 死节点或被罚分的当前节点不享受 tolerance 保护, 直接切到最优候选
+                if let Some(curr) = curr_guard.as_ref().filter(|c| c.is_healthy() && (allow_penalized_current || !c.is_penalized())) {
                     if let Some(curr_lat) = curr.latency_ms(test_type) {
                         if curr_lat <= best.1 + *tolerance_ms {
                             return curr.resolve_leaf();
@@ -1296,5 +1311,60 @@ mod urltest_tests {
         stats(&b).record_latency(100);
         let g = urltest(vec![a.clone(), b], Some(a));
         assert_eq!(g.resolve_leaf().tag(), "a");
+    }
+
+    /// 罚分的当前节点在容差内也被换掉。
+    #[tokio::test]
+    async fn penalized_incumbent_within_tolerance_is_replaced() {
+        let a = mirage("a");
+        let b = mirage("b");
+        stats(&a).record_latency(80);
+        stats(&b).record_latency(100);
+        for i in 0..3 {
+            stats(&a).record_real_failure(&format!("target{}.example.com:443", i));
+        }
+        assert!(a.is_penalized());
+        assert!(a.is_healthy());
+        let g = urltest(vec![a.clone(), b.clone()], Some(a.clone()));
+        assert_eq!(g.resolve_leaf().tag(), "b");
+        let OutboundNode::Urltest { current, .. } = g.as_ref() else { unreachable!() };
+        assert_eq!(current.read().unwrap().as_ref().unwrap().tag(), "b");
+    }
+
+    /// 有未罚分健康节点时不选罚分节点即使它延迟更低。
+    #[tokio::test]
+    async fn unpenalized_node_preferred_over_lower_latency_penalized() {
+        let a = mirage("a");
+        let b = mirage("b");
+        stats(&a).record_latency(50);
+        stats(&b).record_latency(100);
+        for i in 0..3 {
+            stats(&a).record_real_failure(&format!("target{}.example.com:443", i));
+        }
+        assert!(a.is_penalized());
+        let g = urltest(vec![a.clone(), b], None);
+        assert_eq!(g.resolve_leaf().tag(), "b");
+    }
+
+    /// 全部罚分时仍按延迟选。
+    #[tokio::test]
+    async fn all_penalized_nodes_fallback_to_latency_selection() {
+        let a = mirage("a");
+        let b = mirage("b");
+        stats(&a).record_latency(120);
+        stats(&b).record_latency(80);
+        for i in 0..3 {
+            stats(&a).record_real_failure(&format!("target-a{}.example.com:443", i));
+            stats(&b).record_real_failure(&format!("target-b{}.example.com:443", i));
+        }
+        assert!(a.is_penalized());
+        assert!(b.is_penalized());
+        // 无当前节点: 选延迟更低的 b
+        let g = urltest(vec![a.clone(), b.clone()], None);
+        assert_eq!(g.resolve_leaf().tag(), "b");
+
+        // 当前节点为 a 且在容差内 (120 <= 80 + 50): 保护容差内的当前节点
+        let g2 = urltest(vec![a.clone(), b.clone()], Some(a));
+        assert_eq!(g2.resolve_leaf().tag(), "a");
     }
 }
