@@ -365,7 +365,7 @@ mirage-rs config -c config.json
 - [x] **性能调优与架构**: Cipher agility 自动协商硬件加速 AES-256-GCM（`tuning.cipher_agility`）；UDP 多路复用 (`tuning.udp_mux` 突破并发带机量瓶颈)；IPv6 隧道传输支持；隧道 relay 缓冲调优 (上行 64KB buf + greedy `try_read`)。
 - [x] **运维工具与看板**: Web 看板 Mirage Console（双主题、中英双语、分角色视图、可视化规则编辑）；配置工具链 (`check` / `format` / `import` / `test` / `config`)；Geo 规则自动更新与热重载；CI 确定性回归哨兵；cosign keyless 供应链签名与多架构容器镜像。
 - [x] **节点健康判定迟滞 (v0.17.2, 参考 honk)**: 连续失败 3 次判死, 判死后连续成功 2 次才恢复; 网络变化时取消退避立即重建, 判死节点成功 1 次即恢复; urltest 不再黏在已判死的当前节点上。
-- [x] **DNS 过期缓存兜底与负缓存 (v0.17.4, 参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s); NXDOMAIN / 空答复按 SOA 缓存 (≤300s)。
+- [x] **DNS 过期缓存兜底与负缓存 (v0.17.4, 参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s), 上游 1.8s 未返回时先回旧答案并后台刷新; NXDOMAIN / 空答复按 SOA 缓存 (≤300s)。
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
 
 ### 🚧 进行中 / 部分完成
