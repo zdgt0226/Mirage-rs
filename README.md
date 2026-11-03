@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.2-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.3-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -409,6 +409,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.3** | 2026-11-03 | **无协议变更**: urltest / fallback / load_balance 组健康检查间隔默认 300s 改为 60s, 节点空闲时挂掉最坏判死时间从 15 分钟缩到 3 分钟; 显式配置的 `interval` 不受影响。 |
 | **v0.17.2** | 2026-11-03 | **无协议变更**: 修 urltest 组在当前节点挂掉后仍黏在它上面 (新连接要等 10s 超时); 节点健康判定加迟滞 (判死后连续成功 2 次才恢复), 网络变化后立即重建暖池并快速恢复判死节点。 |
 | **v0.17.1** | 2026-11-02 | **无协议变更**: `/api/proxies` 补全 fallback / load_balance 组, 新增默认出站 `default` 与成员健康状态 `healthy`, 组按名称排序; 配套 Mirage-console 出站组切换界面 (四类组、默认出站标记、切换反馈)。 |
 | **v0.17.0** | 2026-11-02 | **无协议变更**: 命令行加到 2 个以上节点时自动引导建出站组 (auto / select / fallback / load_balance, 终端里空格勾选成员); 未写 `default_outbound` 时默认出站取 outbounds 第一条 (原为 direct); selector 手动选择持久化, 重启后保留; 出站增减的改动热重载时若会让路由失效则拒绝并提示重启; `install.sh` 客户端部署可连续添加多个节点, 并整理全部提示文案与排版。 |
