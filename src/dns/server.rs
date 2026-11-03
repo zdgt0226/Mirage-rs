@@ -730,6 +730,7 @@ async fn tcp_query_one(req: &[u8], up: SocketAddr) -> Option<Vec<u8>> {
 
 const STALE_WINDOW: Duration = Duration::from_secs(3600);
 const STALE_TTL: u32 = 30;
+const STALE_ANSWER_DELAY: Duration = Duration::from_millis(1800);
 
 struct CacheEntry {
     response: Vec<u8>,
@@ -1155,7 +1156,7 @@ pub struct DnsForwarder {
     state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
     fake_ip_mapper: Option<Arc<crate::dns::fake_ip::FakeIpMapper>>,
     xdp_engine: Option<Arc<crate::ebpf::XdpEngine>>,
-    cache: Option<DnsCache>,
+    cache: Option<Arc<DnsCache>>,
     /// 本 DNS 入站的 tag, 供路由的 `inbound` 条件用。
     ///
     /// ⚠️ 语义要看清: DNS 查询是从 **dns 入站**进来的, 所以这里带的是 dns 的 tag。
@@ -1184,7 +1185,7 @@ impl DnsForwarder {
             .as_ref()
             .and_then(|adv| adv.cache.as_ref())
             .filter(|c| c.enabled)
-            .map(|c| DnsCache::new(c.max_entries));
+            .map(|c| Arc::new(DnsCache::new(c.max_entries)));
         Ok(Arc::new(Self {
             socket,
             state,
@@ -1249,6 +1250,62 @@ impl DnsForwarder {
         resp
     }
 
+    /// 统一的上游查询封装: 查上游 + 成功写缓存 + 失败/超时 serve-stale 兜底 (RFC 8767 client response timer)。
+    ///
+    /// - 若 cache 未启用或当前无可用 stale 记录 (`get_stale` 返回 None):
+    ///   行为与原有逻辑完全一致: 直接 await `fut`, 成功则写回缓存, 随后走 `stale_fallback`。
+    /// - 若存在 1 小时内的可用 stale 记录:
+    ///   通过 `tokio::spawn` 启动后台任务 await `fut`, 结果 Some 时写回缓存 (基于 Arc clone 的 cache 与拷贝的数据),
+    ///   并通过 oneshot 通道发回结果。主流程等待最长 `STALE_ANSWER_DELAY` (1.8s):
+    ///   - 超时前收到上游结果: 经 `stale_fallback` 返回 (上游成功则返回新答案, 上游失败如 SERVFAIL/None 则回退 stale);
+    ///   - 超时或通道关闭: 提前返回当前取到的 stale 旧答案 (TTL=30), 记录 debug 日志 "stale-early"。后台任务继续跑完并刷新缓存。
+    ///
+    /// 后台任务并发控制说明:
+    /// 上游调用路径本身已有单飞保护 (`direct_query` 入口走 `INFLIGHT_UPSTREAM`，隧道 DNS `dns_over_tunnel_ha` 调用的
+    /// `dns_over_tunnel` 入口走 `INFLIGHT_TUNNEL`)，同一查询的并发 miss 会被单飞机制合并，不会因超时 spawn 而向
+    /// 上游发起重复请求，因此无需在 `query_upstream` 处额外引入并发上限限制。
+    async fn query_upstream<F>(
+        &self,
+        path: ResolvePath,
+        dk: &str,
+        qtype: u16,
+        req: &[u8],
+        fut: F,
+    ) -> Option<Vec<u8>>
+    where
+        F: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
+    {
+        let stale = self.cache.as_ref().and_then(|c| c.get_stale(path, dk, qtype, req));
+        let Some(stale_resp) = stale else {
+            let resp = fut.await;
+            if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+                cache.put(path, dk, qtype, req, r);
+            }
+            return self.stale_fallback(path, dk, qtype, req, resp);
+        };
+
+        let cache = self.cache.as_ref().unwrap().clone();
+        let dk_string = dk.to_string();
+        let req_vec = req.to_vec();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let resp = fut.await;
+            if let Some(r) = &resp {
+                cache.put(path, &dk_string, qtype, &req_vec, r);
+            }
+            let _ = tx.send(resp);
+        });
+
+        match tokio::time::timeout(STALE_ANSWER_DELAY, rx).await {
+            Ok(Ok(resp)) => self.stale_fallback(path, dk, qtype, req, resp),
+            Ok(Err(_)) | Err(_) => {
+                debug!("[DNS] stale-early [{}] → 超时先行返回旧答案 (qtype {})", dk, qtype);
+                Some(stale_resp)
+            }
+        }
+    }
+
     /// 本地 cn/direct resolver 真实解析: 不给 fake-IP → 客户端拿真实 IP。尊重 IP 策略硬抑制 + DNS 缓存。
     /// fakeip.exclude 与 rules 的 `resolve: cn` 共用。
     async fn resolve_cn(
@@ -1268,11 +1325,17 @@ impl DnsForwarder {
                 return Some(hit);
             }
         }
-        let resp = direct_query(req, cn_dns).await;
-        if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-            cache.put(ResolvePath::Cn, &dk, qtype, req, r);
-        }
-        let resp = self.stale_fallback(ResolvePath::Cn, &dk, qtype, req, resp);
+        let req_vec = req.to_vec();
+        let cn_dns_vec = cn_dns.to_vec();
+        let resp = self
+            .query_upstream(
+                ResolvePath::Cn,
+                &dk,
+                qtype,
+                req,
+                async move { direct_query(&req_vec, &cn_dns_vec).await },
+            )
+            .await;
         resp.or_else(|| Some(make_nxdomain(req)))
     }
 
@@ -1316,7 +1379,7 @@ impl DnsForwarder {
             .as_ref()
             .and_then(|adv| adv.cache.as_ref())
             .filter(|c| c.enabled)
-            .map(|c| DnsCache::new(c.max_entries));
+            .map(|c| Arc::new(DnsCache::new(c.max_entries)));
 
         info!(
             "DNS Forwarder listening on {} (dynamic upstream, fake-ip: {}, cache: {})",
@@ -1477,20 +1540,34 @@ impl DnsForwarder {
                         }
                     }
                     debug!("[DNS] rule    [{}] → resolve remote (隧道 failover, {} 个上游)", domain, remote_servers.len().max(1));
-                    let resp = Self::dns_over_tunnel_ha(req, &pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
-                    // remote geoip 重定向 (简化: 不等第二个): 首个 A 属 CN → 学习, 下次降级 cn。本次仍返 remote 结果。
-                    if let (Some(ac), Some(r)) = (&auto_classify, &resp) {
-                        if let Some(ip) = first_a_record(r) {
-                            if ac.is_cn(ip.into()) {
-                                debug!("[DNS] rule    [{}] → remote 解出 CN IP {}, 学习降级 cn (下次)", domain, ip);
-                                ac.mark_cn_learned(&domain);
-                            }
-                        }
-                    }
-                    if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                        cache.put(ResolvePath::Remote, &dk, qtype, req, r);
-                    }
-                    let resp = self.stale_fallback(ResolvePath::Remote, &dk, qtype, req, resp);
+                    let req_vec = req.to_vec();
+                    let pool = pool.clone();
+                    let remote_servers = remote_servers.clone();
+                    let remote_dns_host = remote_dns_host.clone();
+                    let auto_classify = auto_classify.clone();
+                    let domain_str = domain.clone();
+                    let resp = self
+                        .query_upstream(
+                            ResolvePath::Remote,
+                            &dk,
+                            qtype,
+                            req,
+                            async move {
+                                let resp = Self::dns_over_tunnel_ha(&req_vec, &pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
+                                // remote geoip 重定向 (简化: 不等第二个): 首个 A 属 CN → 学习, 下次降级 cn。本次仍返 remote 结果。
+                                // 注意只针对上游真实结果学习, 提前返回 stale 或无真实结果时不学习。
+                                if let (Some(ac), Some(r)) = (&auto_classify, &resp) {
+                                    if let Some(ip) = first_a_record(r) {
+                                        if ac.is_cn(ip.into()) {
+                                            debug!("[DNS] rule    [{}] → remote 解出 CN IP {}, 学习降级 cn (下次)", domain_str, ip);
+                                            ac.mark_cn_learned(&domain_str);
+                                        }
+                                    }
+                                }
+                                resp
+                            },
+                        )
+                        .await;
                     return Some(resp.unwrap_or_else(|| make_nxdomain(req)));
                 }
             }
@@ -1614,11 +1691,16 @@ impl DnsForwarder {
                         }
                     }
                     debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
-                    let resp = direct_query(req, &cn_dns).await;
-                    if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                        cache.put(ResolvePath::Cn, &dk, qtype, req, r);
-                    }
-                    self.stale_fallback(ResolvePath::Cn, &dk, qtype, req, resp)
+                    let req_vec = req.to_vec();
+                    let cn_dns = cn_dns.clone();
+                    self.query_upstream(
+                        ResolvePath::Cn,
+                        &dk,
+                        qtype,
+                        req,
+                        async move { direct_query(&req_vec, &cn_dns).await },
+                    )
+                    .await
                 }
                 OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
@@ -1651,11 +1733,21 @@ impl DnsForwarder {
                         }
                     }
                     debug!("[DNS] proxy   [{}] → 隧道查 (failover {} 上游) via {}", domain, remote_servers.len().max(1), n.tag());
-                    let resp = Self::dns_over_tunnel_ha(req, pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
-                    if let (Some(cache), Some(r)) = (&self.cache, &resp) {
-                        cache.put(ResolvePath::Remote, &dk, qtype, req, r);
-                    }
-                    let resp = self.stale_fallback(ResolvePath::Remote, &dk, qtype, req, resp);
+                    let req_vec = req.to_vec();
+                    let pool = pool.clone();
+                    let remote_servers = remote_servers.clone();
+                    let remote_dns_host = remote_dns_host.clone();
+                    let resp = self
+                        .query_upstream(
+                            ResolvePath::Remote,
+                            &dk,
+                            qtype,
+                            req,
+                            async move {
+                                Self::dns_over_tunnel_ha(&req_vec, &pool, &remote_servers, &remote_dns_host, remote_dns_port).await
+                            },
+                        )
+                        .await;
                     Some(resp.unwrap_or_else(|| make_nxdomain(req)))
                 }
                 _ => Some(make_nxdomain(req)),
@@ -3137,7 +3229,7 @@ mod tests {
             state: state.clone(),
             fake_ip_mapper: None,
             xdp_engine: None,
-            cache: Some(DnsCache::new(10)),
+            cache: Some(Arc::new(DnsCache::new(10))),
             inbound_tag: "dns".into(),
         };
 
@@ -3182,5 +3274,227 @@ mod tests {
             inbound_tag: "dns".into(),
         };
         assert_eq!(fwd_no_cache.stale_fallback(ResolvePath::Cn, "example.com", 1, &q, None), None);
+    }
+
+    async fn make_test_forwarder(cache: Option<Arc<DnsCache>>) -> Arc<DnsForwarder> {
+        let router = Arc::new(crate::router::RouterEngine::new(vec![], "direct".to_string(), "/nonexistent", &std::collections::HashMap::new()).unwrap());
+        let cfg: crate::config::Config = serde_json::from_str(r#"{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"routing":{"default_outbound":"direct"}}"#).unwrap();
+        let om = Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg).unwrap());
+        let state = Arc::new(arc_swap::ArcSwap::from_pointee(crate::config_watcher::CoreState {
+            router,
+            outbounds: om,
+            advanced_dns: None,
+            auto_classify: None,
+            rate_limiter: Arc::new(crate::proxy::rate_limit::RateLimiter::from_device_profiles(&[])),
+        }));
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        Arc::new(DnsForwarder {
+            socket: Arc::new(s),
+            state,
+            fake_ip_mapper: None,
+            xdp_engine: None,
+            cache,
+            inbound_tag: "dns".into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_stale_early_and_background_refresh() {
+        tokio::time::pause();
+
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let stale_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+        let fresh_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &stale_resp);
+        {
+            let mut m = cache.map.lock().unwrap();
+            for entry in m.values_mut() {
+                entry.expiry = Instant::now() - Duration::from_secs(10);
+            }
+        }
+
+        let fwd_cloned = fwd.clone();
+        let q_cloned = q.clone();
+        let fresh_cloned = fresh_resp.clone();
+        let query_task = tokio::spawn(async move {
+            fwd_cloned
+                .query_upstream(
+                    ResolvePath::Cn,
+                    "example.com",
+                    1,
+                    &q_cloned,
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        Some(fresh_cloned)
+                    },
+                )
+                .await
+        });
+
+        // 推进 STALE_ANSWER_DELAY (1800ms)
+        tokio::time::advance(STALE_ANSWER_DELAY).await;
+
+        // 任务应在约 1.8s 超时并返回 stale 答案 (TTL 改为 STALE_TTL=30, IP 为旧答案 [192, 0, 2, 1])
+        let res = query_task.await.unwrap();
+        assert!(res.is_some());
+        let res_bytes = res.unwrap();
+        assert_eq!(min_answer_ttl(&res_bytes), Some(STALE_TTL));
+        assert_eq!(first_a_record(&res_bytes), Some(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+
+        // 推进剩余 4s 让后台任务完成
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+
+        // 断言缓存已被刷新, get 能命中新答案 (IP [192, 0, 2, 2])
+        let hit = cache.get(ResolvePath::Cn, "example.com", 1, &q);
+        assert!(hit.is_some());
+        let hit_bytes = hit.unwrap();
+        assert_eq!(first_a_record(&hit_bytes), Some(std::net::Ipv4Addr::new(192, 0, 2, 2)));
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_stale_immediate_success() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let stale_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+        let fresh_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &stale_resp);
+        {
+            let mut m = cache.map.lock().unwrap();
+            for entry in m.values_mut() {
+                entry.expiry = Instant::now() - Duration::from_secs(10);
+            }
+        }
+
+        let fresh_cloned = fresh_resp.clone();
+        let res = fwd
+            .query_upstream(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                async move { Some(fresh_cloned) },
+            )
+            .await;
+
+        assert_eq!(res, Some(fresh_resp.clone()));
+        // 缓存也已被更新为新答案
+        let hit = cache.get(ResolvePath::Cn, "example.com", 1, &q);
+        assert_eq!(hit, Some(fresh_resp));
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_stale_immediate_none() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let stale_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &stale_resp);
+        {
+            let mut m = cache.map.lock().unwrap();
+            for entry in m.values_mut() {
+                entry.expiry = Instant::now() - Duration::from_secs(10);
+            }
+        }
+
+        let res = fwd
+            .query_upstream(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                async move { None },
+            )
+            .await;
+
+        assert!(res.is_some());
+        let res_bytes = res.unwrap();
+        // 返回 stale 答案, TTL 改写为 STALE_TTL=30, IP 为旧答案 [192, 0, 2, 1]
+        assert_eq!(min_answer_ttl(&res_bytes), Some(STALE_TTL));
+        assert_eq!(first_a_record(&res_bytes), Some(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_no_stale_slow_waits() {
+        tokio::time::pause();
+
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let fresh_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+
+        let fwd_cloned = fwd.clone();
+        let q_cloned = q.clone();
+        let fresh_cloned = fresh_resp.clone();
+        let query_task = tokio::spawn(async move {
+            fwd_cloned
+                .query_upstream(
+                    ResolvePath::Cn,
+                    "example.com",
+                    1,
+                    &q_cloned,
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        Some(fresh_cloned)
+                    },
+                )
+                .await
+        });
+
+        // 推进 1800ms
+        tokio::time::advance(STALE_ANSWER_DELAY).await;
+
+        // 无 stale 记录时，不会提前返回，query_task 仍在等待
+        assert!(!query_task.is_finished());
+
+        // 推进剩余时间让 fut 完成
+        tokio::time::advance(Duration::from_millis(1500)).await;
+
+        let res = query_task.await.unwrap();
+        assert_eq!(res, Some(fresh_resp.clone()));
+
+        // 缓存写入了新答案
+        let hit = cache.get(ResolvePath::Cn, "example.com", 1, &q);
+        assert_eq!(hit, Some(fresh_resp));
+    }
+
+    #[tokio::test]
+    async fn test_query_upstream_cache_disabled() {
+        let fwd = make_test_forwarder(None).await;
+        let q = test_a_query("example.com", [1, 1]);
+        let fresh_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+
+        let fresh_cloned = fresh_resp.clone();
+        let res = fwd
+            .query_upstream(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                async move { Some(fresh_cloned) },
+            )
+            .await;
+        assert_eq!(res, Some(fresh_resp));
+
+        let res_none = fwd
+            .query_upstream(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                async move { None },
+            )
+            .await;
+        assert_eq!(res_none, None);
     }
 }
