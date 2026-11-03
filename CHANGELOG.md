@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### feat(dns): 上游失败时用过期缓存兜底, NXDOMAIN / 空答复负缓存 (2026-11-03)
+
+- **过期缓存兜底 (RFC 8767 serve-stale)**: 当上游查询失败 (网络超时返回 None 或响应 RCODE=2 SERVFAIL) 时，若 DNS 响应缓存中存在未超出 1 小时窗口 (`STALE_WINDOW = 3600s`) 的过期正响应条目，将其 answer 段所有记录 TTL 改写为 30s (`STALE_TTL = 30`) 后返回客户端兜底；超出 1 小时窗口的条目删除。负缓存条目不参与 stale 兜底。仅在 DNS 缓存开启时生效，缓存未开启时行为完全不变。
+- **负缓存 (RFC 2308)**: 允许缓存上游返回的 NXDOMAIN (RCODE=3) 或 NODATA (RCODE=0 且 ancount=0) 响应；要求 authority 段包含 SOA 记录，缓存 TTL 取 `min(SOA RR TTL, SOA MINIMUM)`，下限 1s、封顶 300s。无 SOA 的负响应、SERVFAIL 及服务自身合成的 NXDOMAIN/空答复不缓存。
+- **缓存键加解析路径**: 缓存键新增解析路径 (国内 cn/direct 上游 或 隧道远端上游), 同一域名两条路径的答案 (含负缓存与过期兜底) 不再互相命中; 修正此前 `resolve: cn` / `resolve: remote` 规则切换后可能拿到另一路径缓存答案的问题。
+- **缓存驱逐优化**: 缓存容量满时，清理保留 `expiry + STALE_WINDOW > now` 的条目；仍满时优先驱逐已过期条目，无过期条目时才淘汰任意条目。
+
 ## [v0.17.3] - 出站组健康检查间隔默认 60s (2026-11-03)
 
 - **无协议变更**, 与 v0.17.x 及更早版本两端互通。
