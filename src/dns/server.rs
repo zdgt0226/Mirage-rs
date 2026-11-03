@@ -728,9 +728,13 @@ async fn tcp_query_one(req: &[u8], up: SocketAddr) -> Option<Vec<u8>> {
 // 的上游响应, 按 answer 段最小 TTL 过期。价值: 直连域名不再每查打 114/223; **非 fake-IP /
 // 罕见 qtype 的隧道-DNS 不再每次消耗一条 WarmPool 隧道**。fake-IP 路径本地无需缓存。
 
+const STALE_WINDOW: Duration = Duration::from_secs(3600);
+const STALE_TTL: u32 = 30;
+
 struct CacheEntry {
     response: Vec<u8>,
     expiry: std::time::Instant,
+    negative: bool,
 }
 
 /// 客户端的 EDNS 语义: `(DO, CD, 声明的 UDP payload 上限)`。
@@ -856,11 +860,10 @@ impl DnsCache {
             return None;
         }
         let bucket = edns.bucket();
-        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let e = m.get(&key)?;
         if e.expiry <= std::time::Instant::now() {
-            m.remove(&key);
             return None;
         }
         if e.response.len() > edns.max_udp {
@@ -869,28 +872,85 @@ impl DnsCache {
         Some(patch_for_query(e.response.clone(), query))
     }
 
-    /// 存入 (仅有 answer 的正响应)。NODATA/NXDOMAIN 不缓存 (客户端 SOA 负缓存已兜 AAAA)。
+    /// 过期兜底读取 (RFC 8767 serve-stale):
+    /// 条目已过期但在 `STALE_WINDOW` 内 → 返回 patch_for_query 后的响应, 并将 answer 段 TTL 改为 `STALE_TTL`。
+    /// 超出窗口的删除并返回 None。负缓存条目不参与 stale 兜底, 返回 None。
+    fn get_stale(&self, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
+        let edns = edns_info(query);
+        if get_qclass(query) != Some(1) || edns.has_options {
+            return None;
+        }
+        let bucket = edns.bucket();
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
+        let e = m.get(&key)?;
+        if e.negative {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if now < e.expiry {
+            return None;
+        }
+        if now.saturating_duration_since(e.expiry) >= STALE_WINDOW {
+            m.remove(&key);
+            return None;
+        }
+        if e.response.len() > edns.max_udp {
+            return None;
+        }
+        let mut patched = patch_for_query(e.response.clone(), query);
+        set_answer_ttls(&mut patched, STALE_TTL);
+        Some(patched)
+    }
+
+    /// 存入响应缓存:
+    /// - 正响应 (RCODE=0 且 ancount>0): TTL 为 answer 段最小 TTL clamp(1, 3600);
+    /// - 负响应 (RFC 2308: RCODE=3 NXDOMAIN 或 RCODE=0 ancount=0 NODATA): 且 authority 段含 SOA 记录,
+    ///   TTL 为 min(SOA RR TTL, SOA MINIMUM) clamp(1, 300);
+    /// - 其它 RCODE (如 SERVFAIL) 或无 SOA 的负响应不缓存; TC=1 截断响应不缓存。
     fn put(&self, domain: &str, qtype: u16, query: &[u8], response: &[u8]) {
         let edns = edns_info(query);
         if get_qclass(query) != Some(1) || edns.has_options {
             return;
         }
-        if response.get(2).is_some_and(|b| b & 0x02 != 0) {
+        if response.len() < 12 {
             return;
         }
-        let ttl = match min_answer_ttl(response) {
-            Some(t) => t.clamp(1, 3600),
-            None => return,
+        if response[2] & 0x02 != 0 {
+            return;
+        }
+        let rcode = response[3] & 0x0F;
+        let ancount = u16::from_be_bytes([response[6], response[7]]);
+        let (ttl, negative) = if rcode == 0 && ancount > 0 {
+            let t = match min_answer_ttl(response) {
+                Some(t) => t.clamp(1, 3600),
+                None => return,
+            };
+            (t, false)
+        } else if rcode == 3 || (rcode == 0 && ancount == 0) {
+            let t = match negative_ttl(response) {
+                Some(t) => t,
+                None => return,
+            };
+            (t, true)
+        } else {
+            return;
         };
+
         let bucket = edns.bucket();
         let key = (domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if m.len() >= self.max_entries && !m.contains_key(&key) {
             let now = std::time::Instant::now();
-            m.retain(|_, e| e.expiry > now); // 先清过期
+            m.retain(|_, e| now.saturating_duration_since(e.expiry) < STALE_WINDOW);
             if m.len() >= self.max_entries {
-                if let Some(k) = m.keys().next().cloned() {
-                    m.remove(&k); // 仍满则弹一个 (非严格 LRU, 缓存策略不影响正确性)
+                let victim = m
+                    .iter()
+                    .find(|(_, e)| e.expiry <= now)
+                    .map(|(k, _)| k.clone())
+                    .or_else(|| m.keys().next().cloned());
+                if let Some(k) = victim {
+                    m.remove(&k);
                 }
             }
         }
@@ -899,6 +959,7 @@ impl DnsCache {
             CacheEntry {
                 response: response.to_vec(),
                 expiry: std::time::Instant::now() + Duration::from_secs(ttl as u64),
+                negative,
             },
         );
     }
@@ -989,6 +1050,97 @@ fn min_answer_ttl(resp: &[u8]) -> Option<u32> {
     min
 }
 
+/// 把 answer 段所有 RR 的 TTL 改写为指定 `ttl` (过期兜底 serve-stale 用)。越界安全停止。
+fn set_answer_ttls(resp: &mut [u8], ttl: u32) {
+    if resp.len() < 12 {
+        return;
+    }
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    if ancount == 0 {
+        return;
+    }
+    let mut pos = question_end(resp);
+    let ttl_bytes = ttl.to_be_bytes();
+    for _ in 0..ancount {
+        let Some(after_name) = skip_name(resp, pos) else {
+            return;
+        };
+        let Some(rdlen_at) = after_name.checked_add(8) else {
+            return;
+        };
+        if rdlen_at + 2 > resp.len() {
+            return;
+        }
+        resp[after_name + 4..after_name + 8].copy_from_slice(&ttl_bytes);
+        let rdlen = u16::from_be_bytes([resp[rdlen_at], resp[rdlen_at + 1]]) as usize;
+        let Some(next_pos) = (rdlen_at + 2).checked_add(rdlen) else {
+            return;
+        };
+        if next_pos > resp.len() {
+            return;
+        }
+        pos = next_pos;
+    }
+}
+
+/// 从 authority 段取 SOA 记录的负缓存 TTL (RFC 2308)。
+///
+/// 跳过 question 与 answer 段, 遍历 authority 段 (nscount) 找 type 6 (SOA);
+/// MINIMUM 是 rdata 的最后 4 字节 (rdata 内含两个可能压缩的域名, 用 rdata 结尾往前取 4 字节, 并校验 rdlen >= 22)。
+/// TTL = min(SOA RR 的 TTL, SOA 的 MINIMUM 字段), 上限 300s, 下限 1s。
+/// 越界、无 SOA、畸形一律返回 None。
+fn negative_ttl(resp: &[u8]) -> Option<u32> {
+    if resp.len() < 12 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+    let nscount = u16::from_be_bytes([resp[8], resp[9]]) as usize;
+    if nscount == 0 {
+        return None;
+    }
+    let mut pos = question_end(resp);
+    if pos > resp.len() {
+        return None;
+    }
+    for _ in 0..ancount {
+        pos = skip_rr(resp, pos)?;
+    }
+    for _ in 0..nscount {
+        let after_name = skip_name(resp, pos)?;
+        let rdlen_at = after_name.checked_add(8)?;
+        if rdlen_at + 2 > resp.len() {
+            return None;
+        }
+        let rrtype = u16::from_be_bytes([resp[after_name], resp[after_name + 1]]);
+        let ttl = u32::from_be_bytes([
+            resp[after_name + 4],
+            resp[after_name + 5],
+            resp[after_name + 6],
+            resp[after_name + 7],
+        ]);
+        let rdlen = u16::from_be_bytes([resp[rdlen_at], resp[rdlen_at + 1]]) as usize;
+        let rdata_start = rdlen_at + 2;
+        let rdata_end = rdata_start.checked_add(rdlen)?;
+        if rdata_end > resp.len() {
+            return None;
+        }
+        if rrtype == 6 {
+            if rdlen < 22 {
+                return None;
+            }
+            let minimum = u32::from_be_bytes([
+                resp[rdata_end - 4],
+                resp[rdata_end - 3],
+                resp[rdata_end - 2],
+                resp[rdata_end - 1],
+            ]);
+            return Some(ttl.min(minimum).clamp(1, 300));
+        }
+        pos = rdata_end;
+    }
+    None
+}
+
 pub struct DnsForwarder {
     socket: Arc<UdpSocket>,
     state: Arc<arc_swap::ArcSwap<crate::config_watcher::CoreState>>,
@@ -1060,6 +1212,33 @@ impl DnsForwarder {
         make_empty_response(req).or_else(|| Some(make_nxdomain(req)))
     }
 
+    /// 上游失败时用过期缓存兜底 (RFC 8767 serve-stale):
+    /// 失败定义: resp 为 None 或 RCODE == 2 (SERVFAIL)。
+    /// 失败时若 cache 中存在 STALE_WINDOW 内的过期正条目, 则改写 TTL=30 返回; 否则返回原 resp。
+    /// cache 未开启时直接返回原 resp。
+    fn stale_fallback(
+        &self,
+        domain: &str,
+        qtype: u16,
+        req: &[u8],
+        resp: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        let is_failure = match &resp {
+            None => true,
+            Some(r) => r.len() < 12 || (r[3] & 0x0F) == 2,
+        };
+        if !is_failure {
+            return resp;
+        }
+        if let Some(cache) = &self.cache {
+            if let Some(stale) = cache.get_stale(domain, qtype, req) {
+                debug!("[DNS] stale   [{}] → serve-stale fallback (qtype {})", domain, qtype);
+                return Some(stale);
+            }
+        }
+        resp
+    }
+
     /// 本地 cn/direct resolver 真实解析: 不给 fake-IP → 客户端拿真实 IP。尊重 IP 策略硬抑制 + DNS 缓存。
     /// fakeip.exclude 与 rules 的 `resolve: cn` 共用。
     async fn resolve_cn(
@@ -1083,6 +1262,7 @@ impl DnsForwarder {
         if let (Some(cache), Some(r)) = (&self.cache, &resp) {
             cache.put(&dk, qtype, req, r);
         }
+        let resp = self.stale_fallback(&dk, qtype, req, resp);
         resp.or_else(|| Some(make_nxdomain(req)))
     }
 
@@ -1300,6 +1480,7 @@ impl DnsForwarder {
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, req, r);
                     }
+                    let resp = self.stale_fallback(&dk, qtype, req, resp);
                     return Some(resp.unwrap_or_else(|| make_nxdomain(req)));
                 }
             }
@@ -1376,6 +1557,10 @@ impl DnsForwarder {
                         }
                         None => {
                             debug!("[DNS] auto    [{}] → 无A/解析失败 → 国内结果兜底", domain);
+                            if let (Some(cache), Some(r)) = (&self.cache, &probe) {
+                                cache.put(&dk, qtype, req, r);
+                            }
+                            let probe = self.stale_fallback(&dk, qtype, req, probe);
                             return probe.or_else(|| Some(make_nxdomain(req)));
                         }
                     }
@@ -1423,7 +1608,7 @@ impl DnsForwarder {
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, req, r);
                     }
-                    resp
+                    self.stale_fallback(&dk, qtype, req, resp)
                 }
                 OutboundNode::Mirage { pool, .. } => {
                     if let Some(mapper) = &self.fake_ip_mapper {
@@ -1460,6 +1645,7 @@ impl DnsForwarder {
                     if let (Some(cache), Some(r)) = (&self.cache, &resp) {
                         cache.put(&dk, qtype, req, r);
                     }
+                    let resp = self.stale_fallback(&dk, qtype, req, resp);
                     Some(resp.unwrap_or_else(|| make_nxdomain(req)))
                 }
                 _ => Some(make_nxdomain(req)),
@@ -1629,6 +1815,7 @@ impl DnsForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     // 构造 "x.com" AAAA 查询: header(12) + name(3"x"..1"com"..0) + QTYPE(28) + QCLASS(1)
     fn aaaa_query() -> Vec<u8> {
@@ -2622,5 +2809,345 @@ mod tests {
             ac.mark_foreign(&format!("d{i}.com"));
         }
         assert!(ac.foreign.lock().unwrap().map.len() <= 3, "容量应封顶 (软上限)");
+    }
+
+    // ── 过期兜底与负缓存测试 ──
+
+    fn test_a_query(domain: &str, tx: [u8; 2]) -> Vec<u8> {
+        let mut q = vec![tx[0], tx[1], 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for part in domain.split('.') {
+            q.push(part.len() as u8);
+            q.extend_from_slice(part.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&[0, 1, 0, 1]); // A IN
+        q
+    }
+
+    fn test_a_response(domain: &str, tx: [u8; 2], ttl: u32, ip: [u8; 4]) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        for part in domain.split('.') {
+            r.push(part.len() as u8);
+            r.extend_from_slice(part.as_bytes());
+        }
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]); // A IN
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]); // ptr to domain, A, IN
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&[0, 4, ip[0], ip[1], ip[2], ip[3]]);
+        r
+    }
+
+    fn test_multi_a_response(domain: &str, tx: [u8; 2], ttl1: u32, ip1: [u8; 4], ttl2: u32, ip2: [u8; 4]) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0];
+        for part in domain.split('.') {
+            r.push(part.len() as u8);
+            r.extend_from_slice(part.as_bytes());
+        }
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]); // A IN
+        // RR 1
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        r.extend_from_slice(&ttl1.to_be_bytes());
+        r.extend_from_slice(&[0, 4, ip1[0], ip1[1], ip1[2], ip1[3]]);
+        // RR 2
+        r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        r.extend_from_slice(&ttl2.to_be_bytes());
+        r.extend_from_slice(&[0, 4, ip2[0], ip2[1], ip2[2], ip2[3]]);
+        r
+    }
+
+    fn test_nxdomain_soa_response(domain: &str, tx: [u8; 2], soa_ttl: u32, minimum: u32) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x83, 0, 1, 0, 0, 0, 1, 0, 0];
+        for part in domain.split('.') {
+            r.push(part.len() as u8);
+            r.extend_from_slice(part.as_bytes());
+        }
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]); // A IN
+        // Authority RR: SOA (type 6)
+        r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x06, 0x00, 0x01]);
+        r.extend_from_slice(&soa_ttl.to_be_bytes());
+        r.extend_from_slice(&22u16.to_be_bytes()); // rdlen = 22
+        r.push(0); // mname = "."
+        r.push(0); // rname = "."
+        r.extend_from_slice(&1u32.to_be_bytes()); // serial
+        r.extend_from_slice(&7200u32.to_be_bytes()); // refresh
+        r.extend_from_slice(&3600u32.to_be_bytes()); // retry
+        r.extend_from_slice(&1209600u32.to_be_bytes()); // expire
+        r.extend_from_slice(&minimum.to_be_bytes()); // minimum
+        r
+    }
+
+    fn test_nxdomain_no_soa(domain: &str, tx: [u8; 2]) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x83, 0, 1, 0, 0, 0, 0, 0, 0];
+        for part in domain.split('.') {
+            r.push(part.len() as u8);
+            r.extend_from_slice(part.as_bytes());
+        }
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]);
+        r
+    }
+
+    fn test_servfail_response(domain: &str, tx: [u8; 2]) -> Vec<u8> {
+        let mut r = vec![tx[0], tx[1], 0x81, 0x82, 0, 1, 0, 0, 0, 0, 0, 0];
+        for part in domain.split('.') {
+            r.push(part.len() as u8);
+            r.extend_from_slice(part.as_bytes());
+        }
+        r.push(0);
+        r.extend_from_slice(&[0, 1, 0, 1]);
+        r
+    }
+
+    #[test]
+    fn test_serve_stale_fallback_and_expiry() {
+        let cache = DnsCache::new(10);
+        let q = test_a_query("example.com", [1, 1]);
+        let resp = test_a_response("example.com", [1, 1], 1, [192, 0, 2, 1]);
+        cache.put("example.com", 1, &q, &resp);
+
+        let key = ("example.com".to_string(), 1u16, false, false, 3u8);
+        let now = Instant::now();
+
+        // 1. 条目已过期 (设为 10 秒前)，但在 STALE_WINDOW (3600s) 内
+        {
+            let mut m = cache.map.lock().unwrap();
+            let entry = m.get_mut(&key).expect("entry 必须存在");
+            entry.expiry = now - Duration::from_secs(10);
+        }
+
+        // get() 为 None (过期条目在 get 时仅 miss，不删除)
+        assert!(cache.get("example.com", 1, &q).is_none(), "过期条目 get 应返回 None");
+
+        // get_stale() 有值且 answer TTL == 30
+        let stale = cache.get_stale("example.com", 1, &q).expect("stale 应命中");
+        assert_eq!(min_answer_ttl(&stale), Some(STALE_TTL));
+
+        // 2. 超出 STALE_WINDOW (设为 3601 秒前)。Instant 基于开机时长, 刚开机的 CI 机器
+        // 减不出 1 小时前 (会 panic), 此时跳过这一段。
+        let Some(long_ago) = now.checked_sub(STALE_WINDOW + Duration::from_secs(1)) else {
+            return;
+        };
+        {
+            let mut m = cache.map.lock().unwrap();
+            let entry = m.get_mut(&key).expect("entry 必须存在");
+            entry.expiry = long_ago;
+        }
+
+        // 超出 STALE_WINDOW → get_stale 返回 None 且条目已删
+        assert!(cache.get_stale("example.com", 1, &q).is_none(), "超窗 get_stale 应返回 None");
+        {
+            let m = cache.map.lock().unwrap();
+            assert!(!m.contains_key(&key), "超窗条目应在 get_stale 时被删除");
+        }
+    }
+
+    #[test]
+    fn test_negative_caching() {
+        let cache = DnsCache::new(10);
+        let q = test_a_query("example.com", [2, 2]);
+
+        // 构造带 SOA (TTL 600, MINIMUM 120) 的 NXDOMAIN → put 后 get 命中, 存的 TTL 是 120
+        let nx_soa = test_nxdomain_soa_response("example.com", [2, 2], 600, 120);
+        cache.put("example.com", 1, &q, &nx_soa);
+
+        let key = ("example.com".to_string(), 1u16, false, false, 3u8);
+        {
+            let m = cache.map.lock().unwrap();
+            let e = m.get(&key).expect("负缓存条目应存在");
+            assert!(e.negative, "必须标记为负缓存");
+            let rem = e.expiry.saturating_duration_since(Instant::now()).as_secs();
+            assert!((119..=120).contains(&rem), "TTL 存的应是 120s");
+        }
+        let hit = cache.get("example.com", 1, &q).expect("负缓存 get 应命中");
+        assert_eq!(hit[3] & 0x0F, 3, "命中响应 RCODE 必须是 NXDOMAIN(3)");
+
+        // MINIMUM 900 / SOA TTL 900 → 封顶 300
+        let q_cap = test_a_query("capped.example", [3, 3]);
+        let nx_cap = test_nxdomain_soa_response("capped.example", [3, 3], 900, 900);
+        cache.put("capped.example", 1, &q_cap, &nx_cap);
+        let key_cap = ("capped.example".to_string(), 1u16, false, false, 3u8);
+        {
+            let m = cache.map.lock().unwrap();
+            let e = m.get(&key_cap).expect("cap entry 应存在");
+            let rem = e.expiry.saturating_duration_since(Instant::now()).as_secs();
+            assert!((299..=300).contains(&rem), "TTL 封顶 300s");
+        }
+
+        // 无 SOA 的 NXDOMAIN 不缓存
+        let q_nosoa = test_a_query("nosoa.example", [4, 4]);
+        let nx_nosoa = test_nxdomain_no_soa("nosoa.example", [4, 4]);
+        cache.put("nosoa.example", 1, &q_nosoa, &nx_nosoa);
+        assert!(cache.get("nosoa.example", 1, &q_nosoa).is_none(), "无 SOA 的 NXDOMAIN 不缓存");
+
+        // SERVFAIL 不缓存
+        let q_sf = test_a_query("servfail.example", [5, 5]);
+        let sf = test_servfail_response("servfail.example", [5, 5]);
+        cache.put("servfail.example", 1, &q_sf, &sf);
+        assert!(cache.get("servfail.example", 1, &q_sf).is_none(), "SERVFAIL 不缓存");
+
+        // 负条目 get_stale 返回 None
+        {
+            let mut m = cache.map.lock().unwrap();
+            let e = m.get_mut(&key).unwrap();
+            e.expiry = Instant::now() - Duration::from_secs(10);
+        }
+        assert!(cache.get_stale("example.com", 1, &q).is_none(), "负条目 get_stale 必须返回 None");
+    }
+
+    #[test]
+    fn test_negative_ttl_truncated_and_malformed() {
+        assert_eq!(negative_ttl(&[]), None);
+        assert_eq!(negative_ttl(&[0; 11]), None);
+        // 头部宣称 nscount=1, 但无体
+        assert_eq!(negative_ttl(&[0, 1, 0x81, 0x83, 0, 1, 0, 0, 0, 1, 0, 0]), None);
+
+        let valid = test_nxdomain_soa_response("example.com", [1, 1], 600, 120);
+        assert_eq!(negative_ttl(&valid), Some(120));
+
+        // 截断报文逐字节切片
+        for len in 12..valid.len() {
+            assert_eq!(negative_ttl(&valid[..len]), None);
+        }
+
+        // SOA rdlen < 22
+        let mut short_rdlen = valid.clone();
+        // question len = 12 + 1 + 7 + 1 + 3 + 1 + 4 = 29
+        // authority name is ptr at 29..31 (2B)
+        // after_name = 31. rdlen_at = 31 + 8 = 39. rdlen bytes at 39, 40.
+        short_rdlen[39] = 0;
+        short_rdlen[40] = 21; // < 22
+        assert_eq!(negative_ttl(&short_rdlen), None);
+
+        // 畸形压缩指针标签 (0x40 保留)
+        let mut bad_label = valid.clone();
+        bad_label[29] = 0x40;
+        assert_eq!(negative_ttl(&bad_label), None);
+    }
+
+    #[test]
+    fn test_set_answer_ttls_multi_answers() {
+        let mut resp = test_multi_a_response(
+            "example.com",
+            [0x12, 0x34],
+            100,
+            [192, 0, 2, 1],
+            200,
+            [192, 0, 2, 2],
+        );
+        assert_eq!(min_answer_ttl(&resp), Some(100));
+
+        set_answer_ttls(&mut resp, 30);
+        assert_eq!(min_answer_ttl(&resp), Some(30));
+
+        // 验证两处 answer 的 TTL 均已改写为 30
+        // Question: 12 + 13 + 4 = 29
+        // Answer 1: ptr (2B) + type/class (4B) -> TTL at 35..39
+        assert_eq!(&resp[35..39], &30u32.to_be_bytes());
+        // rdlen=4 (2B) + rdata=4 (4B) -> Answer 1 ends at 35 + 4 + 2 + 4 = 45
+        // Answer 2: ptr (2B) + type/class (4B) -> TTL at 51..55
+        assert_eq!(&resp[51..55], &30u32.to_be_bytes());
+
+        // 截断报文调用不会 panic
+        let mut truncated = resp[..36].to_vec();
+        set_answer_ttls(&mut truncated, 30);
+    }
+
+    #[test]
+    fn test_cache_eviction_stale_window() {
+        let cache = DnsCache::new(2);
+        let q1 = test_a_query("a.example", [1, 1]);
+        let r1 = test_a_response("a.example", [1, 1], 10, [192, 0, 2, 1]);
+        let q2 = test_a_query("b.example", [2, 2]);
+        let r2 = test_a_response("b.example", [2, 2], 300, [192, 0, 2, 2]);
+
+        cache.put("a.example", 1, &q1, &r1);
+        cache.put("b.example", 1, &q2, &r2);
+
+        // a.example 过期 (10s 前, 在 STALE_WINDOW 内)
+        let k1 = ("a.example".to_string(), 1u16, false, false, 3u8);
+        let k2 = ("b.example".to_string(), 1u16, false, false, 3u8);
+        {
+            let mut m = cache.map.lock().unwrap();
+            m.get_mut(&k1).unwrap().expiry = Instant::now() - Duration::from_secs(10);
+        }
+
+        // 插入第 3 个条目: 容量已满 (2), 但 a.example 仍在 STALE_WINDOW 内未被 retain 清理
+        // 仍满时优先弹已过期的 a.example, 保留未过期的 b.example
+        let q3 = test_a_query("c.example", [3, 3]);
+        let r3 = test_a_response("c.example", [3, 3], 300, [192, 0, 2, 3]);
+        cache.put("c.example", 1, &q3, &r3);
+
+        let m = cache.map.lock().unwrap();
+        assert_eq!(m.len(), 2);
+        assert!(!m.contains_key(&k1), "已过期的 a.example 应被优先淘汰");
+        assert!(m.contains_key(&k2), "未过期的 b.example 应保留");
+    }
+
+    #[tokio::test]
+    async fn test_stale_fallback_helper() {
+        let router = Arc::new(crate::router::RouterEngine::new(vec![], "direct".to_string(), "/nonexistent", &std::collections::HashMap::new()).unwrap());
+        let cfg: crate::config::Config = serde_json::from_str(r#"{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"routing":{"default_outbound":"direct"}}"#).unwrap();
+        let om = Arc::new(crate::proxy::outbound::OutboundManager::new(&cfg).unwrap());
+        let state = Arc::new(arc_swap::ArcSwap::from_pointee(crate::config_watcher::CoreState {
+            router,
+            outbounds: om,
+            advanced_dns: None,
+            auto_classify: None,
+            rate_limiter: Arc::new(crate::proxy::rate_limit::RateLimiter::from_device_profiles(&[])),
+        }));
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fwd = DnsForwarder {
+            socket: Arc::new(s),
+            state: state.clone(),
+            fake_ip_mapper: None,
+            xdp_engine: None,
+            cache: Some(DnsCache::new(10)),
+            inbound_tag: "dns".into(),
+        };
+
+        let q = test_a_query("example.com", [1, 1]);
+        let resp = test_a_response("example.com", [1, 1], 1, [192, 0, 2, 1]);
+        fwd.cache.as_ref().unwrap().put("example.com", 1, &q, &resp);
+
+        // 1. 上游成功响应 → 原样返回
+        let ok_resp = Some(resp.clone());
+        let res = fwd.stale_fallback("example.com", 1, &q, ok_resp.clone());
+        assert_eq!(res, ok_resp);
+
+        // 2. 上游失败但条目未过期 (仍在正常 TTL 内) → get_stale 返回 None → 原样返回失败
+        let sf_resp = Some(test_servfail_response("example.com", [1, 1]));
+        let res = fwd.stale_fallback("example.com", 1, &q, sf_resp.clone());
+        assert_eq!(res, sf_resp);
+
+        // 3. 条目过期但处于 STALE_WINDOW 内:
+        let key = ("example.com".to_string(), 1u16, false, false, 3u8);
+        {
+            let mut m = fwd.cache.as_ref().unwrap().map.lock().unwrap();
+            m.get_mut(&key).unwrap().expiry = Instant::now() - Duration::from_secs(10);
+        }
+
+        // 上游返回 None → 触发 stale 兜底
+        let res = fwd.stale_fallback("example.com", 1, &q, None);
+        assert!(res.is_some());
+        assert_eq!(min_answer_ttl(res.as_ref().unwrap()), Some(STALE_TTL));
+
+        // 上游返回 SERVFAIL → 触发 stale 兜底
+        let res = fwd.stale_fallback("example.com", 1, &q, sf_resp);
+        assert!(res.is_some());
+        assert_eq!(min_answer_ttl(res.as_ref().unwrap()), Some(STALE_TTL));
+
+        // 4. 当 cache 为 None 时:
+        let fwd_no_cache = DnsForwarder {
+            socket: fwd.socket.clone(),
+            state: fwd.state.clone(),
+            fake_ip_mapper: None,
+            xdp_engine: None,
+            cache: None,
+            inbound_tag: "dns".into(),
+        };
+        assert_eq!(fwd_no_cache.stale_fallback("example.com", 1, &q, None), None);
     }
 }
