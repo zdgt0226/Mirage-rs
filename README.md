@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.3-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.4-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -365,7 +365,7 @@ mirage-rs config -c config.json
 - [x] **性能调优与架构**: Cipher agility 自动协商硬件加速 AES-256-GCM（`tuning.cipher_agility`）；UDP 多路复用 (`tuning.udp_mux` 突破并发带机量瓶颈)；IPv6 隧道传输支持；隧道 relay 缓冲调优 (上行 64KB buf + greedy `try_read`)。
 - [x] **运维工具与看板**: Web 看板 Mirage Console（双主题、中英双语、分角色视图、可视化规则编辑）；配置工具链 (`check` / `format` / `import` / `test` / `config`)；Geo 规则自动更新与热重载；CI 确定性回归哨兵；cosign keyless 供应链签名与多架构容器镜像。
 - [x] **节点健康判定迟滞 (v0.17.2, 参考 honk)**: 连续失败 3 次判死, 判死后连续成功 2 次才恢复; 网络变化时取消退避立即重建, 判死节点成功 1 次即恢复; urltest 不再黏在已判死的当前节点上。
-- [x] **DNS 过期缓存兜底与负缓存 (参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s); NXDOMAIN / 空答复按 SOA 缓存 (≤300s)。
+- [x] **DNS 过期缓存兜底与负缓存 (v0.17.4, 参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s); NXDOMAIN / 空答复按 SOA 缓存 (≤300s)。
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
 
 ### 🚧 进行中 / 部分完成
@@ -409,6 +409,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.4** | 2026-11-03 | **无协议变更**: 开启 DNS 缓存时, 上游无响应 / SERVFAIL 返回 1 小时内过期的旧答案 (TTL 30s); NXDOMAIN / 空答复按 SOA 负缓存 (≤300s); 缓存按解析路径 (国内 / 隧道) 隔离, 规则切换后不再拿到另一路径的答案。 |
 | **v0.17.3** | 2026-11-03 | **无协议变更**: urltest / fallback / load_balance 组健康检查间隔默认 300s 改为 60s, 节点空闲时挂掉最坏判死时间从 15 分钟缩到 3 分钟; 显式配置的 `interval` 不受影响。 |
 | **v0.17.2** | 2026-11-03 | **无协议变更**: 修 urltest 组在当前节点挂掉后仍黏在它上面 (新连接要等 10s 超时); 节点健康判定加迟滞 (判死后连续成功 2 次才恢复), 网络变化后立即重建暖池并快速恢复判死节点。 |
 | **v0.17.1** | 2026-11-02 | **无协议变更**: `/api/proxies` 补全 fallback / load_balance 组, 新增默认出站 `default` 与成员健康状态 `healthy`, 组按名称排序; 配套 Mirage-console 出站组切换界面 (四类组、默认出站标记、切换反馈)。 |
