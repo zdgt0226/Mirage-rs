@@ -731,11 +731,15 @@ async fn tcp_query_one(req: &[u8], up: SocketAddr) -> Option<Vec<u8>> {
 const STALE_WINDOW: Duration = Duration::from_secs(3600);
 const STALE_TTL: u32 = 30;
 const STALE_ANSWER_DELAY: Duration = Duration::from_millis(1800);
+const FAILURE_RECHECK: Duration = Duration::from_secs(30);
 
 struct CacheEntry {
     response: Vec<u8>,
     expiry: std::time::Instant,
+    ttl: Duration,
     negative: bool,
+    failed_at: Option<std::time::Instant>,
+    prefetching: bool,
 }
 
 /// 客户端的 EDNS 语义: `(DO, CD, 声明的 UDP payload 上限)`。
@@ -857,6 +861,50 @@ impl DnsCache {
         }
     }
 
+    /// 同 `get`, 另返回是否需要预刷新。
+    ///
+    /// 预刷新条件: 正条目, 原始 TTL ≥ 10s, 剩余时间 ≤ 原始 TTL 的 10%, 且 `prefetching == false`。
+    /// 满足时置 `prefetching = true`。负条目不预刷新。
+    fn get_with_prefetch(
+        &self,
+        path: ResolvePath,
+        domain: &str,
+        qtype: u16,
+        query: &[u8],
+    ) -> Option<(Vec<u8>, bool)> {
+        let edns = edns_info(query);
+        // 非 IN / 带 EDNS 选项 (Cookie/ECS 的回显按客户端) 的查询不读写缓存, 与单飞同规则。
+        if get_qclass(query) != Some(1) || edns.has_options {
+            return None;
+        }
+        let bucket = edns.bucket();
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (path, domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
+        let e = m.get_mut(&key)?;
+        let now = std::time::Instant::now();
+        if e.expiry <= now {
+            return None;
+        }
+        if e.response.len() > edns.max_udp {
+            return None; // 超客户端上限: 不截断 (无 TCP 可退)，现查
+        }
+        let should_prefetch = if !e.negative
+            && e.ttl >= Duration::from_secs(10)
+            && !e.prefetching
+        {
+            let remaining = e.expiry.saturating_duration_since(now);
+            if remaining <= e.ttl / 10 {
+                e.prefetching = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        Some((patch_for_query(e.response.clone(), query), should_prefetch))
+    }
+
     /// 命中且未过期 → 返回按当前 query patch 好的响应 (tx_id + question 段, 兼容 0x20 大小写
     /// 随机 + id; 保留响应头/flags/答案不变)。
     ///
@@ -883,9 +931,16 @@ impl DnsCache {
     }
 
     /// 过期兜底读取 (RFC 8767 serve-stale):
-    /// 条目已过期但在 `STALE_WINDOW` 内 → 返回 patch_for_query 后的响应, 并将 answer 段 TTL 改为 `STALE_TTL`。
+    /// 条目已过期但在 `STALE_WINDOW` 内 → 返回 (patch_for_query 后的响应, 最近 30s 内是否失败过)。
+    /// 并将 answer 段 TTL 改为 `STALE_TTL`。
     /// 超出窗口的删除并返回 None。负缓存条目不参与 stale 兜底, 返回 None。
-    fn get_stale(&self, path: ResolvePath, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
+    fn get_stale_with_recheck(
+        &self,
+        path: ResolvePath,
+        domain: &str,
+        qtype: u16,
+        query: &[u8],
+    ) -> Option<(Vec<u8>, bool)> {
         let edns = edns_info(query);
         if get_qclass(query) != Some(1) || edns.has_options {
             return None;
@@ -908,9 +963,48 @@ impl DnsCache {
         if e.response.len() > edns.max_udp {
             return None;
         }
+        let failed_recently = e
+            .failed_at
+            .is_some_and(|t| now.saturating_duration_since(t) < FAILURE_RECHECK);
         let mut patched = patch_for_query(e.response.clone(), query);
         set_answer_ttls(&mut patched, STALE_TTL);
-        Some(patched)
+        Some((patched, failed_recently))
+    }
+
+    /// 过期兜底读取 (RFC 8767 serve-stale):
+    /// 条目已过期但在 `STALE_WINDOW` 内 → 返回 patch_for_query 后的响应, 并将 answer 段 TTL 改为 `STALE_TTL`。
+    /// 超出窗口的删除并返回 None。负缓存条目不参与 stale 兜底, 返回 None。
+    fn get_stale(&self, path: ResolvePath, domain: &str, qtype: u16, query: &[u8]) -> Option<Vec<u8>> {
+        self.get_stale_with_recheck(path, domain, qtype, query).map(|(resp, _)| resp)
+    }
+
+    /// 记录上游失败时间戳 (RFC 8767 failure recheck timer), 并在条目存在时复位 prefetching。
+    fn mark_failed(&self, path: ResolvePath, domain: &str, qtype: u16, query: &[u8]) {
+        let edns = edns_info(query);
+        if get_qclass(query) != Some(1) || edns.has_options {
+            return;
+        }
+        let bucket = edns.bucket();
+        let key = (path, domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = m.get_mut(&key) {
+            entry.failed_at = Some(std::time::Instant::now());
+            entry.prefetching = false;
+        }
+    }
+
+    /// 复位预刷新标志 (例如后台刷新无论何种原因未插入新缓存时)。
+    fn clear_prefetching(&self, path: ResolvePath, domain: &str, qtype: u16, query: &[u8]) {
+        let edns = edns_info(query);
+        if get_qclass(query) != Some(1) || edns.has_options {
+            return;
+        }
+        let bucket = edns.bucket();
+        let key = (path, domain.to_string(), qtype, edns.do_bit, edns.cd_bit, bucket);
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = m.get_mut(&key) {
+            entry.prefetching = false;
+        }
     }
 
     /// 存入响应缓存:
@@ -969,7 +1063,10 @@ impl DnsCache {
             CacheEntry {
                 response: response.to_vec(),
                 expiry: std::time::Instant::now() + Duration::from_secs(ttl as u64),
+                ttl: Duration::from_secs(ttl as u64),
                 negative,
+                failed_at: None,
+                prefetching: false,
             },
         );
     }
@@ -1250,48 +1347,97 @@ impl DnsForwarder {
         resp
     }
 
-    /// 统一的上游查询封装: 查上游 + 成功写缓存 + 失败/超时 serve-stale 兜底 (RFC 8767 client response timer)。
-    ///
-    /// - 若 cache 未启用或当前无可用 stale 记录 (`get_stale` 返回 None):
-    ///   行为与原有逻辑完全一致: 直接 await `fut`, 成功则写回缓存, 随后走 `stale_fallback`。
-    /// - 若存在 1 小时内的可用 stale 记录:
-    ///   通过 `tokio::spawn` 启动后台任务 await `fut`, 结果 Some 时写回缓存 (基于 Arc clone 的 cache 与拷贝的数据),
-    ///   并通过 oneshot 通道发回结果。主流程等待最长 `STALE_ANSWER_DELAY` (1.8s):
-    ///   - 超时前收到上游结果: 经 `stale_fallback` 返回 (上游成功则返回新答案, 上游失败如 SERVFAIL/None 则回退 stale);
-    ///   - 超时或通道关闭: 提前返回当前取到的 stale 旧答案 (TTL=30), 记录 debug 日志 "stale-early"。后台任务继续跑完并刷新缓存。
-    ///
-    /// 后台任务并发控制说明:
-    /// 上游调用路径本身已有单飞保护 (`direct_query` 入口走 `INFLIGHT_UPSTREAM`，隧道 DNS `dns_over_tunnel_ha` 调用的
-    /// `dns_over_tunnel` 入口走 `INFLIGHT_TUNNEL`)，同一查询的并发 miss 会被单飞机制合并，不会因超时 spawn 而向
-    /// 上游发起重复请求，因此无需在 `query_upstream` 处额外引入并发上限限制。
-    async fn query_upstream<F>(
+    /// 统一的缓存与上游解析入口:
+    /// 1. 缓存命中:
+    ///    - 若条目临期 (正条目, 原始 TTL ≥ 10s 且剩余时间 ≤ 10%), 后台异步触发预刷新 (`tokio::spawn(make_fut())`),
+    ///      刷新成功写入缓存并复位 prefetching, 失败复位 prefetching 并记录失败记忆 (`mark_failed`);
+    ///    - 立即向客户端返回命中答案。
+    /// 2. 缓存未命中:
+    ///    - 若存在 1 小时内的可用过期答案且在 30s 内曾发生上游失败 (`FAILURE_RECHECK = 30s`):
+    ///      立即返回过期旧答案, 不向不可用上游发请求, 不 spawn 任务 (RFC 8767 failure recheck timer);
+    ///    - 若存在 1 小时内可用过期答案但未处于失败记忆窗口:
+    ///      通过 `tokio::spawn` 启动后台任务查询上游并等待最长 `STALE_ANSWER_DELAY` (1.8s), 超时先行返回旧答案;
+    ///    - 若无可用过期答案: 同步 await 查询上游并写缓存, 失败回退 `stale_fallback`。
+    /// 3. 上游失败 (None 或 SERVFAIL) 时统一调用 `cache.mark_failed`。
+    /// 4. 缓存未开启时行为完全不变 (直接 await `make_fut()`)。
+    async fn resolve_cached<M, F>(
         &self,
         path: ResolvePath,
         dk: &str,
         qtype: u16,
         req: &[u8],
-        fut: F,
+        make_fut: M,
     ) -> Option<Vec<u8>>
     where
+        M: FnOnce() -> F,
         F: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
     {
-        let stale = self.cache.as_ref().and_then(|c| c.get_stale(path, dk, qtype, req));
-        let Some(stale_resp) = stale else {
+        let Some(cache) = self.cache.as_ref().cloned() else {
+            return make_fut().await;
+        };
+
+        if let Some((hit, should_prefetch)) = cache.get_with_prefetch(path, dk, qtype, req) {
+            debug!("[DNS] cache hit [{}] ({:?}, qtype {})", dk, path, qtype);
+            if should_prefetch {
+                debug!("[DNS] prefetch  [{}] → 临期预刷新 (qtype {})", dk, qtype);
+                let cache = cache.clone();
+                let dk_string = dk.to_string();
+                let req_vec = req.to_vec();
+                let fut = make_fut();
+                tokio::spawn(async move {
+                    let resp = fut.await;
+                    let is_failure = match &resp {
+                        None => true,
+                        Some(r) => r.len() < 12 || (r[3] & 0x0F) == 2,
+                    };
+                    if is_failure {
+                        cache.mark_failed(path, &dk_string, qtype, &req_vec);
+                    } else if let Some(r) = &resp {
+                        cache.put(path, &dk_string, qtype, &req_vec, r);
+                        cache.clear_prefetching(path, &dk_string, qtype, &req_vec);
+                    } else {
+                        cache.clear_prefetching(path, &dk_string, qtype, &req_vec);
+                    }
+                });
+            }
+            return Some(hit);
+        }
+
+        let stale = cache.get_stale_with_recheck(path, dk, qtype, req);
+        let Some((stale_resp, failed_recently)) = stale else {
+            let fut = make_fut();
             let resp = fut.await;
-            if let (Some(cache), Some(r)) = (&self.cache, &resp) {
+            let is_failure = match &resp {
+                None => true,
+                Some(r) => r.len() < 12 || (r[3] & 0x0F) == 2,
+            };
+            if is_failure {
+                cache.mark_failed(path, dk, qtype, req);
+            } else if let Some(r) = &resp {
                 cache.put(path, dk, qtype, req, r);
             }
             return self.stale_fallback(path, dk, qtype, req, resp);
         };
 
-        let cache = self.cache.as_ref().unwrap().clone();
+        if failed_recently {
+            debug!("[DNS] stale-recheck [{}] → 最近 30s 失败过, 直接回旧答案 (qtype {})", dk, qtype);
+            return Some(stale_resp);
+        }
+
         let dk_string = dk.to_string();
         let req_vec = req.to_vec();
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let fut = make_fut();
 
         tokio::spawn(async move {
             let resp = fut.await;
-            if let Some(r) = &resp {
+            let is_failure = match &resp {
+                None => true,
+                Some(r) => r.len() < 12 || (r[3] & 0x0F) == 2,
+            };
+            if is_failure {
+                cache.mark_failed(path, &dk_string, qtype, &req_vec);
+            } else if let Some(r) = &resp {
                 cache.put(path, &dk_string, qtype, &req_vec, r);
             }
             let _ = tx.send(resp);
@@ -1320,20 +1466,15 @@ impl DnsForwarder {
             return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
         }
         let dk = domain.to_lowercase();
-        if let Some(cache) = &self.cache {
-            if let Some(hit) = cache.get(ResolvePath::Cn, &dk, qtype, req) {
-                return Some(hit);
-            }
-        }
         let req_vec = req.to_vec();
         let cn_dns_vec = cn_dns.to_vec();
         let resp = self
-            .query_upstream(
+            .resolve_cached(
                 ResolvePath::Cn,
                 &dk,
                 qtype,
                 req,
-                async move { direct_query(&req_vec, &cn_dns_vec).await },
+                move || async move { direct_query(&req_vec, &cn_dns_vec).await },
             )
             .await;
         resp.or_else(|| Some(make_nxdomain(req)))
@@ -1534,11 +1675,6 @@ impl DnsForwarder {
                         return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
                     }
                     let dk = domain.to_lowercase();
-                    if let Some(cache) = &self.cache {
-                        if let Some(hit) = cache.get(ResolvePath::Remote, &dk, qtype, req) {
-                            return Some(hit);
-                        }
-                    }
                     debug!("[DNS] rule    [{}] → resolve remote (隧道 failover, {} 个上游)", domain, remote_servers.len().max(1));
                     let req_vec = req.to_vec();
                     let pool = pool.clone();
@@ -1547,12 +1683,12 @@ impl DnsForwarder {
                     let auto_classify = auto_classify.clone();
                     let domain_str = domain.clone();
                     let resp = self
-                        .query_upstream(
+                        .resolve_cached(
                             ResolvePath::Remote,
                             &dk,
                             qtype,
                             req,
-                            async move {
+                            move || async move {
                                 let resp = Self::dns_over_tunnel_ha(&req_vec, &pool, &remote_servers, &remote_dns_host, remote_dns_port).await;
                                 // remote geoip 重定向 (简化: 不等第二个): 首个 A 属 CN → 学习, 下次降级 cn。本次仍返 remote 结果。
                                 // 注意只针对上游真实结果学习, 提前返回 stale 或无真实结果时不学习。
@@ -1684,21 +1820,15 @@ impl DnsForwarder {
                         return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
                     }
                     let dk = domain.to_lowercase();
-                    if let Some(cache) = &self.cache {
-                        if let Some(hit) = cache.get(ResolvePath::Cn, &dk, qtype, req) {
-                            debug!("[DNS] direct  [{}] → cache hit", domain);
-                            return Some(hit);
-                        }
-                    }
                     debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
                     let req_vec = req.to_vec();
                     let cn_dns = cn_dns.clone();
-                    self.query_upstream(
+                    self.resolve_cached(
                         ResolvePath::Cn,
                         &dk,
                         qtype,
                         req,
-                        async move { direct_query(&req_vec, &cn_dns).await },
+                        move || async move { direct_query(&req_vec, &cn_dns).await },
                     )
                     .await
                 }
@@ -1726,24 +1856,18 @@ impl DnsForwarder {
                     }
                     // 隧道-DNS 是最贵的路径 (每查耗一条 WarmPool 隧道), 缓存收益最大。
                     let dk = domain.to_lowercase();
-                    if let Some(cache) = &self.cache {
-                        if let Some(hit) = cache.get(ResolvePath::Remote, &dk, qtype, req) {
-                            debug!("[DNS] proxy   [{}] → cache hit (免隧道)", domain);
-                            return Some(hit);
-                        }
-                    }
                     debug!("[DNS] proxy   [{}] → 隧道查 (failover {} 上游) via {}", domain, remote_servers.len().max(1), n.tag());
                     let req_vec = req.to_vec();
                     let pool = pool.clone();
                     let remote_servers = remote_servers.clone();
                     let remote_dns_host = remote_dns_host.clone();
                     let resp = self
-                        .query_upstream(
+                        .resolve_cached(
                             ResolvePath::Remote,
                             &dk,
                             qtype,
                             req,
-                            async move {
+                            move || async move {
                                 Self::dns_over_tunnel_ha(&req_vec, &pool, &remote_servers, &remote_dns_host, remote_dns_port).await
                             },
                         )
@@ -3322,12 +3446,12 @@ mod tests {
         let fresh_cloned = fresh_resp.clone();
         let query_task = tokio::spawn(async move {
             fwd_cloned
-                .query_upstream(
+                .resolve_cached(
                     ResolvePath::Cn,
                     "example.com",
                     1,
                     &q_cloned,
-                    async move {
+                    || async move {
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         Some(fresh_cloned)
                     },
@@ -3375,12 +3499,12 @@ mod tests {
 
         let fresh_cloned = fresh_resp.clone();
         let res = fwd
-            .query_upstream(
+            .resolve_cached(
                 ResolvePath::Cn,
                 "example.com",
                 1,
                 &q,
-                async move { Some(fresh_cloned) },
+                || async move { Some(fresh_cloned) },
             )
             .await;
 
@@ -3407,12 +3531,12 @@ mod tests {
         }
 
         let res = fwd
-            .query_upstream(
+            .resolve_cached(
                 ResolvePath::Cn,
                 "example.com",
                 1,
                 &q,
-                async move { None },
+                || async move { None },
             )
             .await;
 
@@ -3438,12 +3562,12 @@ mod tests {
         let fresh_cloned = fresh_resp.clone();
         let query_task = tokio::spawn(async move {
             fwd_cloned
-                .query_upstream(
+                .resolve_cached(
                     ResolvePath::Cn,
                     "example.com",
                     1,
                     &q_cloned,
-                    async move {
+                    || async move {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         Some(fresh_cloned)
                     },
@@ -3476,25 +3600,394 @@ mod tests {
 
         let fresh_cloned = fresh_resp.clone();
         let res = fwd
-            .query_upstream(
+            .resolve_cached(
                 ResolvePath::Cn,
                 "example.com",
                 1,
                 &q,
-                async move { Some(fresh_cloned) },
+                || async move { Some(fresh_cloned) },
             )
             .await;
         assert_eq!(res, Some(fresh_resp));
 
         let res_none = fwd
-            .query_upstream(
+            .resolve_cached(
                 ResolvePath::Cn,
                 "example.com",
                 1,
                 &q,
-                async move { None },
+                || async move { None },
             )
             .await;
         assert_eq!(res_none, None);
+    }
+
+    // ── A. 上游失败短期记忆 (RFC 8767 failure recheck timer) 测试 ──
+
+    #[tokio::test]
+    async fn test_upstream_failure_recent_memory_skips_query() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let stale_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &stale_resp);
+        let now = Instant::now();
+        {
+            let mut m = cache.map.lock().unwrap();
+            for entry in m.values_mut() {
+                entry.expiry = now - Duration::from_secs(10); // 过期 10s, 在 STALE_WINDOW 内
+                entry.failed_at = Some(now - Duration::from_secs(5)); // 5s 前失败, 在 30s 内
+            }
+        }
+
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_cloned = called.clone();
+
+        let res = fwd
+            .resolve_cached(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                || {
+                    called_cloned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        Some(test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]))
+                    }
+                },
+            )
+            .await;
+
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "30s 内失败过, fut / make_fut 不得被调用");
+        assert!(res.is_some());
+        let res_bytes = res.unwrap();
+        assert_eq!(min_answer_ttl(&res_bytes), Some(STALE_TTL));
+        assert_eq!(first_a_record(&res_bytes), Some(std::net::Ipv4Addr::new(192, 0, 2, 1)));
+    }
+
+    #[tokio::test]
+    async fn test_upstream_failure_expired_memory_queries_upstream() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let stale_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+        let fresh_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &stale_resp);
+        let now = Instant::now();
+        {
+            let mut m = cache.map.lock().unwrap();
+            for entry in m.values_mut() {
+                entry.expiry = now - Duration::from_secs(10); // 过期 10s
+                entry.failed_at = Some(now - Duration::from_secs(35)); // 35s 前失败, 超出 30s
+            }
+        }
+
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_cloned = called.clone();
+        let fresh_cloned = fresh_resp.clone();
+
+        let res = fwd
+            .resolve_cached(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                || {
+                    called_cloned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let fresh = fresh_cloned.clone();
+                    async move { Some(fresh) }
+                },
+            )
+            .await;
+
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst), "超出 30s 必须正常查上游");
+        assert_eq!(res, Some(fresh_resp.clone()));
+        // 缓存也已被更新并清除了 failed_at
+        let m = cache.map.lock().unwrap();
+        let entry = m.values().next().unwrap();
+        assert!(entry.failed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_failure_marks_and_put_clears() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let stale_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &stale_resp);
+
+        // 先确保初始 failed_at 为 None
+        {
+            let m = cache.map.lock().unwrap();
+            assert!(m.values().next().unwrap().failed_at.is_none());
+        }
+
+        // 让条目过期
+        {
+            let mut m = cache.map.lock().unwrap();
+            for entry in m.values_mut() {
+                entry.expiry = Instant::now() - Duration::from_secs(10);
+            }
+        }
+
+        // 查上游失败 (返回 None)
+        let res = fwd
+            .resolve_cached(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                || async move { None },
+            )
+            .await;
+
+        // 回退了 stale 兜底
+        assert!(res.is_some());
+        // 条目被标上了 failed_at
+        {
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            assert!(entry.failed_at.is_some());
+        }
+
+        // 之后 put 新响应, 成功清除 failed_at
+        let fresh_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &fresh_resp);
+        {
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            assert!(entry.failed_at.is_none());
+        }
+    }
+
+    // ── B. 临期预刷新 (prefetch) 测试 ──
+
+    #[tokio::test]
+    async fn test_prefetch_near_expiry_triggers_background_refresh() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let old_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+        let new_resp = test_a_response("example.com", [1, 1], 300, [192, 0, 2, 2]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &old_resp);
+        // 原始 TTL = 100s, 剩余 10s (<= 10%)
+        let now = Instant::now();
+        {
+            let mut m = cache.map.lock().unwrap();
+            let entry = m.values_mut().next().unwrap();
+            entry.ttl = Duration::from_secs(100);
+            entry.expiry = now + Duration::from_secs(10);
+            assert!(!entry.prefetching);
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(Some(release_rx)));
+
+        let new_cloned = new_resp.clone();
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let call_count_cloned = call_count.clone();
+
+        // 第一次命中: 触发预刷新
+        let hit = fwd
+            .resolve_cached(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                move || {
+                    call_count_cloned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let started_tx = started_tx.clone();
+                    let release_rx = release_rx.clone();
+                    let new = new_cloned.clone();
+                    async move {
+                        if let Some(tx) = started_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                        let rx = release_rx.lock().unwrap().take();
+                        if let Some(rx) = rx {
+                            let _ = rx.await;
+                        }
+                        Some(new)
+                    }
+                },
+            )
+            .await;
+
+        // 立刻返回命中旧答案
+        assert_eq!(hit, Some(old_resp.clone()));
+
+        // 等待后台任务开始执行
+        started_rx.await.unwrap();
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 验证处于 prefetching 状态
+        {
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            assert!(entry.prefetching);
+        }
+
+        // 第二次查询: prefetching == true, 不应重复触发预刷新
+        let hit2 = fwd
+            .resolve_cached(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                {
+                    let count = call_count.clone();
+                    move || {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async move { None }
+                    }
+                },
+            )
+            .await;
+        assert_eq!(hit2, Some(old_resp));
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1, "prefetching 中不得重复触发");
+
+        // 释放后台任务继续执行并完成 put
+        let _ = release_tx.send(());
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            if !entry.prefetching && entry.response == new_resp {
+                break;
+            }
+        }
+
+        {
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            assert!(!entry.prefetching, "完成后 prefetching 应复位为 false");
+            assert_eq!(entry.response, new_resp, "缓存应更新为新答案");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_conditions_not_met() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+
+        // 1. 剩余 > 10%: TTL=100s, 剩余 50s
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &resp);
+        let now = Instant::now();
+        {
+            let mut m = cache.map.lock().unwrap();
+            let entry = m.values_mut().next().unwrap();
+            entry.ttl = Duration::from_secs(100);
+            entry.expiry = now + Duration::from_secs(50);
+        }
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_cloned = called.clone();
+        let hit = fwd
+            .resolve_cached(ResolvePath::Cn, "example.com", 1, &q, || {
+                called_cloned.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { None }
+            })
+            .await;
+        assert_eq!(hit, Some(resp.clone()));
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "剩余 > 10% 不得预刷新");
+
+        // 2. 原始 TTL < 10s: TTL=9s, 剩余 0.5s (<= 10%)
+        {
+            let mut m = cache.map.lock().unwrap();
+            let entry = m.values_mut().next().unwrap();
+            entry.ttl = Duration::from_secs(9);
+            entry.expiry = now + Duration::from_millis(500);
+        }
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_cloned = called.clone();
+        let hit = fwd
+            .resolve_cached(ResolvePath::Cn, "example.com", 1, &q, || {
+                called_cloned.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { None }
+            })
+            .await;
+        assert_eq!(hit, Some(resp.clone()));
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "TTL < 10s 不得预刷新");
+
+        // 3. 负条目不预刷新: 即使 TTL >= 10s 且剩余 <= 10%
+        let q_neg = test_a_query("neg.example", [2, 2]);
+        let neg_resp = test_nxdomain_soa_response("neg.example", [2, 2], 60, 60);
+        cache.put(ResolvePath::Cn, "neg.example", 1, &q_neg, &neg_resp);
+        {
+            let mut m = cache.map.lock().unwrap();
+            let key = (ResolvePath::Cn, "neg.example".to_string(), 1u16, false, false, 3u8);
+            let entry = m.get_mut(&key).unwrap();
+            assert!(entry.negative);
+            entry.ttl = Duration::from_secs(60);
+            entry.expiry = now + Duration::from_secs(5); // <= 10%
+        }
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_cloned = called.clone();
+        let hit = fwd
+            .resolve_cached(ResolvePath::Cn, "neg.example", 1, &q_neg, || {
+                called_cloned.store(true, std::sync::atomic::Ordering::SeqCst);
+                async move { None }
+            })
+            .await;
+        assert!(hit.is_some());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst), "负条目不得预刷新");
+    }
+
+    #[tokio::test]
+    async fn test_prefetch_failure_resets_prefetching() {
+        let cache = Arc::new(DnsCache::new(10));
+        let fwd = make_test_forwarder(Some(cache.clone())).await;
+
+        let q = test_a_query("example.com", [1, 1]);
+        let old_resp = test_a_response("example.com", [1, 1], 100, [192, 0, 2, 1]);
+
+        cache.put(ResolvePath::Cn, "example.com", 1, &q, &old_resp);
+        let now = Instant::now();
+        {
+            let mut m = cache.map.lock().unwrap();
+            let entry = m.values_mut().next().unwrap();
+            entry.ttl = Duration::from_secs(100);
+            entry.expiry = now + Duration::from_secs(10);
+            assert!(!entry.prefetching);
+        }
+
+        // 后台任务返回 None (失败)
+        let hit = fwd
+            .resolve_cached(
+                ResolvePath::Cn,
+                "example.com",
+                1,
+                &q,
+                || async move { None },
+            )
+            .await;
+        assert_eq!(hit, Some(old_resp));
+
+        // 等待后台任务失败完成 (复位 prefetching)
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            if !entry.prefetching && entry.failed_at.is_some() {
+                break;
+            }
+        }
+        {
+            let m = cache.map.lock().unwrap();
+            let entry = m.values().next().unwrap();
+            assert!(!entry.prefetching, "失败后 prefetching 必须复位");
+            assert!(entry.failed_at.is_some(), "失败后必须标上 failed_at");
+        }
     }
 }
