@@ -113,7 +113,7 @@ enum Mode {
         /// urltest 组名 (仅 --group 时生效)
         #[arg(long, default_value = "auto")]
         group_name: String,
-        /// urltest 组健康检查间隔秒 (默认 300; 0=关)。仅 --group
+        /// urltest 组健康检查间隔秒 (默认 60; 0=关)。仅 --group
         #[arg(long, requires = "group")]
         group_interval: Option<u64>,
         /// urltest 组 RTT 容差 ms, 现节点领先超过它才切换 (默认 50)。仅 --group
@@ -432,7 +432,7 @@ fn prompt_unique_tag(default: &str, taken: &[String]) -> anyhow::Result<String> 
 /// 更新既有组时保留原值。
 #[derive(Default)]
 struct GroupOpts {
-    interval: Option<u64>,   // 健康检查间隔秒 (默认 300; 0 = 关)
+    interval: Option<u64>,   // 健康检查间隔秒 (默认 60; 0 = 关)
     tolerance: Option<u64>,  // RTT 容差 ms, 现节点领先超过它才切换 (默认 50)
     url: Option<String>,     // HTTP 探测地址 (test_type != rtt 时用; 默认 gstatic/generate_204)
     test_type: Option<String>, // "rtt"=内核 RTT / 否则 HTTP 探测 (默认 ping)

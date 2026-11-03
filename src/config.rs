@@ -1641,7 +1641,7 @@ fn default_schema_version() -> u32 {
 }
 
 fn default_urltest_interval() -> u64 {
-    300
+    60
 }
 
 fn default_urltest_tolerance() -> u64 {
