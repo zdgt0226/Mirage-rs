@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### fix(relay): WG/SS 出站与 SS 入站 TCP relay 补超时 (2026-11-05)
+
+- **补齐空闲与排空超时 (参考 honk)**: 修复客户端 WG 出站、客户端 SS 出站及服务端 SS 入站因裸 `copy_bidirectional` 或裸 loop 缺乏超时导致对端崩溃/丢状态/不关闭时协程与 FD 永久泄漏的问题。
+- **整体空闲超时与半关闭守望**: 整体双向共同静默超时对齐 `relay_idle` (默认 1800s); 一方向正常 EOF 结束后对另一端写半程执行 shutdown (传递 FIN 半关闭), 剩余方向进入 drain 排空守望 (连续 30s 无字节进展即双向关闭, 测试环境 500ms); 剩余方向若有数据持续流动则不断重置计时器, 不打断合法的长时间单向慢速大传输。
+- **SS 入站传递半关闭**: 服务端 SS 入站下行读到目标 EOF 后取出底层写半程执行 shutdown, 正确向客户端传递 TCP 结束语义。
+
 ### feat(outbounds): 出站组按节点名正则过滤 (2026-11-04)
 
 - **出站组节点名正则过滤 (参考 dae)**: 出站组 (`urltest` / `fallback` / `selector` / `load_balance`) 新增可选字段 `filter` (正则字符串), 并在配置 `filter` 时允许省略 `outbounds`。

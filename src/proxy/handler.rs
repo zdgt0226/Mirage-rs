@@ -839,9 +839,16 @@ pub async fn proxy_tcp_target(
             // Direct 走 splice(2) 零拷贝, 但 WgTcpStream **不是真 fd** (数据在用户态 smoltcp
             // 里), 无法 splice —— 只能用通用异步拷贝。
             let mut local = local;
-            match tokio::io::copy_bidirectional(&mut local, &mut remote).await {
+            match crate::proxy::copy_bidirectional_with_drain(
+                &mut local,
+                &mut remote,
+                crate::proxy::relay_idle(),
+                crate::proxy::DRAIN_IDLE,
+            )
+            .await
+            {
                 Ok((up, down)) => {
-                    // copy_bidirectional 只在结束返回总字节, 关闭时补进连接登记。
+                    // copy_bidirectional_with_drain 在结束返回总字节, 关闭时补进连接登记。
                     _conn.counter().up(up);
                     _conn.counter().down(down);
                     debug!(
@@ -876,7 +883,14 @@ pub async fn proxy_tcp_target(
                 _conn.counter().up(initial_payload.len() as u64);
             }
             let mut local = local;
-            match tokio::io::copy_bidirectional(&mut local, &mut remote).await {
+            match crate::proxy::copy_bidirectional_with_drain(
+                &mut local,
+                &mut remote,
+                crate::proxy::relay_idle(),
+                crate::proxy::DRAIN_IDLE,
+            )
+            .await
+            {
                 Ok((up, down)) => {
                     _conn.counter().up(up);
                     _conn.counter().down(down);

@@ -87,6 +87,161 @@ impl IdleClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IdleElapsed;
 
+/// TCP relay drain 阶段的空闲超时 (单侧半关闭后, 剩余方向连续无字节进展满此值即两端都关)。
+/// 生产环境 30s (给慢速下载/大传输留余量, 同时防止对端崩溃/丢状态导致 CLOSE-WAIT 协程泄漏);
+/// 测试环境下缩短为 500ms (同 honk 写法)。
+pub(crate) const DRAIN_IDLE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(500)
+} else {
+    std::time::Duration::from_secs(30)
+};
+
+/// 拷贝单方向运行结果
+#[derive(Debug)]
+pub(crate) enum CopyResult {
+    Finished(u64),
+    Idle,
+    Err(std::io::Error),
+}
+
+/// 等待幸存方向在排空阶段完成。
+/// 仅当连续 `drain` 时长无任何字节进展时才终止并返回已转发的字节数 (不当作错误)。
+/// 若幸存方向在此期间有字节流动, 则重置无进展计时器。
+pub(crate) async fn drain_wait<F>(
+    mut fut: F,
+    progress: &std::sync::atomic::AtomicU64,
+    drain: std::time::Duration,
+) -> std::io::Result<u64>
+where
+    F: std::future::Future<Output = CopyResult> + Unpin,
+{
+    let check = std::time::Duration::from_millis(100)
+        .min(drain / 10)
+        .max(std::time::Duration::from_millis(1));
+    let mut last = progress.load(std::sync::atomic::Ordering::Relaxed);
+    let mut stalled = std::time::Duration::ZERO;
+    loop {
+        tokio::select! {
+            r = &mut fut => match r {
+                CopyResult::Finished(n) => return Ok(n),
+                CopyResult::Idle => {
+                    tracing::debug!("relay drain idle timeout; closing survivor");
+                    return Ok(progress.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                CopyResult::Err(e) => return Err(e),
+            },
+            _ = tokio::time::sleep(check) => {
+                let now = progress.load(std::sync::atomic::Ordering::Relaxed);
+                if now != last {
+                    last = now;
+                    stalled = std::time::Duration::ZERO;
+                } else {
+                    stalled += check;
+                    if stalled >= drain {
+                        tracing::debug!("relay drain stalled ({:?}); closing survivor", drain);
+                        return Ok(now);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn copy_one_direction<R, W>(
+    mut rd: R,
+    mut wr: W,
+    clock: &IdleClock,
+    idle: std::time::Duration,
+    progress: &std::sync::atomic::AtomicU64,
+) -> CopyResult
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let res = idle_timeout(clock, idle, async {
+        let mut buf = vec![0u8; 16384];
+        loop {
+            let n = rd.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            wr.write_all(&buf[..n]).await?;
+            clock.touch();
+            progress.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        wr.flush().await?;
+        wr.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+
+    match res {
+        Ok(Ok(())) => CopyResult::Finished(progress.load(Ordering::Relaxed)),
+        Ok(Err(e)) => CopyResult::Err(e),
+        Err(IdleElapsed) => CopyResult::Idle,
+    }
+}
+
+/// 双向异步拷贝并带超时防护与半关闭排空守望:
+/// - 整体空闲超时 `idle`: 双向共同静默达 `idle` 结束 (不当作错误, 返回 Ok 和实际转发字节数)。
+/// - 半关闭传递: 一侧读到 EOF (0 字节) 后, 先 flush + shutdown 对端写半程, 然后进入 drain 守望。
+/// - 排空超时 `drain`: 剩余方向若连续 `drain` 时长无任何字节进展即关闭 (不当作错误, 返回 Ok 和实际转发字节数);
+///   若有数据持续流动则重置计时器, 不打断慢速大传输。
+/// - 任一方向发生 I/O 错误则立即返回 Err (语义对齐 tokio `copy_bidirectional`)。
+pub(crate) async fn copy_bidirectional_with_drain<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle: std::time::Duration,
+    drain: std::time::Duration,
+) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let (mut a_r, mut a_w) = tokio::io::split(a);
+    let (mut b_r, mut b_w) = tokio::io::split(b);
+
+    let clock = IdleClock::new();
+    let a2b_progress = AtomicU64::new(0);
+    let b2a_progress = AtomicU64::new(0);
+
+    let a2b = copy_one_direction(&mut a_r, &mut b_w, &clock, idle, &a2b_progress);
+    let b2a = copy_one_direction(&mut b_r, &mut a_w, &clock, idle, &b2a_progress);
+
+    tokio::pin!(a2b);
+    tokio::pin!(b2a);
+
+    tokio::select! {
+        r = &mut a2b => match r {
+            CopyResult::Err(e) => Err(e),
+            CopyResult::Idle => {
+                tracing::debug!("relay idle timeout ({:?}); closing both directions", idle);
+                Ok((a2b_progress.load(Ordering::Relaxed), b2a_progress.load(Ordering::Relaxed)))
+            }
+            CopyResult::Finished(a_n) => {
+                let b_n = drain_wait(&mut b2a, &b2a_progress, drain).await?;
+                Ok((a_n, b_n))
+            }
+        },
+        r = &mut b2a => match r {
+            CopyResult::Err(e) => Err(e),
+            CopyResult::Idle => {
+                tracing::debug!("relay idle timeout ({:?}); closing both directions", idle);
+                Ok((a2b_progress.load(Ordering::Relaxed), b2a_progress.load(Ordering::Relaxed)))
+            }
+            CopyResult::Finished(b_n) => {
+                let a_n = drain_wait(&mut a2b, &a2b_progress, drain).await?;
+                Ok((a_n, b_n))
+            }
+        },
+    }
+}
+
 /// 等 fut 完成; 仅当两个方向共同静默达 idle 时返回 Err。
 /// 本方向等待中若另一方向 touch 过, 按剩余时间继续等 (不是重新计满 idle), 保证总空闲上界 = idle。
 pub(crate) async fn idle_timeout<F: std::future::Future>(
@@ -193,5 +348,205 @@ mod tests {
         assert_eq!(res, Err(IdleElapsed));
         let expected = 2 * idle - Duration::from_secs(1); // 19s
         assert_eq!(elapsed, expected);
+    }
+
+    #[tokio::test]
+    async fn test_copy_bidirectional_with_drain_normal() {
+        let (mut client_user, mut client_relay) = tokio::io::duplex(64);
+        let (mut remote_relay, mut remote_user) = tokio::io::duplex(64);
+
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_drain(
+                &mut client_relay,
+                &mut remote_relay,
+                Duration::from_secs(10),
+                DRAIN_IDLE,
+            )
+            .await
+        });
+
+        let client_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            client_user.write_all(b"ping from client").await.unwrap();
+            client_user.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            client_user.read_to_end(&mut resp).await.unwrap();
+            resp
+        });
+
+        let remote_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut req = Vec::new();
+            let mut buf = vec![0u8; 32];
+            loop {
+                let n = remote_user.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+            }
+            remote_user.write_all(b"pong from remote").await.unwrap();
+            remote_user.shutdown().await.unwrap();
+            req
+        });
+
+        let (c_res, r_res) = tokio::join!(client_task, remote_task);
+        assert_eq!(r_res.unwrap(), b"ping from client");
+        assert_eq!(c_res.unwrap(), b"pong from remote");
+
+        let (up, down) = relay.await.unwrap().unwrap();
+        assert_eq!(up, b"ping from client".len() as u64);
+        assert_eq!(down, b"pong from remote".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_copy_bidirectional_with_drain_slow_survivor_not_interrupted() {
+        let (mut client_user, mut client_relay) = tokio::io::duplex(1024);
+        let (mut remote_relay, mut remote_user) = tokio::io::duplex(1024);
+
+        let drain = DRAIN_IDLE; // 500ms in test
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_drain(
+                &mut client_relay,
+                &mut remote_relay,
+                Duration::from_secs(10),
+                drain,
+            )
+            .await
+        });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client_user.write_all(b"client hello").await.unwrap();
+        client_user.shutdown().await.unwrap();
+
+        let mut req = [0u8; 16];
+        let n = remote_user.read(&mut req).await.unwrap();
+        assert_eq!(&req[..n], b"client hello");
+        let n_eof = remote_user.read(&mut req).await.unwrap();
+        assert_eq!(n_eof, 0);
+
+        let total_chunks = 18;
+        let chunk = b"chunk_data_";
+        let mut expected_bytes = Vec::new();
+        let remote_writer = tokio::spawn(async move {
+            for _ in 0..total_chunks {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                remote_user.write_all(chunk).await.unwrap();
+            }
+            remote_user.shutdown().await.unwrap();
+        });
+
+        let client_reader = tokio::spawn(async move {
+            let mut all = Vec::new();
+            client_user.read_to_end(&mut all).await.unwrap();
+            all
+        });
+
+        remote_writer.await.unwrap();
+        let received = client_reader.await.unwrap();
+        for _ in 0..total_chunks {
+            expected_bytes.extend_from_slice(chunk);
+        }
+        assert_eq!(received, expected_bytes);
+
+        let (up, down) = relay.await.unwrap().unwrap();
+        assert_eq!(up, b"client hello".len() as u64);
+        assert_eq!(down, expected_bytes.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_copy_bidirectional_with_drain_survivor_stalled_closes_after_drain() {
+        let (mut client_user, mut client_relay) = tokio::io::duplex(64);
+        let (mut remote_relay, mut remote_user) = tokio::io::duplex(64);
+
+        let drain = DRAIN_IDLE; // 500ms in test
+        let start = tokio::time::Instant::now();
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_drain(
+                &mut client_relay,
+                &mut remote_relay,
+                Duration::from_secs(10),
+                drain,
+            )
+            .await
+        });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client_user.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 8];
+        let n = remote_user.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+
+        let res = tokio::time::timeout(Duration::from_secs(5), relay).await;
+        assert!(res.is_ok(), "relay did not finish within 5s");
+        let (up, down) = res.unwrap().unwrap().unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(up, 0);
+        assert_eq!(down, 0);
+        assert!(elapsed >= Duration::from_millis(450), "elapsed {:?} should be around drain (500ms)", elapsed);
+        assert!(elapsed < Duration::from_secs(2), "elapsed {:?} should not be stalled indefinitely", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_copy_bidirectional_with_drain_both_silent_returns_on_idle() {
+        let (_client_user, mut client_relay) = tokio::io::duplex(64);
+        let (_remote_relay_user, mut remote_relay) = tokio::io::duplex(64);
+
+        let idle = Duration::from_millis(300);
+        let drain = Duration::from_millis(500);
+        let start = tokio::time::Instant::now();
+
+        let res = copy_bidirectional_with_drain(
+            &mut client_relay,
+            &mut remote_relay,
+            idle,
+            drain,
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+        let (up, down) = res.unwrap();
+        assert_eq!(up, 0);
+        assert_eq!(down, 0);
+        assert!(elapsed >= Duration::from_millis(270), "elapsed {:?} should be >= idle (300ms)", elapsed);
+        assert!(elapsed < Duration::from_millis(600), "elapsed {:?} should be around idle (300ms)", elapsed);
+    }
+
+    #[tokio::test]
+    async fn test_copy_bidirectional_with_drain_half_close_propagated() {
+        let (mut client_user, mut client_relay) = tokio::io::duplex(64);
+        let (mut remote_relay, mut remote_user) = tokio::io::duplex(64);
+
+        let relay = tokio::spawn(async move {
+            copy_bidirectional_with_drain(
+                &mut client_relay,
+                &mut remote_relay,
+                Duration::from_secs(10),
+                DRAIN_IDLE,
+            )
+            .await
+        });
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client_user.write_all(b"half close test").await.unwrap();
+        client_user.shutdown().await.unwrap();
+
+        let mut buf = vec![0u8; 32];
+        let n = remote_user.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"half close test");
+        let eof = remote_user.read(&mut buf).await.unwrap();
+        assert_eq!(eof, 0, "remote_user must observe EOF after client half-closes");
+
+        remote_user.write_all(b"ack").await.unwrap();
+        remote_user.shutdown().await.unwrap();
+
+        let mut resp = Vec::new();
+        client_user.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(resp, b"ack");
+
+        let (up, down) = relay.await.unwrap().unwrap();
+        assert_eq!(up, b"half close test".len() as u64);
+        assert_eq!(down, b"ack".len() as u64);
     }
 }
