@@ -1,7 +1,87 @@
 use crate::proxy::outbound::OutboundNode;
 use std::sync::Weak;
 use tokio::time::{sleep, Duration, Instant, timeout};
-use tracing::debug;
+use tracing::{debug, info};
+
+/// 探测成功后的记录结果 (供日志区分)。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Normal,
+    /// 补测轮, 相对基线确认变慢, 已设延迟下限。
+    ConfirmedSlow { baseline: u64 },
+    /// 补测轮, 未确认变慢 (真实变慢多半是目标慢)。
+    NotConfirmed { baseline: u64 },
+    /// 普通轮, 延迟恢复正常, 提前解除变慢下限。
+    FloorCleared,
+}
+
+/// 探测成功拿到 rtt 后记录。补测轮取出 probe_baseline 比对, 确认变慢设下限;
+/// 普通轮照常记样本, 并在恢复正常时解除下限。
+pub(crate) fn record_probe_success(
+    stats: &mut crate::proxy::pool::PoolStats,
+    rtt: u64,
+    is_probe_round: bool,
+    now: Instant,
+) -> ProbeOutcome {
+    if is_probe_round {
+        if let Some(baseline) = stats.probe_baseline.take() {
+            if crate::proxy::pool::is_slow_ttfb(rtt, Some(baseline)) == Some(true) {
+                stats.confirm_slow_at(rtt, baseline, now);
+                return ProbeOutcome::ConfirmedSlow { baseline };
+            }
+            stats.record_latency(rtt);
+            return ProbeOutcome::NotConfirmed { baseline };
+        }
+    }
+    stats.record_latency(rtt);
+    if stats.maybe_clear_slow_floor_at(rtt, now) {
+        return ProbeOutcome::FloorCleared;
+    }
+    ProbeOutcome::Normal
+}
+
+/// 探测失败记录。补测轮结束清掉 probe_baseline。
+pub(crate) fn record_probe_failure(
+    stats: &mut crate::proxy::pool::PoolStats,
+    is_probe_round: bool,
+) {
+    stats.record_failure();
+    if is_probe_round {
+        stats.probe_baseline = None;
+    }
+}
+
+fn handle_probe_result(
+    stats: &std::sync::Arc<std::sync::RwLock<crate::proxy::pool::PoolStats>>,
+    tag: &str,
+    result: Result<u64, &'static str>,
+    is_probe_round: bool,
+) {
+    let mut stats = stats.write().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(rtt) => match record_probe_success(&mut stats, rtt, is_probe_round, Instant::now()) {
+            ProbeOutcome::ConfirmedSlow { baseline } => info!(
+                "节点 {} 补测确认变慢 ({}ms, 原 {}ms), urltest 按此延迟选路 {}s",
+                tag,
+                rtt,
+                baseline,
+                crate::proxy::pool::SLOW_FLOOR_DURATION.as_secs()
+            ),
+            ProbeOutcome::NotConfirmed { baseline } => debug!(
+                "HealthCheck [{}] ok: {}ms (补测未确认变慢, 原 {}ms, 真实变慢多半是目标慢)",
+                tag, rtt, baseline
+            ),
+            ProbeOutcome::FloorCleared => info!("节点 {} 延迟恢复正常 ({}ms), 解除变慢标记", tag, rtt),
+            ProbeOutcome::Normal => debug!("HealthCheck [{}] ok: {}ms", tag, rtt),
+        },
+        Err(reason) => {
+            record_probe_failure(&mut stats, is_probe_round);
+            if !reason.is_empty() {
+                debug!("HealthCheck [{}] failed ({})", tag, reason);
+            }
+        }
+    }
+}
 
 pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64) {
     if interval == 0 {
@@ -12,6 +92,7 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
         // Wait a bit before starting the first check to avoid thundering herd
         sleep(Duration::from_secs(2)).await;
 
+        let mut is_probe_round = false;
         loop {
             let Some(node) = node.upgrade() else {
                 break;
@@ -49,25 +130,29 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                                 let resp = String::from_utf8_lossy(&buf[..n]);
                                 if resp.contains("HTTP/1.1 204") || resp.contains("HTTP/1.1 200") {
                                     let rtt = start.elapsed().as_millis() as u64;
-                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_latency(rtt);
-                                    debug!("HealthCheck [{}] ok: {}ms", tag, rtt);
+                                    handle_probe_result(&pool.stats, tag, Ok(rtt), is_probe_round);
                                 } else {
-                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
-                                    debug!("HealthCheck [{}] failed (bad status)", tag);
+                                    handle_probe_result(&pool.stats, tag, Err("bad status"), is_probe_round);
                                 }
                             } else {
-                                pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
-                                debug!("HealthCheck [{}] failed (recv timeout/err)", tag);
+                                handle_probe_result(&pool.stats, tag, Err("recv timeout/err"), is_probe_round);
                             }
                         } else {
-                            pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                            handle_probe_result(&pool.stats, tag, Err(""), is_probe_round);
                         }
                     } else {
-                        pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
-                        debug!("HealthCheck [{}] failed (quic stream open timeout/err)", tag);
+                        handle_probe_result(&pool.stats, tag, Err("quic stream open timeout/err"), is_probe_round);
                     }
+                    let notify = pool.probe_notify();
                     drop(node);
-                    sleep(Duration::from_secs(interval)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(interval)) => {
+                            is_probe_round = false;
+                        }
+                        _ = notify.notified() => {
+                            is_probe_round = true;
+                        }
+                    }
                     continue;
                 }
 
@@ -92,31 +177,101 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                                 let resp = String::from_utf8_lossy(&data);
                                 if resp.contains("HTTP/1.1 204") || resp.contains("HTTP/1.1 200") {
                                     let rtt = start.elapsed().as_millis() as u64;
-                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_latency(rtt);
-                                    debug!("HealthCheck [{}] ok: {}ms", tag, rtt);
+                                    handle_probe_result(&pool.stats, tag, Ok(rtt), is_probe_round);
                                 } else {
-                                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
-                                    debug!("HealthCheck [{}] failed (bad status)", tag);
+                                    handle_probe_result(&pool.stats, tag, Err("bad status"), is_probe_round);
                                 }
                                 // 正常结束发 close_notify (rtt 已记), 否则服务端按截断 RST 上游。
                                 let _ = tunnel.writer.send_close_notify().await;
                             } else {
-                                pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
-                                debug!("HealthCheck [{}] failed (recv timeout/err)", tag);
+                                handle_probe_result(&pool.stats, tag, Err("recv timeout/err"), is_probe_round);
                             }
                         } else {
-                            pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                            handle_probe_result(&pool.stats, tag, Err(""), is_probe_round);
                         }
                     } else {
-                        pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
+                        handle_probe_result(&pool.stats, tag, Err(""), is_probe_round);
                     }
                 } else {
-                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_failure();
-                    debug!("HealthCheck [{}] failed (pool get timeout/err)", tag);
+                    handle_probe_result(&pool.stats, tag, Err("pool get timeout/err"), is_probe_round);
                 }
+                let notify = pool.probe_notify();
+                drop(node);
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(interval)) => {
+                        is_probe_round = false;
+                    }
+                    _ = notify.notified() => {
+                        is_probe_round = true;
+                    }
+                }
+                continue;
             }
             drop(node);
             sleep(Duration::from_secs(interval)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::pool::PoolStats;
+
+    #[test]
+    fn probe_round_confirms_slow_sets_floor() {
+        let mut stats = PoolStats::new();
+        stats.record_latency(100);
+        stats.probe_baseline = Some(100);
+        let now = Instant::now();
+        assert_eq!(record_probe_success(&mut stats, 2000, true, now), ProbeOutcome::ConfirmedSlow { baseline: 100 });
+        assert_eq!(stats.probe_baseline, None);
+        // 之后暖池快样本拉不回选路延迟
+        for _ in 0..9 {
+            stats.record_latency(100);
+        }
+        assert_eq!(stats.latency_ms_at(now), Some(2000));
+    }
+
+    #[test]
+    fn probe_round_not_confirmed_keeps_samples() {
+        let mut stats = PoolStats::new();
+        stats.record_latency(100);
+        stats.probe_baseline = Some(100);
+        let now = Instant::now();
+        assert_eq!(record_probe_success(&mut stats, 150, true, now), ProbeOutcome::NotConfirmed { baseline: 100 });
+        assert_eq!(stats.slow_floor, None);
+        assert_eq!(stats.latency_samples.len(), 2);
+        assert_eq!(stats.probe_baseline, None);
+    }
+
+    #[test]
+    fn normal_round_ignores_baseline_and_clears_floor_on_recovery() {
+        let mut stats = PoolStats::new();
+        stats.record_latency(100);
+        stats.probe_baseline = Some(100);
+        let now = Instant::now();
+        // 普通轮不消费 probe_baseline
+        assert_eq!(record_probe_success(&mut stats, 2000, false, now), ProbeOutcome::Normal);
+        assert_eq!(stats.probe_baseline, Some(100));
+
+        stats.confirm_slow_at(2000, 100, now);
+        // 普通轮仍慢: 下限保留
+        assert_eq!(record_probe_success(&mut stats, 1800, false, now), ProbeOutcome::Normal);
+        assert!(stats.slow_floor.is_some());
+        // 普通轮恢复: 解除
+        assert_eq!(record_probe_success(&mut stats, 120, false, now), ProbeOutcome::FloorCleared);
+        assert_eq!(stats.slow_floor, None);
+    }
+
+    #[test]
+    fn probe_failure_clears_baseline_in_probe_round() {
+        let mut stats = PoolStats::new();
+        stats.probe_baseline = Some(100);
+        record_probe_failure(&mut stats, false);
+        assert_eq!(stats.probe_baseline, Some(100));
+        record_probe_failure(&mut stats, true);
+        assert_eq!(stats.consecutive_failures, 2);
+        assert_eq!(stats.probe_baseline, None);
+    }
 }

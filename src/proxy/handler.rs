@@ -479,6 +479,12 @@ pub async fn proxy_tcp_target(
             let up_clock = clock.clone();
             let dn_clock = clock;
 
+            let first_up = std::sync::OnceLock::new();
+            let first_down = std::sync::OnceLock::new();
+            if !initial_payload.is_empty() {
+                let _ = first_up.set(std::time::Instant::now());
+            }
+
             let up_conn = _conn.counter();
             let upload = async {
                 // 64KB 堆 buf (非 16KB 栈): 与服务端 download 对称, 配下方 greedy
@@ -516,6 +522,7 @@ pub async fn proxy_tcp_target(
                             if tunnel_writer.send_data(&buf[..total]).await.is_err() {
                                 break;
                             }
+                            let _ = first_up.set(std::time::Instant::now());
                             up_bytes += total as u64;
                             up_conn.up(total as u64);
                         }
@@ -576,6 +583,7 @@ pub async fn proxy_tcp_target(
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
                     match crate::proxy::idle_timeout(&dn_clock, relay_idle(), tunnel_reader.recv_data_borrowed()).await {
                         Ok(Ok(data)) => {
+                            let _ = first_down.set(std::time::Instant::now());
                             dn_clock.touch();
                             if let Some(b) = &dn_bkt {
                                 b.down.consume(data.len()).await; // 限速整形 (下行)
@@ -665,6 +673,35 @@ pub async fn proxy_tcp_target(
                     }
                 }
                 RealConnResult::Ignore => {}
+            }
+
+            // 测真实连接首字节耗时 (TTFB): 仅在 first_up 与 first_down 均有且 first_up <= first_down 时统计
+            if let (Some(&up), Some(&down)) = (first_up.get(), first_down.get()) {
+                if up <= down {
+                    let ttfb_ms = down.duration_since(up).as_millis() as u64;
+                    let baseline_ms = pool.stats.read().unwrap_or_else(|e| e.into_inner()).median_latency_ms();
+                    match crate::proxy::pool::is_slow_ttfb(ttfb_ms, baseline_ms) {
+                        Some(true) => {
+                            let triggered = pool
+                                .stats
+                                .write()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .record_real_slow(&target);
+                            if triggered {
+                                pool.trigger_probe();
+                                info!(
+                                    "节点 {} 真实连接连续明显变慢 (涉及 {} 个不同目标), 触发补测",
+                                    node_tag,
+                                    crate::proxy::pool::SLOW_TRIGGER_COUNT
+                                );
+                            }
+                        }
+                        Some(false) => {
+                            pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_fast();
+                        }
+                        None => {}
+                    }
+                }
             }
         }
         OutboundNode::Direct { .. } => {

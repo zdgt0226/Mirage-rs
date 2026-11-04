@@ -76,6 +76,19 @@ pub const RECOVER_AFTER_SUCCESSES: u32 = 2;
 pub const PENALIZE_AFTER_FAILURES: u32 = 3;
 pub const PENALTY_CLEAR_SUCCESSES: u32 = 2;
 pub const PENALTY_DURATION: Duration = Duration::from_secs(300);
+pub const SLOW_TRIGGER_COUNT: u32 = 3;
+pub const PROBE_TRIGGER_COOLDOWN: Duration = Duration::from_secs(60);
+/// 补测确认变慢后延迟下限的有效期 (期间普通探测恢复正常则提前解除)。
+pub const SLOW_FLOOR_DURATION: Duration = Duration::from_secs(300);
+
+/// 补测确认变慢后的延迟下限: urltest 看到的延迟取 max(中位, rtt)。
+/// 不直接改样本: 暖池每建一条隧道都记一个握手样本, 服务端出口慢时握手照样快, 中位很快被拉回。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlowFloor {
+    pub rtt: u64,
+    pub baseline: u64,
+    pub until: Instant,
+}
 
 #[derive(Debug)]
 pub struct PoolStats {
@@ -89,6 +102,11 @@ pub struct PoolStats {
     pub real_successes: u32,
     pub penalized_until: Option<Instant>,
     pub recent_fail_targets: VecDeque<String>,
+    pub slow_count: u32,
+    pub recent_slow_targets: VecDeque<String>,
+    pub last_probe_trigger: Option<Instant>,
+    pub probe_baseline: Option<u64>,
+    pub slow_floor: Option<SlowFloor>,
 }
 
 impl Default for PoolStats {
@@ -110,6 +128,11 @@ impl PoolStats {
             real_successes: 0,
             penalized_until: None,
             recent_fail_targets: VecDeque::with_capacity(3),
+            slow_count: 0,
+            recent_slow_targets: VecDeque::with_capacity(3),
+            last_probe_trigger: None,
+            probe_baseline: None,
+            slow_floor: None,
         }
     }
 
@@ -178,6 +201,66 @@ impl PoolStats {
         }
     }
 
+    /// 记一次真实连接偏慢。达到 3 个不同目标且满足 60s 冷却时触发补测, 返回 true。
+    pub fn record_real_slow(&mut self, target: &str) -> bool {
+        self.record_real_slow_at(target, Instant::now())
+    }
+
+    pub fn record_real_slow_at(&mut self, target: &str, now: Instant) -> bool {
+        if self.recent_slow_targets.iter().any(|t| t == target) {
+            return false;
+        }
+        if self.recent_slow_targets.len() >= SLOW_TRIGGER_COUNT as usize {
+            self.recent_slow_targets.pop_front();
+        }
+        self.recent_slow_targets.push_back(target.to_string());
+        self.slow_count += 1;
+        if self.slow_count >= SLOW_TRIGGER_COUNT {
+            let cooled_down = match self.last_probe_trigger {
+                Some(last) => now >= last + PROBE_TRIGGER_COOLDOWN,
+                None => true,
+            };
+            if cooled_down {
+                self.last_probe_trigger = Some(now);
+                self.probe_baseline = self.median_latency_ms();
+                self.slow_count = 0;
+                self.recent_slow_targets.clear();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 记一次真实连接耗时正常 (未慢), 清零连续变慢计数与近期慢目标。
+    pub fn record_real_fast(&mut self) {
+        self.slow_count = 0;
+        self.recent_slow_targets.clear();
+    }
+
+    /// 补测确认变慢: 设延迟下限 SLOW_FLOOR_DURATION, 并照常记样本。
+    pub fn confirm_slow_at(&mut self, rtt: u64, baseline: u64, now: Instant) {
+        self.record_latency(rtt);
+        self.slow_floor = Some(SlowFloor { rtt, baseline, until: now + SLOW_FLOOR_DURATION });
+    }
+
+    /// 普通探测成功: 下限生效中且本次 rtt 相对原基线不再算慢 → 提前解除。返回是否解除。
+    pub fn maybe_clear_slow_floor_at(&mut self, rtt: u64, now: Instant) -> bool {
+        match self.slow_floor {
+            Some(f) if now < f.until => {
+                if is_slow_ttfb(rtt, Some(f.baseline)) == Some(false) {
+                    self.slow_floor = None;
+                    return true;
+                }
+                false
+            }
+            Some(_) => {
+                self.slow_floor = None;
+                false
+            }
+            None => false,
+        }
+    }
+
     pub fn is_penalized(&self) -> bool {
         self.is_penalized_at(Instant::now())
     }
@@ -189,7 +272,21 @@ impl PoolStats {
         }
     }
 
+    /// urltest 选路用的延迟: 中位数, 补测确认变慢的下限生效期内取 max(中位, 下限)。
     pub fn latency_ms(&self) -> Option<u64> {
+        self.latency_ms_at(Instant::now())
+    }
+
+    pub fn latency_ms_at(&self, now: Instant) -> Option<u64> {
+        let median = self.median_latency_ms()?;
+        match self.slow_floor {
+            Some(f) if now < f.until => Some(median.max(f.rtt)),
+            _ => Some(median),
+        }
+    }
+
+    /// 样本中位数 (不含变慢下限), 作判慢基线。
+    pub fn median_latency_ms(&self) -> Option<u64> {
         if self.latency_samples.is_empty() {
             return None;
         }
@@ -212,7 +309,19 @@ impl PoolStats {
         self.real_successes = 0;
         self.penalized_until = None;
         self.recent_fail_targets.clear();
+        self.slow_count = 0;
+        self.recent_slow_targets.clear();
+        self.probe_baseline = None;
+        self.slow_floor = None;
     }
+}
+
+/// 判断首字节耗时是否明显慢于基准延迟。
+/// baseline 为 None 返回 None; 慢 = ttfb_ms > max(baseline * 4, baseline + 1500); 否则 Some(false)。
+pub fn is_slow_ttfb(ttfb_ms: u64, baseline_ms: Option<u64>) -> Option<bool> {
+    let baseline = baseline_ms?;
+    let threshold = baseline.saturating_mul(4).max(baseline.saturating_add(1500));
+    Some(ttfb_ms > threshold)
 }
 
 /// 计算连续失败 `consecutive_failures` 次后的基础指数退避时长 (未加抖动).
@@ -533,6 +642,7 @@ pub struct WarmPool {
     notify: Arc<Notify>,                      // 阻塞唤醒器（当没有连接时挂起请求）
     demand_notify: Arc<Notify>,               // 需求唤醒器 (get() 在队列空挂起时叫醒退避中的 builder)
     builder_shutdown_notify: Arc<Notify>,     // 停机唤醒器 (Drop 时快速叫醒退避/SYN抖动中的 builder)
+    probe_notify: Arc<Notify>,                // 补测唤醒器 (真实连接连续变慢时唤醒 health checker 立即探测)
     pub stats: Arc<RwLock<PoolStats>>,        // 连接池的延迟统计和健康检查
     pub brutal_state: Arc<BrutalState>,       // 该连接池绑定的拥塞控制状态
     metrics: Arc<PoolMetrics>,                // 反馈式弹性算法的运行时指标
@@ -598,6 +708,16 @@ impl WarmPool {
         Ok(stream)
     }
 
+    /// 唤醒健康检查任务立即执行一次补测。
+    pub fn trigger_probe(&self) {
+        self.probe_notify.notify_one();
+    }
+
+    /// 获取补测通知器的 Arc 克隆。
+    pub fn probe_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.probe_notify.clone()
+    }
+
     pub fn new(cfg: Arc<PoolConfig>, brutal_state: Arc<BrutalState>) -> Self {
         #[cfg(test)]
         {
@@ -627,6 +747,7 @@ impl WarmPool {
         let notify = Arc::new(Notify::new());
         let demand_notify = Arc::new(Notify::new());
         let builder_shutdown_notify = Arc::new(Notify::new());
+        let probe_notify = Arc::new(Notify::new());
         let stats = Arc::new(RwLock::new(PoolStats::new()));
         let metrics = Arc::new(PoolMetrics::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -655,6 +776,7 @@ impl WarmPool {
             notify: notify.clone(),
             demand_notify: demand_notify.clone(),
             builder_shutdown_notify: builder_shutdown_notify.clone(),
+            probe_notify: probe_notify.clone(),
             stats: stats.clone(),
             brutal_state: brutal_state.clone(),
             metrics: metrics.clone(),
@@ -1911,5 +2033,152 @@ mod backoff_tests {
         assert!(stats.penalized_until.is_none());
         assert!(stats.recent_fail_targets.is_empty());
         assert!(!stats.is_penalized());
+    }
+
+    #[test]
+    fn test_is_slow_ttfb_boundaries() {
+        // baseline 为 None
+        assert_eq!(is_slow_ttfb(1000, None), None);
+
+        // baseline = 100: 4倍 = 400, +1500 = 1600. 门槛取 1600 (+1500 大)
+        assert_eq!(is_slow_ttfb(1599, Some(100)), Some(false));
+        // 恰好等于不算慢
+        assert_eq!(is_slow_ttfb(1600, Some(100)), Some(false));
+        // 大于门槛算慢
+        assert_eq!(is_slow_ttfb(1601, Some(100)), Some(true));
+
+        // baseline = 1000: 4倍 = 4000, +1500 = 2500. 门槛取 4000 (4倍大)
+        assert_eq!(is_slow_ttfb(3999, Some(1000)), Some(false));
+        // 恰好等于不算慢
+        assert_eq!(is_slow_ttfb(4000, Some(1000)), Some(false));
+        // 大于门槛算慢
+        assert_eq!(is_slow_ttfb(4001, Some(1000)), Some(true));
+
+        // 两者相等: baseline = 500: 4*500=2000, 500+1500=2000
+        assert_eq!(is_slow_ttfb(2000, Some(500)), Some(false));
+        assert_eq!(is_slow_ttfb(2001, Some(500)), Some(true));
+    }
+
+    #[test]
+    fn test_pool_stats_real_slow_three_distinct_targets_triggers() {
+        let mut stats = PoolStats::new();
+        stats.record_latency(100);
+        let now = Instant::now();
+
+        assert!(!stats.record_real_slow_at("t1.example.com:443", now));
+        assert_eq!(stats.slow_count, 1);
+        assert_eq!(stats.recent_slow_targets.len(), 1);
+
+        assert!(!stats.record_real_slow_at("t2.example.com:443", now));
+        assert_eq!(stats.slow_count, 2);
+        assert_eq!(stats.recent_slow_targets.len(), 2);
+
+        // 第 3 个不同目标: 触发补测, 计数与列表清零, 记录基线
+        assert!(stats.record_real_slow_at("t3.example.com:443", now));
+        assert_eq!(stats.slow_count, 0);
+        assert!(stats.recent_slow_targets.is_empty());
+        assert_eq!(stats.last_probe_trigger, Some(now));
+        assert_eq!(stats.probe_baseline, Some(100));
+    }
+
+    #[test]
+    fn test_pool_stats_real_slow_same_target_five_times_no_trigger() {
+        let mut stats = PoolStats::new();
+        for _ in 0..5 {
+            assert!(!stats.record_real_slow("same.example.com:443"));
+        }
+        assert_eq!(stats.slow_count, 1);
+        assert_eq!(stats.recent_slow_targets.len(), 1);
+        assert_eq!(stats.last_probe_trigger, None);
+    }
+
+    #[test]
+    fn test_pool_stats_real_slow_interleaved_fast_resets() {
+        let mut stats = PoolStats::new();
+        stats.record_real_slow("t1.example.com:443");
+        stats.record_real_slow("t2.example.com:443");
+        assert_eq!(stats.slow_count, 2);
+
+        // 穿插 fast: 清零
+        stats.record_real_fast();
+        assert_eq!(stats.slow_count, 0);
+        assert!(stats.recent_slow_targets.is_empty());
+
+        // 再来 2 个目标不会触发
+        stats.record_real_slow("t3.example.com:443");
+        stats.record_real_slow("t4.example.com:443");
+        assert_eq!(stats.slow_count, 2);
+        assert_eq!(stats.last_probe_trigger, None);
+    }
+
+    #[test]
+    fn test_pool_stats_real_slow_cooldown_60s() {
+        let mut stats = PoolStats::new();
+        stats.record_latency(100);
+        let t0 = Instant::now();
+
+        // 首次 3 个目标: 触发
+        assert!(!stats.record_real_slow_at("t1.example.com:443", t0));
+        assert!(!stats.record_real_slow_at("t2.example.com:443", t0));
+        assert!(stats.record_real_slow_at("t3.example.com:443", t0));
+        assert_eq!(stats.last_probe_trigger, Some(t0));
+
+        // 60s 内 (如 30s): 达到 3 个不触发, 计数保留
+        let t30 = t0 + Duration::from_secs(30);
+        assert!(!stats.record_real_slow_at("t4.example.com:443", t30));
+        assert!(!stats.record_real_slow_at("t5.example.com:443", t30));
+        assert!(!stats.record_real_slow_at("t6.example.com:443", t30));
+        assert_eq!(stats.slow_count, 3);
+        assert_eq!(stats.last_probe_trigger, Some(t0));
+
+        // 60s 后 (如 61s): 新目标进入触发
+        let t61 = t0 + Duration::from_secs(61);
+        assert!(stats.record_real_slow_at("t7.example.com:443", t61));
+        assert_eq!(stats.slow_count, 0);
+        assert!(stats.recent_slow_targets.is_empty());
+        assert_eq!(stats.last_probe_trigger, Some(t61));
+    }
+
+    #[test]
+    fn test_pool_stats_slow_floor() {
+        let mut stats = PoolStats::new();
+        stats.record_latency(100);
+        let t0 = Instant::now();
+        stats.confirm_slow_at(2000, 100, t0);
+        // 下限生效: 之后来再多快样本, 选路延迟仍取下限
+        for _ in 0..9 {
+            stats.record_latency(100);
+        }
+        assert_eq!(stats.median_latency_ms(), Some(100));
+        assert_eq!(stats.latency_ms_at(t0), Some(2000));
+        // 普通探测仍慢: 不解除
+        assert!(!stats.maybe_clear_slow_floor_at(1700, t0));
+        assert_eq!(stats.latency_ms_at(t0), Some(2000));
+        // 到期后自动失效
+        assert_eq!(stats.latency_ms_at(t0 + SLOW_FLOOR_DURATION), Some(100));
+        // 普通探测恢复正常: 提前解除
+        assert!(stats.maybe_clear_slow_floor_at(150, t0 + Duration::from_secs(10)));
+        assert_eq!(stats.slow_floor, None);
+        assert_eq!(stats.latency_ms_at(t0), Some(100));
+    }
+
+    #[test]
+    fn test_pool_stats_on_network_change_clears_slow_state_except_last_probe_trigger() {
+        let mut stats = PoolStats::new();
+        let now = Instant::now();
+        stats.last_probe_trigger = Some(now);
+        stats.probe_baseline = Some(100);
+        stats.slow_floor = Some(SlowFloor { rtt: 2000, baseline: 100, until: now + SLOW_FLOOR_DURATION });
+        stats.slow_count = 2;
+        stats.recent_slow_targets.push_back("t1.example.com:443".to_string());
+        stats.recent_slow_targets.push_back("t2.example.com:443".to_string());
+
+        stats.on_network_change();
+        assert_eq!(stats.slow_count, 0);
+        assert!(stats.recent_slow_targets.is_empty());
+        assert_eq!(stats.probe_baseline, None);
+        assert_eq!(stats.slow_floor, None);
+        // last_probe_trigger 不清
+        assert_eq!(stats.last_probe_trigger, Some(now));
     }
 }
