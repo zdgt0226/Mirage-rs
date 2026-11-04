@@ -2,7 +2,7 @@ use crate::proxy::pool::{WarmPool, PoolConfig};
 use std::sync::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use crate::config::{Config, OutboundConfig};
 
 pub enum OutboundNode {
@@ -683,19 +683,19 @@ impl OutboundManager {
                 let mut hc_url = "".to_string();
                 let mut hc_interval = 0;
                 let mut hc_test_type = "ping".to_string();
-                let (tag, child_tags, otype, _interval, tolerance) = match oc {
-                    OutboundConfig::Urltest { tag, outbounds, interval, tolerance, url, test_type } => {
+                let (tag, explicit_outbounds, otype, _interval, tolerance) = match oc {
+                    OutboundConfig::Urltest { tag, outbounds, interval, tolerance, url, test_type, .. } => {
                         hc_url = url.clone();
                         hc_interval = *interval;
                         hc_test_type = test_type.clone();
                         (tag, outbounds, "urltest", *interval, *tolerance)
                     }
-                    OutboundConfig::Fallback { tag, outbounds, interval, url } => {
+                    OutboundConfig::Fallback { tag, outbounds, interval, url, .. } => {
                         hc_url = url.clone();
                         hc_interval = *interval;
                         (tag, outbounds, "fallback", *interval, 0)
                     }
-                    OutboundConfig::Selector { tag, outbounds } => {
+                    OutboundConfig::Selector { tag, outbounds, .. } => {
                         (tag, outbounds, "selector", 0, 0)
                     }
                     OutboundConfig::LoadBalance { tag, outbounds, url, interval, .. } => {
@@ -706,9 +706,17 @@ impl OutboundManager {
                     _ => unreachable!(),
                 };
 
+                let child_tags = match oc.group_members(&cfg.outbounds) {
+                    Ok(tags) => tags,
+                    Err(e) => {
+                        warn!("出站组 '{}' filter 正则非法: {}, 退回仅使用显式 outbounds", tag, e);
+                        explicit_outbounds.clone()
+                    }
+                };
+
                 let mut children = Vec::new();
                 let mut resolved = true;
-                for ct in child_tags {
+                for ct in &child_tags {
                     if let Some(node) = outbounds.get(ct) {
                         children.push(node.clone());
                     } else {
@@ -718,6 +726,10 @@ impl OutboundManager {
                 }
 
                 if resolved {
+                    if oc.filter().is_some() {
+                        // group_members 以显式列表为前缀只追加, 差值即 filter 额外加入的节点数
+                        info!("出站组 '{}' filter 额外加入 {} 个节点", tag, child_tags.len().saturating_sub(explicit_outbounds.len()));
+                    }
                     if hc_interval > 0 && !hc_url.is_empty() {
                         for child in &children {
                             if let OutboundNode::Mirage { tag: ctag, .. } = &**child {
@@ -1098,6 +1110,59 @@ mod lb_tests {
         let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
         assert!(cfg.semantic_issues().iter().any(|i| i.contains("strategy") && i.contains("consistent-hash")),
             "未支持的 strategy 应被拦: {:?}", cfg.semantic_issues());
+    }
+
+    #[tokio::test]
+    async fn test_outbound_group_filter_builds_children_in_order() {
+        let s = r#"{
+          "inbounds": [],
+          "outbounds": [
+            {
+              "type": "mirage",
+              "tag": "jp-tokyo-1",
+              "server": "203.0.113.10",
+              "server_port": 443,
+              "password": "pass",
+              "camouflage_host": "example.com"
+            },
+            {
+              "type": "mirage",
+              "tag": "us-la-1",
+              "server": "203.0.113.20",
+              "server_port": 443,
+              "password": "pass",
+              "camouflage_host": "example.com"
+            },
+            {
+              "type": "shadowsocks",
+              "tag": "jp-osaka-2",
+              "server": "203.0.113.30",
+              "server_port": 8388,
+              "method": "aes-256-gcm",
+              "password": "pass"
+            },
+            {
+              "type": "urltest",
+              "tag": "auto-jp",
+              "outbounds": ["jp-osaka-2"],
+              "filter": "(?i)jp"
+            }
+          ],
+          "routing": { "default_outbound": "auto-jp", "rules": [] }
+        }"#;
+        let cfg: Config = serde_json::from_str(s).expect("配置应能解析");
+        assert!(cfg.semantic_issues().is_empty(), "语义检查应无告警: {:?}", cfg.semantic_issues());
+
+        let m = OutboundManager::new(&cfg).expect("含 filter 的组出站应能构建");
+        let group_node = m.outbounds.get("auto-jp").expect("应包含 auto-jp 组");
+        match &**group_node {
+            OutboundNode::Urltest { children, .. } => {
+                let tags: Vec<&str> = children.iter().map(|c| c.tag()).collect();
+                // 显式 "jp-osaka-2" 在前, filter 匹配到的 "jp-tokyo-1" 追加在后, 已去重
+                assert_eq!(tags, vec!["jp-osaka-2", "jp-tokyo-1"]);
+            }
+            _ => panic!("auto-jp 应为 Urltest 节点"),
+        }
     }
 }
 
