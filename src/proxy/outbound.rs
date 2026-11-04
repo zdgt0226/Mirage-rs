@@ -144,6 +144,34 @@ impl OutboundNode {
         }
     }
 
+    /// 标记节点/组有真实流量活动。Mirage 节点通知 pool; urltest / fallback / load_balance
+    /// 递归通知全部子节点 (选路要比较所有成员); selector 只走当前选择, 只标它。
+    pub fn mark_active(self: &Arc<Self>) {
+        match &**self {
+            Self::Mirage { pool, .. } => pool.mark_active(),
+            Self::Urltest { children, .. }
+            | Self::Fallback { children, .. }
+            | Self::LoadBalance { children, .. } => {
+                for child in children {
+                    child.mark_active();
+                }
+            }
+            Self::Selector { children, current, .. } => {
+                let chosen = current.read().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some(c) = chosen.or_else(|| children.first().cloned()) {
+                    c.mark_active();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 真实流量选路: 先标记活跃 (从空闲恢复时唤醒探测), 再选出实际叶子节点。
+    pub fn resolve_leaf_active(self: &Arc<Self>) -> Arc<OutboundNode> {
+        self.mark_active();
+        self.resolve_leaf()
+    }
+
     pub fn resolve_leaf(self: &Arc<Self>) -> Arc<OutboundNode> {
         match &**self {
             Self::Urltest { tag, children, tolerance_ms, test_type, current } => {
@@ -1366,5 +1394,46 @@ mod urltest_tests {
         // 当前节点为 a 且在容差内 (120 <= 80 + 50): 保护容差内的当前节点
         let g2 = urltest(vec![a.clone(), b.clone()], Some(a));
         assert_eq!(g2.resolve_leaf().tag(), "a");
+    }
+
+    /// urltest 组 mark_active 标全部成员, 嵌套递归; selector 只标当前选择。
+    #[tokio::test]
+    async fn mark_active_updates_all_children_and_nested() {
+        let a = mirage("a");
+        let b = mirage("b");
+        let c = mirage("c");
+
+        let pool_a = match a.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        let pool_b = match b.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        let pool_c = match c.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+
+        pool_a.last_active.store(0, std::sync::atomic::Ordering::Relaxed);
+        pool_b.last_active.store(0, std::sync::atomic::Ordering::Relaxed);
+        pool_c.last_active.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // 稍微等待确保 now_ms() > 0
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let sub_group = urltest(vec![a.clone(), b.clone()], None);
+        let top_group = Arc::new(OutboundNode::Selector {
+            tag: "select".into(),
+            children: vec![sub_group.clone(), c.clone()],
+            current: Arc::new(RwLock::new(None)),
+        });
+
+        // selector 未选择时走第一个成员 (sub_group): a/b 都标, c 不标
+        top_group.mark_active();
+        assert!(pool_a.last_active.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(pool_b.last_active.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(pool_c.last_active.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // 切到 c 后只标 c
+        pool_a.last_active.store(0, std::sync::atomic::Ordering::Relaxed);
+        if let OutboundNode::Selector { current, .. } = top_group.as_ref() {
+            *current.write().unwrap() = Some(c.clone());
+        }
+        top_group.mark_active();
+        assert_eq!(pool_a.last_active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(pool_c.last_active.load(std::sync::atomic::Ordering::Relaxed) > 0);
     }
 }

@@ -93,11 +93,39 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
         sleep(Duration::from_secs(2)).await;
 
         let mut is_probe_round = false;
+        let mut paused = false;
         loop {
             let Some(node) = node.upgrade() else {
                 break;
             };
             if let OutboundNode::Mirage { pool, tag, .. } = &*node {
+                if pool.is_idle() {
+                    if !paused {
+                        debug!(
+                            "HealthCheck [{}] 组空闲 {}s, 暂停探测",
+                            tag,
+                            crate::proxy::pool::GROUP_IDLE_PAUSE.as_secs()
+                        );
+                        paused = true;
+                    }
+                    let notify = pool.probe_notify();
+                    drop(node);
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(interval)) => {
+                            is_probe_round = false;
+                        }
+                        _ = notify.notified() => {
+                            is_probe_round = true;
+                        }
+                    }
+                    continue;
+                }
+
+                if paused {
+                    debug!("HealthCheck [{}] 有流量, 恢复探测", tag);
+                    paused = false;
+                }
+
                 let start = Instant::now();
                 
                 // Parse target from url

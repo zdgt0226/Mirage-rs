@@ -529,7 +529,7 @@ async fn setup_flow(
         }
     };
     // leaf 是独立 Arc (不借 snapshot)。提取路由类型, Mirage 需要 pool。
-    let leaf = outbound.resolve_leaf();
+    let leaf = outbound.resolve_leaf_active();
     enum Route {
         Direct,
         Mirage(Arc<crate::proxy::pool::WarmPool>),
