@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.5-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.6-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -365,9 +365,9 @@ mirage-rs config -c config.json
 - [x] **性能调优与架构**: Cipher agility 自动协商硬件加速 AES-256-GCM（`tuning.cipher_agility`）；UDP 多路复用 (`tuning.udp_mux` 突破并发带机量瓶颈)；IPv6 隧道传输支持；隧道 relay 缓冲调优 (上行 64KB buf + greedy `try_read`)。
 - [x] **运维工具与看板**: Web 看板 Mirage Console（双主题、中英双语、分角色视图、可视化规则编辑）；配置工具链 (`check` / `format` / `import` / `test` / `config`)；Geo 规则自动更新与热重载；CI 确定性回归哨兵；cosign keyless 供应链签名与多架构容器镜像。
 - [x] **节点健康判定迟滞 (v0.17.2, 参考 honk)**: 连续失败 3 次判死, 判死后连续成功 2 次才恢复; 网络变化时取消退避立即重建, 判死节点成功 1 次即恢复; urltest 不再黏在已判死的当前节点上。
-- [x] **urltest 真实连接失败降级 (参考 honk)**: 跨 3 个不同目标真实连接失败 (0 字节且对端异常结束) 时罚分 300s, 连续成功 2 次清除罚分; urltest 优先选未罚分节点且被罚分节点不享受迟滞保护, 全部罚分时回退按延迟选; 罚分不判死不影响其他出站。
-- [x] **urltest 连续明显变慢触发补测 (参考 honk)**: 真实 TCP 连接首字节耗时超过 max(4×中位延迟, 中位+1500ms) 跨 3 个不同目标触发立即补测 (同节点 60s 冷却); 补测确认变慢则 300s 内按 max(中位, 补测延迟) 参与 urltest 选路, 普通探测恢复正常提前解除; 健康检查 interval=0 时不生效。
-- [x] **出站组空闲暂停探测 (参考 honk)**: 出站组 (urltest / fallback / load_balance) 成员节点 1800s 内无真实流量 (TCP / UDP / 经隧道的 DNS) 时暂停周期探测, 省流量并减少固定周期探测特征; 有流量立即补测恢复; selector 只算当前选中的成员; 控制台 /api/proxies 轮询不算活动; 暂停期间节点健康状态与延迟样本保持原样。
+- [x] **urltest 真实连接失败降级 (v0.17.6, 参考 honk)**: 跨 3 个不同目标真实连接失败 (0 字节且对端异常结束) 时罚分 300s, 连续成功 2 次清除罚分; urltest 优先选未罚分节点且被罚分节点不享受迟滞保护, 全部罚分时回退按延迟选; 罚分不判死不影响其他出站。
+- [x] **urltest 连续明显变慢触发补测 (v0.17.6, 参考 honk)**: 真实 TCP 连接首字节耗时超过 max(4×中位延迟, 中位+1500ms) 跨 3 个不同目标触发立即补测 (同节点 60s 冷却); 补测确认变慢则 300s 内按 max(中位, 补测延迟) 参与 urltest 选路, 普通探测恢复正常提前解除; 健康检查 interval=0 时不生效。
+- [x] **出站组空闲暂停探测 (v0.17.6, 参考 honk)**: 出站组 (urltest / fallback / load_balance) 成员节点 1800s 内无真实流量 (TCP / UDP / 经隧道的 DNS) 时暂停周期探测, 省流量并减少固定周期探测特征; 有流量立即补测恢复; selector 只算当前选中的成员; 控制台 /api/proxies 轮询不算活动; 暂停期间节点健康状态与延迟样本保持原样。
 - [x] **DNS 过期缓存兜底与负缓存 (v0.17.4~v0.17.5, 参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s), 上游 1.8s 未返回时先回旧答案并后台刷新; NXDOMAIN / 空答复按 SOA 缓存 (≤300s); 上游失败后 30s 内直接回旧答案; 临期 (剩余 ≤10% TTL) 命中时后台预刷新。
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
 
@@ -411,6 +411,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.6** | 2026-11-04 | **无协议变更**: urltest 节点跨 3 个不同目标真实连接失败时降级 300s (只影响 urltest 排序, 不判死); 真实连接首字节连续明显变慢时立即补测, 确认变慢则 300s 内按补测延迟选路; 出站组成员 1800s 无真实流量时暂停健康探测, 有流量立即恢复。 |
 | **v0.17.5** | 2026-11-04 | **无协议变更**: DNS 缓存开启时, 上游 1.8s 未返回先回 1 小时内的过期答案并后台刷新; 上游失败后 30s 内直接回旧答案不再重查; 临期 (剩余 ≤10% TTL) 条目命中时后台预刷新。 |
 | **v0.17.4** | 2026-11-03 | **无协议变更**: 开启 DNS 缓存时, 上游无响应 / SERVFAIL 返回 1 小时内过期的旧答案 (TTL 30s); NXDOMAIN / 空答复按 SOA 负缓存 (≤300s); 缓存按解析路径 (国内 / 隧道) 隔离, 规则切换后不再拿到另一路径的答案。 |
 | **v0.17.3** | 2026-11-03 | **无协议变更**: urltest / fallback / load_balance 组健康检查间隔默认 300s 改为 60s, 节点空闲时挂掉最坏判死时间从 15 分钟缩到 3 分钟; 显式配置的 `interval` 不受影响。 |
