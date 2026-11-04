@@ -111,7 +111,7 @@ pub async fn handle_udp_associate_routed(
             // ── 取或建该出站的 sink ──
             if !sinks.contains_key(&tag) {
                 let node = match snap.outbounds.get(&tag) {
-                    Some(o) => o.resolve_leaf(),
+                    Some(o) => o.resolve_leaf_active(),
                     None => {
                         warn!("[SOCKS-UDP] 出站 [{}] 不存在, 丢弃", tag);
                         continue;

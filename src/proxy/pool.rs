@@ -5,6 +5,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
@@ -80,6 +81,18 @@ pub const SLOW_TRIGGER_COUNT: u32 = 3;
 pub const PROBE_TRIGGER_COOLDOWN: Duration = Duration::from_secs(60);
 /// 补测确认变慢后延迟下限的有效期 (期间普通探测恢复正常则提前解除)。
 pub const SLOW_FLOOR_DURATION: Duration = Duration::from_secs(300);
+pub const GROUP_IDLE_PAUSE: Duration = Duration::from_secs(1800);
+
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    let epoch = EPOCH.get_or_init(Instant::now);
+    Instant::now().saturating_duration_since(*epoch).as_millis() as u64
+}
+
+pub fn idle_elapsed(last_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) >= GROUP_IDLE_PAUSE.as_millis() as u64
+}
 
 /// 补测确认变慢后的延迟下限: urltest 看到的延迟取 max(中位, rtt)。
 /// 不直接改样本: 暖池每建一条隧道都记一个握手样本, 服务端出口慢时握手照样快, 中位很快被拉回。
@@ -649,6 +662,7 @@ pub struct WarmPool {
     cfg: Arc<PoolConfig>,                     // 保留 config (transport/password/quic_sni 等, 供 Model X)
     shutdown: Arc<AtomicBool>,                // 停机标志位 (Drop / 关闭时优雅停止后台协程)
     net_shutdown_notify: Arc<Notify>,         // 专用网络变更 watcher 停机通知 (不与 notify 混用)
+    pub last_active: AtomicU64,               // 上次活动时刻 (毫秒, 进程内相对 EPOCH)
     // Model X: transport=quic 时的共享 QUIC mux。connect() 直接在其上开精简流 (绕过 fake-TLS Tunnel)。
     #[cfg(feature = "quic")]
     quic_mux: Option<Arc<crate::proxy::quic::QuicMux>>,
@@ -711,6 +725,22 @@ impl WarmPool {
     /// 唤醒健康检查任务立即执行一次补测。
     pub fn trigger_probe(&self) {
         self.probe_notify.notify_one();
+    }
+
+    /// 标记节点发生真实流量活动。若旧值距今 ≥ GROUP_IDLE_PAUSE (刚从空闲恢复),
+    /// 触发立即探测并打印日志。
+    pub fn mark_active(&self) {
+        let now = now_ms();
+        let old = self.last_active.swap(now, Ordering::Relaxed);
+        if idle_elapsed(old, now) {
+            debug!("WarmPool: 从空闲恢复活动, 触发立即探测");
+            self.trigger_probe();
+        }
+    }
+
+    /// 是否空闲 (距上次活动 ≥ GROUP_IDLE_PAUSE)。
+    pub fn is_idle(&self) -> bool {
+        idle_elapsed(self.last_active.load(Ordering::Relaxed), now_ms())
     }
 
     /// 获取补测通知器的 Arc 克隆。
@@ -783,6 +813,7 @@ impl WarmPool {
             cfg: cfg.clone(),
             shutdown: shutdown.clone(),
             net_shutdown_notify: net_shutdown_notify.clone(),
+            last_active: AtomicU64::new(now_ms()),
             #[cfg(feature = "quic")]
             quic_mux: quic_mux.clone(),
         };
@@ -2180,5 +2211,24 @@ mod backoff_tests {
         assert_eq!(stats.slow_floor, None);
         // last_probe_trigger 不清
         assert_eq!(stats.last_probe_trigger, Some(now));
+    }
+
+    #[test]
+    fn test_idle_elapsed_boundaries() {
+        let base = 10_000_000u64;
+        // 差 1799999ms -> false
+        assert!(!idle_elapsed(base, base + 1_799_999));
+        // 差 1800000ms -> true
+        assert!(idle_elapsed(base, base + 1_800_000));
+        // 差 1800001ms -> true
+        assert!(idle_elapsed(base, base + 1_800_001));
+        // last > now -> false
+        assert!(!idle_elapsed(base + 100, base));
+    }
+
+    #[tokio::test]
+    async fn test_new_warm_pool_is_not_idle() {
+        let pool = WarmPool::new(test_pool_config(), test_brutal_state());
+        assert!(!pool.is_idle());
     }
 }

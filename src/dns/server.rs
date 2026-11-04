@@ -1640,7 +1640,7 @@ impl DnsForwarder {
                         DnsServer::Remote => st
                             .outbounds
                             .get(st.router.default_outbound())
-                            .map(|n| n.resolve_leaf())
+                            .map(|n| n.resolve_leaf_active())
                             .and_then(|n| match &*n {
                                 OutboundNode::Mirage { pool, .. } => Some(pool.clone()),
                                 _ => None,
@@ -1739,7 +1739,7 @@ impl DnsForwarder {
             if let Some(ac) = st.auto_classify.clone() {
                 // 后台交叉校验 (verify_async) 需一条隧道: 抓 default 出站解析出的叶子 (drop(st) 前)。
                 let verify_leaf = if ac.verify_async {
-                    st.outbounds.get(st.router.default_outbound()).map(|n| n.resolve_leaf())
+                    st.outbounds.get(st.router.default_outbound()).map(|n| n.resolve_leaf_active())
                 } else {
                     None
                 };
@@ -1803,7 +1803,7 @@ impl DnsForwarder {
 
         // 命中规则用其出站; 未命中且 auto_classify 关 → 回落 default_outbound (原行为)。
         let action = matched.unwrap_or_else(|| st.router.default_outbound().to_string());
-        let node = st.outbounds.get(action.as_str()).map(|n| n.resolve_leaf());
+        let node = st.outbounds.get(action.as_str()).map(|n| n.resolve_leaf_active());
         drop(st);
 
         if let Some(n) = node {

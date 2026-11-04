@@ -297,7 +297,7 @@ pub async fn proxy_tcp_target(
         }
     };
 
-    let leaf = outbound.resolve_leaf();
+    let leaf = outbound.resolve_leaf_active();
     drop(current_state);
     match &*leaf {
         OutboundNode::Mirage { tag: node_tag, pool, .. } => {
