@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.6-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.7-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -380,8 +380,8 @@ mirage-rs config -c config.json
 - [x] **出站组空闲暂停探测 (v0.17.6, 参考 honk)**: 出站组 (urltest / fallback / load_balance) 成员节点 1800s 内无真实流量 (TCP / UDP / 经隧道的 DNS) 时暂停周期探测, 省流量并减少固定周期探测特征; 有流量立即补测恢复; selector 只算当前选中的成员; 控制台 /api/proxies 轮询不算活动; 暂停期间节点健康状态与延迟样本保持原样。
 - [x] **DNS 过期缓存兜底与负缓存 (v0.17.4~v0.17.5, 参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s), 上游 1.8s 未返回时先回旧答案并后台刷新; NXDOMAIN / 空答复按 SOA 缓存 (≤300s); 上游失败后 30s 内直接回旧答案; 临期 (剩余 ≤10% TTL) 命中时后台预刷新。
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
-- [x] **出站组按节点名过滤 (参考 dae)**: 出站组 (`urltest` / `fallback` / `selector` / `load_balance`) 新增可选 `filter` 正则过滤, 自动把名字匹配的叶子代理节点动态加入组成员; 支持显式与 filter 混合保序去重, 非法正则 check 报错且运行时告警降级, 展开结果不写回配置。
-- [x] **TCP relay 半关闭收尾超时 (参考 honk)**: WG / SS 出站与 SS 入站原无任何超时 (对端不关即永久泄漏), 现整体空闲超时同 `relay_idle` (默认 1800s), 一方向结束后传递 FIN, 剩余方向连续 30s 无字节进展即关, 有数据流动不受影响。
+- [x] **出站组按节点名过滤 (v0.17.7, 参考 dae)**: 出站组 (`urltest` / `fallback` / `selector` / `load_balance`) 新增可选 `filter` 正则过滤, 自动把名字匹配的叶子代理节点动态加入组成员; 支持显式与 filter 混合保序去重, 非法正则 check 报错且运行时告警降级, 展开结果不写回配置。
+- [x] **TCP relay 半关闭收尾超时 (v0.17.7, 参考 honk)**: WG / SS 出站与 SS 入站原无任何超时 (对端不关即永久泄漏), 现整体空闲超时同 `relay_idle` (默认 1800s), 一方向结束后传递 FIN, 剩余方向连续 30s 无字节进展即关, 有数据流动不受影响。
 
 ### 🚧 进行中 / 部分完成
 
@@ -426,6 +426,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.7** | 2026-11-05 | **无协议变更**: 出站组新增 `filter` 正则, 按节点名自动加入成员 (可省略 `outbounds`); WG / SS 出站与 SS 入站 TCP 转发补上超时 (原对端不关即永久占用), 一方向结束后剩余方向 30s 无数据即关。 |
 | **v0.17.6** | 2026-11-04 | **无协议变更**: urltest 节点跨 3 个不同目标真实连接失败时降级 300s (只影响 urltest 排序, 不判死); 真实连接首字节连续明显变慢时立即补测, 确认变慢则 300s 内按补测延迟选路; 出站组成员 1800s 无真实流量时暂停健康探测, 有流量立即恢复。 |
 | **v0.17.5** | 2026-11-04 | **无协议变更**: DNS 缓存开启时, 上游 1.8s 未返回先回 1 小时内的过期答案并后台刷新; 上游失败后 30s 内直接回旧答案不再重查; 临期 (剩余 ≤10% TTL) 条目命中时后台预刷新。 |
 | **v0.17.4** | 2026-11-03 | **无协议变更**: 开启 DNS 缓存时, 上游无响应 / SERVFAIL 返回 1 小时内过期的旧答案 (TTL 30s); NXDOMAIN / 空答复按 SOA 负缓存 (≤300s); 缓存按解析路径 (国内 / 隧道) 隔离, 规则切换后不再拿到另一路径的答案。 |
