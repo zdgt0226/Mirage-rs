@@ -332,6 +332,16 @@ mirage-rs config -c config.json
 > **默认出站与出站组**:
 > - **默认出站 (Default Outbound)**: 若未显式配置 `routing.default_outbound`，系统统一推导并采用 `outbounds` 列表的第一项作为默认出站；若 `outbounds` 亦未配置，则回退为 `"direct"`。亦可在 `routing` 中手动显式指定。
 > - **出站组类型**: 支持 `urltest` (低延迟自动优选)、`fallback` (故障转移)、`selector` (手动指定)、`load_balance` (轮询负载均衡)。`test` 与 `--group` 建组会读取 `geoip.dat` 校验节点地域并在混杂时发出告警。
+> - **节点名正则过滤 (filter)**: 四种出站组均支持可选 `filter` 正则字符串（参考 dae），自动将名字匹配的叶子代理节点（Mirage / Wireguard / Shadowsocks）纳入组成员，支持与显式 `outbounds` 合并去重（有 `filter` 时可省略 `outbounds`）。例如 `"filter": "(?i)jp|日本"` 自动聚合所有日本节点：
+>   ```json
+>   {
+>     "type": "urltest",
+>     "tag": "auto-jp",
+>     "filter": "(?i)jp|日本",
+>     "interval": 60,
+>     "tolerance": 50
+>   }
+>   ```
 > - **出站组智能调整**: 当节点数 ≥ 2 时，CLI 导入（`import` / `subscribe` / `config`）会自动引导出站组配置（支持终端复选框交互：空格勾选、上下键切换、回车确认，非 TTY 环境退回行输入）。新建出站组自动置于 `outbounds` 首位作为默认出口。
 > - **Selector 选择持久化**: 通过 API (`POST /api/proxies/select`) 手动切换的 selector 节点自动持久化至状态文件（权限 0600 原子写入，默认 `selector_state_client.json` 与统计文件同目录，可由 `tuning.selector_persist_path` 自定义），服务重启后自动恢复；配置热重载本就保留出站与当前选择。新增节点 / 出站组需重启生效，热重载会拒绝引用运行中不存在出站的路由并提示重启。
 
@@ -370,6 +380,7 @@ mirage-rs config -c config.json
 - [x] **出站组空闲暂停探测 (v0.17.6, 参考 honk)**: 出站组 (urltest / fallback / load_balance) 成员节点 1800s 内无真实流量 (TCP / UDP / 经隧道的 DNS) 时暂停周期探测, 省流量并减少固定周期探测特征; 有流量立即补测恢复; selector 只算当前选中的成员; 控制台 /api/proxies 轮询不算活动; 暂停期间节点健康状态与延迟样本保持原样。
 - [x] **DNS 过期缓存兜底与负缓存 (v0.17.4~v0.17.5, 参考 honk)**: 开启 DNS 缓存时, 上游失败 (无响应 / SERVFAIL) 返回 1 小时内过期的旧答案 (TTL 30s), 上游 1.8s 未返回时先回旧答案并后台刷新; NXDOMAIN / 空答复按 SOA 缓存 (≤300s); 上游失败后 30s 内直接回旧答案; 临期 (剩余 ≤10% TTL) 命中时后台预刷新。
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
+- [x] **出站组按节点名过滤 (参考 dae)**: 出站组 (`urltest` / `fallback` / `selector` / `load_balance`) 新增可选 `filter` 正则过滤, 自动把名字匹配的叶子代理节点动态加入组成员; 支持显式与 filter 混合保序去重, 非法正则 check 报错且运行时告警降级, 展开结果不写回配置。
 
 ### 🚧 进行中 / 部分完成
 

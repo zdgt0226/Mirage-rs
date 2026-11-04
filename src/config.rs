@@ -705,7 +705,10 @@ pub enum OutboundConfig {
     },
     Urltest {
         tag: String,
+        #[serde(default)]
         outbounds: Vec<String>,
+        #[serde(default)]
+        filter: Option<String>,
         #[serde(default = "default_probe_url")]
         url: String,
         #[serde(default = "default_urltest_interval")]
@@ -717,7 +720,10 @@ pub enum OutboundConfig {
     },
     Fallback {
         tag: String,
+        #[serde(default)]
         outbounds: Vec<String>,
+        #[serde(default)]
+        filter: Option<String>,
         #[serde(default = "default_probe_url")]
         url: String,
         #[serde(default = "default_urltest_interval")]
@@ -725,14 +731,20 @@ pub enum OutboundConfig {
     },
     Selector {
         tag: String,
+        #[serde(default)]
         outbounds: Vec<String>,
+        #[serde(default)]
+        filter: Option<String>,
     },
     /// 负载均衡组: 把连接**分摊**到多个健康成员 (与 urltest 选最优不同)。
     /// v1 仅 `round-robin` (每连接轮流)。健康检查同 urltest (url + interval)。
     /// type = `load_balance`。
     LoadBalance {
         tag: String,
+        #[serde(default)]
         outbounds: Vec<String>,
+        #[serde(default)]
+        filter: Option<String>,
         /// 分摊策略。v1 只支持 `round-robin`; 其它值在 check/启动时报错 (留给后续
         /// consistent-hash 等作显式扩展, 不静默降级)。
         #[serde(default = "default_lb_strategy")]
@@ -759,6 +771,61 @@ impl OutboundConfig {
             | Self::Selector { tag, .. }
             | Self::LoadBalance { tag, .. } => tag.as_str(),
         }
+    }
+
+    pub fn filter(&self) -> Option<&str> {
+        match self {
+            Self::Urltest { filter, .. }
+            | Self::Fallback { filter, .. }
+            | Self::Selector { filter, .. }
+            | Self::LoadBalance { filter, .. } => filter.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn explicit_outbounds(&self) -> &[String] {
+        match self {
+            Self::Urltest { outbounds, .. }
+            | Self::Fallback { outbounds, .. }
+            | Self::Selector { outbounds, .. }
+            | Self::LoadBalance { outbounds, .. } => outbounds.as_slice(),
+            _ => &[],
+        }
+    }
+
+    /// 获取出站组的实际成员列表 (非组变体返回空 Vec):
+    /// - 结果 = 显式 `outbounds` (保持原顺序) + 按 `all` 的声明顺序追加 tag 匹配 `filter` 的出站。
+    /// - 只匹配叶子代理节点: Mirage / Wireguard / Shadowsocks。不匹配 Direct / Block / 其它组。
+    /// - 去重 (已在显式列表里的不再追加); 永远不包含组自己的 tag。
+    /// - 正则编译失败返回 Err (带组 tag 与正则原文)。区分大小写按正则原样, 用户可写 `(?i)`。
+    pub fn group_members(&self, all: &[OutboundConfig]) -> anyhow::Result<Vec<String>> {
+        let (tag, explicit_outbounds, filter, kind) = match self {
+            Self::Urltest { tag, outbounds, filter, .. } => (tag.as_str(), outbounds, filter, "urltest"),
+            Self::Fallback { tag, outbounds, filter, .. } => (tag.as_str(), outbounds, filter, "fallback"),
+            Self::Selector { tag, outbounds, filter, .. } => (tag.as_str(), outbounds, filter, "selector"),
+            Self::LoadBalance { tag, outbounds, filter, .. } => (tag.as_str(), outbounds, filter, "load_balance"),
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut result = explicit_outbounds.clone();
+        if let Some(pattern) = filter {
+            let re = regex::Regex::new(pattern).map_err(|e| {
+                anyhow::anyhow!("{kind} `{tag}` 的 filter `{pattern}` 不是合法正则: {e}")
+            })?;
+            for cand in all {
+                let cand_tag = cand.tag();
+                if cand_tag == tag {
+                    continue;
+                }
+                if matches!(cand, Self::Mirage { .. } | Self::Wireguard { .. } | Self::Shadowsocks { .. })
+                    && re.is_match(cand_tag)
+                    && !result.iter().any(|t| t == cand_tag)
+                {
+                    result.push(cand_tag.to_string());
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -854,34 +921,38 @@ impl std::fmt::Debug for OutboundConfig {
             }
             Self::Direct { tag } => f.debug_struct("Direct").field("tag", tag).finish(),
             Self::Block { tag } => f.debug_struct("Block").field("tag", tag).finish(),
-            Self::Urltest { tag, outbounds, url, interval, tolerance, test_type } => {
+            Self::Urltest { tag, outbounds, filter, url, interval, tolerance, test_type } => {
                 f.debug_struct("Urltest")
                     .field("tag", tag)
                     .field("outbounds", outbounds)
+                    .field("filter", filter)
                     .field("url", url)
                     .field("interval", interval)
                     .field("tolerance", tolerance)
                     .field("test_type", test_type)
                     .finish()
             }
-            Self::Fallback { tag, outbounds, url, interval } => {
+            Self::Fallback { tag, outbounds, filter, url, interval } => {
                 f.debug_struct("Fallback")
                     .field("tag", tag)
                     .field("outbounds", outbounds)
+                    .field("filter", filter)
                     .field("url", url)
                     .field("interval", interval)
                     .finish()
             }
-            Self::Selector { tag, outbounds } => {
+            Self::Selector { tag, outbounds, filter } => {
                 f.debug_struct("Selector")
                     .field("tag", tag)
                     .field("outbounds", outbounds)
+                    .field("filter", filter)
                     .finish()
             }
-            Self::LoadBalance { tag, outbounds, strategy, url, interval } => {
+            Self::LoadBalance { tag, outbounds, filter, strategy, url, interval } => {
                 f.debug_struct("LoadBalance")
                     .field("tag", tag)
                     .field("outbounds", outbounds)
+                    .field("filter", filter)
                     .field("strategy", strategy)
                     .field("url", url)
                     .field("interval", interval)
@@ -2015,31 +2086,42 @@ impl Config {
 
         // 出站组的成员必须存在, 且组不能为空
         for ob in &self.outbounds {
-            let (tag, children, kind) = match ob {
-                OutboundConfig::Urltest { tag, outbounds, .. } => (tag, outbounds, "urltest"),
-                OutboundConfig::Fallback { tag, outbounds, .. } => (tag, outbounds, "fallback"),
-                OutboundConfig::Selector { tag, outbounds, .. } => (tag, outbounds, "selector"),
-                OutboundConfig::LoadBalance { tag, outbounds, strategy, .. } => {
+            let (tag, kind) = match ob {
+                OutboundConfig::Urltest { tag, .. } => (tag.as_str(), "urltest"),
+                OutboundConfig::Fallback { tag, .. } => (tag.as_str(), "fallback"),
+                OutboundConfig::Selector { tag, .. } => (tag.as_str(), "selector"),
+                OutboundConfig::LoadBalance { tag, strategy, .. } => {
                     // v1 只支持 round-robin, 别的策略明确报错 (不静默降级)。
                     if strategy != "round-robin" {
                         issues.push(format!(
                             "load_balance `{tag}` 的 strategy `{strategy}` 暂不支持 (v1 仅 round-robin)"
                         ));
                     }
-                    (tag, outbounds, "load_balance")
+                    (tag.as_str(), "load_balance")
                 }
                 _ => continue,
             };
-            if children.is_empty() {
-                issues.push(format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用)"));
-            }
-            for child in children {
-                if !known(child) {
-                    issues.push(format!("{kind} `{tag}` 引用了不存在的成员 `{child}`"));
+            match ob.group_members(&self.outbounds) {
+                Ok(children) => {
+                    if children.is_empty() {
+                        if ob.filter().is_some() {
+                            issues.push(format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用) (filter 未匹配到任何节点)"));
+                        } else {
+                            issues.push(format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用)"));
+                        }
+                    }
+                    for child in &children {
+                        if !known(child) {
+                            issues.push(format!("{kind} `{tag}` 引用了不存在的成员 `{child}`"));
+                        }
+                    }
+                    if children.iter().any(|c| c == tag) {
+                        issues.push(format!("{kind} `{tag}` 把自己列为成员 (自引用)"));
+                    }
                 }
-            }
-            if children.iter().any(|c| c == tag) {
-                issues.push(format!("{kind} `{tag}` 把自己列为成员 (自引用)"));
+                Err(err) => {
+                    issues.push(err.to_string());
+                }
             }
         }
 
@@ -3633,6 +3715,146 @@ mod profile_tests {
             issues.iter().any(|i| i.contains("alice") && i.contains("限额配置与入站 `in1` 不一致")),
             "跨入站同名用户限额不一致应被提示: {issues:?}"
         );
+    }
+
+    #[test]
+    fn test_group_members_filter_and_explicit() {
+        let mirage_node = |tag: &str| -> OutboundConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "mirage",
+                "tag": tag,
+                "server": "203.0.113.10",
+                "server_port": 443,
+                "password": "testpassword",
+                "camouflage_host": "example.com"
+            })).unwrap()
+        };
+        let ss_node = |tag: &str| -> OutboundConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "shadowsocks",
+                "tag": tag,
+                "server": "203.0.113.11",
+                "server_port": 8388,
+                "method": "aes-256-gcm",
+                "password": "testpassword"
+            })).unwrap()
+        };
+        let wg_node = |tag: &str| -> OutboundConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "wireguard",
+                "tag": tag,
+                "private_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+                "peer_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+                "endpoint": "203.0.113.12:51820",
+                "address": "10.0.0.2"
+            })).unwrap()
+        };
+
+        let all = vec![
+            OutboundConfig::Direct { tag: "direct".into() },
+            OutboundConfig::Block { tag: "block".into() },
+            mirage_node("explicit_node"),
+            mirage_node("jp_tokyo_01"),
+            ss_node("JP_osaka_02"),
+            wg_node("jp_fukuoka_03"),
+            mirage_node("us_losangeles_01"),
+            OutboundConfig::Selector { tag: "other_group".into(), outbounds: vec![], filter: None },
+            mirage_node("my_group"),
+        ];
+
+        // 1. 显式 + filter 合并保序去重; 只匹配 Mirage/WG/SS 不匹配 Direct/Block/组; 不包含自己; (?i) 生效
+        let group = OutboundConfig::Urltest {
+            tag: "my_group".into(),
+            outbounds: vec!["explicit_node".into(), "jp_tokyo_01".into()],
+            filter: Some("(?i)jp".into()),
+            url: "http://example.com/generate_204".into(),
+            interval: 60,
+            tolerance: 50,
+            test_type: "ping".into(),
+        };
+
+        let members = group.group_members(&all).unwrap();
+        assert_eq!(
+            members,
+            vec!["explicit_node", "jp_tokyo_01", "JP_osaka_02", "jp_fukuoka_03"]
+        );
+
+        // 2. 非组变体返回空 Vec
+        let direct = OutboundConfig::Direct { tag: "direct".into() };
+        assert!(direct.group_members(&all).unwrap().is_empty());
+
+        // 3. 非法正则返回 Err 带组 tag 和正则原文
+        let bad_group = OutboundConfig::Selector {
+            tag: "bad_grp".into(),
+            outbounds: vec![],
+            filter: Some("[unclosed".into()),
+        };
+        let err = bad_group.group_members(&all).unwrap_err().to_string();
+        assert!(err.contains("bad_grp"), "err should contain tag: {err}");
+        assert!(err.contains("[unclosed"), "err should contain regex: {err}");
+
+        // 4. 只有 filter 无 outbounds 的 JSON 能正常反序列化
+        let json_filter_only = r#"{
+            "type": "urltest",
+            "tag": "auto_jp",
+            "filter": "(?i)jp"
+        }"#;
+        let parsed: OutboundConfig = serde_json::from_str(json_filter_only).expect("仅含 filter 应反序列化成功");
+        assert_eq!(parsed.tag(), "auto_jp");
+        assert_eq!(parsed.filter(), Some("(?i)jp"));
+        assert!(parsed.explicit_outbounds().is_empty());
+        let auto_members = parsed.group_members(&all).unwrap();
+        assert_eq!(auto_members, vec!["jp_tokyo_01", "JP_osaka_02", "jp_fukuoka_03"]);
+    }
+
+    #[test]
+    fn test_semantic_issues_with_group_filter() {
+        // 1. 非法正则报 issue
+        let bad_regex_cfg = r#"{
+            "inbounds": [],
+            "outbounds": [
+                { "type": "mirage", "tag": "jp-1", "server": "203.0.113.10", "server_port": 443, "password": "pass", "camouflage_host": "example.com" },
+                { "type": "urltest", "tag": "auto", "filter": "[abc" }
+            ],
+            "routing": { "default_outbound": "auto", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(bad_regex_cfg).unwrap();
+        assert!(
+            issues.iter().any(|i| i.contains("urltest `auto` 的 filter `[abc` 不是合法正则")),
+            "应报非法正则 issue: {issues:?}"
+        );
+
+        // 2. filter 无匹配且显式成员为空报 "为空 (filter 未匹配到任何节点)"
+        let no_match_cfg = r#"{
+            "inbounds": [],
+            "outbounds": [
+                { "type": "mirage", "tag": "us-1", "server": "203.0.113.10", "server_port": 443, "password": "pass", "camouflage_host": "example.com" },
+                { "type": "urltest", "tag": "auto", "filter": "jp.*" }
+            ],
+            "routing": { "default_outbound": "auto", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(no_match_cfg).unwrap();
+        assert!(
+            issues.iter().any(|i| i.contains("urltest `auto` 的 outbounds 为空 (该组不可用) (filter 未匹配到任何节点)")),
+            "应报无匹配且为空 issue: {issues:?}"
+        );
+
+        // 3. filter 匹配到的成员不再误报 "不存在"
+        let valid_filter_cfg = r#"{
+            "inbounds": [],
+            "outbounds": [
+                { "type": "mirage", "tag": "jp-1", "server": "203.0.113.10", "server_port": 443, "password": "pass", "camouflage_host": "example.com" },
+                { "type": "urltest", "tag": "auto", "filter": "jp.*" }
+            ],
+            "routing": { "default_outbound": "auto", "rules": [] }
+        }"#;
+        let (cfg_valid, issues_valid) = Config::parse_with_diagnostics(valid_filter_cfg).unwrap();
+        assert!(
+            issues_valid.is_empty(),
+            "合法 filter 匹配不应有任何 issue: {issues_valid:?}"
+        );
+        let members = cfg_valid.outbounds[1].group_members(&cfg_valid.outbounds).unwrap();
+        assert_eq!(members, vec!["jp-1"]);
     }
 }
 
