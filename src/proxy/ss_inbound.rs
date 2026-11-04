@@ -106,31 +106,102 @@ pub async fn handle_ss_client(
     }
 
     // 5. 双向 relay: 客户端(解密) ↔ 目标(明文)。
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::proxy::{idle_timeout, relay_idle, CopyResult, IdleClock, IdleElapsed, DRAIN_IDLE};
+
+    let clock = IdleClock::new();
+    let idle = relay_idle();
+    let up_progress = AtomicU64::new(0);
+    let down_progress = AtomicU64::new(0);
+
     let up = async {
-        loop {
-            match ssr.read_chunk().await {
-                Ok(b) if !b.is_empty() => {
-                    if out_w.write_all(&b).await.is_err() {
-                        break;
+        let res = idle_timeout(&clock, idle, async {
+            loop {
+                match ssr.read_chunk().await {
+                    Ok(b) if !b.is_empty() => {
+                        out_w.write_all(&b).await?;
+                        clock.touch();
+                        up_progress.fetch_add(b.len() as u64, Ordering::Relaxed);
                     }
+                    Ok(_) => break, // EOF
+                    Err(e) => return Err(e),
                 }
-                _ => break, // EOF / 错误
             }
+            out_w.flush().await?;
+            out_w.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        match res {
+            Ok(Ok(())) => CopyResult::Finished(up_progress.load(Ordering::Relaxed)),
+            Ok(Err(e)) => CopyResult::Err(e),
+            Err(IdleElapsed) => CopyResult::Idle,
         }
-        let _ = out_w.shutdown().await;
     };
+
     let down = async {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            match out_r.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if ssw.write_all(&buf[..n]).await.is_err() {
-                        break;
+        let res = idle_timeout(&clock, idle, async {
+            let mut buf = vec![0u8; 16384];
+            loop {
+                match out_r.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        ssw.write_all(&buf[..n]).await?;
+                        clock.touch();
+                        down_progress.fetch_add(n as u64, Ordering::Relaxed);
                     }
+                    Err(e) => return Err(e),
                 }
             }
+            // SsWriter 本身无 shutdown 方法, 取出底层写半程对其 shutdown, 向客户端传递半关闭 (FIN)。
+            let mut raw_w = ssw.into_inner();
+            raw_w.flush().await?;
+            raw_w.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        match res {
+            Ok(Ok(())) => CopyResult::Finished(down_progress.load(Ordering::Relaxed)),
+            Ok(Err(e)) => CopyResult::Err(e),
+            Err(IdleElapsed) => CopyResult::Idle,
         }
     };
-    tokio::join!(up, down);
+
+    tokio::pin!(up);
+    tokio::pin!(down);
+
+    tokio::select! {
+        r = &mut up => match r {
+            CopyResult::Err(e) => {
+                debug!("SS 入站 [{inbound_tag}] 上行出错: {e}");
+            }
+            CopyResult::Idle => {
+                debug!("SS 入站 [{inbound_tag}] relay 空闲超时 ({}s)", idle.as_secs_f64());
+            }
+            CopyResult::Finished(up_n) => {
+                if let Err(e) = crate::proxy::drain_wait(&mut down, &down_progress, DRAIN_IDLE).await {
+                    debug!("SS 入站 [{inbound_tag}] 下行排空出错: {e}");
+                }
+                let down_n = down_progress.load(Ordering::Relaxed);
+                debug!("SS 入站 [{inbound_tag}] relay 完成 (↑{up_n} ↓{down_n})");
+            }
+        },
+        r = &mut down => match r {
+            CopyResult::Err(e) => {
+                debug!("SS 入站 [{inbound_tag}] 下行出错: {e}");
+            }
+            CopyResult::Idle => {
+                debug!("SS 入站 [{inbound_tag}] relay 空闲超时 ({}s)", idle.as_secs_f64());
+            }
+            CopyResult::Finished(down_n) => {
+                if let Err(e) = crate::proxy::drain_wait(&mut up, &up_progress, DRAIN_IDLE).await {
+                    debug!("SS 入站 [{inbound_tag}] 上行排空出错: {e}");
+                }
+                let up_n = up_progress.load(Ordering::Relaxed);
+                debug!("SS 入站 [{inbound_tag}] relay 完成 (↑{up_n} ↓{down_n})");
+            }
+        },
+    }
 }
