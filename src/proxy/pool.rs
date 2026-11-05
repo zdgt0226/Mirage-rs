@@ -85,7 +85,7 @@ pub const GROUP_IDLE_PAUSE: Duration = Duration::from_secs(1800);
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     let epoch = EPOCH.get_or_init(Instant::now);
     Instant::now().saturating_duration_since(*epoch).as_millis() as u64
 }
@@ -748,13 +748,16 @@ impl WarmPool {
 
     /// 标记节点发生真实流量活动。若旧值距今 ≥ GROUP_IDLE_PAUSE (刚从空闲恢复),
     /// 触发立即探测并打印日志。
-    pub fn mark_active(&self) {
-        let now = now_ms();
+    pub fn mark_active_at(&self, now: u64) {
         let old = self.last_active.swap(now, Ordering::Relaxed);
         if idle_elapsed(old, now) {
             debug!("WarmPool: 从空闲恢复活动, 触发立即探测");
             self.trigger_probe();
         }
+    }
+
+    pub fn mark_active(&self) {
+        self.mark_active_at(now_ms());
     }
 
     /// 是否空闲 (距上次活动 ≥ GROUP_IDLE_PAUSE)。

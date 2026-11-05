@@ -271,6 +271,74 @@ pub(crate) async fn idle_timeout<F: std::future::Future>(
     }
 }
 
+/// 一条 relay 某方向"已结束"的信号: drain 守望方据此把超时从 idle 收紧到 drain。
+/// `set` 同时唤醒正在等待的 `idle_timeout_drain`, 对侧未结束时等待方不做周期轮询 (零额外唤醒)。
+pub(crate) struct PeerDone {
+    done: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl PeerDone {
+    pub(crate) fn new() -> Self {
+        Self { done: std::sync::atomic::AtomicBool::new(false), notify: tokio::sync::Notify::new() }
+    }
+
+    pub(crate) fn set(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.done.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// 同 `idle_timeout`, 另加 drain: 对侧方向已结束 (`peer` 已 set) 后, 共享 clock 连续 `drain`
+/// 无进展即返回 Err。对侧结束时应先 `clock.touch()` 再 `set`, 使 drain 从结束那刻起算。
+/// 对侧未结束时只按 `idle` 睡眠, 并在 `peer.set()` 时被唤醒重算 (不做周期轮询)。
+pub(crate) async fn idle_timeout_drain<F: std::future::Future>(
+    clock: &IdleClock,
+    idle: std::time::Duration,
+    drain: std::time::Duration,
+    peer: &PeerDone,
+    fut: F,
+) -> Result<F::Output, IdleElapsed> {
+    tokio::pin!(fut);
+    loop {
+        // 先登记唤醒再读标志, 避免 set 落在两者之间丢唤醒 (notify_waiters 不存许可)。
+        let notified = peer.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let peer_done = peer.is_set();
+        let limit = if peer_done { drain.min(idle) } else { idle };
+        let remaining = match limit.checked_sub(clock.elapsed_since_active()) {
+            Some(rem) if !rem.is_zero() => rem,
+            // 到期前再 poll 一次 (同 idle_timeout)
+            _ => {
+                return tokio::select! {
+                    biased;
+                    res = &mut fut => Ok(res),
+                    _ = std::future::ready(()) => Err(IdleElapsed),
+                };
+            }
+        };
+        if peer_done {
+            tokio::select! {
+                biased;
+                res = &mut fut => return Ok(res),
+                _ = tokio::time::sleep(remaining) => {}
+            }
+        } else {
+            tokio::select! {
+                biased;
+                res = &mut fut => return Ok(res),
+                _ = tokio::time::sleep(remaining) => {}
+                _ = &mut notified => {}
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +616,119 @@ mod tests {
         let (up, down) = relay.await.unwrap().unwrap();
         assert_eq!(up, b"half close test".len() as u64);
         assert_eq!(down, b"ack".len() as u64);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timeout_drain_peer_not_done_times_out_on_idle() {
+        let clock = IdleClock::new();
+        let peer_done = PeerDone::new();
+        let idle = Duration::from_secs(10);
+        let drain = Duration::from_secs(2);
+
+        let fut = async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            42
+        };
+
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(15),
+            idle_timeout_drain(&clock, idle, drain, &peer_done, fut),
+        )
+        .await
+        .expect("不应挂起");
+        let elapsed = start.elapsed();
+
+        assert_eq!(res, Err(IdleElapsed));
+        assert_eq!(elapsed, idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timeout_drain_peer_done_sustained_touch() {
+        let clock = Arc::new(IdleClock::new());
+        let peer_done = PeerDone::new();
+        peer_done.set();
+        let idle = Duration::from_secs(20);
+        let drain = Duration::from_secs(1);
+        let other_clock = clock.clone();
+
+        // 持续 touch (每 100ms), 超过 3*drain (3s), 持续 3.5s
+        tokio::spawn(async move {
+            for _ in 0..35 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                other_clock.touch();
+            }
+        });
+
+        let fut = async {
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            42
+        };
+
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            idle_timeout_drain(&clock, idle, drain, &peer_done, fut),
+        )
+        .await
+        .expect("不应挂起");
+        let elapsed = start.elapsed();
+
+        assert_eq!(res, Ok(42));
+        assert_eq!(elapsed, Duration::from_millis(3500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timeout_drain_peer_done_drain_timeout() {
+        let clock = IdleClock::new();
+        let peer_done = PeerDone::new();
+        peer_done.set();
+        let idle = Duration::from_secs(20);
+        let drain = Duration::from_secs(2);
+
+        let fut = async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            42
+        };
+
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            idle_timeout_drain(&clock, idle, drain, &peer_done, fut),
+        )
+        .await
+        .expect("不应挂起");
+        let elapsed = start.elapsed();
+
+        assert_eq!(res, Err(IdleElapsed));
+        assert_eq!(elapsed, drain);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_idle_timeout_drain_wakes_when_peer_sets_mid_wait() {
+        let clock = Arc::new(IdleClock::new());
+        let peer_done = Arc::new(PeerDone::new());
+        let idle = Duration::from_secs(1800);
+        let drain = Duration::from_secs(2);
+        let (c2, p2) = (clock.clone(), peer_done.clone());
+        // 对侧 5s 后结束: 先 touch 再 set, drain 从此刻起算
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            c2.touch();
+            p2.set();
+        });
+        let fut = async {
+            tokio::time::sleep(Duration::from_secs(1000)).await;
+            42
+        };
+        let start = tokio::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(60),
+            idle_timeout_drain(&clock, idle, drain, &peer_done, fut),
+        )
+        .await
+        .expect("对侧结束后应在 drain 内返回, 不应等到 idle");
+        assert_eq!(res, Err(IdleElapsed));
+        assert_eq!(start.elapsed(), Duration::from_secs(7));
     }
 }

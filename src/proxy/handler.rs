@@ -482,6 +482,10 @@ pub async fn proxy_tcp_target(
             let up_clock = clock.clone();
             let dn_clock = clock;
 
+            // 方向结束信号: 一方向结束后, 另一方向连续 DRAIN_IDLE 无进展即关 (同 #214 的 WG/SS)
+            let up_done = crate::proxy::PeerDone::new();
+            let dn_done = crate::proxy::PeerDone::new();
+
             let first_up = std::sync::OnceLock::new();
             let first_down = std::sync::OnceLock::new();
             if !initial_payload.is_empty() {
@@ -497,7 +501,7 @@ pub async fn proxy_tcp_target(
                 let mut up_bytes: u64 = 0;
                 loop {
                     // 空闲超时包在每次 read 内层 (非整个 loop 外层, 见 MIRAGE_RELAY_IDLE 注释)
-                    match crate::proxy::idle_timeout(&up_clock, relay_idle(), local_read.read(&mut buf)).await {
+                    match crate::proxy::idle_timeout_drain(&up_clock, relay_idle(), crate::proxy::DRAIN_IDLE, &dn_done, local_read.read(&mut buf)).await {
                         Ok(Ok(0)) => {
                             if !local_aborted.load(std::sync::atomic::Ordering::SeqCst) {
                                 local_eof.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -545,9 +549,18 @@ pub async fn proxy_tcp_target(
                             }
                             break;
                         }
-                        Err(_) => break, // 空闲超时: 双向 1800s 无数据
+                        Err(_) => {
+                            if dn_done.is_set() {
+                                debug!("[TUNNEL] {} upload drain 超时", target);
+                            } else {
+                                debug!("[TUNNEL] {} upload 空闲超时", target);
+                            }
+                            break; // 空闲/drain 超时
+                        }
                     }
                 }
+                up_clock.touch();
+                up_done.set();
 
                 // 退出前排空残留的本地数据，确保发送给本地的是 FIN 而不是 RST
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
@@ -584,7 +597,7 @@ pub async fn proxy_tcp_target(
 
                 loop {
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
-                    match crate::proxy::idle_timeout(&dn_clock, relay_idle(), tunnel_reader.recv_data_borrowed()).await {
+                    match crate::proxy::idle_timeout_drain(&dn_clock, relay_idle(), crate::proxy::DRAIN_IDLE, &up_done, tunnel_reader.recv_data_borrowed()).await {
                         Ok(Ok(data)) => {
                             let now = std::time::Instant::now();
                             if first_down.set(now).is_ok() {
@@ -639,12 +652,19 @@ pub async fn proxy_tcp_target(
                             break;
                         }
                         Err(_) => {
-                            truncated = true; // 空闲超时
+                            truncated = true; // 空闲/drain超时
                             end_reason = DownloadEndReason::IdleTimeout;
+                            if up_done.is_set() {
+                                debug!("[TUNNEL] {} download drain 超时", target);
+                            } else {
+                                debug!("[TUNNEL] {} download 空闲超时", target);
+                            }
                             break;
                         }
                     }
                 }
+                dn_clock.touch();
+                dn_done.set();
 
                 // 退出前排空远端发来的残留数据, 确保发给服务端的是 FIN 而不是 RST (核心隐蔽特征)
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {

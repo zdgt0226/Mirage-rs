@@ -1768,9 +1768,92 @@ impl Config {
         let config: Config = serde_ignored::deserialize(de, |path| {
             issues.push(format!("未知字段 `{}` (拼写错误? 已被忽略, 不会生效)", path));
         })?;
-        issues.extend(config.semantic_issues());
+        let mut sem_issues = config.semantic_issues();
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(content) {
+            Self::check_group_unknown_fields(&raw, &config, &mut sem_issues);
+        }
+        issues.extend(sem_issues);
         Ok((config, issues))
     }
+
+/// 检查出站组是否有未知字段 (例如将 `outbounds` 误写为 `outbound`)。
+/// 仅针对成员为空的组附加提示, 避免在合法带额外字段的组上产生误报。
+fn check_group_unknown_fields(
+    raw: &serde_json::Value,
+    config: &Config,
+    sem_issues: &mut Vec<String>,
+) {
+    let Some(outbounds_arr) = raw.get("outbounds").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    for ob_val in outbounds_arr {
+        let Some(ob_obj) = ob_val.as_object() else {
+            continue;
+        };
+        let Some(tag) = ob_obj.get("tag").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(typ) = ob_obj.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let known_fields: &[&str] = match typ {
+            "urltest" => &["type", "tag", "outbounds", "filter", "url", "interval", "tolerance", "test_type"],
+            "fallback" => &["type", "tag", "outbounds", "filter", "url", "interval"],
+            "selector" => &["type", "tag", "outbounds", "filter"],
+            "load_balance" => &["type", "tag", "outbounds", "filter", "strategy", "url", "interval"],
+            _ => continue,
+        };
+
+        let Some(ob_cfg) = config.outbounds.iter().find(|o| o.tag() == tag) else {
+            continue;
+        };
+        let is_empty = match ob_cfg.group_members(&config.outbounds) {
+            Ok(members) => members.is_empty(),
+            Err(_) => false,
+        };
+
+        if !is_empty {
+            continue;
+        }
+
+        let mut unknown_keys: Vec<&str> = ob_obj
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|k| !known_fields.contains(k))
+            .collect();
+        unknown_keys.sort();
+
+        if unknown_keys.is_empty() {
+            continue;
+        }
+
+        let hints: Vec<String> = unknown_keys
+            .iter()
+            .map(|&k| {
+                if k == "outbound" {
+                    "发现未知字段 `outbound` (是否想写 `outbounds`?)".to_string()
+                } else {
+                    format!("发现未知字段 `{k}`")
+                }
+            })
+            .collect();
+        let hint_str = hints.join(", ");
+
+        let mut attached = false;
+        for issue in sem_issues.iter_mut() {
+            if issue.contains(&format!("`{tag}` 的 outbounds 为空")) {
+                issue.push_str(&format!("; {hint_str}"));
+                attached = true;
+                break;
+            }
+        }
+        if !attached {
+            sem_issues.push(format!("组 `{tag}` 没有成员; {hint_str}"));
+        }
+    }
+}
 
     /// 校验用户硬错误 (空名、重名/撞保留名 default、空口令、重复口令)。
     /// 仅返回必须拒写的硬错误, 不包含跨入站限额不一致等普通 issue。
@@ -4317,5 +4400,48 @@ mod secret_debug_tests {
         assert!(!debug_wg.contains("upstream_wg_psk_000"));
         assert!(debug_wg.contains("upstream_wg_pub_999"));
         assert!(debug_wg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_group_outbound_typo_reports_hint() {
+        let typo_cfg = serde_json::json!({
+            "outbounds": [
+                {
+                    "type": "selector",
+                    "tag": "auto",
+                    "outbound": ["direct"]
+                },
+                {
+                    "type": "direct",
+                    "tag": "direct"
+                }
+            ]
+        });
+        let (_, issues) = Config::parse_with_diagnostics(&typo_cfg.to_string()).unwrap();
+        let typo_issue = issues
+            .iter()
+            .find(|i| i.contains("auto") && i.contains("outbound") && i.contains("outbounds"))
+            .expect("写成 outbound 的组应包含 outbound 和 outbounds 提示");
+        assert!(typo_issue.contains("发现未知字段 `outbound` (是否想写 `outbounds`?)"));
+
+        // 正常组不报 typo issue
+        let normal_cfg = serde_json::json!({
+            "outbounds": [
+                {
+                    "type": "selector",
+                    "tag": "auto",
+                    "outbounds": ["direct"]
+                },
+                {
+                    "type": "direct",
+                    "tag": "direct"
+                }
+            ]
+        });
+        let (_, normal_issues) = Config::parse_with_diagnostics(&normal_cfg.to_string()).unwrap();
+        assert!(
+            !normal_issues.iter().any(|i| i.contains("outbound") || i.contains("未知字段")),
+            "正常组不应报错: {normal_issues:?}"
+        );
     }
 }
