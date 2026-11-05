@@ -415,6 +415,11 @@ impl<W: AsyncWriteExt + Unpin> SsWriter<W> {
         self.inner
     }
 
+    /// 关闭底层写半程 (发送 FIN)。
+    pub fn poll_shutdown(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
     /// 写入明文, 内部按 MAX_CHUNK 切块并逐块加密。首次写入时若有惰性 salt, 拼在首块前一次送出。
     pub async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
         let mut pending = self.pending_salt.take();

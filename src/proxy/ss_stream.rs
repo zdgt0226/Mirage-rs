@@ -40,6 +40,8 @@ pub struct SsStream {
     /// future 会顶掉 socket 上登记的写方 waker; 读写分在两个 task 时, 写 future 在读路径完成后
     /// 须由这里叫醒写方, 否则它会一直 Pending。
     write_waker: Option<std::task::Waker>,
+    /// 是否已对底层写半程执行过 shutdown (幂等保证)。
+    shutdown_done: bool,
 }
 
 impl SsStream {
@@ -52,6 +54,7 @@ impl SsStream {
             read_pos: 0,
             write_err: None,
             write_waker: None,
+            shutdown_done: false,
         }
     }
 
@@ -193,7 +196,100 @@ impl AsyncWrite for SsStream {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_flush(cx)
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let me = &mut *self;
+        if me.shutdown_done {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(e) = me.write_err.take() {
+            return Poll::Ready(Err(e));
+        }
+        loop {
+            match std::mem::replace(&mut me.write, WriteState::Poisoned) {
+                WriteState::Idle(mut writer) => {
+                    let res = writer.poll_shutdown(cx);
+                    me.write = WriteState::Idle(writer);
+                    if let Poll::Ready(Ok(())) = &res {
+                        me.shutdown_done = true;
+                    }
+                    return res;
+                }
+                WriteState::Busy(mut fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready((writer, res)) => {
+                        me.write = WriteState::Idle(writer);
+                        me.write_waker = None;
+                        if let Err(e) = res {
+                            return Poll::Ready(Err(e));
+                        }
+                    }
+                    Poll::Pending => {
+                        me.write = WriteState::Busy(fut);
+                        me.write_waker = Some(cx.waker().clone());
+                        return Poll::Pending;
+                    }
+                },
+                WriteState::Poisoned => unreachable!("SsStream write state poisoned"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use crate::proxy::shadowsocks::{Method, client_handshake_over, server_handshake, SsConfig};
+
+    #[tokio::test]
+    async fn test_ss_stream_shutdown_sends_eof_to_peer() {
+        let cfg = SsConfig {
+            server: "192.0.2.1".into(),
+            port: 8388,
+            password: "test-password-ss".into(),
+            method: Method::Chacha20IetfPoly1305,
+            block_udp: true,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, sw) = tokio::io::split(server_io);
+
+        let (c_reader, c_writer) = client_handshake_over(
+            Box::new(cr) as BoxRead,
+            Box::new(cw) as BoxWrite,
+            &cfg,
+            "example.com:443",
+        ).await.unwrap();
+
+        let (mut s_reader, _s_writer) = server_handshake(
+            sr,
+            sw,
+            cfg.method,
+            &cfg.password,
+        ).await.unwrap();
+
+        let mut stream = SsStream::new(c_reader, c_writer);
+
+        // 写数据
+        stream.write_all(b"hello via ss stream").await.unwrap();
+        // 关写端 (FIN)
+        stream.shutdown().await.unwrap();
+        // 再次 shutdown 保证幂等
+        stream.shutdown().await.unwrap();
+
+        // 对端读首块 (握手时客户端发的 target 目标头)
+        let first_chunk = s_reader.read_chunk().await.unwrap();
+        assert!(!first_chunk.is_empty(), "首块应包含目标头");
+        let (target, hlen) = crate::proxy::shadowsocks::decode_socks_addr(&first_chunk).unwrap();
+        assert_eq!(target, "example.com:443");
+        assert_eq!(&first_chunk[hlen..], b"");
+
+        // 对端读第 2 块 (stream.write_all 写入的数据)
+        let data_chunk = s_reader.read_chunk().await.unwrap();
+        assert_eq!(data_chunk, b"hello via ss stream");
+
+        // 对端读到 EOF (空 Vec)
+        let eof_chunk = s_reader.read_chunk().await.unwrap();
+        assert!(eof_chunk.is_empty(), "对端在 shutdown 后必须读到 EOF");
     }
 }

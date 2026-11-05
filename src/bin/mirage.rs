@@ -1412,11 +1412,25 @@ fn build_export(
             if tag.is_empty() || exported.contains(&tag) {
                 continue; // 无 tag 或已纳入
             }
-            let Some(members) = g.get("outbounds").and_then(|m| m.as_array()) else { continue };
-            let has_member = members.iter()
-                .any(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false));
-            if has_member {
-                exported.insert(tag); // 至少一个成员可达 → 组可纳入
+            let has_explicit = g.get("outbounds")
+                .and_then(|m| m.as_array())
+                .is_some_and(|members| {
+                    members.iter().any(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false))
+                });
+            let has_filter_match = g.get("filter")
+                .and_then(|f| f.as_str())
+                .and_then(|pattern| regex::Regex::new(pattern).ok())
+                .is_some_and(|re| {
+                    outbounds.iter().any(|o| {
+                        let t = type_of(o);
+                        let otag = tag_of(o);
+                        matches!(t.as_str(), "mirage" | "wireguard" | "shadowsocks")
+                            && exported.contains(&otag)
+                            && re.is_match(&otag)
+                    })
+                });
+            if has_explicit || has_filter_match {
+                exported.insert(tag); // 显式成员可达或 filter 匹配到已导出叶子节点 → 组可纳入
                 added = true;
             }
         }
@@ -1430,12 +1444,13 @@ fn build_export(
         if tag.is_empty() || !exported.contains(&tag) {
             return None;
         }
-        let members = g.get("outbounds").and_then(|m| m.as_array())?;
-        let kept: Vec<Value> = members.iter()
-            .filter(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false))
-            .cloned().collect();
         let mut gc = (*g).clone();
-        gc["outbounds"] = Value::Array(kept);
+        if let Some(members) = g.get("outbounds").and_then(|m| m.as_array()) {
+            let kept: Vec<Value> = members.iter()
+                .filter(|m| m.as_str().map(|s| exported.contains(s)).unwrap_or(false))
+                .cloned().collect();
+            gc["outbounds"] = Value::Array(kept);
+        }
         Some(gc)
     }).collect();
 
@@ -2110,6 +2125,36 @@ mod tests {
         let tags: Vec<&str> = e["outbounds"].as_array().unwrap().iter()
             .filter_map(|o| o["tag"].as_str()).collect();
         assert!(tags.contains(&"grpB") && tags.contains(&"grpC"));
+    }
+
+    #[test]
+    fn export_keeps_group_with_only_matching_filter() {
+        let root = serde_json::json!({
+            "outbounds": [
+                { "type": "mirage", "tag": "hk-01", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "us-01", "server": "192.0.2.2", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "urltest", "tag": "grp_hk", "filter": "^hk-" },
+                { "type": "urltest", "tag": "grp_jp", "filter": "^jp-" },
+                { "type": "urltest", "tag": "grp_bad_regex", "filter": "[" }
+            ]
+        });
+        let picked: std::collections::HashSet<String> = ["hk-01"].iter().map(|s| s.to_string()).collect();
+        let e = build_export(&root, &picked, false, false);
+
+        let groups: std::collections::HashMap<&str, &serde_json::Value> = e["outbounds"].as_array().unwrap()
+            .iter().filter(|o| o["type"] == "urltest")
+            .map(|o| (o["tag"].as_str().unwrap(), o)).collect();
+
+        // 匹配已导出节点 hk-01 的 grp_hk 保留，且 filter 字段原样保留，无 outbounds 字段
+        assert!(groups.contains_key("grp_hk"));
+        assert_eq!(groups["grp_hk"]["filter"], "^hk-");
+        assert!(groups["grp_hk"].get("outbounds").is_none());
+
+        // 未匹配任何已导出节点的 grp_jp 被丢弃
+        assert!(!groups.contains_key("grp_jp"));
+
+        // 非法正则视为不匹配，grp_bad_regex 被丢弃
+        assert!(!groups.contains_key("grp_bad_regex"));
     }
 
     #[cfg(unix)]

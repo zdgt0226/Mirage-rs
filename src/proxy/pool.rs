@@ -178,6 +178,12 @@ impl PoolStats {
     }
 
     pub fn record_real_failure_at(&mut self, target: &str, now: Instant) -> bool {
+        if self.penalized_until.is_some() && !self.is_penalized_at(now) {
+            self.real_failures = 0;
+            self.recent_fail_targets.clear();
+            self.real_successes = 0;
+            self.penalized_until = None;
+        }
         self.real_successes = 0;
         if self.recent_fail_targets.iter().any(|t| t == target) {
             return false;
@@ -285,6 +291,18 @@ impl PoolStats {
         }
     }
 
+    /// 补测确认变慢的下限值 (生效中返回 Some(rtt), 过期或未设返回 None)。
+    pub fn slow_floor_ms(&self) -> Option<u64> {
+        self.slow_floor_ms_at(Instant::now())
+    }
+
+    pub fn slow_floor_ms_at(&self, now: Instant) -> Option<u64> {
+        match self.slow_floor {
+            Some(f) if now < f.until => Some(f.rtt),
+            _ => None,
+        }
+    }
+
     /// urltest 选路用的延迟: 中位数, 补测确认变慢的下限生效期内取 max(中位, 下限)。
     pub fn latency_ms(&self) -> Option<u64> {
         self.latency_ms_at(Instant::now())
@@ -292,9 +310,9 @@ impl PoolStats {
 
     pub fn latency_ms_at(&self, now: Instant) -> Option<u64> {
         let median = self.median_latency_ms()?;
-        match self.slow_floor {
-            Some(f) if now < f.until => Some(median.max(f.rtt)),
-            _ => Some(median),
+        match self.slow_floor_ms_at(now) {
+            Some(floor) => Some(median.max(floor)),
+            None => Some(median),
         }
     }
 
@@ -695,6 +713,7 @@ impl WarmPool {
         true
     }
     pub fn password(&self) -> &str { &self.cfg.password }
+    pub fn underlying(&self) -> Option<Arc<OutboundNode>> { self.cfg.underlying.clone() }
     #[cfg(feature = "quic")]
     pub fn quic_mux(&self) -> Option<&Arc<crate::proxy::quic::QuicMux>> { self.quic_mux.as_ref() }
 
@@ -2048,6 +2067,31 @@ mod backoff_tests {
         assert!(stats.is_penalized_at(now + Duration::from_secs(299)));
         assert!(!stats.is_penalized_at(now + Duration::from_secs(300)));
         assert!(!stats.is_penalized_at(now + Duration::from_secs(301)));
+    }
+
+    #[test]
+    fn test_pool_stats_failure_counter_resets_after_penalty_expires() {
+        let mut stats = PoolStats::new();
+        let now = Instant::now();
+        stats.record_real_failure_at("t1.example.com:443", now);
+        stats.record_real_failure_at("t2.example.com:443", now);
+        assert!(stats.record_real_failure_at("t3.example.com:443", now));
+        assert!(stats.is_penalized_at(now));
+
+        // 推进 300s (罚分到期)
+        let later = now + Duration::from_secs(300);
+        assert!(!stats.is_penalized_at(later));
+
+        // 到期后第 1 次新目标失败: 不罚 (返回 false, is_penalized false)
+        let penalized = stats.record_real_failure_at("t4.example.com:443", later);
+        assert!(!penalized);
+        assert!(!stats.is_penalized_at(later));
+        assert_eq!(stats.real_failures, 1);
+
+        // 再 2 个不同目标失败: 满 3 次, 重新罚分
+        assert!(!stats.record_real_failure_at("t5.example.com:443", later));
+        assert!(stats.record_real_failure_at("t6.example.com:443", later));
+        assert!(stats.is_penalized_at(later));
     }
 
     #[test]
