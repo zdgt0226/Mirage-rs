@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [v0.17.8] - 多模型审计修复 / 出站组 filter 遗留问题 (2026-11-05)
+
+- **无协议变更**, 与 v0.17.x 及更早版本两端互通。
+
 ### fix(config,cli): 出站组 filter 遗留问题 (2026-11-05)
 
 - **check 能查出 filter/显式成员与 underlying 形成的循环引用**: 针对 Mirage/Shadowsocks 出站的 `underlying` 底层代理与出站组显式或 `filter` 匹配展开后构成的循环引用链路（如叶子底层指向组、组通过 filter 或显式包含该叶子，或跨多跳环），在 `semantic_issues` 配置校验阶段使用 DFS 三色环检测直接发现并报告包含 tag 路径及 filter 触发关系的 issue，避免原实现 check 阶段通过而仅在启动或热重载时失败报错的问题。

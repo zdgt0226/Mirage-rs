@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.7-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.8-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -426,6 +426,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.8** | 2026-11-05 | **无协议变更**: 审计修复: 罚分到期后失败计数清零; SS 入站真实流量算活动, 空闲恢复后 2s 间隔快速补测; SS 出站半关闭发 FIN; 真实连接首字节即记成功与判慢; `export` 保留仅含 `filter` 的组; rtt 测速受变慢下限约束; `check` 能查出 `filter` / 显式成员与 `underlying` 形成的循环引用; 命令行列表 / 删除 / 自动建组认 `filter` 成员。 |
 | **v0.17.7** | 2026-11-05 | **无协议变更**: 出站组新增 `filter` 正则, 按节点名自动加入成员 (可省略 `outbounds`); WG / SS 出站与 SS 入站 TCP 转发补上超时 (原对端不关即永久占用), 一方向结束后剩余方向 30s 无数据即关。 |
 | **v0.17.6** | 2026-11-04 | **无协议变更**: urltest 节点跨 3 个不同目标真实连接失败时降级 300s (只影响 urltest 排序, 不判死); 真实连接首字节连续明显变慢时立即补测, 确认变慢则 300s 内按补测延迟选路; 出站组成员 1800s 无真实流量时暂停健康探测, 有流量立即恢复。 |
 | **v0.17.5** | 2026-11-04 | **无协议变更**: DNS 缓存开启时, 上游 1.8s 未返回先回 1 小时内的过期答案并后台刷新; 上游失败后 30s 内直接回旧答案不再重查; 临期 (剩余 ≤10% TTL) 条目命中时后台预刷新。 |
