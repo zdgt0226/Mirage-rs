@@ -2212,6 +2212,135 @@ impl Config {
             }
         }
 
+        // 出站引用环检测: 叶子 (Mirage / Shadowsocks) -> 其 underlying;
+        // 出站组 (Urltest / Fallback / Selector / LoadBalance) -> 其全部实际成员 (显式 + filter)。
+        // 忽略自引用 (自身自环已在上面单独提示)。
+        {
+            let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+            let mut filter_edges: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
+
+            for ob in &self.outbounds {
+                let tag = ob.tag();
+                match ob {
+                    OutboundConfig::Mirage { underlying: Some(u), .. }
+                    | OutboundConfig::Shadowsocks { underlying: Some(u), .. } => {
+                        if let Some(&canonical_u) = tags.iter().find(|&&t| t == u.as_str()) {
+                            if canonical_u != tag {
+                                let edges = adj.entry(tag).or_default();
+                                if !edges.contains(&canonical_u) {
+                                    edges.push(canonical_u);
+                                }
+                            }
+                        }
+                    }
+                    OutboundConfig::Urltest { .. }
+                    | OutboundConfig::Fallback { .. }
+                    | OutboundConfig::Selector { .. }
+                    | OutboundConfig::LoadBalance { .. } => {
+                        if let Ok(members) = ob.group_members(&self.outbounds) {
+                            let explicit = ob.explicit_outbounds();
+                            for m in &members {
+                                if let Some(&canonical_m) = tags.iter().find(|&&t| t == m.as_str()) {
+                                    if canonical_m != tag {
+                                        let edges = adj.entry(tag).or_default();
+                                        if !edges.contains(&canonical_m) {
+                                            edges.push(canonical_m);
+                                        }
+                                        if ob.filter().is_some() && !explicit.iter().any(|e| e == m) {
+                                            filter_edges.insert((tag, canonical_m));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            #[derive(Copy, Clone, PartialEq, Eq)]
+            enum Color {
+                White,
+                Gray,
+                Black,
+            }
+
+            let mut colors: std::collections::HashMap<&str, Color> = std::collections::HashMap::new();
+            let mut path: Vec<&str> = Vec::new();
+            let mut reported_cycles: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+
+            fn dfs<'a>(
+                u: &'a str,
+                adj: &std::collections::HashMap<&'a str, Vec<&'a str>>,
+                filter_edges: &std::collections::HashSet<(&'a str, &'a str)>,
+                colors: &mut std::collections::HashMap<&'a str, Color>,
+                path: &mut Vec<&'a str>,
+                reported_cycles: &mut std::collections::HashSet<Vec<String>>,
+                issues: &mut Vec<String>,
+            ) {
+                colors.insert(u, Color::Gray);
+                path.push(u);
+
+                if let Some(neighbors) = adj.get(u) {
+                    for &v in neighbors {
+                        match colors.get(v).copied().unwrap_or(Color::White) {
+                            Color::Gray => {
+                                if let Some(pos) = path.iter().position(|&node| node == v) {
+                                    let cycle_nodes = &path[pos..];
+                                    let min_idx = cycle_nodes
+                                        .iter()
+                                        .enumerate()
+                                        .min_by_key(|(_, &name)| name)
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(0);
+                                    let mut norm: Vec<String> = cycle_nodes[min_idx..]
+                                        .iter()
+                                        .map(|&s| s.to_string())
+                                        .collect();
+                                    norm.extend(cycle_nodes[..min_idx].iter().map(|&s| s.to_string()));
+
+                                    if reported_cycles.insert(norm) {
+                                        let mut full_path: Vec<&str> = cycle_nodes.to_vec();
+                                        full_path.push(v);
+                                        let path_str = full_path.join(" → ");
+
+                                        let mut filter_notes = Vec::new();
+                                        for w in full_path.windows(2) {
+                                            let (src, dst) = (w[0], w[1]);
+                                            if filter_edges.contains(&(src, dst)) {
+                                                filter_notes.push(format!("{src} 的 filter 匹配到 {dst}"));
+                                            }
+                                        }
+
+                                        let msg = if filter_notes.is_empty() {
+                                            format!("出站存在循环引用: {path_str}")
+                                        } else {
+                                            format!("出站存在循环引用: {path_str} ({})", filter_notes.join(", "))
+                                        };
+                                        issues.push(msg);
+                                    }
+                                }
+                            }
+                            Color::White => {
+                                dfs(v, adj, filter_edges, colors, path, reported_cycles, issues);
+                            }
+                            Color::Black => {}
+                        }
+                    }
+                }
+
+                path.pop();
+                colors.insert(u, Color::Black);
+            }
+
+            for ob in &self.outbounds {
+                let tag = ob.tag();
+                if colors.get(tag).copied().unwrap_or(Color::White) == Color::White {
+                    dfs(tag, &adj, &filter_edges, &mut colors, &mut path, &mut reported_cycles, &mut issues);
+                }
+            }
+        }
+
         // 入站 tag 查重 + 端口 0 + 监听冲突 + 服务端空密码
         let mut in_tags: Vec<&str> = Vec::new();
         let mut in_binds: Vec<(InboundProto, &str, u16)> = Vec::new();
@@ -3855,6 +3984,161 @@ mod profile_tests {
         );
         let members = cfg_valid.outbounds[1].group_members(&cfg_valid.outbounds).unwrap();
         assert_eq!(members, vec!["jp-1"]);
+    }
+
+    #[test]
+    fn test_cycle_detection_filter_implicit_cycle() {
+        let cfg_json = r#"{
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "hk-landing",
+                    "server": "203.0.113.10",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com",
+                    "underlying": "auto-hk"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "auto-hk",
+                    "filter": "hk"
+                }
+            ],
+            "routing": { "default_outbound": "auto-hk", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(cfg_json).unwrap();
+        assert!(
+            issues.iter().any(|i| i.contains("出站存在循环引用")
+                && i.contains("hk-landing")
+                && i.contains("auto-hk")
+                && i.contains("auto-hk 的 filter 匹配到 hk-landing")),
+            "filter 隐式环未被识别或诊断信息不全: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_cycle_detection_explicit_member_cycle() {
+        let cfg_json = r#"{
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "node-a",
+                    "server": "203.0.113.20",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com",
+                    "underlying": "grp-a"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "grp-a",
+                    "outbounds": ["node-a"]
+                }
+            ],
+            "routing": { "default_outbound": "grp-a", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(cfg_json).unwrap();
+        assert!(
+            issues.iter().any(|i| i.contains("出站存在循环引用")
+                && i.contains("node-a → grp-a → node-a")),
+            "显式成员环未被正确识别: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_cycle_detection_multi_hop_cycle() {
+        let cfg_json = r#"{
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "node-a",
+                    "server": "203.0.113.30",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com",
+                    "underlying": "grp-1"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "grp-1",
+                    "outbounds": ["node-b"]
+                },
+                {
+                    "type": "shadowsocks",
+                    "tag": "node-b",
+                    "server": "203.0.113.31",
+                    "server_port": 8388,
+                    "method": "aes-256-gcm",
+                    "password": "pass",
+                    "underlying": "grp-2"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "grp-2",
+                    "outbounds": ["node-a"]
+                }
+            ],
+            "routing": { "default_outbound": "grp-1", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(cfg_json).unwrap();
+        assert!(
+            issues.iter().any(|i| i.contains("出站存在循环引用")
+                && i.contains("node-a")
+                && i.contains("grp-1")
+                && i.contains("node-b")
+                && i.contains("grp-2")),
+            "多跳环未被正确识别: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_cycle_detection_normal_chain_no_cycle() {
+        let cfg_json = r#"{
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "m-1",
+                    "server": "203.0.113.40",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com"
+                },
+                {
+                    "type": "mirage",
+                    "tag": "m-2",
+                    "server": "203.0.113.41",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "auto",
+                    "filter": "m-.*"
+                },
+                {
+                    "type": "shadowsocks",
+                    "tag": "ss-out",
+                    "server": "203.0.113.42",
+                    "server_port": 8388,
+                    "method": "aes-256-gcm",
+                    "password": "pass",
+                    "underlying": "auto"
+                }
+            ],
+            "routing": { "default_outbound": "auto", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(cfg_json).unwrap();
+        let cycle_issues: Vec<_> = issues.iter().filter(|i| i.contains("循环引用")).collect();
+        assert!(
+            cycle_issues.is_empty(),
+            "正常链式代理不应报错循环引用: {cycle_issues:?}"
+        );
     }
 }
 

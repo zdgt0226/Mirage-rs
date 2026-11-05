@@ -503,20 +503,16 @@ pub fn adjust_outbound_groups(
         return Ok(false);
     }
 
-    let arr = root
-        .get_mut("outbounds")
-        .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| "outbounds 必须为数组".to_string())?;
-
     // 检查是否已有出站组
-    let mut has_existing_groups = false;
-    for o in arr.iter() {
-        let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        if mirage_rs::config::is_group_type(o_type) {
-            has_existing_groups = true;
-            break;
-        }
-    }
+    let has_existing_groups = root
+        .get("outbounds")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "outbounds 必须为数组".to_string())?
+        .iter()
+        .any(|o| {
+            let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            mirage_rs::config::is_group_type(o_type)
+        });
 
     if !has_existing_groups {
         // ── 情况 1: 配置里还没有组 ─────────────────────────────────────
@@ -692,12 +688,10 @@ pub fn adjust_outbound_groups(
         let mut group_items = Vec::new();
         // 新节点: 调用方给出 (import 一个 / subscribe 一批); 未给出时退化为"不在任何组里的节点"
         let new_tags: Vec<String> = if new_node_tags.is_empty() {
-            let in_groups: std::collections::HashSet<String> = arr
-                .iter()
-                .filter(|o| mirage_rs::config::is_group_type(o.get("type").and_then(|t| t.as_str()).unwrap_or("")))
-                .filter_map(|o| o.get("outbounds").and_then(|m| m.as_array()))
-                .flatten()
-                .filter_map(|v| v.as_str().map(str::to_string))
+            let group_infos = super::config_edit::resolve_group_memberships(root);
+            let in_groups: std::collections::HashSet<String> = group_infos
+                .into_iter()
+                .flat_map(|g| g.all_members)
                 .collect();
             mirage_tags.iter().filter(|t| !in_groups.contains(*t)).cloned().collect()
         } else {
@@ -708,6 +702,11 @@ pub fn adjust_outbound_groups(
         }
         let other_mirage_tags: Vec<String> =
             mirage_tags.iter().filter(|t| !new_tags.contains(t)).cloned().collect();
+
+        let arr = root
+            .get_mut("outbounds")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| "outbounds 必须为数组".to_string())?;
 
         for o in arr.iter() {
             let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -974,5 +973,24 @@ mod tests {
         assert!(default_outbound_note(&root).contains("默认出站为组 `select`"));
         root["routing"] = serde_json::json!({ "default_outbound": "direct" });
         assert!(default_outbound_note(&root).contains("仍是 `direct`"));
+    }
+
+    #[test]
+    fn test_in_groups_recognizes_filter_members() {
+        let mut root = serde_json::json!({
+            "outbounds": [
+                { "type": "urltest", "tag": "auto", "filter": "m.*" },
+                { "type": "mirage", "tag": "m1", "server": "192.0.2.1", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "mirage", "tag": "m2", "server": "192.0.2.2", "server_port": 443, "password": "p", "camouflage_host": "example.com" },
+                { "type": "direct", "tag": "direct" }
+            ],
+            "routing": { "default_outbound": "auto", "rules": [] }
+        });
+        let mut reader = Cursor::new(b"\n");
+        let mut writer = Vec::new();
+        // 当未提供新节点标签时，检查未在组里的节点。
+        // m1 和 m2 都被 auto 的 filter "m.*" 匹配并认作已在组里，因此没有新节点需要入组，返回 Ok(false)
+        let changed = adjust_outbound_groups(&mut root, &mut reader, &mut writer, false, &[]).unwrap();
+        assert!(!changed, "filter 已收纳的节点算'已在组里'，不应再触发建组交互");
     }
 }
