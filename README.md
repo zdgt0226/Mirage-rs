@@ -382,6 +382,7 @@ mirage-rs config -c config.json
 - [x] **单隧道高 RTT 吞吐调研**: 实机确认高丢包高 RTT 链路受 TCP 固有机制限制，决定不在 TCP 侧追加多隧道单下载 striping 优化，转向 QUIC 链路。
 - [x] **出站组按节点名过滤 (v0.17.7, 参考 dae)**: 出站组 (`urltest` / `fallback` / `selector` / `load_balance`) 新增可选 `filter` 正则过滤, 自动把名字匹配的叶子代理节点动态加入组成员; 支持显式与 filter 混合保序去重, 非法正则 check 报错且运行时告警降级, 展开结果不写回配置。
 - [x] **TCP relay 半关闭收尾超时 (v0.17.7, 参考 honk)**: WG / SS 出站与 SS 入站原无任何超时 (对端不关即永久泄漏), 现整体空闲超时同 `relay_idle` (默认 1800s), 一方向结束后传递 FIN, 剩余方向连续 30s 无字节进展即关, 有数据流动不受影响。
+- [x] **Mirage TCP 隧道半关闭收尾 30s (客户端, 未发布)**: 客户端 Mirage TCP relay 一方向结束后, 剩余方向连续 30s 无数据进展即关 (原要等 1800s); 有数据持续流动不受影响; 截断判定 / close_notify 语义不变。
 
 ### 🚧 进行中 / 部分完成
 
@@ -401,7 +402,7 @@ mirage-rs config -c config.json
 - [ ] **控制台: 从连接一键加路由规则 (参考 doona)**: 连接详情里按域名后缀 / 关键字 / IP / 进程 / 仅此设备生成规则, 选出站, 校验后保存; 后端连接记录补命中规则编号, 支持插在命中规则之前与跳转到命中规则。
 - [ ] **控制台: 断开单条连接**: 后端为连接保存取消句柄, 提供关闭接口。
 - [ ] **orphan 验证器接回 CI**: 本地测试稳定，需重构为单进程模式以适应 GitHub Actions 共享 runner。
-- [ ] **Mirage TCP 隧道半关闭收尾 30s**: 客户端 Mirage TCP relay 与服务端 `tcp_relay` 上游先 EOF 方向, 一方结束后剩余方向现要等满 `relay_idle` (默认 1800s); 改为连续 30s 无进展即关 (同 WG/SS 已做的 drain)。客户端 relay 有 abort / 截断判定, 须细审 + 实机。
+- [ ] **服务端 tcp_relay 上游先 EOF 收尾 30s**: 服务端上游先 EOF 后, 客户端方向现仍等满 `relay_idle`; 改为 30s 无进展即关 (客户端已做)。
 - [ ] **QUIC 流半关闭收尾 30s**: 客户端 QUIC 流 relay 与服务端 `quic_pump` 同上; 实机须走能过 QUIC 的线路。
 - [ ] **服务端恢复应用层 TCP 半关闭 (可选)**: 上两项完成后, 服务端客户端先 EOF 时可由 SHUT_RDWR 改为 SHUT_WR + 30s drain, 支持 `nc -N` / HTTP/1.0 式半关闭; 改变服务端行为, 须实机 + 新旧版本互通。
 

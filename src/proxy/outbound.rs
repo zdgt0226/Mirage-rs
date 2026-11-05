@@ -153,27 +153,32 @@ impl OutboundNode {
     /// Shadowsocks 节点链式通知 underlying; urltest / fallback / load_balance
     /// 递归通知全部子节点 (选路要比较所有成员); selector 只走当前选择, 只标它。
     pub fn mark_active(self: &Arc<Self>) {
+        let now = crate::proxy::pool::now_ms();
+        self.mark_active_at(now);
+    }
+
+    pub(crate) fn mark_active_at(self: &Arc<Self>, now: u64) {
         match &**self {
             Self::Mirage { pool, .. } => {
-                pool.mark_active();
+                pool.mark_active_at(now);
                 if let Some(underlying) = pool.underlying() {
-                    underlying.mark_active();
+                    underlying.mark_active_at(now);
                 }
             }
             Self::Shadowsocks { underlying: Some(underlying), .. } => {
-                underlying.mark_active();
+                underlying.mark_active_at(now);
             }
             Self::Urltest { children, .. }
             | Self::Fallback { children, .. }
             | Self::LoadBalance { children, .. } => {
                 for child in children {
-                    child.mark_active();
+                    child.mark_active_at(now);
                 }
             }
             Self::Selector { children, current, .. } => {
                 let chosen = current.read().unwrap_or_else(|e| e.into_inner()).clone();
                 if let Some(c) = chosen.or_else(|| children.first().cloned()) {
-                    c.mark_active();
+                    c.mark_active_at(now);
                 }
             }
             _ => {}

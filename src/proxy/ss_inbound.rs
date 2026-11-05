@@ -111,7 +111,7 @@ pub async fn handle_ss_client(
 
     let clock = IdleClock::new();
     let idle = relay_idle();
-    let up_progress = AtomicU64::new(0);
+    let up_progress = AtomicU64::new(initial.len() as u64);
     let down_progress = AtomicU64::new(0);
 
     let up = async {
