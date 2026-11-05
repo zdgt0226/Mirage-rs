@@ -426,6 +426,9 @@ pub async fn proxy_tcp_target(
                     Ok(t) => t,
                     Err(e) => {
                         error!("Mirage outbound unavailable for {}: {}", target, e);
+                        if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target) {
+                            info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
+                        }
                         return;
                     }
                 };
@@ -583,7 +586,38 @@ pub async fn proxy_tcp_target(
                     // 空闲超时包在每次 recv 内层 (非整个 loop 外层)
                     match crate::proxy::idle_timeout(&dn_clock, relay_idle(), tunnel_reader.recv_data_borrowed()).await {
                         Ok(Ok(data)) => {
-                            let _ = first_down.set(std::time::Instant::now());
+                            let now = std::time::Instant::now();
+                            if first_down.set(now).is_ok() {
+                                let mut trigger_probe = false;
+                                {
+                                    let mut stats = pool.stats.write().unwrap_or_else(|e| e.into_inner());
+                                    stats.record_real_success();
+                                    if let Some(&up) = first_up.get() {
+                                        if up <= now {
+                                            let ttfb_ms = now.duration_since(up).as_millis() as u64;
+                                            let baseline_ms = stats.median_latency_ms();
+                                            match crate::proxy::pool::is_slow_ttfb(ttfb_ms, baseline_ms) {
+                                                Some(true) if stats.record_real_slow(&target) => {
+                                                    trigger_probe = true;
+                                                }
+                                                Some(true) => {}
+                                                Some(false) => {
+                                                    stats.record_real_fast();
+                                                }
+                                                None => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                if trigger_probe {
+                                    pool.trigger_probe();
+                                    info!(
+                                        "节点 {} 真实连接连续明显变慢 (涉及 {} 个不同目标), 触发补测",
+                                        node_tag,
+                                        crate::proxy::pool::SLOW_TRIGGER_COUNT
+                                    );
+                                }
+                            }
                             dn_clock.touch();
                             if let Some(b) = &dn_bkt {
                                 b.down.consume(data.len()).await; // 限速整形 (下行)
@@ -663,45 +697,11 @@ pub async fn proxy_tcp_target(
             );
 
             let local_eof_val = local_eof.load(std::sync::atomic::Ordering::SeqCst);
-            match classify_real_conn(down_bytes, end_reason, local_eof_val) {
-                RealConnResult::Success => {
-                    pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_success();
-                }
-                RealConnResult::Failure => {
-                    if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target) {
-                        info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
-                    }
-                }
-                RealConnResult::Ignore => {}
-            }
-
-            // 测真实连接首字节耗时 (TTFB): 仅在 first_up 与 first_down 均有且 first_up <= first_down 时统计
-            if let (Some(&up), Some(&down)) = (first_up.get(), first_down.get()) {
-                if up <= down {
-                    let ttfb_ms = down.duration_since(up).as_millis() as u64;
-                    let baseline_ms = pool.stats.read().unwrap_or_else(|e| e.into_inner()).median_latency_ms();
-                    match crate::proxy::pool::is_slow_ttfb(ttfb_ms, baseline_ms) {
-                        Some(true) => {
-                            let triggered = pool
-                                .stats
-                                .write()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .record_real_slow(&target);
-                            if triggered {
-                                pool.trigger_probe();
-                                info!(
-                                    "节点 {} 真实连接连续明显变慢 (涉及 {} 个不同目标), 触发补测",
-                                    node_tag,
-                                    crate::proxy::pool::SLOW_TRIGGER_COUNT
-                                );
-                            }
-                        }
-                        Some(false) => {
-                            pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_fast();
-                        }
-                        None => {}
-                    }
-                }
+            // 真实连接成功与 TTFB 判定已在下行首字节时立即记录; 此处仅保留 0 字节错误失败判定。
+            if classify_real_conn(down_bytes, end_reason, local_eof_val) == RealConnResult::Failure
+                && pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target)
+            {
+                info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
             }
         }
         OutboundNode::Direct { .. } => {

@@ -83,6 +83,29 @@ fn handle_probe_result(
     }
 }
 
+/// 恢复探测时的短间隔 (2s)
+pub const RESUME_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+pub const MAX_RESUME_PROBE_ROUNDS: u32 = 3;
+
+/// 计算下一次探测的等待时长与剩余快探轮数。
+/// 当从暂停恢复 (remaining_rounds > 0) 且健康状态未"确定" (failures < DEAD_AFTER_FAILURES 且 successes < RECOVER_AFTER_SUCCESSES) 时，
+/// 改用 2s 短间隔快探，消耗 1 轮；否则回到正常 interval 且剩余轮数清零。
+pub fn next_probe_delay(
+    failures: u32,
+    successes: u32,
+    remaining_rounds: u32,
+    normal_interval: Duration,
+) -> (Duration, u32) {
+    if remaining_rounds > 0
+        && failures < crate::proxy::pool::DEAD_AFTER_FAILURES
+        && successes < crate::proxy::pool::RECOVER_AFTER_SUCCESSES
+    {
+        (RESUME_PROBE_INTERVAL, remaining_rounds - 1)
+    } else {
+        (normal_interval, 0)
+    }
+}
+
 pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64) {
     if interval == 0 {
         return;
@@ -94,6 +117,7 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
 
         let mut is_probe_round = false;
         let mut paused = false;
+        let mut resume_fast_rounds: u32 = 0;
         loop {
             let Some(node) = node.upgrade() else {
                 break;
@@ -124,6 +148,7 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                 if paused {
                     debug!("HealthCheck [{}] 有流量, 恢复探测", tag);
                     paused = false;
+                    resume_fast_rounds = MAX_RESUME_PROBE_ROUNDS;
                 }
 
                 let start = Instant::now();
@@ -171,10 +196,21 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                     } else {
                         handle_probe_result(&pool.stats, tag, Err("quic stream open timeout/err"), is_probe_round);
                     }
+                    let delay = {
+                        let s = pool.stats.read().unwrap_or_else(|e| e.into_inner());
+                        let (d, rem) = next_probe_delay(
+                            s.consecutive_failures,
+                            s.consecutive_successes,
+                            resume_fast_rounds,
+                            Duration::from_secs(interval),
+                        );
+                        resume_fast_rounds = rem;
+                        d
+                    };
                     let notify = pool.probe_notify();
                     drop(node);
                     tokio::select! {
-                        _ = sleep(Duration::from_secs(interval)) => {
+                        _ = sleep(delay) => {
                             is_probe_round = false;
                         }
                         _ = notify.notified() => {
@@ -223,10 +259,21 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                 } else {
                     handle_probe_result(&pool.stats, tag, Err("pool get timeout/err"), is_probe_round);
                 }
+                let delay = {
+                    let s = pool.stats.read().unwrap_or_else(|e| e.into_inner());
+                    let (d, rem) = next_probe_delay(
+                        s.consecutive_failures,
+                        s.consecutive_successes,
+                        resume_fast_rounds,
+                        Duration::from_secs(interval),
+                    );
+                    resume_fast_rounds = rem;
+                    d
+                };
                 let notify = pool.probe_notify();
                 drop(node);
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(interval)) => {
+                    _ = sleep(delay) => {
                         is_probe_round = false;
                     }
                     _ = notify.notified() => {
@@ -301,5 +348,35 @@ mod tests {
         record_probe_failure(&mut stats, true);
         assert_eq!(stats.consecutive_failures, 2);
         assert_eq!(stats.probe_baseline, None);
+    }
+
+    #[test]
+    fn test_next_probe_delay_from_resume() {
+        let normal = Duration::from_secs(60);
+
+        // 恢复后初始 rounds = 3，状态未确定 (failures=1, successes=0) -> 2s 快探，剩余 2 轮
+        let (d, rem) = next_probe_delay(1, 0, 3, normal);
+        assert_eq!(d, RESUME_PROBE_INTERVAL);
+        assert_eq!(rem, 2);
+
+        // 第 2 次仍未确定 (failures=2, successes=0) -> 2s 快探，剩余 1 轮
+        let (d, rem) = next_probe_delay(2, 0, 2, normal);
+        assert_eq!(d, RESUME_PROBE_INTERVAL);
+        assert_eq!(rem, 1);
+
+        // 连续失败达 DEAD_AFTER_FAILURES (3) -> 状态确定 (dead)，恢复正常 60s
+        let (d, rem) = next_probe_delay(3, 0, 1, normal);
+        assert_eq!(d, normal);
+        assert_eq!(rem, 0);
+
+        // 若成功达 RECOVER_AFTER_SUCCESSES (2) -> 状态确定 (healthy)，恢复正常 60s
+        let (d, rem) = next_probe_delay(0, 2, 2, normal);
+        assert_eq!(d, normal);
+        assert_eq!(rem, 0);
+
+        // 若达到最大轮数 (3轮用尽 rem=0) 但未达到确定阈值 -> 恢复正常 60s
+        let (d, rem) = next_probe_delay(1, 1, 0, normal);
+        assert_eq!(d, normal);
+        assert_eq!(rem, 0);
     }
 }

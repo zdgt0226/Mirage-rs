@@ -90,8 +90,8 @@ pub async fn handle_ss_client(
     drop(st);
     debug!("SS 入站 {target} → 出站 [{outbound_tag}]");
 
-    // 4. 经统一出站接口连目标。
-    let out = match outbound.connect(&addr).await {
+    // 4. 经统一出站接口连目标 (connect_active: 真实流量标活跃, 保活底层组)。
+    let out = match outbound.connect_active(&addr).await {
         Ok(s) => s,
         Err(e) => {
             warn!("SS 入站经出站 [{outbound_tag}] 连 {target} 失败: {e}");

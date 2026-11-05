@@ -113,9 +113,14 @@ impl OutboundNode {
 
     pub fn latency_rtt_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
-            Self::Mirage { rtt_ms, .. } => {
+            Self::Mirage { rtt_ms, pool, .. } => {
                 let rtt = rtt_ms.load(std::sync::atomic::Ordering::Relaxed);
-                if rtt > 0 && rtt != u64::MAX { Some(rtt) } else { None }
+                if rtt > 0 && rtt != u64::MAX {
+                    let floor = pool.stats.read().unwrap_or_else(|e| e.into_inner()).slow_floor_ms();
+                    Some(floor.map_or(rtt, |f| rtt.max(f)))
+                } else {
+                    None
+                }
             },
             Self::Direct { .. } | Self::Block { .. } | Self::Wireguard { .. } | Self::Shadowsocks { .. } => None,
             Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. } => {
@@ -144,11 +149,20 @@ impl OutboundNode {
         }
     }
 
-    /// 标记节点/组有真实流量活动。Mirage 节点通知 pool; urltest / fallback / load_balance
+    /// 标记节点/组有真实流量活动。Mirage 节点通知 pool (并链式通知 underlying);
+    /// Shadowsocks 节点链式通知 underlying; urltest / fallback / load_balance
     /// 递归通知全部子节点 (选路要比较所有成员); selector 只走当前选择, 只标它。
     pub fn mark_active(self: &Arc<Self>) {
         match &**self {
-            Self::Mirage { pool, .. } => pool.mark_active(),
+            Self::Mirage { pool, .. } => {
+                pool.mark_active();
+                if let Some(underlying) = pool.underlying() {
+                    underlying.mark_active();
+                }
+            }
+            Self::Shadowsocks { underlying: Some(underlying), .. } => {
+                underlying.mark_active();
+            }
             Self::Urltest { children, .. }
             | Self::Fallback { children, .. }
             | Self::LoadBalance { children, .. } => {
@@ -255,6 +269,12 @@ impl OutboundNode {
             }
             _ => self.clone(),
         }
+    }
+
+    /// 统一出站流接口 (带活跃标记): 供真实外部流量 (如 SS 入站) 接入, 先标活跃使底层组保活, 再执行 connect。
+    pub async fn connect_active(self: &Arc<Self>, target: &Address) -> anyhow::Result<OutStream> {
+        self.mark_active();
+        self.connect(target).await
     }
 
     /// 统一出站流接口: 经本出站连到 `target`, 返回一条普通字节流。
@@ -1500,5 +1520,66 @@ mod urltest_tests {
         top_group.mark_active();
         assert_eq!(pool_a.last_active.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(pool_c.last_active.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    fn ss_with_underlying(tag: &str, underlying: Arc<OutboundNode>) -> Arc<OutboundNode> {
+        let cfg = Arc::new(crate::proxy::shadowsocks::SsConfig {
+            server: "192.0.2.2".into(),
+            port: 8388,
+            password: "test-password".into(),
+            method: crate::proxy::shadowsocks::Method::Chacha20IetfPoly1305,
+            block_udp: true,
+        });
+        Arc::new(OutboundNode::Shadowsocks {
+            tag: tag.into(),
+            cfg,
+            underlying: Some(underlying),
+        })
+    }
+
+    /// SS 节点 underlying=urltest(mirage a, b), 对 SS 节点 mark_active 后 a/b 的 pool last_active 更新。
+    #[tokio::test]
+    async fn mark_active_cascades_to_ss_underlying() {
+        let a = mirage("a");
+        let b = mirage("b");
+        let pool_a = match a.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        let pool_b = match b.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+
+        pool_a.last_active.store(0, std::sync::atomic::Ordering::Relaxed);
+        pool_b.last_active.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let sub_group = urltest(vec![a.clone(), b.clone()], None);
+        let ss_node = ss_with_underlying("ss_over_urltest", sub_group);
+
+        ss_node.mark_active();
+        assert!(pool_a.last_active.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(pool_b.last_active.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+
+    /// test_type = "rtt" 时，Mirage 节点的 slow_floor 生效中必须遵守 max(rtt, floor)。
+    #[tokio::test]
+    async fn latency_rtt_respects_slow_floor() {
+        let node = mirage("mirage_rtt");
+        let (pool, rtt_ms) = match node.as_ref() {
+            OutboundNode::Mirage { pool, rtt_ms, .. } => (pool.clone(), rtt_ms.clone()),
+            _ => unreachable!(),
+        };
+
+        // 未设 floor 时读原始 rtt
+        rtt_ms.store(50, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(node.latency_ms("rtt"), Some(50));
+
+        // 设 floor = 200ms
+        let now = tokio::time::Instant::now();
+        pool.stats.write().unwrap().confirm_slow_at(200, 40, now);
+
+        // rtt (50) < floor (200) 时返回 floor (200)
+        assert_eq!(node.latency_ms("rtt"), Some(200));
+
+        // rtt (300) > floor (200) 时返回 rtt (300)
+        rtt_ms.store(300, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(node.latency_ms("rtt"), Some(300));
     }
 }
