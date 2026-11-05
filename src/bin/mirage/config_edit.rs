@@ -72,6 +72,7 @@ pub enum OutboundRef {
     Rule { rule_index: usize },
     ProfileRule { profile: String, rule_index: usize },
     Group { group_tag: String },
+    GroupFilter { group_tag: String },
     Underlying { outbound_tag: String },
 }
 
@@ -82,6 +83,7 @@ impl std::fmt::Display for OutboundRef {
             Self::Rule { rule_index } => write!(f, "routing.rules[{rule_index}] 路由规则"),
             Self::ProfileRule { profile, rule_index } => write!(f, "routing.profiles.{profile}[{rule_index}] 策略规则"),
             Self::Group { group_tag } => write!(f, "出站组 `{group_tag}`"),
+            Self::GroupFilter { group_tag } => write!(f, "该节点经出站组 `{group_tag}` 的 filter 匹配入组, 删除后自动退出"),
             Self::Underlying { outbound_tag } => write!(f, "出站 `{outbound_tag}` 的 underlying 链式底座"),
         }
     }
@@ -208,6 +210,70 @@ pub fn get_existing_outbound_tags(root: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// 解析后的出站组成员信息 (包含显式配置成员与经由 filter 动态匹配的全部成员)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGroupInfo {
+    pub group_tag: String,
+    pub explicit_members: Vec<String>,
+    pub all_members: Vec<String>,
+}
+
+/// 解析出站组成员 helper:
+/// 尝试把 `root["outbounds"]` 反序列化为 `Vec<OutboundConfig>`, 通过 `OutboundConfig::group_members`
+/// 完整计算显式与 filter 匹配成员; 反序列化失败时退回原有的显式 `outbounds` 数组提取逻辑。
+pub fn resolve_group_memberships(root: &Value) -> Vec<ResolvedGroupInfo> {
+    if let Some(outbounds_val) = root.get("outbounds") {
+        if let Ok(configs) = serde_json::from_value::<Vec<mirage_rs::config::OutboundConfig>>(outbounds_val.clone()) {
+            let mut groups = Vec::new();
+            for oc in &configs {
+                if !matches!(
+                    oc,
+                    mirage_rs::config::OutboundConfig::Urltest { .. }
+                        | mirage_rs::config::OutboundConfig::Fallback { .. }
+                        | mirage_rs::config::OutboundConfig::Selector { .. }
+                        | mirage_rs::config::OutboundConfig::LoadBalance { .. }
+                ) {
+                    continue;
+                }
+                let explicit = oc.explicit_outbounds().to_vec();
+                let all = oc.group_members(&configs).unwrap_or_else(|_| explicit.clone());
+                groups.push(ResolvedGroupInfo {
+                    group_tag: oc.tag().to_string(),
+                    explicit_members: explicit,
+                    all_members: all,
+                });
+            }
+            return groups;
+        }
+    }
+
+    // 反序列化失败或缺少 outbounds 时退回原显式逻辑
+    let arr = match root.get("outbounds").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut groups = Vec::new();
+    for o in arr {
+        let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let g_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
+        if is_group_type(o_type) && !g_tag.is_empty() {
+            let explicit: Vec<String> = o
+                .get("outbounds")
+                .and_then(|m| m.as_array())
+                .map(|members| {
+                    members.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()
+                })
+                .unwrap_or_default();
+            groups.push(ResolvedGroupInfo {
+                group_tag: g_tag.to_string(),
+                explicit_members: explicit.clone(),
+                all_members: explicit,
+            });
+        }
+    }
+    groups
+}
+
 /// 列出所有 mirage 类型的出站节点
 pub fn list_mirage_outbounds(root: &Value) -> Vec<OutboundSummary> {
     let default_outbound = mirage_rs::config::resolve_default_outbound_from_value(root);
@@ -217,21 +283,14 @@ pub fn list_mirage_outbounds(root: &Value) -> Vec<OutboundSummary> {
         None => return Vec::new(),
     };
 
-    // 收集所有组节点成员信息 (tag -> 所属组名列表)
+    // 收集所有组节点成员信息 (tag -> 所属组名列表, 包含显式与 filter 匹配成员)
+    let group_infos = resolve_group_memberships(root);
     let mut node_groups: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for o in arr {
-        let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let g_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
-        if is_group_type(o_type) && !g_tag.is_empty() {
-            if let Some(members) = o.get("outbounds").and_then(|m| m.as_array()) {
-                for m in members {
-                    if let Some(m_str) = m.as_str() {
-                        node_groups
-                            .entry(m_str.to_string())
-                            .or_default()
-                            .push(g_tag.to_string());
-                    }
-                }
+    for g in group_infos {
+        for m in g.all_members {
+            let entry = node_groups.entry(m).or_default();
+            if !entry.contains(&g.group_tag) {
+                entry.push(g.group_tag.clone());
             }
         }
     }
@@ -540,20 +599,24 @@ pub fn check_outbound_references(root: &Value, tag: &str) -> Vec<OutboundRef> {
         }
     }
 
-    // 3. 出站组 (urltest / fallback / selector / load_balance) 中的 outbounds
+    // 3. 出站组 (urltest / fallback / selector / load_balance) 中的 outbounds (显式引用与 filter 动态匹配)
+    let group_infos = resolve_group_memberships(root);
+    for g in group_infos {
+        if g.group_tag == tag {
+            continue;
+        }
+        if g.explicit_members.iter().any(|m| m == tag) {
+            refs.push(OutboundRef::Group { group_tag: g.group_tag });
+        } else if g.all_members.iter().any(|m| m == tag) {
+            refs.push(OutboundRef::GroupFilter { group_tag: g.group_tag });
+        }
+    }
+
+    // 4. underlying
     if let Some(arr) = root.get("outbounds").and_then(|v| v.as_array()) {
         for o in arr {
             let o_tag = o.get("tag").and_then(|t| t.as_str()).unwrap_or("");
             if o_tag == tag { continue; }
-            let o_type = o.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if is_group_type(o_type) {
-                if let Some(members) = o.get("outbounds").and_then(|m| m.as_array()) {
-                    if members.iter().any(|m| m.as_str() == Some(tag)) {
-                        refs.push(OutboundRef::Group { group_tag: o_tag.to_string() });
-                    }
-                }
-            }
-            // 4. underlying
             if o.get("underlying").and_then(|u| u.as_str()) == Some(tag) {
                 refs.push(OutboundRef::Underlying { outbound_tag: o_tag.to_string() });
             }
@@ -571,8 +634,9 @@ pub fn delete_outbound(
 ) -> Result<(), Vec<OutboundRef>> {
     let refs = check_outbound_references(root, tag);
     if !refs.is_empty() {
-        let has_blocking = refs.iter().any(|r| !matches!(r, OutboundRef::Group { .. }));
-        if has_blocking || !auto_remove_from_groups {
+        let has_blocking = refs.iter().any(|r| !matches!(r, OutboundRef::Group { .. } | OutboundRef::GroupFilter { .. }));
+        let has_explicit_group = refs.iter().any(|r| matches!(r, OutboundRef::Group { .. }));
+        if has_blocking || (!auto_remove_from_groups && has_explicit_group) {
             return Err(refs);
         }
     }
@@ -1661,14 +1725,19 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
 
                     // 重新检查引用
                     let remaining_refs = check_outbound_references(&root, &tag);
-                    let non_group = remaining_refs.iter().any(|r| !matches!(r, OutboundRef::Group { .. }));
+                    let non_group = remaining_refs.iter().any(|r| !matches!(r, OutboundRef::Group { .. } | OutboundRef::GroupFilter { .. }));
                     if non_group {
                         writeln!(writer, "✗ 该节点仍被规则或链式底座引用，请先修改对应规则后重试。").map_err(|e| e.to_string())?;
                         root = snapshot;
                         continue;
                     }
 
-                    if prompt_yes_no(reader, writer, "是否确认从所属出站组中一并移除并删除该节点？", true) {
+                    let prompt_msg = if remaining_refs.iter().any(|r| matches!(r, OutboundRef::Group { .. })) {
+                        "是否确认从所属出站组中一并移除并删除该节点？"
+                    } else {
+                        "是否确认删除该节点？"
+                    };
+                    if prompt_yes_no(reader, writer, prompt_msg, true) {
                         if let Err(e) = delete_outbound(&mut root, &tag, true) {
                             writeln!(writer, "✗ 删除失败: {e:?}").map_err(|e| e.to_string())?;
                         } else {
@@ -2792,5 +2861,92 @@ mod tests {
         assert!(executor.recorded_calls.lock().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_list_mirage_outbounds_includes_filter_groups() {
+        let root = json!({
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "hk-landing",
+                    "server": "203.0.113.10",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "auto-hk",
+                    "filter": "hk"
+                }
+            ],
+            "routing": {
+                "default_outbound": "auto-hk",
+                "rules": []
+            }
+        });
+        let summaries = list_mirage_outbounds(&root);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].tag, "hk-landing");
+        assert!(
+            summaries[0].groups.contains(&"auto-hk".to_string()),
+            "filter 匹配的节点 list 应显示所属组: {:?}",
+            summaries[0].groups
+        );
+    }
+
+    #[test]
+    fn test_delete_outbound_filter_only_not_blocked_and_json_unchanged() {
+        let mut root = json!({
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "hk-landing",
+                    "server": "203.0.113.10",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com"
+                },
+                {
+                    "type": "mirage",
+                    "tag": "fallback-node",
+                    "server": "203.0.113.11",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "auto-hk",
+                    "filter": "hk"
+                }
+            ],
+            "routing": {
+                "default_outbound": "fallback-node",
+                "rules": []
+            }
+        });
+
+        // 检查引用: 仅被 auto-hk 的 filter 匹配
+        let refs = check_outbound_references(&root, "hk-landing");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], OutboundRef::GroupFilter { group_tag: "auto-hk".to_string() });
+        assert_eq!(
+            refs[0].to_string(),
+            "该节点经出站组 `auto-hk` 的 filter 匹配入组, 删除后自动退出"
+        );
+
+        // 删除仅 filter 入组节点, 即使 auto_remove_from_groups 为 false 也不阻塞
+        assert!(delete_outbound(&mut root, "hk-landing", false).is_ok());
+
+        // 节点已被移除
+        let outbounds = root["outbounds"].as_array().unwrap();
+        assert!(!outbounds.iter().any(|o| o["tag"] == "hk-landing"));
+
+        // 组 JSON 保持不变 (filter 仍为 "hk", 未被增删或修改)
+        let group = outbounds.iter().find(|o| o["tag"] == "auto-hk").unwrap();
+        assert_eq!(group["filter"], "hk");
+        assert!(group.get("outbounds").is_none());
     }
 }
