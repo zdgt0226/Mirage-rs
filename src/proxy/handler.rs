@@ -63,6 +63,59 @@ pub(crate) fn classify_real_conn(
     }
 }
 
+pub(crate) fn record_real_failure_and_log(
+    pool: &crate::proxy::pool::WarmPool,
+    target: &str,
+    node_tag: &str,
+) {
+    if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(target) {
+        info!(
+            "节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s",
+            node_tag,
+            crate::proxy::pool::PENALIZE_AFTER_FAILURES,
+            crate::proxy::pool::PENALTY_DURATION.as_secs()
+        );
+    }
+}
+
+pub(crate) fn record_first_down(
+    pool: &crate::proxy::pool::WarmPool,
+    target: &str,
+    first_up: Option<std::time::Instant>,
+    now: std::time::Instant,
+    node_tag: &str,
+) {
+    let mut trigger_probe = false;
+    {
+        let mut stats = pool.stats.write().unwrap_or_else(|e| e.into_inner());
+        stats.record_real_success();
+        if let Some(up) = first_up {
+            if up <= now {
+                let ttfb_ms = now.duration_since(up).as_millis() as u64;
+                let baseline_ms = stats.median_latency_ms();
+                match crate::proxy::pool::is_slow_ttfb(ttfb_ms, baseline_ms) {
+                    Some(true) if stats.record_real_slow(target) => {
+                        trigger_probe = true;
+                    }
+                    Some(true) => {}
+                    Some(false) => {
+                        stats.record_real_fast();
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    if trigger_probe {
+        pool.trigger_probe();
+        info!(
+            "节点 {} 真实连接连续明显变慢 (涉及 {} 个不同目标), 触发补测",
+            node_tag,
+            crate::proxy::pool::SLOW_TRIGGER_COUNT
+        );
+    }
+}
+
 /**
  * [SOCKS5 客户端接入点]
  * 负责接收局域网设备或本机发来的代理请求，执行 SOCKS5 握手，
@@ -320,7 +373,11 @@ pub async fn proxy_tcp_target(
                 };
                 let (send, recv) = match mux.open_stream().await {
                     Ok(s) => s,
-                    Err(e) => { error!("Mirage QUIC open_stream {}: {}", target, e); return; }
+                    Err(e) => {
+                        error!("Mirage QUIC open_stream {}: {}", target, e);
+                        record_real_failure_and_log(pool, &target, node_tag);
+                        return;
+                    }
                 };
                 let token = crate::crypto::hello_auth::make_session_token(
                     pool.password(),
@@ -330,84 +387,153 @@ pub async fn proxy_tcp_target(
                 hdr.extend_from_slice(&token);
                 hdr.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
                 hdr.extend_from_slice(target_bytes);
-                let (mut send, mut recv) = (send, recv);
+                let (mut send, recv) = (send, recv);
                 if AsyncWriteExt::write_all(&mut send, &hdr).await.is_err() {
                     mux.check_conn_closed();
+                    record_real_failure_and_log(pool, &target, node_tag);
                     return;
                 }
                 if !initial_payload.is_empty() {
                     if AsyncWriteExt::write_all(&mut send, &initial_payload).await.is_err() {
                         mux.check_conn_closed();
+                        record_real_failure_and_log(pool, &target, node_tag);
                         return;
                     }
                     _conn.counter().up(initial_payload.len() as u64);
                 }
-                // 双向裸转发 (QUIC 加密), 带空闲超时 + 字节计数 (WebUI 统计), 对齐 Model-Y 路径的健壮性。
+                // 双向裸转发 (QUIC 加密), 带空闲超时 + 半关闭排空 (DRAIN_IDLE 30s) + 字节计数 (WebUI 统计)。
                 // 结束语义: 流 finish (读到 0) = 对端完整结束写, 传 FIN; 流 RESET / 连接断 / 超时 = 异常,
-                // 对另一端 RST (同 Model-Y 的 close_notify 判定)。QUIC 路径支持半关闭, 无需 local_eof。
+                // 对另一端 RST。QUIC 节点参与真实连接失败降级与变慢补测。
                 let local_fd = std::os::fd::AsRawFd::as_raw_fd(&local);
+                let local_aborted = std::sync::atomic::AtomicBool::new(false);
+                let local_eof = std::sync::atomic::AtomicBool::new(false);
                 let (mut lr, lw) = local.into_split();
                 let up_c = _conn.counter();
                 let dn_c = _conn.counter();
                 let clock = Arc::new(crate::proxy::IdleClock::new());
                 let up_clock = clock.clone();
                 let dn_clock = clock;
-                let upload = async move {
+
+                let up_done = crate::proxy::PeerDone::new();
+                let dn_done = crate::proxy::PeerDone::new();
+
+                let first_up = std::sync::OnceLock::new();
+                let first_down = std::sync::OnceLock::new();
+                if !initial_payload.is_empty() {
+                    let _ = first_up.set(std::time::Instant::now());
+                }
+
+                let upload = async {
                     use tokio::io::AsyncReadExt;
+                    let mut send = send;
                     let mut buf = vec![0u8; 65536];
                     let mut local_err = false;
                     loop {
-                        match crate::proxy::idle_timeout(&up_clock, relay_idle(), lr.read(&mut buf)).await {
-                            Ok(Ok(0)) => break,
-                            Ok(Err(_)) | Err(_) => {
-                                local_err = true;
+                        match crate::proxy::idle_timeout_drain(&up_clock, relay_idle(), crate::proxy::DRAIN_IDLE, &dn_done, lr.read(&mut buf)).await {
+                            Ok(Ok(0)) => {
+                                if !local_aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                                    local_eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
                                 break;
                             }
                             Ok(Ok(n)) => {
                                 up_clock.touch();
                                 if AsyncWriteExt::write_all(&mut send, &buf[..n]).await.is_err() { break; }
+                                let _ = first_up.set(std::time::Instant::now());
                                 up_c.up(n as u64);
+                            }
+                            Ok(Err(_)) => {
+                                if !local_aborted.load(std::sync::atomic::Ordering::SeqCst) {
+                                    local_eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                                }
+                                local_err = true;
+                                break;
+                            }
+                            Err(_) => {
+                                if dn_done.is_set() {
+                                    debug!("[QUIC] {} upload drain 超时", target);
+                                } else {
+                                    debug!("[QUIC] {} upload 空闲超时", target);
+                                }
+                                local_err = true;
+                                break;
                             }
                         }
                     }
+                    up_clock.touch();
+                    up_done.set();
                     if local_err {
-                        // 本地应用 RST / 空闲超时: 上行未正常结束, RESET 流 (服务端据此对目标 RST), 别 finish
-                        // 冒充完整结束 (同 Model-Y 空闲时不发 close_notify)。
+                        // 本地应用 RST / 空闲超时 / drain 超时: 上行未正常结束, RESET 流 (服务端据此对目标 RST), 别 finish
+                        // 冒充完整结束。
                         let _ = send.reset(quinn::VarInt::from_u32(0));
                     } else {
                         let _ = send.finish(); // 半关上行, 让对端 EOF
                     }
                 };
-                let download = async move {
+                let download = async {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+                    let mut recv = recv;
                     let mut lw = lw;
                     let mut buf = vec![0u8; 65536];
+                    let mut down_bytes: u64 = 0;
                     let mut truncated = false;
+                    let end_reason: DownloadEndReason;
                     loop {
-                        match crate::proxy::idle_timeout(&dn_clock, relay_idle(), AsyncReadExt::read(&mut recv, &mut buf)).await {
-                            Ok(Ok(0)) => break,
-                            Ok(Err(_)) | Err(_) => {
-                                truncated = true;
+                        match crate::proxy::idle_timeout_drain(&dn_clock, relay_idle(), crate::proxy::DRAIN_IDLE, &up_done, AsyncReadExt::read(&mut recv, &mut buf)).await {
+                            Ok(Ok(0)) => {
+                                end_reason = DownloadEndReason::CloseNotify;
                                 break;
                             }
                             Ok(Ok(n)) => {
+                                let now = std::time::Instant::now();
+                                if first_down.set(now).is_ok() {
+                                    record_first_down(pool, &target, first_up.get().copied(), now, node_tag);
+                                }
                                 dn_clock.touch();
-                                if lw.write_all(&buf[..n]).await.is_err() { break; }
+                                if lw.write_all(&buf[..n]).await.is_err() {
+                                    end_reason = DownloadEndReason::LocalWriteErr;
+                                    break;
+                                }
+                                down_bytes += n as u64;
                                 dn_c.down(n as u64);
+                            }
+                            Ok(Err(_)) => {
+                                truncated = true;
+                                end_reason = DownloadEndReason::PeerError;
+                                break;
+                            }
+                            Err(_) => {
+                                truncated = true;
+                                end_reason = DownloadEndReason::IdleTimeout;
+                                if up_done.is_set() {
+                                    debug!("[QUIC] {} download drain 超时", target);
+                                } else {
+                                    debug!("[QUIC] {} download 空闲超时", target);
+                                }
+                                break;
                             }
                         }
                     }
+                    dn_clock.touch();
+                    dn_done.set();
                     if truncated {
                         // 同 Model-Y 截断分支: RST 本地并叫醒 upload (读报错 → RESET 上行流, 不 finish),
                         // forget 跳过退回路径下写半程 drop 的 FIN。
+                        local_aborted.store(true, std::sync::atomic::Ordering::SeqCst);
                         crate::net_util::abort_socket(local_fd);
                         lw.forget();
                     } else {
                         let _ = lw.shutdown().await;
                     }
+                    (down_bytes, end_reason)
                 };
-                tokio::join!(upload, download);
+                let (_, (down_bytes, end_reason)) = tokio::join!(upload, download);
                 mux.check_conn_closed();
+
+                let local_eof_val = local_eof.load(std::sync::atomic::Ordering::SeqCst);
+                if classify_real_conn(down_bytes, end_reason, local_eof_val) == RealConnResult::Failure {
+                    record_real_failure_and_log(pool, &target, node_tag);
+                }
                 return;
             }
 
@@ -426,9 +552,7 @@ pub async fn proxy_tcp_target(
                     Ok(t) => t,
                     Err(e) => {
                         error!("Mirage outbound unavailable for {}: {}", target, e);
-                        if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target) {
-                            info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
-                        }
+                        record_real_failure_and_log(pool, &target, node_tag);
                         return;
                     }
                 };
@@ -449,9 +573,7 @@ pub async fn proxy_tcp_target(
                 Some(t) => t,
                 None => {
                     error!("Mirage outbound: {} 尝试 {} 条隧道首写均失败, 放弃", target, MAX_TUNNEL_ATTEMPTS);
-                    if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target) {
-                        info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
-                    }
+                    record_real_failure_and_log(pool, &target, node_tag);
                     return;
                 }
             };
@@ -601,35 +723,7 @@ pub async fn proxy_tcp_target(
                         Ok(Ok(data)) => {
                             let now = std::time::Instant::now();
                             if first_down.set(now).is_ok() {
-                                let mut trigger_probe = false;
-                                {
-                                    let mut stats = pool.stats.write().unwrap_or_else(|e| e.into_inner());
-                                    stats.record_real_success();
-                                    if let Some(&up) = first_up.get() {
-                                        if up <= now {
-                                            let ttfb_ms = now.duration_since(up).as_millis() as u64;
-                                            let baseline_ms = stats.median_latency_ms();
-                                            match crate::proxy::pool::is_slow_ttfb(ttfb_ms, baseline_ms) {
-                                                Some(true) if stats.record_real_slow(&target) => {
-                                                    trigger_probe = true;
-                                                }
-                                                Some(true) => {}
-                                                Some(false) => {
-                                                    stats.record_real_fast();
-                                                }
-                                                None => {}
-                                            }
-                                        }
-                                    }
-                                }
-                                if trigger_probe {
-                                    pool.trigger_probe();
-                                    info!(
-                                        "节点 {} 真实连接连续明显变慢 (涉及 {} 个不同目标), 触发补测",
-                                        node_tag,
-                                        crate::proxy::pool::SLOW_TRIGGER_COUNT
-                                    );
-                                }
+                                record_first_down(pool, &target, first_up.get().copied(), now, node_tag);
                             }
                             dn_clock.touch();
                             if let Some(b) = &dn_bkt {
@@ -718,10 +812,8 @@ pub async fn proxy_tcp_target(
 
             let local_eof_val = local_eof.load(std::sync::atomic::Ordering::SeqCst);
             // 真实连接成功与 TTFB 判定已在下行首字节时立即记录; 此处仅保留 0 字节错误失败判定。
-            if classify_real_conn(down_bytes, end_reason, local_eof_val) == RealConnResult::Failure
-                && pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(&target)
-            {
-                info!("节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s", node_tag, crate::proxy::pool::PENALIZE_AFTER_FAILURES, crate::proxy::pool::PENALTY_DURATION.as_secs());
+            if classify_real_conn(down_bytes, end_reason, local_eof_val) == RealConnResult::Failure {
+                record_real_failure_and_log(pool, &target, node_tag);
             }
         }
         OutboundNode::Direct { .. } => {
@@ -1049,5 +1141,47 @@ mod tests {
             classify_real_conn(0, DownloadEndReason::PeerError, true),
             RealConnResult::Ignore
         );
+    }
+
+    #[tokio::test]
+    async fn test_record_first_down() {
+        let pool = std::sync::Arc::new(crate::proxy::pool::WarmPool::new_with_connect_fn(
+            std::sync::Arc::new(crate::proxy::pool::PoolConfig {
+                server_host: "127.0.0.1".into(),
+                server_port: 8080,
+                password: "test_password".into(),
+                camouflage_host: "example.com".into(),
+                pool_size: 1,
+                underlying: None,
+                pfs: false,
+                transport: crate::config::Transport::Tcp,
+                quic_window_mb: 4,
+                quic_erasure_cc: true,
+                quic_sni: "example.com".into(),
+                quic_low_src_port: false,
+                quic_pre_packet: false,
+                quic_obfs: None,
+                quic_pin: None,
+            }),
+            std::sync::Arc::new(crate::proxy::pool::BrutalState {
+                configured_rate: None,
+                current_rate: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                base_rtt: None,
+                active_fds: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            }),
+            std::sync::Arc::new(|_, _| Box::pin(async { Err(anyhow::anyhow!("stub")) })),
+        ));
+
+        // 先记录一次失败
+        pool.stats.write().unwrap().record_real_failure("fail.example.com:443");
+        assert_eq!(pool.stats.read().unwrap().real_failures, 1);
+
+        let now = std::time::Instant::now();
+        let up = now - std::time::Duration::from_millis(10);
+        super::record_first_down(&pool, "example.com:443", Some(up), now, "test-node");
+
+        // 收到首字节后, 真实成功应重置失败计数
+        let stats = pool.stats.read().unwrap();
+        assert_eq!(stats.real_failures, 0);
     }
 }

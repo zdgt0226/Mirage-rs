@@ -1285,9 +1285,10 @@ async fn relay_authenticated_quic_stream(
     let stopped = stop_rx.clone(); // 自留一个接收端: 泵都退出后仍能读到是否异常结束
     let t0 = tokio::time::Instant::now();
     let last_active = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let any_eof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ((q_read, up_write, up_eof), (up_read, q_write, down_eof)) = tokio::join!(
-        quic_pump(q_read, up_write, dev_buckets.clone(), session_auth.clone(), true, stop_tx.clone(), stop_rx.clone(), t0, last_active.clone()),
-        quic_pump(up_read, q_write, dev_buckets, session_auth, false, stop_tx, stop_rx, t0, last_active),
+        quic_pump(q_read, up_write, dev_buckets.clone(), session_auth.clone(), true, stop_tx.clone(), stop_rx.clone(), t0, last_active.clone(), any_eof.clone()),
+        quic_pump(up_read, q_write, dev_buckets, session_auth, false, stop_tx, stop_rx, t0, last_active, any_eof),
     );
     // 异常结束 (流 RESET / 目标 RST / 超额 / 吊销 / 空闲): 未正常结束的方向以 RST 收尾, 别让 drop
     // 的隐式 finish / FIN 把截断伪装成完整结束 (quinn SendStream drop 会 finish)。已经 EOF 半关闭
@@ -1323,11 +1324,13 @@ async fn quic_pump<R, W>(
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     t0: tokio::time::Instant,
     last_active: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    any_eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> (R, W, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 32768];
     loop {
@@ -1345,13 +1348,19 @@ where
                     return (r, w, false);
                 }
             },
-            // 周期唤醒检查 auth.should_stop() 与双向总空闲超时:
+            // 周期唤醒检查 auth.should_stop() 与双向总空闲 / 半关闭排空超时:
             // 只要任一方向有数据流动 (如单向长下载), last_active 持续刷新不会误断;
-            // 两个方向均静默达 relay_idle 时发 stop 回收孤儿流。
+            // 若对侧已 EOF, 幸存方向空闲达 DRAIN_IDLE 即发 stop 回收;
+            // 若均未 EOF, 两个方向均静默达 relay_idle 时发 stop 回收孤儿流。
             _ = tokio::time::sleep(REVOKE_CHECK_INTERVAL) => {
-                let now_secs = t0.elapsed().as_secs();
-                let idle_secs = now_secs.saturating_sub(last_active.load(Ordering::Relaxed));
-                if idle_secs >= crate::proxy::relay_idle().as_secs() {
+                let now_ms = t0.elapsed().as_millis() as u64;
+                let idle_ms = now_ms.saturating_sub(last_active.load(Ordering::Acquire));
+                let idle = std::time::Duration::from_millis(idle_ms);
+                if any_eof.load(Ordering::Acquire) && idle >= crate::proxy::DRAIN_IDLE {
+                    let _ = stop_tx.send(true);
+                    return (r, w, false);
+                }
+                if idle >= crate::proxy::relay_idle() {
                     let _ = stop_tx.send(true);
                     return (r, w, false);
                 }
@@ -1360,9 +1369,11 @@ where
         };
         if n == 0 {
             let _ = w.shutdown().await; // EOF → 半关闭
+            last_active.store(t0.elapsed().as_millis() as u64, Ordering::Release);
+            any_eof.store(true, Ordering::Release);
             return (r, w, true);
         }
-        last_active.store(t0.elapsed().as_secs(), Ordering::Relaxed);
+        last_active.store(t0.elapsed().as_millis() as u64, Ordering::Release);
         if let Some(b) = &ip {
             if up { b.up.consume(n).await } else { b.down.consume(n).await }
         }
@@ -2013,5 +2024,52 @@ mod quic_gate_tests {
             assert_eq!(&out, b"ping", "第 {round} 条流应回显");
         }
         echo_task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_quic_pump_half_close_drain() {
+        let (client_r, _client_w) = tokio::io::duplex(1024);
+        let (_target_r, target_w) = tokio::io::duplex(1024);
+
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let t0 = tokio::time::Instant::now();
+        let last_active = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let any_eof = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let auth = SessionAuth::unlimited();
+
+        // 启动 pump: client_r -> target_w
+        let pump_task = tokio::spawn(quic_pump(
+            client_r,
+            target_w,
+            None,
+            auth,
+            false,
+            stop_tx,
+            stop_rx,
+            t0,
+            last_active.clone(),
+            any_eof.clone(),
+        ));
+
+        // 对侧未 EOF 时，推进 15s，pump 也不应因为 DRAIN_IDLE 退出 (仅比对 relay_idle)
+        tokio::time::advance(std::time::Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(!pump_task.is_finished());
+
+        // 对侧发生 EOF: 更新 last_active 并置位 any_eof
+        last_active.store(t0.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Release);
+        any_eof.store(true, std::sync::atomic::Ordering::Release);
+
+        // 推进 REVOKE_CHECK_INTERVAL (10s), 此时 idle (10s) >= DRAIN_IDLE (test 下 500ms)
+        tokio::time::advance(REVOKE_CHECK_INTERVAL).await;
+        tokio::task::yield_now().await;
+
+        let res = tokio::time::timeout(std::time::Duration::from_millis(500), pump_task)
+            .await
+            .expect("pump 应因 drain 超时退出")
+            .unwrap();
+        // res 为 (r, w, bool)，由于是 drain 超时退出，第三个返回值应为 false
+        assert!(!res.2);
     }
 }
