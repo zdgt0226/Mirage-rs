@@ -26,6 +26,13 @@ pub const NONCE_SIZE: usize = 12;
 pub const TAG_SIZE: usize = 16;
 pub const MAX_RECORD_SIZE: usize = 16384;
 
+pub const INNER_TYPE_TARGET_UNREACHABLE: u8 = 0x18;
+
+pub const TARGET_UNREACHABLE_CONNECT_FAILED: u8 = 0x01;
+pub const TARGET_UNREACHABLE_EGRESS_BLOCKED: u8 = 0x02;
+pub const TARGET_UNREACHABLE_ROUTING_REJECT: u8 = 0x03;
+pub const TARGET_UNREACHABLE_UPSTREAM_FAILED: u8 = 0x04;
+
 pub const SESSION_INFO_V2: &[u8] = b"mirage-session-v2";
 pub const SESSION_INFO_V2_PFS: &[u8] = b"mirage-session-v2-pfs";
 
@@ -220,11 +227,10 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         Ok(())
     }
 
-    /// 发送 TLS 1.3 close_notify 警告，优雅关闭连接
-    pub async fn send_close_notify(&mut self) -> Result<()> {
+    async fn send_control_record(&mut self, body: [u8; 2], inner_type: u8) -> Result<()> {
         self.buffer.clear();
-        self.buffer.extend_from_slice(b"\x01\x00"); // Alert: warning(1), close_notify(0)
-        self.buffer.push(0x15); // inner content type = alert (21)
+        self.buffer.extend_from_slice(&body);
+        self.buffer.push(inner_type);
 
         // nonce 用尽守卫 (与 send_data 一致): (key,nonce) 复用会毁 AEAD 安全。2^64 帧物理不可达,
         // 仅一致性 —— 关闭帧也不例外。
@@ -245,6 +251,17 @@ impl<W: AsyncWrite + Unpin> CryptoWriter<W> {
         self.writer.write_all(&self.buffer).await?;
         self.writer.flush().await?;
         Ok(())
+    }
+
+    /// 发送 TLS 1.3 close_notify 警告，优雅关闭连接
+    pub async fn send_close_notify(&mut self) -> Result<()> {
+        self.send_control_record([0x01, 0x00], 0x15).await
+    }
+
+    /// 发送经 AEAD 认证的"目标不可达"记录 (与 close_notify 逐字节同长, 仅密文不同), 告诉客户端
+    /// 连接失败源于目标或出站策略, 而非本服务端节点故障。
+    pub async fn send_target_unreachable(&mut self, reason: u8) -> Result<()> {
+        self.send_control_record([reason, 0x00], INNER_TYPE_TARGET_UNREACHABLE).await
     }
 
     /// 不发 close_notify, 直接关闭底层传输的写方向 (TCP 为 FIN): 告诉对端"本端异常结束写",
@@ -276,6 +293,26 @@ impl std::error::Error for PeerCloseNotify {}
 /// `recv_data*` 的错误是否为认证过的 close_notify (见 [`PeerCloseNotify`])。
 pub fn is_close_notify(e: &anyhow::Error) -> bool {
     e.downcast_ref::<PeerCloseNotify>().is_some()
+}
+
+/// 对端发来经 AEAD 认证的"目标不可达"记录 (inner type 0x18) —— 服务端连接最终目标失败时的通知。
+/// 客户端收到此错误即可区分"目标不可达"与"代理节点不可达", 避免因目标故障而误罚节点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTargetUnreachable {
+    pub reason: u8,
+}
+
+impl std::fmt::Display for PeerTargetUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer reported target unreachable (reason={:#04x})", self.reason)
+    }
+}
+
+impl std::error::Error for PeerTargetUnreachable {}
+
+/// `recv_data*` 的错误是否为认证过的"目标不可达"通知。若为是，返回 reason 码。
+pub fn target_unreachable_reason(e: &anyhow::Error) -> Option<u8> {
+    e.downcast_ref::<PeerTargetUnreachable>().map(|u| u.reason)
 }
 
 pub struct CryptoReader<R> {
@@ -404,6 +441,13 @@ impl<R: AsyncRead + Unpin> CryptoReader<R> {
             Ok(content_len)
         } else if inner_type == 0x15 {
             Err(anyhow::Error::new(PeerCloseNotify))
+        } else if inner_type == INNER_TYPE_TARGET_UNREACHABLE {
+            let reason = if content_len >= 1 {
+                pt[0]
+            } else {
+                TARGET_UNREACHABLE_CONNECT_FAILED
+            };
+            Err(anyhow::Error::new(PeerTargetUnreachable { reason }))
         } else {
             Err(anyhow!("unknown TLS inner content type {:#x}", inner_type))
         }
@@ -894,5 +938,91 @@ mod recv_borrow_tests {
         assert_eq!(sink.len(), 5 + body_len, "总长 = 5B header + body_len");
         // 未 padding: body = plaintext(5) + inner_type(1) + tag(16) = 22
         assert_eq!(body_len, 5 + 1 + TAG_SIZE, "无 padding body 长度");
+    }
+
+    // 线上格式硬约束: target_unreachable 记录长度必须与 close_notify 逐字节同长, 外层 5 字节头完全一致。
+    #[tokio::test]
+    async fn target_unreachable_record_wire_length_and_header_match_close_notify() {
+        let m = [0x55u8; 32];
+
+        let mut sink_close = Vec::new();
+        {
+            let mut w = CryptoWriter::new(&mut sink_close, &m, true);
+            w.send_close_notify().await.unwrap();
+        }
+
+        for reason in [
+            TARGET_UNREACHABLE_CONNECT_FAILED,
+            TARGET_UNREACHABLE_EGRESS_BLOCKED,
+            TARGET_UNREACHABLE_ROUTING_REJECT,
+            TARGET_UNREACHABLE_UPSTREAM_FAILED,
+            0x99, // 未知 reason
+        ] {
+            let mut sink_unreach = Vec::new();
+            {
+                let mut w = CryptoWriter::new(&mut sink_unreach, &m, true);
+                w.send_target_unreachable(reason).await.unwrap();
+            }
+
+            assert_eq!(
+                sink_unreach.len(),
+                sink_close.len(),
+                "target_unreachable (reason={:#x}) 记录长度必须与 close_notify 记录完全相同",
+                reason
+            );
+            // 5 字节外层头: 0x17 0x03 0x03 0x00 0x13 (19 bytes body: 2B body + 1B inner_type + 16B tag)
+            assert_eq!(
+                &sink_unreach[0..5],
+                &sink_close[0..5],
+                "外层 5 字节头必须逐字节相同"
+            );
+            assert_eq!(&sink_unreach[0..5], &[0x17, 0x03, 0x03, 0x00, 0x13]);
+            assert_eq!(sink_unreach.len(), 24, "整条记录总长必须为 24 字节");
+            // 密文内容不同
+            assert_ne!(sink_unreach[5..], sink_close[5..]);
+        }
+    }
+
+    #[tokio::test]
+    async fn target_unreachable_duplex_roundtrip() {
+        let m = [0x77u8; 32];
+        for reason in [
+            TARGET_UNREACHABLE_CONNECT_FAILED,
+            TARGET_UNREACHABLE_EGRESS_BLOCKED,
+            TARGET_UNREACHABLE_ROUTING_REJECT,
+            TARGET_UNREACHABLE_UPSTREAM_FAILED,
+            0x99, // 未知 reason
+        ] {
+            let (a, b) = duplex(1024);
+            let mut w = CryptoWriter::new(a, &m, true);
+            let mut r = CryptoReader::new(b, &m, false);
+
+            w.send_target_unreachable(reason).await.unwrap();
+            let err = r.recv_data().await.unwrap_err();
+
+            assert_eq!(
+                target_unreachable_reason(&err),
+                Some(reason),
+                "必须正确还原 target_unreachable reason"
+            );
+            assert!(
+                !is_close_notify(&err),
+                "target_unreachable 绝不能被误判为 close_notify"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn close_notify_is_not_target_unreachable() {
+        let m = [0x88u8; 32];
+        let (a, b) = duplex(1024);
+        let mut w = CryptoWriter::new(a, &m, true);
+        let mut r = CryptoReader::new(b, &m, false);
+
+        w.send_close_notify().await.unwrap();
+        let err = r.recv_data().await.unwrap_err();
+
+        assert!(is_close_notify(&err));
+        assert_eq!(target_unreachable_reason(&err), None);
     }
 }

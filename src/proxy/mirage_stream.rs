@@ -91,9 +91,17 @@ impl MirageStream {
 
 /// recv_data 的 Err: 只有认证过的 close_notify 视为流结束 (EOF); 其余 (含裸 TCP EOF) 是真错误,
 /// 不能当 EOF —— 否则路径注入的 FIN/RST 会把截断伪装成完整结束。
+/// 服务端发来 target_unreachable 信号时映射为 ConnectionRefused (出口拦截映射为 PermissionDenied)。
 fn recv_err_to_eof_or_io(e: anyhow::Error) -> io::Result<Option<Vec<u8>>> {
     if crate::crypto::aead::is_close_notify(&e) {
         Ok(None)
+    } else if let Some(reason) = crate::crypto::aead::target_unreachable_reason(&e) {
+        let kind = if reason == crate::crypto::aead::TARGET_UNREACHABLE_EGRESS_BLOCKED {
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::ConnectionRefused
+        };
+        Err(io::Error::new(kind, e.to_string()))
     } else {
         Err(io::Error::other(e.to_string()))
     }
@@ -370,5 +378,30 @@ mod tests {
         let mut got = Vec::new();
         assert!(ms.read_to_end(&mut got).await.is_err(), "无 close_notify 的结束必须报错");
         assert_eq!(&got, b"partial");
+    }
+
+    /// 服务端返回 target_unreachable 信号时, 映射为 ConnectionRefused (而不是 panic 或 EOF)。
+    #[tokio::test]
+    async fn target_unreachable_maps_to_connection_refused() {
+        let master = [0x5au8; 32];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (_r, w) = s.into_split();
+            let mut sw = CryptoWriter::new(w, &master, false);
+            sw.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await.unwrap();
+        });
+
+        let cs = TcpStream::connect(addr).await.unwrap();
+        let (r, w) = cs.into_split();
+        let reader = CryptoReader::new(TunnelRead::Tcp(r), &master, true);
+        let writer = CryptoWriter::new(TunnelWrite::Tcp(w), &master, true);
+        let mut ms = MirageStream::from_tunnel(Tunnel::new(reader, writer));
+        srv.await.unwrap();
+
+        let mut got = Vec::new();
+        let err = ms.read_to_end(&mut got).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 }
