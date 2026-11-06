@@ -70,6 +70,7 @@ pub(super) async fn handle_tcp_relay(
     // block 出站 / 路由选到服务端不可用的出站: 拒绝 (不回落直连)。
     if matches!(decision.target, super::server_router::ServerOutboundTarget::Reject) {
         debug!("Mirage Server: 目标 {} 路由至出站 `{}` (拒绝)", target, decision.tag);
+        let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_ROUTING_REJECT).await;
         return;
     }
     // 配了上游或路由选到上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
@@ -99,8 +100,10 @@ pub(super) async fn handle_tcp_relay(
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 super::warn_egress_blocked("Mirage Server TCP", &user, &target);
+                let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_EGRESS_BLOCKED).await;
             } else {
                 warn!("Mirage Server failed to connect to {}: {}", target, e);
+                let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
             }
             return;
         }
@@ -334,6 +337,7 @@ async fn relay_via_shadowsocks(
             Ok(v) => v,
             Err(e) => {
                 warn!("Mirage Server: 连接 SS 上游 {} 失败 ({}): {}", ss.addr(), target, e);
+                let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
                 return;
             }
         };
@@ -466,6 +470,7 @@ async fn relay_via_wireguard(
         Ok(t) => t,
         Err(e) => {
             warn!("Mirage Server: 建立 WireGuard 上游隧道失败: {}", e);
+            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
     };
@@ -477,6 +482,7 @@ async fn relay_via_wireguard(
         Some(hp) => hp,
         None => {
             warn!("Mirage Server: 目标 `{}` 不是合法 host:port", target);
+            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
             return;
         }
     };
@@ -484,6 +490,7 @@ async fn relay_via_wireguard(
         Ok(a) => a,
         Err(e) => {
             warn!("Mirage Server: 解析 {} 失败: {}", target, e);
+            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
     };
@@ -492,6 +499,7 @@ async fn relay_via_wireguard(
         Ok(s) => s,
         Err(e) => {
             warn!("Mirage Server: 经 WG 隧道连接 {} 失败: {}", target, e);
+            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
     };
@@ -773,5 +781,73 @@ mod tests {
             matches!(&res, Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset),
             "下行异常退出时上游必须收到 RST, 实得: {res:?}"
         );
+    }
+
+    /// 目标连接失败 (已关闭端口) 时, 服务端必须发送认证过的 target_unreachable 信号 (reason=0x01)
+    #[tokio::test]
+    async fn target_unreachable_signal_on_connect_failure() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        drop(up); // 立即释放端口, 使目标处于已关闭状态 (本地 SYN 必被拒绝)
+
+        let (mut cr, _cw, _relay) = spawn_relay(target).await;
+        let res = tokio::time::timeout(Duration::from_secs(5), cr.recv_data())
+            .await
+            .expect("中继不应挂死");
+        match res {
+            Err(e) => {
+                assert_eq!(
+                    crate::crypto::aead::target_unreachable_reason(&e),
+                    Some(crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED),
+                    "连不上目标时服务端必须发 target_unreachable(0x01)"
+                );
+            }
+            Ok(d) => panic!("不应收到正常数据: {d:?}"),
+        }
+    }
+
+    /// 出口被禁止 (SSRF / allow_local_targets=false) 时, 服务端必须发送 target_unreachable (reason=0x02)
+    #[tokio::test]
+    async fn target_unreachable_signal_on_egress_blocked() {
+        let master = [0x42u8; 32];
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let (r, w) = s.into_split();
+            let reader = CryptoReader::new(TunnelRead::Tcp(r), &master, false);
+            let writer = CryptoWriter::new(TunnelWrite::Tcp(w), &master, false);
+            // allow_local_targets = false, 目标 127.0.0.1 必触发 PermissionDenied
+            handle_tcp_relay(
+                "127.0.0.1:80".into(),
+                None,
+                reader,
+                writer,
+                None,
+                None,
+                "default".into(),
+                super::super::SessionAuth::unlimited(),
+                false,
+                None,
+            )
+            .await;
+        });
+        let c = TcpStream::connect(addr).await.unwrap();
+        let (r, _w) = c.into_split();
+        let mut cr = CryptoReader::new(r, &master, true);
+        let res = tokio::time::timeout(Duration::from_secs(5), cr.recv_data())
+            .await
+            .expect("中继不应挂死");
+        match res {
+            Err(e) => {
+                assert_eq!(
+                    crate::crypto::aead::target_unreachable_reason(&e),
+                    Some(crate::crypto::aead::TARGET_UNREACHABLE_EGRESS_BLOCKED),
+                    "SSRF/出站被禁时服务端必须发 target_unreachable(0x02)"
+                );
+            }
+            Ok(d) => panic!("不应收到正常数据: {d:?}"),
+        }
+        let _ = relay.await;
     }
 }

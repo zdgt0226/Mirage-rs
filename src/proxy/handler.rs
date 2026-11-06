@@ -37,6 +37,7 @@ pub(crate) fn human_bytes(n: u64) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DownloadEndReason {
     CloseNotify,
+    TargetUnreachable, // 服务端报告目标不可达
     PeerError,     // 对端错误结束 (裸 EOF、RST、解密失败)
     IdleTimeout,   // 空闲超时
     LocalWriteErr, // 本地写失败
@@ -739,6 +740,10 @@ pub async fn proxy_tcp_target(
                         Ok(Err(e)) => {
                             if crate::crypto::aead::is_close_notify(&e) {
                                 end_reason = DownloadEndReason::CloseNotify;
+                            } else if let Some(reason) = crate::crypto::aead::target_unreachable_reason(&e) {
+                                truncated = true;
+                                end_reason = DownloadEndReason::TargetUnreachable;
+                                debug!("服务端报告目标不可达 {} (reason={})", target, reason);
                             } else {
                                 truncated = true;
                                 end_reason = DownloadEndReason::PeerError;
@@ -1140,6 +1145,19 @@ mod tests {
         assert_eq!(
             classify_real_conn(0, DownloadEndReason::PeerError, true),
             RealConnResult::Ignore
+        );
+        // 0 字节但服务端报告目标不可达 (Ignore, 不把目标故障当节点故障)
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::TargetUnreachable, false),
+            RealConnResult::Ignore
+        );
+        assert_eq!(
+            classify_real_conn(0, DownloadEndReason::TargetUnreachable, true),
+            RealConnResult::Ignore
+        );
+        assert_eq!(
+            classify_real_conn(100, DownloadEndReason::TargetUnreachable, false),
+            RealConnResult::Success
         );
     }
 
