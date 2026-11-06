@@ -32,6 +32,28 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
+/// 告知客户端"目标不可达" (见 aead::send_target_unreachable) 并按正常关闭的顺序收尾。
+/// 只发记录就 drop 连接会丢信号: 客户端在目标头后已发来请求数据 (首包), 服务端未读就 close
+/// → 内核回 RST 而非 FIN, RST 先到时客户端接收缓冲里尚未读的这条记录被丢弃 (实测约 1/3 丢失)。
+/// 故: 发记录 → 关写方向 (FIN, 同正常结束"close_notify + FIN") → 读掉客户端残余数据直到其关闭
+/// (新老客户端收到该记录都会随即关隧道, 约一个 RTT), 最多等 `REJECT_LINGER` 后再 drop。
+const REJECT_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn reject_with_signal(
+    reader: &mut crate::crypto::aead::CryptoReader<crate::proxy::tunnel::TunnelRead>,
+    writer: &mut crate::crypto::aead::CryptoWriter<crate::proxy::tunnel::TunnelWrite>,
+    reason: u8,
+) {
+    if writer.send_target_unreachable(reason).await.is_err() {
+        return;
+    }
+    let _ = writer.shutdown_transport().await;
+    let _ = tokio::time::timeout(REJECT_LINGER, async {
+        while reader.recv_data_borrowed().await.is_ok() {}
+    })
+    .await;
+}
+
 pub(super) async fn handle_tcp_relay(
     target: String,
     initial_payload: Option<Vec<u8>>,
@@ -70,7 +92,7 @@ pub(super) async fn handle_tcp_relay(
     // block 出站 / 路由选到服务端不可用的出站: 拒绝 (不回落直连)。
     if matches!(decision.target, super::server_router::ServerOutboundTarget::Reject) {
         debug!("Mirage Server: 目标 {} 路由至出站 `{}` (拒绝)", target, decision.tag);
-        let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_ROUTING_REJECT).await;
+        reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_ROUTING_REJECT).await;
         return;
     }
     // 配了上游或路由选到上游 → 本服务端作中转站, 流量再经上游出口发出, 而非直连目标。
@@ -100,10 +122,10 @@ pub(super) async fn handle_tcp_relay(
         Err(e) => {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 super::warn_egress_blocked("Mirage Server TCP", &user, &target);
-                let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_EGRESS_BLOCKED).await;
+                reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_EGRESS_BLOCKED).await;
             } else {
                 warn!("Mirage Server failed to connect to {}: {}", target, e);
-                let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
+                reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
             }
             return;
         }
@@ -337,7 +359,7 @@ async fn relay_via_shadowsocks(
             Ok(v) => v,
             Err(e) => {
                 warn!("Mirage Server: 连接 SS 上游 {} 失败 ({}): {}", ss.addr(), target, e);
-                let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
+                reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
                 return;
             }
         };
@@ -470,7 +492,7 @@ async fn relay_via_wireguard(
         Ok(t) => t,
         Err(e) => {
             warn!("Mirage Server: 建立 WireGuard 上游隧道失败: {}", e);
-            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
+            reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
     };
@@ -482,7 +504,7 @@ async fn relay_via_wireguard(
         Some(hp) => hp,
         None => {
             warn!("Mirage Server: 目标 `{}` 不是合法 host:port", target);
-            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
+            reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
             return;
         }
     };
@@ -490,7 +512,7 @@ async fn relay_via_wireguard(
         Ok(a) => a,
         Err(e) => {
             warn!("Mirage Server: 解析 {} 失败: {}", target, e);
-            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
+            reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
     };
@@ -499,7 +521,7 @@ async fn relay_via_wireguard(
         Ok(s) => s,
         Err(e) => {
             warn!("Mirage Server: 经 WG 隧道连接 {} 失败: {}", target, e);
-            let _ = writer.send_target_unreachable(crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
+            reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
     };
