@@ -131,7 +131,11 @@ pub async fn handle_udp_associate_routed(
                         sinks.insert(tag.clone(), sink);
                     }
                     None => {
-                        warn!("[SOCKS-UDP] 出站 [{}] 无法建立 sink, 丢弃", tag);
+                        if node.is_group() {
+                            debug!("[SOCKS-UDP] outbound group [{}] cannot build sink, dropping", tag);
+                        } else {
+                            warn!("[SOCKS-UDP] 出站 [{}] 无法建立 sink, 丢弃", tag);
+                        }
                         continue;
                     }
                 }
@@ -300,7 +304,11 @@ async fn build_sink(
             Some((Sink::Mirage { writer }, Some(h.abort_handle())))
         }
         other => {
-            warn!("[SOCKS-UDP] 不支持的出站类型 {:?}", other.tag());
+            if other.is_group() {
+                debug!("[SOCKS-UDP] outbound group `{}` has no available member (all dead), cannot build sink", other.tag());
+            } else {
+                warn!("[SOCKS-UDP] 不支持的出站类型 {:?}", other.tag());
+            }
             None
         }
     }

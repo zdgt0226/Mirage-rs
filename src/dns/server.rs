@@ -1874,7 +1874,12 @@ impl DnsForwarder {
                         .await;
                     Some(resp.unwrap_or_else(|| make_nxdomain(req)))
                 }
-                _ => Some(make_nxdomain(req)),
+                other => {
+                    if other.is_group() {
+                        debug!("[DNS] outbound group `{}` has no available member (all dead), returning NXDOMAIN", other.tag());
+                    }
+                    Some(make_nxdomain(req))
+                }
             }
         } else {
             Some(make_nxdomain(req))

@@ -544,7 +544,11 @@ async fn setup_flow(
         OutboundNode::Mirage { pool, .. } => Route::Mirage(pool.clone()),
         OutboundNode::Wireguard { .. } => Route::Wireguard(leaf.clone()),
         other => {
-            warn!("[TPROXY-UDP] unsupported outbound leaf {:?}, dropping", other.tag());
+            if other.is_group() {
+                debug!("[TPROXY-UDP] outbound group `{}` has no available member (all dead), dropping", other.tag());
+            } else {
+                warn!("[TPROXY-UDP] unsupported outbound leaf {:?}, dropping", other.tag());
+            }
             return;
         }
     };

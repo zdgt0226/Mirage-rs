@@ -78,6 +78,14 @@ impl OutboundNode {
         }
     }
 
+    /// 是否为出站组 (Urltest / Fallback / Selector / LoadBalance)。
+    pub fn is_group(&self) -> bool {
+        matches!(
+            self,
+            Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. }
+        )
+    }
+
     /// 取(或首次建立)本出站的 WireGuard 隧道。
     ///
     /// 懒初始化: 第一条路由到此出站的连接才真正建隧道。失败**不缓存** ——
@@ -1586,5 +1594,37 @@ mod urltest_tests {
         // rtt (300) > floor (200) 时返回 rtt (300)
         rtt_ms.store(300, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(node.latency_ms("rtt"), Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_is_group() {
+        assert!(urltest(vec![], None).is_group());
+        assert!(OutboundNode::Fallback { tag: "fb".into(), children: vec![] }.is_group());
+        assert!(OutboundNode::Selector { tag: "sel".into(), children: vec![], current: Arc::new(RwLock::new(None)) }.is_group());
+        assert!(OutboundNode::LoadBalance { tag: "lb".into(), children: vec![], next: Arc::new(std::sync::atomic::AtomicU64::new(0)) }.is_group());
+        assert!(!OutboundNode::Direct { tag: "direct".into() }.is_group());
+        assert!(!OutboundNode::Block { tag: "block".into() }.is_group());
+        assert!(!mirage("m").is_group());
+    }
+
+    #[tokio::test]
+    async fn test_urltest_all_dead_returns_self_group() {
+        let a = mirage("a");
+        let b = mirage("b");
+        let pool_a = match a.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        let pool_b = match b.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        pool_a.stats.write().unwrap().record_failure();
+        pool_a.stats.write().unwrap().record_failure();
+        pool_a.stats.write().unwrap().record_failure();
+        pool_b.stats.write().unwrap().record_failure();
+        pool_b.stats.write().unwrap().record_failure();
+        pool_b.stats.write().unwrap().record_failure();
+        assert!(!a.is_healthy());
+        assert!(!b.is_healthy());
+
+        let g = urltest(vec![a.clone(), b.clone()], None);
+        let resolved = g.resolve_leaf();
+        assert!(resolved.is_group());
+        assert_eq!(resolved.tag(), g.tag());
     }
 }

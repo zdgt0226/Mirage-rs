@@ -452,9 +452,9 @@ pub async fn proxy_tcp_target(
                             }
                             Err(_) => {
                                 if dn_done.is_set() {
-                                    debug!("[QUIC] {} upload drain 超时", target);
+                                    debug!("[QUIC] {} upload drain timeout", target);
                                 } else {
-                                    debug!("[QUIC] {} upload 空闲超时", target);
+                                    debug!("[QUIC] {} upload idle timeout", target);
                                 }
                                 local_err = true;
                                 break;
@@ -507,9 +507,9 @@ pub async fn proxy_tcp_target(
                                 truncated = true;
                                 end_reason = DownloadEndReason::IdleTimeout;
                                 if up_done.is_set() {
-                                    debug!("[QUIC] {} download drain 超时", target);
+                                    debug!("[QUIC] {} download drain timeout", target);
                                 } else {
-                                    debug!("[QUIC] {} download 空闲超时", target);
+                                    debug!("[QUIC] {} download idle timeout", target);
                                 }
                                 break;
                             }
@@ -674,9 +674,9 @@ pub async fn proxy_tcp_target(
                         }
                         Err(_) => {
                             if dn_done.is_set() {
-                                debug!("[TUNNEL] {} upload drain 超时", target);
+                                debug!("[TUNNEL] {} upload drain timeout", target);
                             } else {
-                                debug!("[TUNNEL] {} upload 空闲超时", target);
+                                debug!("[TUNNEL] {} upload idle timeout", target);
                             }
                             break; // 空闲/drain 超时
                         }
@@ -754,9 +754,9 @@ pub async fn proxy_tcp_target(
                             truncated = true; // 空闲/drain超时
                             end_reason = DownloadEndReason::IdleTimeout;
                             if up_done.is_set() {
-                                debug!("[TUNNEL] {} download drain 超时", target);
+                                debug!("[TUNNEL] {} download drain timeout", target);
                             } else {
-                                debug!("[TUNNEL] {} download 空闲超时", target);
+                                debug!("[TUNNEL] {} download idle timeout", target);
                             }
                             break;
                         }
@@ -1025,7 +1025,11 @@ pub async fn proxy_tcp_target(
             // Drop connection
         }
         _ => {
-            tracing::warn!("Unexpected leaf type {:?} for {}, dropping", leaf.tag(), target);
+            if leaf.is_group() {
+                warn!("outbound group `{}` has no available member (all dead), dropping {}", leaf.tag(), target);
+            } else {
+                tracing::warn!("Unexpected leaf type {:?} for {}, dropping", leaf.tag(), target);
+            }
         }
     }
 }

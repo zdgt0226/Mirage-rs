@@ -196,6 +196,14 @@ pub(super) async fn handle_tcp_relay(
     let up_clock = clock.clone();
     let dn_clock = clock;
 
+    let up_done = Arc::new(crate::proxy::PeerDone::new());
+    let dn_done = Arc::new(crate::proxy::PeerDone::new());
+    let (up_done_up, dn_done_up) = (up_done.clone(), dn_done.clone());
+    let (up_done_dn, dn_done_dn) = (up_done, dn_done);
+
+    let target = Arc::new(target);
+    let (target_up, target_dn) = (target.clone(), target);
+
     let up_conn = _conn.counter();
     let upload = async move {
         let mut clean_end = false;
@@ -204,7 +212,7 @@ pub(super) async fn handle_tcp_relay(
             if up_auth.should_stop() {
                 break;
             }
-            match crate::proxy::idle_timeout(&up_clock, crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
+            match crate::proxy::idle_timeout_drain(&up_clock, crate::proxy::relay_idle(), crate::proxy::DRAIN_IDLE, &dn_done_up, reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
                     up_clock.touch();
                     // 限速叠加: 客户端 IP 桶与用户桶同时扣 (取更严)
@@ -225,7 +233,14 @@ pub(super) async fn handle_tcp_relay(
                     clean_end = crate::crypto::aead::is_close_notify(&e);
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if dn_done_up.is_set() {
+                        debug!("Mirage Server: {} upload drain timeout", target_up);
+                    } else {
+                        debug!("Mirage Server: {} upload idle timeout", target_up);
+                    }
+                    break;
+                }
             }
         }
         // upload 退出 (客户端 reader 报错或超时) → 强制 shutdown upstream,
@@ -243,6 +258,8 @@ pub(super) async fn handle_tcp_relay(
         // shutdown(Write) 永远多余 —— 且 download 刚抢到 fd、尚未 abort 时它会抢先发出 FIN。
         // fd 由读半程 drop 时关闭。
         up_write.forget();
+        up_clock.touch();
+        up_done_up.set();
     };
 
     let dn_conn = _conn.counter();
@@ -261,7 +278,7 @@ pub(super) async fn handle_tcp_relay(
             if dn_auth.should_stop() {
                 break;
             }
-            match crate::proxy::idle_timeout(&dn_clock, crate::proxy::relay_idle(), up_read.read(&mut buf)).await {
+            match crate::proxy::idle_timeout_drain(&dn_clock, crate::proxy::relay_idle(), crate::proxy::DRAIN_IDLE, &up_done_dn, up_read.read(&mut buf)).await {
                 Ok(Ok(0)) => {
                     // 上游自己 EOF 才算干净结束; fd 已被 upload 置 -1 说明这个 0 是 upload 退出
                     // 时 SHUT_RDWR 造成的 (隧道上行被断/截断), 下行同样不完整。
@@ -295,7 +312,15 @@ pub(super) async fn handle_tcp_relay(
                     }
                     dn_conn.down(total as u64);
                 }
-                _ => break,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if up_done_dn.is_set() {
+                        debug!("Mirage Server: {} download drain timeout", target_dn);
+                    } else {
+                        debug!("Mirage Server: {} download idle timeout", target_dn);
+                    }
+                    break;
+                }
             }
         }
         // 只有上游干净 EOF 才发加密 close_notify —— 它是客户端判断"下行完整"的唯一依据
@@ -314,6 +339,8 @@ pub(super) async fn handle_tcp_relay(
             // 对上游 RST 而非 FIN, 别把残缺上传当完整。
             abort_upstream(stop_fd_down);
         }
+        dn_clock.touch();
+        dn_done_dn.set();
     };
 
     tokio::join!(upload, download);
@@ -395,6 +422,14 @@ async fn relay_via_shadowsocks(
     let up_clock = clock.clone();
     let dn_clock = clock;
 
+    let up_done = Arc::new(crate::proxy::PeerDone::new());
+    let dn_done = Arc::new(crate::proxy::PeerDone::new());
+    let (up_done_up, dn_done_up) = (up_done.clone(), dn_done.clone());
+    let (up_done_dn, dn_done_dn) = (up_done, dn_done);
+
+    let target = Arc::new(target);
+    let (target_up, target_dn) = (target.clone(), target);
+
     let up_lim = limits.clone();
     let upload = async move {
         let mut clean_end = false;
@@ -403,7 +438,7 @@ async fn relay_via_shadowsocks(
             if up_lim.exhausted() {
                 break;
             }
-            match crate::proxy::idle_timeout(&up_clock, crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
+            match crate::proxy::idle_timeout_drain(&up_clock, crate::proxy::relay_idle(), crate::proxy::DRAIN_IDLE, &dn_done_up, reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
                     up_clock.touch();
                     if up_lim.charge(data.len(), true).await {
@@ -418,7 +453,14 @@ async fn relay_via_shadowsocks(
                     clean_end = crate::crypto::aead::is_close_notify(&e);
                     break;
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if dn_done_up.is_set() {
+                        debug!("Mirage Server: SS {} upload drain timeout", target_up);
+                    } else {
+                        debug!("Mirage Server: SS {} upload idle timeout", target_up);
+                    }
+                    break;
+                }
             }
         }
         // 只有 close_notify 才对 SS 上游 FIN, 否则 RST; 写上游失败保留接收队列 (见直连路径)。
@@ -428,6 +470,8 @@ async fn relay_via_shadowsocks(
             abort_upstream(stop_up);
         }
         up_write.into_inner().forget(); // 无条件, 见直连路径
+        up_clock.touch();
+        up_done_up.set();
     };
 
     let download = async move {
@@ -436,7 +480,7 @@ async fn relay_via_shadowsocks(
             if limits.exhausted() {
                 break;
             }
-            match crate::proxy::idle_timeout(&dn_clock, crate::proxy::relay_idle(), up_read.read_chunk()).await {
+            match crate::proxy::idle_timeout_drain(&dn_clock, crate::proxy::relay_idle(), crate::proxy::DRAIN_IDLE, &up_done_dn, up_read.read_chunk()).await {
                 Ok(Ok(chunk)) if chunk.is_empty() => {
                     // 上游 EOF; fd 已被 upload 置 -1 则是 upload 退出时的 SHUT_RDWR 所致, 不算干净 (同直连路径)。
                     clean_eof = stop_down.load(Ordering::SeqCst) >= 0;
@@ -451,7 +495,15 @@ async fn relay_via_shadowsocks(
                         break;
                     }
                 }
-                _ => break,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if up_done_dn.is_set() {
+                        debug!("Mirage Server: SS {} download drain timeout", target_dn);
+                    } else {
+                        debug!("Mirage Server: SS {} download idle timeout", target_dn);
+                    }
+                    break;
+                }
             }
         }
         if clean_eof {
@@ -460,6 +512,8 @@ async fn relay_via_shadowsocks(
         } else {
             abort_upstream(stop_down); // 下行异常先退出, 见直连路径
         }
+        dn_clock.touch();
+        dn_done_dn.set();
     };
 
     tokio::join!(upload, download);
@@ -547,13 +601,21 @@ async fn relay_via_wireguard(
     let up_clock = clock.clone();
     let dn_clock = clock;
 
+    let up_done = Arc::new(crate::proxy::PeerDone::new());
+    let dn_done = Arc::new(crate::proxy::PeerDone::new());
+    let (up_done_up, dn_done_up) = (up_done.clone(), dn_done.clone());
+    let (up_done_dn, dn_done_dn) = (up_done, dn_done);
+
+    let target = Arc::new(target);
+    let (target_up, target_dn) = (target.clone(), target);
+
     let up_lim = limits.clone();
     let upload = async move {
         loop {
             if up_lim.exhausted() {
                 break;
             }
-            match crate::proxy::idle_timeout(&up_clock, crate::proxy::relay_idle(), reader.recv_data_borrowed()).await {
+            match crate::proxy::idle_timeout_drain(&up_clock, crate::proxy::relay_idle(), crate::proxy::DRAIN_IDLE, &dn_done_up, reader.recv_data_borrowed()).await {
                 Ok(Ok(data)) => {
                     up_clock.touch();
                     if up_lim.charge(data.len(), true).await {
@@ -563,12 +625,22 @@ async fn relay_via_wireguard(
                         break;
                     }
                 }
-                _ => break,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if dn_done_up.is_set() {
+                        debug!("Mirage Server: WG {} upload drain timeout", target_up);
+                    } else {
+                        debug!("Mirage Server: WG {} upload idle timeout", target_up);
+                    }
+                    break;
+                }
             }
         }
         // 中止整条连接, 叫醒可能正阻塞在读上的 download。
         upload_done.store(true, Ordering::SeqCst);
         stop_up.abort();
+        up_clock.touch();
+        up_done_up.set();
     };
 
     let download = async move {
@@ -578,9 +650,11 @@ async fn relay_via_wireguard(
             if limits.exhausted() {
                 break;
             }
-            match crate::proxy::idle_timeout(
+            match crate::proxy::idle_timeout_drain(
                 &dn_clock,
                 crate::proxy::relay_idle(),
+                crate::proxy::DRAIN_IDLE,
+                &up_done_dn,
                 up_read.read(&mut buf),
             )
             .await
@@ -598,13 +672,23 @@ async fn relay_via_wireguard(
                         break;
                     }
                 }
-                _ => break,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    if up_done_dn.is_set() {
+                        debug!("Mirage Server: WG {} download drain timeout", target_dn);
+                    } else {
+                        debug!("Mirage Server: WG {} download idle timeout", target_dn);
+                    }
+                    break;
+                }
             }
         }
         if clean_eof {
             let _ = writer.send_close_notify().await; // 只在干净 EOF 时发, 见直连路径
         }
         stop_down.abort();
+        dn_clock.touch();
+        dn_done_dn.set();
     };
 
     tokio::join!(upload, download);
@@ -871,5 +955,36 @@ mod tests {
             Ok(d) => panic!("不应收到正常数据: {d:?}"),
         }
         let _ = relay.await;
+    }
+
+    /// 上游发完数据后干净 EOF, 客户端收到 close_notify 后不关隧道
+    /// → relay 任务应在约 DRAIN_IDLE (cfg!(test) 下 500ms) 后结束。
+    #[tokio::test]
+    async fn upstream_clean_eof_drain_timeout_when_client_keeps_tunnel_open() {
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = up.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = up.accept().await.unwrap();
+            s.write_all(b"response data").await.unwrap();
+            // drop(s) 发送 FIN，上游干净结束
+        });
+        let (mut cr, cw, relay) = spawn_relay(target).await;
+        let (got, clean) = read_until_end(&mut cr).await;
+        assert_eq!(got, b"response data");
+        assert!(clean, "上游干净 EOF 时服务端必须发 close_notify");
+
+        // 客户端收到 close_notify 后保持 cw 存活且不发数据 (不关隧道)
+        let start = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("服务端 relay 应在 DRAIN_IDLE (500ms) 后收尾结束, 不应挂起 1800s")
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(400) && elapsed <= Duration::from_secs(3),
+            "relay 结束耗时 ({:?}) 应接近 DRAIN_IDLE (500ms)",
+            elapsed
+        );
+        drop(cw);
     }
 }
