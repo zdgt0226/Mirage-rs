@@ -29,7 +29,7 @@ pub async fn handle_udp_associate_routed(
     let client_socket = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            error!("UDP relay: 绑客户端侧 socket 失败: {}", e);
+            error!("UDP relay: failed to bind client-side socket: {}", e);
             return;
         }
     };
@@ -43,7 +43,7 @@ pub async fn handle_udp_associate_routed(
     if local_tcp.write_all(&reply).await.is_err() {
         return;
     }
-    info!("UDP Relay (逐包路由) started on port {}", port);
+    info!("UDP Relay (per-packet routing) started on port {}", port);
 
     // 每个出站 tag 一个 sink; 懒创建。
     let mut sinks: HashMap<String, Sink> = HashMap::new();
@@ -113,7 +113,7 @@ pub async fn handle_udp_associate_routed(
                 let node = match snap.outbounds.get(&tag) {
                     Some(o) => o.resolve_leaf_active(),
                     None => {
-                        warn!("[SOCKS-UDP] 出站 [{}] 不存在, 丢弃", tag);
+                        warn!("[SOCKS-UDP] outbound [{}] does not exist, dropping", tag);
                         continue;
                     }
                 };
@@ -127,11 +127,15 @@ pub async fn handle_udp_associate_routed(
                             downlinks.retain(|h| !h.is_finished());
                             downlinks.push(ah);
                         }
-                        debug!("[SOCKS-UDP] 为出站 [{}] 建立 sink", tag);
+                        debug!("[SOCKS-UDP] building sink for outbound [{}]", tag);
                         sinks.insert(tag.clone(), sink);
                     }
                     None => {
-                        warn!("[SOCKS-UDP] 出站 [{}] 无法建立 sink, 丢弃", tag);
+                        if node.is_group() {
+                            debug!("[SOCKS-UDP] outbound group [{}] cannot build sink, dropping", tag);
+                        } else {
+                            warn!("[SOCKS-UDP] outbound [{}] cannot build sink, dropping", tag);
+                        }
                         continue;
                     }
                 }
@@ -148,7 +152,7 @@ pub async fn handle_udp_associate_routed(
 
             match sinks.get(&tag) {
                 Some(Sink::Block) => {
-                    debug!("[SOCKS-UDP] {} 命中 block 规则, 丢弃", host_for_log);
+                    debug!("[SOCKS-UDP] {} matched block rule, dropping", host_for_log);
                 }
                 Some(Sink::Direct { out }) => {
                     let dst = match &target {
@@ -167,7 +171,7 @@ pub async fn handle_udp_associate_routed(
                         }
                     };
                     if dst.is_ipv6() {
-                        warn!("[SOCKS-UDP] IPv6 目标 {} 暂不支持, 丢弃", dst);
+                        warn!("[SOCKS-UDP] IPv6 target {} is not supported yet, dropping", dst);
                         continue;
                     }
                     let _ = out.send_to(payload, dst).await;
@@ -263,7 +267,7 @@ async fn build_sink(
             let mut tunnel = match pool.get().await {
                 Ok(t) => t,
                 Err(e) => {
-                    debug!("UDP relay 获取暖池隧道失败: {:#}", e);
+                    debug!("UDP relay failed to get tunnel from warm pool: {:#}", e);
                     return None;
                 }
             };
@@ -300,7 +304,11 @@ async fn build_sink(
             Some((Sink::Mirage { writer }, Some(h.abort_handle())))
         }
         other => {
-            warn!("[SOCKS-UDP] 不支持的出站类型 {:?}", other.tag());
+            if other.is_group() {
+                debug!("[SOCKS-UDP] outbound group `{}` has no available member (all dead), cannot build sink", other.tag());
+            } else {
+                warn!("[SOCKS-UDP] unsupported outbound type {:?}", other.tag());
+            }
             None
         }
     }

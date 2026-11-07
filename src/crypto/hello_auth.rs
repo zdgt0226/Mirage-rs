@@ -132,7 +132,7 @@ impl TokenReplayCache {
         // 只有服务器系统时间 now 本身发生超出保留窗口的大幅回拨时才会触发。
         if current_bucket.saturating_add(retain_buckets) < *hwm {
             tracing::warn!(
-                "[REPLAY_CACHE] 检测到系统时钟大幅回拨: current_bucket={}, hwm={}, 重置缓存与 hwm",
+                "[REPLAY_CACHE] detected large system clock step backward: current_bucket={}, hwm={}, resetting cache and hwm",
                 current_bucket,
                 *hwm
             );

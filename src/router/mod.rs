@@ -676,7 +676,7 @@ impl RouterEngine {
     pub fn route(&self, req: RoutingRequest) -> OutboundTag {
         self.route_matched(&req).unwrap_or_else(|| {
             tracing::debug!(
-                "[ROUTE] {} :{}/{} → [{}] (默认出口, 无规则命中)",
+                "[ROUTE] {} :{}/{} -> [{}] (default outbound, no rule matched)",
                 req.domain.map(|d| d.to_string()).or_else(|| req.ip.map(|i| i.to_string())).unwrap_or_else(|| "?".into()),
                 req.port, req.protocol, self.default_outbound
             );
@@ -737,7 +737,7 @@ impl RouterEngine {
             let rule = &self.rule_table[id];
             if rule.matches_port(req.port) && rule.matches_extra(req) {
                 tracing::debug!(
-                    "[ROUTE] {} :{}/{} → [{}] (命中规则 #{})",
+                    "[ROUTE] {} :{}/{} -> [{}] (matched rule #{})",
                     req.domain
                         .map(|d| d.to_string())
                         .or_else(|| req.ip.map(|i| i.to_string()))

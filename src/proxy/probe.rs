@@ -61,8 +61,8 @@ async fn probe_inner(
     let t0 = Instant::now();
     let stream = timeout(dl, TcpStream::connect(&addr))
         .await
-        .map_err(|_| anyhow!("TCP 连接 {addr} 超时 ({timeout_secs}s, 黑洞路由/端口不通?)"))?
-        .map_err(|e| anyhow!("TCP 连接 {addr} 失败: {e}"))?;
+        .map_err(|_| anyhow!("TCP connect to {addr} timed out ({timeout_secs}s, blackhole route/port unreachable?)"))?
+        .map_err(|e| anyhow!("TCP connect to {addr} failed: {e}"))?;
     let tcp_ms = t0.elapsed().as_millis() as u64;
     let _ = stream.set_nodelay(true);
     let (mut read_half, mut write_half) = stream.into_split();
@@ -81,7 +81,7 @@ async fn probe_inner(
         write_half.flush().await?;
         let handshake = crate::proxy::pool::read_server_handshake(&mut read_half).await?;
         if handshake.server_random == [0u8; 32] {
-            anyhow::bail!("未能捕获有效的 ServerHello.random (全 0)");
+            anyhow::bail!("failed to capture valid ServerHello.random (all zeros)");
         }
         let tail = crate::crypto::tls_raw::build_fake_client_tail(handshake.cipher_suite);
         write_half.write_all(&tail).await?;
@@ -94,8 +94,8 @@ async fn probe_inner(
     let hs_dl = dl.max(Duration::from_secs(15));
     let (client_random, server_random) = timeout(hs_dl, hs)
         .await
-        .map_err(|_| anyhow!("TLS 伪装握手超时 ({}s)", hs_dl.as_secs()))?
-        .map_err(|e| anyhow!("TLS 伪装握手失败: {e}"))?;
+        .map_err(|_| anyhow!("TLS camouflage handshake timed out ({}s)", hs_dl.as_secs()))?
+        .map_err(|e| anyhow!("TLS camouflage handshake failed: {e}"))?;
 
     // 3. 派生会话密钥, 尝试解服务端首帧。解密成功 = 密钥正确 = 密码对且是真 Mirage 服务端。
     let (mut reader, mut writer) = crate::crypto::aead::create_crypto_pair(
@@ -182,7 +182,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let (host, port, path) = parse_http_probe_url(url)
-        .ok_or_else(|| anyhow!("探测 URL 非法 (需 http://host[:port]/path): {url}"))?;
+        .ok_or_else(|| anyhow!("probe URL invalid (requires http://host[:port]/path): {url}"))?;
     let target = format!("{host}:{port}");
     let mut header = Vec::with_capacity(2 + target.len());
     header.extend_from_slice(&(target.len() as u16).to_be_bytes());
@@ -201,7 +201,7 @@ where
     };
     let resp = timeout(dl, io)
         .await
-        .map_err(|_| anyhow!("穿隧道 HTTP 探测超时"))??;
+        .map_err(|_| anyhow!("through-tunnel HTTP probe timed out"))??;
     let ms = t.elapsed().as_millis() as u64;
     // 正常结束发 close_notify, 否则服务端按截断 RST 上游。
     let _ = writer.send_close_notify().await;
@@ -209,7 +209,7 @@ where
     if resp.starts_with(b"HTTP/") {
         Ok(ms)
     } else {
-        Err(anyhow!("穿隧道响应非 HTTP (出口异常?)"))
+        Err(anyhow!("through-tunnel response is not HTTP (abnormal egress?)"))
     }
 }
 

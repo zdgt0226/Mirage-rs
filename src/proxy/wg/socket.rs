@@ -96,7 +96,7 @@ impl WgTcpStream {
                 // connect 同步失败: 此时 WgTcpStream 尚未构造, Drop 不触发, 必须显式摘除刚
                 // add 的 socket, 否则它 (含 128KB 收发缓冲) 永留 SocketSet 泄漏。
                 g.sockets.remove(handle);
-                anyhow::bail!("WireGuard: 发起 TCP 连接失败: {e:?}");
+                anyhow::bail!("WireGuard: failed to initiate TCP connection: {e:?}");
             }
             handle
         };
@@ -107,7 +107,7 @@ impl WgTcpStream {
             Ok(r) => r?,
             // 超时后 stream 在此被 drop, Drop 会 close + 摘除 socket, 不留残骸。
             Err(_) => anyhow::bail!(
-                "WireGuard: 经隧道连接 {remote} 超时 ({}s)",
+                "WireGuard: connection to {remote} through tunnel timed out ({}s)",
                 CONNECT_TIMEOUT.as_secs()
             ),
         }
@@ -135,7 +135,7 @@ impl WgTcpStream {
                 tcp::State::Established => Poll::Ready(Ok(())),
                 // 对端拒绝或连接被重置
                 tcp::State::Closed => {
-                    Poll::Ready(Err(anyhow!("WireGuard: 目标拒绝连接 (TCP 已关闭)")))
+                    Poll::Ready(Err(anyhow!("WireGuard: target rejected connection (TCP closed)")))
                 }
                 _ => {
                     // 状态未就绪: 挂上 waker, 由 pump 的下一次 poll 唤醒。

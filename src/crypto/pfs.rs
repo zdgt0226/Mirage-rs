@@ -42,7 +42,7 @@ impl Ephemeral {
     pub fn generate() -> anyhow::Result<Self> {
         let mut rng = rand::rng();
         let hidden = elligator2::generate(&mut rng)
-            .ok_or_else(|| anyhow::anyhow!("Elligator2 X25519 临时密钥生成失败 (RNG 异常)"))?;
+            .ok_or_else(|| anyhow::anyhow!("failed to generate Elligator2 X25519 ephemeral key (RNG error)"))?;
         let public = *hidden.representative();
         Ok(Self { hidden, public })
     }
@@ -56,7 +56,7 @@ impl Ephemeral {
         let peer_pk = x25519_dalek::PublicKey::from(peer_point);
         let shared = self.hidden.diffie_hellman(&peer_pk);
         if !shared.was_contributory() {
-            anyhow::bail!("X25519 ECDH 协商失败: 共享秘密非 contributory (低阶点拒绝)");
+            anyhow::bail!("X25519 ECDH agreement failed: non-contributory shared secret (low-order point rejected)");
         }
         let mut out = [0u8; 32];
         out.copy_from_slice(shared.as_bytes());

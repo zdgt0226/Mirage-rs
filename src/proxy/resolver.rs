@@ -161,7 +161,7 @@ pub async fn keep_warm_dns(host: &str, port: u16) {
         .await
         .is_err()
     {
-        warn!("伪装站 DNS 保活首次解析超时 ({:?}), 启动不受阻; 后台继续重试", KEEP_WARM_FIRST_WAIT);
+        warn!("Camouflage site DNS keepalive initial resolve timed out ({:?}), startup not blocked; will retry in background", KEEP_WARM_FIRST_WAIT);
     }
 
     static STARTED: OnceLock<()> = OnceLock::new();
@@ -195,7 +195,7 @@ pub async fn keep_warm_dns(host: &str, port: u16) {
                     }
                 }
                 None => warn!(
-                    "伪装站 DNS 保活已连续失败超 {}s, 不再延长旧 IP (等解析恢复)",
+                    "Camouflage site DNS keepalive continuously failed for over {}s, no longer extending stale IP (waiting for DNS recovery)",
                     DNS_STALE_CAP.as_secs()
                 ),
             }
@@ -371,7 +371,7 @@ async fn resolve_via_tcp(host: &str, upstream: SocketAddr) -> io::Result<Vec<IpA
         return Err(last_err.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("DNS-over-TCP: {host} 无 A/AAAA 记录 (上游 {upstream})"),
+                format!("DNS-over-TCP: {host} has no A/AAAA records (upstream {upstream})"),
             )
         }));
     }
@@ -381,7 +381,7 @@ async fn resolve_via_tcp(host: &str, upstream: SocketAddr) -> io::Result<Vec<IpA
 /// 一次 DNS-over-TCP 查询 (RFC 7766: 连接 → [2B 长度][报文] → 收 [2B 长度][响应])。
 async fn query_one(host: &str, qtype: u16, upstream: SocketAddr) -> io::Result<Vec<IpAddr>> {
     let query = build_dns_query(host, qtype)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("非法域名: {host}")))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid domain: {host}")))?;
     // TXID 在 query 头 2 字节 (build_dns_query 生成), 收响应时用它校验 ID 防串号/注入。
     let tx = u16::from_be_bytes([query[0], query[1]]);
     let fut = async {
@@ -398,7 +398,7 @@ async fn query_one(host: &str, qtype: u16, upstream: SocketAddr) -> io::Result<V
     };
     tokio::time::timeout(DNS_TCP_TIMEOUT, fut)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("DNS-over-TCP {upstream} 超时")))?
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("DNS-over-TCP {upstream} timed out")))?
 }
 
 /// 构造一个标准 DNS 查询报文 (RD=1, QDCOUNT=1, 单问题)。域名 label 空或 >63 → None。

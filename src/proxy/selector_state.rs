@@ -23,7 +23,7 @@ pub fn load_selector_choices(path: &str) -> HashMap<String, String> {
         Ok(map) => map,
         Err(e) => {
             tracing::warn!(
-                "[SELECTOR] 解析持久化选择文件 `{path}` 失败 ({e})，忽略损坏文件并回落默认"
+                "[SELECTOR] failed to parse persisted selection file `{path}` ({e}), ignoring corrupted file and falling back to default"
             );
             HashMap::new()
         }
@@ -72,7 +72,7 @@ fn write_selector_choices_locked(path: &str, map: &HashMap<String, String>) {
     let json = match serde_json::to_string_pretty(map) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("[SELECTOR] 序列化持久化选择失败: {e}");
+            tracing::warn!("[SELECTOR] failed to serialize persisted selections: {e}");
             return;
         }
     };
@@ -133,7 +133,7 @@ fn write_selector_choices_locked(path: &str, map: &HashMap<String, String>) {
     })();
 
     if let Err(e) = res {
-        tracing::warn!("[SELECTOR] 写入持久化选择文件 `{resolved}` 失败 (不影响代理转发): {e}");
+        tracing::warn!("[SELECTOR] failed to write persisted selection file `{resolved}` (proxy forwarding unaffected): {e}");
         let _ = std::fs::remove_file(&tmp);
     }
 }

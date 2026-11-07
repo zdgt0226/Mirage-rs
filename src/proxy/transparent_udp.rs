@@ -199,7 +199,7 @@ fn build_main_socket(bind_addr: SocketAddrV4) -> anyhow::Result<UdpSocket> {
         let _ = setsockopt(&fd, sockopt::RcvBuf, &MAIN_RCVBUF);
     }
     if let Ok(n) = getsockopt(&fd, sockopt::RcvBuf) {
-        info!("Transparent UDP 主 socket 接收缓冲 {} KB", n / 1024);
+        info!("Transparent UDP main socket recv buffer {} KB", n / 1024);
     }
     bind(fd.as_raw_fd(), &SockaddrIn::from(bind_addr))?;
     let std_sock = unsafe { std::net::UdpSocket::from_raw_fd(fd.into_raw_fd()) };
@@ -346,7 +346,7 @@ pub async fn start_transparent_udp(
     // socket 并 sk_assign, 不依赖 sockmap。把 UDP socket 塞 SOCKMAP 在多数内核 EINVAL,
     // 若 `?` 硬失败会 drop main socket → tc_divert 无 socket 可 assign、UDP 全断。
     if let Err(e) = transparent_engine.lock().await.register_udp_listener(&main) {
-        warn!("sk_lookup register_udp_listener 失败 (不影响 tc_divert 转发拦截): {}", e);
+        warn!("sk_lookup register_udp_listener failed (does not affect tc_divert forwarding interception): {}", e);
     }
     info!("Transparent UDP proxy on {}", listen_addr);
 
@@ -399,7 +399,7 @@ pub async fn start_transparent_udp(
             let n = CAP_DROPS.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(1000) {
                 warn!(
-                    "[TPROXY-UDP] 并发流到上限 {} , 丢弃新流 (累计丢 {})",
+                    "[TPROXY-UDP] concurrent flows reached limit {}, dropping new flow (cumulative dropped {})",
                     MAX_FLOWS,
                     n + 1
                 );
@@ -544,7 +544,11 @@ async fn setup_flow(
         OutboundNode::Mirage { pool, .. } => Route::Mirage(pool.clone()),
         OutboundNode::Wireguard { .. } => Route::Wireguard(leaf.clone()),
         other => {
-            warn!("[TPROXY-UDP] unsupported outbound leaf {:?}, dropping", other.tag());
+            if other.is_group() {
+                debug!("[TPROXY-UDP] outbound group `{}` has no available member (all dead), dropping", other.tag());
+            } else {
+                warn!("[TPROXY-UDP] unsupported outbound leaf {:?}, dropping", other.tag());
+            }
             return;
         }
     };
@@ -589,7 +593,7 @@ async fn setup_flow(
                 },
                 Some(UdpTarget::Ip(ip)) => SocketAddr::V4(SocketAddrV4::new(*ip, port)),
                 None => {
-                    warn!("[TPROXY-UDP] 淘汰的 fake-ip {} 无域名可恢复, dropping", fake_ip);
+                    warn!("[TPROXY-UDP] evicted fake-ip {} has no domain to recover, dropping", fake_ip);
                     return;
                 }
             };
@@ -618,7 +622,7 @@ async fn setup_flow(
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Direct(out.clone()) },
             );
             guard.committed_id = Some(flow_id);
-            debug!("[TPROXY-UDP] new Direct flow {} → {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
+            debug!("[TPROXY-UDP] new Direct flow {} -> {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
 
             let _ = out.send(&first_payload).await;
             let mut dbuf = vec![0u8; UDP_BUF];
@@ -643,7 +647,7 @@ async fn setup_flow(
             let tunnel = match node.wg_tunnel().await {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("[TPROXY-UDP/WG] 建立隧道失败: {}", e);
+                    error!("[TPROXY-UDP/WG] failed to establish tunnel: {}", e);
                     return;
                 }
             };
@@ -652,25 +656,25 @@ async fn setup_flow(
                     match crate::proxy::wg::resolve_target(&tunnel, d, port).await {
                         Ok(sa) => sa,
                         Err(e) => {
-                            debug!("[TPROXY-UDP/WG] 解析 {} 失败: {}", d, e);
+                            debug!("[TPROXY-UDP/WG] failed to resolve {}: {}", d, e);
                             return;
                         }
                     }
                 }
                 Some(UdpTarget::Ip(ip)) => SocketAddr::V4(SocketAddrV4::new(*ip, port)),
                 None => {
-                    warn!("[TPROXY-UDP/WG] 淘汰的 fake-ip {} 无域名可恢复, dropping", fake_ip);
+                    warn!("[TPROXY-UDP/WG] evicted fake-ip {} has no domain to recover, dropping", fake_ip);
                     return;
                 }
             };
             if real.is_ipv6() {
-                warn!("[TPROXY-UDP/WG] IPv6 目标 {} 暂不支持, dropping", real);
+                warn!("[TPROXY-UDP/WG] IPv6 target {} is not supported yet, dropping", real);
                 return;
             }
             let sock = match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
-                    error!("[TPROXY-UDP/WG] 隧道内绑 UDP 失败: {}", e);
+                    error!("[TPROXY-UDP/WG] failed to bind UDP in tunnel: {}", e);
                     return;
                 }
             };
@@ -686,7 +690,7 @@ async fn setup_flow(
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Wireguard(sock.clone(), real) },
             );
             guard.committed_id = Some(flow_id);
-            debug!("[TPROXY-UDP/WG] new flow {} → {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
+            debug!("[TPROXY-UDP/WG] new flow {} -> {} (real {})", client, domain.as_deref().unwrap_or("?"), real);
 
             let _ = sock.send_to(&first_payload, real);
             // buf 必须 ≥ 隧道 MTU: UDP 是逐数据报的, 缓冲不足会截断而不是分片。
@@ -712,12 +716,12 @@ async fn setup_flow(
             let target = match target {
                 Some(UdpTarget::Domain(d)) if d.len() <= 255 => UdpTarget::Domain(d),
                 Some(UdpTarget::Domain(_)) => {
-                    warn!("[TPROXY-UDP] Mirage 域名过长, dropping");
+                    warn!("[TPROXY-UDP] Mirage domain too long, dropping");
                     return;
                 }
                 Some(UdpTarget::Ip(ip)) => UdpTarget::Ip(ip),
                 None => {
-                    warn!("[TPROXY-UDP] Mirage 淘汰的 fake-ip {} 无目标, dropping", fake_ip);
+                    warn!("[TPROXY-UDP] Mirage evicted fake-ip {} has no target, dropping", fake_ip);
                     return;
                 }
             };
@@ -735,7 +739,7 @@ async fn setup_flow(
                 let mtun = match crate::proxy::udp_mux::get_mux_tunnel(&pool, &key).await {
                     Ok(t) => t,
                     Err(e) => {
-                        error!("[TPROXY-UDP] Mirage-MUX 隧道不可用: {}", e);
+                        error!("[TPROXY-UDP] Mirage-MUX tunnel unavailable: {}", e);
                         return;
                     }
                 };
@@ -751,7 +755,7 @@ async fn setup_flow(
                 let (_sid_guard, got_downlink) = match mtun.try_register(sid, reply, client) {
                     Some(v) => v,
                     None => {
-                        debug!("[TPROXY-UDP] Mirage-MUX 单隧道 sid 到上限, 丢弃 (客户端回落 TCP)");
+                        debug!("[TPROXY-UDP] Mirage-MUX per-tunnel sid reached cap, dropping (client will fall back to TCP)");
                         return;
                     }
                 };
@@ -761,7 +765,7 @@ async fn setup_flow(
                     FlowSlot::Ready { id: flow_id, sink: FlowSink::Mirage(tx.clone()) },
                 );
                 guard.committed_id = Some(flow_id);
-                debug!("[TPROXY-UDP] new Mirage-MUX flow {} → {} (sid {})", client, tdesc, sid);
+                debug!("[TPROXY-UDP] new Mirage-MUX flow {} -> {} (sid {})", client, tdesc, sid);
                 let _ = tx.try_send(first_payload);
 
                 let shared = mtun.uplink();
@@ -819,7 +823,7 @@ async fn setup_flow(
             let _udp_permit = match MirageUdpPermit::try_acquire() {
                 Some(p) => p,
                 None => {
-                    debug!("[TPROXY-UDP] Mirage-UDP 流到子上限 {}, 丢弃 (客户端回落 TCP)", MAX_MIRAGE_UDP_FLOWS);
+                    debug!("[TPROXY-UDP] Mirage-UDP flows reached sub-cap {}, dropping (client will fall back to TCP)", MAX_MIRAGE_UDP_FLOWS);
                     return;
                 }
             };
@@ -845,7 +849,7 @@ async fn setup_flow(
                 FlowSlot::Ready { id: flow_id, sink: FlowSink::Mirage(tx.clone()) },
             );
             guard.committed_id = Some(flow_id);
-            debug!("[TPROXY-UDP] new Mirage flow {} → {} (via tunnel)", client, tdesc);
+            debug!("[TPROXY-UDP] new Mirage flow {} -> {} (via tunnel)", client, tdesc);
 
             // 首包入 channel, 由 uplink 统一封帧
             let _ = tx.try_send(first_payload);
@@ -934,9 +938,9 @@ async fn setup_flow(
                         std::sync::atomic::AtomicBool::new(false);
                     if !HINTED.swap(true, Ordering::Relaxed) {
                         warn!(
-                            "[TPROXY-UDP] UDP 流整段无下行后拆流 —— 服务端 VPS 很可能过滤出向 UDP \
-                             (QUIC/UDP:443 常见), 客户端会回落 TCP。若大量 QUIC 站点如此, 检查服务端 \
-                             VPS 的 UDP 出站策略 (廉价 VPS 防滥用常封 UDP)。"
+                            "[TPROXY-UDP] UDP flow torn down after zero downlink traffic - server VPS likely filters outbound UDP \
+                             (common for QUIC/UDP:443), client will fall back to TCP. If this occurs on many QUIC sites, check \
+                             the server VPS outbound UDP policy (cheap VPS often block UDP to prevent abuse)."
                         );
                     }
                 }
@@ -951,7 +955,7 @@ async fn setup_flow(
 
     // teardown (session 移除 + reply refs--) 由 FlowGuard::drop 保证执行。
     debug!(
-        "[TPROXY-UDP] flow {:?} 关闭 (↓{}, 存活 {:.1}s)",
+        "[TPROXY-UDP] flow {:?} closed (down {}, alive {:.1}s)",
         key,
         human_bytes(down_ctr.load(Ordering::Relaxed)),
         t_start.elapsed().as_secs_f64()

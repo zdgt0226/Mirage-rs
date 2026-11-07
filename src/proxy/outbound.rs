@@ -78,13 +78,21 @@ impl OutboundNode {
         }
     }
 
+    /// 是否为出站组 (Urltest / Fallback / Selector / LoadBalance)。
+    pub fn is_group(&self) -> bool {
+        matches!(
+            self,
+            Self::Urltest { .. } | Self::Fallback { .. } | Self::Selector { .. } | Self::LoadBalance { .. }
+        )
+    }
+
     /// 取(或首次建立)本出站的 WireGuard 隧道。
     ///
     /// 懒初始化: 第一条路由到此出站的连接才真正建隧道。失败**不缓存** ——
     /// 网络暂时不可达时下一条连接应能重试, 而不是把一次失败钉死到进程结束。
     pub async fn wg_tunnel(&self) -> anyhow::Result<Arc<crate::proxy::wg::tunnel::WgTunnel>> {
         let Self::Wireguard { cfg, tunnel, .. } = self else {
-            anyhow::bail!("内部错误: 对非 WireGuard 出站请求隧道");
+            anyhow::bail!("internal error: requested tunnel on non-WireGuard outbound");
         };
         tunnel
             .get_or_try_init(|| async {
@@ -301,13 +309,13 @@ impl OutboundNode {
                 Ok(OutStream::Direct(s))
             }
             OutboundNode::Block { tag } => {
-                anyhow::bail!("outbound `{tag}` 是 block, 拒绝连接 {target}")
+                anyhow::bail!("outbound `{tag}` is block, rejecting connection to {target}")
             }
             OutboundNode::Mirage { pool, .. } => {
                 let hp = target.host_port();
                 let tb = hp.as_bytes();
                 if tb.is_empty() || tb.len() > 512 {
-                    anyhow::bail!("target 长度非法 ({} 字节, 需 1..=512)", tb.len());
+                    anyhow::bail!("invalid target length ({} bytes, must be 1..=512)", tb.len());
                 }
                 // Model X 精简 (transport=quic): 共享连接开一条流, 写 [token(32B)][2B len][host:port],
                 // 之后裸转发 (QUIC 自加密, 无内层 fake-TLS/AEAD)。
@@ -364,7 +372,7 @@ impl OutboundNode {
                 Ok(OutStream::Ss(crate::proxy::ss_stream::SsStream::new(reader, writer)))
             }
             // resolve_leaf 已把组解到叶子; 仍是组 = 无健康成员可用。
-            other => anyhow::bail!("outbound `{}` 无可用叶子出站, 无法连接 {target}", other.tag()),
+            other => anyhow::bail!("outbound `{}` has no available leaf outbound, cannot connect to {target}", other.tag()),
         }
     }
 }
@@ -388,13 +396,13 @@ impl Address {
         // 否则拆 host:port ([v6]:port 或域名:port)。
         let (host, port) = if let Some(rest) = s.strip_prefix('[') {
             rest.split_once("]:")
-                .ok_or_else(|| anyhow::anyhow!("非法 [v6]:port: {s}"))?
+                .ok_or_else(|| anyhow::anyhow!("invalid [v6]:port: {s}"))?
         } else {
             s.rsplit_once(':')
-                .ok_or_else(|| anyhow::anyhow!("target 缺端口 (需 host:port): {s}"))?
+                .ok_or_else(|| anyhow::anyhow!("target missing port (requires host:port): {s}"))?
         };
         if host.is_empty() {
-            anyhow::bail!("target host 为空: {s}");
+            anyhow::bail!("target host is empty: {s}");
         }
         Ok(Address::Domain(host.to_string(), port.parse()?))
     }
@@ -619,14 +627,14 @@ impl OutboundManager {
                                 .as_deref()
                                 .map(|s| {
                                     s.parse::<std::net::IpAddr>()
-                                        .map_err(|_| anyhow::anyhow!("WireGuard dns `{s}` 不是合法 IP"))
+                                        .map_err(|_| anyhow::anyhow!("WireGuard dns `{s}` is not a valid IP"))
                                 })
                                 .transpose()?,
                         })
                     })();
                     match built {
                         Ok(wg) => {
-                            info!("出站 `{}`: WireGuard → {} (隧道内地址 {}, MTU {})",
+                            info!("outbound `{}`: WireGuard -> {} (in-tunnel address {}, MTU {})",
                                   tag, wg.endpoint, wg.address, wg.mtu);
                             outbounds.insert(tag.clone(), Arc::new(OutboundNode::Wireguard {
                                 tag: tag.clone(),
@@ -636,8 +644,8 @@ impl OutboundManager {
                         }
                         Err(e) => {
                             tracing::error!(
-                                "出站 `{}` 的 WireGuard 配置有误, 已降级为 block (拒绝连接) \
-                                 而非直连 —— 避免本该走隧道的流量从本机 IP 裸奔出去。原因: {}",
+                                "outbound `{}` has invalid WireGuard configuration, downgraded to block (rejecting connection) \
+                                 rather than direct - preventing traffic intended for tunnel from leaking out via local IP. Reason: {}",
                                 tag, e
                             );
                             outbounds.insert(tag.clone(), Arc::new(OutboundNode::Block { tag: tag.clone() }));
@@ -734,7 +742,7 @@ impl OutboundManager {
                 let child_tags = match oc.group_members(&cfg.outbounds) {
                     Ok(tags) => tags,
                     Err(e) => {
-                        warn!("出站组 '{}' filter 正则非法: {}, 退回仅使用显式 outbounds", tag, e);
+                        warn!("outbound group '{}' filter regex invalid: {}, falling back to explicit outbounds only", tag, e);
                         explicit_outbounds.clone()
                     }
                 };
@@ -753,7 +761,7 @@ impl OutboundManager {
                 if resolved {
                     if oc.filter().is_some() {
                         // group_members 以显式列表为前缀只追加, 差值即 filter 额外加入的节点数
-                        info!("出站组 '{}' filter 额外加入 {} 个节点", tag, child_tags.len().saturating_sub(explicit_outbounds.len()));
+                        info!("outbound group '{}' filter added {} additional node(s)", tag, child_tags.len().saturating_sub(explicit_outbounds.len()));
                     }
                     if hc_interval > 0 && !hc_url.is_empty() {
                         for child in &children {
@@ -818,7 +826,7 @@ impl OutboundManager {
             if !progress {
                 // 配置错误 (未解析 / 循环出站组): 返回诊断错误而非 panic 杀进程。
                 anyhow::bail!(
-                    "outbound 组无法解析或存在循环引用: {:?} (检查这些 group 的 children 是否都指向已定义的出站, 且无相互/自我引用)",
+                    "outbound group unresolved or circular reference exists: {:?} (check if these groups' children point to defined outbounds without mutual/self-references)",
                     next_round
                 );
             }
@@ -1586,5 +1594,37 @@ mod urltest_tests {
         // rtt (300) > floor (200) 时返回 rtt (300)
         rtt_ms.store(300, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(node.latency_ms("rtt"), Some(300));
+    }
+
+    #[tokio::test]
+    async fn test_is_group() {
+        assert!(urltest(vec![], None).is_group());
+        assert!(OutboundNode::Fallback { tag: "fb".into(), children: vec![] }.is_group());
+        assert!(OutboundNode::Selector { tag: "sel".into(), children: vec![], current: Arc::new(RwLock::new(None)) }.is_group());
+        assert!(OutboundNode::LoadBalance { tag: "lb".into(), children: vec![], next: Arc::new(std::sync::atomic::AtomicU64::new(0)) }.is_group());
+        assert!(!OutboundNode::Direct { tag: "direct".into() }.is_group());
+        assert!(!OutboundNode::Block { tag: "block".into() }.is_group());
+        assert!(!mirage("m").is_group());
+    }
+
+    #[tokio::test]
+    async fn test_urltest_all_dead_returns_self_group() {
+        let a = mirage("a");
+        let b = mirage("b");
+        let pool_a = match a.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        let pool_b = match b.as_ref() { OutboundNode::Mirage { pool, .. } => pool.clone(), _ => unreachable!() };
+        pool_a.stats.write().unwrap().record_failure();
+        pool_a.stats.write().unwrap().record_failure();
+        pool_a.stats.write().unwrap().record_failure();
+        pool_b.stats.write().unwrap().record_failure();
+        pool_b.stats.write().unwrap().record_failure();
+        pool_b.stats.write().unwrap().record_failure();
+        assert!(!a.is_healthy());
+        assert!(!b.is_healthy());
+
+        let g = urltest(vec![a.clone(), b.clone()], None);
+        let resolved = g.resolve_leaf();
+        assert!(resolved.is_group());
+        assert_eq!(resolved.tag(), g.tag());
     }
 }

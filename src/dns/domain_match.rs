@@ -47,7 +47,7 @@ impl DomainMatcher {
         for r in regex.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
             match regex::Regex::new(r) {
                 Ok(_) => valid_regex.push(format!("(?i){r}")),
-                Err(e) => tracing::warn!("[DNS] 忽略非法 domain_regex 规则 `{}`: {}", r, e),
+                Err(e) => tracing::warn!("[DNS] ignoring invalid domain_regex rule `{}`: {}", r, e),
             }
         }
         let regex = if valid_regex.is_empty() { None } else { RegexSet::new(&valid_regex).ok() };

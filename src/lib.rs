@@ -48,10 +48,10 @@ fn warn_if_open_proxy(kind: &str, listen: &str, port: u16, has_auth: bool) {
         return;
     }
     warn!(
-        "⚠️  {kind} 入站监听 {listen}:{port} 且**未配置认证** = 开放代理, \
-         任何能连到该端口的人都能使用你的隧道 (出口 IP 会被滥用/拉黑)。\
-         请在该入站加 \"auth\": {{\"username\": \"...\", \"password\": \"...\"}}, \
-         或把 listen 改回 127.0.0.1 仅本机使用。"
+        "WARNING: {kind} inbound listening on {listen}:{port} with no auth configured = open proxy, \
+         anyone who can reach this port can use your tunnel (egress IP may be abused/blacklisted). \
+         Please add \"auth\": {{\"username\": \"...\", \"password\": \"...\"}} to this inbound, \
+         or change listen back to 127.0.0.1 for local-only use."
     );
 }
 
@@ -71,15 +71,15 @@ pub(crate) fn build_upstream(
     let warn_udp = |block_udp: bool, why: &str| {
         if block_udp {
             info!(
-                "UDP 策略: block (默认) —— {why}, 放行会让 UDP 从本机直连出去 \
-                 (出口 IP 与 TCP 不同, 落地解锁场景会判错区域)。故直接拒绝 UDP 中继: \
-                 QUIC 将回落 TCP, 游戏/WebRTC 不可用。要保留旧行为请显式设 \"udp\": \"direct\"。"
+                "UDP policy: block (default) - {why}, allowing it would let UDP connect directly from local machine \
+                 (egress IP differs from TCP, causing region mismatch in landing/unlocking scenarios). UDP relay is rejected: \
+                 QUIC will fall back to TCP, games/WebRTC unavailable. To keep legacy behavior, explicitly set \"udp\": \"direct\"."
             );
         } else {
             warn!(
-                "⚠️  UDP 策略: direct —— UDP 将从**本机 IP** 直连出去, 与 TCP 的上游出口**不同**。\
-                 流媒体走 QUIC 时会被判成本机所在区域 (且不会回落 TCP, 故表现为解锁时灵时不灵)。\
-                 除非你确认不介意, 否则建议改回默认的 \"udp\": \"block\"。"
+                "WARNING: UDP policy: direct - UDP will connect directly from local IP, which differs from TCP upstream egress. \
+                 Streaming media over QUIC will be detected as local IP region (and will not fall back to TCP, causing intermittent unlocking issues). \
+                 Unless you are sure you want this, it is recommended to revert to default \"udp\": \"block\"."
             );
         }
     };
@@ -93,11 +93,11 @@ pub(crate) fn build_upstream(
                 crate::proxy::shadowsocks::decode_ss2022_psk(password, m.key_len())?;
             }
             info!(
-                "上游出口: Shadowsocks {}:{} ({}) —— 本服务端作为中转站, TCP 流量将再经 SS 转发",
+                "Upstream outlet: Shadowsocks {}:{} ({}) - this server acts as transit relay, TCP traffic forwarded via SS",
                 server, server_port, method
             );
             let block_udp = matches!(udp, crate::config::UdpPolicy::Block);
-            warn_udp(block_udp, "SS 的 UDP 尚未实现");
+            warn_udp(block_udp, "SS UDP is not yet implemented");
             Ok(Some(Arc::new(UpstreamOutlet::Shadowsocks(Arc::new(
                 crate::proxy::shadowsocks::SsConfig {
                     server: server.clone(),
@@ -121,7 +121,7 @@ pub(crate) fn build_upstream(
                     .transpose()?,
                 endpoint: endpoint.clone(),
                 address: address.parse().map_err(|_| {
-                    anyhow::anyhow!("上游 WireGuard: address `{address}` 不是合法 IP (不带掩码, 如 10.0.0.2)")
+                    anyhow::anyhow!("upstream WireGuard: address `{address}` is not a valid IP (without netmask, e.g. 10.0.0.2)")
                 })?,
                 mtu: *mtu,
                 persistent_keepalive: *persistent_keepalive,
@@ -130,28 +130,28 @@ pub(crate) fn build_upstream(
                     .as_deref()
                     .map(|s| {
                         s.parse::<std::net::IpAddr>().map_err(|_| {
-                            anyhow::anyhow!("上游 WireGuard: dns `{s}` 不是合法 IP")
+                            anyhow::anyhow!("upstream WireGuard: dns `{s}` is not a valid IP")
                         })
                     })
                     .transpose()?,
             };
             info!(
-                "上游出口: WireGuard {} (隧道内地址 {}) —— 本服务端作为中转站, TCP 流量将再经 WG 转发",
+                "Upstream outlet: WireGuard {} (in-tunnel address {}) - this server acts as transit relay, TCP traffic forwarded via WG",
                 wg.endpoint, wg.address
             );
             match udp {
                 crate::config::UdpPolicy::Tunnel => info!(
-                    "UDP 策略: tunnel (默认) —— UDP 也走 WG 隧道, 与 TCP 同一个出口 IP。"
+                    "UDP policy: tunnel (default) - UDP also traverses WG tunnel, sharing same egress IP with TCP."
                 ),
                 crate::config::UdpPolicy::Block => info!(
-                    "UDP 策略: block —— 直接拒绝 UDP 中继。注意 WG 隧道本可承载 UDP \
-                     (默认即 tunnel), 除非你刻意要禁用, 否则 block 只会让 QUIC 回落 TCP、\
-                     游戏/WebRTC 不可用。"
+                    "UDP policy: block - UDP relay directly rejected. Note that WG tunnel can carry UDP \
+                     (tunnel by default); unless intentionally disabled, block will cause QUIC to fall back to TCP, \
+                     and games/WebRTC to be unavailable."
                 ),
                 crate::config::UdpPolicy::Direct => warn!(
-                    "⚠️  UDP 策略: direct —— UDP 将从**本机 IP** 直连出去, 与 TCP 的 WG 出口\
-                     **不同**。WG 隧道本可承载 UDP (默认 tunnel), 除非你确知自己在做什么, \
-                     否则建议改回 \"udp\": \"tunnel\"。"
+                    "WARNING: UDP policy: direct - UDP will connect directly from local IP, which differs from TCP WG egress. \
+                     WG tunnel can carry UDP (tunnel by default); unless you know what you are doing, \
+                     reverting to \"udp\": \"tunnel\" is recommended."
                 ),
             }
             Ok(Some(Arc::new(UpstreamOutlet::Wireguard(WgUpstream::new(wg, *udp)))))
@@ -173,12 +173,12 @@ fn ensure_default_config(config_path: &str, is_server: bool) -> Result<()> {
     }
     if is_server {
         warn!(
-            "{} 不存在: 将写入一份**客户端**默认模板 (SOCKS5 入站)。服务端请改用 install.sh 或手写 \
-             含 mirage_server 入站的配置。",
+            "{} does not exist: writing a client default template (SOCKS5 inbound). For server mode, please use install.sh or manually write \
+             a config with mirage_server inbound.",
             config_path
         );
     } else {
-        info!("{} 不存在, 写入客户端默认模板", config_path);
+        info!("{} does not exist, writing client default template", config_path);
     }
     let default_cfg = r#"{
     "log_level": "info",
@@ -257,7 +257,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         warn!("Routing rules reference geosite/geoip but `tuning.geo_sources` is empty. \
                Updater is waiting for hot-reload to add sources.");
     } else if !needs_geo {
-        info!("No geosite/geoip rules configured — geo updater running but idle (no sources).");
+        info!("No geosite/geoip rules configured - geo updater running but idle (no sources).");
     }
     
     // 自定义 fake-TLS 指纹模板 (client_hello_template): 装入 tls_raw 全局, 出站握手复刻其 JA3/JA4。
@@ -286,7 +286,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         let xdp_clone = xdp.clone();
         watcher.set_reload_hook(move |_st| {
             if let Err(e) = xdp_clone.clear_dns_cache() {
-                warn!("配置热重载: 清空 XDP DNS 缓存 map 失败: {}", e);
+                warn!("config hot reload: failed to clear XDP DNS cache map: {}", e);
             }
         });
     }
@@ -308,7 +308,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 for ib in &inbounds {
                     if let crate::config::InboundConfig::MirageServer { tag, .. } = ib {
                         if !seen_tags.insert(tag.as_str()) {
-                            let msg = format!("inbound tag `{tag}` 重复定义");
+                            let msg = format!("inbound tag `{tag}` is duplicated");
                             tracing::error!("{msg}");
                             return Err(anyhow::anyhow!("{msg}"));
                         }
@@ -323,7 +323,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     crate::proxy::rate_limit::RateLimiter::from_device_profiles(&config.routing.device_profiles),
                 );
                 if !rl.is_empty() {
-                    info!("限速(服务端): device_profiles 已配置带宽上限 (按客户端 IP TCP 整形)");
+                    info!("rate limit (server): device_profiles configured bandwidth limit (TCP traffic shaping per client IP)");
                 }
                 crate::proxy::rate_limit::set_server_limiter(rl);
             }
@@ -406,8 +406,8 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
         {
             let _ = (&gui_listen, &gui_token); // 抑制未用告警 (headless 构建)
             warn!(
-                "config 配了 gui.enabled 但本二进制未编译 WebUI (未启用 `gui` feature) —— 面板不可用。\
-                 要面板请用默认构建 (含 gui)。"
+                "config has gui.enabled but this binary was built without WebUI (feature `gui` not enabled) - console unavailable. \
+                 For console, please use default build (with gui)."
             );
         }
     }
@@ -453,12 +453,12 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                 let inbound_tag: std::sync::Arc<str> = tag.as_str().into();
                 let m = match crate::proxy::shadowsocks::Method::parse(&method) {
                     Ok(m) if m.is_2022() => {
-                        error!("SS 入站 `{tag}` method `{method}` 是 SIP022, 入站暂不支持, 未启动");
+                        error!("SS inbound `{tag}` method `{method}` is SIP022, inbound not supported yet, not started");
                         continue;
                     }
                     Ok(m) => m,
                     Err(e) => {
-                        error!("SS 入站 `{tag}` method 非法: {e}, 未启动");
+                        error!("SS inbound `{tag}` method is invalid: {e}, not started");
                         continue;
                     }
                 };
@@ -516,7 +516,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     Some(st) => st.inbound_upstreams.get(&tag).cloned(),
                     None => match build_upstream(upstream.as_ref()) {
                         Ok(v) => v,
-                        Err(e) => { error!("上游出口配置无效, 服务端未启动: {e}"); continue; }
+                        Err(e) => { error!("invalid upstream outlet config, server not started: {e}"); continue; }
                     },
                 };
                 match transport {
@@ -540,7 +540,7 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                             ).await;
                         });
                         #[cfg(not(feature = "quic"))]
-                        error!("MirageServer transport=quic 需以 `--features quic` 编译, 该入站未启动 (见 docs/quic-transport-design.md)");
+                        error!("MirageServer transport=quic requires building with `--features quic`, this inbound not started (see docs/quic-transport-design.md)");
                     }
                     crate::config::Transport::Tcp => {
                         tokio::spawn(async move {
@@ -593,16 +593,16 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                     match crate::ebpf::CgroupConnectEngine::init(port, net, prefix) {
                         Ok(eng) => match eng.attach("/sys/fs/cgroup") {
                             Ok(()) => {
-                                info!("cgroup_connect 已接管本机出向 fake-IP 流量 (本机也走代理)");
+                                info!("cgroup_connect took over local outbound fake-IP traffic (local traffic also proxied)");
                                 Some(std::sync::Arc::new(eng))
                             }
                             Err(e) => {
-                                error!("cgroup_connect attach 失败, 本机流量不走代理: {}", e);
+                                error!("cgroup_connect attach failed, local traffic will not be proxied: {}", e);
                                 None
                             }
                         },
                         Err(e) => {
-                            warn!("cgroup_connect 初始化失败, 本机流量不走代理: {}", e);
+                            warn!("cgroup_connect initialization failed, local traffic will not be proxied: {}", e);
                             None
                         }
                     }
@@ -625,27 +625,27 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                                 let engine = std::sync::Arc::new(engine);
                                 let cidrs = watcher.state.load().direct_v4_cidrs();
                                 if let Err(e) = engine.sync_direct_cidrs(&cidrs) {
-                                    warn!("tc_divert direct_cidr 初始加载失败: {}", e);
+                                    warn!("tc_divert direct_cidr initial load failed: {}", e);
                                 }
                                 match engine.attach(&iface) {
                                     Ok(()) => {
-                                        info!("tc_divert 已接管 {} 上的裸-IP 转发流量 ({} 段直连快路径)", iface, cidrs.len());
+                                        info!("tc_divert took over raw IP forward traffic on {} ({} direct fast-path prefixes)", iface, cidrs.len());
                                         tc_divert_engine = Some(engine.clone());
                                         // 热重载后按新规则刷新 direct_cidr map
                                         let eng = engine.clone();
                                         watcher.set_reload_hook(move |st| {
                                             if let Err(e) = eng.sync_direct_cidrs(&st.direct_v4_cidrs()) {
-                                                warn!("tc_divert direct_cidr 热重载刷新失败: {}", e);
+                                                warn!("tc_divert direct_cidr hot reload refresh failed: {}", e);
                                             }
                                         });
                                     }
-                                    Err(e) => error!("tc_divert attach {} 失败, 裸-IP 转发流量不接管: {}", iface, e),
+                                    Err(e) => error!("tc_divert attach {} failed, raw IP forward traffic will not be taken over: {}", iface, e),
                                 }
                             }
-                            Err(e) => warn!("tc_divert 初始化失败, 裸-IP 转发流量不接管: {}", e),
+                            Err(e) => warn!("tc_divert initialization failed, raw IP forward traffic will not be taken over: {}", e),
                         }
                     } else {
-                        warn!("Transparent interface={} 已配置但 eBPF 未启用, tc_divert 跳过", iface);
+                        warn!("Transparent interface={} configured but eBPF not enabled, tc_divert skipped", iface);
                     }
                 }
                 let trans_eng = transparent_engine.clone();
@@ -660,8 +660,8 @@ pub async fn start_proxy(config_path: &str, is_server: bool) -> Result<()> {
                             match crate::dns::server::DnsForwarder::for_hijack(
                                 hijack_state, hijack_fm, hijack_xdp,
                             ).await {
-                                Ok(f) => { info!("DNS 劫持已启用: 流经 LAN 的 53 端口查询将由本机应答"); Some(f) }
-                                Err(e) => { error!("DNS 劫持 forwarder 构造失败, 劫持关闭: {}", e); None }
+                                Ok(f) => { info!("DNS hijack enabled: port 53 queries through LAN will be answered locally"); Some(f) }
+                                Err(e) => { error!("failed to construct DNS hijack forwarder, hijacking disabled: {}", e); None }
                             }
                         } else { None };
                         let net = fm.network();

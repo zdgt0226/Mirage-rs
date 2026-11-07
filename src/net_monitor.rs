@@ -66,14 +66,14 @@ mod imp {
         let fd = match open_netlink() {
             Ok(fd) => fd,
             Err(e) => {
-                warn!("链路自愈 netlink 启动失败 ({e}); 降级为仅靠 get() stale 探测 + 首写重试");
+                warn!("link healing netlink failed to start ({e}); falling back to get() stale probe + first-write retry");
                 return;
             }
         };
         let _ = std::thread::Builder::new()
             .name("mirage-net-monitor".into())
             .spawn(move || run(fd));
-        info!("链路自愈: netlink 网络变更监听已启动 (Wi-Fi↔蜂窝 / 宽带续租 / 载波变化 → 清空重建连接池)");
+        info!("link healing: netlink network change monitor started (Wi-Fi <-> cellular / DHCP renewal / carrier change -> flush and rebuild connection pool)");
     }
 
     fn open_netlink() -> std::io::Result<OwnedFd> {
@@ -157,7 +157,7 @@ mod imp {
                     // 缓冲溢出 = 短时间大量变更, 无法解析内容, 保守视为"网络变了"
                     Some(libc::ENOBUFS) => true,
                     _ => {
-                        warn!("链路自愈 netlink recv 错误 ({err}); 监听退出, 降级为 stale 探测/重试");
+                        warn!("link healing netlink recv error ({err}); monitor exiting, falling back to stale probe/retry");
                         return;
                     }
                 }

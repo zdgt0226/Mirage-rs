@@ -51,7 +51,7 @@ pub fn set_server_router_state(state: Arc<ServerRouterState>) {
             h.spawn(async move {
                 if let crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) = &*outlet {
                     if let Err(e) = wg.tunnel().await {
-                        tracing::warn!("WG 上游出口预热握手失败 (请求时会重试): {e}");
+                        tracing::warn!("WG upstream outlet pre-warm handshake failed (will retry on request): {e}");
                     }
                 }
             });
@@ -207,7 +207,7 @@ fn warn_unroutable(tag: &str) {
         m.clear();
     }
     m.insert(tag.to_string(), now);
-    tracing::warn!("服务端路由选到出站 `{tag}`, 但它不是服务端可用的出站 (仅支持 direct / block / shadowsocks / wireguard), 拒绝该连接");
+    tracing::warn!("Server routing selected outbound `{tag}`, but it is not available on server (only direct / block / shadowsocks / wireguard supported), rejecting connection");
 }
 
 /// 配置里是否有服务端入站。只有服务端才建服务端路由表: 纯客户端建它既浪费内存 (再载一份
@@ -498,10 +498,10 @@ pub fn build_server_router_state(
 
     let router = if !invalid.is_empty() || (!unsupported.is_empty() && !legacy) {
         invalid.extend(unsupported);
-        anyhow::bail!("服务端路由配置无效: {}", invalid.join("; "));
+        anyhow::bail!("Server routing configuration invalid: {}", invalid.join("; "));
     } else if !unsupported.is_empty() {
         tracing::warn!(
-            "服务端路由引用了服务端用不了的出站, 且未配置任何上游出站 (视为旧配置): 忽略 routing、全部直连。{}",
+            "Server routing references outbounds unsupported on server, and no upstream outbounds configured (treated as legacy config): ignoring routing, defaulting all to direct. {}",
             unsupported.join("; ")
         );
         None
@@ -517,7 +517,7 @@ pub fn build_server_router_state(
     };
 
     info!(
-        "服务端出站表构建完成: {} 个出站 (旧 upstream 入站 {} 个), 默认出站 `{}`",
+        "Server outbound table built: {} outbound(s) (legacy upstream inbound: {}), default outbound `{}`",
         outbounds.len(),
         inbound_upstreams.len(),
         default_outbound

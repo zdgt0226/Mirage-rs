@@ -52,11 +52,11 @@ impl Method {
             "2022-blake3-aes-256-gcm" => Ok(Self::Ss2022Aes256Gcm),
             "2022-blake3-chacha20-poly1305" => Ok(Self::Ss2022Chacha20Poly1305),
             other => bail!(
-                "不支持的 Shadowsocks 加密方式 `{other}`。支持: \
+                "unsupported Shadowsocks cipher `{other}`. Supported: \
                  aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305 (SIP004), \
                  2022-blake3-aes-128-gcm / 2022-blake3-aes-256-gcm / \
-                 2022-blake3-chacha20-poly1305 (SIP022)。\
-                 (legacy 流式加密如 aes-256-cfb 无完整性校验、已废弃, 不支持)"
+                 2022-blake3-chacha20-poly1305 (SIP022). \
+                 (legacy stream ciphers such as aes-256-cfb lack integrity verification and are deprecated, not supported)"
             ),
         }
     }
@@ -117,11 +117,11 @@ pub fn decode_ss2022_psk(b64: &str, key_len: usize) -> Result<Vec<u8>> {
     use base64::Engine;
     let psk = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .map_err(|e| anyhow!("SIP022 的 password 必须是 base64 编码的密钥: {e}"))?;
+        .map_err(|e| anyhow!("SIP022 password must be a base64-encoded key: {e}"))?;
     if psk.len() != key_len {
         bail!(
-            "SIP022 密钥长度不对: base64 解码后 {} 字节, 该加密方式要求 {} 字节。\
-             (可用 `openssl rand -base64 {}` 生成)",
+            "SIP022 key invalid length: {} bytes after base64 decode, cipher requires {} bytes. \
+             (generate with `openssl rand -base64 {}`)",
             psk.len(), key_len, key_len
         );
     }
@@ -215,7 +215,7 @@ impl Crypter {
         let n = Nonce::assume_unique_for_key(self.nonce);
         self.key
             .seal_in_place_append_tag(n, Aad::empty(), buf)
-            .map_err(|_| anyhow!("shadowsocks 加密失败"))?;
+            .map_err(|_| anyhow!("shadowsocks encryption failed"))?;
         self.bump();
         Ok(())
     }
@@ -226,7 +226,7 @@ impl Crypter {
         let plain = self
             .key
             .open_in_place(n, Aad::empty(), buf)
-            .map_err(|_| anyhow!("shadowsocks 解密失败 (密码或加密方式不匹配?)"))?;
+            .map_err(|_| anyhow!("shadowsocks decryption failed (password or cipher mismatch?)"))?;
         let len = plain.len();
         self.bump();
         Ok(len)
@@ -237,8 +237,8 @@ impl Crypter {
 pub fn encode_socks_addr(target: &str) -> Result<Vec<u8>> {
     let (host, port_s) = target
         .rsplit_once(':')
-        .ok_or_else(|| anyhow!("目标缺少端口: {target}"))?;
-    let port: u16 = port_s.parse().map_err(|_| anyhow!("端口非法: {port_s}"))?;
+        .ok_or_else(|| anyhow!("target missing port: {target}"))?;
+    let port: u16 = port_s.parse().map_err(|_| anyhow!("invalid port: {port_s}"))?;
     // 去掉 IPv6 字面量的方括号
     let host = host.trim_start_matches('[').trim_end_matches(']');
 
@@ -251,7 +251,7 @@ pub fn encode_socks_addr(target: &str) -> Result<Vec<u8>> {
         out.extend_from_slice(&v6.octets());
     } else {
         if host.is_empty() || host.len() > 255 {
-            bail!("域名长度非法: {host:?}");
+            bail!("invalid domain length: {host:?}");
         }
         out.push(0x03);
         out.push(host.len() as u8);
@@ -265,12 +265,12 @@ pub fn encode_socks_addr(target: &str) -> Result<Vec<u8>> {
 /// 返回 (host:port 串, 头部消耗字节数) —— 剩余字节是紧随的初始载荷。
 pub fn decode_socks_addr(buf: &[u8]) -> Result<(String, usize)> {
     if buf.is_empty() {
-        bail!("SS 目标头为空");
+        bail!("SS target header is empty");
     }
     match buf[0] {
         0x01 => {
             if buf.len() < 1 + 4 + 2 {
-                bail!("SS IPv4 目标头截断");
+                bail!("SS IPv4 target header truncated");
             }
             let ip = std::net::Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
             let port = u16::from_be_bytes([buf[5], buf[6]]);
@@ -278,7 +278,7 @@ pub fn decode_socks_addr(buf: &[u8]) -> Result<(String, usize)> {
         }
         0x04 => {
             if buf.len() < 1 + 16 + 2 {
-                bail!("SS IPv6 目标头截断");
+                bail!("SS IPv6 target header truncated");
             }
             let mut o = [0u8; 16];
             o.copy_from_slice(&buf[1..17]);
@@ -288,18 +288,18 @@ pub fn decode_socks_addr(buf: &[u8]) -> Result<(String, usize)> {
         }
         0x03 => {
             if buf.len() < 2 {
-                bail!("SS 域名目标头截断");
+                bail!("SS domain target header truncated");
             }
             let dlen = buf[1] as usize;
             let end = 2 + dlen;
             if buf.len() < end + 2 {
-                bail!("SS 域名目标头截断");
+                bail!("SS domain target header truncated");
             }
-            let host = std::str::from_utf8(&buf[2..end]).map_err(|_| anyhow!("SS 域名非 UTF-8"))?;
+            let host = std::str::from_utf8(&buf[2..end]).map_err(|_| anyhow!("SS domain is not UTF-8"))?;
             let port = u16::from_be_bytes([buf[end], buf[end + 1]]);
             Ok((format!("{host}:{port}"), end + 2))
         }
-        a => bail!("SS 未知 ATYP: {a:#x}"),
+        a => bail!("SS unknown ATYP: {a:#x}"),
     }
 }
 
@@ -359,7 +359,7 @@ fn build_2022_request(target: &str, initial_payload: &[u8]) -> Result<(Vec<u8>, 
     }
 
     if var.len() > u16::MAX as usize {
-        bail!("SIP022 变长头过长: {} 字节", var.len());
+        bail!("SIP022 variable-length header too long: {} bytes", var.len());
     }
     let mut fixed = Vec::with_capacity(11);
     fixed.push(SS2022_TYPE_CLIENT);
@@ -375,21 +375,21 @@ fn build_2022_request(target: &str, initial_payload: &[u8]) -> Result<(Vec<u8>, 
 fn parse_2022_response_header(plain: &[u8], our_salt: &[u8]) -> Result<usize> {
     let klen = our_salt.len();
     if plain.len() != 1 + 8 + klen + 2 {
-        bail!("SIP022 响应定长头长度异常: {}", plain.len());
+        bail!("SIP022 response fixed-length header abnormal size: {}", plain.len());
     }
     if plain[0] != SS2022_TYPE_SERVER {
-        bail!("SIP022 响应头类型应为 {SS2022_TYPE_SERVER}, 实际 {}", plain[0]);
+        bail!("SIP022 response header type expected {SS2022_TYPE_SERVER}, got {}", plain[0]);
     }
     let ts = u64::from_be_bytes(plain[1..9].try_into().unwrap());
     let now = now_unix();
     if now.abs_diff(ts) > SS2022_TS_TOLERANCE {
         bail!(
-            "SIP022 响应时间戳超出 ±{SS2022_TS_TOLERANCE}s (对端 {ts}, 本机 {now}) —— \
-             两端时钟不同步, 或是重放的旧响应"
+            "SIP022 response timestamp exceeds +/-{SS2022_TS_TOLERANCE}s (peer {ts}, local {now}) - \
+             clocks out of sync between peers, or replayed response"
         );
     }
     if &plain[9..9 + klen] != our_salt {
-        bail!("SIP022 响应未回显本次请求的 salt —— 可能是重放的其它会话响应");
+        bail!("SIP022 response did not echo this request's salt - likely a replayed response from another session");
     }
     Ok(u16::from_be_bytes(plain[9 + klen..].try_into().unwrap()) as usize)
 }
@@ -671,7 +671,7 @@ where
     // 上行 salt: 每连接随机。
     let mut salt = vec![0u8; key_len];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
-        .map_err(|_| anyhow!("生成 salt 失败"))?;
+        .map_err(|_| anyhow!("failed to generate salt"))?;
     let subkey = if cfg.method.is_2022() {
         ss2022_session_key(&master, &salt, key_len)
     } else {
@@ -717,7 +717,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     if method.is_2022() {
-        bail!("SS 入站暂不支持 SIP022 (仅 SIP004: aes-128/256-gcm / chacha20-ietf-poly1305)");
+        bail!("SS inbound does not support SIP022 yet (SIP004 only: aes-128/256-gcm / chacha20-ietf-poly1305)");
     }
     let key_len = method.key_len();
     let master = evp_bytes_to_key(password, key_len);
@@ -727,7 +727,7 @@ where
     // 探针连上不发数据 → 服务端一字节不吐 (若立刻发 salt = 吐一串高熵随机数, 是可探测指纹)。
     let mut salt = vec![0u8; key_len];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut salt)
-        .map_err(|_| anyhow!("生成 salt 失败"))?;
+        .map_err(|_| anyhow!("failed to generate salt"))?;
     let subkey = hkdf_subkey(&master, &salt, key_len);
 
     let writer = SsWriter {
@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(Method::parse("chacha20-poly1305").unwrap().key_len(), 32);
         // legacy 流式加密必须明确拒绝, 且错误信息要解释原因
         let e = Method::parse("aes-256-cfb").unwrap_err().to_string();
-        assert!(e.contains("aes-256-cfb") && e.contains("废弃"), "实际: {e}");
+        assert!(e.contains("aes-256-cfb") && e.contains("deprecated"), "实际: {e}");
     }
 
     #[test]
@@ -986,7 +986,7 @@ mod ss2022_crypto_tests {
         // 长度不匹配必须报错 (静默截断/补齐会造成两端密钥不一致)
         let short = base64::engine::general_purpose::STANDARD.encode([7u8; 16]);
         let e = decode_ss2022_psk(&short, 32).unwrap_err().to_string();
-        assert!(e.contains("16 字节") && e.contains("32 字节"), "实际: {e}");
+        assert!(e.contains("16 bytes") && e.contains("32 bytes"), "实际: {e}");
 
         // 非 base64 必须报错
         assert!(decode_ss2022_psk("不是base64!!!", 32).is_err());

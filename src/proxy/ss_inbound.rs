@@ -32,7 +32,7 @@ pub async fn handle_ss_client(
     let (mut ssr, mut ssw) = match server_handshake(r, w, method, &password).await {
         Ok(x) => x,
         Err(e) => {
-            warn!("SS 入站握手失败 (peer={peer:?}): {e}");
+            warn!("SS inbound handshake failed (peer={peer:?}): {e}");
             return;
         }
     };
@@ -42,14 +42,14 @@ pub async fn handle_ss_client(
         Ok(c) if !c.is_empty() => c,
         Ok(_) => return, // EOF
         Err(e) => {
-            warn!("SS 入站读目标头失败 (peer={peer:?}, 多为密钥不符): {e}");
+            warn!("SS inbound failed to read target header (peer={peer:?}, likely password mismatch): {e}");
             return;
         }
     };
     let (target, hlen) = match decode_socks_addr(&first) {
         Ok(x) => x,
         Err(e) => {
-            warn!("SS 入站目标头非法 (peer={peer:?}): {e}");
+            warn!("SS inbound invalid target header (peer={peer:?}): {e}");
             return;
         }
     };
@@ -59,7 +59,7 @@ pub async fn handle_ss_client(
     let addr = match Address::parse(&target) {
         Ok(a) => a,
         Err(e) => {
-            warn!("SS 入站目标 `{target}` 非法: {e}");
+            warn!("SS inbound invalid target `{target}`: {e}");
             return;
         }
     };
@@ -83,18 +83,18 @@ pub async fn handle_ss_client(
     let outbound = match st.outbounds.get(&outbound_tag) {
         Some(o) => o.clone(),
         None => {
-            warn!("SS 入站: 选中出站 `{outbound_tag}` 不存在");
+            warn!("SS inbound: selected outbound `{outbound_tag}` does not exist");
             return;
         }
     };
     drop(st);
-    debug!("SS 入站 {target} → 出站 [{outbound_tag}]");
+    debug!("SS inbound {target} -> outbound [{outbound_tag}]");
 
     // 4. 经统一出站接口连目标 (connect_active: 真实流量标活跃, 保活底层组)。
     let out = match outbound.connect_active(&addr).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("SS 入站经出站 [{outbound_tag}] 连 {target} 失败: {e}");
+            warn!("SS inbound via outbound [{outbound_tag}] failed to connect to {target}: {e}");
             return;
         }
     };
@@ -175,32 +175,32 @@ pub async fn handle_ss_client(
     tokio::select! {
         r = &mut up => match r {
             CopyResult::Err(e) => {
-                debug!("SS 入站 [{inbound_tag}] 上行出错: {e}");
+                debug!("SS inbound [{inbound_tag}] uplink error: {e}");
             }
             CopyResult::Idle => {
-                debug!("SS 入站 [{inbound_tag}] relay 空闲超时 ({}s)", idle.as_secs_f64());
+                debug!("SS inbound [{inbound_tag}] relay idle timeout ({}s)", idle.as_secs_f64());
             }
             CopyResult::Finished(up_n) => {
                 if let Err(e) = crate::proxy::drain_wait(&mut down, &down_progress, DRAIN_IDLE).await {
-                    debug!("SS 入站 [{inbound_tag}] 下行排空出错: {e}");
+                    debug!("SS inbound [{inbound_tag}] downlink drain error: {e}");
                 }
                 let down_n = down_progress.load(Ordering::Relaxed);
-                debug!("SS 入站 [{inbound_tag}] relay 完成 (↑{up_n} ↓{down_n})");
+                debug!("SS inbound [{inbound_tag}] relay completed (up {up_n} down {down_n})");
             }
         },
         r = &mut down => match r {
             CopyResult::Err(e) => {
-                debug!("SS 入站 [{inbound_tag}] 下行出错: {e}");
+                debug!("SS inbound [{inbound_tag}] downlink error: {e}");
             }
             CopyResult::Idle => {
-                debug!("SS 入站 [{inbound_tag}] relay 空闲超时 ({}s)", idle.as_secs_f64());
+                debug!("SS inbound [{inbound_tag}] relay idle timeout ({}s)", idle.as_secs_f64());
             }
             CopyResult::Finished(down_n) => {
                 if let Err(e) = crate::proxy::drain_wait(&mut up, &up_progress, DRAIN_IDLE).await {
-                    debug!("SS 入站 [{inbound_tag}] 上行排空出错: {e}");
+                    debug!("SS inbound [{inbound_tag}] uplink drain error: {e}");
                 }
                 let up_n = up_progress.load(Ordering::Relaxed);
-                debug!("SS 入站 [{inbound_tag}] relay 完成 (↑{up_n} ↓{down_n})");
+                debug!("SS inbound [{inbound_tag}] relay completed (up {up_n} down {down_n})");
             }
         },
     }

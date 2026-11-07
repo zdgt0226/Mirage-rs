@@ -115,15 +115,15 @@ impl ConfigWatcher {
     pub(crate) fn build_state(config_path: &str, geodata_dir: &str, old_outbounds: Option<Arc<OutboundManager>>) -> Result<CoreState> {
         info!("Loading configuration from {}", config_path);
         let content = std::fs::read_to_string(config_path)
-            .map_err(|e| anyhow::anyhow!("读取配置文件失败: {config_path}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to read config file: {config_path}: {e}"))?;
         let (config, issues) = Config::parse_with_diagnostics(&content)
-            .map_err(|e| anyhow::anyhow!("解析配置 JSON 失败: {config_path}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to parse config JSON: {config_path}: {e}"))?;
         for issue in &issues {
             // 重复口令会让鉴权命中错误用户 (用量记错人), 用 error 级别醒目提示。
             if issue.contains("password 与") {
-                error!("配置校验: {}", issue);
+                error!("configuration validation: {}", issue);
             } else {
-                warn!("配置校验: {}", issue);
+                warn!("configuration validation: {}", issue);
             }
         }
         
@@ -225,7 +225,7 @@ impl ConfigWatcher {
                 .collect();
             if !missing.is_empty() {
                 anyhow::bail!(
-                    "路由引用了运行中尚不存在的出站 {:?} (出站增减不支持热重载), 本次重载已拒绝, 请重启服务生效",
+                    "routing references non-existent outbound {:?} at runtime (adding/removing outbounds does not support hot reload), reload rejected, please restart service",
                     missing
                 );
             }
@@ -272,7 +272,7 @@ impl ConfigWatcher {
                             let entry = (addr, proto_override.unwrap_or(r.protocol));
                             if !cn_dns.contains(&entry) { cn_dns.push(entry); }
                         }
-                        None => tracing::warn!("advanced_dns.resolvers: direct 上游地址 `{}` 非法 (需 ip / ip:port, 可带 tcp://|udp:// 前缀), 已跳过", r.address),
+                        None => tracing::warn!("advanced_dns.resolvers: direct upstream address `{}` is invalid (expects ip / ip:port, optional tcp://|udp:// prefix), skipped", r.address),
                     }
                 }
             }
@@ -285,7 +285,7 @@ impl ConfigWatcher {
             // 静态解析归一化 (剥尾点+小写, 确定性去重, 长度降序) —— 见 normalize_static_hosts。
             let cached_static = crate::config::normalize_static_hosts(&adv.static_hosts);
             if !cached_static.is_empty() {
-                tracing::info!("advanced_dns.static: 已加载 {} 条静态解析 (最长域名优先匹配)", cached_static.len());
+                tracing::info!("advanced_dns.static: loaded {} static resolve entries (longest domain prefix match)", cached_static.len());
             }
             adv.cached_static = cached_static;
 
@@ -300,7 +300,7 @@ impl ConfigWatcher {
                         .filter_map(|s| match s.trim().parse::<std::net::IpAddr>() {
                             Ok(ip) => Some(ip),
                             Err(_) => {
-                                tracing::warn!("advanced_dns.rules: host IP `{}` 非法, 已跳过", s);
+                                tracing::warn!("advanced_dns.rules: host IP `{}` is invalid, skipped", s);
                                 None
                             }
                         })
@@ -314,7 +314,7 @@ impl ConfigWatcher {
                 })
                 .collect();
             if !adv.cached_dns_rules.is_empty() {
-                tracing::info!("advanced_dns.rules: 已加载 {} 条 DNS 规则 (首匹配, 选路/host/reject)", adv.cached_dns_rules.len());
+                tracing::info!("advanced_dns.rules: loaded {} DNS rules (first match, routing/host/reject)", adv.cached_dns_rules.len());
             }
         }
 
@@ -331,7 +331,7 @@ impl ConfigWatcher {
             old_limiter.as_deref(),
         ));
         if !rate_limiter.is_empty() {
-            info!("限速: device_profiles 已配置带宽上限 (按源 IP TCP 整形)");
+            info!("rate limit: device_profiles configured bandwidth limit (TCP traffic shaping per source IP)");
         }
         // 服务端 IP 限速器随热重载更新
         crate::proxy::rate_limit::set_server_limiter(rate_limiter.clone());
@@ -352,7 +352,7 @@ impl ConfigWatcher {
 
         if let Some(st) = srv_state {
             srv_router::set_server_router_state(st);
-            info!("服务端路由与出站表已就绪/已热重载更新");
+            info!("server routing and outbound tables ready/updated via hot reload");
         }
         Ok(CoreState {
             router: Arc::new(router),
@@ -507,7 +507,7 @@ impl ConfigWatcher {
                             let sources_delta = new_updater.sources.len() as i64
                                 - old_updater.sources.len() as i64;
                             info!(
-                                "Geo updater config reloaded ({} source(s), interval {} days, Δsources={:+}). Notifying updater.",
+                                "Geo updater config reloaded ({} source(s), interval {} days, delta_sources={:+}). Notifying updater.",
                                 new_updater.sources.len(),
                                 new_updater.update_days,
                                 sources_delta,
@@ -596,7 +596,7 @@ impl ConfigWatcher {
                         // 30s 低频兜底轮询: 覆盖深层中间目录链接切换与配置目录链接切换场景
                         let current_record = inspect_config(&config_pathbuf);
                         if current_record.is_some() && current_record != last_record {
-                            info!("30s 兜底轮询: 检测到配置文件真实路径/mtime/长度变更, 触发重载...");
+                            info!("30s fallback poll: detected config file real path/mtime/length change, triggering reload...");
                             let symlink_action = symlink_state.update(
                                 &config_pathbuf,
                                 &config_dir_canon,
@@ -660,7 +660,7 @@ fn apply_user_config_locked(inbounds: &[crate::config::InboundConfig]) {
     for ib in inbounds {
         if let crate::config::InboundConfig::MirageServer { tag, .. } = ib {
             if !seen_tags.insert(tag.as_str()) {
-                error!("apply_user_config: mirage_server 入站 tag `{tag}` 重复定义, 拒绝本次用户配置应用 (保持现有凭据与限额)");
+                error!("apply_user_config: mirage_server inbound tag `{tag}` duplicate definition, rejecting user config apply (keeping current credentials and limits)");
                 return;
             }
         }
@@ -672,7 +672,7 @@ fn apply_user_config_locked(inbounds: &[crate::config::InboundConfig]) {
     for registered_tag in current_registered {
         if !seen_tags.contains(registered_tag.as_str()) {
             crate::proxy::mirage_server::reload_creds(&registered_tag, Vec::new());
-            warn!("入站 `{registered_tag}` 已从配置移除: 已吊销其全部凭据, 监听端口需重启才会关闭");
+            warn!("inbound `{registered_tag}` removed from config: all its credentials revoked, listening port will remain open until restart");
         }
     }
 
@@ -681,7 +681,7 @@ fn apply_user_config_locked(inbounds: &[crate::config::InboundConfig]) {
         if let crate::config::InboundConfig::MirageServer { tag, password, users, .. } = ib {
             let new_creds = crate::proxy::mirage_server::build_creds(password, users);
             if !crate::proxy::mirage_server::reload_creds(tag, new_creds) {
-                warn!("入站 `{tag}` 未在运行中注册 (新增或改名的入站需重启才生效, 其凭据变更本次未应用)");
+                warn!("inbound `{tag}` not registered at runtime (new or renamed inbounds require restart to take effect, credentials not applied this time)");
             }
         }
     }
@@ -694,14 +694,14 @@ pub fn apply_user_config_from_file(config_path: &str) {
     let content = match std::fs::read_to_string(config_path) {
         Ok(c) => c,
         Err(e) => {
-            warn!("apply_user_config_from_file: 读取配置文件失败 ({config_path}): {e}, 放弃本次用户配置应用");
+            warn!("apply_user_config_from_file: failed to read config file ({config_path}): {e}, aborting user config apply");
             return;
         }
     };
     let (config, _) = match Config::parse_with_diagnostics(&content) {
         Ok(cfg) => cfg,
         Err(e) => {
-            warn!("apply_user_config_from_file: 解析配置文件失败 ({config_path}): {e}, 放弃本次用户配置应用");
+            warn!("apply_user_config_from_file: failed to parse config file ({config_path}): {e}, aborting user config apply");
             return;
         }
     };
@@ -919,12 +919,12 @@ fn validate_geodata_dir(geodata_dir: &str) {
         match path.extension().and_then(|e| e.to_str()) {
             Some("dat") => match crate::router::geo::count_categories(&path) {
                 Ok(0) => tracing::warn!(
-                    "geo 数据 {:?} 载入 0 个分类 (空壳/损坏/非 v2ray 格式?) — 引用它的 geosite/geoip 规则将全部不匹配, 回落 default 出站。检查文件或删除让 geo_updater 重下。",
+                    "geo data {:?} loaded 0 categories (empty/corrupted/non-v2ray format?) - geosite/geoip rules referencing it will never match and will fall back to default outbound. Check file or delete it for geo_updater to re-download.",
                     path
                 ),
-                Ok(n) => tracing::debug!("geo 数据 {:?} 自检通过 ({} 个分类)", path, n),
+                Ok(n) => tracing::debug!("geo data {:?} self-check passed ({} categories)", path, n),
                 Err(e) => tracing::warn!(
-                    "geo 数据 {:?} 解析失败 ({}) — 引用它的规则将不匹配。检查文件或删除重下。",
+                    "geo data {:?} failed to parse ({}) - rules referencing it will not match. Check file or delete to re-download.",
                     path, e
                 ),
             },
@@ -933,12 +933,12 @@ fn validate_geodata_dir(geodata_dir: &str) {
             // 第三方 sing-box rule-set JSON (RouterEngine 按 .json 后缀走 load_singbox_json)。
             Some("json") => match crate::router::geo::load_singbox_json(&path) {
                 Ok((d, c)) if d.is_empty() && c.is_empty() => tracing::warn!(
-                    "sing-box geo {:?} 载入 0 条 domain/ip_cidr (空壳/损坏/非 sing-box rule-set 格式?) — 引用它的规则将全部不匹配, 回落 default。检查文件。",
+                    "sing-box geo {:?} loaded 0 domain/ip_cidr entries (empty/corrupted/non-sing-box rule-set format?) - rules referencing it will never match and will fall back to default. Check file.",
                     path
                 ),
-                Ok((d, c)) => tracing::debug!("sing-box geo {:?} 自检通过 ({} domain + {} cidr)", path, d.len(), c.len()),
+                Ok((d, c)) => tracing::debug!("sing-box geo {:?} self-check passed ({} domain + {} cidr)", path, d.len(), c.len()),
                 Err(e) => tracing::warn!(
-                    "sing-box geo {:?} 解析失败 ({}) — 引用它的规则将不匹配。检查文件。",
+                    "sing-box geo {:?} failed to parse ({}) - rules referencing it will not match. Check file.",
                     path, e
                 ),
             },

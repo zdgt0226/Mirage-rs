@@ -91,8 +91,8 @@ impl WgTunnel {
     pub async fn connect(cfg: &WgConfig) -> Result<Self> {
         if cfg.mtu == 0 || cfg.mtu > MAX_MTU {
             anyhow::bail!(
-                "WireGuard mtu 非法: {} (须在 1..={}); 超限会让 boringtun 加密时 panic, \
-                 隧道静默失效。常用值 1420。",
+                "WireGuard mtu invalid: {} (must be in 1..={}); exceeding limit causes panic during boringtun encryption, \
+                 silently breaking the tunnel. Common value is 1420.",
                 cfg.mtu,
                 MAX_MTU
             );
@@ -100,10 +100,10 @@ impl WgTunnel {
         // 本地绑 0.0.0.0:0; connect 后 send/recv 只与该 peer 通信。
         let udp = UdpSocket::bind("0.0.0.0:0")
             .await
-            .context("WireGuard: 绑本地 UDP 失败")?;
+            .context("WireGuard: failed to bind local UDP socket")?;
         udp.connect(&cfg.endpoint)
             .await
-            .with_context(|| format!("WireGuard: 连接 peer endpoint {} 失败", cfg.endpoint))?;
+            .with_context(|| format!("WireGuard: failed to connect to peer endpoint {}", cfg.endpoint))?;
         let udp = Arc::new(udp);
 
         let tunn = super::build_tunn(cfg, 1);
@@ -221,7 +221,7 @@ async fn pump(
                 let n = match r {
                     Ok(n) => n,
                     Err(e) => {
-                        tracing::debug!("[WG] UDP recv 失败, 隧道退出: {e}");
+                        tracing::debug!("[WG] UDP recv failed, tunnel exiting: {e}");
                         return;
                     }
                 };
@@ -349,7 +349,7 @@ mod tests {
             Err(e) => e.to_string(),
             Ok(_) => panic!("超限 MTU 必须被拒"),
         };
-        assert!(e.contains("mtu 非法"), "实际: {e}");
+        assert!(e.contains("mtu invalid"), "实际: {e}");
         // 0 也不合法
         assert!(WgTunnel::connect(&cfg_to("127.0.0.1:1".into(), 0)).await.is_err());
     }

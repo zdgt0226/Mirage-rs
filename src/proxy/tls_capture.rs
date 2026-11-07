@@ -41,7 +41,7 @@ pub fn arm(out: Option<String>) {
     let mut s = lock();
     s.armed = true;
     s.out = out;
-    info!("[TLS-CAPTURE] 已武装: 下一个经过的浏览器 ClientHello 将被抓为指纹模板");
+    info!("[TLS-CAPTURE] Armed: next browser ClientHello passing through will be captured as fingerprint template");
 }
 
 /// 是否 armed (供 API status)。
@@ -91,7 +91,7 @@ fn try_capture(data: &[u8]) {
     };
     if let Some(path) = &out {
         if let Err(e) = write_files(path, &cap) {
-            warn!("[TLS-CAPTURE] 写 {} 失败: {} —— 重新武装, 可再试", path, e);
+            warn!("[TLS-CAPTURE] Failed to write {}: {} - re-arming, can retry", path, e);
             let mut s = lock();
             s.armed = true;
             s.out = out;
@@ -99,10 +99,10 @@ fn try_capture(data: &[u8]) {
         }
     }
     info!(
-        "[TLS-CAPTURE] 已抓取 ClientHello ({} 字节, SNI={}){}",
+        "[TLS-CAPTURE] Captured ClientHello ({} bytes, SNI={}){}",
         cap.record_len,
         cap.sni_host.as_deref().unwrap_or("?"),
-        out.as_ref().map(|p| format!(" → {p} (+ .json)")).unwrap_or_default()
+        out.as_ref().map(|p| format!(" -> {p} (+ .json)")).unwrap_or_default()
     );
     NOTIFY.notify_waiters();
 }

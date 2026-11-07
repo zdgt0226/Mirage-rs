@@ -69,12 +69,12 @@ pub fn set_offset_from_server_time(server_time: u64) {
     const SIGNIFICANT_DELTA: i64 = 3;
     if delta.abs() >= SIGNIFICANT_DELTA {
         tracing::info!(
-            "TIME_SYNC: offset updated {}s → {}s (Δ {}s) from server's encrypted handshake",
+            "TIME_SYNC: offset updated {}s -> {}s (delta {}s) from server's encrypted handshake",
             old, offset, delta
         );
     } else if delta != 0 {
         tracing::trace!(
-            "TIME_SYNC: minor drift {}s → {}s (Δ {}s, < {}s threshold)",
+            "TIME_SYNC: minor drift {}s -> {}s (delta {}s, < {}s threshold)",
             old, offset, delta, SIGNIFICANT_DELTA
         );
     } else {

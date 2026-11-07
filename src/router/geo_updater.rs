@@ -182,9 +182,9 @@ fn write_meta(dir: &str, meta: &MetaFile) {
                 return;
             }
             let _ = std::fs::remove_file(&tmp);
-            warn!("GeoUpdater: 写 meta.json 失败, 下次启动会退回无条件下载");
+            warn!("GeoUpdater: failed to write meta.json, next startup will fall back to unconditional download");
         }
-        Err(e) => warn!("GeoUpdater: 序列化 meta.json 失败: {}", e),
+        Err(e) => warn!("GeoUpdater: failed to serialize meta.json: {}", e),
     }
 }
 
@@ -204,7 +204,7 @@ async fn update_one(
 ) -> Result<()> {
     // name 直接拼进文件路径: 拒绝空名、路径分隔符与 "..", 防止写出 geodata_dir 之外。
     if !crate::config::geo_source_name_ok(&source.name) {
-        anyhow::bail!("geo_sources.name `{}` 非法 (不得为空、含路径分隔符或 \"..\")", source.name);
+        anyhow::bail!("geo_sources.name `{}` is invalid (must not be empty, contain path separators or \"..\")", source.name);
     }
     let filename = format!("{}.dat", source.name);
     let path = Path::new(dir).join(&filename);
@@ -225,7 +225,7 @@ async fn update_one(
         .map(|m| !m.urls.is_empty() && m.urls != source.url)
         .unwrap_or(false);
     if url_changed {
-        info!("GeoUpdater: {} 的 url 已变更, 忽略新鲜度直接重新下载", filename);
+        info!("GeoUpdater: url for {} has changed, ignoring freshness and re-downloading directly", filename);
     }
     if exists && !url_changed {
         let age = meta
@@ -237,7 +237,7 @@ async fn update_one(
         if let Some(age) = age {
             if age < max_age {
                 info!(
-                    "GeoUpdater: {} 已是最新 (距上次 {:.1} 天 < {} 天), 跳过",
+                    "GeoUpdater: {} is already up to date ({:.1} days since last < {} days), skipping",
                     filename,
                     age.as_secs_f64() / 86_400.0,
                     update_days.max(1)
@@ -260,14 +260,14 @@ async fn update_one(
     };
 
     debug!(
-        "GeoUpdater: 下载 {} (kind={:?}, via={:?}, {} 个镜像)",
+        "GeoUpdater: downloading {} (kind={:?}, via={:?}, {} mirror(s))",
         source.name, source.kind, source.via, source.url.len()
     );
 
     let (bytes, validators) = match fetch_with_fallback(source, proxy_url, cond.as_ref()).await? {
         FetchOutcome::NotModified => {
             // 上游没变: 不重下, 但要把"刚校验过"记一笔, 否则每个周期都会再问一次。
-            info!("GeoUpdater: {} 上游未变更 (304), 复用本地文件", filename);
+            info!("GeoUpdater: {} upstream not modified (304), reusing local file", filename);
             let e = meta.sources.entry(source.name.clone()).or_default();
             e.downloaded_at = now_secs();
             e.urls = source.url.clone();
@@ -278,10 +278,10 @@ async fn update_one(
 
     // 写到 .tmp 再原子重命名, 避免下载中途文件损坏被读
     if !Path::new(dir).exists() {
-        std::fs::create_dir_all(dir).with_context(|| format!("创建 geo 目录失败: {dir}"))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("failed to create geo directory: {dir}"))?;
     }
     if let Err(e) = std::fs::write(&tmp_path, &bytes) {
-        error!("GeoUpdater: 写 {} 的临时文件失败: {:?}", source.name, e);
+        error!("GeoUpdater: failed to write temp file for {}: {:?}", source.name, e);
         return Err(anyhow!("Write tmp failed"));
     }
 
@@ -292,14 +292,14 @@ async fn update_one(
     if let Err(e) = validate_dat(&tmp_path, source.kind) {
         let _ = std::fs::remove_file(&tmp_path);
         error!(
-            "GeoUpdater: {} 下载内容不是有效的 {:?} 数据 ({}), 保留原文件不覆盖",
+            "GeoUpdater: downloaded content for {} is not valid {:?} data ({}), keeping existing file untouched",
             filename, source.kind, e
         );
         return Err(anyhow!("downloaded data failed validation"));
     }
 
     if let Err(e) = std::fs::rename(&tmp_path, &path) {
-        error!("GeoUpdater: 重命名 {} 失败: {:?}", source.name, e);
+        error!("GeoUpdater: failed to rename {}: {:?}", source.name, e);
         let _ = std::fs::remove_file(&tmp_path);
         return Err(anyhow!("Rename failed"));
     }
@@ -309,7 +309,7 @@ async fn update_one(
     e.downloaded_at = now_secs();
     e.urls = source.url.clone();
 
-    info!("GeoUpdater: {} 已更新 ({} 字节)", filename, bytes.len());
+    info!("GeoUpdater: {} updated ({} bytes)", filename, bytes.len());
     Ok(())
 }
 
@@ -329,7 +329,7 @@ fn validate_dat(path: &Path, _kind: crate::config::GeoKind) -> Result<()> {
     let n = crate::router::geo::count_categories(path)?;
     if n == 0 {
         return Err(anyhow!(
-            "解析出 0 个分类 —— 多半是 HTML 错误页/限流页而非 geo 数据"
+            "parsed 0 categories - likely an HTML error/rate-limit page rather than geo data"
         ));
     }
     Ok(())
@@ -472,32 +472,32 @@ async fn fetch_with_fallback(
         match do_fetch(&primary_client, url, cond).await {
             Ok(out) => {
                 if total > 1 {
-                    debug!("GeoUpdater: '{}' 镜像 {}/{} 成功: {}", source.name, i + 1, total, url);
+                    debug!("GeoUpdater: '{}' mirror {}/{} succeeded: {}", source.name, i + 1, total, url);
                 }
                 return Ok(out);
             }
             Err(e) => {
                 if matches!(source.via, GeoVia::Proxy) {
                     warn!(
-                        "GeoUpdater: '{}' 镜像 {}/{} 经代理失败 ({}), 改试直连",
+                        "GeoUpdater: '{}' mirror {}/{} via proxy failed ({}), trying direct fallback",
                         source.name, i + 1, total, e
                     );
                     let direct_client = build_client(GeoVia::Direct, None, &source.name)?;
                     match do_fetch(&direct_client, url, cond).await {
                         Ok(out) => {
-                            info!("GeoUpdater: '{}' 镜像 {}/{} 直连回落成功", source.name, i + 1, total);
+                            info!("GeoUpdater: '{}' mirror {}/{} direct fallback succeeded", source.name, i + 1, total);
                             return Ok(out);
                         }
                         Err(e2) => {
                             warn!(
-                                "GeoUpdater: '{}' 镜像 {}/{} 代理与直连均失败 (proxy: {}, direct: {})",
+                                "GeoUpdater: '{}' mirror {}/{} failed via both proxy and direct (proxy: {}, direct: {})",
                                 source.name, i + 1, total, e, e2
                             );
                             last_err = anyhow!("proxy: {}; direct: {}", e, e2);
                         }
                     }
                 } else {
-                    warn!("GeoUpdater: '{}' 镜像 {}/{} 失败: {}", source.name, i + 1, total, e);
+                    warn!("GeoUpdater: '{}' mirror {}/{} failed: {}", source.name, i + 1, total, e);
                     last_err = e;
                 }
             }
@@ -505,7 +505,7 @@ async fn fetch_with_fallback(
     }
 
     error!(
-        "GeoUpdater: '{}' 全部 {} 个镜像都失败, 保留现有 .dat 不覆盖。最后一次错误: {}",
+        "GeoUpdater: '{}' all {} mirror(s) failed, keeping existing .dat untouched. Last error: {}",
         source.name, total, last_err
     );
     Err(anyhow!("all {} mirror(s) failed: {}", total, last_err))

@@ -19,7 +19,7 @@ fn build_transparent_listener(listen_addr: &str) -> anyhow::Result<TcpListener> 
     match build_transparent_listener_inner(listen_addr) {
         Ok(l) => Ok(l),
         Err(e) => {
-            warn!("IP_TRANSPARENT listener 构建失败 ({}); 回落普通 listener —— fake-IP 转发可用, raw-IP 直连分流受限", e);
+            warn!("IP_TRANSPARENT listener build failed ({}); falling back to standard listener - fake-IP forwarding functional, raw-IP direct routing limited", e);
             let std_l = std::net::TcpListener::bind(listen_addr)?;
             std_l.set_nonblocking(true)?;
             Ok(TcpListener::from_std(std_l)?)
@@ -37,7 +37,7 @@ fn build_transparent_listener_inner(listen_addr: &str) -> anyhow::Result<TcpList
 
     let addr: std::net::SocketAddrV4 = listen_addr
         .parse()
-        .map_err(|e| anyhow::anyhow!("透明 TCP listen 地址非 IPv4 ({}): {}", listen_addr, e))?;
+        .map_err(|e| anyhow::anyhow!("transparent TCP listen address is not IPv4 ({}): {}", listen_addr, e))?;
     let fd = socket(AddressFamily::Inet, SockType::Stream, SockFlag::SOCK_NONBLOCK, None)
         .context("socket(AF_INET, SOCK_STREAM)")?;
     setsockopt(&fd, sockopt::ReuseAddr, &true).context("setsockopt SO_REUSEADDR")?;
@@ -46,7 +46,7 @@ fn build_transparent_listener_inner(listen_addr: &str) -> anyhow::Result<TcpList
     // 某些内核/受限环境 setsockopt 会 EINVAL —— 失败则降级为普通 listener, fake-IP
     // 转发照常, 只有 raw-IP 直连分流受限。绝不能因它 drop 掉整个 listener。
     if let Err(e) = setsockopt(&fd, sockopt::IpTransparent, &true) {
-        warn!("透明 listener IP_TRANSPARENT 设置失败 ({}); fake-IP 仍可用, raw-IP 分流受限", e);
+        warn!("transparent listener IP_TRANSPARENT setsockopt failed ({}); fake-IP still usable, raw-IP routing limited", e);
     }
     bind(fd.as_raw_fd(), &SockaddrIn::from(addr)).with_context(|| format!("bind {}", addr))?;
     // Backlog::MAXCONN (=SOMAXCONN) 恒合法; 早前 Backlog::new(1024) 在 SOMAXCONN=128
@@ -94,13 +94,13 @@ pub async fn start_transparent(
     {
         let engine = transparent_engine.lock().await;
         if let Err(e) = engine.register_listener(&listener) {
-            warn!("sk_lookup register_listener 失败 (不影响 tc_divert 转发拦截): {}", e);
+            warn!("sk_lookup register_listener failed (does not affect tc_divert forwarding interception): {}", e);
         }
     }
     {
         let mut engine = transparent_engine.lock().await;
         if let Err(e) = engine.attach_to_netns(fake_ip_net, fake_ip_prefix) {
-            warn!("sk_lookup attach_to_netns 失败 (不影响 tc_divert 转发拦截): {}", e);
+            warn!("sk_lookup attach_to_netns failed (does not affect tc_divert forwarding interception): {}", e);
         }
     }
 
@@ -159,7 +159,7 @@ pub async fn start_transparent(
                                     // 那会让代理连回自己 (至少是一次注定失败的自连, 表现为偶发卡顿)。
                                     // 直接丢弃 —— 客户端 TCP 会重传, 届时 map 多半已同步。
                                     debug!(
-                                        "[TPROXY] {} origdst 查询落空 (cgroup map 竞态), 丢弃以防自连 127.0.0.1:{}",
+                                        "[TPROXY] {} origdst lookup missed (cgroup map race), dropping to prevent self-connect to 127.0.0.1:{}",
                                         peer_addr, dst_addr.port()
                                     );
                                     return;
@@ -168,7 +168,7 @@ pub async fn start_transparent(
                         }
                         // 双保险: 无论走哪条路径, 目标若恰是本 listener 端口 = 自连, 丢弃。
                         if dst_addr.ip().is_loopback() && dst_addr.port() == lport {
-                            debug!("[TPROXY] {} 目标为自身监听端口 127.0.0.1:{}, 丢弃防死循环", peer_addr, lport);
+                            debug!("[TPROXY] {} target is own listen port 127.0.0.1:{}, dropping to prevent loop", peer_addr, lport);
                             return;
                         }
                         // DNS 劫持: 流经 LAN 的 53/TCP 查询由本机应答 (tc_divert 已把它
@@ -194,21 +194,21 @@ pub async fn start_transparent(
                                 Some(d) => format!("{}:{}", d, dst_addr.port()),
                                 None => match sniff_first_kb(&stream).await {
                                     Some(sniffed) => {
-                                        debug!("[TPROXY] TCP {} 裸-IP 嗅探到 SNI/Host [{}]", peer_addr, sniffed);
+                                        debug!("[TPROXY] TCP {} raw-IP sniffed SNI/Host [{}]", peer_addr, sniffed);
                                         format!("{}:{}", sniffed, dst_addr.port())
                                     }
                                     // 段内 fake-IP 反查 miss + 非 HTTP 嗅不到域名: 连字面 fake-IP (198.18.x) 不可
                                     // 路由 = 死地址, 非标端口国内服务就卡在这。fail-fast reset, 客户端重解析拿新
                                     // fake-IP (多因网关重启清内存表; 设 fakeip.persist_path 可扛)。裸真实 IP 才直连。
                                     None if fake_ip_mapper_clone.is_fake_ip(&dst_v4) => {
-                                        warn!("[TPROXY] TCP {} → fake-IP {} 反查 miss 且非 HTTP 无法嗅域名 → reset (客户端将重解析)。建议开 advanced_dns.fakeip.persist_path", peer_addr, dst_v4);
+                                        warn!("[TPROXY] TCP {} -> fake-IP {} reverse lookup miss and non-HTTP cannot sniff domain -> reset (client will re-resolve). Suggest enabling advanced_dns.fakeip.persist_path", peer_addr, dst_v4);
                                         return;
                                     }
                                     None => format!("{}:{}", dst_v4, dst_addr.port()),
                                 },
                             };
 
-                            debug!("[TPROXY] TCP {} → {} → [{}]", peer_addr, dst_addr, target_host);
+                            debug!("[TPROXY] TCP {} -> {} -> [{}]", peer_addr, dst_addr, target_host);
 
                             // 复用现有的 TCP 处理逻辑，根据 rule_engine 进行路由分发
                             crate::proxy::handler::proxy_tcp_target(
