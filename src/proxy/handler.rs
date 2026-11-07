@@ -71,7 +71,7 @@ pub(crate) fn record_real_failure_and_log(
 ) {
     if pool.stats.write().unwrap_or_else(|e| e.into_inner()).record_real_failure(target) {
         info!(
-            "节点 {} 真实连接连续失败 (涉及 {} 个不同目标), urltest 降级 {}s",
+            "Node {} real connections continuously failed (across {} distinct targets), urltest penalized for {}s",
             node_tag,
             crate::proxy::pool::PENALIZE_AFTER_FAILURES,
             crate::proxy::pool::PENALTY_DURATION.as_secs()
@@ -110,7 +110,7 @@ pub(crate) fn record_first_down(
     if trigger_probe {
         pool.trigger_probe();
         info!(
-            "节点 {} 真实连接连续明显变慢 (涉及 {} 个不同目标), 触发补测",
+            "Node {} real connections continuously noticeably slow (across {} distinct targets), triggering re-probe",
             node_tag,
             crate::proxy::pool::SLOW_TRIGGER_COUNT
         );
@@ -250,7 +250,7 @@ pub async fn proxy_tcp_target(
         )
         .await
         {
-            debug!("[SNIFF] 裸 IP {} 嗅到 SNI/Host [{}], 改按域名分流", final_host, sniffed);
+            debug!("[SNIFF] raw IP {} sniffed SNI/Host [{}], routing by domain instead", final_host, sniffed);
             sniffed_domain = Some(sniffed);
         }
     }
@@ -264,7 +264,7 @@ pub async fn proxy_tcp_target(
                 final_target = format!("{}:{}", d, final_port);
             }
             None => {
-                warn!("fake-IP {} 反查 miss 且非 HTTP 无法嗅域名 → reset (客户端将重解析)。建议开 advanced_dns.fakeip.persist_path", final_host);
+                warn!("fake-IP {} reverse lookup miss and non-HTTP cannot sniff domain -> reset (client will re-resolve). Suggest enabling advanced_dns.fakeip.persist_path", final_host);
                 return;
             }
         }
@@ -358,7 +358,7 @@ pub async fn proxy_tcp_target(
             let target_bytes = target.as_bytes();
             if target_bytes.is_empty() || target_bytes.len() > 512 {
                 error!(
-                    "Mirage: target 长度非法 (须 1..=512 字节): {} 字节",
+                    "Mirage: target length invalid (must be 1..=512 bytes): {} bytes",
                     target_bytes.len()
                 );
                 return;
@@ -370,7 +370,7 @@ pub async fn proxy_tcp_target(
                 use tokio::io::AsyncWriteExt;
                 let mux = match pool.quic_mux() {
                     Some(m) => m,
-                    None => { error!("Mirage QUIC: mux 未初始化 {}", target); return; }
+                    None => { error!("Mirage QUIC: mux not initialized {}", target); return; }
                 };
                 let (send, recv) = match mux.open_stream().await {
                     Ok(s) => s,
@@ -558,12 +558,12 @@ pub async fn proxy_tcp_target(
                     }
                 };
                 if let Err(e) = t.writer.send_data(&target_header).await {
-                    debug!("[TUNNEL] {} 首写目标头失败 (第 {} 次尝试), 换隧道重试: {:?}", target, attempt + 1, e);
+                    debug!("[TUNNEL] {} first write target header failed (attempt {}), retrying with fresh tunnel: {:?}", target, attempt + 1, e);
                     continue; // 旧隧道 drop 关闭, 循环取新的
                 }
                 if !initial_payload.is_empty() {
                     if let Err(e) = t.writer.send_data(&initial_payload).await {
-                        debug!("[TUNNEL] {} 首写首包失败 (第 {} 次尝试), 换隧道重试: {:?}", target, attempt + 1, e);
+                        debug!("[TUNNEL] {} first write initial payload failed (attempt {}), retrying with fresh tunnel: {:?}", target, attempt + 1, e);
                         continue;
                     }
                 }
@@ -573,7 +573,7 @@ pub async fn proxy_tcp_target(
             let tunnel = match tunnel {
                 Some(t) => t,
                 None => {
-                    error!("Mirage outbound: {} 尝试 {} 条隧道首写均失败, 放弃", target, MAX_TUNNEL_ATTEMPTS);
+                    error!("Mirage outbound: {} all {} tunnel first write attempts failed, giving up", target, MAX_TUNNEL_ATTEMPTS);
                     record_real_failure_and_log(pool, &target, node_tag);
                     return;
                 }
@@ -581,7 +581,7 @@ pub async fn proxy_tcp_target(
 
             let active_fd = tunnel.get_raw_fd();
 
-            debug!("[TUNNEL] {} 建立 (隧道就绪, 目标头已发)", target);
+            debug!("[TUNNEL] {} established (tunnel ready, target header sent)", target);
             let t_start = std::time::Instant::now();
 
             // 本地 socket fd: 下行被截断时据此对本地应用 RST (见 download 末尾)。两个半程活着期间有效。
@@ -743,7 +743,7 @@ pub async fn proxy_tcp_target(
                             } else if let Some(reason) = crate::crypto::aead::target_unreachable_reason(&e) {
                                 truncated = true;
                                 end_reason = DownloadEndReason::TargetUnreachable;
-                                debug!("服务端报告目标不可达 {} (reason={})", target, reason);
+                                debug!("server reported target unreachable {} (reason={})", target, reason);
                             } else {
                                 truncated = true;
                                 end_reason = DownloadEndReason::PeerError;
@@ -808,7 +808,7 @@ pub async fn proxy_tcp_target(
             drop(tw);
             drop(tr);
             debug!(
-                "[TUNNEL] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                "[TUNNEL] {} closed (up {} down {}, alive {:.1}s)",
                 target,
                 human_bytes(up_bytes),
                 human_bytes(down_bytes),
@@ -862,7 +862,7 @@ pub async fn proxy_tcp_target(
 
             let (pool_hits_pre, pool_misses_pre, _) = crate::proxy::splice::pool_stats();
             debug!(
-                "[DIRECT] {} 建立 (peer={} initial={}B connect={}ms pool_hits={} pool_misses={})",
+                "[DIRECT] {} established (peer={} initial={}B connect={}ms pool_hits={} pool_misses={})",
                 target, peer_str, initial_len, t_connect_ms, pool_hits_pre, pool_misses_pre
             );
 
@@ -874,7 +874,7 @@ pub async fn proxy_tcp_target(
                     _conn.counter().down(down);
                     let (pool_hits, pool_misses, pool_len) = crate::proxy::splice::pool_stats();
                     debug!(
-                        "[DIRECT] {} 关闭 (↑{} ↓{}, 存活 {:.1}s, peer={} relay={}ms \
+                        "[DIRECT] {} closed (up {} down {}, alive {:.1}s, peer={} relay={}ms \
                          pool_hits={} pool_misses={} pool_idle={})",
                         target, human_bytes(up), human_bytes(down), t_start.elapsed().as_secs_f64(),
                         peer_str, relay_start.elapsed().as_millis(),
@@ -894,7 +894,7 @@ pub async fn proxy_tcp_target(
                         _ => "other",
                     };
                     debug!(
-                        "[DIRECT] {} 出错 (reason={} 存活 {:.1}s peer={} err='{}')",
+                        "[DIRECT] {} error (reason={} alive {:.1}s peer={} err='{}')",
                         target, reason, t_start.elapsed().as_secs_f64(), peer_str, e
                     );
                 }
@@ -907,7 +907,7 @@ pub async fn proxy_tcp_target(
             let tunnel = match leaf.wg_tunnel().await {
                 Ok(t) => t,
                 Err(e) => {
-                    error!("[WG] {} 建立隧道失败: {}", target, e);
+                    error!("[WG] {} failed to establish tunnel: {}", target, e);
                     return;
                 }
             };
@@ -923,14 +923,14 @@ pub async fn proxy_tcp_target(
             }) {
                 Some(hp) => hp,
                 None => {
-                    error!("[WG] 目标 `{}` 不是合法的 host:port", target);
+                    error!("[WG] target `{}` is not a valid host:port", target);
                     return;
                 }
             };
             let addr = match crate::proxy::wg::resolve_target(&tunnel, host, port).await {
                 Ok(a) => a,
                 Err(e) => {
-                    error!("[WG] {} 解析目标失败: {}", target, e);
+                    error!("[WG] {} failed to resolve target: {}", target, e);
                     return;
                 }
             };
@@ -938,17 +938,17 @@ pub async fn proxy_tcp_target(
             let mut remote = match crate::proxy::wg::socket::WgTcpStream::connect(tunnel, addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("[WG] {} 经隧道连接失败: {}", target, e);
+                    error!("[WG] {} connect via tunnel failed: {}", target, e);
                     return;
                 }
             };
-            debug!("[WG] {} 已连通 ({}ms)", target, t_start.elapsed().as_millis());
+            debug!("[WG] {} connected ({}ms)", target, t_start.elapsed().as_millis());
 
             // 首包 (SOCKS5 早期数据 / HTTP 请求头) 必须先送出去, 否则对端干等。
             if !initial_payload.is_empty() {
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = remote.write_all(&initial_payload).await {
-                    error!("[WG] {} 首包写入失败: {}", target, e);
+                    error!("[WG] {} failed to write initial payload: {}", target, e);
                     return;
                 }
             }
@@ -969,32 +969,32 @@ pub async fn proxy_tcp_target(
                     _conn.counter().up(up);
                     _conn.counter().down(down);
                     debug!(
-                        "[WG] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                        "[WG] {} closed (up {} down {}, alive {:.1}s)",
                         target, human_bytes(up), human_bytes(down),
                         t_start.elapsed().as_secs_f64()
                     );
                 }
-                Err(e) => debug!("[WG] {} 出错: {}", target, e),
+                Err(e) => debug!("[WG] {} error: {}", target, e),
             }
         }
         OutboundNode::Shadowsocks { tag, .. } => {
             let t_start = std::time::Instant::now();
             let Ok(addr) = crate::proxy::outbound::Address::parse(&target) else {
-                error!("[SS:{}] 目标地址非法: {}", tag, target);
+                error!("[SS:{}] invalid target address: {}", tag, target);
                 return;
             };
             let mut remote = match leaf.connect(&addr).await {
                 Ok(s) => s,
                 Err(e) => {
-                    error!("[SS:{}] {} 连接失败: {}", tag, target, e);
+                    error!("[SS:{}] {} connect failed: {}", tag, target, e);
                     return;
                 }
             };
-            debug!("[SS:{}] {} 已连通 ({}ms)", tag, target, t_start.elapsed().as_millis());
+            debug!("[SS:{}] {} connected ({}ms)", tag, target, t_start.elapsed().as_millis());
             if !initial_payload.is_empty() {
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = remote.write_all(&initial_payload).await {
-                    error!("[SS:{}] {} 首包写入失败: {}", tag, target, e);
+                    error!("[SS:{}] {} failed to write initial payload: {}", tag, target, e);
                     return;
                 }
                 _conn.counter().up(initial_payload.len() as u64);
@@ -1012,12 +1012,12 @@ pub async fn proxy_tcp_target(
                     _conn.counter().up(up);
                     _conn.counter().down(down);
                     debug!(
-                        "[SS:{}] {} 关闭 (↑{} ↓{}, 存活 {:.1}s)",
+                        "[SS:{}] {} closed (up {} down {}, alive {:.1}s)",
                         tag, target, human_bytes(up), human_bytes(down),
                         t_start.elapsed().as_secs_f64()
                     );
                 }
-                Err(e) => debug!("[SS:{}] {} 出错: {}", tag, target, e),
+                Err(e) => debug!("[SS:{}] {} error: {}", tag, target, e),
             }
         }
         OutboundNode::Block { .. } => {

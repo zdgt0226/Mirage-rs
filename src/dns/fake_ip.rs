@@ -43,7 +43,7 @@ impl FakeIpMapper {
         // 会发出范围外 IP。上界 32 之外再设下界: prefix <= 29。
         if prefix > 29 {
             return Err(anyhow::anyhow!(
-                "fake-ip CIDR 前缀 /{prefix} 太小 (需 <= /29, 至少 3 个主机位)"
+                "fake-ip CIDR prefix /{prefix} too small (must be <= /29, at least 3 host bits)"
             ));
         }
 
@@ -66,7 +66,7 @@ impl FakeIpMapper {
         if let Some(p) = &mapper.persist_path {
             if p.exists() {
                 if let Err(e) = mapper.load(p) {
-                    tracing::warn!("[FAKEIP] 加载持久化缓存 {} 失败 ({}), 空启动", p.display(), e);
+                    tracing::warn!("[FAKEIP] failed to load persist cache {} ({}), starting empty", p.display(), e);
                 }
             }
         }
@@ -90,7 +90,7 @@ impl FakeIpMapper {
     /// 只接受落在本 range 的 IP (换过 fakeip 网段的旧缓存自动丢弃)。best-effort 解析。
     fn load(&self, path: &Path) -> anyhow::Result<()> {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("读取 fake-ip 持久化文件失败: {}", path.display()))?;
+            .with_context(|| format!("failed to read fake-ip persist file: {}", path.display()))?;
         let mut d2i = self.domain_to_ip.write().unwrap_or_else(|e| e.into_inner());
         let mut i2d = self.ip_to_domain.write().unwrap_or_else(|e| e.into_inner());
         let mut loaded_next: Option<u32> = None;
@@ -133,7 +133,7 @@ impl FakeIpMapper {
                 *self.next_ip.write().unwrap_or_else(|e| e.into_inner()) = n;
             }
         }
-        tracing::info!("[FAKEIP] 从 {} 恢复 {} 条映射", path.display(), count);
+        tracing::info!("[FAKEIP] restored {} mappings from {}", count, path.display());
         Ok(())
     }
 
@@ -166,17 +166,17 @@ impl FakeIpMapper {
         }
         let tmp = path.with_extension("tmp");
         if let Err(e) = std::fs::write(&tmp, out.as_bytes()) {
-            tracing::warn!("[FAKEIP] 写临时缓存 {} 失败: {}", tmp.display(), e);
+            tracing::warn!("[FAKEIP] failed to write temp cache {}: {}", tmp.display(), e);
             self.dirty.store(true, Ordering::SeqCst); // 恢复 dirty
             return;
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
-            tracing::warn!("[FAKEIP] rename 缓存 {} 失败: {}", path.display(), e);
+            tracing::warn!("[FAKEIP] failed to rename cache {}: {}", path.display(), e);
             let _ = std::fs::remove_file(&tmp);
             self.dirty.store(true, Ordering::SeqCst);
             return;
         }
-        tracing::debug!("[FAKEIP] 持久化 {} 条映射 → {}", snapshot.len(), path.display());
+        tracing::debug!("[FAKEIP] persisted {} mappings -> {}", snapshot.len(), path.display());
     }
 
     /// 启动周期落盘后台任务 (每 60s, 仅 dirty 才写)。持久化未启用则 no-op。
@@ -251,11 +251,11 @@ impl FakeIpMapper {
         if let Some(old_domain) = i2d.insert(ip, domain.clone()) {
             if old_domain != domain {
                 d2i.remove(&old_domain);
-                tracing::debug!("[FAKEIP] {} 槽位复用 → 淘汰旧域名 [{}]", ip, old_domain);
+                tracing::debug!("[FAKEIP] {} slot reused -> evicted old domain [{}]", ip, old_domain);
                 evicted = Some(old_domain);
             }
         }
-        tracing::debug!("[FAKEIP] assign [{}] → {} (已用 {}/~{})", domain, ip, d2i.len() + 1, !self.mask);
+        tracing::debug!("[FAKEIP] assign [{}] -> {} (used {}/~{})", domain, ip, d2i.len() + 1, !self.mask);
         d2i.insert(domain, ip);
         self.dirty.store(true, Ordering::Relaxed); // 新分配 → 待落盘
 

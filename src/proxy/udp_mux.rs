@@ -423,7 +423,7 @@ impl MuxSet {
         let pool = self
             .pool
             .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("mux: 底层 pool 已释放 (配置重载?)"))?;
+            .ok_or_else(|| anyhow::anyhow!("mux: underlying pool dropped (config reload?)"))?;
         let idx = self.slot_for(key);
         let mut slot = self.slots[idx].lock().await;
         if let Some(t) = slot.as_ref() {

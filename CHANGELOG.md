@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### chore(log): 运行时日志与错误文本改为英文 (2026-11-07)
+
+- **日志全部英文 + 纯 ASCII**: 部分系统 / 终端 / 日志采集不是 UTF-8 时中文日志会乱码。约 500 处日志宏 (error / warn / info / debug / trace) 与会写进日志的错误文本 (anyhow / bail / context / io::Error) 改为英文, 且只含 ASCII 字符 (箭头、破折号、± 等也换成 ASCII)。`mirage check` 的检查提示与 `mirage config` 等命令行交互界面保持中文。若有脚本按中文日志关键字匹配 (如 grep "降级"), 需改用英文关键字。
+
 ### fix(server,outbounds): 服务端 TCP relay 半关闭收尾 + 出站组无可用成员日志 (2026-11-07)
 
 - **服务端 TCP relay 半关闭收尾 30s**: 服务端上游先结束后, 客户端 30s 不关隧道即断开, 原等 1800s; 对 v0.17.9 之前不做收尾的老客户端尤其有用。直连 / SS 上游 / WG 上游三条路径都生效; close_notify / FIN / RST 规则不变。

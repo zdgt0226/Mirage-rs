@@ -130,7 +130,7 @@ pub(super) async fn dispatch_authenticated(
                 static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !HINTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::warn!(
-                        "Mirage Server: first_chunk 解密失败 ({:?})。{}",
+                        "Mirage Server: first_chunk decryption failed ({:?}).{}",
                         e,
                         crate::crypto::hello_auth::session_decrypt_failure_hint()
                     );
@@ -166,7 +166,7 @@ pub(super) async fn dispatch_authenticated(
                 writer.rekey(final_cipher);
                 reader.rekey(final_cipher);
             }
-            tracing::debug!("Mirage Server: cipher agility 协商为 {:?}", final_cipher);
+            tracing::debug!("Mirage Server: cipher agility negotiated as {:?}", final_cipher);
             // 读 rekey 后的真首帧
             match tokio::time::timeout(std::time::Duration::from_secs(60), reader.recv_data()).await {
                 Ok(Ok(d)) => d,
@@ -201,7 +201,7 @@ pub(super) async fn dispatch_authenticated(
 
     // 凭据是否已吊销
     if cred_revoked.load(std::sync::atomic::Ordering::Relaxed) {
-        tracing::debug!("Mirage Server: 凭据已被吊销, 拒绝分发并断开连接");
+        tracing::debug!("Mirage Server: credentials revoked, refusing dispatch and disconnecting");
         let _ = writer.send_close_notify().await;
         return;
     }
@@ -210,7 +210,7 @@ pub(super) async fn dispatch_authenticated(
     // 将句柄直接传给后续 relay, 消除与 connect 之间的 TOCTOU 窗口。
     let user_limit = crate::proxy::user_limits::get_user_limit(&user);
     if user != "default" && user_limit.is_none() {
-        tracing::debug!("Mirage Server: 用户 `{}` 已被删除或不存在, 拒绝分发并断开连接", user);
+        tracing::debug!("Mirage Server: user `{}` has been deleted or does not exist, refusing dispatch and disconnecting", user);
         let _ = writer.send_close_notify().await;
         return;
     }
@@ -227,15 +227,15 @@ pub(super) async fn dispatch_authenticated(
         let legacy_up = super::server_router::current_inbound_upstream(inbound_tag.as_deref(), upstream.as_ref());
         if let Some(up) = legacy_up.as_ref().filter(|u| u.block_udp()) {
             tracing::warn!(
-                "拒绝 UDP 中继: 上游 {} 的 udp 策略为 block。{}",
+                "Refusing UDP relay: upstream {} has udp policy set to block. {}",
                 up.describe(),
                 match &**up {
                     crate::proxy::upstream::UpstreamOutlet::Shadowsocks(_) =>
-                        "SS 的 UDP 未实现; 放行会让 UDP 从本机 IP 出去而与 TCP 出口不一致。\
-                         确需旧行为请设 \"udp\": \"direct\"。",
+                        "SS UDP is unimplemented; allowing it would route UDP through local IP inconsistent with TCP exit IP. \
+                         If legacy behavior is required, set \"udp\": \"direct\".",
                     crate::proxy::upstream::UpstreamOutlet::Wireguard(_) =>
-                        "注意 WG 隧道本可承载 UDP (默认即 \"tunnel\", 与 TCP 同出口), \
-                         这里是你显式设了 block。",
+                        "Note that WG tunnels can carry UDP by default (\"tunnel\", same exit as TCP); \
+                         block was explicitly configured here.",
                 }
             );
             let _ = writer.send_close_notify().await;
@@ -246,7 +246,7 @@ pub(super) async fn dispatch_authenticated(
         // UDP MUX Mode: 一条隧道复用多条 UDP 流 (session-id)。block_udp 同样拒绝。
         let legacy_up = super::server_router::current_inbound_upstream(inbound_tag.as_deref(), upstream.as_ref());
         if legacy_up.as_ref().is_some_and(|u| u.block_udp()) {
-            tracing::warn!("拒绝 UDP mux 中继: 上游 udp 策略为 block");
+            tracing::warn!("Refusing UDP mux relay: upstream udp policy is block");
             let _ = writer.send_close_notify().await;
             return;
         }

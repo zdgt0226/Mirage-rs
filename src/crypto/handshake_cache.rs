@@ -76,8 +76,8 @@ async fn install_templates(new: Vec<Vec<u8>>) {
             let age = now_secs().saturating_sub(last);
             if age > STALE_WARN_SECS {
                 warn!(
-                    "HandshakeCache 已 {age}s 未更新 (伪装站不可达?): 继续回放旧模板 — \
-                     若伪装站已轮换证书/密钥, 回放的 ServerHello 与真站不一致 ⇒ 可区分"
+                    "HandshakeCache has not been updated for {age}s (camouflage site unreachable?): continuing to replay old templates - \
+                     if camouflage site rotated cert/keys, replayed ServerHello will differ from real site -> distinguishable"
                 );
             }
         }
@@ -91,7 +91,7 @@ async fn install_templates(new: Vec<Vec<u8>>) {
     drop(guard);
     LAST_OK_SECS.store(now_secs(), Ordering::Relaxed);
     if kept_old {
-        warn!("模板刷新只取到部分集, 已与旧集合并 (现 {n} 条) — 避免回放多样性塔缩");
+        warn!("template refresh only retrieved partial set, merged with old set (now {n} entries) - preventing replay diversity collapse");
     }
 }
 
@@ -180,7 +180,7 @@ pub async fn prewarm(camouflage_host: &str) {
         LAST_OK_SECS.store(now_secs(), Ordering::Relaxed);
     } else {
         warn!(
-            "HandshakeCache prewarm got no templates from {} — will retry lazily on first connection",
+            "HandshakeCache prewarm got no templates from {} - will retry lazily on first connection",
             camouflage_host
         );
     }
@@ -221,7 +221,7 @@ pub async fn get_server_hello_pfs(
                 // WARN 而非 ERROR: 这是**优雅降级**, 非故障 —— 拉不到真模板 (无外网/camouflage
                 // 不可达的 VPS/容器很常见) 就用恒完整的合成 fallback, 握手照常。降级为 WARN 免得
                 // 无外网服务端满屏吓人的 ERROR。
-                warn!("Failed to fetch any templates from {}. Using synthetic fallback (握手不受影响).", camouflage_host);
+                warn!("Failed to fetch any templates from {}. Using synthetic fallback (handshake unaffected).", camouflage_host);
                 guard.push(fallback_server_hello(client_hello, client_session_id));
             }
             drop(guard);

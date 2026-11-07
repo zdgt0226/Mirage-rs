@@ -131,25 +131,25 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
         // 刻意**不致命** —— 见 Config::parse_with_diagnostics 的说明。
         match crate::config::Config::parse_with_diagnostics(&content) {
             Ok((_, issues)) if !issues.is_empty() => {
-                warn!("配置校验发现 {} 个问题 (不影响启动, 但很可能不是你想要的):", issues.len());
+                warn!("configuration validation found {} issue(s) (does not block startup, but likely not what you intended):", issues.len());
                 for issue in &issues {
                     if issue.contains("password 与") {
-                        error!("  · {}", issue);
+                        error!("  - {}", issue);
                     } else {
-                        warn!("  · {}", issue);
+                        warn!("  - {}", issue);
                     }
                 }
             }
-            Ok(_) => info!("配置校验通过 (无未知字段, 引用完整)"),
-            Err(e) => warn!("配置校验跳过 (解析失败: {e})"),
+            Ok(_) => info!("configuration validation passed (no unknown fields, references intact)"),
+            Err(e) => warn!("configuration validation skipped (parse failed: {e})"),
         }
 
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             for w in config.weak_password_warnings() {
-                warn!("安全提示: {w}");
+                warn!("security warning: {w}");
             }
             for w in config.server_routing_warnings() {
-                warn!("配置提示: {w}");
+                warn!("configuration notice: {w}");
             }
             // ClientHello 计时/判定参数 (服务端; 见 docs/client-hello-timing-design.md)。
             // 环境变量 MIRAGE_CH_* 优先覆盖 (真机 A/B 调参)。放在 tuning 块外:
@@ -175,22 +175,22 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                 );
                 let (m, lo, hi, j, h, am, ao, ac) = crate::proxy::mirage_server::client_hello_guard_params();
                 info!(
-                    "ClientHello 守卫: 预连 {}×RTT (clamp {}~{}ms) · 静默判定 {}ms · 总时限 {}ms · \
-                     auth-succ 注入 {}.{}×cam_RTT+{}ms · 自校准={} (MIRAGE_CH_* 可覆盖)",
+                    "ClientHello guard: preconnect {}xRTT (clamp {}-{}ms) - silence threshold {}ms - total deadline {}ms - \
+                     auth-succ inject {}.{}xcam_RTT+{}ms - auto-calibrate={} (MIRAGE_CH_* can override)",
                     m, lo, hi, j, h, am / 10, am % 10, ao, if ac { "on" } else { "off" }
                 );
                 if ac {
                     info!(
-                        "自校准已开: 有 F 样本→注入 F; 冷启动(尚无 F 样本)→纯倍率 {}.{}×cam_RTT, 不加 offset",
+                        "auto-calibrate enabled: with F samples -> inject F; cold start (no F samples yet) -> pure multiplier {}.{}xcam_RTT, no offset added",
                         am / 10,
                         am % 10
                     );
                 } else {
                     warn!(
-                        "ClientHello 守卫未启用自校准 (auto_calibrate=false): auth-succ 注入用静态公式 \
-                         {}.{}×cam_RTT+{}ms。其固定偏置 P 是按某一伪装站实测定档的, 换节点/换伪装站后 \
-                         Δ 会残留该节点的 P 偏差 (两节点 P 的 95% CI 实测不相交) → 建议开 \
-                         tuning.client_hello_guard.auto_calibrate 或 MIRAGE_CH_AUTO_CALIBRATE=1。",
+                        "ClientHello guard auto-calibrate disabled (auto_calibrate=false): auth-succ injection uses static formula \
+                         {}.{}xcam_RTT+{}ms. Its fixed offset P was calibrated against a specific camouflage site; after changing node or camouflage site, \
+                         delta will retain the P bias of that node (empirical 95% CI of P across two nodes do not overlap) -> recommend enabling \
+                         tuning.client_hello_guard.auto_calibrate or MIRAGE_CH_AUTO_CALIBRATE=1.",
                         am / 10,
                         am % 10,
                         ao
@@ -202,7 +202,7 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                     Ok(v) => match v.parse::<usize>() {
                         Ok(n) => Some(n),
                         Err(_) => {
-                            warn!("MIRAGE_MAX_CONNS=`{v}` 不是合法整数, 已忽略 (改用 tuning.max_connections / 默认值)");
+                            warn!("MIRAGE_MAX_CONNS=`{v}` is not a valid integer, ignored (falling back to tuning.max_connections / default)");
                             None
                         }
                     },
@@ -213,7 +213,7 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                     .unwrap_or(crate::proxy::mirage_server::DEFAULT_MAX_CONNECTIONS);
                 crate::proxy::mirage_server::set_max_connections(max_conns);
                 info!(
-                    "服务端并发连接上限: {} (tuning.max_connections / MIRAGE_MAX_CONNS; 超限直接关闭并计数)",
+                    "server concurrent connection limit: {} (tuning.max_connections / MIRAGE_MAX_CONNS; excess connections immediately closed and counted)",
                     crate::proxy::mirage_server::effective_max_connections(max_conns)
                 );
             }
@@ -228,9 +228,9 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                         Some(scheme) => {
                             let n = scheme.len();
                             crate::crypto::cipher::set_padding_scheme(scheme);
-                            info!("已加载自定义 tls_padding_scheme ({} 条整形记录)", n);
+                            info!("loaded custom tls_padding_scheme ({} traffic shaping record(s))", n);
                         }
-                        None => warn!("tls_padding_scheme 非法 (格式 `lo-hi;lo-hi;...`, 1≤lo≤hi≤16384), 回落默认方案"),
+                        None => warn!("invalid tls_padding_scheme (format `lo-hi;lo-hi;...`, 1<=lo<=hi<=16384), falling back to default scheme"),
                     }
                 } else {
                     crate::crypto::cipher::set_padding_scheme(crate::crypto::cipher::DEFAULT_PAD_SCHEME.to_vec());
@@ -238,20 +238,20 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                 // 客户端版本识别 (两端同开: 客户端发 / 服务端读)。
                 crate::client_info::set_enabled(tuning.client_info);
                 if tuning.client_info {
-                    warn!("已开启 client_info: 要求两端同开 (单边开会多发/漏读一帧致该连接失败)。");
+                    warn!("client_info enabled: requires both ends to enable (one-sided enable will send extra or miss a frame causing connection failure).");
                 }
                 if tuning.tls_padding {
                     warn!(
-                        "已开启 tls_padding: 要求两端都升到支持剥零的版本。老对端不剥零, 会把填充零\
-                         当 content_type 解析失败断连。"
+                        "tls_padding enabled: requires both ends upgraded to versions supporting zero-stripping. Legacy peers without stripping will fail to parse padding zeros \
+                         as content_type and disconnect."
                     );
                 }
                 // UDP mux 开关 (客户端; 设进全局, transparent_udp 读)。
                 crate::proxy::udp_mux::set_udp_mux(tuning.udp_mux, tuning.udp_mux_tunnels);
                 if tuning.udp_mux {
                     warn!(
-                        "已开启 udp_mux (K={}): 要求服务端也升到支持 mux 的版本。老服务端不认 mux \
-                         sentinel, 那些 UDP 流会失败 → 客户端回落 TCP。",
+                        "udp_mux enabled (K={}): requires server upgraded to version supporting mux. Legacy servers do not recognize mux \
+                         sentinel, so those UDP streams will fail -> client falls back to TCP.",
                         tuning.udp_mux_tunnels
                     );
                 }
@@ -260,9 +260,9 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                     // 不认 0x02 → 丢弃 TIME_SYNC 不同步时钟 → 若本机与服务端时钟偏差超容差
                     // (默认 ±60s) 认证直接失败连不上。故必须确保所有客户端 ≥ v0.7.0。
                     warn!(
-                        "已开启 cipher_agility: 要求所有客户端升级到 ≥ v0.7.0。\
-                         老客户端会丢弃 TIME_SYNC (proto_ver 0x02 不识别) → 时钟不同步 → \
-                         若偏差超容差则认证失败连不上。"
+                        "cipher_agility enabled: requires all clients upgraded to >= v0.7.0. \
+                         Legacy clients will discard TIME_SYNC (unrecognized proto_ver 0x02) -> unsynchronized clock -> \
+                         authentication failure if offset exceeds tolerance."
                     );
                 }
                 if let Some(d) = tuning.geodata_dir { geodata_dir = d; }
@@ -284,9 +284,9 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                     match crate::config::parse_dns_upstream(r) {
                         Some(addr) => {
                             crate::proxy::resolver::set_tcp_resolver(addr);
-                            info!("DNS 解析改走 DNS-over-TCP 上游 {} (系统 getaddrinfo 停用; UDP 被封的 VPS 用)", addr);
+                            info!("DNS resolution switched to DNS-over-TCP upstream {} (system getaddrinfo disabled; for VPS with blocked UDP)", addr);
                         }
-                        None => error!("tuning.dns_tcp_resolver `{}` 非法 (需 ip 或 ip:port), 仍用系统解析器", r),
+                        None => error!("tuning.dns_tcp_resolver `{}` is invalid (expects ip or ip:port), still using system resolver", r),
                     }
                 }
             }
@@ -308,7 +308,7 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                         socks_proxy_url = Some(url);
                         internal_socks_listener = Some(l);
                     }
-                    Err(e) => warn!("内部 geo SOCKS 绑定失败: {e}; via=proxy 将回退直连"),
+                    Err(e) => warn!("internal geo SOCKS bind failed: {e}; via=proxy will fall back to direct"),
                 }
             }
         }
@@ -535,10 +535,10 @@ pub fn load_tls_fingerprint_template(config_path: &str) {
         Ok(bytes) if bytes.len() >= 44 && bytes[0] == 0x16 => {
             let n = bytes.len();
             crate::crypto::tls_raw::set_custom_template(bytes);
-            info!("已装载自定义 fake-TLS 指纹模板 {} ({}B), 出站握手将复刻其 JA3/JA4", path, n);
+            info!("loaded custom fake-TLS fingerprint template {} ({}B), outbound handshakes will replicate its JA3/JA4", path, n);
         }
-        Ok(_) => warn!("client_hello_template {} 非法 (非 TLS ClientHello), 落回内置指纹轮换", path),
-        Err(e) => warn!("client_hello_template {} 读取失败: {}, 落回内置指纹轮换", path, e),
+        Ok(_) => warn!("client_hello_template {} is invalid (not a TLS ClientHello), falling back to built-in fingerprint rotation", path),
+        Err(e) => warn!("failed to read client_hello_template {}: {}, falling back to built-in fingerprint rotation", path, e),
     }
 }
 

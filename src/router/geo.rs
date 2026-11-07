@@ -90,7 +90,7 @@ fn parse_domain_msg(data: &[u8]) -> Result<Option<GeoDomain>> {
 }
 
 pub fn load_geosite_dat(path: &Path, target_code: &str) -> Result<Vec<GeoDomain>> {
-    let data = fs::read(path).with_context(|| format!("读取 geosite.dat 失败: {}", path.display()))?;
+    let data = fs::read(path).with_context(|| format!("failed to read geosite.dat: {}", path.display()))?;
     let mut pos = 0;
     let target_upper = target_code.to_uppercase();
 
@@ -197,7 +197,7 @@ fn parse_cidr_msg(data: &[u8]) -> Result<Option<IpNet>> {
 }
 
 pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
-    let data = fs::read(path).with_context(|| format!("读取 geoip.dat 失败: {}", path.display()))?;
+    let data = fs::read(path).with_context(|| format!("failed to read geoip.dat: {}", path.display()))?;
     let mut pos = 0;
     let target_upper = target_code.to_uppercase();
 
@@ -264,7 +264,7 @@ pub fn load_geoip_dat(path: &Path, target_code: &str) -> Result<Vec<IpNet>> {
 /// 解析 geoip.dat 里**全部国家**的 CIDR (泛化 load_geoip_dat: 不过滤 target_code)。
 /// 返回 (国家码大写, 该国 CIDR 列表)。供 IP→国家 反查用 (节点区域判定)。
 pub fn load_all_geoip(path: &Path) -> Result<Vec<(String, Vec<IpNet>)>> {
-    let data = fs::read(path).with_context(|| format!("读取 geoip.dat (全国家) 失败: {}", path.display()))?;
+    let data = fs::read(path).with_context(|| format!("failed to read geoip.dat (all countries): {}", path.display()))?;
     let mut pos = 0;
     let mut out: Vec<(String, Vec<IpNet>)> = Vec::new();
 
@@ -339,9 +339,9 @@ use serde_json::Value;
 
 pub fn load_singbox_json(path: &Path) -> Result<(Vec<GeoDomain>, Vec<IpNet>)> {
     let data = fs::read_to_string(path)
-        .with_context(|| format!("读取 sing-box geo JSON 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to read sing-box geo JSON: {}", path.display()))?;
     let parsed: Value = serde_json::from_str(&data)
-        .with_context(|| format!("解析 sing-box geo JSON 失败: {}", path.display()))?;
+        .with_context(|| format!("failed to parse sing-box geo JSON: {}", path.display()))?;
     
     let mut domains = Vec::new();
     let mut cidrs = Vec::new();

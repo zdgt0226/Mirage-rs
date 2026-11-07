@@ -278,7 +278,7 @@ async fn forward_reply(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, from: SocketAddr
     let frame = encode_reply_frame(from, data);
     if frame.len() > u16::MAX as usize {
         debug!(
-            "Mirage Server UDP: 下行帧长度 ({}B) 超过 u16::MAX, 丢弃该报文以防解帧失步",
+            "Mirage Server UDP: downlink frame length ({}B) exceeds u16::MAX, dropping packet to prevent desync",
             frame.len()
         );
         return true;
@@ -540,14 +540,14 @@ pub(super) async fn handle_udp_relay(
                     super::server_router::ServerOutboundTarget::Upstream(outlet) => match &**outlet {
                         crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
                             if ss.block_udp {
-                                debug!("UDP: 丢弃发往 {} 的报文, 出站 `{}` 的 udp 策略为 block", target_str, decision.tag);
+                                debug!("UDP: dropping packet to {}, outbound `{}` udp policy is block", target_str, decision.tag);
                                 continue;
                             }
                             None // SS 的 udp=direct: 本机直发 (既有语义, 出口与 TCP 不同)
                         }
                         crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => match wg.udp {
                             crate::config::UdpPolicy::Block => {
-                                debug!("UDP: 丢弃发往 {} 的报文, 出站 `{}` 的 udp 策略为 block", target_str, decision.tag);
+                                debug!("UDP: dropping packet to {}, outbound `{}` udp policy is block", target_str, decision.tag);
                                 continue;
                             }
                             crate::config::UdpPolicy::Direct => None,
@@ -602,7 +602,7 @@ pub(super) async fn handle_udp_relay(
                         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                             tracing::warn!(
-                                "UDP relay send_to {} 失败: {} —— 若持续, 本机(VPS)可能禁止出向 UDP",
+                                "UDP relay send_to {} failed: {} - if persistent, local machine (VPS) may forbid outbound UDP",
                                 socket_addr, e
                             );
                         }
@@ -625,13 +625,13 @@ pub(super) async fn handle_udp_relay(
                         let built = match wg.tunnel().await {
                             Ok(tunnel) => crate::proxy::wg::socket::WgUdpSocket::bind(tunnel.clone())
                                 .map(|s| (Arc::new(s), tunnel))
-                                .map_err(|e| anyhow::anyhow!("隧道内绑 UDP 失败: {e}")),
+                                .map_err(|e| anyhow::anyhow!("failed to bind UDP in tunnel: {e}")),
                             Err(e) => Err(e),
                         };
                         let (socket, tunnel) = match built {
                             Ok(v) => v,
                             Err(e) => {
-                                debug!("UDP: WG 上游 `{}` 不可用 ({}s 内不再重试): {e}", decision.tag, WG_RETRY_COOLDOWN.as_secs());
+                                debug!("UDP: WG upstream `{}` unavailable (will not retry for {}s): {e}", decision.tag, WG_RETRY_COOLDOWN.as_secs());
                                 if wg_failed.len() >= 256 {
                                     wg_failed.clear();
                                 }
@@ -709,7 +709,7 @@ pub(super) async fn handle_udp_relay(
                 {
                     Some(a) => a,
                     None => {
-                        debug!("UDP: WG 上游 `{}` 解析 {} 失败 (或处于负缓存冷却中)", decision.tag, target_str);
+                        debug!("UDP: WG upstream `{}` failed to resolve {} (or in negative cache cooldown)", decision.tag, target_str);
                         continue;
                     }
                 };
@@ -722,7 +722,7 @@ pub(super) async fn handle_udp_relay(
                 );
                 // 隧道侧是同步入队 (数据进 smoltcp 缓冲后由 pump 加密发出), 不阻塞。
                 if let Err(e) = egress.socket.send_to(payload, socket_addr) {
-                    debug!("UDP: 经 WG 上游 `{}` 发往 {} 失败: {e}", decision.tag, socket_addr);
+                    debug!("UDP: via WG upstream `{}` sending to {} failed: {e}", decision.tag, socket_addr);
                 }
             }
         }
@@ -909,8 +909,8 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                     let n = MUX_CAP_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if n.is_multiple_of(1000) {
                         tracing::warn!(
-                            "UDP mux: 单隧道 sid 到上限 {}, 丢弃新流 (累计丢 {})。若持续, 说明 UDP 流\
-                             翻转率高 —— 客户端会回落 TCP。",
+                            "UDP mux: per-tunnel sid reached cap {}, dropping new flow (cumulative dropped {}). If persistent, indicates high UDP flow \
+                             churn rate - client will fall back to TCP.",
                             MAX_MUX_SIDS,
                             n + 1
                         );
@@ -961,7 +961,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                     super::server_router::ServerOutboundTarget::Upstream(outlet) => match &**outlet {
                         crate::proxy::upstream::UpstreamOutlet::Shadowsocks(ss) => {
                             if ss.block_udp {
-                                debug!("UDP mux: sid {} 命中 SS 上游 {} 但 SS udp 策略为 block, 丢弃", uf.sid, decision.tag);
+                                debug!("UDP mux: sid {} matched SS upstream {} but SS udp policy is block, dropping", uf.sid, decision.tag);
                                 continue;
                             } else {
                                 let target_sa = match crate::proxy::resolver::resolve_first_filtered(&uf.target, uf.port, |ip| {
@@ -994,7 +994,7 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                         }
                         crate::proxy::upstream::UpstreamOutlet::Wireguard(wg) => match wg.udp {
                             crate::config::UdpPolicy::Block => {
-                                debug!("UDP mux: sid {} 命中 WG 上游 {} 但 udp 策略为 block, 丢弃", uf.sid, decision.tag);
+                                debug!("UDP mux: sid {} matched WG upstream {} but udp policy is block, dropping", uf.sid, decision.tag);
                                 continue;
                             }
                             crate::config::UdpPolicy::Direct => {
@@ -1029,21 +1029,21 @@ pub(crate) async fn handle_udp_mux_relay_inner(
                                 let tunnel = match wg.tunnel().await {
                                     Ok(t) => t,
                                     Err(e) => {
-                                        error!("UDP mux: 建立 WG 上游隧道失败: {}", e);
+                                        error!("UDP mux: failed to establish WG upstream tunnel: {}", e);
                                         continue;
                                     }
                                 };
                                 let target_sa = match crate::proxy::wg::resolve_target(&tunnel, &uf.target, uf.port).await {
                                     Ok(sa) => sa,
                                     Err(e) => {
-                                        debug!("UDP mux: WG 内解析目标 {} 失败: {}", target_str, e);
+                                        debug!("UDP mux: failed to resolve target {} within WG: {}", target_str, e);
                                         continue;
                                     }
                                 };
                                 match crate::proxy::wg::socket::WgUdpSocket::bind(tunnel) {
                                     Ok(s) => (SidEgress::Wireguard(Arc::new(s), target_sa), target_sa),
                                     Err(e) => {
-                                        debug!("UDP mux: WG 内绑 UDP 失败: {}", e);
+                                        debug!("UDP mux: failed to bind UDP within WG: {}", e);
                                         continue;
                                     }
                                 }

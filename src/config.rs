@@ -810,7 +810,7 @@ impl OutboundConfig {
         let mut result = explicit_outbounds.clone();
         if let Some(pattern) = filter {
             let re = regex::Regex::new(pattern).map_err(|e| {
-                anyhow::anyhow!("{kind} `{tag}` 的 filter `{pattern}` 不是合法正则: {e}")
+                anyhow::anyhow!("{kind} `{tag}` filter `{pattern}` is not a valid regex: {e}")
             })?;
             for cand in all {
                 let cand_tag = cand.tag();
@@ -1278,7 +1278,7 @@ pub fn normalize_static_hosts(
     for (domain, val) in raw {
         let norm = domain.trim_end_matches('.').to_lowercase();
         if norm.is_empty() {
-            tracing::warn!("advanced_dns.static: 域名 `{}` 归一化后为空, 已跳过", domain);
+            tracing::warn!("advanced_dns.static: domain `{}` is empty after normalization, skipped", domain);
             continue;
         }
         let ips: Vec<std::net::IpAddr> = val
@@ -1287,7 +1287,7 @@ pub fn normalize_static_hosts(
             .filter_map(|s| match s.parse::<std::net::IpAddr>() {
                 Ok(ip) => Some(ip),
                 Err(_) => {
-                    tracing::warn!("advanced_dns.static: 域名 `{}` 的地址 `{}` 不是合法 IP, 已跳过", domain, s);
+                    tracing::warn!("advanced_dns.static: address `{}` for domain `{}` is not a valid IP, skipped", s, domain);
                     None
                 }
             })
@@ -1296,7 +1296,7 @@ pub fn normalize_static_hosts(
             continue;
         }
         if !seen.insert(norm.clone()) {
-            tracing::warn!("advanced_dns.static: 域名 `{}` 与已有条目归一化后重复 (`{}`), 已忽略", domain, norm);
+            tracing::warn!("advanced_dns.static: domain `{}` duplicates existing entry after normalization (`{}`), ignored", domain, norm);
             continue;
         }
         out.push((norm, ips));
@@ -1747,9 +1747,9 @@ impl Config {
     /// Loads configuration from a JSON file.
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
-            .with_context(|| format!("读取配置文件失败: {path}"))?;
+            .with_context(|| format!("failed to read config file: {path}"))?;
         let config: Config = serde_json::from_str(&content)
-            .with_context(|| format!("解析配置 JSON 失败: {path}"))?;
+            .with_context(|| format!("failed to parse config JSON: {path}"))?;
         Ok(config)
     }
 
@@ -3242,7 +3242,7 @@ mod validation_tests {
                             "password": short, "method": "2022-blake3-aes-256-gcm" } }
         ]);
         let is = issues_of(&v);
-        assert!(has(&is, "16 字节") && has(&is, "32 字节"), "实际: {is:?}");
+        assert!(has(&is, "16 bytes") && has(&is, "32 bytes"), "实际: {is:?}");
 
         // 长度正确则放行
         let good = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
@@ -4032,7 +4032,7 @@ mod profile_tests {
         }"#;
         let (_, issues) = Config::parse_with_diagnostics(bad_regex_cfg).unwrap();
         assert!(
-            issues.iter().any(|i| i.contains("urltest `auto` 的 filter `[abc` 不是合法正则")),
+            issues.iter().any(|i| i.contains("urltest `auto` filter `[abc` is not a valid regex")),
             "应报非法正则 issue: {issues:?}"
         );
 

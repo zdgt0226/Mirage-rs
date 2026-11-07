@@ -31,11 +31,11 @@ fn bind_client_socket(is_ipv6: bool, dst_port: u16, low_src_port: bool) -> std::
         for _ in 0..8 {
             let sp = lo + fastrand::u16(0..(hi - lo).max(1));
             if let Ok(s) = std::net::UdpSocket::bind(format!("{any}:{sp}")) {
-                tracing::debug!("QUIC: 源端口 {} ≤ 目标 {} (GFW src-port 规避)", sp, dst_port);
+                tracing::debug!("QUIC: source port {} <= target {} (GFW src-port evasion)", sp, dst_port);
                 return Ok(s);
             }
         }
-        tracing::warn!("QUIC: 无法绑 ≤{} 的源端口 (需 root? 占用?), 回落临时口 —— src-port 规避降级", dst_port);
+        tracing::warn!("QUIC: failed to bind source port <={} (requires root? in use?), falling back to ephemeral port - src-port evasion degraded", dst_port);
     }
     std::net::UdpSocket::bind(format!("{any}:0"))
 }
@@ -44,7 +44,7 @@ fn bind_client_socket(is_ipv6: bool, dst_port: u16, low_src_port: bool) -> std::
 /// 先发一个随机 UDP 包到 server, desync GFW 的 UDP 四元组追踪 (USENIX Security 2025 规避法之一)。
 fn make_client_endpoint(server_addr: SocketAddr, low_src_port: bool, pre_packet: bool, obfs: Option<&str>) -> Result<quinn::Endpoint> {
     let sock = bind_client_socket(server_addr.is_ipv6(), server_addr.port(), low_src_port)
-        .context("QUIC: 绑客户端 UDP socket 失败")?;
+        .context("QUIC: failed to bind client UDP socket")?;
     if pre_packet {
         // 随机长度 (8~64B) 随机内容, 在同一 4-tuple 上先发, 让 GFW 对该四元组的 QUIC 追踪失准。
         // 到达我们的 QUIC 服务端会被当无效包丢弃, 无副作用。⚠️ obfs 开时这个裸包不混淆, 会被服务端
@@ -52,19 +52,19 @@ fn make_client_endpoint(server_addr: SocketAddr, low_src_port: bool, pre_packet:
         let n = 8 + fastrand::usize(0..=56);
         let junk: Vec<u8> = (0..n).map(|_| fastrand::u8(..)).collect();
         let _ = sock.send_to(&junk, server_addr);
-        tracing::debug!("QUIC: 发 {}B pre-packet 到 {} (GFW 四元组 desync)", n, server_addr);
+        tracing::debug!("QUIC: sending {}B pre-packet to {} (GFW 4-tuple desync)", n, server_addr);
     }
-    let runtime = quinn::default_runtime().context("QUIC: 无 tokio runtime")?;
+    let runtime = quinn::default_runtime().context("QUIC: missing tokio runtime")?;
     match obfs {
         Some(pw) => {
-            tracing::info!("QUIC: Salamander 混淆已启用 (客户端)");
-            let inner = runtime.wrap_udp_socket(sock).context("QUIC: wrap socket 失败")?;
+            tracing::info!("QUIC: Salamander obfuscation enabled (client)");
+            let inner = runtime.wrap_udp_socket(sock).context("QUIC: failed to wrap socket")?;
             let obf = crate::proxy::quic_obfs::ObfsSocket::wrap(inner, pw);
             quinn::Endpoint::new_with_abstract_socket(endpoint_config(true), None, obf, runtime)
-                .context("QUIC: 建客户端 endpoint (obfs) 失败")
+                .context("QUIC: failed to build client endpoint (obfs)")
         }
         None => quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, runtime)
-            .context("QUIC: 建客户端 endpoint 失败"),
+            .context("QUIC: failed to build client endpoint"),
     }
 }
 
@@ -131,13 +131,13 @@ fn transport_config(window_mb: u64, cc: QuicCc) -> Arc<quinn::TransportConfig> {
     match cc {
         QuicCc::FixedRate(bps) => {
             tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::FixedRateConfig { bytes_per_sec: bps }));
-            tracing::info!("QUIC: 定速 CC 启用 ({} Mbps, 窗口 {}MB)", bps / 125_000, wnd_mb);
+            tracing::info!("QUIC: fixed-rate CC enabled ({} Mbps, window {}MB)", bps / 125_000, wnd_mb);
         }
         QuicCc::Erasure => {
             tc.congestion_controller_factory(Arc::new(crate::proxy::quic_cc::ErasureConfig::default()));
-            tracing::info!("QUIC: erasure-aware CC 启用 (窗口 {}MB)", wnd_mb);
+            tracing::info!("QUIC: erasure-aware CC enabled (window {}MB)", wnd_mb);
         }
-        QuicCc::Stock => tracing::info!("QUIC: CC = quinn 原生 (erasure 关, 窗口 {}MB)", wnd_mb),
+        QuicCc::Stock => tracing::info!("QUIC: CC = quinn stock (erasure disabled, window {}MB)", wnd_mb),
     }
     Arc::new(tc)
 }
@@ -302,12 +302,12 @@ impl QuicMux {
         match &self.pin {
             Some(p) if crate::config::is_valid_quic_pin(p) => Ok(p.as_str()),
             Some(p) => {
-                tracing::error!("QUIC: quic_pin 格式非法 (`{p}`), 拒绝建立连接 (fail-closed)");
-                anyhow::bail!("QUIC: quic_pin 格式非法，拒绝建立连接 (fail-closed)");
+                tracing::error!("QUIC: quic_pin format invalid (`{p}`), rejecting connection (fail-closed)");
+                anyhow::bail!("QUIC: quic_pin format invalid, rejecting connection (fail-closed)");
             }
             None => {
-                tracing::error!("QUIC: 未配置 quic_pin (服务端证书 SPKI 指纹必填, fail-closed)");
-                anyhow::bail!("QUIC: 未配置 quic_pin，拒绝建立连接 (fail-closed)");
+                tracing::error!("QUIC: quic_pin not configured (server certificate SPKI fingerprint required, fail-closed)");
+                anyhow::bail!("QUIC: quic_pin not configured, rejecting connection (fail-closed)");
             }
         }
     }
@@ -337,7 +337,7 @@ impl QuicMux {
                         let now = std::time::Instant::now();
                         if now < until {
                             anyhow::bail!(
-                                "QUIC: 服务端拒绝了本客户端的连接 (口令不符 / 时钟偏差 / IP 被屏蔽 / 凭据吊销), 冷却中, {}s 后重试",
+                                "QUIC: server rejected this client's connection (wrong password / clock skew / IP blocked / credentials revoked), in cooldown, retry after {}s",
                                 (until - now).as_secs() + 1
                             );
                         }
@@ -387,7 +387,7 @@ impl QuicMux {
                         ep.set_default_client_config(client_config(self.window_mb, self.cc, pin)?);
                         let conn = ep
                             .connect(addr, &self.sni) // SNI = 良性 camouflage_host, 非 server 真身
-                            .context("QUIC: connect 配置无效")?
+                            .context("QUIC: invalid connect configuration")?
                             .await
                             .map_err(classify_quic_handshake_error)?;
                         Ok((ep, conn))
@@ -457,9 +457,9 @@ impl QuicMux {
                     }
                     drop(g);
                     if !was_cached || attempt == 1 {
-                        return Err(anyhow::anyhow!("QUIC: open_bi 失败 (连接已断): {e}"));
+                        return Err(anyhow::anyhow!("QUIC: open_bi failed (connection closed): {e}"));
                     }
-                    tracing::debug!("QUIC: 缓存连接已失效 ({e})，自动重连重试...");
+                    tracing::debug!("QUIC: cached connection invalidated ({e}), retrying with automatic reconnect...");
                 }
             }
         }
@@ -498,13 +498,13 @@ pub fn client_config(window_mb: u64, cc: QuicCc, pin: &str) -> Result<quinn::Cli
         rustls::crypto::ring::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])
-    .context("QUIC: rustls 客户端 builder 失败")?
+    .context("QUIC: rustls client builder failed")?
     .dangerous()
     .with_custom_certificate_verifier(Arc::new(PinnedVerifier::new(pin.to_string())))
     .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     let qcc = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
-        .context("QUIC: rustls→quinn 客户端配置转换失败")?;
+        .context("QUIC: failed to convert rustls->quinn client config")?;
     let mut cfg = quinn::ClientConfig::new(Arc::new(qcc));
     cfg.transport_config(transport_config(window_mb, cc));
     Ok(cfg)
@@ -572,16 +572,16 @@ fn write_key_atomic_0600(path: &std::path::Path, content: &str) -> std::io::Resu
 pub fn load_or_generate_key(path: &std::path::Path) -> Result<rcgen::KeyPair> {
     if path.exists() {
         let pem = std::fs::read_to_string(path)
-            .with_context(|| format!("QUIC: 读取私钥文件 `{}` 失败", path.display()))?;
+            .with_context(|| format!("QUIC: failed to read private key file `{}`", path.display()))?;
         let key_pair = rcgen::KeyPair::from_pem(&pem)
-            .with_context(|| format!("QUIC: 解析私钥文件 `{}` 失败 (PEM 损坏或格式错误)", path.display()))?;
+            .with_context(|| format!("QUIC: failed to parse private key file `{}` (corrupted PEM or format error)", path.display()))?;
         Ok(key_pair)
     } else {
         let key_pair = rcgen::KeyPair::generate()
-            .context("QUIC: 生成 ECDSA P-256 私钥失败")?;
+            .context("QUIC: failed to generate ECDSA P-256 private key")?;
         let pem = key_pair.serialize_pem();
         write_key_atomic_0600(path, &pem)
-            .with_context(|| format!("QUIC: 保存私钥至 `{}` 失败", path.display()))?;
+            .with_context(|| format!("QUIC: failed to save private key to `{}`", path.display()))?;
         Ok(key_pair)
     }
 }
@@ -600,12 +600,12 @@ pub fn server_endpoint(
     let key_path_str = key_path.unwrap_or("quic_key.pem");
     let key_pair = load_or_generate_key(std::path::Path::new(key_path_str))?;
     let pin = spki_pin(&key_pair.public_key_der());
-    tracing::info!("QUIC 服务端证书指纹 (quic_pin): {pin}");
+    tracing::info!("QUIC server certificate fingerprint (quic_pin): {pin}");
 
     let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .context("QUIC: 构造证书参数失败")?;
+        .context("QUIC: failed to construct certificate params")?;
     let cert = params.self_signed(&key_pair)
-        .context("QUIC: 自签证书失败")?;
+        .context("QUIC: failed to self-sign certificate")?;
     let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
 
@@ -613,29 +613,29 @@ pub fn server_endpoint(
         rustls::crypto::ring::default_provider().into(),
     )
     .with_protocol_versions(&[&rustls::version::TLS13])
-    .context("QUIC: rustls 服务端 builder 失败")?
+    .context("QUIC: rustls server builder failed")?
     .with_no_client_auth()
     .with_single_cert(vec![cert_der], key_der.into())
-    .context("QUIC: 装配自签证书失败")?;
+    .context("QUIC: failed to configure self-signed certificate")?;
     crypto.alpn_protocols = vec![ALPN.to_vec()];
 
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-        .context("QUIC: rustls→quinn 服务端配置转换失败")?;
+        .context("QUIC: failed to convert rustls->quinn server config")?;
     let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(qsc));
     server_cfg.transport_config(transport_config(window_mb, cc));
     server_cfg.max_incoming(4096);
     match obfs {
         Some(pw) => {
-            tracing::info!("QUIC: Salamander 混淆已启用 (服务端)");
+            tracing::info!("QUIC: Salamander obfuscation enabled (server)");
             // 混淆开: 自建 socket + 包 ObfsSocket + new_with_abstract_socket。
-            let sock = std::net::UdpSocket::bind(listen_addr).context("QUIC: 绑定服务端 UDP socket 失败")?;
-            let runtime = quinn::default_runtime().context("QUIC: 无 tokio runtime")?;
-            let inner = runtime.wrap_udp_socket(sock).context("QUIC: wrap socket 失败")?;
+            let sock = std::net::UdpSocket::bind(listen_addr).context("QUIC: failed to bind server UDP socket")?;
+            let runtime = quinn::default_runtime().context("QUIC: missing tokio runtime")?;
+            let inner = runtime.wrap_udp_socket(sock).context("QUIC: failed to wrap socket")?;
             let obf = crate::proxy::quic_obfs::ObfsSocket::wrap(inner, pw);
             quinn::Endpoint::new_with_abstract_socket(endpoint_config(true), Some(server_cfg), obf, runtime)
-                .context("QUIC: 绑定服务端 endpoint (obfs) 失败")
+                .context("QUIC: failed to bind server endpoint (obfs)")
         }
-        None => quinn::Endpoint::server(server_cfg, listen_addr).context("QUIC: 绑定服务端 endpoint 失败"),
+        None => quinn::Endpoint::server(server_cfg, listen_addr).context("QUIC: failed to bind server endpoint"),
     }
 }
 
@@ -682,9 +682,9 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
     use tokio::net::lookup_host;
     lookup_host((host, port))
         .await
-        .context("QUIC: DNS 解析失败")?
+        .context("QUIC: DNS resolution failed")?
         .next()
-        .with_context(|| format!("QUIC: {host}:{port} 无解析结果"))
+        .with_context(|| format!("QUIC: {host}:{port} resolved to no addresses"))
 }
 
 /// 基于 SPKI 指纹的服务端证书验证器 (替换原 NoVerify)。
@@ -783,10 +783,10 @@ pub fn is_pin_mismatch_error(e: &quinn::ConnectionError) -> bool {
 pub fn classify_quic_handshake_error(e: quinn::ConnectionError) -> anyhow::Error {
     if is_pin_mismatch_error(&e) {
         anyhow::anyhow!(
-            "QUIC: 服务端证书指纹与 quic_pin 不符 (pin 配错, 或服务端换了私钥; 服务端运行 `mirage-rs quic-pin -c <配置>` 获取当前指纹)"
+            "QUIC: server certificate fingerprint does not match quic_pin (incorrect pin, or server changed private key; run `mirage-rs quic-pin -c <config>` on server to obtain current fingerprint)"
         )
     } else {
-        anyhow::Error::new(e).context("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)")
+        anyhow::Error::new(e).context("QUIC: handshake failed (peer not listening on QUIC? UDP blocked?)")
     }
 }
 
@@ -1034,7 +1034,7 @@ mod tests {
         let err = bad_conn_res.unwrap_err();
         assert!(is_pin_mismatch_error(&err), "错误 pin 必须被识别为 pin mismatch");
         let classified = classify_quic_handshake_error(err);
-        assert!(classified.to_string().contains("服务端证书指纹与 quic_pin 不符"));
+        assert!(classified.to_string().contains("server certificate fingerprint does not match quic_pin"));
 
         srv_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1086,7 +1086,7 @@ mod tests {
         });
         assert!(is_pin_mismatch_error(&err_pin));
         let classified_pin = classify_quic_handshake_error(err_pin);
-        assert!(classified_pin.to_string().contains("服务端证书指纹与 quic_pin 不符"));
+        assert!(classified_pin.to_string().contains("server certificate fingerprint does not match quic_pin"));
 
         let err_app_fail = quinn::ConnectionError::TransportError(quinn_proto::TransportError {
             code: quinn_proto::TransportErrorCode::crypto(46),
@@ -1098,7 +1098,7 @@ mod tests {
         let err_timeout = quinn::ConnectionError::TimedOut;
         assert!(!is_pin_mismatch_error(&err_timeout));
         let classified_timeout = classify_quic_handshake_error(err_timeout);
-        assert!(classified_timeout.to_string().contains("QUIC: 握手失败 (对端未监听 QUIC? UDP 被封?)"));
+        assert!(classified_timeout.to_string().contains("QUIC: handshake failed (peer not listening on QUIC? UDP blocked?)"));
     }
 
     #[tokio::test]
@@ -1220,7 +1220,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let err2 = bad_mux.open_stream().await.unwrap_err();
         assert!(t0.elapsed() < DIAL_FAIL_BACKOFF, "退避窗口内应立即快速失败");
-        assert!(err1.to_string().contains("服务端证书指纹与 quic_pin 不符"));
+        assert!(err1.to_string().contains("server certificate fingerprint does not match quic_pin"));
         assert_eq!(err1.to_string(), err2.to_string());
 
         srv_handle.abort();
@@ -1289,7 +1289,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let err = mux.open_stream().await.unwrap_err();
         assert!(t0.elapsed() < std::time::Duration::from_millis(300), "冷却内应立即失败, 实际 {:?}", t0.elapsed());
-        assert!(err.to_string().contains("服务端拒绝"), "错误应提示服务端拒绝: {err}");
+        assert!(err.to_string().contains("server rejected"), "错误应提示服务端拒绝: {err}");
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "冷却期内不得重新拨号");
 
         // 冷却 (第 1 次 = 1s) 结束后可以重新建连。
@@ -1361,7 +1361,7 @@ mod tests {
 
         // 后续请求在冷却期内直接返回服务端拒绝的明确错误提示
         let err = mux.open_stream().await.unwrap_err();
-        assert!(err.to_string().contains("服务端拒绝了本客户端的连接"), "错误提示必须明确指示拒绝: {err}");
+        assert!(err.to_string().contains("server rejected this client's connection"), "错误提示必须明确指示拒绝: {err}");
         assert_eq!(mux.reject_streak(), 1, "同一连接不得重复累加拒绝计数");
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "冷却期间不得重新发起拨号建连");
 

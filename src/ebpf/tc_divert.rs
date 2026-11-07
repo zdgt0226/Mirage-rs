@@ -56,9 +56,9 @@ mod sys {
                 }, 0)?;
             }
             info!(
-                "eBPF tc_divert engine initialized (listen_port={}, mss_clamp mtu={}, fake-IP ICMP 反射={}).",
+                "eBPF tc_divert engine initialized (listen_port={}, mss_clamp mtu={}, fake-IP ICMP reflection={}).",
                 listen_port, mtu,
-                if mask != 0 { format!("{}/{}", fakeip_net, prefix_len) } else { "关".to_string() }
+                if mask != 0 { format!("{}/{}", fakeip_net, prefix_len) } else { "off".to_string() }
             );
             Ok(Self {
                 bpf: Mutex::new(bpf),
@@ -100,9 +100,9 @@ mod sys {
             let Some(prog) = bpf.program_mut("tc_divert") else { return };
             let prog: Result<&mut SchedClassifier, _> = prog.try_into();
             match prog.map(|p| p.detach(link_id)) {
-                Ok(Ok(())) => info!("eBPF tc_divert 已从网卡摘除。"),
-                Ok(Err(e)) => warn!("tc_divert detach 失败 (过滤器可能残留): {}", e),
-                Err(e) => warn!("tc_divert detach 取程序失败: {}", e),
+                Ok(Ok(())) => info!("eBPF tc_divert detached from interface."),
+                Ok(Err(e)) => warn!("tc_divert detach failed (filter may remain): {}", e),
+                Err(e) => warn!("tc_divert detach failed to get program: {}", e),
             }
         }
 
@@ -143,7 +143,7 @@ mod sys {
             }
             let n = want.len();
             *loaded = want;
-            info!("eBPF tc_divert direct_cidr synced: {} 段直连快路径", n);
+            info!("eBPF tc_divert direct_cidr synced: {} direct fast-path prefixes", n);
             Ok(())
         }
     }

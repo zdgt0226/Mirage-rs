@@ -126,7 +126,7 @@ fn build_core_state(cfg: &LiteClientConfig) -> Result<crate::config_watcher::Cor
         "advanced_dns": null, "api": null, "tuning": null, "gui": null,
     });
     let parsed: crate::config::Config =
-        serde_json::from_value(full).context("展开轻量配置失败 (内部错误)")?;
+        serde_json::from_value(full).context("failed to expand lite config (internal error)")?;
 
     let outbounds = Arc::new(crate::proxy::outbound::OutboundManager::new(&parsed)?);
     // 空规则 → 一切都落到 default_outbound; geodata_dir 不会被触碰 (没有 geosite/geoip 规则)。
@@ -151,16 +151,17 @@ fn build_core_state(cfg: &LiteClientConfig) -> Result<crate::config_watcher::Cor
 pub async fn start_client(cfg: LiteClientConfig) -> Result<()> {
     init_log(&cfg.log_level);
     info!(
-        "Mirage-rs 轻量模式 (客户端): SOCKS5 {}:{} → {}:{}  [仅 TCP · 全部转发 · 无分流/DNS/看板]",
+        "Mirage-rs lite mode (client): SOCKS5 {}:{} -> {}:{}  [TCP only, relay all, no routing/DNS/console]",
         cfg.listen, cfg.port, cfg.server, cfg.server_port
     );
 
     let loopback = cfg.listen.starts_with("127.") || cfg.listen == "::1" || cfg.listen == "localhost";
     if !loopback && cfg.auth.is_none() {
         warn!(
-            "⚠️  SOCKS5 监听 {}:{} 且**未配置认证** = 开放代理, 任何能连到该端口的人都能\
-             使用你的隧道 (出口 IP 会被滥用/拉黑)。请加 \"auth\": {{\"username\": \"...\", \
-             \"password\": \"...\"}}, 或把 listen 改回 127.0.0.1。",
+            "WARNING: SOCKS5 listening on {}:{} with no auth configured = open proxy, \
+             anyone who can reach this port can use your tunnel (egress IP may be abused/blacklisted). \
+             Please add \"auth\": {{\"username\": \"...\", \"password\": \"...\"}}, \
+             or change listen back to 127.0.0.1.",
             cfg.listen, cfg.port
         );
     }
@@ -170,14 +171,14 @@ pub async fn start_client(cfg: LiteClientConfig) -> Result<()> {
     let addr = format!("{}:{}", cfg.listen, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("SOCKS5 监听 {addr} 失败"))?;
+        .with_context(|| format!("failed to listen on SOCKS5 {addr}"))?;
     info!("SOCKS5 listening on {addr}");
 
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                error!("accept 失败: {e}");
+                error!("accept failed: {e}");
                 continue;
             }
         };
@@ -212,10 +213,10 @@ async fn serve_client(
             let _ = stream
                 .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await;
-            warn!("[LITE] {peer} 请求 UDP ASSOCIATE, 轻量模式仅支持 TCP, 已拒绝");
+            warn!("[LITE] {peer} requested UDP ASSOCIATE, lite mode only supports TCP, rejected");
         }
         Err(e) => {
-            tracing::debug!("[LITE] {peer} SOCKS5 握手失败: {e}");
+            tracing::debug!("[LITE] {peer} SOCKS5 handshake failed: {e}");
         }
     }
 }
@@ -225,11 +226,11 @@ pub async fn start_server(cfg: LiteServerConfig) -> Result<()> {
     init_log(&cfg.log_level);
     let addr = format!("{}:{}", cfg.listen, cfg.port);
     info!(
-        "Mirage-rs 轻量模式 (服务端): 监听 {addr}, 伪装站 {}  [全部转发 · 无看板/DNS/eBPF]",
+        "Mirage-rs lite mode (server): listening on {addr}, camouflage site {}  [relay all, no console/DNS/eBPF]",
         cfg.sni
     );
     if cfg.password.is_empty() {
-        warn!("⚠️  password 为空 —— 任何人都能连上你的服务端, 请设置一个强密码。");
+        warn!("WARNING: password is empty - anyone can connect to your server, please set a strong password.");
     }
     let brutal_bps = cfg.brutal_rate_mbps.filter(|m| *m > 0).map(|m| m * 125_000);
     let ss_upstream = crate::build_upstream(cfg.upstream.as_ref())?;

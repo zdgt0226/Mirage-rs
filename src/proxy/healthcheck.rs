@@ -61,17 +61,17 @@ fn handle_probe_result(
     match result {
         Ok(rtt) => match record_probe_success(&mut stats, rtt, is_probe_round, Instant::now()) {
             ProbeOutcome::ConfirmedSlow { baseline } => info!(
-                "节点 {} 补测确认变慢 ({}ms, 原 {}ms), urltest 按此延迟选路 {}s",
+                "Node {} re-probe confirmed slower ({}ms, was {}ms), urltest will route with this latency for {}s",
                 tag,
                 rtt,
                 baseline,
                 crate::proxy::pool::SLOW_FLOOR_DURATION.as_secs()
             ),
             ProbeOutcome::NotConfirmed { baseline } => debug!(
-                "HealthCheck [{}] ok: {}ms (补测未确认变慢, 原 {}ms, 真实变慢多半是目标慢)",
+                "HealthCheck [{}] ok: {}ms (re-probe did not confirm slowdown, was {}ms, real slowdown likely at target)",
                 tag, rtt, baseline
             ),
-            ProbeOutcome::FloorCleared => info!("节点 {} 延迟恢复正常 ({}ms), 解除变慢标记", tag, rtt),
+            ProbeOutcome::FloorCleared => info!("Node {} latency recovered to normal ({}ms), cleared slow mark", tag, rtt),
             ProbeOutcome::Normal => debug!("HealthCheck [{}] ok: {}ms", tag, rtt),
         },
         Err(reason) => {
@@ -126,7 +126,7 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                 if pool.is_idle() {
                     if !paused {
                         debug!(
-                            "HealthCheck [{}] 组空闲 {}s, 暂停探测",
+                            "HealthCheck [{}] group idle for {}s, pausing probes",
                             tag,
                             crate::proxy::pool::GROUP_IDLE_PAUSE.as_secs()
                         );
@@ -146,7 +146,7 @@ pub fn start_health_checker(node: Weak<OutboundNode>, url: String, interval: u64
                 }
 
                 if paused {
-                    debug!("HealthCheck [{}] 有流量, 恢复探测", tag);
+                    debug!("HealthCheck [{}] traffic detected, resuming probes", tag);
                     paused = false;
                     resume_fast_rounds = MAX_RESUME_PROBE_ROUNDS;
                 }

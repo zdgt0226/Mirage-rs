@@ -399,7 +399,7 @@ pub(crate) fn injection_base_us(
         if fail_us > 0 {
             if fail_us > MAX_AUTH_SUCC_INJECTION_US {
                 tracing::warn!(
-                    "自校准 F 样本异常过大 ({}ms > {}ms 上限), 回落静态公式避免合法握手延迟失控",
+                    "Auto-calibrated F sample abnormally large ({}ms > {}ms cap), falling back to static formula to prevent legitimate handshake delay blowup",
                     fail_us / 1000,
                     MAX_AUTH_SUCC_INJECTION_US / 1000
                 );
@@ -518,10 +518,10 @@ fn log_ch_guard(
     if outcome == "fallback" && pre_tls && timing.max_internal_gap_us >= LOSS_SUSPECT_GAP_US {
         if !KILL_WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                "Mirage Server: 疑似丢包误杀合法客户端 ({} 字节, 到达间隔 {}ms >= {}ms)。\
-                 judge_silence_ms={} 可能小于 TCP 重传退避 (RTO 可退到 800ms+): \
-                 调大 MIRAGE_CH_JUDGE_MS 或核对 docs/real-machine-verification.md A1/A3。\
-                 (本告警只打一次; 开 MIRAGE_CH_MEASURE=1 可逐条统计)",
+                "Mirage Server: suspected packet loss falsely killing legitimate client ({} bytes, arrival gap {}ms >= {}ms). \
+                 judge_silence_ms={} may be smaller than TCP retransmission backoff (RTO can back off to 800ms+): \
+                 increase MIRAGE_CH_JUDGE_MS or check docs/real-machine-verification.md A1/A3. \
+                 (this warning is logged only once; enable MIRAGE_CH_MEASURE=1 for per-event stats)",
                 timing.bytes,
                 timing.max_internal_gap_us / 1000,
                 LOSS_SUSPECT_GAP_US / 1000,
@@ -529,7 +529,7 @@ fn log_ch_guard(
             );
         } else {
             tracing::debug!(
-                "Mirage Server: 疑似丢包误杀 ({} 字节, 间隔 {}ms)",
+                "Mirage Server: suspected packet loss false kill ({} bytes, gap {}ms)",
                 timing.bytes,
                 timing.max_internal_gap_us / 1000
             );
@@ -576,8 +576,8 @@ async fn preconnect_permit(
                 // 采样告警: 避免扫描时刷满日志
                 if n % 500 == 1 {
                     tracing::warn!(
-                        "预连预算耗尽, 第 {n} 次降级 (在途上限 {PRECONNECT_MAX_INFLIGHT}); \
-                         该连接将退回判定时按需建连 ⇒ 关闭时间对齐变差"
+                        "Preconnect budget exhausted, degradation #{n} (in-flight cap {PRECONNECT_MAX_INFLIGHT}); \
+                         this connection will fall back to on-demand connect during evaluation => close timing alignment degraded"
                     );
                 }
             }
@@ -984,7 +984,7 @@ where
         match crate::crypto::pfs::Ephemeral::generate() {
             Ok(e) => Some(e),
             Err(e) => {
-                tracing::error!("Mirage Server: PFS 临时密钥生成失败: {e}");
+                tracing::error!("Mirage Server: failed to generate ephemeral PFS key: {e}");
                 return None;
             }
         }
@@ -1003,7 +1003,7 @@ where
     // random —— 此时派生退化为只依赖 client_random, 重放防护失效。客户端遇全 0 会自行断开, 但攻击者
     // 扮演客户端时不会, 故服务端也必须 fail-closed。正常路径 (apply_server_random) 恒写入随机值。
     if server_random == [0u8; 32] {
-        warn!("Mirage Server: ServerHello 模板未携带 random (全 0), 拒绝该连接 (fail-closed) from {}", peer_addr);
+        warn!("Mirage Server: ServerHello template missing random (all zeros), rejecting connection (fail-closed) from {}", peer_addr);
         return None;
     }
 
@@ -1044,7 +1044,7 @@ where
         Some(e) => match e.agree(&client_random) {
             Ok(s) => Some(s),
             Err(err) => {
-                tracing::error!("Mirage Server: PFS ECDH 协商失败: {err}");
+                tracing::error!("Mirage Server: PFS ECDH agreement failed: {err}");
                 return None;
             }
         },

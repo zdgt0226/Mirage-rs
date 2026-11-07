@@ -52,11 +52,11 @@ pub(super) async fn connect_camouflage(
             match resolved {
                 Ok(v) if !v.is_empty() => v,
                 Ok(_) => {
-                    warn!("camouflage_host `{h}` 解析结果为空");
+                    warn!("camouflage_host `{h}` resolved to empty list");
                     return None;
                 }
                 Err(e) => {
-                    warn!("camouflage_host `{h}` 解析失败: {e}");
+                    warn!("camouflage_host `{h}` resolution failed: {e}");
                     return None;
                 }
             }
@@ -83,7 +83,7 @@ pub(super) async fn connect_camouflage(
             Err(_) => debug!("camouflage connect {sa} timed out"),
         }
     }
-    warn!("camouflage_host `{h}` 所有候选均未能建连 (预算 {CONNECT_TOTAL_TIMEOUT:?})");
+    warn!("camouflage_host `{h}` all candidates failed to connect (budget {CONNECT_TOTAL_TIMEOUT:?})");
     cam_rtt.observe_connect_failure();
     None
 }
@@ -100,7 +100,7 @@ fn log_cam_edge(ip: IpAddr) {
         Err(p) => p.into_inner(),
     };
     if *last != Some(ip) {
-        info!("伪装站出站边缘: {ip} (变更时打印; 与同源 baseline 探针比对需同一 IP)");
+        info!("Camouflage site outbound edge: {ip} (printed on change; baseline probe must use same IP)");
         *last = Some(ip);
     }
 }
@@ -190,7 +190,7 @@ pub(super) async fn run_camouflage_forward<S>(
             return;
         }
         debug!(
-            "Mirage Server: camouflage forward write failed (attempt {}/2), 换一条新连接重试",
+            "Mirage Server: camouflage forward write failed (attempt {}/2), retrying with fresh connection",
             attempt + 1
         );
     }

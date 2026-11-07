@@ -96,7 +96,7 @@ use tracing::warn;
 
 static LOCAL_IPS: LazyLock<ArcSwap<HashSet<IpAddr>>> = LazyLock::new(|| {
     ArcSwap::from_pointee(enumerate_local_ips().unwrap_or_else(|e| {
-        warn!("枚举本机网络接口地址失败: {e}");
+        warn!("failed to enumerate local network interface addresses: {e}");
         HashSet::new()
     }))
 });
@@ -126,7 +126,7 @@ fn enumerate_local_ips() -> nix::Result<HashSet<IpAddr>> {
 pub fn refresh_local_ips() {
     match enumerate_local_ips() {
         Ok(ips) => LOCAL_IPS.store(Arc::new(ips)),
-        Err(e) => warn!("枚举本机网络接口地址失败: {e}"),
+        Err(e) => warn!("failed to enumerate local network interface addresses: {e}"),
     }
 }
 

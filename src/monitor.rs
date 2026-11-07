@@ -239,7 +239,7 @@ pub fn load_stats(path: &str) {
     let parsed: PersistedStats = match serde_json::from_str(&content) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("[STATS] 持久化文件 {} 解析失败 ({}), 空启动", path, e);
+            tracing::warn!("[STATS] failed to parse persist file {} ({}), starting empty", path, e);
             return;
         }
     };
@@ -262,7 +262,7 @@ pub fn load_stats(path: &str) {
     GLOBAL_DOWN.store(parsed.global_down, Ordering::Relaxed);
     crate::proxy::user_limits::restore_persisted_quotas(parsed.user_quota);
     crate::blocklist::restore_all(parsed.blocklist);
-    tracing::info!("[STATS] 从 {} 恢复统计 (域名/设备/出站/用户聚合表, 全局流量及屏蔽名单, 用户配额)", path);
+    tracing::info!("[STATS] restored statistics from {} (domain/device/outbound/user tables, global traffic, blocklist, user quotas)", path);
 }
 
 /// 落盘聚合表、全局总量与屏蔽名单。先以 0600 写 .tmp 再原子 rename。
@@ -294,7 +294,7 @@ pub fn flush_stats(path: &str) {
     let json = match serde_json::to_string(&snap) {
         Ok(j) => j,
         Err(e) => {
-            tracing::warn!("[STATS] 序列化失败: {}", e);
+            tracing::warn!("[STATS] failed to serialize: {}", e);
             return;
         }
     };
@@ -356,7 +356,7 @@ pub fn flush_stats(path: &str) {
     })();
 
     if let Err(e) = write_res {
-        tracing::warn!("[STATS] 写持久化文件 {} 失败: {}", path, e);
+        tracing::warn!("[STATS] failed to write persist file {}: {}", path, e);
         let _ = std::fs::remove_file(&tmp);
     }
 }

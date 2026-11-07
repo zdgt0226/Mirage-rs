@@ -90,8 +90,8 @@ fn brutal_module_version(fd: i32) -> u32 {
         static WARNED: AtomicBool = AtomicBool::new(false);
         if !WARNED.swap(true, Ordering::Relaxed) {
             tracing::warn!(
-                "brutal 版本探测失败 (getsockopt TCP_BRUTAL_VERSION), 本连接暂按 v1 per-socket, \
-                 后续连接重试。若模块确为 v1 属正常; 若为 2.0 则本条连接不分组。"
+                "brutal version probe failed (getsockopt TCP_BRUTAL_VERSION), treating this connection as v1 per-socket, \
+                 subsequent connections will retry. Normal if module is indeed v1; if v2.0, this connection will not be grouped."
             );
         }
         0 // 本次按 v1 处理, 不写缓存

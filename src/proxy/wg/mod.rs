@@ -77,11 +77,11 @@ pub fn decode_wg_key(b64: &str, what: &str) -> Result<[u8; 32]> {
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .map_err(|e| anyhow!("WireGuard {what} 必须是 base64 编码的密钥: {e}"))?;
+        .map_err(|e| anyhow!("WireGuard {what} must be a base64-encoded key: {e}"))?;
     if raw.len() != 32 {
         bail!(
-            "WireGuard {what} 长度不对: base64 解码后 {} 字节, 应为 32 字节 \
-             (标准 wg genkey/pubkey 输出的密钥)",
+            "WireGuard {what} invalid length: {} bytes after base64 decode, expected 32 bytes \
+             (standard wg genkey/pubkey output)",
             raw.len()
         );
     }
@@ -181,7 +181,7 @@ mod tests {
         // 16 字节 (误填短密钥) 必须报错并说明应有长度
         let short = b64(&[0u8; 16]);
         let e = decode_wg_key(&short, "peer_public_key").unwrap_err().to_string();
-        assert!(e.contains("16 字节") && e.contains("32 字节"), "实际: {e}");
+        assert!(e.contains("16 bytes") && e.contains("32 bytes"), "实际: {e}");
         // 非 base64
         assert!(decode_wg_key("这不是base64!!", "private_key").is_err());
     }

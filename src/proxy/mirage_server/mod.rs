@@ -317,7 +317,7 @@ pub fn warn_egress_blocked(proto: &str, user: &str, target: &str) {
     }
     map.insert((user.to_string(), target.to_string()), now);
     tracing::warn!(
-        "{}: 拒绝用户 `{}` 直连内网/元数据目标 `{}` (egress_allowed check failed)",
+        "{}: rejecting direct connection from user `{}` to internal/metadata target `{}` (egress_allowed check failed)",
         proto,
         user,
         target
@@ -347,7 +347,7 @@ pub fn warn_quic_upstream_unsupported(tag: &str, target: &str) {
     }
     map.insert((tag.to_string(), target.to_string()), now);
     tracing::warn!(
-        "Mirage QUIC(lean): 目标 `{target}` 路由至上游出站 `{tag}`, 但 QUIC 传输暂不支持经上游出口转发, 拒绝该流 (建议改用 TCP 传输或调整路由)"
+        "Mirage QUIC(lean): target `{target}` routed to upstream outbound `{tag}`, but QUIC transport does not support forwarding via upstream outlet yet, stream rejected (suggest switching to TCP transport or adjusting routing)"
     );
 }
 
@@ -698,7 +698,7 @@ fn seed_rtt_from_cache(cam_rtt: &Arc<CamouflageRtt>) {
     let us = crate::crypto::handshake_cache::last_connect_us();
     if us > 0 {
         cam_rtt.observe_connect(std::time::Duration::from_micros(us));
-        debug!("camouflage RTT 播种/刷新: {}us (来自 HandshakeCache 建连)", us);
+        debug!("camouflage RTT seeded/refreshed: {}us (from HandshakeCache connect)", us);
     }
 }
 
@@ -723,7 +723,7 @@ pub async fn start_server(
             return;
         }
     };
-    info!("Mirage Server listening on {} (auth 时钟容差 ±{}s)", listen_addr, auth_ts_tolerance_secs);
+    info!("Mirage Server listening on {} (auth clock tolerance +/-{}s)", listen_addr, auth_ts_tolerance_secs);
 
     // Brutal CC 必须在 listener 上预设算法名, 让 accept 出来的子 socket 从
     // SYN-ACK 起就是 brutal. 在已 ESTABLISHED 的 accepted socket 上中途切换
@@ -732,7 +732,7 @@ pub async fn start_server(
     if let Some(bps) = brutal_rate_bytes_per_sec {
         use std::os::unix::io::AsRawFd;
         crate::proxy::brutal::set_brutal_on_listener(listener.as_raw_fd());
-        info!("Brutal CC enabled for downloads (server→client): {} Mbps", bps / 125_000);
+        info!("Brutal CC enabled for downloads (server->client): {} Mbps", bps / 125_000);
     }
 
     // 伪装站 RTT 估计 (取代旧预热连接池, 见 camouflage_rtt.rs 与 docs/client-hello-timing-design.md)。
@@ -768,7 +768,7 @@ pub async fn start_server(
             Ok((stream, peer_addr)) => {
                 // 屏蔽名单 (WebUI 管理): 被屏蔽的客户端 IP 立即关连接, 省掉握手/BPF/brutal 全部开销。
                 if crate::blocklist::is_blocked(&peer_addr.ip()) {
-                    debug!("Mirage Server: 拒绝被屏蔽客户端 {}", peer_addr.ip());
+                    debug!("Mirage Server: rejecting blocked client {}", peer_addr.ip());
                     drop(stream);
                     continue;
                 }
@@ -816,7 +816,7 @@ pub async fn start_server(
                     let n = ACCEPT_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % 500 == 1 {
                         warn!(
-                            "连接数达上限 (全局 {} / 单来源未认证 {}; 累计拒绝 {n}), 直接关闭 {} — 调大 tuning.max_connections 或排查 flood",
+                            "Connection limit reached (global {} / per-source unauthenticated {}; cumulative rejected {n}), immediately closing {} - increase tuning.max_connections or investigate flood",
                             max_connections(),
                             max_conns_per_ip(),
                             peer_addr.ip()
@@ -861,18 +861,18 @@ pub async fn start_quic_server(
     let addr: std::net::SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
-            error!("Mirage QUIC Server: listen 地址须为 IP:port ({}): {}", listen_addr, e);
+            error!("Mirage QUIC Server: listen address must be IP:port ({}): {}", listen_addr, e);
             return;
         }
     };
     let endpoint = match crate::proxy::quic::server_endpoint(addr, quic_window_mb, quic_cc, quic_obfs.as_deref(), quic_key_path) {
         Ok(ep) => ep,
         Err(e) => {
-            error!("Mirage QUIC Server: 绑定失败 {}: {:#}", listen_addr, e);
+            error!("Mirage QUIC Server: failed to bind {}: {:#}", listen_addr, e);
             return;
         }
     };
-    info!("Mirage QUIC Server listening on {} (UDP, 实验传输 · auth 容差 ±{}s)", listen_addr, auth_ts_tolerance_secs);
+    info!("Mirage QUIC Server listening on {} (UDP, experimental transport, auth tolerance +/-{}s)", listen_addr, auth_ts_tolerance_secs);
 
     let _ = (camouflage_host, pfs); // Model X 精简: QUIC 路径不用 camouflage/fake-TLS/pfs
 
@@ -885,7 +885,7 @@ pub async fn start_quic_server(
 
         // 1. 黑名单检查前置 (省下握手 CPU)
         if crate::blocklist::is_blocked(&peer_ip) {
-            debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {peer_ip}");
+            debug!("Mirage QUIC Server: rejecting blocked client {peer_ip}");
             incoming.refuse();
             continue;
         }
@@ -898,9 +898,9 @@ pub async fn start_quic_server(
             && limiter.under_pressure(peer_ip)
             && incoming.may_retry()
         {
-            debug!("Mirage QUIC Server: 握手压力下要求地址验证 (Retry): {peer_ip}");
+            debug!("Mirage QUIC Server: requiring address validation under handshake pressure (Retry): {peer_ip}");
             if let Err(e) = incoming.retry() {
-                debug!("Mirage QUIC Server: 发送 Retry 失败 ({peer_ip}): {e}");
+                debug!("Mirage QUIC Server: failed to send Retry ({peer_ip}): {e}");
             }
             continue;
         }
@@ -910,7 +910,7 @@ pub async fn start_quic_server(
             Some(g) => g,
             None => {
                 debug!(
-                    "Mirage QUIC Server: 握手/未认证并发超限 (每IP上限 {} 或全局上限 {}), 拒绝来自 {} 的连接",
+                    "Mirage QUIC Server: handshake/unauthenticated concurrency limit exceeded (per-IP limit {} or global limit {}), rejecting connection from {}",
                     limiter.max_per_ip(),
                     limiter.max_global(),
                     peer_ip
@@ -933,12 +933,12 @@ pub async fn start_quic_server(
             let peer = conn.remote_address();
             let peer_ip = peer.ip();
             if crate::blocklist::is_blocked(&peer_ip) {
-                debug!("Mirage QUIC Server: 拒绝被屏蔽客户端 {}", peer_ip);
+                debug!("Mirage QUIC Server: rejecting blocked client {}", peer_ip);
                 conn.close(quinn::VarInt::from_u32(0), b"");
                 return;
             }
             if up.is_some() {
-                debug!("Mirage QUIC(lean): 暂不支持上游中继, 拒绝 (改用 TCP 传输或 direct)");
+                debug!("Mirage QUIC(lean): upstream relay not supported yet, rejecting (switch to TCP transport or direct)");
                 conn.close(quinn::VarInt::from_u32(0), b"");
                 return;
             }
@@ -974,14 +974,14 @@ pub async fn start_quic_server(
 
             // 首流认证通过: 转移至已认证活跃连接预算与流预算, 随后释放未认证握手槽位 guard
             let Some(_conn_guard) = rt_limiter.try_acquire_conn(peer_ip) else {
-                debug!("Mirage QUIC Server: 活跃连接预算超限, 关闭来自 {} 的连接", peer_ip);
+                debug!("Mirage QUIC Server: active connection budget exceeded, closing connection from {}", peer_ip);
                 let _ = first_send.reset(quinn::VarInt::from_u32(0));
                 let _ = first_recv.stop(quinn::VarInt::from_u32(0));
                 conn.close(quinn::VarInt::from_u32(0), b"");
                 return;
             };
             let Some(first_stream_guard) = rt_limiter.try_acquire_stream(peer_ip) else {
-                debug!("Mirage QUIC Server: 活跃流预算超限, 关闭来自 {} 的首条流", peer_ip);
+                debug!("Mirage QUIC Server: active stream budget exceeded, closing first stream from {}", peer_ip);
                 let _ = first_send.reset(quinn::VarInt::from_u32(0));
                 let _ = first_recv.stop(quinn::VarInt::from_u32(0));
                 conn.close(quinn::VarInt::from_u32(0), b"");
@@ -1016,7 +1016,7 @@ pub async fn start_quic_server(
                             let n = STREAM_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
                             if n % 500 == 1 {
                                 warn!(
-                                    "Mirage QUIC Server: 活跃流预算超限 (单来源 {} / 全局 {}; 累计拒绝 {n}), 重置来自 {} 的新流",
+                                    "Mirage QUIC Server: active stream budget exceeded (per-source {} / global {}; cumulative rejected {n}), resetting new stream from {}",
                                     QuicRuntimeLimiter::DEFAULT_MAX_STREAMS_PER_IP,
                                     QuicRuntimeLimiter::DEFAULT_MAX_STREAMS_GLOBAL,
                                     peer_ip
@@ -1105,12 +1105,12 @@ async fn authenticate_quic_stream_token(
             static HINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !HINTED.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
-                    "Mirage QUIC(lean): token 认证失败 from {} ({})",
+                    "Mirage QUIC(lean): token authentication failed from {} ({})",
                     peer_ip,
                     crate::crypto::hello_auth::session_decrypt_failure_hint()
                 );
             } else {
-                tracing::debug!("Mirage QUIC(lean): token 认证失败 from {}", peer_ip);
+                tracing::debug!("Mirage QUIC(lean): token authentication failed from {}", peer_ip);
             }
             let _ = send.reset(quinn::VarInt::from_u32(0));
             let _ = recv.stop(quinn::VarInt::from_u32(0));
@@ -1121,7 +1121,7 @@ async fn authenticate_quic_stream_token(
         }
     };
     if cred_revoked.load(Ordering::Relaxed) {
-        tracing::debug!("Mirage QUIC(lean): 凭据已吊销 from {}", peer_ip);
+        tracing::debug!("Mirage QUIC(lean): credentials revoked from {}", peer_ip);
         let _ = send.reset(quinn::VarInt::from_u32(0));
         let _ = recv.stop(quinn::VarInt::from_u32(0));
         conn.close(quinn::VarInt::from_u32(0), b"");
@@ -1141,7 +1141,7 @@ async fn authenticate_quic_stream_token(
     // 消除与后续 connect 之间的 TOCTOU 窗口。
     let user_limit = crate::proxy::user_limits::get_user_limit(&user);
     if user != "default" && user_limit.is_none() {
-        tracing::debug!("Mirage QUIC(lean): 用户 `{}` 已被删除或不存在, 拒绝并断开连接", user);
+        tracing::debug!("Mirage QUIC(lean): user `{}` has been deleted or does not exist, refusing and disconnecting", user);
         let _ = send.reset(quinn::VarInt::from_u32(0));
         let _ = recv.stop(quinn::VarInt::from_u32(0));
         conn.close(quinn::VarInt::from_u32(0), b"");
@@ -1264,7 +1264,7 @@ async fn relay_authenticated_quic_stream(
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 warn_egress_blocked("Mirage QUIC(lean)", &user, &target);
             } else {
-                tracing::warn!("Mirage QUIC(lean): 连 {} 失败: {}", target, e);
+                tracing::warn!("Mirage QUIC(lean): connect to {} failed: {}", target, e);
             }
             return;
         }
@@ -1965,7 +1965,7 @@ mod quic_gate_tests {
         let t0 = std::time::Instant::now();
         let err = mux.open_stream().await.unwrap_err();
         assert!(t0.elapsed() < std::time::Duration::from_millis(300), "冷却内应立即失败");
-        assert!(err.to_string().contains("服务端拒绝"), "应提示服务端拒绝: {err}");
+        assert!(err.to_string().contains("server rejected"), "应提示服务端拒绝: {err}");
     }
 
     /// 握手后一直不发首流: 5s 后服务端回收整条连接 (防占位型慢速攻击)。

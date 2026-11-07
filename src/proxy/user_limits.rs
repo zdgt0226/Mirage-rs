@@ -200,7 +200,7 @@ impl UserLimitHandle {
             let _ = self.period_used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| Some(u.saturating_sub(old_used)));
             self.reevaluate_exhausted();
             info!(
-                "[USER_LIMITS] 用户 `{}` 滚动进入新配额周期 (起点 {}), 用量已清零",
+                "[USER_LIMITS] user `{}` rolled into new quota period (start {}), usage reset to zero",
                 self.name, expected_start
             );
         }
@@ -386,7 +386,7 @@ pub fn reload_user_limits(users: &[crate::config::MirageUser]) {
 
     let count = reg.users.len();
     registry_slot().store(Arc::new(reg));
-    info!("[USER_LIMITS] 热重载完成, 已更新 {} 位用户限速与配额", count);
+    info!("[USER_LIMITS] hot reload complete, updated rate limits and quotas for {} user(s)", count);
 }
 
 /// 重置指定用户的本周期配额与超额状态 (不改 config)
@@ -395,7 +395,7 @@ pub fn reset_user_quota(name: &str) {
     if let Some(h) = reg.users.get(name) {
         h.period_used.store(0, Ordering::SeqCst);
         h.exhausted.store(false, Ordering::SeqCst);
-        info!("[USER_LIMITS] 用户 `{}` 本周期配额已重置为 0", name);
+        info!("[USER_LIMITS] quota for user `{}` has been reset to 0 for this period", name);
     }
     let mut restored = restored_slot().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(p) = restored.get_mut(name) {

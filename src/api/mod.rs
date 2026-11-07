@@ -395,7 +395,7 @@ pub async fn start_server(
     let addr: SocketAddr = match listen_addr.parse() {
         Ok(a) => a,
         Err(e) => {
-            tracing::error!("GUI listen addr '{}' 非法 ({}); GUI 未启动", listen_addr, e);
+            tracing::error!("GUI listen addr '{}' invalid ({}); GUI not started", listen_addr, e);
             return;
         }
     };
@@ -430,27 +430,27 @@ pub async fn start_server(
         .with_state(app_state);
 
     if auth_enabled {
-        tracing::info!("GUI Server listening on http://{} (API 鉴权已启用; 浏览器用 /?token=XXX 访问)", addr);
+        tracing::info!("GUI Server listening on http://{} (API auth enabled; access in browser via /?token=XXX)", addr);
     } else if !addr.ip().is_loopback() {
         tracing::warn!(
-            "GUI Server listening on http://{} 且**未设 gui.token** —— 非 localhost 暴露, 任何可达者可读日志/配置+改路由规则! 请设 gui.token 或外挂 nginx 鉴权",
+            "GUI Server listening on http://{} without gui.token configured - exposed beyond localhost, anyone with network access can read logs/config and modify routing rules! Please configure gui.token or place behind nginx auth",
             addr
         );
     } else {
-        tracing::info!("GUI Server listening on http://{} (localhost, 未设 token)", addr);
+        tracing::info!("GUI Server listening on http://{} (localhost, no token configured)", addr);
     }
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("GUI 绑定 {} 失败 ({}); GUI 未启动 (端口占用?)", addr, e);
+            tracing::error!("failed to bind GUI to {} ({}); GUI not started (port already in use?)", addr, e);
             return;
         }
     };
     // into_make_service_with_connect_info: 让 auth_mw 能拿到 TCP peer IP (per-IP 限流用)。
     let app = app.into_make_service_with_connect_info::<SocketAddr>();
     if let Err(e) = axum::serve(listener, app).await {
-        tracing::error!("GUI serve 退出: {}", e);
+        tracing::error!("GUI serve exited: {}", e);
     }
 }
 

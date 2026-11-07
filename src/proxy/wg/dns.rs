@@ -29,7 +29,7 @@ fn build_query(id: u16, name: &str) -> Result<Vec<u8>> {
     q.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR = 0
     for label in name.split('.').filter(|l| !l.is_empty()) {
         if label.len() > 63 {
-            bail!("域名标签超过 63 字节: {label}");
+            bail!("domain label exceeds 63 bytes: {label}");
         }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
@@ -49,7 +49,7 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Result<usize> {
     let mut jumps = 0;
     loop {
         if pos >= msg.len() {
-            bail!("DNS 报文截断");
+            bail!("DNS message truncated");
         }
         let len = msg[pos] as usize;
         if len == 0 {
@@ -58,12 +58,12 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Result<usize> {
         if len & 0xC0 == 0xC0 {
             // 压缩指针: 名字到此结束, 后面跟 2 字节指针
             if pos + 1 >= msg.len() {
-                bail!("DNS 压缩指针截断");
+                bail!("DNS compression pointer truncated");
             }
             jumps += 1;
             if jumps > 1 {
                 // 跳过一个名字最多只需读到第一个指针 —— 再跳说明报文有环或恶意构造
-                bail!("DNS 压缩指针异常");
+                bail!("invalid DNS compression pointer");
             }
             return Ok(pos + 2);
         }
@@ -74,18 +74,18 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Result<usize> {
 /// 从响应里取出 A 记录与最小 TTL。CNAME 直接跳过 —— 我们只要最终的 A。
 fn parse_a_records(resp: &[u8], want_id: u16) -> Result<(Vec<Ipv4Addr>, u64)> {
     if resp.len() < 12 {
-        bail!("DNS 响应过短");
+        bail!("DNS response too short");
     }
     if resp[0..2] != want_id.to_be_bytes() {
-        bail!("DNS 响应 ID 不匹配 (可能是串包)");
+        bail!("DNS response ID mismatch (possible out-of-order packet)");
     }
     if resp[2] & 0x80 == 0 {
-        bail!("DNS 响应的 QR 位不是响应");
+        bail!("DNS response QR bit indicates query, not response");
     }
     match resp[3] & 0x0F {
         0 => {}
-        3 => bail!("域名不存在 (NXDOMAIN)"),
-        rc => bail!("DNS 服务端返回错误 RCODE={rc}"),
+        3 => bail!("domain does not exist (NXDOMAIN)"),
+        rc => bail!("DNS server returned error RCODE={rc}"),
     }
 
     let qd = u16::from_be_bytes([resp[4], resp[5]]) as usize;
@@ -102,14 +102,14 @@ fn parse_a_records(resp: &[u8], want_id: u16) -> Result<(Vec<Ipv4Addr>, u64)> {
     for _ in 0..an {
         pos = skip_name(resp, pos)?;
         if pos + 10 > resp.len() {
-            bail!("DNS 回答段截断");
+            bail!("DNS answer section truncated");
         }
         let rtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
         let ttl = u32::from_be_bytes([resp[pos + 4], resp[pos + 5], resp[pos + 6], resp[pos + 7]]);
         let rdlen = u16::from_be_bytes([resp[pos + 8], resp[pos + 9]]) as usize;
         pos += 10;
         if pos + rdlen > resp.len() {
-            bail!("DNS 记录数据截断");
+            bail!("DNS record data truncated");
         }
         if rtype == 1 && rdlen == 4 {
             ips.push(Ipv4Addr::new(resp[pos], resp[pos + 1], resp[pos + 2], resp[pos + 3]));
@@ -119,7 +119,7 @@ fn parse_a_records(resp: &[u8], want_id: u16) -> Result<(Vec<Ipv4Addr>, u64)> {
     }
 
     if ips.is_empty() {
-        bail!("响应里没有 A 记录");
+        bail!("no A record in DNS response");
     }
     Ok((ips, min_ttl.clamp(TTL_MIN, TTL_MAX)))
 }
@@ -187,7 +187,7 @@ impl TunnelDns {
         let mut buf = vec![0u8; 2048];
         let (n, _) = tokio::time::timeout(QUERY_TIMEOUT, sock.recv_from(&mut buf))
             .await
-            .map_err(|_| anyhow::anyhow!("隧道内 DNS 查询超时 ({}s)", QUERY_TIMEOUT.as_secs()))??;
+            .map_err(|_| anyhow::anyhow!("in-tunnel DNS query timed out ({}s)", QUERY_TIMEOUT.as_secs()))??;
 
         let (ips, ttl) = parse_a_records(&buf[..n], id)?;
         self.store(name, &ips, ttl);
@@ -238,7 +238,7 @@ mod tests {
         let r = resp_with_a(0x1111, &[Ipv4Addr::new(1, 1, 1, 1)], 60);
         // ID 不匹配必须拒绝 —— 否则一个串进来的响应就能把域名解析到攻击者指定的 IP
         let e = parse_a_records(&r, 0x2222).unwrap_err().to_string();
-        assert!(e.contains("ID 不匹配"), "实际: {e}");
+        assert!(e.contains("ID mismatch"), "实际: {e}");
     }
 
     #[test]

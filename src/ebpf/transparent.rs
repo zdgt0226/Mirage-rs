@@ -41,7 +41,7 @@ mod sys {
 
         pub fn attach_to_netns(&mut self, fakeip_net: std::net::Ipv4Addr, prefix_len: u8) -> Result<()> {
             if prefix_len > 32 {
-                anyhow::bail!("fake-ip prefix_len /{prefix_len} 非法 (须 <= 32)"); // 防 32-prefix 移位下溢
+                anyhow::bail!("invalid fake-ip prefix_len /{prefix_len} (must be <= 32)"); // 防 32-prefix 移位下溢
             }
             let mut bpf = self.bpf.lock().unwrap_or_else(|e| e.into_inner());
 

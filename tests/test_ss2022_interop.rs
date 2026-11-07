@@ -180,5 +180,5 @@ async fn ss2022_psk_length_is_enforced() {
         Err(e) => e.to_string(),
         Ok(_) => panic!("PSK 长度不符必须报错, 却连接成功了"),
     };
-    assert!(e.contains("16 字节") && e.contains("32 字节"), "实际: {e}");
+    assert!(e.contains("16 bytes") && e.contains("32 bytes"), "实际: {e}");
 }

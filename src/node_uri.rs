@@ -25,11 +25,11 @@ fn percent_decode(s: &str) -> Result<String> {
     while i < b.len() {
         if b[i] == b'%' {
             if i + 2 >= b.len() {
-                return Err(anyhow!("百分号转义不完整: ...{}", &s[i..]));
+                return Err(anyhow!("incomplete percent-encoding: ...{}", &s[i..]));
             }
             let hex = std::str::from_utf8(&b[i + 1..i + 3])?;
             let v = u8::from_str_radix(hex, 16)
-                .map_err(|_| anyhow!("非法百分号转义: %{}", hex))?;
+                .map_err(|_| anyhow!("invalid percent-encoding: %{}", hex))?;
             out.push(v);
             i += 3;
         } else {
@@ -45,13 +45,13 @@ impl NodeUri {
         let uri = uri.trim();
         let rest = uri
             .strip_prefix("mirage://")
-            .ok_or_else(|| anyhow!("不是 mirage:// 开头的节点 URI"))?;
+            .ok_or_else(|| anyhow!("node URI does not start with mirage://"))?;
 
         // 密码里可能含 '@' 的转义形式, 但未转义的 '@' 只应有分隔符那一个。
         // 用 rsplit_once 以最后一个 '@' 为界, 容忍密码中出现字面 '@'。
         let (pwd_enc, hostport_query) = rest
             .rsplit_once('@')
-            .ok_or_else(|| anyhow!("缺少 '@' 分隔符 (格式: mirage://密码@host:port?sni=...)"))?;
+            .ok_or_else(|| anyhow!("missing '@' separator (format: mirage://password@host:port?sni=...)"))?;
 
         let (hostport, query) = match hostport_query.split_once('?') {
             Some((hp, q)) => (hp, q),
@@ -63,18 +63,18 @@ impl NodeUri {
         let (host, port_str) = if let Some(rest6) = hostport.strip_prefix('[') {
             let (h, p) = rest6
                 .split_once("]:")
-                .ok_or_else(|| anyhow!("IPv6 字面量格式应为 [addr]:port"))?;
+                .ok_or_else(|| anyhow!("IPv6 literal format should be [addr]:port"))?;
             (h, p)
         } else {
             hostport
                 .rsplit_once(':')
-                .ok_or_else(|| anyhow!("缺少端口 (格式: host:port)"))?
+                .ok_or_else(|| anyhow!("missing port (format: host:port)"))?
         };
         let port: u16 = port_str
             .parse()
-            .map_err(|_| anyhow!("端口非法: `{port_str}`"))?;
+            .map_err(|_| anyhow!("invalid port: `{port_str}`"))?;
         if port == 0 {
-            return Err(anyhow!("端口不能为 0"));
+            return Err(anyhow!("port cannot be 0"));
         }
 
         let mut sni = String::new();
@@ -88,13 +88,13 @@ impl NodeUri {
 
         let password = percent_decode(pwd_enc)?;
         if password.is_empty() {
-            return Err(anyhow!("密码为空"));
+            return Err(anyhow!("password is empty"));
         }
         if host.is_empty() {
-            return Err(anyhow!("host 为空"));
+            return Err(anyhow!("host is empty"));
         }
         if sni.is_empty() {
-            return Err(anyhow!("缺少 sni 参数 (伪装域名, 必须与服务端一致)"));
+            return Err(anyhow!("missing sni parameter (camouflage domain, must match server)"));
         }
 
         Ok(NodeUri { password, host: host.to_string(), port, sni })

@@ -1087,8 +1087,8 @@ async fn run_test(path: &str, only_tag: Option<&str>, timeout_secs: u64, http_pr
 fn load_lite<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     use anyhow::Context;
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("读不了轻量配置 {path}"))?;
-    serde_json::from_str(&content).with_context(|| format!("解析轻量配置 {path} 失败"))
+        .with_context(|| format!("failed to read lite config: {path}"))?;
+    serde_json::from_str(&content).with_context(|| format!("failed to parse lite config: {path}"))
 }
 
 /// 合并 JSON 片段的结果统计。

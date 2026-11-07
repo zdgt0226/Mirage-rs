@@ -187,7 +187,7 @@ impl AutoClassify {
         match crate::router::geo::load_geoip_dat(&path, "cn") {
             Ok(cn) if !cn.is_empty() => {
                 info!(
-                    "auto_classify 启用: 载入 CN 段 {} 条 (ttl {}s, cap {})",
+                    "auto_classify enabled: loaded {} CN CIDRs (ttl {}s, cap {})",
                     cn.len(),
                     ac.ttl,
                     ac.max_entries
@@ -207,11 +207,11 @@ impl AutoClassify {
                 }))
             }
             Ok(_) => {
-                warn!("auto_classify 开启但 geoip.dat 的 cn 段为空 ({}) — 已禁用", path.display());
+                warn!("auto_classify enabled but cn CIDRs in geoip.dat are empty ({}) - disabled", path.display());
                 None
             }
             Err(e) => {
-                warn!("auto_classify 开启但读 geoip cn 段失败 ({}): {} — 已禁用", path.display(), e);
+                warn!("auto_classify enabled but failed to read geoip cn CIDRs ({}): {} - disabled", path.display(), e);
                 None
             }
         }
@@ -1340,7 +1340,7 @@ impl DnsForwarder {
         }
         if let Some(cache) = &self.cache {
             if let Some(stale) = cache.get_stale(path, domain, qtype, req) {
-                debug!("[DNS] stale   [{}] → serve-stale fallback (qtype {})", domain, qtype);
+                debug!("[DNS] stale   [{}] -> serve-stale fallback (qtype {})", domain, qtype);
                 return Some(stale);
             }
         }
@@ -1379,7 +1379,7 @@ impl DnsForwarder {
         if let Some((hit, should_prefetch)) = cache.get_with_prefetch(path, dk, qtype, req) {
             debug!("[DNS] cache hit [{}] ({:?}, qtype {})", dk, path, qtype);
             if should_prefetch {
-                debug!("[DNS] prefetch  [{}] → 临期预刷新 (qtype {})", dk, qtype);
+                debug!("[DNS] prefetch  [{}] -> prefetch near expiry (qtype {})", dk, qtype);
                 let cache = cache.clone();
                 let dk_string = dk.to_string();
                 let req_vec = req.to_vec();
@@ -1420,7 +1420,7 @@ impl DnsForwarder {
         };
 
         if failed_recently {
-            debug!("[DNS] stale-recheck [{}] → 最近 30s 失败过, 直接回旧答案 (qtype {})", dk, qtype);
+            debug!("[DNS] stale-recheck [{}] -> failed in last 30s, returning stale answer directly (qtype {})", dk, qtype);
             return Some(stale_resp);
         }
 
@@ -1446,7 +1446,7 @@ impl DnsForwarder {
         match tokio::time::timeout(STALE_ANSWER_DELAY, rx).await {
             Ok(Ok(resp)) => self.stale_fallback(path, dk, qtype, req, resp),
             Ok(Err(_)) | Err(_) => {
-                debug!("[DNS] stale-early [{}] → 超时先行返回旧答案 (qtype {})", dk, qtype);
+                debug!("[DNS] stale-early [{}] -> timeout early return stale answer (qtype {})", dk, qtype);
                 Some(stale_resp)
             }
         }
@@ -1495,7 +1495,7 @@ impl DnsForwarder {
                 if let Some(resp) = Self::dns_over_tunnel(&query, pool, &host, port).await {
                     if let Some(ip) = first_a_record(&resp) {
                         if !ac.is_cn(ip.into()) {
-                            debug!("[DNS] auto-verify [{}] 国内判CN但可信判海外 {} → 疑污染, 标记海外", domain, ip);
+                            debug!("[DNS] auto-verify [{}] domestic classified as CN but trusted foreign {} -> suspected pollution, marked foreign", domain, ip);
                             ac.mark_foreign(&domain);
                         }
                     }
@@ -1596,7 +1596,7 @@ impl DnsForwarder {
             if !adv.cached_static.is_empty() {
                 let dq = domain.to_lowercase();
                 if let Some((key, ips)) = adv.cached_static.iter().find(|(k, _)| static_domain_matches(&dq, k)) {
-                    debug!("[DNS] static  [{}] → 匹配 `{}` {:?} (qtype {}, strategy {:?})", domain, key, ips, qtype, ip_strategy);
+                    debug!("[DNS] static  [{}] -> matched `{}` {:?} (qtype {}, strategy {:?})", domain, key, ips, qtype, ip_strategy);
                     return static_answer(req, qtype, ips, ip_strategy);
                 }
             }
@@ -1657,25 +1657,25 @@ impl DnsForwarder {
             drop(st); // 已取出所需 (clone), 释放 guard 再 await
             match hit {
                 DnsRuleHit::Reject => {
-                    debug!("[DNS] rule    [{}] → reject (NODATA)", domain);
+                    debug!("[DNS] rule    [{}] -> reject (NODATA)", domain);
                     return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
                 }
                 DnsRuleHit::Host(ips) => {
-                    debug!("[DNS] rule    [{}] → host {:?}", domain, ips);
+                    debug!("[DNS] rule    [{}] -> host {:?}", domain, ips);
                     return static_answer(req, qtype, &ips, ip_strategy).or_else(|| Some(make_nxdomain(req)));
                 }
                 DnsRuleHit::ResolveCn => {
-                    debug!("[DNS] rule    [{}] → resolve cn via {:?}", domain, cn_dns);
+                    debug!("[DNS] rule    [{}] -> resolve cn via {:?}", domain, cn_dns);
                     return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
                 }
                 DnsRuleHit::ResolveRemote(pool) => {
                     // case ②: 已学习该域名境外解出的是 CN IP → 降级走 cn (免隧道 + 就近)。
                     if auto_classify.as_ref().is_some_and(|ac| ac.is_cn_learned(&domain)) {
-                        debug!("[DNS] rule    [{}] → remote 但已学习属 CN, 降级 cn", domain);
+                        debug!("[DNS] rule    [{}] -> remote but learned as CN, downgraded to cn", domain);
                         return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
                     }
                     let dk = domain.to_lowercase();
-                    debug!("[DNS] rule    [{}] → resolve remote (隧道 failover, {} 个上游)", domain, remote_servers.len().max(1));
+                    debug!("[DNS] rule    [{}] -> resolve remote (tunnel failover, {} upstreams)", domain, remote_servers.len().max(1));
                     let req_vec = req.to_vec();
                     let pool = pool.clone();
                     let remote_servers = remote_servers.clone();
@@ -1695,7 +1695,7 @@ impl DnsForwarder {
                                 if let (Some(ac), Some(r)) = (&auto_classify, &resp) {
                                     if let Some(ip) = first_a_record(r) {
                                         if ac.is_cn(ip.into()) {
-                                            debug!("[DNS] rule    [{}] → remote 解出 CN IP {}, 学习降级 cn (下次)", domain_str, ip);
+                                            debug!("[DNS] rule    [{}] -> remote resolved CN IP {}, learning downgrade to cn (next time)", domain_str, ip);
                                             ac.mark_cn_learned(&domain_str);
                                         }
                                     }
@@ -1712,7 +1712,7 @@ impl DnsForwarder {
         // fake-ip 排除名单 (config `fakeip.exclude`): 命中即真实解析 (等价一条 resolve:cn 规则, 保留兼容)。
         // 覆盖所有会给 fake-IP 的分支 (Mirage/auto_classify), 在路由前统一拦。
         if self.fake_ip_mapper.as_ref().is_some_and(|m| m.is_excluded(&domain)) {
-            debug!("[DNS] fakeip-excl [{}] → 真实解析 (排除名单)", domain);
+            debug!("[DNS] fakeip-excl [{}] -> real resolve (excluded list)", domain);
             return self.resolve_cn(req, &domain, qtype, ip_strategy, &cn_dns).await;
         }
 
@@ -1750,14 +1750,14 @@ impl DnsForwarder {
                     // A 查询: 国内解析探首个 A 归属 (先查 DNS cache 省一次上游)
                     if let Some(cache) = &self.cache {
                         if let Some(hit) = cache.get(ResolvePath::Cn, &dk, qtype, req) {
-                            debug!("[DNS] auto    [{}] → cache hit", domain);
+                            debug!("[DNS] auto    [{}] -> cache hit", domain);
                             return Some(hit);
                         }
                     }
                     let probe = direct_query(req, &cn_dns).await;
                     match probe.as_deref().and_then(first_a_record) {
                         Some(ip) if ac.is_cn(ip.into()) => {
-                            debug!("[DNS] auto    [{}] → 首个A {} 属CN → 直连返回", domain, ip);
+                            debug!("[DNS] auto    [{}] -> first A {} is CN -> direct return", domain, ip);
                             if let (Some(cache), Some(r)) = (&self.cache, &probe) {
                                 cache.put(ResolvePath::Cn, &dk, qtype, req, r);
                             }
@@ -1769,17 +1769,17 @@ impl DnsForwarder {
                                 Self::spawn_cn_verify(
                                     leaf, ac.clone(), dk.clone(), req.to_vec(),
                                     remote_dns_host.clone(), remote_dns_port,
-                                );
+                                    );
                             }
                             return probe;
                         }
                         Some(ip) => {
-                            debug!("[DNS] auto    [{}] → 首个A {} 属海外 → 学习标记 + fakeip", domain, ip);
+                            debug!("[DNS] auto    [{}] -> first A {} is foreign -> learned mark + fakeip", domain, ip);
                             ac.mark_foreign(&dk);
                             return self.answer_fakeip(req, &domain, qtype);
                         }
                         None => {
-                            debug!("[DNS] auto    [{}] → 无A/解析失败 → 国内结果兜底", domain);
+                            debug!("[DNS] auto    [{}] -> no A/resolve failed -> domestic fallback", domain);
                             if let (Some(cache), Some(r)) = (&self.cache, &probe) {
                                 cache.put(ResolvePath::Cn, &dk, qtype, req, r);
                             }
@@ -1809,18 +1809,18 @@ impl DnsForwarder {
         if let Some(n) = node {
             match &*n {
                 OutboundNode::Block { .. } => {
-                    debug!("[DNS] block   [{}] → NXDOMAIN", domain);
+                    debug!("[DNS] block   [{}] -> NXDOMAIN", domain);
                     Some(make_nxdomain(req))
                 }
                 OutboundNode::Direct { .. } => {
                     // IP 策略 (direct 只做硬抑制: prefer 无法探测另一族, 降为 Dual)。
                     // has_v4/has_v6 传 false → ip_strategy_suppresses 里 prefer 分支恒不抑制。
                     if ip_strategy_suppresses(ip_strategy, qtype, false, false) {
-                        debug!("[DNS] direct  [{}] → qtype {} 被 IP 策略 {:?} 抑制 (NODATA)", domain, qtype, ip_strategy);
+                        debug!("[DNS] direct  [{}] -> qtype {} suppressed by IP strategy {:?} (NODATA)", domain, qtype, ip_strategy);
                         return make_empty_response(req).or_else(|| Some(make_nxdomain(req)));
                     }
                     let dk = domain.to_lowercase();
-                    debug!("[DNS] direct  [{}] → 真实解析 via {:?}", domain, cn_dns);
+                    debug!("[DNS] direct  [{}] -> real resolve via {:?}", domain, cn_dns);
                     let req_vec = req.to_vec();
                     let cn_dns = cn_dns.clone();
                     self.resolve_cached(
@@ -1836,7 +1836,7 @@ impl DnsForwarder {
                     if let Some(mapper) = &self.fake_ip_mapper {
                         if qtype == 1 { // A
                             let (fake_ip, evicted) = mapper.lookup_or_assign_with_eviction(&domain);
-                            debug!("[DNS] proxy   [{}] → fake-IP {} (A)", domain, fake_ip);
+                            debug!("[DNS] proxy   [{}] -> fake-IP {} (A)", domain, fake_ip);
                             if let Some(engine) = &self.xdp_engine {
                                 if let Some(old) = evicted {
                                     let _ = engine.remove_dns_cache(&old);
@@ -1850,13 +1850,13 @@ impl DnsForwarder {
                             // 对每个域名都发, 若逐个走 tcp_over_tunnel 会各消耗+销毁一条
                             // 预热隧道 → 开页面 20-30 域名瞬间打空 WarmPool。返回 NODATA
                             // 空答复 (同 AAAA), 客户端回落 A 记录 fake-IP 连接, 功能无损。
-                            debug!("[DNS] proxy   [{}] → qtype {} 空答复 (fake-IP 免隧道)", domain, qtype);
+                            debug!("[DNS] proxy   [{}] -> qtype {} empty response (fake-IP skips tunnel)", domain, qtype);
                             return make_empty_response(req);
                         }
                     }
                     // 隧道-DNS 是最贵的路径 (每查耗一条 WarmPool 隧道), 缓存收益最大。
                     let dk = domain.to_lowercase();
-                    debug!("[DNS] proxy   [{}] → 隧道查 (failover {} 上游) via {}", domain, remote_servers.len().max(1), n.tag());
+                    debug!("[DNS] proxy   [{}] -> tunnel query (failover {} upstreams) via {}", domain, remote_servers.len().max(1), n.tag());
                     let req_vec = req.to_vec();
                     let pool = pool.clone();
                     let remote_servers = remote_servers.clone();

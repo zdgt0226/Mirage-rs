@@ -42,7 +42,7 @@ pub async fn install(net: Ipv4Addr, prefix: u8) {
             );
         }
         Ok(o) => warn!(
-            "Fake-IP route install failed (rc={:?}): {}. sk_lookup interception WILL NOT WORK — \
+            "Fake-IP route install failed (rc={:?}): {}. sk_lookup interception WILL NOT WORK - \
              need CAP_NET_ADMIN / root.",
             o.status.code(),
             String::from_utf8_lossy(&o.stderr).trim()

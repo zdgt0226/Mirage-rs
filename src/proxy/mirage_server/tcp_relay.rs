@@ -91,7 +91,7 @@ pub(super) async fn handle_tcp_relay(
 
     // block 出站 / 路由选到服务端不可用的出站: 拒绝 (不回落直连)。
     if matches!(decision.target, super::server_router::ServerOutboundTarget::Reject) {
-        debug!("Mirage Server: 目标 {} 路由至出站 `{}` (拒绝)", target, decision.tag);
+        debug!("Mirage Server: target {} routed to outbound `{}` (rejected)", target, decision.tag);
         reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_ROUTING_REJECT).await;
         return;
     }
@@ -380,12 +380,12 @@ async fn relay_via_shadowsocks(
     ss: &crate::proxy::shadowsocks::SsConfig,
     limits: UpstreamLimits,
 ) {
-    debug!("Mirage Server: 经 SS 上游 {} 转发到 {}", ss.addr(), target);
+    debug!("Mirage Server: via SS upstream {} forwarding to {}", ss.addr(), target);
     let (mut up_read, mut up_write, up_fd) =
         match crate::proxy::shadowsocks::connect(ss, &target).await {
             Ok(v) => v,
             Err(e) => {
-                warn!("Mirage Server: 连接 SS 上游 {} 失败 ({}): {}", ss.addr(), target, e);
+                warn!("Mirage Server: connect to SS upstream {} failed ({}): {}", ss.addr(), target, e);
                 reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
                 return;
             }
@@ -540,12 +540,12 @@ async fn relay_via_wireguard(
     wg: &crate::proxy::upstream::WgUpstream,
     limits: UpstreamLimits,
 ) {
-    debug!("Mirage Server: 经 WireGuard 上游 {} 转发到 {}", wg.cfg.endpoint, target);
+    debug!("Mirage Server: via WireGuard upstream {} forwarding to {}", wg.cfg.endpoint, target);
 
     let tunnel = match wg.tunnel().await {
         Ok(t) => t,
         Err(e) => {
-            warn!("Mirage Server: 建立 WireGuard 上游隧道失败: {}", e);
+            warn!("Mirage Server: failed to establish WireGuard upstream tunnel: {}", e);
             reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
@@ -557,7 +557,7 @@ async fn relay_via_wireguard(
     }) {
         Some(hp) => hp,
         None => {
-            warn!("Mirage Server: 目标 `{}` 不是合法 host:port", target);
+            warn!("Mirage Server: target `{}` is not a valid host:port", target);
             reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
             return;
         }
@@ -565,7 +565,7 @@ async fn relay_via_wireguard(
     let addr = match crate::proxy::wg::resolve_target(&tunnel, host, port).await {
         Ok(a) => a,
         Err(e) => {
-            warn!("Mirage Server: 解析 {} 失败: {}", target, e);
+            warn!("Mirage Server: resolve {} failed: {}", target, e);
             reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
@@ -574,7 +574,7 @@ async fn relay_via_wireguard(
     let stream = match crate::proxy::wg::socket::WgTcpStream::connect(tunnel, addr).await {
         Ok(s) => s,
         Err(e) => {
-            warn!("Mirage Server: 经 WG 隧道连接 {} 失败: {}", target, e);
+            warn!("Mirage Server: connect to {} via WG tunnel failed: {}", target, e);
             reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED).await;
             return;
         }
