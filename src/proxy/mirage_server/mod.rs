@@ -1243,14 +1243,14 @@ async fn relay_authenticated_quic_stream(
         ServerOutboundTarget::Upstream(_) => {
             warn_quic_upstream_unsupported(&decision.tag, &target);
             let mut send = send;
-            let _ = send.reset(quinn::VarInt::from_u32(0));
-            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            let _ = send.reset(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_RESET_TARGET_UNREACHABLE));
+            let _ = recv.stop(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_RESET_TARGET_UNREACHABLE));
             return;
         }
         ServerOutboundTarget::Reject => {
             let mut send = send;
-            let _ = send.reset(quinn::VarInt::from_u32(0));
-            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            let _ = send.reset(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_RESET_TARGET_UNREACHABLE));
+            let _ = recv.stop(quinn::VarInt::from_u32(crate::proxy::quic::QUIC_RESET_TARGET_UNREACHABLE));
             return;
         }
     }
@@ -1383,6 +1383,7 @@ where
             let _ = stop_tx.send(true); // 超额、凭据吊销或写失败 → 两个方向都断
             return (r, w, false);
         }
+        last_active.store(t0.elapsed().as_millis() as u64, Ordering::Release);
     }
 }
 

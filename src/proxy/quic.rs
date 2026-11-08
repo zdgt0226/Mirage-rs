@@ -22,6 +22,23 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// docs/quic-transport-design.md §3.1 + §7。
 const ALPN: &[u8] = b"h3";
 
+/// QUIC 专用的流重置错误码: 目标不可达 / 服务端路由拒绝 (与 TCP inner type 0x18 同义)。
+/// 避免使用默认错误码 0 导致客户端无法区分"服务端主动拒绝"与"传输异常/对端断开", 进而误罚节点。
+pub const QUIC_RESET_TARGET_UNREACHABLE: u32 = 0x18;
+
+/// 检查 `quinn::ReadError` 是否为 `QUIC_RESET_TARGET_UNREACHABLE` (0x18)。
+pub fn is_quic_target_unreachable_read_error(re: &quinn::ReadError) -> bool {
+    matches!(re, quinn::ReadError::Reset(code) if *code == quinn::VarInt::from_u32(QUIC_RESET_TARGET_UNREACHABLE))
+}
+
+/// 检查 `io::Error` 是否是由服务端返回的 `QUIC_RESET_TARGET_UNREACHABLE` (0x18) 流重置导致。
+pub fn is_quic_target_unreachable_err(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .and_then(|x| x.downcast_ref::<quinn::ReadError>())
+        .map(is_quic_target_unreachable_read_error)
+        .unwrap_or(false)
+}
+
 /// 绑客户端 UDP socket。`low_src_port` 时尝试源端口 ≤ 目标端口 (GFW "仅 src>dst 才查 QUIC" 规避,
 /// USENIX Security 2025)。优先非特权范围 [1024, dst_port); dst≤1024 需特权口, 失败回落临时口。
 fn bind_client_socket(is_ipv6: bool, dst_port: u16, low_src_port: bool) -> std::io::Result<std::net::UdpSocket> {
@@ -1364,6 +1381,74 @@ mod tests {
         assert!(err.to_string().contains("server rejected this client's connection"), "错误提示必须明确指示拒绝: {err}");
         assert_eq!(mux.reject_streak(), 1, "同一连接不得重复累加拒绝计数");
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "冷却期间不得重新发起拨号建连");
+
+        srv_handle.abort();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_quic_target_unreachable_err_predicate() {
+        let err_unreachable = std::io::Error::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(QUIC_RESET_TARGET_UNREACHABLE)));
+        assert!(is_quic_target_unreachable_err(&err_unreachable));
+
+        let err_other_reset = std::io::Error::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(0)));
+        assert!(!is_quic_target_unreachable_err(&err_other_reset));
+
+        let err_another_reset = std::io::Error::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(1)));
+        assert!(!is_quic_target_unreachable_err(&err_another_reset));
+
+        let err_closed = std::io::Error::from(quinn::ReadError::ClosedStream);
+        assert!(!is_quic_target_unreachable_err(&err_closed));
+
+        let err_io = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "generic reset");
+        assert!(!is_quic_target_unreachable_err(&err_io));
+    }
+
+    #[tokio::test]
+    async fn test_quic_stream_reset_target_unreachable_loopback() {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_quic_rst_{}", fastrand::u64(..)));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let key_path = temp_dir.join("quic_key.pem");
+        let key_path_str = key_path.to_str().unwrap();
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let ep_server = server_endpoint(listen_addr, 2, QuicCc::Stock, None, Some(key_path_str)).unwrap();
+        let server_addr = ep_server.local_addr().unwrap();
+        let pin = spki_pin(&load_or_generate_key(&key_path).unwrap().public_key_der());
+
+        let srv_handle = tokio::spawn(async move {
+            while let Some(incoming) = ep_server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            // 模拟服务端路由拒绝: 用 0x18 重置流
+                            let _ = send.reset(quinn::VarInt::from_u32(QUIC_RESET_TARGET_UNREACHABLE));
+                            let _ = recv.stop(quinn::VarInt::from_u32(QUIC_RESET_TARGET_UNREACHABLE));
+                        }
+                        let _ = conn.closed().await;
+                    }
+                });
+            }
+        });
+
+        let mux = QuicMux::new("127.0.0.1", server_addr.port(), "localhost", false, false, None, 2, QuicCc::Stock, Some(pin));
+        let (mut send, mut recv) = mux.open_stream().await.expect("open_stream should succeed");
+        tokio::io::AsyncWriteExt::write_all(&mut send, b"hello").await.unwrap();
+
+        let mut buf = [0u8; 16];
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut recv, &mut buf),
+        )
+        .await
+        .expect("read should complete within 2s");
+
+        assert!(res.is_err(), "reading from reset stream must return Err");
+        let err = res.unwrap_err();
+        assert!(
+            is_quic_target_unreachable_err(&err),
+            "expected QUIC_RESET_TARGET_UNREACHABLE, got: {err:?}"
+        );
 
         srv_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);

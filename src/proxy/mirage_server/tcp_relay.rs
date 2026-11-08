@@ -154,6 +154,7 @@ pub(super) async fn handle_tcp_relay(
                 return;
             }
             if upstream.write_all(&payload).await.is_err() {
+                reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
                 return;
             }
             _conn.counter().up(payload.len() as u64);
@@ -227,6 +228,7 @@ pub(super) async fn handle_tcp_relay(
                         write_failed = true;
                         break;
                     }
+                    up_clock.touch();
                     up_conn.up(data.len() as u64);
                 }
                 Ok(Err(e)) => {
@@ -310,6 +312,7 @@ pub(super) async fn handle_tcp_relay(
                     if writer.send_data(&buf[..total]).await.is_err() {
                         break;
                     }
+                    dn_clock.touch();
                     dn_conn.down(total as u64);
                 }
                 Ok(Err(_)) => break,
@@ -397,6 +400,7 @@ async fn relay_via_shadowsocks(
                 return;
             }
             if up_write.write_all(&payload).await.is_err() {
+                reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
                 return;
             }
         }
@@ -448,6 +452,7 @@ async fn relay_via_shadowsocks(
                         write_failed = true;
                         break;
                     }
+                    up_clock.touch();
                 }
                 Ok(Err(e)) => {
                     clean_end = crate::crypto::aead::is_close_notify(&e);
@@ -494,6 +499,7 @@ async fn relay_via_shadowsocks(
                     if writer.send_data(&chunk).await.is_err() {
                         break;
                     }
+                    dn_clock.touch();
                 }
                 Ok(Err(_)) => break,
                 Err(_) => {
@@ -592,6 +598,7 @@ async fn relay_via_wireguard(
                 return;
             }
             if up_write.write_all(&payload).await.is_err() {
+                reject_with_signal(&mut reader, &mut writer, crate::crypto::aead::TARGET_UNREACHABLE_CONNECT_FAILED).await;
                 return;
             }
         }
@@ -624,6 +631,7 @@ async fn relay_via_wireguard(
                     if up_write.write_all(data).await.is_err() {
                         break;
                     }
+                    up_clock.touch();
                 }
                 Ok(Err(_)) => break,
                 Err(_) => {
@@ -671,6 +679,7 @@ async fn relay_via_wireguard(
                     if writer.send_data(&buf[..n]).await.is_err() {
                         break;
                     }
+                    dn_clock.touch();
                 }
                 Ok(Err(_)) => break,
                 Err(_) => {
