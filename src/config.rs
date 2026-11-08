@@ -1743,6 +1743,56 @@ fn default_auth_ts_tolerance() -> u64 {
     crate::crypto::hello_auth::DEFAULT_AUTH_TS_TOLERANCE_SECS
 }
 
+/// 配置诊断提示 (双语): `zh` 给命令行 / 控制台, `en` 给运行时日志 (仅 ASCII)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issue {
+    pub zh: String,
+    pub en: String,
+}
+
+impl Issue {
+    pub fn new(zh: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            zh: zh.into(),
+            en: en.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Issue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.zh)
+    }
+}
+
+impl std::ops::Deref for Issue {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.zh
+    }
+}
+
+impl AsRef<str> for Issue {
+    fn as_ref(&self) -> &str {
+        &self.zh
+    }
+}
+
+impl std::borrow::Borrow<str> for Issue {
+    fn borrow(&self) -> &str {
+        &self.zh
+    }
+}
+
+impl serde::Serialize for Issue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.zh)
+    }
+}
+
 impl Config {
     /// Loads configuration from a JSON file.
     pub fn load_from_file(path: &str) -> anyhow::Result<Self> {
@@ -1762,11 +1812,14 @@ impl Config {
     /// 覆盖两类:
     /// 1. **未知字段** —— 拼错的键此前被 serde 静默忽略, 用户永远不知道自己配了个寂寞;
     /// 2. **语义问题** —— 语法合法但逻辑不成立 (引用了不存在的 outbound、tag 重复等)。
-    pub fn parse_with_diagnostics(content: &str) -> anyhow::Result<(Self, Vec<String>)> {
+    pub fn parse_with_diagnostics(content: &str) -> anyhow::Result<(Self, Vec<Issue>)> {
         let mut issues = Vec::new();
         let de = &mut serde_json::Deserializer::from_str(content);
         let config: Config = serde_ignored::deserialize(de, |path| {
-            issues.push(format!("未知字段 `{}` (拼写错误? 已被忽略, 不会生效)", path));
+            issues.push(Issue::new(
+                format!("未知字段 `{}` (拼写错误? 已被忽略, 不会生效)", path),
+                format!("unknown field `{}` (misspelled? ignored, will not take effect)", path),
+            ));
         })?;
         let mut sem_issues = config.semantic_issues();
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(content) {
@@ -1781,7 +1834,7 @@ impl Config {
 fn check_group_unknown_fields(
     raw: &serde_json::Value,
     config: &Config,
-    sem_issues: &mut Vec<String>,
+    sem_issues: &mut Vec<Issue>,
 ) {
     let Some(outbounds_arr) = raw.get("outbounds").and_then(|v| v.as_array()) else {
         return;
@@ -1829,7 +1882,7 @@ fn check_group_unknown_fields(
             continue;
         }
 
-        let hints: Vec<String> = unknown_keys
+        let hints_zh: Vec<String> = unknown_keys
             .iter()
             .map(|&k| {
                 if k == "outbound" {
@@ -1839,25 +1892,41 @@ fn check_group_unknown_fields(
                 }
             })
             .collect();
-        let hint_str = hints.join(", ");
+        let hint_str_zh = hints_zh.join(", ");
+
+        let hints_en: Vec<String> = unknown_keys
+            .iter()
+            .map(|&k| {
+                if k == "outbound" {
+                    "unknown field `outbound` found (did you mean `outbounds`?)".to_string()
+                } else {
+                    format!("unknown field `{k}` found")
+                }
+            })
+            .collect();
+        let hint_str_en = hints_en.join(", ");
 
         let mut attached = false;
         for issue in sem_issues.iter_mut() {
-            if issue.contains(&format!("`{tag}` 的 outbounds 为空")) {
-                issue.push_str(&format!("; {hint_str}"));
+            if issue.zh.contains(&format!("`{tag}` 的 outbounds 为空")) {
+                issue.zh.push_str(&format!("; {hint_str_zh}"));
+                issue.en.push_str(&format!("; {hint_str_en}"));
                 attached = true;
                 break;
             }
         }
         if !attached {
-            sem_issues.push(format!("组 `{tag}` 没有成员; {hint_str}"));
+            sem_issues.push(Issue::new(
+                format!("组 `{tag}` 没有成员; {hint_str_zh}"),
+                format!("group `{tag}` has no members; {hint_str_en}"),
+            ));
         }
     }
 }
 
     /// 校验用户硬错误 (空名、重名/撞保留名 default、空口令、重复口令)。
     /// 仅返回必须拒写的硬错误, 不包含跨入站限额不一致等普通 issue。
-    pub fn user_hard_errors(&self) -> Vec<String> {
+    pub fn user_hard_errors(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
         for ib in &self.inbounds {
             if let InboundConfig::MirageServer { tag, password, users, .. } = ib {
@@ -1869,16 +1938,31 @@ fn check_group_unknown_fields(
                 }
                 for u in users {
                     if u.name.trim().is_empty() {
-                        issues.push(format!("mirage_server 入站 `{tag}` 有 user 的 name 为空"));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 有 user 的 name 为空"),
+                            format!("mirage_server inbound `{tag}` has a user with empty name"),
+                        ));
                     } else if !seen_names.insert(u.name.clone()) {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 user name `{}` 重复 (或撞保留名 default)", u.name));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 user name `{}` 重复 (或撞保留名 default)", u.name),
+                            format!("mirage_server inbound `{tag}` user name `{}` is duplicated (or conflicts with reserved name default)", u.name),
+                        ));
                     }
                     if u.password.is_empty() {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 user `{}` password 为空", u.name),
+                            format!("mirage_server inbound `{tag}` user `{}` has empty password", u.name),
+                        ));
                     } else if let Some(prev) = seen_passwords.get(u.password.as_str()) {
-                        issues.push(format!(
-                            "mirage_server 入站 `{tag}` 的 user `{}` password 与 `{prev}` 重复 (口令相同会导致鉴权串号)",
-                            u.name
+                        issues.push(Issue::new(
+                            format!(
+                                "mirage_server 入站 `{tag}` 的 user `{}` password 与 `{prev}` 重复 (口令相同会导致鉴权串号)",
+                                u.name
+                            ),
+                            format!(
+                                "mirage_server inbound `{tag}` user `{}` password duplicates `{prev}` (identical passwords cause authentication crosstalk)",
+                                u.name
+                            ),
                         ));
                     } else {
                         seen_passwords.insert(u.password.as_str(), u.name.as_str());
@@ -1895,7 +1979,7 @@ fn check_group_unknown_fields(
     /// 解开录下的会话; 改 KDF 要动线上协议, 所以只能靠口令本身足够长。内置生成器 (install.sh /
     /// `mirage-rs config`) 都是 128 位随机口令, 这里只拦手填的短口令。按字符数计 (多字节字符口令按
     /// 字节数会放过很短的口令)。
-    pub fn weak_password_warnings(&self) -> Vec<String> {
+    pub fn weak_password_warnings(&self) -> Vec<Issue> {
         const MIN_PASSWORD_CHARS: usize = 16;
         let mut out = Vec::new();
         for ib in &self.inbounds {
@@ -1904,9 +1988,15 @@ fn check_group_unknown_fields(
                     .chain(users.iter().map(|u| (u.name.as_str(), u.password.as_str())));
                 for (name, pw) in named {
                     if !pw.is_empty() && pw.chars().count() < MIN_PASSWORD_CHARS {
-                        out.push(format!(
-                            "mirage_server 入站 `{tag}` 的口令 ({name}) 少于 {MIN_PASSWORD_CHARS} 个字符, \
-                             可被抓包后离线猜解; 建议换成随机长口令 (如 `openssl rand -hex 16`)"
+                        out.push(Issue::new(
+                            format!(
+                                "mirage_server 入站 `{tag}` 的口令 ({name}) 少于 {MIN_PASSWORD_CHARS} 个字符, \
+                                 可被抓包后离线猜解; 建议换成随机长口令 (如 `openssl rand -hex 16`)"
+                            ),
+                            format!(
+                                "mirage_server inbound `{tag}` password ({name}) is shorter than {MIN_PASSWORD_CHARS} characters, \
+                                 vulnerable to offline cracking; consider using a long random password (e.g. `openssl rand -hex 16`)"
+                            ),
                         ));
                     }
                 }
@@ -1917,7 +2007,7 @@ fn check_group_unknown_fields(
 
     /// 服务端配置的提示类问题 (QUIC 入站路由至上游、服务端不生效的字段): 只打告警, 不进
     /// [`Self::semantic_issues`] —— 后者会让 `check` 失败、`mirage-rs config` 拒绝写回。
-    pub fn server_routing_warnings(&self) -> Vec<String> {
+    pub fn server_routing_warnings(&self) -> Vec<Issue> {
         let mut warnings = Vec::new();
         let quic_inbounds: Vec<&str> = self
             .inbounds
@@ -1939,8 +2029,13 @@ fn check_group_unknown_fields(
         if server_only {
             for ob in &self.outbounds {
                 if let OutboundConfig::Shadowsocks { tag, underlying: Some(_), .. } = ob {
-                    warnings.push(format!(
-                        "shadowsocks 出站 `{tag}` 的 underlying 在服务端不生效 (服务端直接拨 SS 服务器), 可删除该字段"
+                    warnings.push(Issue::new(
+                        format!(
+                            "shadowsocks 出站 `{tag}` 的 underlying 在服务端不生效 (服务端直接拨 SS 服务器), 可删除该字段"
+                        ),
+                        format!(
+                            "shadowsocks outbound `{tag}` underlying does not take effect on server (server connects directly to SS server), you can remove this field"
+                        ),
                     ));
                 }
             }
@@ -1961,18 +2056,30 @@ fn check_group_unknown_fields(
 
         for q_tag in &quic_inbounds {
             if is_non_direct(&self.routing.default_outbound) {
-                warnings.push(format!(
-                    "入站 `{q_tag}` 采用 QUIC 传输, 但 default_outbound `{}` 为非 direct 出站: QUIC 传输暂不支持上游出口 (运行时将拒绝该流)",
-                    self.routing.default_outbound
+                warnings.push(Issue::new(
+                    format!(
+                        "入站 `{q_tag}` 采用 QUIC 传输, 但 default_outbound `{}` 为非 direct 出站: QUIC 传输暂不支持上游出口 (运行时将拒绝该流)",
+                        self.routing.default_outbound
+                    ),
+                    format!(
+                        "inbound `{q_tag}` uses QUIC transport, but default_outbound `{}` is non-direct: QUIC transport does not support upstream egress yet (stream will be rejected at runtime)",
+                        self.routing.default_outbound
+                    ),
                 ));
             }
             for (i, rule) in self.routing.rules.iter().enumerate() {
                 if is_non_direct(&rule.outbound)
                     && (rule.inbound.is_empty() || rule.inbound.iter().any(|ib| ib == *q_tag))
                 {
-                    warnings.push(format!(
-                        "入站 `{q_tag}` 采用 QUIC 传输, 规则[{i}]将其导向非 direct 出站 `{}`: QUIC 传输暂不支持上游出口 (运行时将拒绝该流)",
-                        rule.outbound
+                    warnings.push(Issue::new(
+                        format!(
+                            "入站 `{q_tag}` 采用 QUIC 传输, 规则[{i}]将其导向非 direct 出站 `{}`: QUIC 传输暂不支持上游出口 (运行时将拒绝该流)",
+                            rule.outbound
+                        ),
+                        format!(
+                            "inbound `{q_tag}` uses QUIC transport, rule[{i}] routes it to non-direct outbound `{}`: QUIC transport does not support upstream egress yet (stream will be rejected at runtime)",
+                            rule.outbound
+                        ),
                     ));
                 }
             }
@@ -1981,7 +2088,7 @@ fn check_group_unknown_fields(
     }
 
     /// 语义校验: 语法没问题但逻辑不成立的配置。
-    pub fn semantic_issues(&self) -> Vec<String> {
+    pub fn semantic_issues(&self) -> Vec<Issue> {
         let mut issues = Vec::new();
         issues.extend(self.user_hard_errors());
 
@@ -2000,7 +2107,10 @@ fn check_group_unknown_fields(
                 | OutboundConfig::LoadBalance { tag, .. } => tag.as_str(),
             };
             if tags.contains(&tag) {
-                issues.push(format!("outbound tag `{tag}` 重复定义 (后者覆盖前者, 行为不确定)"));
+                issues.push(Issue::new(
+                    format!("outbound tag `{tag}` 重复定义 (后者覆盖前者, 行为不确定)"),
+                    format!("outbound tag `{tag}` duplicate definition (later overwrites earlier, behavior undefined)"),
+                ));
             }
             tags.push(tag);
         }
@@ -2013,7 +2123,10 @@ fn check_group_unknown_fields(
             // pool_size=0 → 暖池永不建货, pool.get() 恒 10s 超时, 每条连接静默失败 (服务看着在跑, 全连不上)。
             if let OutboundConfig::Mirage { tag, pool_size, .. } = ob {
                 if *pool_size == 0 {
-                    issues.push(format!("outbound `{tag}`: pool_size 不能为 0 (暖池会永远建不出连接, 全部代理静默超时)"));
+                    issues.push(Issue::new(
+                        format!("outbound `{tag}`: pool_size 不能为 0 (暖池会永远建不出连接, 全部代理静默超时)"),
+                        format!("outbound `{tag}`: pool_size cannot be 0 (warm pool will never establish connections, all proxy traffic will silently time out)"),
+                    ));
                 }
             }
             if let OutboundConfig::Wireguard {
@@ -2024,8 +2137,13 @@ fn check_group_unknown_fields(
                 // 这正是"配了但不生效"的静默失败类, 必须 check 阶段拦。
                 if let Some(d) = dns {
                     if d.parse::<std::net::IpAddr>().is_err() {
-                        issues.push(format!(
-                            "outbound `{tag}`: dns `{d}` 不是合法 IP (隧道内 DNS 服务器地址, 如 10.0.0.1)"
+                        issues.push(Issue::new(
+                            format!(
+                                "outbound `{tag}`: dns `{d}` 不是合法 IP (隧道内 DNS 服务器地址, 如 10.0.0.1)"
+                            ),
+                            format!(
+                                "outbound `{tag}`: dns `{d}` is not a valid IP (in-tunnel DNS server address, e.g. 10.0.0.1)"
+                            ),
                         ));
                     }
                 }
@@ -2034,29 +2152,51 @@ fn check_group_unknown_fields(
                     (peer_public_key, "peer_public_key"),
                 ] {
                     if let Err(e) = crate::proxy::wg::decode_wg_key(val, what) {
-                        issues.push(format!("outbound `{tag}`: {e}"));
+                        issues.push(Issue::new(
+                            format!("outbound `{tag}`: {e}"),
+                            format!("outbound `{tag}`: {e}"),
+                        ));
                     }
                 }
                 if let Some(psk) = preshared_key {
                     if let Err(e) = crate::proxy::wg::decode_wg_key(psk, "preshared_key") {
-                        issues.push(format!("outbound `{tag}`: {e}"));
+                        issues.push(Issue::new(
+                            format!("outbound `{tag}`: {e}"),
+                            format!("outbound `{tag}`: {e}"),
+                        ));
                     }
                 }
                 if address.parse::<std::net::IpAddr>().is_err() {
-                    issues.push(format!(
-                        "outbound `{tag}`: address `{address}` 不是合法 IP \
-                         (应是隧道内本端地址, 如 10.0.0.2, 不带掩码)"
+                    issues.push(Issue::new(
+                        format!(
+                            "outbound `{tag}`: address `{address}` 不是合法 IP \
+                             (应是隧道内本端地址, 如 10.0.0.2, 不带掩码)"
+                        ),
+                        format!(
+                            "outbound `{tag}`: address `{address}` is not a valid IP \
+                             (should be in-tunnel local address, e.g. 10.0.0.2, without subnet mask)"
+                        ),
                     ));
                 }
                 // endpoint 必须带端口 —— 少写端口是最常见的手抄错误
                 if endpoint.rsplit(':').next().is_none_or(|p| p.parse::<u16>().is_err()) {
-                    issues.push(format!(
-                        "outbound `{tag}`: endpoint `{endpoint}` 缺少端口 (应形如 host:51820)"
+                    issues.push(Issue::new(
+                        format!(
+                            "outbound `{tag}`: endpoint `{endpoint}` 缺少端口 (应形如 host:51820)"
+                        ),
+                        format!(
+                            "outbound `{tag}`: endpoint `{endpoint}` is missing port (should be host:51820)"
+                        ),
                     ));
                 }
                 if *mtu == 0 || *mtu > 65503 {
-                    issues.push(format!(
-                        "outbound `{tag}`: mtu {mtu} 非法 (须 1..=65503, 常用 1420)"
+                    issues.push(Issue::new(
+                        format!(
+                            "outbound `{tag}`: mtu {mtu} 非法 (须 1..=65503, 常用 1420)"
+                        ),
+                        format!(
+                            "outbound `{tag}`: mtu {mtu} invalid (must be 1..=65503, commonly 1420)"
+                        ),
                     ));
                 }
             }
@@ -2065,9 +2205,15 @@ fn check_group_unknown_fields(
 
         // 路由默认出站必须存在 —— 不存在则所有未命中规则的流量无处可去
         if !known(&self.routing.default_outbound) {
-            issues.push(format!(
-                "routing.default_outbound = `{}` 不存在于 outbounds (未命中任何规则的流量将无法路由)",
-                self.routing.default_outbound
+            issues.push(Issue::new(
+                format!(
+                    "routing.default_outbound = `{}` 不存在于 outbounds (未命中任何规则的流量将无法路由)",
+                    self.routing.default_outbound
+                ),
+                format!(
+                    "routing.default_outbound = `{}` does not exist in outbounds (traffic not matching any rule cannot be routed)",
+                    self.routing.default_outbound
+                ),
             ));
         }
 
@@ -2091,8 +2237,13 @@ fn check_group_unknown_fields(
             }
             for (field, t) in refs {
                 if known(t) && !server_usable(t) {
-                    issues.push(format!(
-                        "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站"
+                    issues.push(Issue::new(
+                        format!(
+                            "{field} = `{t}`: 服务端只支持 direct / block / shadowsocks / wireguard 出站"
+                        ),
+                        format!(
+                            "{field} = `{t}`: server only supports direct / block / shadowsocks / wireguard outbound"
+                        ),
                     ));
                 }
             }
@@ -2103,7 +2254,10 @@ fn check_group_unknown_fields(
         for (i, rule) in self.routing.rules.iter().enumerate() {
             for (field, list) in [("ip_cidr", &rule.ip_cidr), ("source_ip_cidr", &rule.source_ip_cidr)] {
                 if let Err(bad) = crate::router::parse_ip_nets(list) {
-                    issues.push(format!("routing.rules[{i}].{field} 含非法项 `{bad}` (应为 CIDR 或 IP)"));
+                    issues.push(Issue::new(
+                        format!("routing.rules[{i}].{field} 含非法项 `{bad}` (应为 CIDR 或 IP)"),
+                        format!("routing.rules[{i}].{field} contains invalid entry `{bad}` (must be CIDR or IP)"),
+                    ));
                 }
             }
         }
@@ -2129,9 +2283,15 @@ fn check_group_unknown_fields(
         }
         for (i, rule) in self.routing.rules.iter().enumerate() {
             if !known(&rule.outbound) {
-                issues.push(format!(
-                    "routing.rules[{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
-                    rule.outbound
+                issues.push(Issue::new(
+                    format!(
+                        "routing.rules[{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
+                        rule.outbound
+                    ),
+                    format!(
+                        "routing.rules[{i}].outbound = `{}` does not exist in outbounds (this rule will never take effect properly)",
+                        rule.outbound
+                    ),
                 ));
             }
             // mode 非法值现由 RuleMode 枚举在解析期直接拒 (unknown variant), 无需软校验。
@@ -2139,8 +2299,13 @@ fn check_group_unknown_fields(
             // 拼错入站名是很容易犯的错, 而症状是"规则写了不生效", 极难自查。
             for t in &rule.inbound {
                 if !inbound_tags.contains(&t.as_str()) {
-                    issues.push(format!(
-                        "routing.rules[{i}].inbound = `{t}` 不存在于 inbounds (该规则永远不会命中)"
+                    issues.push(Issue::new(
+                        format!(
+                            "routing.rules[{i}].inbound = `{t}` 不存在于 inbounds (该规则永远不会命中)"
+                        ),
+                        format!(
+                            "routing.rules[{i}].inbound = `{t}` does not exist in inbounds (this rule will never match)"
+                        ),
                     ));
                 }
             }
@@ -2150,9 +2315,15 @@ fn check_group_unknown_fields(
         for (pname, prules) in &self.routing.profiles {
             for (i, rule) in prules.iter().enumerate() {
                 if !known(&rule.outbound) {
-                    issues.push(format!(
-                        "routing.profiles[{pname}][{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
-                        rule.outbound
+                    issues.push(Issue::new(
+                        format!(
+                            "routing.profiles[{pname}][{i}].outbound = `{}` 不存在于 outbounds (该规则永远不会正确生效)",
+                            rule.outbound
+                        ),
+                        format!(
+                            "routing.profiles[{pname}][{i}].outbound = `{}` does not exist in outbounds (this rule will never take effect properly)",
+                            rule.outbound
+                        ),
                     ));
                 }
             }
@@ -2160,9 +2331,15 @@ fn check_group_unknown_fields(
         // 设备分配引用的 profile 必须存在, 否则该设备的分配形同虚设 (静默不生效)。
         for (i, dp) in self.routing.device_profiles.iter().enumerate() {
             if !self.routing.profiles.contains_key(&dp.profile) {
-                issues.push(format!(
-                    "routing.device_profiles[{i}].profile = `{}` 不存在于 routing.profiles (该设备分配不生效)",
-                    dp.profile
+                issues.push(Issue::new(
+                    format!(
+                        "routing.device_profiles[{i}].profile = `{}` 不存在于 routing.profiles (该设备分配不生效)",
+                        dp.profile
+                    ),
+                    format!(
+                        "routing.device_profiles[{i}].profile = `{}` does not exist in routing.profiles (this device assignment will not take effect)",
+                        dp.profile
+                    ),
                 ));
             }
         }
@@ -2176,8 +2353,13 @@ fn check_group_unknown_fields(
                 OutboundConfig::LoadBalance { tag, strategy, .. } => {
                     // v1 只支持 round-robin, 别的策略明确报错 (不静默降级)。
                     if strategy != "round-robin" {
-                        issues.push(format!(
-                            "load_balance `{tag}` 的 strategy `{strategy}` 暂不支持 (v1 仅 round-robin)"
+                        issues.push(Issue::new(
+                            format!(
+                                "load_balance `{tag}` 的 strategy `{strategy}` 暂不支持 (v1 仅 round-robin)"
+                            ),
+                            format!(
+                                "load_balance `{tag}` strategy `{strategy}` is not supported yet (v1 supports only round-robin)"
+                            ),
                         ));
                     }
                     (tag.as_str(), "load_balance")
@@ -2188,22 +2370,35 @@ fn check_group_unknown_fields(
                 Ok(children) => {
                     if children.is_empty() {
                         if ob.filter().is_some() {
-                            issues.push(format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用) (filter 未匹配到任何节点)"));
+                            issues.push(Issue::new(
+                                format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用) (filter 未匹配到任何节点)"),
+                                format!("{kind} `{tag}` outbounds is empty (group unusable) (filter matched no nodes)"),
+                            ));
                         } else {
-                            issues.push(format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用)"));
+                            issues.push(Issue::new(
+                                format!("{kind} `{tag}` 的 outbounds 为空 (该组不可用)"),
+                                format!("{kind} `{tag}` outbounds is empty (group unusable)"),
+                            ));
                         }
                     }
                     for child in &children {
                         if !known(child) {
-                            issues.push(format!("{kind} `{tag}` 引用了不存在的成员 `{child}`"));
+                            issues.push(Issue::new(
+                                format!("{kind} `{tag}` 引用了不存在的成员 `{child}`"),
+                                format!("{kind} `{tag}` references nonexistent member `{child}`"),
+                            ));
                         }
                     }
                     if children.iter().any(|c| c == tag) {
-                        issues.push(format!("{kind} `{tag}` 把自己列为成员 (自引用)"));
+                        issues.push(Issue::new(
+                            format!("{kind} `{tag}` 把自己列为成员 (自引用)"),
+                            format!("{kind} `{tag}` lists itself as a member (self-reference)"),
+                        ));
                     }
                 }
                 Err(err) => {
-                    issues.push(err.to_string());
+                    let err_str = err.to_string();
+                    issues.push(Issue::new(err_str.clone(), err_str));
                 }
             }
         }
@@ -2212,39 +2407,68 @@ fn check_group_unknown_fields(
         for ob in &self.outbounds {
             if let OutboundConfig::Mirage { tag, server, server_port, password, underlying, transport, quic_window_mb, quic_pin, .. } = ob {
                 if server.trim().is_empty() {
-                    issues.push(format!("mirage 出站 `{tag}` 的 server 为空"));
+                    issues.push(Issue::new(
+                        format!("mirage 出站 `{tag}` 的 server 为空"),
+                        format!("mirage outbound `{tag}` server is empty"),
+                    ));
                 }
                 // transport=quic fail-fast: 没编 quic 特性 → check 阶段就拦, 别等运行时每连接报错。
                 #[cfg(not(feature = "quic"))]
                 if *transport == Transport::Quic {
-                    issues.push(format!("mirage 出站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"));
+                    issues.push(Issue::new(
+                        format!("mirage 出站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"),
+                        format!("mirage outbound `{tag}` configured transport=quic, but this binary was compiled without `--features quic`"),
+                    ));
                 }
                 if *transport == Transport::Quic {
                     match quic_pin {
-                        None => issues.push(format!("mirage 出站 `{tag}` 配了 transport=quic 但未配置 quic_pin (服务端证书 SPKI 指纹, 必填)")),
-                        Some(pin) if !is_valid_quic_pin(pin) => issues.push(format!(
-                            "mirage 出站 `{tag}` 的 quic_pin `{pin}` 格式非法 (须为 43 字符 base64url SHA-256 SPKI 指纹)"
+                        None => issues.push(Issue::new(
+                            format!("mirage 出站 `{tag}` 配了 transport=quic 但未配置 quic_pin (服务端证书 SPKI 指纹, 必填)"),
+                            format!("mirage outbound `{tag}` configured transport=quic but missing quic_pin (server certificate SPKI pin, required)"),
+                        )),
+                        Some(pin) if !is_valid_quic_pin(pin) => issues.push(Issue::new(
+                            format!(
+                                "mirage 出站 `{tag}` 的 quic_pin `{pin}` 格式非法 (须为 43 字符 base64url SHA-256 SPKI 指纹)"
+                            ),
+                            format!(
+                                "mirage outbound `{tag}` quic_pin `{pin}` format is invalid (must be 43-character base64url SHA-256 SPKI pin)"
+                            ),
                         )),
                         _ => {}
                     }
                     if let Some(mb) = quic_window_mb {
                         if *mb == 0 || *mb > 256 {
-                            issues.push(format!("mirage 出站 `{tag}` 的 quic_window_mb={mb} 不合理 (荐 2~64; 重排序线路用 2, 干净长肥用 16-64)"));
+                            issues.push(Issue::new(
+                                format!("mirage 出站 `{tag}` 的 quic_window_mb={mb} 不合理 (荐 2~64; 重排序线路用 2, 干净长肥用 16-64)"),
+                                format!("mirage outbound `{tag}` quic_window_mb={mb} is unreasonable (recommended 2~64; 2 for reordering paths, 16-64 for clean BDP)"),
+                            ));
                         }
                     }
                 }
                 if *server_port == 0 {
-                    issues.push(format!("mirage 出站 `{tag}` 的 server_port 为 0"));
+                    issues.push(Issue::new(
+                        format!("mirage 出站 `{tag}` 的 server_port 为 0"),
+                        format!("mirage outbound `{tag}` server_port is 0"),
+                    ));
                 }
                 if password.is_empty() {
-                    issues.push(format!("mirage 出站 `{tag}` 的 password 为空 (服务端会认证失败)"));
+                    issues.push(Issue::new(
+                        format!("mirage 出站 `{tag}` 的 password 为空 (服务端会认证失败)"),
+                        format!("mirage outbound `{tag}` password is empty (server authentication will fail)"),
+                    ));
                 }
                 // 链式代理 underlying: 引用的出站必须存在且不能自引用 (环由启动构建的拓扑排序拦)。
                 if let Some(u) = underlying {
                     if u == tag {
-                        issues.push(format!("mirage 出站 `{tag}` 的 underlying 自引用 (会形成环)"));
+                        issues.push(Issue::new(
+                            format!("mirage 出站 `{tag}` 的 underlying 自引用 (会形成环)"),
+                            format!("mirage outbound `{tag}` underlying self-reference (creates a cycle)"),
+                        ));
                     } else if !tags.contains(&u.as_str()) {
-                        issues.push(format!("mirage 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"));
+                        issues.push(Issue::new(
+                            format!("mirage 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"),
+                            format!("mirage outbound `{tag}` underlying `{u}` does not exist in outbounds"),
+                        ));
                     }
                 }
             }
@@ -2260,36 +2484,60 @@ fn check_group_unknown_fields(
             } = ob
             {
                 if server.trim().is_empty() {
-                    issues.push(format!("shadowsocks 出站 `{tag}` 的 server 为空"));
+                    issues.push(Issue::new(
+                        format!("shadowsocks 出站 `{tag}` 的 server 为空"),
+                        format!("shadowsocks outbound `{tag}` server is empty"),
+                    ));
                 }
                 if *server_port == 0 {
-                    issues.push(format!("shadowsocks 出站 `{tag}` 的 server_port 为 0"));
+                    issues.push(Issue::new(
+                        format!("shadowsocks 出站 `{tag}` 的 server_port 为 0"),
+                        format!("shadowsocks outbound `{tag}` server_port is 0"),
+                    ));
                 }
                 if password.is_empty() {
-                    issues.push(format!("shadowsocks 出站 `{tag}` 的 password 为空"));
+                    issues.push(Issue::new(
+                        format!("shadowsocks 出站 `{tag}` 的 password 为空"),
+                        format!("shadowsocks outbound `{tag}` password is empty"),
+                    ));
                 }
                 match crate::proxy::shadowsocks::Method::parse(method) {
                     Ok(m) => {
                         if m.is_2022() {
                             if let Err(e) = crate::proxy::shadowsocks::decode_ss2022_psk(password, m.key_len()) {
-                                issues.push(format!("shadowsocks 出站 `{tag}` 的 password 非法: {e}"));
+                                issues.push(Issue::new(
+                                    format!("shadowsocks 出站 `{tag}` 的 password 非法: {e}"),
+                                    format!("shadowsocks outbound `{tag}` password is invalid: {e}"),
+                                ));
                             }
                         }
                     }
                     Err(e) => {
-                        issues.push(format!("shadowsocks 出站 `{tag}` 的 method 非法: {e}"));
+                        issues.push(Issue::new(
+                            format!("shadowsocks 出站 `{tag}` 的 method 非法: {e}"),
+                            format!("shadowsocks outbound `{tag}` method is invalid: {e}"),
+                        ));
                     }
                 }
                 if let Some(policy) = udp {
                     if matches!(policy, UdpPolicy::Tunnel) {
-                        issues.push(format!("shadowsocks 出站 `{tag}` 的 udp 策略仅支持 block 或 direct (不支持 tunnel)"));
+                        issues.push(Issue::new(
+                            format!("shadowsocks 出站 `{tag}` 的 udp 策略仅支持 block 或 direct (不支持 tunnel)"),
+                            format!("shadowsocks outbound `{tag}` udp policy only supports block or direct (tunnel is not supported)"),
+                        ));
                     }
                 }
                 if let Some(u) = underlying {
                     if u == tag {
-                        issues.push(format!("shadowsocks 出站 `{tag}` 的 underlying 自引用 (会形成环)"));
+                        issues.push(Issue::new(
+                            format!("shadowsocks 出站 `{tag}` 的 underlying 自引用 (会形成环)"),
+                            format!("shadowsocks outbound `{tag}` underlying self-reference (creates a cycle)"),
+                        ));
                     } else if !tags.contains(&u.as_str()) {
-                        issues.push(format!("shadowsocks 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"));
+                        issues.push(Issue::new(
+                            format!("shadowsocks 出站 `{tag}` 的 underlying `{u}` 不存在于 outbounds"),
+                            format!("shadowsocks outbound `{tag}` underlying `{u}` does not exist in outbounds"),
+                        ));
                     }
                 }
             }
@@ -2359,7 +2607,7 @@ fn check_group_unknown_fields(
                 colors: &mut std::collections::HashMap<&'a str, Color>,
                 path: &mut Vec<&'a str>,
                 reported_cycles: &mut std::collections::HashSet<Vec<String>>,
-                issues: &mut Vec<String>,
+                issues: &mut Vec<Issue>,
             ) {
                 colors.insert(u, Color::Gray);
                 path.push(u);
@@ -2385,22 +2633,30 @@ fn check_group_unknown_fields(
                                     if reported_cycles.insert(norm) {
                                         let mut full_path: Vec<&str> = cycle_nodes.to_vec();
                                         full_path.push(v);
-                                        let path_str = full_path.join(" → ");
+                                        let path_str_zh = full_path.join(" → ");
+                                        let path_str_en = full_path.join(" -> ");
 
-                                        let mut filter_notes = Vec::new();
+                                        let mut filter_notes_zh = Vec::new();
+                                        let mut filter_notes_en = Vec::new();
                                         for w in full_path.windows(2) {
-                                            let (src, dst) = (w[0], w[1]);
-                                            if filter_edges.contains(&(src, dst)) {
-                                                filter_notes.push(format!("{src} 的 filter 匹配到 {dst}"));
-                                            }
+                                             let (src, dst) = (w[0], w[1]);
+                                             if filter_edges.contains(&(src, dst)) {
+                                                 filter_notes_zh.push(format!("{src} 的 filter 匹配到 {dst}"));
+                                                 filter_notes_en.push(format!("{src} filter matched {dst}"));
+                                             }
                                         }
 
-                                        let msg = if filter_notes.is_empty() {
-                                            format!("出站存在循环引用: {path_str}")
+                                        let zh = if filter_notes_zh.is_empty() {
+                                            format!("出站存在循环引用: {path_str_zh}")
                                         } else {
-                                            format!("出站存在循环引用: {path_str} ({})", filter_notes.join(", "))
+                                            format!("出站存在循环引用: {path_str_zh} ({})", filter_notes_zh.join(", "))
                                         };
-                                        issues.push(msg);
+                                        let en = if filter_notes_en.is_empty() {
+                                            format!("cyclic reference found in outbounds: {path_str_en}")
+                                        } else {
+                                            format!("cyclic reference found in outbounds: {path_str_en} ({})", filter_notes_en.join(", "))
+                                        };
+                                        issues.push(Issue::new(zh, en));
                                     }
                                 }
                             }
@@ -2439,11 +2695,17 @@ fn check_group_unknown_fields(
                 }
             };
             if in_tags.contains(&tag) {
-                issues.push(format!("inbound tag `{tag}` 重复定义"));
+                issues.push(Issue::new(
+                    format!("inbound tag `{tag}` 重复定义"),
+                    format!("inbound tag `{tag}` duplicate definition"),
+                ));
             }
             in_tags.push(tag);
             if port == 0 {
-                issues.push(format!("inbound `{tag}` 的 port 为 0"));
+                issues.push(Issue::new(
+                    format!("inbound `{tag}` 的 port 为 0"),
+                    format!("inbound `{tag}` port is 0"),
+                ));
             }
             // 监听地址:端口冲突 —— 两入站绑同一 (协议, listen:port), 启动时第二个 bind 会
             // "address already in use", 而配置层此前零提示。TCP 与 UDP 监听同端口不冲突
@@ -2452,9 +2714,15 @@ fn check_group_unknown_fields(
             if port != 0 {
                 for &proto in ib.bound_protocols() {
                     if in_binds.contains(&(proto, listen, port)) {
-                        issues.push(format!(
-                            "inbound `{tag}` 的监听 `{proto} {listen}:{port}` 与前一个入站冲突 \
-                             (启动时会 bind 失败: address already in use)"
+                        issues.push(Issue::new(
+                            format!(
+                                "inbound `{tag}` 的监听 `{proto} {listen}:{port}` 与前一个入站冲突 \
+                                 (启动时会 bind 失败: address already in use)"
+                            ),
+                            format!(
+                                "inbound `{tag}` listening on `{proto} {listen}:{port}` conflicts with an earlier inbound \
+                                 (startup will fail to bind: address already in use)"
+                            ),
                         ));
                     }
                     in_binds.push((proto, listen, port));
@@ -2462,50 +2730,83 @@ fn check_group_unknown_fields(
             }
             if let InboundConfig::Shadowsocks { tag, method, password, .. } = ib {
                 if password.is_empty() {
-                    issues.push(format!("shadowsocks 入站 `{tag}` 的 password 为空"));
+                    issues.push(Issue::new(
+                        format!("shadowsocks 入站 `{tag}` 的 password 为空"),
+                        format!("shadowsocks inbound `{tag}` password is empty"),
+                    ));
                 }
                 match crate::proxy::shadowsocks::Method::parse(method) {
-                    Ok(m) if m.is_2022() => issues.push(format!(
-                        "shadowsocks 入站 `{tag}` 的 method `{method}` 是 SIP022, 入站暂不支持 \
-                         (仅 SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305)"
+                    Ok(m) if m.is_2022() => issues.push(Issue::new(
+                        format!(
+                            "shadowsocks 入站 `{tag}` 的 method `{method}` 是 SIP022, 入站暂不支持 \
+                             (仅 SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305)"
+                        ),
+                        format!(
+                            "shadowsocks inbound `{tag}` method `{method}` is SIP022, inbound does not support it yet \
+                             (only SIP004: aes-128-gcm / aes-256-gcm / chacha20-ietf-poly1305)"
+                        ),
                     )),
                     Ok(_) => {}
-                    Err(e) => issues.push(format!("shadowsocks 入站 `{tag}` 的 method 非法: {e}")),
+                    Err(e) => issues.push(Issue::new(
+                        format!("shadowsocks 入站 `{tag}` 的 method 非法: {e}"),
+                        format!("shadowsocks inbound `{tag}` method is invalid: {e}"),
+                    )),
                 }
             }
             if let InboundConfig::MirageServer { tag, password, users, upstream, transport, auth_ts_tolerance_secs, .. } = ib {
                 if password.is_empty() {
-                    issues.push(format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"));
+                    issues.push(Issue::new(
+                        format!("mirage_server 入站 `{tag}` 的 password 为空 (任何人都能连)"),
+                        format!("mirage_server inbound `{tag}` password is empty (anyone can connect)"),
+                    ));
                 }
                 for u in users {
                     if let Some(kbps) = u.rate_limit_kbps {
                         if kbps == 0 {
-                            issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` rate_limit_kbps 必须大于 0", u.name));
+                            issues.push(Issue::new(
+                                format!("mirage_server 入站 `{tag}` 的 user `{}` rate_limit_kbps 必须大于 0", u.name),
+                                format!("mirage_server inbound `{tag}` user `{}` rate_limit_kbps must be greater than 0", u.name),
+                            ));
                         }
                     }
                     if let Some(quota) = u.quota_gb {
                         if !quota.is_finite() || quota <= 0.0 {
-                            issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` quota_gb 必须为有效正数 (>0)", u.name));
+                            issues.push(Issue::new(
+                                format!("mirage_server 入站 `{tag}` 的 user `{}` quota_gb 必须为有效正数 (>0)", u.name),
+                                format!("mirage_server inbound `{tag}` user `{}` quota_gb must be a positive number (>0)", u.name),
+                            ));
                         }
                     }
                     if let Some(day) = u.quota_reset_day {
                         if !(1..=28).contains(&day) {
-                            issues.push(format!("mirage_server 入站 `{tag}` 的 user `{}` quota_reset_day 必须在 1..=28 范围内", u.name));
+                            issues.push(Issue::new(
+                                format!("mirage_server 入站 `{tag}` 的 user `{}` quota_reset_day 必须在 1..=28 范围内", u.name),
+                                format!("mirage_server inbound `{tag}` user `{}` quota_reset_day must be within 1..=28", u.name),
+                            ));
                         }
                     }
                 }
                 // 容忍窗口直接推导 replay 去重桶数, 极大值会放大内存。3600s (1h) 已远超时钟漂移
                 // 与 TIME_SYNC bootstrap 所需, 上不封顶等于给配置错留个内存放大口。
                 if *auth_ts_tolerance_secs > 3600 {
-                    issues.push(format!("mirage_server 入站 `{tag}` 的 auth_ts_tolerance_secs={auth_ts_tolerance_secs} 过大 (上限 3600s; 越大 replay 去重桶越占内存)"));
+                    issues.push(Issue::new(
+                        format!("mirage_server 入站 `{tag}` 的 auth_ts_tolerance_secs={auth_ts_tolerance_secs} 过大 (上限 3600s; 越大 replay 去重桶越占内存)"),
+                        format!("mirage_server inbound `{tag}` auth_ts_tolerance_secs={auth_ts_tolerance_secs} is too large (max 3600s; larger window consumes more replay cache memory)"),
+                    ));
                 }
                 #[cfg(not(feature = "quic"))]
                 if *transport == Transport::Quic {
-                    issues.push(format!("mirage_server 入站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"));
+                    issues.push(Issue::new(
+                        format!("mirage_server 入站 `{tag}` 配了 transport=quic, 但本二进制未以 `--features quic` 编译"),
+                        format!("mirage_server inbound `{tag}` configured transport=quic, but this binary was compiled without `--features quic`"),
+                    ));
                 }
                 // Model X 精简路 (quic) 只支持直连出口; 配了 SS/WG 上游会被拒 → check 阶段就提示。
                 if *transport == Transport::Quic && upstream.is_some() {
-                    issues.push(format!("mirage_server 入站 `{tag}` transport=quic 暂不支持 upstream 中继 (SS/WG); 用 transport=tcp 或去掉 upstream"));
+                    issues.push(Issue::new(
+                        format!("mirage_server 入站 `{tag}` transport=quic 暂不支持 upstream 中继 (SS/WG); 用 transport=tcp 或去掉 upstream"),
+                        format!("mirage_server inbound `{tag}` transport=quic does not support upstream relay (SS/WG) yet; use transport=tcp or remove upstream"),
+                    ));
                 }
                 // 上游出口配错会让服务端**拒绝启动**, 必须在 check 阶段就拦住 ——
                 // 否则 `check && systemctl restart` 这个闸门对这条路径形同虚设。
@@ -2515,8 +2816,13 @@ fn check_group_unknown_fields(
                 {
                     if let Some(d) = dns {
                         if d.parse::<std::net::IpAddr>().is_err() {
-                            issues.push(format!(
-                                "mirage_server 入站 `{tag}` 的 upstream.dns `{d}` 不是合法 IP (隧道内 DNS 地址)"
+                            issues.push(Issue::new(
+                                format!(
+                                    "mirage_server 入站 `{tag}` 的 upstream.dns `{d}` 不是合法 IP (隧道内 DNS 地址)"
+                                ),
+                                format!(
+                                    "mirage_server inbound `{tag}` upstream.dns `{d}` is not a valid IP (in-tunnel DNS address)"
+                                ),
                             ));
                         }
                     }
@@ -2525,33 +2831,58 @@ fn check_group_unknown_fields(
                         (peer_public_key, "peer_public_key"),
                     ] {
                         if let Err(e) = crate::proxy::wg::decode_wg_key(val, what) {
-                            issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                            issues.push(Issue::new(
+                                format!("mirage_server 入站 `{tag}` 的 upstream: {e}"),
+                                format!("mirage_server inbound `{tag}` upstream: {e}"),
+                            ));
                         }
                     }
                     if let Some(psk) = preshared_key {
                         if let Err(e) = crate::proxy::wg::decode_wg_key(psk, "preshared_key") {
-                            issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                            issues.push(Issue::new(
+                                format!("mirage_server 入站 `{tag}` 的 upstream: {e}"),
+                                format!("mirage_server inbound `{tag}` upstream: {e}"),
+                            ));
                         }
                     }
                     if address.parse::<std::net::IpAddr>().is_err() {
-                        issues.push(format!(
-                            "mirage_server 入站 `{tag}` 的 upstream.address `{address}` 不是合法 IP (不带掩码)"
+                        issues.push(Issue::new(
+                            format!(
+                                "mirage_server 入站 `{tag}` 的 upstream.address `{address}` 不是合法 IP (不带掩码)"
+                            ),
+                            format!(
+                                "mirage_server inbound `{tag}` upstream.address `{address}` is not a valid IP (without subnet mask)"
+                            ),
                         ));
                     }
                     if endpoint.rsplit(':').next().is_none_or(|p| p.parse::<u16>().is_err()) {
-                        issues.push(format!(
-                            "mirage_server 入站 `{tag}` 的 upstream.endpoint `{endpoint}` 缺少端口"
+                        issues.push(Issue::new(
+                            format!(
+                                "mirage_server 入站 `{tag}` 的 upstream.endpoint `{endpoint}` 缺少端口"
+                            ),
+                            format!(
+                                "mirage_server inbound `{tag}` upstream.endpoint `{endpoint}` is missing port"
+                            ),
                         ));
                     }
                     if *mtu == 0 || *mtu > 65503 {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.mtu {mtu} 非法"));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 upstream.mtu {mtu} 非法"),
+                            format!("mirage_server inbound `{tag}` upstream.mtu {mtu} is invalid"),
+                        ));
                     }
                 }
                 if let Some(UpstreamConfig::Shadowsocks { udp, .. }) = upstream {
                     if matches!(udp, UdpPolicy::Tunnel) {
-                        issues.push(format!(
-                            "mirage_server 入站 `{tag}` 的 upstream.udp 不能是 `tunnel`: \
-                             SS 的 UDP 是另一套包格式, 尚未实现。用 `block`(默认) 或 `direct`。"
+                        issues.push(Issue::new(
+                            format!(
+                                "mirage_server 入站 `{tag}` 的 upstream.udp 不能是 `tunnel`: \
+                                 SS 的 UDP 是另一套包格式, 尚未实现。用 `block`(默认) 或 `direct`。"
+                            ),
+                            format!(
+                                "mirage_server inbound `{tag}` upstream.udp cannot be `tunnel`: \
+                                 SS UDP packet format is not implemented yet. Use `block` (default) or `direct`."
+                            ),
                         ));
                     }
                 }
@@ -2560,7 +2891,10 @@ fn check_group_unknown_fields(
                 }) = upstream
                 {
                     match crate::proxy::shadowsocks::Method::parse(method) {
-                        Err(e) => issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}")),
+                        Err(e) => issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 upstream: {e}"),
+                            format!("mirage_server inbound `{tag}` upstream: {e}"),
+                        )),
                         Ok(m) if m.is_2022() => {
                             // SIP022 的 password 是 base64 密钥且长度固定。写错不会让服务端
                             // 起不来, 而是**每条连接都静默失败** —— 服务看着健康却什么都代理
@@ -2568,19 +2902,31 @@ fn check_group_unknown_fields(
                             if let Err(e) =
                                 crate::proxy::shadowsocks::decode_ss2022_psk(ss_pw, m.key_len())
                             {
-                                issues.push(format!("mirage_server 入站 `{tag}` 的 upstream: {e}"));
+                                issues.push(Issue::new(
+                                    format!("mirage_server 入站 `{tag}` 的 upstream: {e}"),
+                                    format!("mirage_server inbound `{tag}` upstream: {e}"),
+                                ));
                             }
                         }
                         Ok(_) => {}
                     }
                     if server.trim().is_empty() {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.server 为空"));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 upstream.server 为空"),
+                            format!("mirage_server inbound `{tag}` upstream.server is empty"),
+                        ));
                     }
                     if *server_port == 0 {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.server_port 为 0"));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 upstream.server_port 为 0"),
+                            format!("mirage_server inbound `{tag}` upstream.server_port is 0"),
+                        ));
                     }
                     if ss_pw.is_empty() {
-                        issues.push(format!("mirage_server 入站 `{tag}` 的 upstream.password 为空"));
+                        issues.push(Issue::new(
+                            format!("mirage_server 入站 `{tag}` 的 upstream.password 为空"),
+                            format!("mirage_server inbound `{tag}` upstream.password is empty"),
+                        ));
                     }
                 }
             }
@@ -2601,9 +2947,15 @@ fn check_group_unknown_fields(
                             _ => true,
                         };
                         if diff_kbps || diff_reset || diff_quota {
-                            issues.push(format!(
-                                "mirage_server 入站 `{tag}` 的 user `{}` 限额配置与入站 `{prev_tag}` 不一致 (全局注册表以先出现者为准, 后续配置被忽略)",
-                                u.name
+                            issues.push(Issue::new(
+                                format!(
+                                    "mirage_server 入站 `{tag}` 的 user `{}` 限额配置与入站 `{prev_tag}` 不一致 (全局注册表以先出现者为准, 后续配置被忽略)",
+                                    u.name
+                                ),
+                                format!(
+                                    "mirage_server inbound `{tag}` user `{}` quota config is inconsistent with inbound `{prev_tag}` (global registry uses first occurrence, subsequent config ignored)",
+                                    u.name
+                                ),
                             ));
                         }
                     } else {
@@ -2621,9 +2973,15 @@ fn check_group_unknown_fields(
                 if r.tag == "direct" || r.tag == "cn" {
                     let (raw, _) = strip_dns_scheme(&r.address);
                     if parse_dns_upstream(raw).is_none() {
-                        issues.push(format!(
-                            "advanced_dns.resolvers: 直连上游 `{}` 的 address `{}` 解析不出 IP (需 ip / ip:port, 可带 tcp://|udp:// 前缀) —— 运行时会被静默跳过并回落公共 DNS",
-                            r.tag, r.address
+                        issues.push(Issue::new(
+                            format!(
+                                "advanced_dns.resolvers: 直连上游 `{}` 的 address `{}` 解析不出 IP (需 ip / ip:port, 可带 tcp://|udp:// 前缀) —— 运行时会被静默跳过并回落公共 DNS",
+                                r.tag, r.address
+                            ),
+                            format!(
+                                "advanced_dns.resolvers: direct upstream `{}` address `{}` cannot be resolved to IP (requires ip or ip:port, optional tcp:// or udp:// prefix) - will be silently skipped and fall back to public DNS at runtime",
+                                r.tag, r.address
+                            ),
                         ));
                     }
                 }
@@ -2634,69 +2992,129 @@ fn check_group_unknown_fields(
         if let Some(t) = self.tuning.as_ref() {
             if let Some(n) = t.max_connections {
                 if n > 0 && n < 16 {
-                    issues.push(format!(
-                        "tuning.max_connections={n} 过小 (<16): 正常浏览器就有 6~8 条并发, 会被大量误拒"
+                    issues.push(Issue::new(
+                        format!(
+                            "tuning.max_connections={n} 过小 (<16): 正常浏览器就有 6~8 条并发, 会被大量误拒"
+                        ),
+                        format!(
+                            "tuning.max_connections={n} is too small (<16): a normal browser opens 6~8 concurrent streams and will be falsely rejected"
+                        ),
                     ));
                 }
                 if n > 1_000_000 {
-                    issues.push(format!("tuning.max_connections={n} 过大 (>1e6): 上限失去意义"));
+                    issues.push(Issue::new(
+                        format!("tuning.max_connections={n} 过大 (>1e6): 上限失去意义"),
+                        format!("tuning.max_connections={n} is too large (>1e6): limit becomes meaningless"),
+                    ));
                 }
             }
             for s in &t.geo_sources {
                 if !geo_source_name_ok(&s.name) {
-                    issues.push(format!(
-                        "tuning.geo_sources.name `{}` 非法: 不得为空、含路径分隔符或 \"..\" (会写出 geodata_dir 之外)",
-                        s.name
+                    issues.push(Issue::new(
+                        format!(
+                            "tuning.geo_sources.name `{}` 非法: 不得为空、含路径分隔符或 \"..\" (会写出 geodata_dir 之外)",
+                            s.name
+                        ),
+                        format!(
+                            "tuning.geo_sources.name `{}` is invalid: must not be empty or contain path separators or \"..\" (could escape geodata_dir)",
+                            s.name
+                        ),
                     ));
                 }
             }
         }
         if let Some(q) = self.tuning.as_ref().and_then(|t| t.client_hello_guard.as_ref()) {
             if q.preconnect_mult == 0 {
-                issues.push("tuning.client_hello_guard.preconnect_mult 不能为 0 (触发 = mult × RTT)".to_string());
+                issues.push(Issue::new(
+                    "tuning.client_hello_guard.preconnect_mult 不能为 0 (触发 = mult × RTT)".to_string(),
+                    "tuning.client_hello_guard.preconnect_mult cannot be 0 (trigger = mult * RTT)".to_string(),
+                ));
             }
             if q.preconnect_min_ms == 0 || q.preconnect_min_ms > q.preconnect_max_ms {
-                issues.push(format!(
-                    "tuning.client_hello_guard 的 preconnect_min_ms={} / preconnect_max_ms={} 非法 (需 0 < min <= max)",
-                    q.preconnect_min_ms, q.preconnect_max_ms
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard 的 preconnect_min_ms={} / preconnect_max_ms={} 非法 (需 0 < min <= max)",
+                        q.preconnect_min_ms, q.preconnect_max_ms
+                    ),
+                    format!(
+                        "tuning.client_hello_guard preconnect_min_ms={} / preconnect_max_ms={} invalid (requires 0 < min <= max)",
+                        q.preconnect_min_ms, q.preconnect_max_ms
+                    ),
                 ));
             }
             if q.preconnect_max_ms > 5_000 {
-                issues.push(format!(
-                    "tuning.client_hello_guard.preconnect_max_ms={} 过大 (>5000): 探测偏差会随之放大",
-                    q.preconnect_max_ms
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard.preconnect_max_ms={} 过大 (>5000): 探测偏差会随之放大",
+                        q.preconnect_max_ms
+                    ),
+                    format!(
+                        "tuning.client_hello_guard.preconnect_max_ms={} is too large (>5000): probe variance will be amplified",
+                        q.preconnect_max_ms
+                    ),
                 ));
             }
             if q.judge_silence_ms < 200 {
-                issues.push(format!(
-                    "tuning.client_hello_guard.judge_silence_ms={} 过小 (<200ms): 小于 TCP 最小 RTO, \
-                     丢包重传的合法客户端会被判成探测 (静默窗口不必再为对齐让步, 建议 >=1000)",
-                    q.judge_silence_ms
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard.judge_silence_ms={} 过小 (<200ms): 小于 TCP 最小 RTO, \
+                         丢包重传的合法客户端会被判成探测 (静默窗口不必再为对齐让步, 建议 >=1000)",
+                        q.judge_silence_ms
+                    ),
+                    format!(
+                        "tuning.client_hello_guard.judge_silence_ms={} is too small (<200ms): smaller than TCP min RTO, \
+                         legitimate clients retransmitting will be judged as probes (recommend >=1000)",
+                        q.judge_silence_ms
+                    ),
                 ));
             }
             if q.hard_deadline_ms < q.judge_silence_ms {
-                issues.push(format!(
-                    "tuning.client_hello_guard 的 hard_deadline_ms={} < judge_silence_ms={} (总时限不能短于静默期限)",
-                    q.hard_deadline_ms, q.judge_silence_ms
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard 的 hard_deadline_ms={} < judge_silence_ms={} (总时限不能短于静默期限)",
+                        q.hard_deadline_ms, q.judge_silence_ms
+                    ),
+                    format!(
+                        "tuning.client_hello_guard hard_deadline_ms={} < judge_silence_ms={} (total deadline cannot be shorter than silence window)",
+                        q.hard_deadline_ms, q.judge_silence_ms
+                    ),
                 ));
             }
             if q.hard_deadline_ms > 60_000 {
-                issues.push(format!(
-                    "tuning.client_hello_guard.hard_deadline_ms={} 过大 (>60000): 未认证连接可被拖很久",
-                    q.hard_deadline_ms
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard.hard_deadline_ms={} 过大 (>60000): 未认证连接可被拖很久",
+                        q.hard_deadline_ms
+                    ),
+                    format!(
+                        "tuning.client_hello_guard.hard_deadline_ms={} is too large (>60000): unauthenticated connections can hang for too long",
+                        q.hard_deadline_ms
+                    ),
                 ));
             }
             // auth-succ 时序注入: 倍率 0 或过大都无意义; 偏置过大则每条合法握手都被拖慢。
             if q.auth_succ_mult_x10 == 0 || q.auth_succ_mult_x10 > 100 {
-                issues.push(format!(
-                    "tuning.client_hello_guard.auth_succ_mult_x10={} 非法 (需 1..=100, 即 0.1×~10× cam_RTT)",
-                    q.auth_succ_mult_x10
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard.auth_succ_mult_x10={} 非法 (需 1..=100, 即 0.1×~10× cam_RTT)",
+                        q.auth_succ_mult_x10
+                    ),
+                    format!(
+                        "tuning.client_hello_guard.auth_succ_mult_x10={} invalid (requires 1..=100, i.e. 0.1x~10x cam_RTT)",
+                        q.auth_succ_mult_x10
+                    ),
                 ));
             }
             if q.auth_succ_offset_ms > 2_000 {
-                issues.push(format!(
-                    "tuning.client_hello_guard.auth_succ_offset_ms={} 过大 (>2000): 每条合法握手都会被拖慢",
-                    q.auth_succ_offset_ms
+                issues.push(Issue::new(
+                    format!(
+                        "tuning.client_hello_guard.auth_succ_offset_ms={} 过大 (>2000): 每条合法握手都会被拖慢",
+                        q.auth_succ_offset_ms
+                    ),
+                    format!(
+                        "tuning.client_hello_guard.auth_succ_offset_ms={} is too large (>2000): every legitimate handshake will be delayed",
+                        q.auth_succ_offset_ms
+                    ),
                 ));
             }
         }
@@ -2865,7 +3283,7 @@ mod tests {
 
 #[cfg(test)]
 mod validation_tests {
-    use super::{Config, InboundConfig, OutboundConfig, RuleConfig};
+    use super::{Config, InboundConfig, OutboundConfig, RuleConfig, Issue};
 
     /// 一份最小可用配置; 各用例在其上做局部破坏。
     fn base() -> serde_json::Value {
@@ -2882,12 +3300,12 @@ mod validation_tests {
         })
     }
 
-    fn issues_of(v: &serde_json::Value) -> Vec<String> {
+    fn issues_of(v: &serde_json::Value) -> Vec<Issue> {
         let (_, issues) = Config::parse_with_diagnostics(&v.to_string()).expect("应能解析");
         issues
     }
 
-    fn has(issues: &[String], needle: &str) -> bool {
+    fn has(issues: &[Issue], needle: &str) -> bool {
         issues.iter().any(|i| i.contains(needle))
     }
 
@@ -4443,5 +4861,194 @@ mod secret_debug_tests {
             !normal_issues.iter().any(|i| i.contains("outbound") || i.contains("未知字段")),
             "正常组不应报错: {normal_issues:?}"
         );
+    }
+
+    #[test]
+    fn test_bilingual_diagnostics() {
+        // 1. 未知字段双语检查 (en 纯 ASCII, 包含字段名)
+        let unknown_field_cfg = r#"{
+            "unknown_foo": 123,
+            "inbounds": [],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        }"#;
+        let (_, issues) = Config::parse_with_diagnostics(unknown_field_cfg).unwrap();
+        let unk = issues.iter().find(|i| i.zh.contains("unknown_foo")).expect("应捕获未知字段");
+        assert!(unk.zh.contains("未知字段 `unknown_foo`"));
+        assert!(unk.en.contains("unknown field `unknown_foo` (misspelled? ignored, will not take effect)"));
+        assert!(unk.en.is_ascii(), "en 必须是纯 ASCII: {}", unk.en);
+
+        // 2. 出站组 typo 字段提示双语检查
+        let typo_cfg = serde_json::json!({
+            "outbounds": [
+                {
+                    "type": "urltest",
+                    "tag": "auto",
+                    "outbound": ["direct"]
+                },
+                { "type": "direct", "tag": "direct" }
+            ],
+            "routing": { "default_outbound": "auto", "rules": [] }
+        });
+        let (_, issues) = Config::parse_with_diagnostics(&typo_cfg.to_string()).unwrap();
+        let typo_iss = issues.iter().find(|i| i.zh.contains("outbound")).expect("应捕获组未知字段");
+        assert!(typo_iss.zh.contains("发现未知字段 `outbound` (是否想写 `outbounds`?)"));
+        assert!(typo_iss.en.contains("unknown field `outbound` found (did you mean `outbounds`?)"));
+        assert!(typo_iss.en.is_ascii(), "en 必须是纯 ASCII: {}", typo_iss.en);
+
+        // 3. 弱口令提示双语检查
+        let srv_cfg: Config = serde_json::from_value(serde_json::json!({
+            "inbounds": [{
+                "type": "mirage_server",
+                "tag": "srv",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "short"
+            }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        })).unwrap();
+        let weak_warnings = srv_cfg.weak_password_warnings();
+        assert_eq!(weak_warnings.len(), 1);
+        assert!(weak_warnings[0].zh.contains("少于 16 个字符"));
+        assert!(weak_warnings[0].en.contains("shorter than 16 characters"));
+        assert!(weak_warnings[0].en.contains("offline cracking"));
+        assert!(weak_warnings[0].en.is_ascii(), "en 必须是纯 ASCII: {}", weak_warnings[0].en);
+
+        // 4. 重复口令硬错误双语检查
+        let dup_cfg: Config = serde_json::from_value(serde_json::json!({
+            "inbounds": [{
+                "type": "mirage_server",
+                "tag": "srv",
+                "listen": "0.0.0.0",
+                "port": 443,
+                "password": "samepassword123456",
+                "users": [{ "name": "alice", "password": "samepassword123456" }]
+            }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        })).unwrap();
+        let hard_errs = dup_cfg.user_hard_errors();
+        assert_eq!(hard_errs.len(), 1);
+        assert!(hard_errs[0].zh.contains("password 与 `default` 重复"));
+        assert!(hard_errs[0].en.contains("password duplicates `default`"));
+        assert!(hard_errs[0].en.contains("authentication crosstalk"));
+        assert!(hard_errs[0].en.is_ascii(), "en 必须是纯 ASCII: {}", hard_errs[0].en);
+
+        // 5. 循环引用双语检查
+        let cycle_cfg = r#"{
+            "inbounds": [],
+            "outbounds": [
+                {
+                    "type": "mirage",
+                    "tag": "node-a",
+                    "server": "203.0.113.20",
+                    "server_port": 443,
+                    "password": "pass",
+                    "camouflage_host": "example.com",
+                    "underlying": "grp-a"
+                },
+                {
+                    "type": "urltest",
+                    "tag": "grp-a",
+                    "outbounds": ["node-a"]
+                }
+            ],
+            "routing": { "default_outbound": "grp-a", "rules": [] }
+        }"#;
+        let (_, cycle_issues) = Config::parse_with_diagnostics(cycle_cfg).unwrap();
+        let cyc = cycle_issues.iter().find(|i| i.zh.contains("循环引用")).expect("应检测出环");
+        assert!(cyc.zh.contains("node-a → grp-a → node-a"));
+        assert!(cyc.en.contains("cyclic reference found in outbounds: node-a -> grp-a -> node-a"));
+        assert!(cyc.en.is_ascii(), "en 必须是纯 ASCII: {}", cyc.en);
+
+        // 6. Issue trait 行为验证: Display 与 Deref 为 zh, JSON 序列化为中文字符串
+        let test_issue = Issue::new("中文提示", "english hint");
+        assert_eq!(test_issue.to_string(), "中文提示");
+        assert_eq!(&*test_issue, "中文提示");
+        assert!(test_issue.contains("中文"));
+        let json_val = serde_json::to_value(&test_issue).unwrap();
+        assert_eq!(json_val, serde_json::json!("中文提示"));
+
+        // 7. 静态校验: 校验本文件源码中所有 Issue::new 的第二个参数 (en) 均为纯 ASCII
+        let src_code = include_str!("config.rs");
+        let mut idx = 0;
+        let mut count = 0;
+        while let Some(pos) = src_code[idx..].find("Issue::new(") {
+            let start = idx + pos + "Issue::new(".len();
+            let mut depth = 0;
+            let mut in_quote = false;
+            let mut escape = false;
+            let mut end = None;
+            for (i, ch) in src_code[start..].char_indices() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escape = true;
+                    continue;
+                }
+                if ch == '"' {
+                    in_quote = !in_quote;
+                    continue;
+                }
+                if !in_quote {
+                    if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        if depth == 0 {
+                            end = Some(start + i);
+                            break;
+                        } else {
+                            depth -= 1;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = end {
+                let args = &src_code[start..e];
+                let mut d = 0;
+                let mut q = false;
+                let mut esc = false;
+                let mut comma = None;
+                for (i, ch) in args.char_indices() {
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    if ch == '\\' {
+                        esc = true;
+                        continue;
+                    }
+                    if ch == '"' {
+                        q = !q;
+                        continue;
+                    }
+                    if !q {
+                        if ch == '(' {
+                            d += 1;
+                        } else if ch == ')' {
+                            d -= 1;
+                        } else if ch == ',' && d == 0 {
+                            comma = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(c) = comma {
+                    let en_arg = args[c + 1..].trim();
+                    assert!(
+                        en_arg.is_ascii(),
+                        "Issue::new 的 en 参数必须纯 ASCII: {en_arg}"
+                    );
+                    count += 1;
+                }
+                idx = e + 1;
+            } else {
+                break;
+            }
+        }
+        assert!(count >= 80, "应检测到至少 80 处 Issue::new, 实际: {count}");
     }
 }

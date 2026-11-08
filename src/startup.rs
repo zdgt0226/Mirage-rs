@@ -134,9 +134,9 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
                 warn!("configuration validation found {} issue(s) (does not block startup, but likely not what you intended):", issues.len());
                 for issue in &issues {
                     if issue.contains("password 与") {
-                        error!("  - {}", issue);
+                        error!("  - {}", issue.en);
                     } else {
-                        warn!("  - {}", issue);
+                        warn!("  - {}", issue.en);
                     }
                 }
             }
@@ -146,10 +146,10 @@ pub(crate) async fn scan_runtime_config(config_path: &str) -> RuntimeScan {
 
         if let Ok(config) = serde_json::from_str::<crate::config::Config>(&content) {
             for w in config.weak_password_warnings() {
-                warn!("security warning: {w}");
+                warn!("security warning: {}", w.en);
             }
             for w in config.server_routing_warnings() {
-                warn!("configuration notice: {w}");
+                warn!("configuration notice: {}", w.en);
             }
             // ClientHello 计时/判定参数 (服务端; 见 docs/client-hello-timing-design.md)。
             // 环境变量 MIRAGE_CH_* 优先覆盖 (真机 A/B 调参)。放在 tuning 块外:
