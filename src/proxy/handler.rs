@@ -43,6 +43,14 @@ pub(crate) enum DownloadEndReason {
     LocalWriteErr, // 本地写失败
 }
 
+pub(crate) fn end_reason_for_unreachable(reason: u8) -> DownloadEndReason {
+    if reason == crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED {
+        DownloadEndReason::PeerError
+    } else {
+        DownloadEndReason::TargetUnreachable
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RealConnResult {
     Success,
@@ -440,6 +448,7 @@ pub async fn proxy_tcp_target(
                             Ok(Ok(n)) => {
                                 up_clock.touch();
                                 if AsyncWriteExt::write_all(&mut send, &buf[..n]).await.is_err() { break; }
+                                up_clock.touch();
                                 let _ = first_up.set(std::time::Instant::now());
                                 up_c.up(n as u64);
                             }
@@ -495,12 +504,18 @@ pub async fn proxy_tcp_target(
                                     end_reason = DownloadEndReason::LocalWriteErr;
                                     break;
                                 }
+                                dn_clock.touch();
                                 down_bytes += n as u64;
                                 dn_c.down(n as u64);
                             }
-                            Ok(Err(_)) => {
+                            Ok(Err(e)) => {
                                 truncated = true;
-                                end_reason = DownloadEndReason::PeerError;
+                                if crate::proxy::quic::is_quic_target_unreachable_err(&e) {
+                                    end_reason = DownloadEndReason::TargetUnreachable;
+                                    debug!("[QUIC] {} server reported target unreachable (reset 0x{:x})", target, crate::proxy::quic::QUIC_RESET_TARGET_UNREACHABLE);
+                                } else {
+                                    end_reason = DownloadEndReason::PeerError;
+                                }
                                 break;
                             }
                             Err(_) => {
@@ -578,6 +593,9 @@ pub async fn proxy_tcp_target(
                     return;
                 }
             };
+            if !initial_payload.is_empty() {
+                _conn.counter().up(initial_payload.len() as u64);
+            }
 
             let active_fd = tunnel.get_raw_fd();
 
@@ -652,6 +670,7 @@ pub async fn proxy_tcp_target(
                             if tunnel_writer.send_data(&buf[..total]).await.is_err() {
                                 break;
                             }
+                            up_clock.touch();
                             let _ = first_up.set(std::time::Instant::now());
                             up_bytes += total as u64;
                             up_conn.up(total as u64);
@@ -734,6 +753,7 @@ pub async fn proxy_tcp_target(
                                 end_reason = DownloadEndReason::LocalWriteErr;
                                 break;
                             }
+                            dn_clock.touch();
                             down_bytes += data.len() as u64;
                             dn_conn.down(data.len() as u64);
                         }
@@ -742,7 +762,7 @@ pub async fn proxy_tcp_target(
                                 end_reason = DownloadEndReason::CloseNotify;
                             } else if let Some(reason) = crate::crypto::aead::target_unreachable_reason(&e) {
                                 truncated = true;
-                                end_reason = DownloadEndReason::TargetUnreachable;
+                                end_reason = end_reason_for_unreachable(reason);
                                 debug!("server reported target unreachable {} (reason={})", target, reason);
                             } else {
                                 truncated = true;
@@ -770,8 +790,11 @@ pub async fn proxy_tcp_target(
                     while tunnel_reader.recv_data().await.is_ok() {}
                 }).await;
 
-                if truncated && !local_eof.load(std::sync::atomic::Ordering::SeqCst) {
-                    // 截断: 不能给本地 FIN (以 EOF 定界的明文协议会把残缺数据当完整结果), 改为 RST。
+                if (truncated && !local_eof.load(std::sync::atomic::Ordering::SeqCst))
+                    || end_reason == DownloadEndReason::TargetUnreachable
+                {
+                    // 截断或目标不可达: 不能给本地 FIN (以 EOF 定界的明文协议会把残缺数据当完整结果), 改为 RST。
+                    // 目标不可达时无论本地是否已先半关闭 (local_eof), 均必须无条件发 RST, 避免应用误当空响应。
                     // abort_socket 当场发 RST 并叫醒阻塞在 local_read 上的 upload, 避免 join! 挂到 relay_idle。
                     // forget(): 退回路径 (SO_LINGER=0 + SHUT_RD) 下 OwnedWriteHalf 的 drop 会先
                     // shutdown(Write) 发 FIN, 必须跳过, 等读半程 drop 时 fd 关闭才发 RST。
@@ -951,6 +974,7 @@ pub async fn proxy_tcp_target(
                     error!("[WG] {} failed to write initial payload: {}", target, e);
                     return;
                 }
+                _conn.counter().up(initial_payload.len() as u64);
             }
 
             // Direct 走 splice(2) 零拷贝, 但 WgTcpStream **不是真 fd** (数据在用户态 smoltcp
@@ -1205,5 +1229,44 @@ mod tests {
         // 收到首字节后, 真实成功应重置失败计数
         let stats = pool.stats.read().unwrap();
         assert_eq!(stats.real_failures, 0);
+    }
+
+    #[test]
+    fn test_end_reason_for_unreachable() {
+        use super::{end_reason_for_unreachable, DownloadEndReason};
+        use crate::crypto::aead::*;
+
+        assert_eq!(
+            end_reason_for_unreachable(TARGET_UNREACHABLE_UPSTREAM_FAILED),
+            DownloadEndReason::PeerError
+        );
+        assert_eq!(
+            end_reason_for_unreachable(TARGET_UNREACHABLE_CONNECT_FAILED),
+            DownloadEndReason::TargetUnreachable
+        );
+        assert_eq!(
+            end_reason_for_unreachable(TARGET_UNREACHABLE_EGRESS_BLOCKED),
+            DownloadEndReason::TargetUnreachable
+        );
+        assert_eq!(
+            end_reason_for_unreachable(TARGET_UNREACHABLE_ROUTING_REJECT),
+            DownloadEndReason::TargetUnreachable
+        );
+        assert_eq!(
+            end_reason_for_unreachable(0xff),
+            DownloadEndReason::TargetUnreachable
+        );
+    }
+
+    #[test]
+    fn test_upstream_failed_classified_as_failure() {
+        use super::{classify_real_conn, end_reason_for_unreachable, RealConnResult};
+        use crate::crypto::aead::TARGET_UNREACHABLE_UPSTREAM_FAILED;
+
+        let end_reason = end_reason_for_unreachable(TARGET_UNREACHABLE_UPSTREAM_FAILED);
+        assert_eq!(
+            classify_real_conn(0, end_reason, false),
+            RealConnResult::Failure
+        );
     }
 }
