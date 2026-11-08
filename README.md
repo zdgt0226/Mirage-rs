@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.9-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.10-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -384,7 +384,7 @@ mirage-rs config -c config.json
 - [x] **TCP relay 半关闭收尾超时 (v0.17.7, 参考 honk)**: WG / SS 出站与 SS 入站原无任何超时 (对端不关即永久泄漏), 现整体空闲超时同 `relay_idle` (默认 1800s), 一方向结束后传递 FIN, 剩余方向连续 30s 无字节进展即关, 有数据流动不受影响。
 - [x] **Mirage TCP 隧道半关闭收尾 30s (客户端, v0.17.9)**: 客户端 Mirage TCP relay 一方向结束后, 剩余方向连续 30s 无数据进展即关 (原要等 1800s); 有数据持续流动不受影响; 截断判定 / close_notify 语义不变。
 - [x] **QUIC 流半关闭收尾 30s (客户端与服务端, v0.17.9)**: 客户端 QUIC 流 relay 与服务端 `quic_pump` 一方向结束后, 剩余方向连续 30s 无数据进展即关 (原要等 1800s); QUIC 节点参与真实连接失败降级与首字节变慢补测。
-- [x] **服务端 tcp_relay 上游先 EOF 收尾 30s (未发布)**: 服务端上游先 EOF 后, 客户端方向若不关隧道 30s 无进展即断开 (原等满 1800s); close_notify 只在上游干净 EOF 时发, 截断与异常终止语义不变。
+- [x] **服务端 tcp_relay 上游先 EOF 收尾 30s (v0.17.10)**: 服务端上游先 EOF 后, 客户端方向若不关隧道 30s 无进展即断开 (原等满 1800s); close_notify 只在上游干净 EOF 时发, 截断与异常终止语义不变。
 
 ### 🚧 进行中 / 部分完成
 
@@ -427,6 +427,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.10** | 2026-11-08 | **无协议变更**: 服务端上游先结束后, 客户端 30s 不关隧道即断开 (原等 1800s, 主要照顾老客户端); 出站组成员全部判死时日志写明原因; 运行时日志与错误文本全部改为英文 (纯 ASCII), 避免非 UTF-8 环境乱码 (`check` 提示与 `config` 交互仍为中文)。 |
 | **v0.17.9** | 2026-11-07 | **无协议变更 (向后兼容)**: Mirage TCP 隧道与 QUIC 流一方向结束后, 剩余方向 30s 无数据即关 (原要等 1800s); QUIC 节点也参与真实连接失败降级与变慢补测; 服务端连目标失败时告知客户端, 不再把目标故障误记为节点故障 (老客户端不受影响); `outbounds` 键名写错有提示。 |
 | **v0.17.8** | 2026-11-05 | **无协议变更**: 审计修复: 罚分到期后失败计数清零; SS 入站真实流量算活动, 空闲恢复后 2s 间隔快速补测; SS 出站半关闭发 FIN; 真实连接首字节即记成功与判慢; `export` 保留仅含 `filter` 的组; rtt 测速受变慢下限约束; `check` 能查出 `filter` / 显式成员与 `underlying` 形成的循环引用; 命令行列表 / 删除 / 自动建组认 `filter` 成员。 |
 | **v0.17.7** | 2026-11-05 | **无协议变更**: 出站组新增 `filter` 正则, 按节点名自动加入成员 (可省略 `outbounds`); WG / SS 出站与 SS 入站 TCP 转发补上超时 (原对端不关即永久占用), 一方向结束后剩余方向 30s 无数据即关。 |

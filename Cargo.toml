@@ -1,6 +1,6 @@
 [package]
 name = "mirage-rs"
-version = "0.17.9"
+version = "0.17.10"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
