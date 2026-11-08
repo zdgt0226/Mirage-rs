@@ -1,6 +1,9 @@
 // Tests for src/proxy/sniff.rs (TLS SNI + HTTP Host extraction).
 // Uses a loopback TcpListener so sniff_first_kb can peek real bytes.
 
+mod common;
+
+use std::time::Duration;
 use mirage_rs::proxy::sniff::sniff_first_kb;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -168,41 +171,6 @@ async fn test_sniff_unknown_protocol_returns_none() {
 // 未命中 → default direct (echo 正常回显)。两者一眼可分, 不靠日志。
 
 use std::io::{Read as _, Write as _};
-use std::process::{Child, Command, Stdio};
-
-struct Kid(Child);
-impl Drop for Kid {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().unwrap();
-    p.pop();
-    p.pop();
-    p.push("mirage");
-    p
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn wait_port(port: u16) -> bool {
-    for _ in 0..50 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    false
-}
 
 /// echo 服务当"目标站点"。
 fn spawn_echo() -> u16 {
@@ -239,7 +207,8 @@ fn socks5_connect_bare_ip(proxy: u16, target_port: u16) -> std::io::Result<std::
 }
 
 /// 起一个只有 socks 入站的客户端; `blocked_suffix` 命中则走 block。
-fn spawn_proxy(socks_port: u16, blocked_suffix: &str) -> Kid {
+fn spawn_proxy(socks_port: u16, blocked_suffix: &str) -> (common::Kid, common::TempTestDir) {
+    let tmp = common::TempTestDir::new("sniff");
     let cfg = format!(
         r#"{{
           "log_level": "warn",
@@ -251,22 +220,17 @@ fn spawn_proxy(socks_port: u16, blocked_suffix: &str) -> Kid {
           }}
         }}"#
     );
-    let p = std::env::temp_dir().join(format!("mirage_sniff_{}.json", std::process::id()));
-    std::fs::write(&p, cfg).unwrap();
-    Kid(Command::new(bin())
-        .args(["client", "-c", p.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap())
+    let p = tmp.write_file("cfg.json", &cfg);
+    let kid = common::spawn_mirage("client", &p);
+    (kid, tmp)
 }
 
 #[test]
 fn bare_ip_target_is_routed_by_sniffed_sni() {
     let echo = spawn_echo();
-    let socks = free_port();
-    let _proxy = spawn_proxy(socks, "blocked.example");
-    assert!(wait_port(socks), "代理未起来");
+    let socks = common::free_ports(1)[0];
+    let (_proxy, _tmp) = spawn_proxy(socks, "blocked.example");
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", socks), Duration::from_secs(10)), "代理未起来");
 
     // ① SNI 命中 block 规则 —— 只有"嗅探生效"才可能命中 (SOCKS5 送的是裸 IP)
     let mut s = socks5_connect_bare_ip(socks, echo).expect("SOCKS5 建连失败");

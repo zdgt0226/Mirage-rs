@@ -5,6 +5,9 @@
 //! 2. 服务端热重载：运行时修改配置文件中的 `outbounds` 与 `routing`，新连接无缝应用新配置。
 //! 3. 模式二：`default_outbound: "ss-up"`，默认全部走落地上游，通过规则将指定端口拉回 direct 直连。
 
+mod common;
+
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -174,11 +177,6 @@ async fn spawn_ss_upstream(
     (port, rx)
 }
 
-async fn get_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 async fn socks5_connect(socks_port: u16, target: &str, port: u16, is_domain: bool) -> TcpStream {
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -224,13 +222,13 @@ async fn test_server_outbound_routing_and_hot_reload_e2e() {
 
     let echo_port = start_echo_server().await;
     let (ss_port, mut ss_rx) = spawn_ss_upstream(SS_PW, SS_DOWN).await;
-    let server_port = get_free_port().await;
-    let socks_port = get_free_port().await;
+    let ports = common::free_ports(2);
+    let server_port = ports[0];
+    let socks_port = ports[1];
 
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let server_cfg_path = dir.join(format!("mirage_srv_e2e_{}_{}.json", pid, server_port));
-    let client_cfg_path = dir.join(format!("mirage_cli_e2e_{}_{}.json", pid, socks_port));
+    let tmp = common::TempTestDir::new("routing_e2e");
+    let server_cfg_path = tmp.path().join("server.json");
+    let client_cfg_path = tmp.path().join("client.json");
 
     // ────────────────────────────────────────────────────────────────────────────
     // 阶段一：模式一配置 (default_outbound = "direct", rules 将 *.proxy.example 分流到 ss-up)
@@ -242,7 +240,7 @@ async fn test_server_outbound_routing_and_hot_reload_e2e() {
             "listen": "127.0.0.1",
             "port": server_port,
             "password": "srv-secret-pwd-16B",
-            "camouflage_host": "www.apple.com",
+            "camouflage_host": common::TEST_CAMOUFLAGE_HOST,
             "allow_local_targets": true
         }],
         "outbounds": [
@@ -284,7 +282,7 @@ async fn test_server_outbound_routing_and_hot_reload_e2e() {
             "server": "127.0.0.1",
             "server_port": server_port,
             "password": "srv-secret-pwd-16B",
-            "camouflage_host": "www.apple.com",
+            "camouflage_host": common::TEST_CAMOUFLAGE_HOST,
             "pool_size": 1
         }],
         "routing": {
@@ -307,8 +305,14 @@ async fn test_server_outbound_routing_and_hot_reload_e2e() {
         let _ = mirage_rs::start_proxy(&cli_path_str, false).await;
     });
 
-    // 等待服务端与客户端完成初始化与连接池就绪
-    tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+    assert!(
+        common::wait_tcp_ready_async(&format!("127.0.0.1:{}", server_port), Duration::from_secs(10)).await,
+        "Mirage server listening timed out"
+    );
+    assert!(
+        common::wait_tcp_ready_async(&format!("127.0.0.1:{}", socks_port), Duration::from_secs(10)).await,
+        "SOCKS client listening timed out"
+    );
 
     // 1.1 模式一未命中规则：走 direct 直连本地 echo 服务器
     {
@@ -364,7 +368,7 @@ async fn test_server_outbound_routing_and_hot_reload_e2e() {
             "listen": "127.0.0.1",
             "port": server_port,
             "password": "srv-secret-pwd-16B",
-            "camouflage_host": "www.apple.com",
+            "camouflage_host": common::TEST_CAMOUFLAGE_HOST,
             "allow_local_targets": true
         }],
         "outbounds": [
@@ -432,8 +436,4 @@ async fn test_server_outbound_routing_and_hot_reload_e2e() {
         assert_eq!(ss_target, "other.example:9999");
         assert_eq!(ss_payload, msg);
     }
-
-    // 清理临时配置文件
-    let _ = std::fs::remove_file(&server_cfg_path);
-    let _ = std::fs::remove_file(&client_cfg_path);
 }

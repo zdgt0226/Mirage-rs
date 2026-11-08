@@ -9,6 +9,9 @@
 //! 为什么要独立实现服务端: 用被测代码自己解自己, 双方以同样的方式错依然会"通过"。
 //! 这里的解密逻辑照着协议另写一遍, 才能真正证明互通。
 
+mod common;
+
+use std::time::Duration;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -187,31 +190,43 @@ async fn wrong_password_cannot_decrypt_downlink() {
 
 // ── UDP 策略 (方案 A: 配了上游默认阻断 UDP) ────────────────────────────────
 
-/// 起一个轻量服务端 + 轻量客户端, 返回 (客户端 SOCKS5 端口, 两个进程守卫)。
+/// 起一个轻量服务端 + 轻量客户端, 返回 (两个进程守卫, 临时目录守卫)。
 /// `udp_field` 直接拼进 upstream, 用于切换策略。
-fn spawn_pair(sport: u16, cport: u16, udp_field: &str) -> (std::process::Child, std::process::Child) {
-    use std::process::{Command, Stdio};
-    let bin = {
-        let mut p = std::env::current_exe().unwrap();
-        p.pop(); p.pop(); p.push("mirage"); p
-    };
-    let dir = std::env::temp_dir();
-    let scfg = dir.join(format!("ss_udp_srv_{}_{}.json", std::process::id(), sport));
-    let ccfg = dir.join(format!("ss_udp_cli_{}_{}.json", std::process::id(), cport));
-    std::fs::write(&scfg, format!(
-        r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw","sni":"www.apple.com","log_level":"warn",
-            "upstream":{{"type":"shadowsocks","server":"127.0.0.1","server_port":19699,
-                         "password":"x","method":"aes-256-gcm"{udp_field}}}}}"#)).unwrap();
-    std::fs::write(&ccfg, format!(
-        r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},
-            "password":"pw","sni":"www.apple.com","pool_size":1,"log_level":"warn"}}"#)).unwrap();
-    let s = Command::new(&bin).args(["lite-server","-c",scfg.to_str().unwrap()])
-        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(600));
-    let c = Command::new(&bin).args(["lite-client","-c",ccfg.to_str().unwrap()])
-        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-    (s, c)
+fn spawn_pair(
+    sport: u16,
+    cport: u16,
+    ss_port: u16,
+    udp_field: &str,
+) -> (common::Kid, common::Kid, common::TempTestDir) {
+    let tmp = common::TempTestDir::new("ss_upstream");
+    let scfg = tmp.write_file(
+        "srv.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw","sni":"{sni}","log_level":"warn",
+            "upstream":{{"type":"shadowsocks","server":"127.0.0.1","server_port":{ss_port},
+                         "password":"x","method":"aes-256-gcm"{udp_field}}}}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
+        ),
+    );
+    let ccfg = tmp.write_file(
+        "cli.json",
+        &format!(
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},
+            "password":"pw","sni":"{sni}","pool_size":1,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
+        ),
+    );
+    let s = common::spawn_mirage("lite-server", &scfg);
+    assert!(
+        common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)),
+        "lite-server未在{sport}监听"
+    );
+    let c = common::spawn_mirage("lite-client", &ccfg);
+    assert!(
+        common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)),
+        "lite-client未在{cport}监听"
+    );
+    (s, c, tmp)
 }
 
 /// 轻量客户端本就拒绝 UDP, 所以这里直接验证**服务端**的分派行为:
@@ -219,12 +234,12 @@ fn spawn_pair(sport: u16, cport: u16, udp_field: &str) -> (std::process::Child, 
 /// 真正的阻断行为由下面的"服务端仍能正常提供 TCP"间接佐证(阻断不应波及 TCP)。
 #[tokio::test]
 async fn udp_block_does_not_break_tcp() {
-    let (mut s, mut c) = spawn_pair(19611, 19612, "");
+    let ports = common::free_ports(3);
+    let (sport, cport, ss_port) = (ports[0], ports[1], ports[2]);
+    let (_s, _c, _tmp) = spawn_pair(sport, cport, ss_port, "");
     // 配了上游(指向一个不存在的 SS 端口)时 TCP 会连不通, 但服务端本身必须仍在监听 ——
     // 即"阻断 UDP"这个改动不能把 TCP 路径也带崩。
-    let alive = std::net::TcpStream::connect(("127.0.0.1", 19611u16)).is_ok();
-    let _ = s.kill(); let _ = c.kill();
-    let _ = s.wait(); let _ = c.wait();
+    let alive = std::net::TcpStream::connect(("127.0.0.1", sport)).is_ok();
     assert!(alive, "配 udp=block 后服务端仍应正常监听 TCP");
 }
 
@@ -246,7 +261,7 @@ async fn udp_policy_parses_both_values() {
     let mirage_rs::config::UpstreamConfig::Shadowsocks { udp, .. } = &e else {
         panic!("应解析为 shadowsocks 上游")
     };
-    assert_eq!(*udp, mirage_rs::config::UdpPolicy::Direct);
+    assert_eq!(*udp, mirage_rs::config::UdpPolicy::Direct, "显式配 direct 必须生效");
 
     // 拼错的值必须报错而不是静默回落成某个默认
     assert!(serde_json::from_str::<mirage_rs::config::UpstreamConfig>(
