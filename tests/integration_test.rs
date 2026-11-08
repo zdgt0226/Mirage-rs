@@ -1,10 +1,13 @@
+mod common;
+
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 async fn start_echo_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    
+
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
@@ -15,7 +18,7 @@ async fn start_echo_server() -> u16 {
             });
         }
     });
-    
+
     port
 }
 
@@ -23,24 +26,20 @@ async fn start_echo_server() -> u16 {
 async fn test_echo_server_baseline() {
     let port = start_echo_server().await;
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
-    
+
     stream.write_all(b"hello world").await.unwrap();
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).await.unwrap();
-    
-    assert_eq!(&buf[..n], b"hello world");
-}
 
-async fn get_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    assert_eq!(&buf[..n], b"hello world");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_full_e2e_proxy() {
     let echo_port = start_echo_server().await;
-    let server_port = get_free_port().await;
-    let socks_port = get_free_port().await;
+    let ports = common::free_ports(2);
+    let server_port = ports[0];
+    let socks_port = ports[1];
 
     let server_config = serde_json::json!({
         "inbounds": [{
@@ -49,7 +48,7 @@ async fn test_full_e2e_proxy() {
             "listen": "127.0.0.1",
             "port": server_port,
             "password": "test_password",
-            "camouflage_host": "www.apple.com",
+            "camouflage_host": common::TEST_CAMOUFLAGE_HOST,
             "allow_local_targets": true
         }],
         "outbounds": [{
@@ -75,7 +74,7 @@ async fn test_full_e2e_proxy() {
             "server": "127.0.0.1",
             "server_port": server_port,
             "password": "test_password",
-            "camouflage_host": "www.apple.com",
+            "camouflage_host": common::TEST_CAMOUFLAGE_HOST,
             "pool_size": 1
         }],
         "routing": {
@@ -84,18 +83,29 @@ async fn test_full_e2e_proxy() {
         }
     });
 
-    std::fs::write("test_server_config.json", serde_json::to_string_pretty(&server_config).unwrap()).unwrap();
-    std::fs::write("test_client_config.json", serde_json::to_string_pretty(&client_config).unwrap()).unwrap();
+    let tmp = common::TempTestDir::new("integration");
+    let server_cfg = tmp.write_file("server_config.json", &serde_json::to_string_pretty(&server_config).unwrap());
+    let client_cfg = tmp.write_file("client_config.json", &serde_json::to_string_pretty(&client_config).unwrap());
+
+    let srv_str = server_cfg.to_str().unwrap().to_string();
+    let cli_str = client_cfg.to_str().unwrap().to_string();
 
     tokio::spawn(async move {
-        let _ = mirage_rs::start_proxy("test_server_config.json", true).await;
+        let _ = mirage_rs::start_proxy(&srv_str, true).await;
     });
 
     tokio::spawn(async move {
-        let _ = mirage_rs::start_proxy("test_client_config.json", false).await;
+        let _ = mirage_rs::start_proxy(&cli_str, false).await;
     });
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    assert!(
+        common::wait_tcp_ready_async(&format!("127.0.0.1:{}", server_port), Duration::from_secs(10)).await,
+        "Mirage server listening timed out"
+    );
+    assert!(
+        common::wait_tcp_ready_async(&format!("127.0.0.1:{}", socks_port), Duration::from_secs(10)).await,
+        "SOCKS client listening timed out"
+    );
 
     println!("Connecting to SOCKS5 client...");
     let mut stream = tokio::time::timeout(tokio::time::Duration::from_secs(5), TcpStream::connect(format!("127.0.0.1:{}", socks_port))).await.unwrap().unwrap();
@@ -128,10 +138,6 @@ async fn test_full_e2e_proxy() {
     let mut buf = [0u8; 1024];
     let n = tokio::time::timeout(tokio::time::Duration::from_secs(5), stream.read(&mut buf)).await.unwrap().unwrap();
     assert_eq!(&buf[..n], payload);
-    
-    println!("Test complete!");
 
-    // Cleanup files
-    let _ = std::fs::remove_file("test_server_config.json");
-    let _ = std::fs::remove_file("test_client_config.json");
+    println!("Test complete!");
 }

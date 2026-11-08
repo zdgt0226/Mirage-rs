@@ -116,7 +116,7 @@ fn format_invalid_json_exits_nonzero() {
 
 // ── import ────────────────────────────────────────────────────────────────
 
-const URI: &str = "mirage://p%40ss@vps.example.com:9443?sni=www.apple.com";
+const URI: &str = "mirage://p%40ss@vps.example.com:9443?sni=camouflage.test";
 
 fn read_json(p: &std::path::Path) -> serde_json::Value {
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
@@ -150,7 +150,7 @@ fn import_adds_outbound_with_chosen_tag() {
     assert_eq!(last["server"], "vps.example.com");
     assert_eq!(last["server_port"], 9443);
     assert_eq!(last["password"], "p@ss", "百分号编码的密码必须解码还原");
-    assert_eq!(last["camouflage_host"], "www.apple.com");
+    assert_eq!(last["camouflage_host"], "camouflage.test");
     // 原有出站不能被动到
     assert_eq!(obs[0]["tag"], "direct");
 

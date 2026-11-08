@@ -3,52 +3,11 @@
 //! 不依赖外网 —— 目标是本测试自己起的一个 echo 服务, 所以 CI 里也能稳定跑。
 //! 覆盖两条核心契约: ①「全部转发」真的走了隧道; ②「仅 TCP」对 UDP ASSOCIATE 明确拒绝。
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-
-fn bin() -> std::path::PathBuf {
-    let mut p = std::env::current_exe().unwrap();
-    p.pop();
-    p.pop();
-    p.push("mirage");
-    p
-}
-
-/// 进程守卫: 测试无论怎么结束 (含 panic) 都杀掉子进程, 不留端口占用。
-struct Kid(Child);
-impl Drop for Kid {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn write_cfg(name: &str, json: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!("mirage_lite_{}_{}", std::process::id(), name));
-    std::fs::write(&p, json).unwrap();
-    p
-}
-
-fn spawn(sub: &str, cfg: &std::path::Path) -> Kid {
-    Kid(Command::new(bin())
-        .args([sub, "-c", cfg.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap())
-}
-
-/// 等端口可连, 最多 ~5s。
-fn wait_port(port: u16) -> bool {
-    for _ in 0..50 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    false
-}
+use std::time::Duration;
 
 /// 起一个最小 echo 服务当"目标站点", 返回其端口。
 fn spawn_echo() -> u16 {
@@ -113,25 +72,28 @@ fn socks5_connect(proxy: u16, target_port: u16) -> std::io::Result<TcpStream> {
 #[test]
 fn lite_tunnel_forwards_tcp_end_to_end() {
     let echo = spawn_echo();
-    // 端口取相对不常用的段, 降低与本机既有服务冲突的概率
-    let (sport, cport) = (18571, 11571);
-    let srv_cfg = write_cfg(
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new("lite_e2e");
+    let srv_cfg = tmp.write_file(
         "srv.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-e2e","sni":"www.apple.com","allow_local_targets":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-e2e","sni":"{sni}","allow_local_targets":true,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         "cli.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-e2e","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-e2e","sni":"{sni}","pool_size":2,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
 
-    let _s = spawn("lite-server", &srv_cfg);
-    assert!(wait_port(sport), "轻量服务端未监听");
-    let _c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport), "轻量客户端未监听");
+    let _s = common::spawn_mirage("lite-server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)), "轻量服务端未监听");
+    let _c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)), "轻量客户端未监听");
 
     // 经隧道往 echo 服务发一段数据, 应原样回来 —— 证明整条链路 (SOCKS5 → 加密隧道 →
     // 服务端 → 目标) 双向通。
@@ -140,30 +102,31 @@ fn lite_tunnel_forwards_tcp_end_to_end() {
     let mut buf = [0u8; 64];
     let n = s.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"hello-through-lite-tunnel", "回环数据应原样返回");
-
-    std::fs::remove_file(&srv_cfg).ok();
-    std::fs::remove_file(&cli_cfg).ok();
 }
 
 #[test]
 fn lite_client_rejects_udp_associate() {
-    let (sport, cport) = (18572, 11572);
-    let srv_cfg = write_cfg(
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new("lite_udp");
+    let srv_cfg = tmp.write_file(
         "srv_udp.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-udp","sni":"www.apple.com","log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-udp","sni":"{sni}","log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         "cli_udp.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-udp","sni":"www.apple.com","pool_size":1,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-udp","sni":"{sni}","pool_size":1,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let _s = spawn("lite-server", &srv_cfg);
-    assert!(wait_port(sport));
-    let _c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport));
+    let _s = common::spawn_mirage("lite-server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)));
+    let _c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)));
 
     let mut s = TcpStream::connect(("127.0.0.1", cport)).unwrap();
     s.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
@@ -176,9 +139,6 @@ fn lite_client_rejects_udp_associate() {
     s.read_exact(&mut rep).unwrap();
     // 必须按 SOCKS5 规范回 0x07 (command not supported), 而不是静默断开让客户端干等
     assert_eq!(rep[1], 0x07, "轻量模式仅 TCP, UDP ASSOCIATE 应回 REP=0x07");
-
-    std::fs::remove_file(&srv_cfg).ok();
-    std::fs::remove_file(&cli_cfg).ok();
 }
 
 /// 回归 (fetch 边界): **完整模式服务端**的 camouflage_host 指向一个只回残 ServerHello 的站,
@@ -192,25 +152,28 @@ fn lite_client_rejects_udp_associate() {
 fn server_falls_back_when_camouflage_template_incomplete() {
     let echo = spawn_echo();
     let camo = spawn_incomplete_camouflage();
-    let (sport, cport) = (18574, 11574);
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new("fallback");
     // 完整模式服务端: camouflage_host = 本地残站。fetch 必残 → 弃 → 回落 fallback。
-    let srv_cfg = write_cfg(
+    let srv_cfg = tmp.write_file(
         "fallback_srv.json",
         &format!(
             r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-fb","camouflage_host":"127.0.0.1:{camo}","allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
         ),
     );
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         "fallback_cli.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-fb","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-fb","sni":"{sni}","pool_size":2,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
 
-    let _s = spawn("server", &srv_cfg);
-    assert!(wait_port(sport), "完整模式服务端未监听");
-    let _c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport), "轻量客户端未监听");
+    let _s = common::spawn_mirage("server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)), "完整模式服务端未监听");
+    let _c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)), "轻量客户端未监听");
 
     let mut s = socks5_connect(cport, echo)
         .expect("残 camouflage 下 SOCKS5 CONNECT 失败: 服务端未回落 fallback (缓存了残模板 → tail 超时)");
@@ -218,9 +181,6 @@ fn server_falls_back_when_camouflage_template_incomplete() {
     let mut buf = [0u8; 64];
     let n = s.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"incomplete-camouflage-fallback", "回落 fallback 后隧道回环数据应原样返回");
-
-    std::fs::remove_file(&srv_cfg).ok();
-    std::fs::remove_file(&cli_cfg).ok();
 }
 
 /// PFS 两端同开 (pfs=true): 握手做 X25519 ECDH, 隧道照常打通 echo 回环。
@@ -229,33 +189,34 @@ fn server_falls_back_when_camouflage_template_incomplete() {
 #[test]
 fn pfs_both_ends_tunnel_works() {
     let echo = spawn_echo();
-    let (sport, cport) = (18581, 11581);
-    let srv_cfg = write_cfg(
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new("pfs");
+    let srv_cfg = tmp.write_file(
         "pfs_srv.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-pfs","sni":"www.apple.com","pfs":true,"allow_local_targets":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-pfs","sni":"{sni}","pfs":true,"allow_local_targets":true,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         "pfs_cli.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs","sni":"www.apple.com","pool_size":2,"pfs":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs","sni":"{sni}","pool_size":2,"pfs":true,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
 
-    let _s = spawn("lite-server", &srv_cfg);
-    assert!(wait_port(sport), "PFS 服务端未监听");
-    let _c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport), "PFS 客户端未监听");
+    let _s = common::spawn_mirage("lite-server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)), "PFS 服务端未监听");
+    let _c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)), "PFS 客户端未监听");
 
     let mut s = socks5_connect(cport, echo).expect("PFS 两端同开 SOCKS5 CONNECT 应成功");
     s.write_all(b"hello-through-pfs-tunnel").unwrap();
     let mut buf = [0u8; 64];
     let n = s.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"hello-through-pfs-tunnel", "PFS 隧道回环数据应原样返回");
-
-    std::fs::remove_file(&srv_cfg).ok();
-    std::fs::remove_file(&cli_cfg).ok();
 }
 
 /// PFS 失配 (服务端 pfs=true, 客户端 pfs=false): 两端派生的会话 master 不同 (label 域分隔 +
@@ -267,25 +228,29 @@ fn pfs_both_ends_tunnel_works() {
 #[test]
 fn pfs_mismatch_fails_closed() {
     let echo = spawn_echo();
-    let (sport, cport) = (18582, 11582);
-    let srv_cfg = write_cfg(
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new("pfs_mm");
+    let srv_cfg = tmp.write_file(
         "pfs_mm_srv.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-mm","sni":"www.apple.com","pfs":true,"allow_local_targets":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{sport},"password":"pw-mm","sni":"{sni}","pfs":true,"allow_local_targets":true,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
     // 客户端不开 pfs (默认 false)。
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         "pfs_mm_cli.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-mm","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-mm","sni":"{sni}","pool_size":2,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
 
-    let _s = spawn("lite-server", &srv_cfg);
-    assert!(wait_port(sport), "服务端未监听");
-    let _c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport), "客户端未监听");
+    let _s = common::spawn_mirage("lite-server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)), "服务端未监听");
+    let _c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)), "客户端未监听");
 
     // master 失配 → 加密中继解不开 → 整条回环不该成功 (CONNECT 失败 / 无回显 / 回显不符)。
     let ok_roundtrip = (|| -> Option<()> {
@@ -296,9 +261,6 @@ fn pfs_mismatch_fails_closed() {
         (n > 0 && &buf[..n] == b"pfs-mismatch-probe").then_some(())
     })();
     assert!(ok_roundtrip.is_none(), "PFS 失配下不该有成功的隧道回环 (fail-closed)");
-
-    std::fs::remove_file(&srv_cfg).ok();
-    std::fs::remove_file(&cli_cfg).ok();
 }
 
 /// PFS 完整模式覆盖: **完整 mirage_server 入站** (走 handshake.rs + control.rs 服务端侧 PFS
@@ -307,25 +269,29 @@ fn pfs_mismatch_fails_closed() {
 #[test]
 fn pfs_full_server_interops_with_lite_client() {
     let echo = spawn_echo();
-    let (sport, cport) = (18583, 11583);
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new("pfs_full");
     // 完整模式服务端: mirage_server 入站 + pfs=true + direct 出站。
-    let srv_cfg = write_cfg(
+    let srv_cfg = tmp.write_file(
         "pfs_full_srv.json",
         &format!(
-            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-pfs-full","camouflage_host":"www.apple.com","pfs":true,"allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-pfs-full","camouflage_host":"{camo_host}","pfs":true,"allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#,
+            camo_host = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         "pfs_full_cli.json",
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs-full","sni":"www.apple.com","pool_size":2,"pfs":true,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-pfs-full","sni":"{sni}","pool_size":2,"pfs":true,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
 
-    let _s = spawn("server", &srv_cfg);
-    assert!(wait_port(sport), "完整模式 PFS 服务端未监听");
-    let _c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport), "PFS 客户端未监听");
+    let _s = common::spawn_mirage("server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)), "完整模式 PFS 服务端未监听");
+    let _c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)), "PFS 客户端未监听");
 
     let mut s = socks5_connect(cport, echo)
         .expect("完整服务端 PFS ↔ lite 客户端 PFS 应互通");
@@ -333,30 +299,32 @@ fn pfs_full_server_interops_with_lite_client() {
     let mut buf = [0u8; 64];
     let n = s.read(&mut buf).unwrap();
     assert_eq!(&buf[..n], b"pfs-full-server-lite-client", "完整模式 PFS 隧道回环应原样返回");
-
-    std::fs::remove_file(&srv_cfg).ok();
-    std::fs::remove_file(&cli_cfg).ok();
 }
 
-/// 起完整 mirage_server + lite-client 一对, 返回 (进程守卫, SOCKS 端口)。
-fn spawn_pair(name: &str, sport: u16, cport: u16) -> (Kid, Kid, u16) {
-    let srv_cfg = write_cfg(
+/// 起完整 mirage_server + lite-client 一对, 返回 (服务端守卫, 客户端守卫, 临时目录守卫, SOCKS 端口)。
+fn spawn_pair(name: &str) -> (common::Kid, common::Kid, common::TempTestDir, u16) {
+    let ports = common::free_ports(2);
+    let (sport, cport) = (ports[0], ports[1]);
+    let tmp = common::TempTestDir::new(&format!("pair_{}", name));
+    let srv_cfg = tmp.write_file(
         &format!("{name}_srv.json"),
         &format!(
-            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-close-semantics","camouflage_host":"www.apple.com","allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#
+            r#"{{"schema_version":1,"log_level":"warn","inbounds":[{{"type":"mirage_server","tag":"mirage-in","listen":"127.0.0.1","port":{sport},"password":"pw-close-semantics","camouflage_host":"{camo_host}","allow_local_targets":true}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"routing":{{"default_outbound":"direct","rules":[]}}}}"#,
+            camo_host = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let cli_cfg = write_cfg(
+    let cli_cfg = tmp.write_file(
         &format!("{name}_cli.json"),
         &format!(
-            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-close-semantics","sni":"www.apple.com","pool_size":2,"log_level":"warn"}}"#
+            r#"{{"listen":"127.0.0.1","port":{cport},"server":"127.0.0.1","server_port":{sport},"password":"pw-close-semantics","sni":"{sni}","pool_size":2,"log_level":"warn"}}"#,
+            sni = common::TEST_CAMOUFLAGE_HOST
         ),
     );
-    let s = spawn("server", &srv_cfg);
-    assert!(wait_port(sport), "服务端未监听");
-    let c = spawn("lite-client", &cli_cfg);
-    assert!(wait_port(cport), "客户端未监听");
-    (s, c, cport)
+    let s = common::spawn_mirage("server", &srv_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", sport), Duration::from_secs(10)), "服务端未监听");
+    let c = common::spawn_mirage("lite-client", &cli_cfg);
+    assert!(common::wait_tcp_ready(&format!("127.0.0.1:{}", cport), Duration::from_secs(10)), "客户端未监听");
+    (s, c, tmp, cport)
 }
 
 /// 起一个目标: 读一次请求后按 `mode` 结束 —— "fin" 回 data 后正常关闭; "rst" 回 data 后 RST;
@@ -418,7 +386,7 @@ fn read_all_or_reset(s: &mut TcpStream) -> Result<Vec<u8>, std::io::ErrorKind> {
 #[test]
 fn target_clean_close_reaches_app_as_fin() {
     let target = spawn_target("fin");
-    let (_s, _c, cport) = spawn_pair("close_fin", 18591, 11591);
+    let (_s, _c, _tmp, cport) = spawn_pair("close_fin");
     let mut s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
     s.write_all(b"req").unwrap();
     assert_eq!(read_all_or_reset(&mut s), Ok(b"data".to_vec()), "干净结束应给本地 FIN");
@@ -429,7 +397,7 @@ fn target_clean_close_reaches_app_as_fin() {
 #[test]
 fn target_reset_reaches_app_as_reset() {
     let target = spawn_target("rst");
-    let (_s, _c, cport) = spawn_pair("close_rst", 18592, 11592);
+    let (_s, _c, _tmp, cport) = spawn_pair("close_rst");
     let mut s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
     s.write_all(b"req").unwrap();
     assert_eq!(read_all_or_reset(&mut s), Err(std::io::ErrorKind::ConnectionReset), "截断应给本地 RST");
@@ -440,7 +408,7 @@ fn target_reset_reaches_app_as_reset() {
 #[test]
 fn app_half_close_first_gets_fin_not_reset() {
     let target = spawn_target("slow");
-    let (_s, _c, cport) = spawn_pair("close_half", 18593, 11593);
+    let (_s, _c, _tmp, cport) = spawn_pair("close_half");
     let mut s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
     s.write_all(b"req").unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -448,29 +416,53 @@ fn app_half_close_first_gets_fin_not_reset() {
     assert!(read_all_or_reset(&mut s).is_ok(), "本地先关应收 FIN, 不应被 RST");
 }
 
-/// 起一个目标: 读到结束后把结果 (Ok(数据)=FIN / Err=RST) 发回测试线程。
-fn spawn_target_report() -> (u16, std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::ErrorKind>>) {
+type TargetReportResult = Result<Vec<u8>, std::io::ErrorKind>;
+
+/// 起一个目标: 读到结束后把结果 (Ok(数据)=FIN / Err=RST) 发回测试线程, 收到请求数据后发 ready 通知。
+fn spawn_target_report() -> (
+    u16,
+    std::sync::mpsc::Receiver<TargetReportResult>,
+    std::sync::mpsc::Receiver<()>,
+) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Some(mut s) = l.incoming().flatten().next() {
             s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let _ = tx.send(read_all_or_reset(&mut s));
+            let mut out = Vec::new();
+            let mut buf = [0u8; 256];
+            let mut signaled = false;
+            let res = loop {
+                match s.read(&mut buf) {
+                    Ok(0) => break Ok(out),
+                    Ok(n) => {
+                        out.extend_from_slice(&buf[..n]);
+                        if !signaled {
+                            signaled = true;
+                            let _ = ready_tx.send(());
+                        }
+                    }
+                    Err(e) => break Err(e.kind()),
+                }
+            };
+            let _ = tx.send(res);
         }
     });
-    (port, rx)
+    (port, rx, ready_rx)
 }
 
 /// 回归 (上行截断对称): 本地应用 RST (上行不完整) → 客户端不发 close_notify、关隧道写 →
 /// 服务端让目标看到 RST, 不能是 FIN (否则目标把残缺上传当完整)。旧版这里是 FIN。
 #[test]
 fn app_reset_reaches_target_as_reset() {
-    let (target, rx) = spawn_target_report();
-    let (_s, _c, cport) = spawn_pair("close_app_rst", 18594, 11594);
+    let (target, rx, ready_rx) = spawn_target_report();
+    let (_s, _c, _tmp, cport) = spawn_pair("close_app_rst");
     let s = socks5_connect(cport, target).expect("SOCKS5 CONNECT");
     (&s).write_all(b"req").unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // 确保目标已实际收到数据, 避免因时序慢在客户端建立前就发出 RST
+    let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));
     socket2_free_linger_zero(&s).unwrap();
     drop(s); // RST
     let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("目标应结束");
