@@ -381,7 +381,8 @@ pub async fn update_users(
     // 其余语义提示 (如跨入站同名用户限额不一致) 只随响应 issues 返回, 不拦写入。
     let user_errs = cfg.user_hard_errors();
     if !user_errs.is_empty() {
-        return err_resp(StatusCode::UNPROCESSABLE_ENTITY, "invalid_users", format!("凭据校验失败, 已拒绝 (未写入): {}", user_errs.join("; ")), user_errs);
+        let user_err_msgs: Vec<String> = user_errs.iter().map(|i| i.zh.clone()).collect();
+        return err_resp(StatusCode::UNPROCESSABLE_ENTITY, "invalid_users", format!("凭据校验失败, 已拒绝 (未写入): {}", user_err_msgs.join("; ")), user_err_msgs);
     }
 
     if q.dry_run {

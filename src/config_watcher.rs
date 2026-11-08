@@ -121,9 +121,9 @@ impl ConfigWatcher {
         for issue in &issues {
             // 重复口令会让鉴权命中错误用户 (用量记错人), 用 error 级别醒目提示。
             if issue.contains("password 与") {
-                error!("configuration validation: {}", issue);
+                error!("configuration validation: {}", issue.en);
             } else {
-                warn!("configuration validation: {}", issue);
+                warn!("configuration validation: {}", issue.en);
             }
         }
         
