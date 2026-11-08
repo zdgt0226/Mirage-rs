@@ -1,6 +1,6 @@
 # Mirage-rs
 
-![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.11-10b981.svg)
+![Mirage-rs](https://img.shields.io/badge/Language-Rust-f74c00.svg) ![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg) ![Version](https://img.shields.io/badge/Version-v0.17.12-10b981.svg)
 
 基于 **Rust** 与 **Tokio** 重写的高性能、抗审查代理引擎。提供内核级 eBPF 加速、TLS 指纹仿真伪装与内置 Web 看板。
 
@@ -427,6 +427,7 @@ mirage-rs config -c config.json
 
 | 版本 | 发布日期 | 核心重大特性与变更 |
 | :--- | :--- | :--- |
+| **v0.17.12** | 2026-11-09 | **无协议变更**: 启动 / 热重载写进日志的配置检查提示改为英文 (纯 ASCII), 避免非 UTF-8 环境乱码; `mirage check` 命令行与控制台仍显示中文。 |
 | **v0.17.11** | 2026-11-08 | **无协议断代**: 多模型审计修复: QUIC 节点不再因服务端路由拒绝被误罚; 服务端上游故障仍计节点失败; "目标不可达"一律给本地应用 RST; 服务端首包写目标失败也报告目标不可达; 半关闭收尾计时写成功后也刷新; Mirage TCP / WG 首包计入流量统计。 |
 | **v0.17.10** | 2026-11-08 | **无协议变更**: 服务端上游先结束后, 客户端 30s 不关隧道即断开 (原等 1800s, 主要照顾老客户端); 出站组成员全部判死时日志写明原因; 运行时日志与错误文本全部改为英文 (纯 ASCII), 避免非 UTF-8 环境乱码 (`check` 提示与 `config` 交互仍为中文)。 |
 | **v0.17.9** | 2026-11-07 | **无协议变更 (向后兼容)**: Mirage TCP 隧道与 QUIC 流一方向结束后, 剩余方向 30s 无数据即关 (原要等 1800s); QUIC 节点也参与真实连接失败降级与变慢补测; 服务端连目标失败时告知客户端, 不再把目标故障误记为节点故障 (老客户端不受影响); `outbounds` 键名写错有提示。 |
