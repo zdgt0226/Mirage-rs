@@ -1512,44 +1512,72 @@ impl WarmPool {
     }
 
     /// 采样连接池当前可用连接的 TCP 平滑 RTT (微秒)。
-    /// 优先从活跃传输套接字 (active_fds) 采样，无活跃传输时回退到空闲预热连接 (queue)。
-    /// 基于内核 getsockopt(TCP_INFO)，无需 root 权限或 eBPF。
+    /// 同时扫描活跃传输套接字 (active_fds) 与空闲预热连接 (queue)，优先选用最近有
+    /// ACK 交互的 ESTABLISHED 连接（最小 `last_ack_recv` 的 5s 窗口内），避免长期静默的
+    /// push / UDP-Mux 长连接冻结 RTT 读数。基于内核 getsockopt(TCP_INFO)，无需 root 或 eBPF。
     pub fn sample_tcp_rtt_us(&self) -> Option<u32> {
-        // 1. 优先采样活跃连接
-        if let Ok(actives) = self.brutal_state.active_fds.lock() {
-            let mut sum = 0u64;
-            let mut count = 0u32;
-            for &fd in actives.iter() {
-                if let Ok(info) = crate::proxy::brutal::get_tcp_info(fd) {
-                    if info.rtt > 0 {
-                        sum += info.rtt as u64;
-                        count += 1;
-                    }
+        const TCP_ESTABLISHED: u8 = 1;
+        let mut samples: Vec<(u32, u32)> = Vec::new();
+        let mut collect_fd = |fd: i32| {
+            if let Ok(info) = crate::proxy::brutal::get_tcp_info(fd) {
+                if info.state == TCP_ESTABLISHED && info.rtt > 0 {
+                    samples.push((info.rtt, info.last_ack_recv));
                 }
             }
-            if count > 0 {
-                return Some((sum / count as u64) as u32);
+        };
+
+        if let Ok(actives) = self.brutal_state.active_fds.lock() {
+            for &fd in actives.iter() {
+                collect_fd(fd);
             }
         }
-        // 2. 活跃集合为空时，采样池内空闲预热连接
         if let Ok(q) = self.queue.try_lock() {
-            let mut sum = 0u64;
-            let mut count = 0u32;
             for t in q.iter() {
                 if let Some(fd) = t.get_raw_fd() {
-                    if let Ok(info) = crate::proxy::brutal::get_tcp_info(fd) {
-                        if info.rtt > 0 {
-                            sum += info.rtt as u64;
-                            count += 1;
-                        }
-                    }
+                    collect_fd(fd);
                 }
             }
-            if count > 0 {
-                return Some((sum / count as u64) as u32);
-            }
         }
-        None
+        select_freshest_rtt_us(&samples)
+    }
+}
+
+/// 从 `(rtt_us, last_ack_recv_ms)` 样本中选出最近活跃窗口（最小 `last_ack_recv` + 5s）内
+/// 套接字的平均平滑 RTT（微秒），避免静默长连接阻塞更新。
+pub(crate) fn select_freshest_rtt_us(samples: &[(u32, u32)]) -> Option<u32> {
+    const FRESH_WINDOW_MS: u32 = 5_000;
+    let min_ack = samples.iter().map(|&(_, ack)| ack).min()?;
+    let cutoff = min_ack.saturating_add(FRESH_WINDOW_MS);
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for &(rtt, ack) in samples {
+        if ack <= cutoff {
+            sum += rtt as u64;
+            count += 1;
+        }
+    }
+    (count > 0).then(|| (sum / count) as u32)
+}
+
+#[cfg(test)]
+mod rtt_sampling_tests {
+    use super::select_freshest_rtt_us;
+
+    #[test]
+    fn empty_samples_returns_none() {
+        assert_eq!(select_freshest_rtt_us(&[]), None);
+    }
+
+    #[test]
+    fn dormant_mux_or_push_socket_does_not_poison_fresh_sample() {
+        let samples = [(12_000, 360_000), (130_000, 2_000)];
+        assert_eq!(select_freshest_rtt_us(&samples), Some(130_000));
+    }
+
+    #[test]
+    fn averages_samples_within_fresh_window() {
+        let samples = [(100_000, 100), (120_000, 2_500), (12_000, 20_000)];
+        assert_eq!(select_freshest_rtt_us(&samples), Some(110_000));
     }
 }
 
