@@ -392,137 +392,161 @@ pub(crate) fn init_engines(
     }
 }
 
-/// eBPF 启用时的两个后台监控任务: ① 每 60s 后台 DNS 解析 (Mirage 出站 server_host → target IP,
-/// 喂给 BPF); ② 每 2s RTT 监控 + 动态 Brutal 调速 (采样丢 spawn_blocking, 不占 worker)。
+/// 运行期后台监控任务:
+/// ① 每 60s 后台 DNS 解析 (Mirage 出站 server_host → target IP, 若启用 BPF 则同步登记白名单);
+/// ② 每 2s RTT 监控 + 动态 Brutal 调速 (优先 eBPF cookie 快速查询, 回退 getsockopt TCP_INFO,
+///   无活跃传输时回退采样连接池空闲连接; 采样丢 spawn_blocking, 不占 worker)。
 pub(crate) fn spawn_ebpf_monitor_tasks(
     ebpf_engine: &Option<EbpfEngineHandle>,
     state: &Arc<ArcSwap<CoreState>>,
 ) {
-    if let Some(engine_arc) = ebpf_engine {
-        // 只在真有 engine 时才 clone state (与抽取前语义一致: clone 在 if let Some 内)。
-        let state = state.clone();
-        let lock = engine_arc.clone();
+    let state = state.clone();
+    let bpf_opt = ebpf_engine.clone();
 
-        // P1 #3: Decoupled background DNS resolver task (every 60s)
-        let dns_state = state.clone();
-        let dns_lock = lock.clone();
-        tokio::spawn(async move {
-            loop {
-                let st = dns_state.load();
-                let mut futures = Vec::new();
+    // 1. 后台 DNS 解析任务 (每 60s)
+    let dns_state = state.clone();
+    let dns_bpf = bpf_opt.clone();
+    tokio::spawn(async move {
+        loop {
+            let st = dns_state.load();
+            let mut futures = Vec::new();
 
-                for node in st.outbounds.outbounds.values() {
-                    if let crate::proxy::outbound::OutboundNode::Mirage { server_host, server_port, server_ip, .. } = node.as_ref() {
-                        let host = server_host.clone();
-                        let port = *server_port;
-                        let ip_arc = server_ip.clone();
-                        let bpf_lock = dns_lock.clone();
+            for node in st.outbounds.outbounds.values() {
+                if let crate::proxy::outbound::OutboundNode::Mirage { server_host, server_port, server_ip, .. } = node.as_ref() {
+                    let host = server_host.clone();
+                    let port = *server_port;
+                    let ip_arc = server_ip.clone();
+                    let bpf_lock = dns_bpf.clone();
 
-                        futures.push(tokio::spawn(async move {
-                            if let Ok(Ok(addrs)) = tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                tokio::net::lookup_host((host.as_str(), port))
-                            ).await {
-                                let mut v4 = None;
-                                let mut v6 = None;
-                                for addr in addrs {
-                                    match addr.ip() {
-                                        std::net::IpAddr::V4(_) if v4.is_none() => v4 = Some(addr.ip()),
-                                        std::net::IpAddr::V6(_) if v6.is_none() => v6 = Some(addr.ip()),
-                                        _ => {}
-                                    }
+                    futures.push(tokio::spawn(async move {
+                        if let Ok(Ok(addrs)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            tokio::net::lookup_host((host.as_str(), port))
+                        ).await {
+                            let mut v4 = None;
+                            let mut v6 = None;
+                            for addr in addrs {
+                                match addr.ip() {
+                                    std::net::IpAddr::V4(_) if v4.is_none() => v4 = Some(addr.ip()),
+                                    std::net::IpAddr::V6(_) if v6.is_none() => v6 = Some(addr.ip()),
+                                    _ => {}
                                 }
-                                if let Some(ip) = v4.or(v6) {
-                                    *ip_arc.write().unwrap_or_else(|e| e.into_inner()) = Some(ip);
-                                    if let Ok(mut engine) = bpf_lock.try_lock() {
+                            }
+                            if let Some(ip) = v4.or(v6) {
+                                *ip_arc.write().unwrap_or_else(|e| e.into_inner()) = Some(ip);
+                                if let Some(bpf) = &bpf_lock {
+                                    if let Ok(mut engine) = bpf.try_lock() {
                                         let _ = engine.set_target_ip(ip);
                                     }
                                 }
                             }
-                        }));
-                    }
-                }
-                for f in futures {
-                    let _ = f.await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            }
-        });
-
-        // RTT monitor task (fast polling every 2s)
-        let core_state = state.clone();
-        let lock_clone = lock.clone();
-        tokio::spawn(async move {
-            loop {
-                let st = core_state.load();
-                let engine = lock_clone.clone();
-                let outbounds = st.outbounds.clone();
-                // 采样是阻塞的 (每个 active fd 一次 getsockopt SO_COOKIE + TCP_INFO 系统调用 +
-                // std 锁遍历), 全丢 spawn_blocking, 不占 tokio worker。只把"需要下调/上调的速率"
-                // 带回 async 侧 apply (update_brutal_rate 是 async)。调速决策已抽成纯函数
-                // decide_brutal_rate (见 proxy::brutal, 有单测), 这里只做 IO + 分发。
-                let updates = tokio::task::spawn_blocking(move || {
-                    let mut updates: Vec<(std::sync::Arc<crate::proxy::pool::WarmPool>, u64)> = Vec::new();
-                    let Ok(lock) = engine.try_lock() else { return updates };
-                    for node in outbounds.outbounds.values() {
-                        let crate::proxy::outbound::OutboundNode::Mirage {
-                            server_ip, rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, ..
-                        } = node.as_ref() else { continue };
-                        // server_ip 还没解析出来 = 该出站没建过连接, 无可采样。
-                        if server_ip.read().unwrap_or_else(|e| e.into_inner()).is_none() {
-                            continue;
                         }
-                        let Ok(actives) = pool.brutal_state.active_fds.lock() else { continue };
-                        let mut sum_retrans = 0;
-                        let mut sum_segs = 0;
-                        let mut sum_rtt = 0;
-                        let mut max_cwnd = 0;
-                        let mut count = 0;
+                    }));
+                }
+            }
+            for f in futures {
+                let _ = f.await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+
+    // 2. RTT 监控与 Brutal 动态调速任务 (每 2s)
+    let core_state = state.clone();
+    let rtt_bpf = bpf_opt.clone();
+    tokio::spawn(async move {
+        loop {
+            let st = core_state.load();
+            let bpf_handle = rtt_bpf.clone();
+            let outbounds = st.outbounds.clone();
+            let updates = tokio::task::spawn_blocking(move || {
+                let mut updates: Vec<(std::sync::Arc<crate::proxy::pool::WarmPool>, u64)> = Vec::new();
+                let bpf_guard = bpf_handle.as_ref().and_then(|h| h.try_lock().ok());
+
+                for node in outbounds.outbounds.values() {
+                    let crate::proxy::outbound::OutboundNode::Mirage {
+                        rtt_ms, snd_cwnd, total_retrans, total_segs_out, pool, ..
+                    } = node.as_ref() else { continue };
+
+                    let mut sum_retrans = 0u64;
+                    let mut sum_segs = 0u64;
+                    let mut sum_rtt = 0u64;
+                    let mut max_cwnd = 0u64;
+                    let mut count = 0u32;
+
+                    // 1. 优先采样活跃传输连接 (active_fds)
+                    if let Ok(actives) = pool.brutal_state.active_fds.lock() {
                         for &fd in actives.iter() {
-                            if let Ok(cookie) = crate::ebpf::get_socket_cookie(fd) {
-                                if let Ok(state) = lock.get_tcp_state_by_cookie(cookie) {
-                                    sum_retrans += state.total_retrans as u64;
-                                    sum_segs += state.data_segs_out as u64;
-                                    sum_rtt += state.srtt_us / 1000;
-                                    max_cwnd = max_cwnd.max(state.snd_cwnd as u64);
+                            let mut sampled = false;
+                            // 若 eBPF 可用，先尝试通过 SO_COOKIE 读 BPF map
+                            if let Some(ref lock) = bpf_guard {
+                                if let Ok(cookie) = crate::ebpf::get_socket_cookie(fd) {
+                                    if let Ok(state) = lock.get_tcp_state_by_cookie(cookie) {
+                                        sum_retrans += state.total_retrans as u64;
+                                        sum_segs += state.data_segs_out as u64;
+                                        sum_rtt += (state.srtt_us / 1000) as u64;
+                                        max_cwnd = max_cwnd.max(state.snd_cwnd as u64);
+                                        count += 1;
+                                        sampled = true;
+                                    }
+                                }
+                            }
+                            // 无 eBPF 或 BPF 查找失败时，回退到 getsockopt(TCP_INFO)
+                            if !sampled {
+                                if let Ok(info) = crate::proxy::brutal::get_tcp_info(fd) {
+                                    sum_retrans += info.total_retrans as u64;
+                                    sum_segs += info.segs_out as u64;
+                                    sum_rtt += (info.rtt / 1000) as u64;
+                                    max_cwnd = max_cwnd.max(info.snd_cwnd as u64);
                                     count += 1;
                                 }
                             }
                         }
-                        let Some(rtt) = sum_rtt.checked_div(count) else { continue };
-                        rtt_ms.store(rtt as u64, std::sync::atomic::Ordering::Relaxed);
-                        snd_cwnd.store(max_cwnd, std::sync::atomic::Ordering::Relaxed);
-                        let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
-                        let old_segs = total_segs_out.swap(sum_segs, std::sync::atomic::Ordering::Relaxed);
-                        let (delta_retrans, delta_segs) = if old_retrans == u64::MAX || old_segs == u64::MAX {
-                            (0i64, 0i64)
-                        } else {
-                            (sum_retrans as i64 - old_retrans as i64, sum_segs as i64 - old_segs as i64)
-                        };
-                        // P3.1: 动态 Brutal 调速 (纯函数决策)。
-                        if let (Some(base_rate), Some(base_rtt_ms)) =
-                            (pool.brutal_state.configured_rate, pool.brutal_state.base_rtt)
-                        {
-                            let current_rate = pool.brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
-                            if let Some(new_rate) = crate::proxy::brutal::decide_brutal_rate(
-                                rtt, base_rtt_ms, max_cwnd, delta_retrans, delta_segs, base_rate, current_rate,
-                            ) {
-                                updates.push((pool.clone(), new_rate));
-                            }
+                    }
+
+                    // 2. 活跃连接为空时，采样池内空闲连接 (queue) 的 TCP_INFO
+                    if count == 0 {
+                        if let Some(rtt_us) = pool.sample_tcp_rtt_us() {
+                            let rtt_val = (rtt_us / 1000).max(1) as u64;
+                            sum_rtt += rtt_val;
+                            count += 1;
                         }
                     }
-                    updates
-                })
-                .await
-                .unwrap_or_default();
 
-                for (p, rate) in updates {
-                    p.update_brutal_rate(rate).await;
+                    let Some(rtt) = sum_rtt.checked_div(count as u64) else { continue };
+                    let final_rtt = rtt.max(1);
+                    rtt_ms.store(final_rtt, std::sync::atomic::Ordering::Relaxed);
+                    snd_cwnd.store(max_cwnd, std::sync::atomic::Ordering::Relaxed);
+                    let old_retrans = total_retrans.swap(sum_retrans, std::sync::atomic::Ordering::Relaxed);
+                    let old_segs = total_segs_out.swap(sum_segs, std::sync::atomic::Ordering::Relaxed);
+                    let (delta_retrans, delta_segs) = if old_retrans == u64::MAX || old_segs == u64::MAX {
+                        (0i64, 0i64)
+                    } else {
+                        (sum_retrans as i64 - old_retrans as i64, sum_segs as i64 - old_segs as i64)
+                    };
+                    // P3.1: 动态 Brutal 调速 (纯函数决策)
+                    if let (Some(base_rate), Some(base_rtt_ms)) =
+                        (pool.brutal_state.configured_rate, pool.brutal_state.base_rtt)
+                    {
+                        let current_rate = pool.brutal_state.current_rate.load(std::sync::atomic::Ordering::Relaxed);
+                        if let Some(new_rate) = crate::proxy::brutal::decide_brutal_rate(
+                            final_rtt as u32, base_rtt_ms, max_cwnd, delta_retrans, delta_segs, base_rate, current_rate,
+                        ) {
+                            updates.push((pool.clone(), new_rate));
+                        }
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                updates
+            })
+            .await
+            .unwrap_or_default();
+
+            for (p, rate) in updates {
+                p.update_brutal_rate(rate).await;
             }
-        });
-    }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
 }
 
 /// 启动装载自定义 fake-TLS 指纹模板 (config `client_hello_template`)。装入 tls_raw 全局后,
