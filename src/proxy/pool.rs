@@ -1510,6 +1510,47 @@ impl WarmPool {
             fd,
         }
     }
+
+    /// 采样连接池当前可用连接的 TCP 平滑 RTT (微秒)。
+    /// 优先从活跃传输套接字 (active_fds) 采样，无活跃传输时回退到空闲预热连接 (queue)。
+    /// 基于内核 getsockopt(TCP_INFO)，无需 root 权限或 eBPF。
+    pub fn sample_tcp_rtt_us(&self) -> Option<u32> {
+        // 1. 优先采样活跃连接
+        if let Ok(actives) = self.brutal_state.active_fds.lock() {
+            let mut sum = 0u64;
+            let mut count = 0u32;
+            for &fd in actives.iter() {
+                if let Ok(info) = crate::proxy::brutal::get_tcp_info(fd) {
+                    if info.rtt > 0 {
+                        sum += info.rtt as u64;
+                        count += 1;
+                    }
+                }
+            }
+            if count > 0 {
+                return Some((sum / count as u64) as u32);
+            }
+        }
+        // 2. 活跃集合为空时，采样池内空闲预热连接
+        if let Ok(q) = self.queue.try_lock() {
+            let mut sum = 0u64;
+            let mut count = 0u32;
+            for t in q.iter() {
+                if let Some(fd) = t.get_raw_fd() {
+                    if let Ok(info) = crate::proxy::brutal::get_tcp_info(fd) {
+                        if info.rtt > 0 {
+                            sum += info.rtt as u64;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                return Some((sum / count as u64) as u32);
+            }
+        }
+        None
+    }
 }
 
 impl Drop for WarmPool {

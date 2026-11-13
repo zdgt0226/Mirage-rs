@@ -122,7 +122,14 @@ impl OutboundNode {
     pub fn latency_rtt_ms(self: &Arc<Self>) -> Option<u64> {
         match &**self {
             Self::Mirage { rtt_ms, pool, .. } => {
-                let rtt = rtt_ms.load(std::sync::atomic::Ordering::Relaxed);
+                let mut rtt = rtt_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if rtt == 0 || rtt == u64::MAX {
+                    if let Some(rtt_us) = pool.sample_tcp_rtt_us() {
+                        let ms = (rtt_us as u64 / 1000).max(if rtt_us > 0 { 1 } else { 0 });
+                        rtt_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+                        rtt = ms;
+                    }
+                }
                 if rtt > 0 && rtt != u64::MAX {
                     let floor = pool.stats.read().unwrap_or_else(|e| e.into_inner()).slow_floor_ms();
                     Some(floor.map_or(rtt, |f| rtt.max(f)))
