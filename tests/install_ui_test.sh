@@ -357,6 +357,139 @@ EOF
     rm -rf "$d"
 }
 
+section_b8() {
+    echo "[B8] 依赖检测与自动安装 (ensure_deps)"
+    eq_ "B8.1a pkg_for_cmd ss apt-get"     "$(pkg_for_cmd ss apt-get)" "iproute2"
+    eq_ "B8.1b pkg_for_cmd ss dnf"         "$(pkg_for_cmd ss dnf)" "iproute"
+    eq_ "B8.1c pkg_for_cmd ss yum"         "$(pkg_for_cmd ss yum)" "iproute"
+    eq_ "B8.1d pkg_for_cmd ss apk"         "$(pkg_for_cmd ss apk)" "iproute2-ss"
+    eq_ "B8.1e pkg_for_cmd sha256sum"      "$(pkg_for_cmd sha256sum apt-get)" "coreutils"
+    eq_ "B8.1f pkg_for_cmd curl"           "$(pkg_for_cmd curl apt-get)" "curl"
+
+    eq_ "B8.2a manual_install_cmd apt-get" "$(manual_install_cmd apt-get curl iproute2)" "apt-get update && apt-get install -y curl iproute2"
+    eq_ "B8.2b manual_install_cmd apk"     "$(manual_install_cmd apk curl iproute2-ss)" "apk add --no-cache curl iproute2-ss"
+
+    local pm; pm=$(detect_pm)
+    has_ "B8.3  detect_pm 返回已知包管理器或 none" "apt-get dnf yum apk pacman zypper none" "$pm"
+
+    eq_ "B8.4  SKIP_DEP_CHECK=1 跳过依赖检测" "$(SKIP_DEP_CHECK=1 ensure_deps; echo $?)" "0"
+
+    # B8.5 模拟缺必需命令且用户拒绝 → 非零退出 (exit 1)
+    local rc=0
+    (
+        command() {
+            if [[ "$2" == "curl" ]]; then return 1; fi
+            builtin command "$@"
+        }
+        ask_yn() { return 1; }
+        is_noninteractive() { return 1; }
+        ensure_deps >/dev/null 2>&1
+    ) || rc=$?
+    eq_ "B8.5  缺少必需依赖且用户拒绝 → 退出码 1" "$rc" "1"
+
+    # B8.6 模拟非交互模式自动触发 pm_install
+    local log; log=$(mktemp)
+    (
+        command() {
+            if [[ "$2" == "curl" && -z "${_installed:-}" ]]; then return 1; fi
+            builtin command "$@"
+        }
+        detect_pm() { echo "mockpm"; }
+        pm_install() {
+            echo "installed: $*" > "$log"
+            _installed=1
+            return 0
+        }
+        is_noninteractive() { return 0; }
+        ensure_deps >/dev/null 2>&1
+    )
+    has_ "B8.6  非交互模式缺必需依赖自动安装" "$(cat "$log")" "installed: mockpm curl"
+    rm -f "$log"
+
+    # B8.7 NONINTERACTIVE=1 时 ask 返回默认值
+    local x
+    x=$(NONINTERACTIVE=1 ask "p" "dflt")
+    eq_ "B8.7  NONINTERACTIVE=1 时 ask 得到默认值" "$x" "dflt"
+
+    # B8.8 非交互模式下 handle_brutal_optional 拒绝执行外部脚本且返回非零
+    local marker; marker=$(mktemp -u /tmp/mirage_brutal_marker.XXXXXX)
+    rm -f "$marker"
+    local brutal_rc=0 brutal_out
+    brutal_out=$(
+        export NONINTERACTIVE=1
+        export MARKER_FILE="$marker"
+        brutal_loaded() { return 1; }
+        ask_choice() { echo "1"; }
+        curl() {
+            local out=""
+            while [[ $# -gt 0 ]]; do
+                if [[ "$1" == "-o" ]]; then
+                    out="$2"; shift 2
+                else
+                    shift
+                fi
+            done
+            if [[ -n "$out" ]]; then
+                cat > "$out" <<'EOF'
+#!/usr/bin/env bash
+touch "$MARKER_FILE"
+EOF
+                return 0
+            fi
+            return 1
+        }
+        handle_brutal_optional 2>&1
+    ) || brutal_rc=$?
+
+    eq_  "B8.8a 非交互模式下 handle_brutal_optional 返回非零" "$(( brutal_rc != 0 ))" "1"
+    eq_  "B8.8b 非交互模式下从不执行外部脚本" "$([[ ! -f "$marker" ]] && echo "unexecuted" || echo "executed")" "unexecuted"
+    has_ "B8.8c 包含拒绝执行外部脚本警告" "$brutal_out" "非交互模式下拒绝执行外部脚本"
+    rm -f "$marker"
+
+    # B8.9 W1: 脚本执行成功但 brutal 模块未加载 → 直接返回非零, 不进入重试循环 (不出现 [r] 重试, curl 只调用 1 次)
+    local curl_count_file; curl_count_file=$(mktemp)
+    echo 0 > "$curl_count_file"
+    local w1_rc=0 w1_out
+    w1_out=$(
+        is_noninteractive() { return 1; }
+        ask_yn() { return 0; }
+        ask_choice() { echo "1"; }
+        version_ge() { return 0; }
+        brutal_loaded() { return 1; }
+        curl() {
+            local cnt
+            cnt=$(cat "$curl_count_file")
+            echo $((cnt + 1)) > "$curl_count_file"
+            local out=""
+            while [[ $# -gt 0 ]]; do
+                if [[ "$1" == "-o" ]]; then
+                    out="$2"; shift 2
+                else
+                    shift
+                fi
+            done
+            if [[ -n "$out" ]]; then
+                cat > "$out" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+                return 0
+            fi
+            return 1
+        }
+        handle_brutal_optional 2>&1
+    ) || w1_rc=$?
+
+    local final_curl_count
+    final_curl_count=$(cat "$curl_count_file")
+    rm -f "$curl_count_file"
+
+    eq_  "B8.9a 模块未加载时 handle_brutal_optional 返回非零" "$(( w1_rc != 0 ))" "1"
+    eq_  "B8.9b 不进入重试循环，curl 仅调用 1 次" "$final_curl_count" "1"
+    no_  "B8.9c 输出中不包含 [r] 重试 交互提示" "$w1_out" "[r] 重试"
+    has_ "B8.9d 包含内核不兼容或需重启警告及参考链接" "$w1_out" "https://github.com/apernet/tcp-brutal"
+}
+
 echo "== install.sh UI 护甲 =="
 section_b3
 load_install
@@ -366,6 +499,7 @@ section_b4
 section_b5
 section_b6
 section_b7
+section_b8
 echo "----"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

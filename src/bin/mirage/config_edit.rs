@@ -89,9 +89,29 @@ impl std::fmt::Display for OutboundRef {
     }
 }
 
-/// 命令行执行器接口 (用于抽象 systemctl 执行, 便于单元与集成测试注入)
+/// 支持的 Init 服务管理系统
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitSystem {
+    Systemd,
+    OpenRc,
+    SysVInit,
+    None,
+}
+
+impl InitSystem {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Systemd => "systemd",
+            Self::OpenRc => "OpenRC",
+            Self::SysVInit => "SysV init",
+            Self::None => "none",
+        }
+    }
+}
+
+/// 命令行执行器接口 (用于抽象 init 系统服务管理执行, 便于单元与集成测试注入)
 pub trait CommandExecutor {
-    fn has_systemctl(&self) -> bool;
+    fn detect_init(&self) -> InitSystem;
     fn execute(&self, cmd: &str, args: &[&str]) -> Result<String, String>;
     /// 交互输入是否来自真实终端 (决定出站组复选框用空格勾选控件还是行输入)。测试桩默认 false。
     fn stdin_is_tty(&self) -> bool {
@@ -106,14 +126,31 @@ impl CommandExecutor for RealCommandExecutor {
     fn stdin_is_tty(&self) -> bool {
         unsafe { libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0 }
     }
-    fn has_systemctl(&self) -> bool {
-        std::process::Command::new("which")
-            .arg("systemctl")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-            || std::path::Path::new("/bin/systemctl").exists()
-            || std::path::Path::new("/usr/bin/systemctl").exists()
+
+    fn detect_init(&self) -> InitSystem {
+        let has_cmd = |cmd: &str| -> bool {
+            std::process::Command::new("which")
+                .arg(cmd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                || std::path::Path::new(&format!("/bin/{cmd}")).exists()
+                || std::path::Path::new(&format!("/usr/bin/{cmd}")).exists()
+                || std::path::Path::new(&format!("/sbin/{cmd}")).exists()
+                || std::path::Path::new(&format!("/usr/sbin/{cmd}")).exists()
+        };
+
+        if has_cmd("systemctl") && std::path::Path::new("/run/systemd/system").is_dir() {
+            InitSystem::Systemd
+        } else if has_cmd("rc-service") || has_cmd("openrc-run") || std::path::Path::new("/sbin/openrc-run").exists() {
+            InitSystem::OpenRc
+        } else if std::path::Path::new("/etc/init.d").is_dir()
+            && (has_cmd("service") || has_cmd("chkconfig") || has_cmd("update-rc.d"))
+        {
+            InitSystem::SysVInit
+        } else {
+            InitSystem::None
+        }
     }
 
     fn execute(&self, cmd: &str, args: &[&str]) -> Result<String, String> {
@@ -2114,23 +2151,58 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                                 ("mirage-rs-client", "mirage-rs-lite-client")
                             };
 
+                            let init_system = executor.detect_init();
                             let mut inferred_unit = default_unit.to_string();
-                            if executor.has_systemctl() {
-                                if let Ok(st) = executor.execute("systemctl", &["is-active", lite_unit]) {
-                                    if st == "active" {
+
+                            match init_system {
+                                InitSystem::Systemd => {
+                                    if let Ok(st) = executor.execute("systemctl", &["is-active", lite_unit]) {
+                                        if st == "active" {
+                                            inferred_unit = lite_unit.to_string();
+                                        }
+                                    }
+                                }
+                                InitSystem::OpenRc => {
+                                    if let Ok(st) = executor.execute("rc-service", &[lite_unit, "status"]) {
+                                        if st.to_lowercase().contains("started") {
+                                            inferred_unit = lite_unit.to_string();
+                                        }
+                                    }
+                                }
+                                InitSystem::SysVInit => {
+                                    if executor.execute("service", &[lite_unit, "status"]).is_ok() {
                                         inferred_unit = lite_unit.to_string();
                                     }
                                 }
+                                InitSystem::None => {}
                             }
 
-                            if executor.has_systemctl() {
-                                let unit_input = prompt_line(reader, writer, &format!("确认 systemd 服务单元名 [{inferred_unit}]:"));
+                            if init_system != InitSystem::None {
+                                let unit_prompt = if init_system == InitSystem::Systemd {
+                                    format!("确认 systemd 服务单元名 [{inferred_unit}]:")
+                                } else {
+                                    format!("确认 {} 服务名 [{inferred_unit}]:", init_system.name())
+                                };
+                                let unit_input = prompt_line(reader, writer, &unit_prompt);
                                 let final_unit = if unit_input.is_empty() { inferred_unit } else { unit_input };
 
                                 writeln!(writer, "正在重启服务 `{final_unit}` ...").map_err(|e| e.to_string())?;
-                                match executor.execute("systemctl", &["restart", &final_unit]) {
+
+                                let restart_res = match init_system {
+                                    InitSystem::Systemd => executor.execute("systemctl", &["restart", &final_unit]),
+                                    InitSystem::OpenRc => executor.execute("rc-service", &[&final_unit, "restart"]),
+                                    InitSystem::SysVInit => executor.execute("service", &[&final_unit, "restart"]),
+                                    InitSystem::None => unreachable!(),
+                                };
+
+                                match restart_res {
                                     Ok(_) => {
-                                        let status = executor.execute("systemctl", &["is-active", &final_unit]).unwrap_or_else(|e| e);
+                                        let status = match init_system {
+                                            InitSystem::Systemd => executor.execute("systemctl", &["is-active", &final_unit]).unwrap_or_else(|e| e),
+                                            InitSystem::OpenRc => executor.execute("rc-service", &[&final_unit, "status"]).unwrap_or_else(|e| e),
+                                            InitSystem::SysVInit => executor.execute("service", &[&final_unit, "status"]).unwrap_or_else(|e| e),
+                                            InitSystem::None => unreachable!(),
+                                        };
                                         writeln!(writer, "✓ 服务重启完成，当前状态: {status}").map_err(|e| e.to_string())?;
                                     }
                                     Err(e) => {
@@ -2138,7 +2210,10 @@ pub async fn run_interactive_session<R: BufRead, W: Write, E: CommandExecutor>(
                                     }
                                 }
                             } else {
-                                writeln!(writer, "未检测到 systemctl 环境。请手动重启服务: 例如 `systemctl restart {inferred_unit}` 或相应 init 脚本。").map_err(|e| e.to_string())?;
+                                writeln!(
+                                    writer,
+                                    "未检测到支持的 init 系统。请手动重启服务:\n  systemd:  systemctl restart {inferred_unit}\n  OpenRC:   rc-service {inferred_unit} restart\n  SysVinit: service {inferred_unit} restart (或 /etc/init.d/{inferred_unit} restart)"
+                                ).map_err(|e| e.to_string())?;
                             }
                         }
                     }
@@ -2192,7 +2267,7 @@ mod tests {
 
     // 测试用命令执行器替身 (Mock)
     pub struct MockCommandExecutor {
-        pub systemctl_available: bool,
+        pub init_system: InitSystem,
         pub recorded_calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
         pub active_units: std::sync::Mutex<HashSet<String>>,
     }
@@ -2200,7 +2275,15 @@ mod tests {
     impl MockCommandExecutor {
         pub fn new(systemctl_available: bool) -> Self {
             Self {
-                systemctl_available,
+                init_system: if systemctl_available { InitSystem::Systemd } else { InitSystem::None },
+                recorded_calls: std::sync::Mutex::new(Vec::new()),
+                active_units: std::sync::Mutex::new(HashSet::new()),
+            }
+        }
+
+        pub fn with_init(init_system: InitSystem) -> Self {
+            Self {
+                init_system,
                 recorded_calls: std::sync::Mutex::new(Vec::new()),
                 active_units: std::sync::Mutex::new(HashSet::new()),
             }
@@ -2208,25 +2291,56 @@ mod tests {
     }
 
     impl CommandExecutor for MockCommandExecutor {
-        fn has_systemctl(&self) -> bool {
-            self.systemctl_available
+        fn detect_init(&self) -> InitSystem {
+            self.init_system
         }
 
         fn execute(&self, cmd: &str, args: &[&str]) -> Result<String, String> {
             self.recorded_calls.lock().unwrap().push((cmd.to_string(), args.iter().map(|s| s.to_string()).collect()));
-            if cmd == "systemctl" {
-                if args.first() == Some(&"is-active") {
-                    let unit = args.get(1).unwrap_or(&"");
-                    if self.active_units.lock().unwrap().contains(*unit) {
-                        return Ok("active".to_string());
-                    } else {
-                        return Ok("inactive".to_string());
+            match cmd {
+                "systemctl" => {
+                    if args.first() == Some(&"is-active") {
+                        let unit = args.get(1).unwrap_or(&"");
+                        if self.active_units.lock().unwrap().contains(*unit) {
+                            return Ok("active".to_string());
+                        } else {
+                            return Ok("inactive".to_string());
+                        }
+                    } else if args.first() == Some(&"restart") {
+                        let unit = args.get(1).unwrap_or(&"");
+                        self.active_units.lock().unwrap().insert(unit.to_string());
+                        return Ok("".to_string());
                     }
-                } else if args.first() == Some(&"restart") {
-                    let unit = args.get(1).unwrap_or(&"");
-                    self.active_units.lock().unwrap().insert(unit.to_string());
-                    return Ok("".to_string());
                 }
+                "rc-service" => {
+                    let unit = args.first().unwrap_or(&"");
+                    let action = args.get(1).unwrap_or(&"");
+                    if *action == "status" {
+                        if self.active_units.lock().unwrap().contains(*unit) {
+                            return Ok("status: started".to_string());
+                        } else {
+                            return Err("status: stopped".to_string());
+                        }
+                    } else if *action == "restart" {
+                        self.active_units.lock().unwrap().insert(unit.to_string());
+                        return Ok("".to_string());
+                    }
+                }
+                "service" => {
+                    let unit = args.first().unwrap_or(&"");
+                    let action = args.get(1).unwrap_or(&"");
+                    if *action == "status" {
+                        if self.active_units.lock().unwrap().contains(*unit) {
+                            return Ok("running".to_string());
+                        } else {
+                            return Err("stopped".to_string());
+                        }
+                    } else if *action == "restart" {
+                        self.active_units.lock().unwrap().insert(unit.to_string());
+                        return Ok("".to_string());
+                    }
+                }
+                _ => {}
             }
             Ok("".to_string())
         }
@@ -2948,5 +3062,99 @@ mod tests {
         let group = outbounds.iter().find(|o| o["tag"] == "auto-hk").unwrap();
         assert_eq!(group["filter"], "hk");
         assert!(group.get("outbounds").is_none());
+    }
+
+    async fn run_restart_session(
+        init: InitSystem,
+        preactive_lite: bool,
+        with_unit_confirm: bool,
+    ) -> (ApplyPlan, Vec<(String, Vec<String>)>, String) {
+        let temp_dir = std::env::temp_dir().join(format!("mirage_test_restart_{}", fastrand::u64(..)));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cfg_path = temp_dir.join("config.json");
+        let initial_cfg = json!({
+            "inbounds": [{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "port": 1080 }],
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "routing": { "default_outbound": "direct", "rules": [] }
+        });
+        std::fs::write(&cfg_path, serde_json::to_string_pretty(&initial_cfg).unwrap()).unwrap();
+
+        let mut script = String::from(concat!(
+            "2\n", "2\n", "node-restart\n", "203.0.113.20\n", "443\n", "pass123\n",
+            "example.com\n", "n\n", "\n", "\n", "\n", "\n", "n\n",
+            "12\n", "y\n", "y\n",
+        ));
+        if with_unit_confirm {
+            script.push('\n');
+        }
+        let mut reader = std::io::Cursor::new(script.as_bytes());
+        let mut output = Vec::new();
+        let executor = MockCommandExecutor::with_init(init);
+        if preactive_lite {
+            executor.active_units.lock().unwrap().insert("mirage-rs-lite-client".to_string());
+        }
+
+        let plan = run_interactive_session(cfg_path.to_str().unwrap(), &mut reader, &mut output, &executor).await.unwrap();
+        let calls = executor.recorded_calls.lock().unwrap().clone();
+        let out_str = String::from_utf8_lossy(&output).into_owned();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        (plan, calls, out_str)
+    }
+
+    #[tokio::test]
+    async fn test_interactive_session_restart_systemd() {
+        let (plan, calls, _out) = run_restart_session(InitSystem::Systemd, true, true).await;
+        match plan {
+            ApplyPlan::RestartRequired { .. } => {}
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], ("systemctl".to_string(), vec!["is-active".to_string(), "mirage-rs-lite-client".to_string()]));
+        assert_eq!(calls[1], ("systemctl".to_string(), vec!["restart".to_string(), "mirage-rs-lite-client".to_string()]));
+        assert_eq!(calls[2], ("systemctl".to_string(), vec!["is-active".to_string(), "mirage-rs-lite-client".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_session_restart_openrc() {
+        let (plan, calls, _out) = run_restart_session(InitSystem::OpenRc, true, true).await;
+        match plan {
+            ApplyPlan::RestartRequired { .. } => {}
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], ("rc-service".to_string(), vec!["mirage-rs-lite-client".to_string(), "status".to_string()]));
+        assert_eq!(calls[1], ("rc-service".to_string(), vec!["mirage-rs-lite-client".to_string(), "restart".to_string()]));
+        assert_eq!(calls[2], ("rc-service".to_string(), vec!["mirage-rs-lite-client".to_string(), "status".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_session_restart_sysvinit() {
+        let (plan, calls, _out) = run_restart_session(InitSystem::SysVInit, true, true).await;
+        match plan {
+            ApplyPlan::RestartRequired { .. } => {}
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0], ("service".to_string(), vec!["mirage-rs-lite-client".to_string(), "status".to_string()]));
+        assert_eq!(calls[1], ("service".to_string(), vec!["mirage-rs-lite-client".to_string(), "restart".to_string()]));
+        assert_eq!(calls[2], ("service".to_string(), vec!["mirage-rs-lite-client".to_string(), "status".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn test_interactive_session_restart_none() {
+        let (plan, calls, out_str) = run_restart_session(InitSystem::None, false, false).await;
+        match plan {
+            ApplyPlan::RestartRequired { .. } => {}
+            other => panic!("expected RestartRequired, got {other:?}"),
+        }
+
+        assert!(calls.is_empty(), "when init is None, no restart command should be called");
+        assert!(out_str.contains("systemctl restart mirage-rs-client"));
+        assert!(out_str.contains("rc-service mirage-rs-client restart"));
+        assert!(out_str.contains("service mirage-rs-client restart"));
     }
 }

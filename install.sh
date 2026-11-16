@@ -52,18 +52,34 @@ section_box() {
     note
 }
 
+is_noninteractive() {
+    [[ -n "${NONINTERACTIVE:-}" ]] \
+        || [[ -n "${ASSUME_YES:-}" ]] \
+        || [[ -n "${CI:-}" ]] \
+        || [[ "${DEBIAN_FRONTEND:-}" == "noninteractive" ]] \
+        || ! { : </dev/tty; } 2>/dev/null
+}
+
 ask() {
     local prompt=$1 default=${2:-} val
     local hint=""
     [[ -n "$default" ]] && hint=" [$default]"
-    read -rp "  ${prompt}${hint}: " val </dev/tty
+    if is_noninteractive; then
+        echo "$default"
+        return
+    fi
+    read -rp "  ${prompt}${hint}: " val </dev/tty 2>/dev/null || val="$default"
     echo "${val:-$default}"
 }
 
 ask_yn() {
     local prompt=$1 default=${2:-y} hint val
     hint=$( [[ "$default" == y ]] && echo "Y/n" || echo "y/N" )
-    read -rp "  ${prompt} (${hint}): " val </dev/tty
+    if is_noninteractive; then
+        [[ "$default" =~ ^[Yy] ]]
+        return
+    fi
+    read -rp "  ${prompt} (${hint}): " val </dev/tty 2>/dev/null || val="$default"
     val="${val:-$default}"
     [[ "$val" =~ ^[Yy] ]]
 }
@@ -289,7 +305,7 @@ suggest_camouflage_host() {
         local ref="${MIRAGE_TAG:-main}"
         local url="https://raw.githubusercontent.com/zdgt0226/Mirage-rs/${ref}/tools/find_camouflage.py"
         tmp_finder=$(mktemp /tmp/mirage_find_camouflage.XXXXXX.py) || return 1
-        if ! curl -fsSL --max-time 20 "$url" -o "$tmp_finder"; then
+        if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 20 "$url" -o "$tmp_finder"; then
             warn "下载搜索工具失败 ($url), 跳过自动搜索"
             rm -f "$tmp_finder"; return 1
         fi
@@ -401,7 +417,7 @@ detect_public_ip() {
     )
     local ip
     for svc in "${services[@]}"; do
-        ip=$(curl -4 -sfL --max-time 3 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
+        ip=$(curl -4 -sfL --connect-timeout 3 --max-time 3 "$svc" 2>/dev/null | tr -d '[:space:]' || true)
         if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
             echo "$ip"
             return 0
@@ -472,39 +488,47 @@ handle_brutal_optional() {
     if (( ${#install_args[@]} > 0 )); then
         desc_args=" -s -- ${install_args[*]}"
     fi
-    local script_file
-    script_file=$(mktemp) || err "创建临时文件失败"
-    info "下载官方一键脚本到临时文件..."
-    if ! curl -fsSL https://tcp.hy2.sh/ -o "$script_file"; then
-        rm -f "$script_file"
-        warn "安装脚本下载失败, 请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
-        return 1
-    fi
+    local max_attempts=3 attempt=1
+    while (( attempt <= max_attempts )); do
+        local fail_reason=""
+        local script_file
+        script_file=$(mktemp) || err "创建临时文件失败"
+        info "下载官方一键脚本到临时文件 (第 ${attempt}/${max_attempts} 次)..."
+        if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$script_file" https://tcp.hy2.sh/; then
+            rm -f "$script_file"
+            fail_reason="下载安装脚本失败"
+        else
+            local script_hash
+            script_hash=$(sha256sum "$script_file" | cut -d' ' -f1)
+            info "脚本 SHA256: ${script_hash}"
 
-    local script_hash
-    script_hash=$(sha256sum "$script_file" | cut -d' ' -f1)
-    info "脚本 SHA256: ${script_hash}"
+            if is_noninteractive; then
+                rm -f "$script_file"
+                warn "非交互模式下拒绝执行外部脚本, 跳过 Brutal 安装。"
+                return 1
+            fi
 
-    if [[ ! -t 0 && ! -t 1 ]] || [[ ! -r /dev/tty ]] || [[ -n "${NONINTERACTIVE:-}" ]] || [[ "${DEBIAN_FRONTEND:-}" == "noninteractive" ]]; then
-        rm -f "$script_file"
-        warn "非交互模式下拒绝执行外部脚本, 跳过 Brutal 安装。"
-        return 1
-    fi
+            if ! ask_yn "是否确认执行上述 Brutal 安装脚本?" n; then
+                rm -f "$script_file"
+                info "已取消执行安装脚本, 跳过 Brutal 安装。"
+                return 1
+            fi
 
-    if ! ask_yn "是否确认执行上述 Brutal 安装脚本?" n; then
-        rm -f "$script_file"
-        info "已取消执行安装脚本, 跳过 Brutal 安装。"
-        return 1
-    fi
+            local run_ok=0
+            if bash "$script_file" ${install_args[@]+"${install_args[@]}"} >&2; then
+                run_ok=1
+            fi
+            rm -f "$script_file"
 
-    local run_ret=0
-    if bash "$script_file" ${install_args[@]+"${install_args[@]}"} >&2; then
-        run_ret=1
-    fi
-    rm -f "$script_file"
+            if (( run_ok != 1 )); then
+                fail_reason="安装脚本执行失败"
+            elif ! brutal_loaded; then
+                warn "安装脚本执行成功但未检测到已加载的 brutal 内核模块 (可能内核不兼容或需重启后生效, 手动安装参考 https://github.com/apernet/tcp-brutal)"
+                return 1
+            fi
+        fi
 
-    if (( run_ret == 1 )); then
-        if brutal_loaded; then
+        if [[ -z "$fail_reason" ]]; then
             local new_ver want_major=2
             new_ver=$(brutal_version)
             (( choice == 2 )) && want_major=1
@@ -515,12 +539,36 @@ handle_brutal_optional() {
                 warn "已安装所选版本, 但当前加载的仍是 ${new_ver}: 需重启服务器, 或停止使用 brutal 的服务后执行 rmmod brutal && modprobe brutal"
             fi
             return 0
-        else
-            warn "安装完成但未检测到 brutal, 可能是内核不兼容或需要重启。"
         fi
-    else
-        warn "安装脚本执行失败, 请查阅 https://github.com/apernet/tcp-brutal 手动安装。"
-    fi
+
+        warn "tcp-brutal 安装失败: ${fail_reason}"
+
+        if (( attempt >= max_attempts )); then
+            warn "已达到最大重试次数 (${max_attempts} 次), 跳过 Brutal 安装。"
+            return 1
+        fi
+
+        local act=""
+        while :; do
+            read -rp "  tcp-brutal 安装失败: ${fail_reason}。[r] 重试 / [s] 跳过 (不启用 brutal) / [q] 退出: " act </dev/tty || act="s"
+            case "$act" in
+                [Rr])
+                    attempt=$((attempt + 1))
+                    break
+                    ;;
+                [Ss])
+                    info "已跳过 Brutal 安装 (不启用 brutal)。"
+                    return 1
+                    ;;
+                [Qq])
+                    err "用户退出安装。"
+                    ;;
+                *)
+                    echo "  无效输入, 请输入 r、s 或 q。" >&2
+                    ;;
+            esac
+        done
+    done
     return 1
 }
 
@@ -551,7 +599,7 @@ verify_binary_integrity() {
         local api_url="https://api.github.com/repos/zdgt0226/Mirage-rs/releases/latest"
         [[ -n "$MIRAGE_TAG" ]] && api_url="https://api.github.com/repos/zdgt0226/Mirage-rs/releases/tags/${MIRAGE_TAG}"
         local api_resp
-        api_resp=$(curl -sfL --max-time 10 \
+        api_resp=$(curl -sfL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 10 \
             -H "Accept: application/vnd.github+json" \
             "$api_url" 2>/dev/null || true)
         if [[ -n "$api_resp" ]]; then
@@ -578,7 +626,7 @@ except Exception:
         info "API digest 不可用, fallback 到 release .sha256 文件..."
         local sha_url="${download_url}.sha256"
         local sha_tmp; sha_tmp=$(mktemp)
-        if curl -sfL --max-time 30 -o "$sha_tmp" "$sha_url" 2>/dev/null; then
+        if curl -sfL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 30 -o "$sha_tmp" "$sha_url" 2>/dev/null; then
             expected_sha=$(cut -d' ' -f1 "$sha_tmp" 2>/dev/null || true)
             [[ -n "$expected_sha" ]] && sha_source="release .sha256 文件"
         fi
@@ -717,6 +765,197 @@ select_version() {
     fi
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 基础环境检测与依赖自动安装
+# ──────────────────────────────────────────────────────────────────────────────
+detect_pm() {
+    local pm
+    for pm in apt-get dnf yum apk pacman zypper; do
+        if command -v "$pm" >/dev/null 2>&1; then
+            echo "$pm"
+            return 0
+        fi
+    done
+    echo "none"
+}
+
+pkg_for_cmd() {
+    local cmd=$1 pm=${2:-$(detect_pm)}
+    case "$cmd" in
+        curl)      echo "curl" ;;
+        sha256sum) echo "coreutils" ;;
+        ss)
+            case "$pm" in
+                apk) echo "iproute2-ss" ;;
+                dnf|yum) echo "iproute" ;;
+                *) echo "iproute2" ;;
+            esac
+            ;;
+        python3)   echo "python3" ;;
+        openssl)   echo "openssl" ;;
+        qrencode)  echo "qrencode" ;;
+        *)         echo "$cmd" ;;
+    esac
+}
+
+manual_install_cmd() {
+    local pm=$1; shift
+    local pkgs=("$*")
+    case "$pm" in
+        apt-get) echo "apt-get update && apt-get install -y $pkgs" ;;
+        dnf)     echo "dnf install -y $pkgs" ;;
+        yum)     echo "yum install -y $pkgs" ;;
+        apk)     echo "apk add --no-cache $pkgs" ;;
+        pacman)  echo "pacman -S --needed --noconfirm $pkgs" ;;
+        zypper)  echo "zypper --non-interactive install -y $pkgs" ;;
+        *)       echo "请使用系统包管理器安装: $pkgs" ;;
+    esac
+}
+
+pm_install() {
+    local pm=$1; shift
+    local pkgs=("$@")
+    (( ${#pkgs[@]} == 0 )) && return 0
+    case "$pm" in
+        apt-get)
+            DEBIAN_FRONTEND=noninteractive apt-get update -y && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}"
+            ;;
+        dnf)
+            dnf install -y "${pkgs[@]}"
+            ;;
+        yum)
+            yum install -y "${pkgs[@]}"
+            ;;
+        apk)
+            apk add --no-cache "${pkgs[@]}"
+            ;;
+        pacman)
+            pacman -S --needed --noconfirm "${pkgs[@]}"
+            ;;
+        zypper)
+            zypper --non-interactive install -y "${pkgs[@]}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_deps() {
+    if [[ "${SKIP_DEP_CHECK:-0}" == "1" ]]; then
+        return 0
+    fi
+
+    # 必需: curl (所有下载) / sha256sum (二进制完整性校验, 缺了会跳过校验)。
+    # ss 缺了只跳过端口冲突检测 (HAVE_SS=0 降级), 归可选。
+    local req_cmds=(curl sha256sum)
+    local opt_cmds=(ss python3 openssl qrencode)
+
+    local missing_req=()
+    local cmd p
+    for cmd in "${req_cmds[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_req+=("$cmd")
+        fi
+    done
+
+    local pm
+    pm=$(detect_pm)
+
+    if (( ${#missing_req[@]} > 0 )); then
+        local req_pkgs=()
+        for cmd in "${missing_req[@]}"; do
+            p=$(pkg_for_cmd "$cmd" "$pm")
+            if [[ ! " ${req_pkgs[*]} " =~ " ${p} " ]]; then
+                req_pkgs+=("$p")
+            fi
+        done
+
+        local manual_cmd
+        manual_cmd=$(manual_install_cmd "$pm" "${req_pkgs[*]}")
+
+        warn "缺少必需命令: ${missing_req[*]} (对应软件包: ${req_pkgs[*]})"
+
+        local should_install=0
+        if is_noninteractive; then
+            info "非交互模式: 自动安装缺少依赖"
+            should_install=1
+        else
+            if ask_yn "缺少 ${missing_req[*]}, 是否自动安装?" y; then
+                should_install=1
+            fi
+        fi
+
+        if (( should_install == 1 )); then
+            if [[ "$pm" == "none" ]]; then
+                warn "未检测到支持的包管理器 (apt-get / dnf / yum / apk / pacman / zypper)。"
+                echo "  请手动执行以下命令后重新运行:" >&2
+                echo "    ${manual_cmd}" >&2
+                exit 1
+            fi
+
+            info "正在使用 ${pm} 自动安装必需依赖: ${req_pkgs[*]}..."
+            if pm_install "$pm" "${req_pkgs[@]}"; then
+                ok "必需依赖安装完成。"
+            else
+                warn "自动安装必需依赖失败。"
+                echo "  请手动执行以下命令安装依赖后重新运行:" >&2
+                echo "    ${manual_cmd}" >&2
+                exit 1
+            fi
+
+            local still_missing=()
+            for cmd in "${missing_req[@]}"; do
+                if ! command -v "$cmd" >/dev/null 2>&1; then
+                    still_missing+=("$cmd")
+                fi
+            done
+            if (( ${#still_missing[@]} > 0 )); then
+                err "安装后仍缺少必需命令: ${still_missing[*]}。请手动执行: ${manual_cmd}"
+            fi
+        else
+            warn "已拒绝自动安装必需依赖。"
+            echo "  请手动执行以下命令安装依赖后重新运行:" >&2
+            echo "    ${manual_cmd}" >&2
+            exit 1
+        fi
+    fi
+
+    command -v ss >/dev/null 2>&1 && HAVE_SS=1
+
+    local missing_opt=()
+    for cmd in "${opt_cmds[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_opt+=("$cmd")
+        fi
+    done
+
+    if (( ${#missing_opt[@]} > 0 )); then
+        local opt_pkgs=()
+        for cmd in "${missing_opt[@]}"; do
+            p=$(pkg_for_cmd "$cmd" "$pm")
+            if [[ ! " ${opt_pkgs[*]} " =~ " ${p} " ]]; then
+                opt_pkgs+=("$p")
+            fi
+        done
+
+        if is_noninteractive; then
+            info "可选依赖未安装: ${missing_opt[*]} (用于 SNI 自动探测、二维码生成等辅助功能, 已跳过)"
+        else
+            info "提示: 未安装可选工具: ${missing_opt[*]} (用于 SNI 探测、二维码生成等, 缺了只影响个别辅助功能)"
+            if ask_yn "是否一并安装可选工具 (${opt_pkgs[*]})?" n; then
+                if [[ "$pm" != "none" ]]; then
+                    info "正在使用 ${pm} 安装可选工具: ${opt_pkgs[*]}..."
+                    pm_install "$pm" "${opt_pkgs[@]}" || warn "可选工具安装失败, 继续常规流程。"
+                else
+                    warn "未检测到支持的包管理器, 跳过可选工具安装。"
+                fi
+            fi
+        fi
+    fi
+}
+
 # 探测服务管理器. 优先级: systemd (需真正在跑, 光有二进制不算) > OpenRC
 # (Alpine/Gentoo) > SysV init (老 Debian/CentOS6/精简系统) > none.
 detect_init() {
@@ -786,7 +1025,7 @@ fetch_release_binary() {
         download_url="https://github.com/zdgt0226/Mirage-rs/releases/latest/download/mirage-rs-${arch}-musl"
         info "下载最新版本: $download_url"
     fi
-    if ! curl -# -fLo "$dest" "$download_url"; then
+    if ! curl -# -fL --retry 3 --retry-delay 2 --connect-timeout 10 -o "$dest" "$download_url"; then
         warn "从 GitHub Releases 下载失败, 请检查网络或手动下载编译。"
         return 1
     fi
@@ -810,7 +1049,7 @@ remote_version() {
         echo "${MIRAGE_TAG#v}"; return 0
     fi
     local resp
-    resp=$(curl -sfL --max-time 10 -H "Accept: application/vnd.github+json" \
+    resp=$(curl -sfL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 10 -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/zdgt0226/Mirage-rs/releases/latest" 2>/dev/null || true)
     [[ -n "$resp" ]] || return 1
     grep -m1 '"tag_name"' <<< "$resp" \
@@ -1164,7 +1403,7 @@ update_binary() {
     if [[ -n "$lv" ]] && ! version_ge "${lv#v}" "0.15.0" && { [[ -z "$rv" ]] || version_ge "${rv#v}" "0.15.0"; }; then
         warn "本机已安装的 mirage 版本 ($lv) < v0.15.0"
         warn "协议不兼容, 所有客户端 (含 Android) 必须同步升级到 ≥ v0.15"
-        if [[ -t 0 || -t 1 ]] && [[ -r /dev/tty ]] && [[ -z "${NONINTERACTIVE:-}" ]] && [[ "${DEBIAN_FRONTEND:-}" != "noninteractive" ]]; then
+        if ! is_noninteractive; then
             local mig_choice
             mig_choice=$(ask_choice "检测到老版本升级, 请选择升级方案" \
                 "原地升级 (继续现有流程, 停用老服务并替换)" \
@@ -3874,6 +4113,12 @@ edit_config_interactive() {
 }
 
 main() {
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes|--non-interactive) NONINTERACTIVE=1 ;;
+        esac
+    done
+
     title "Mirage-rs 安装向导"
     if [[ $EUID -ne 0 ]]; then
         err "需要 Root 权限。请使用 sudo bash install.sh 运行。"
@@ -3899,10 +4144,10 @@ main() {
         "管理服务端出口与路由")
 
     case "$mode" in
-        4) update_binary; return ;;
+        4) ensure_deps; update_binary; return ;;
         5) show_server_node; return ;;
         6) uninstall; return ;;
-        7) config_wg_server; return ;;
+        7) ensure_deps; config_wg_server; return ;;
         8) edit_config_interactive; return ;;
         9) edit_server_upstream; return ;;
     esac
@@ -3921,6 +4166,7 @@ EOM
     fi
 
     # 选择安装版本 (留空 = latest)
+    ensure_deps
     select_version
 
     setup_fhs
