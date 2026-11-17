@@ -37,9 +37,10 @@
 ### 一键安装 (推荐)
 
 alpha.4+ 起提供交互式安装向导 `install.sh`（需 root 权限），自动完成：
-- 下载最新预编译二进制至 `/usr/local/bin/mirage-rs`（双通道 SHA256 校验）。
-- 探测公网 IP、端口占用与 Brutal 内核模块（可选 v2 按客户端分组限速 / v1.0.3 兼容老内核）。
-- 生成配置文件并注册 systemd 服务（完整版 `mirage-rs-{server,client}`，轻量版 `mirage-rs-lite-{server,client}`）。
+- 自动检测基础环境依赖（curl / coreutils 必需，iproute2 / python3 / openssl / qrencode 可选），缺依赖会提示自动安装。
+- 下载最新预编译二进制至 `/usr/local/bin/mirage-rs`（双通道 SHA256 校验，带网络超时与重试）。
+- 探测公网 IP、端口占用与 Brutal 内核模块（可选 v2 按客户端分组限速 / v1.0.3 兼容老内核，安装失败支持重试/跳过）。
+- 生成配置文件并注册系统服务（支持 systemd、OpenRC、SysV init；完整版 `mirage-rs-{server,client}`，轻量版 `mirage-rs-lite-{server,client}`）。
 - 交互配置 GUI 端口、SNI 伪装、Brutal 速率、Geo 分流策略与可选 Shadowsocks 上游。
 - 非回环监听时强制设置入站认证密码，防止开放代理。
 - 服务端配置完成后直接输出 `mirage://` 节点 URI 与二维码，客户端一步导入。
@@ -53,7 +54,7 @@ git clone https://github.com/zdgt0226/Mirage-rs.git && cd Mirage-rs
 sudo bash install.sh
 ```
 
-服务状态管理: `sudo systemctl status mirage-rs-{server,client}` (轻量版对应 `mirage-rs-lite-{server,client}`)。
+服务状态管理: `sudo systemctl status mirage-rs-{server,client}` (OpenRC 对应 `rc-service ... status`，SysV init 对应 `service ... status`；轻量版对应 `mirage-rs-lite-{server,client}`)。
 
 > **手动下载 Releases 二进制**: glibc 版需 glibc ≥ 2.34，旧版系统（如 Debian 11 / CentOS 8）请选择 `-musl` 版；`install.sh` 默认下载 musl 版。
 

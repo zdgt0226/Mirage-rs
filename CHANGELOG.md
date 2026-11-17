@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### fix(install,cli): 实机部署反馈 (2026-11-14)
+
+- **基础环境检测与依赖自动安装 (install.sh)**: 安装流程早期自动检测必需依赖 (curl、sha256sum (coreutils)) 与可选工具 (ss (iproute2, 缺失仅跳过端口占用检测)、python3、openssl、qrencode); 自动识别 apt-get / dnf / yum / apk / pacman / zypper 包管理器，缺失必需命令时提示是否自动安装（非交互 / CI 模式下自动同意），若拒绝或失败提供精确手动安装命令。
+- **下载与 tcp-brutal 安装重试加固 (install.sh)**: 全脚本下载类 curl 统一补齐连接超时与重试参数 (`--retry 3 --retry-delay 2 --connect-timeout 10`); tcp-brutal 安装在下载脚本、执行安装、模块加载任一步失败时提供重试/跳过/退出交互循环（最多重试 3 次），非交互模式拒绝执行外部安装脚本并跳过，避免单次网络抖动阻塞部署。非交互判定只认显式变量 (NONINTERACTIVE/ASSUME_YES/-y/CI/DEBIAN_FRONTEND) 与 /dev/tty 能否打开，修复 `curl | bash` 下提示被跳过。
+- **配置保存后多 Init 服务自动重启 (mirage config)**: `mirage config` 保存需重启的配置改动后，增加 init 系统检测（systemd / OpenRC / SysV init），针对不同 init 分别执行状态检测与服务重启（systemd 走 systemctl，OpenRC 走 rc-service，SysV init 走 service）；未检测到支持的 init 时提供三种 init 的手动重启命令示例。
+
+### chore(deps): quinn-udp 安全升级 (2026-11-17)
+
+- quinn-udp 0.5.14 → 0.5.16, 修复 RUSTSEC-2026-0538 (Receive loop can spin after a truncated datagram / 截断数据包后接收循环可能空转; 仅影响 Apple/BSD/illumos 等单包 recvmsg 平台, Linux/Android 不受影响, 主要为通过 cargo-deny 门禁); 仅 Cargo.lock 变更, 无代码与协议变更。
+
 ## [v0.17.12] - 配置诊断提示在日志中改为英文 (2026-11-09)
 
 - **无协议变更**, 与 v0.17.x 及更早版本两端互通。
